@@ -7,10 +7,11 @@
 //!
 //! Windows: the same API is backed by a real ConPTY session
 //! (`CreatePseudoConsole` + `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`); see
-//! [`windows`] for the exact construction. (Audit round 53: ConPTY was the
-//! last declared platform blocker for terminal parity — crates/winjob
-//! already covers OS-enforced Job-Object kill-on-close for process trees,
-//! which is deliberately NOT duplicated in this crate.)
+//! [`windows`] for the exact construction. Every ConPTY child is assigned to
+//! a `faktor-winjob` Job created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+//! before `Pty::spawn` returns (spawn suspended → assign → resume), so
+//! closing the Pty (or the session/daemon owning it) terminates the whole
+//! child tree through the OS; no taskkill-based guarantee exists here.
 //!
 //! Both backends share: a bounded output ring (drop-oldest bytes; a child
 //! can never deadlock on a full pipe and memory stays bounded regardless of

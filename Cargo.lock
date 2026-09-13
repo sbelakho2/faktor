@@ -1216,6 +1216,7 @@ name = "faktor-pty"
 version = "0.1.0"
 dependencies = [
  "faktor-core",
+ "faktor-winjob",
  "libc",
  "serde",
  "tracing",

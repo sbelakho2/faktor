@@ -55,8 +55,12 @@ use faktor_core::attachment::AttachmentId;
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::completion::CompletionContract;
 use faktor_core::hash::FileHash;
-use faktor_core::id::{OpId, SessionId, TaskId, VerificationRecordId, WorktreeId};
-use faktor_core::state::{TaskState, TaskTransition, VerificationStatus};
+use faktor_core::id::{OpId, SessionId, TaskId, TaskRevision, VerificationRecordId, WorktreeId};
+use faktor_core::state::{
+    CandidateProofRef, EnvironmentFingerprint, NoOpDisposition, TaskState, TaskTransition,
+    VerificationStatus,
+};
+use faktor_session::task::{ProofBasis, ProofBasisCheck, ProofBasisCriterion, ProofReuse};
 use faktor_session::{
     CompletionContractGate, SessionManager, TaskBudget, MAX_TASK_CRITERIA,
     MAX_TASK_CRITERION_BYTES, MAX_TASK_GOAL_BYTES,
@@ -79,6 +83,10 @@ use crate::{ChildState, OwnershipSpec, TaskPlan, WorkItem, WorkKind, MAX_GOAL_CH
 /// the wave-14 operation graph stays unambiguous for sessions whose
 /// in-session runs never spawned children.
 pub const TASK_RUN_ROW_KIND: &str = "taskexec_run";
+/// Durable row kind of the executor's per-RUN policy facts (the P0 no-op
+/// disposition). Keyed by run id; separate from the plan/registry/linkage
+/// kinds so every existing reader stays unambiguous.
+pub const RUN_POLICY_ROW_KIND: &str = "taskexec_policy";
 /// Bound on a linkage-row value (the memory-fact store caps values at 4096
 /// bytes; we refuse loudly before the write instead of losing the row).
 const MAX_TASK_RUN_ROW_BYTES: usize = 3500;
@@ -173,6 +181,48 @@ impl TaskRunRow {
     }
 }
 
+/// The durable per-run policy value (kind [`RUN_POLICY_ROW_KIND`], key = run
+/// id). Additive: an old row without the field decodes with `None`, and
+/// `None` resolves to the mutating-task default (`RequiresCriterionProof`) —
+/// never a silent `Allowed`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunPolicyRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    no_op_disposition: Option<NoOpDisposition>,
+}
+
+/// Record one orchestrated run's durable policy row BEFORE the run is
+/// claimed (the settlement reads it back; a failed write leaves no claimed
+/// slot).
+fn write_run_policy_row(
+    handle: &faktor_session::SessionHandle,
+    run_id: &str,
+    no_op_disposition: Option<NoOpDisposition>,
+) -> Result<(), ExecError> {
+    let value = serde_json::to_string(&RunPolicyRow { no_op_disposition })
+        .map_err(|e| ExecError::Internal(format!("run policy row encode: {e}")))?;
+    handle
+        .upsert_memory_fact(RUN_POLICY_ROW_KIND, run_id, &value)
+        .map_err(|e| ExecError::Internal(format!("run policy row write: {e}")))
+}
+
+/// The run's effective no-op disposition from its durable policy row; an
+/// absent row (a legacy run), an absent field or an undecodable row resolves
+/// to the mutating-task default — never a silent `Allowed`.
+fn run_no_op_disposition(handle: &faktor_session::SessionHandle, run_id: &str) -> NoOpDisposition {
+    parent_facts(handle)
+        .ok()
+        .and_then(|facts| {
+            facts
+                .into_iter()
+                .find(|(kind, key, _)| kind == RUN_POLICY_ROW_KIND && key == run_id)
+        })
+        .and_then(|(_, _, value)| serde_json::from_str::<RunPolicyRow>(&value).ok())
+        .and_then(|row| row.no_op_disposition)
+        .unwrap_or_else(NoOpDisposition::default_for_mutating_task)
+}
+
 /// One native task start: a goal plus one or more work items. Dispatch is
 /// by item count: one item drives the existing session (single-agent case),
 /// two or more spawn real children through the orchestrator runtime.
@@ -234,6 +284,11 @@ pub struct TaskRunRequest {
     /// [`CandidateWorkspaceService`] before any durable row. A non-empty
     /// root is the programmatic/test override.
     pub isolated_root: PathBuf,
+    /// P0 no-op policy of the run: what an EMPTY aggregate change set may
+    /// do. `None` = [`NoOpDisposition::default_for_mutating_task`]
+    /// (`RequiresCriterionProof`). Persisted durably with the run BEFORE the
+    /// first spawn, so a re-settled run applies the byte-identical policy.
+    pub no_op_disposition: Option<NoOpDisposition>,
     /// Deterministic crash seam (adversarial tests only).
     pub crash_seam: Option<CrashSeam>,
 }
@@ -255,6 +310,7 @@ impl Default for TaskRunRequest {
             ceilings: super::Ceilings::default(),
             completion_contract: None,
             isolated_root: PathBuf::new(),
+            no_op_disposition: None,
             crash_seam: None,
         }
     }
@@ -1488,6 +1544,10 @@ impl TaskExecutor {
             specs.push(s);
         }
         let run_id = format!("run-{:016x}", self.session.next_op_id().raw());
+        // P0 no-op policy: the run's disposition is durable BEFORE the run is
+        // claimed or any child spawns, so the detached settlement applies the
+        // exact policy the caller requested.
+        write_run_policy_row(&handle, &run_id, req.no_op_disposition)?;
         self.occupy(parent, &run_id)?;
         // The DAEMON allocates the isolated root itself (never an HTTP
         // path): one CandidateWorkspaceService authority per executor. A
@@ -1569,70 +1629,46 @@ impl TaskExecutor {
     // ------------------------------------------- completion steps (P2 follow-up)
 
     /// Execute the durable completion contract's requested steps (ordered
-    /// commit, push, pr) for one session's current task, recording every
-    /// outcome through `set_completion_step_status`.
+    /// commit, push, pr) for one session's current task, AUTHORIZED by the
+    /// immutable verification record `proof` — the P0 proof-validated API.
+    /// Every step revalidates the proof binding (task/revision/status/
+    /// coverage/snapshot/current-root digest) immediately before it runs; a
+    /// moved root records the step `Invalidated` (retryable refusal), never a
+    /// blind side effect. There is NO fact-based authorization path: the
+    /// durable `verification`/`last` fact is reporting state only.
     ///
     /// Additive invocation: the executor calls this from the post-drive
     /// settlement of a contracted run (deterministic verification has run);
     /// an uncontracted run returns `Ok(None)` BEFORE any runner exists or
     /// any git/supervisor work happens — the default path is byte-identical.
-    ///
-    /// Fail-closed guard: the steps run only when the durable verification
-    /// fact for the latest genuine end says `passed`; a failed/pending/absent
-    /// verification records nothing, so a rework run is never prematurely
-    /// committed/pushed.
     pub async fn run_completion_steps(
         &self,
         parent: SessionId,
+        proof: VerificationRecordId,
     ) -> Result<Option<CompletionStepReport>, ExecError> {
         let handle = self
             .session
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
-        let task_id = handle.task_id()?;
-        let Some((_revision, contract)) = handle
-            .completion_contract(task_id)
-            .map_err(|e| ExecError::Internal(format!("completion contract read: {e}")))?
-        else {
-            return Ok(None);
-        };
-        if contract.is_default() {
-            return Ok(None);
-        }
-        let Some(task) = handle
-            .get_task(task_id)
-            .map_err(|e| ExecError::Internal(format!("completion task read: {e}")))?
-        else {
-            return Ok(None);
-        };
-        if task.state.is_terminal() {
-            // A terminal row is frozen: nothing to execute (an already
-            // certified run) and nothing to resurrect (a failed/cancelled
-            // one).
-            return Ok(None);
-        }
-        if !verification_passed(&handle) {
-            return Ok(None);
-        }
         // The run's integration/candidate root: the LIVE shadow root when
         // the session has one, else its durable owner worktree root.
         let root = match self.session.active_root(parent)? {
             Some(root) => root,
             None => self.owner_root_of(parent, &handle)?,
         };
-        self.run_completion_steps_at(parent, root).await
+        self.run_completion_steps_at(parent, proof, root).await
     }
 
     /// The steps of a VERIFIED orchestrated landing: execute the accepted
     /// contract against the LANDED owner root after the whole-root equality
-    /// proof holds. The durable verification fact + record were written by
-    /// the verify phase; the fail-closed guard is unchanged.
+    /// proof holds, authorized by the landing's verification record (the
+    /// proof the landing itself consumed).
     pub async fn run_completion_steps_against_proof(
         &self,
         parent: SessionId,
         landed: &LandedRunIntegration,
     ) -> Result<Option<CompletionStepReport>, ExecError> {
-        let handle = self
+        let _handle = self
             .session
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
@@ -1650,18 +1686,16 @@ impl TaskExecutor {
                 landed.prepared.candidate_snapshot
             )));
         }
-        if !verification_passed(&handle) {
-            return Ok(None);
-        }
-        self.run_completion_steps_at(parent, landed.prepared.owner_root.clone())
+        self.run_completion_steps_at(parent, landed.record, landed.prepared.owner_root.clone())
             .await
     }
 
-    /// The shared completion-step body: contract lookup, terminal/guard
-    /// checks and the runner invocation against one explicit root.
+    /// The shared completion-step body: contract lookup, terminal check and
+    /// the PROOF-VALIDATED runner invocation against one explicit root.
     async fn run_completion_steps_at(
         &self,
         parent: SessionId,
+        proof: VerificationRecordId,
         root: PathBuf,
     ) -> Result<Option<CompletionStepReport>, ExecError> {
         let handle = self
@@ -1687,18 +1721,16 @@ impl TaskExecutor {
         if task.state.is_terminal() {
             return Ok(None);
         }
-        if !verification_passed(&handle) {
-            return Ok(None);
-        }
         let Some(runner) = self.completion_step_runner()? else {
             return Err(ExecError::Conflict(
                 "completion steps are requested but the daemon has no process supervisor; no step can be executed".into(),
             ));
         };
         let report = runner
-            .run(
+            .run_completion_steps(
                 &handle,
                 task_id,
+                proof,
                 &CompletionStepContext {
                     root,
                     goal: task.goal,
@@ -1707,6 +1739,28 @@ impl TaskExecutor {
             .await
             .map_err(|e| ExecError::Internal(format!("completion steps: {e}")))?;
         Ok(Some(report))
+    }
+
+    /// The newest durable PASSED verification record of the session's task at
+    /// its CURRENT revision — the immutable basis an in-session completion
+    /// step may be authorized by. `None` (no passing record, or only records
+    /// for an older revision) runs NOTHING: a completion contract never
+    /// advances from an advisory fact.
+    fn latest_passing_proof(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
+    ) -> Option<VerificationRecordId> {
+        let revision = handle.task_revision(task_id).ok()?;
+        handle
+            .list_verification_records(task_id)
+            .ok()?
+            .into_iter()
+            .filter(|record| {
+                record.status == VerificationStatus::Passed && record.revision == revision
+            })
+            .max_by_key(|record| record.record_id)
+            .map(|record| record.record_id)
     }
 
     // ------------------------------------------------- post-run settlement (P1)
@@ -1749,15 +1803,34 @@ impl TaskExecutor {
             .session
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
-        let steps = match self.run_completion_steps(parent).await {
-            Ok(report) => report,
-            Err(e) => {
-                eprintln!("completion-step execution failed for session {parent}: {e}");
+        // Proof-validated steps: only a durable PASSED record at the task's
+        // CURRENT revision authorizes any side effect. No passing proof (or
+        // only stale-revision proof) runs nothing — the durable fact is
+        // reporting state, never authorization.
+        let task_id = handle.task_id()?;
+        let steps = match self.latest_passing_proof(&handle, task_id) {
+            Some(proof) => match self.run_completion_steps(parent, proof).await {
+                Ok(report) => report,
+                Err(e) => {
+                    eprintln!("completion-step execution failed for session {parent}: {e}");
+                    None
+                }
+            },
+            None => {
+                if handle
+                    .completion_contract(task_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|(_, contract)| !contract.is_default())
+                {
+                    eprintln!(
+                        "completion steps for session {parent} are refused: no durable PASSED verification record at the current revision authorizes them; nothing is committed, pushed or opened"
+                    );
+                }
                 None
             }
         };
         let finalize = self.finalize_shadow_run(parent)?;
-        let task_id = handle.task_id()?;
         let task_state = handle
             .get_task(task_id)
             .map_err(|e| ExecError::Internal(format!("task row read: {e}")))?
@@ -1967,9 +2040,13 @@ impl TaskExecutor {
         let prepared =
             self.prepare_run_integration(&handle, parent, &run_id, task_id, &candidate_ids)?;
         self.check_settlement_seam(CrashSeam::AfterCandidatePrepared)?;
-        // (2) VERIFY the CANDIDATE (never the owner).
+        // (2) VERIFY the CANDIDATE (never the owner) under the run's durable
+        // no-op policy: an empty aggregate change set completes only through
+        // the independent reviewer's no-op criterion proof (or the explicit
+        // Allowed disposition; Refused never completes).
+        let no_op = run_no_op_disposition(&handle, &run_id);
         let Some(proof) = self
-            .verify_prepared_integration(&handle, task_id, &criteria, &prepared)
+            .verify_prepared_integration(&handle, task_id, &criteria, &prepared, no_op)
             .await?
         else {
             return Ok(outcome);
@@ -2234,34 +2311,62 @@ impl TaskExecutor {
     /// verification record bound to the CANDIDATE snapshot. `Ok(None)` for
     /// a failed/unavailable run (completion stays refused); a passing run
     /// returns the proof the landing phase consumes.
+    ///
+    /// The P0 no-op policy of an EMPTY aggregate change set is applied HERE:
+    /// `Refused` never verifies (no record, completion stays refused);
+    /// `Allowed` (an explicitly investigative task) mints the empty no-op
+    /// record without a criterion proof; `RequiresCriterionProof` routes
+    /// through [`faktor_agent::AgentRuntime::verify_integrated_root`]'s
+    /// reviewer-proved no-op path — no reviewer verdict is a typed refusal,
+    /// never a synthetic pass over an empty suite.
     pub async fn verify_prepared_integration(
         &self,
         handle: &faktor_session::SessionHandle,
         task_id: TaskId,
         criteria: &[String],
         prepared: &PreparedRunIntegration,
+        no_op: NoOpDisposition,
     ) -> Result<Option<VerifiedRunIntegration>, ExecError> {
         let token = CancellationToken::new();
-        let run = match self
-            .orchestrator
-            .agent()
-            .verify_integrated_root(
-                handle,
-                &prepared.candidate_root,
-                &prepared.changed,
-                criteria,
-                &token,
-            )
-            .await
-        {
-            Ok(run) => run,
-            Err(e) => {
-                persist_root_verification_fact(handle, "pending", &[], &prepared.changed)?;
-                eprintln!(
-                    "root verification unavailable for orchestrated run {}: {e}; run stays unverified",
-                    prepared.run_id
-                );
-                return Ok(None);
+        let run = if prepared.changed.is_empty() && no_op == NoOpDisposition::Refused {
+            persist_root_verification_fact(handle, "pending", &[], &[])?;
+            eprintln!(
+                "orchestrated run {} produced an empty aggregate change set and its no-op policy is refused; completion stays blocked",
+                prepared.run_id
+            );
+            return Ok(None);
+        } else if prepared.changed.is_empty() && no_op == NoOpDisposition::Allowed {
+            faktor_agent::IntegratedRootVerification {
+                status: VerificationStatus::Passed,
+                checks: Vec::new(),
+                criteria: Vec::new(),
+                changed: Vec::new(),
+                summary:
+                    "empty aggregate change set allowed without criterion proof by the run's no-op policy"
+                        .into(),
+            }
+        } else {
+            match self
+                .orchestrator
+                .agent()
+                .verify_integrated_root(
+                    handle,
+                    &prepared.candidate_root,
+                    &prepared.changed,
+                    criteria,
+                    &token,
+                )
+                .await
+            {
+                Ok(run) => run,
+                Err(e) => {
+                    persist_root_verification_fact(handle, "pending", &[], &prepared.changed)?;
+                    eprintln!(
+                        "root verification unavailable for orchestrated run {}: {e}; run stays unverified",
+                        prepared.run_id
+                    );
+                    return Ok(None);
+                }
             }
         };
         let record = self.find_or_create_root_verification_record(
@@ -2270,6 +2375,7 @@ impl TaskExecutor {
             criteria,
             &prepared.candidate_snapshot,
             &run,
+            prepared,
         )?;
         persist_root_verification_fact(
             handle,
@@ -2897,10 +3003,14 @@ impl TaskExecutor {
     /// Find-or-create the root verification record of one orchestrated run at
     /// the CURRENT revision, bound to the final integration snapshot
     /// (`tree_hash`) and covering every acceptance criterion. A matching
-    /// record (same revision + integration snapshot + status, criteria
-    /// covered when passing) is reused — replay-idempotent; anything else
-    /// creates a fresh record (an owner edit that changed the snapshot can
-    /// never reuse the old one).
+    /// record is reused ONLY while its persisted proof basis is byte-identical
+    /// to the current basis ([`SessionHandle::verification_record_reusable`]);
+    /// a record with a different basis (a changed candidate snapshot, check
+    /// set, task contract or revision) — or a legacy record without a basis —
+    /// is NEVER reused and a fresh record is written. The fresh record lands
+    /// WITH its environment fingerprint (carrying the proof-basis digest) and
+    /// its candidate-proof reference, so the next settlement can consult the
+    /// basis of a record this call created.
     fn find_or_create_root_verification_record(
         &self,
         handle: &faktor_session::SessionHandle,
@@ -2908,6 +3018,7 @@ impl TaskExecutor {
         criteria: &[String],
         final_snapshot: &str,
         run: &faktor_agent::IntegratedRootVerification,
+        prepared: &PreparedRunIntegration,
     ) -> Result<VerificationRecordId, ExecError> {
         let revision = handle
             .task_revision(task_id)
@@ -2919,21 +3030,53 @@ impl TaskExecutor {
                     .any(|cv| cv.criterion_key == *c && cv.passed)
             })
         };
-        if let Some(existing) = handle
+        let basis = self.root_verification_proof_basis(
+            handle,
+            task_id,
+            prepared.sources_digest.clone(),
+            final_snapshot,
+            run,
+            &prepared.changed,
+        )?;
+        let mut candidates: Vec<faktor_session::VerificationRecord> = handle
             .list_verification_records(task_id)
             .map_err(|e| ExecError::Internal(format!("verification record list: {e}")))?
             .into_iter()
-            .find(|r| {
+            .filter(|r| {
                 r.status == run.status
                     && r.revision == revision
                     && r.tree_hash.as_deref() == Some(final_snapshot)
                     && (run.status != VerificationStatus::Passed || covers(r))
             })
-        {
-            return Ok(existing.record_id);
+            .collect();
+        // Newest first: a newer basis-bound record is preferred, and a
+        // divergent older record can never shadow it.
+        candidates.sort_by_key(|r| std::cmp::Reverse(r.record_id));
+        for existing in &candidates {
+            match handle
+                .verification_record_reusable(existing.record_id, &basis)
+                .map_err(|e| ExecError::Internal(format!("proof reuse consult: {e}")))?
+            {
+                ProofReuse::Allowed => return Ok(existing.record_id),
+                ProofReuse::Refused { reason } => {
+                    eprintln!(
+                        "root verification record {} of task {task_id} is not reusable: {reason}; consulting older records / writing a fresh basis-bound record",
+                        existing.record_id
+                    );
+                }
+            }
         }
+        let fingerprint = root_verification_fingerprint(handle, task_id, &basis)?;
+        let candidate_proof_ref = root_verification_candidate_proof(
+            handle,
+            task_id,
+            revision,
+            final_snapshot,
+            prepared,
+            run,
+        )?;
         handle
-            .create_verification_record(
+            .create_verification_record_with_evidence(
                 task_id,
                 Some(final_snapshot.to_string()),
                 run.criteria.clone(),
@@ -2943,8 +3086,74 @@ impl TaskExecutor {
                 None,
                 run.status,
                 handle.now_ms(),
+                Some(fingerprint),
+                Some(candidate_proof_ref),
             )
             .map_err(|e| ExecError::Internal(format!("root verification record write: {e}")))
+    }
+
+    /// The canonical proof basis of one orchestrated root verification: the
+    /// exact task/revision/contract, candidate snapshot, integration sources,
+    /// changed-file evidence, ordered check set, verifier version and
+    /// criterion bindings that a reusable record must match byte-for-byte.
+    /// Built through the same bounded [`ProofBasis`] shape the session layer
+    /// digests (`verification_record_reusable` compares the digests).
+    fn root_verification_proof_basis(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
+        sources_digest: String,
+        final_snapshot: &str,
+        run: &faktor_agent::IntegratedRootVerification,
+        changed: &[String],
+    ) -> Result<ProofBasis, ExecError> {
+        let revision = handle
+            .task_revision(task_id)
+            .map_err(|e| ExecError::Internal(format!("root task revision read: {e}")))?;
+        let task = handle
+            .get_task(task_id)
+            .map_err(|e| ExecError::Internal(format!("root task row read: {e}")))?
+            .ok_or_else(|| ExecError::Internal(format!("root task {task_id} missing")))?;
+        let criteria: Vec<ProofBasisCriterion> = task
+            .criteria()
+            .into_iter()
+            .take(faktor_session::task::MAX_PROOF_BASIS_ENTRIES)
+            .map(|criterion| ProofBasisCriterion {
+                criterion_id: criterion.id.to_string(),
+                binding_digest: criterion.binding.as_ref().map(|b| b.content_digest()),
+            })
+            .collect();
+        let checks: Vec<ProofBasisCheck> = run
+            .checks
+            .iter()
+            .take(faktor_session::task::MAX_PROOF_BASIS_ENTRIES)
+            .map(|check| ProofBasisCheck {
+                check_id: check.check.clone(),
+                program: check.program.clone(),
+                args: check.args.clone(),
+            })
+            .collect();
+        let changed_files_digest = if changed.is_empty() {
+            String::new()
+        } else {
+            stable_list_digest(changed)
+        };
+        Ok(ProofBasis {
+            task_id: task_id.raw(),
+            task_revision: revision.raw(),
+            task_contract_digest: stable_list_digest(&task.acceptance_criteria),
+            candidate_snapshot: final_snapshot.to_string(),
+            integration_sources_digest: sources_digest,
+            changed_files_digest,
+            checks,
+            verification_impl_version: faktor_agent::runtime::VERIFICATION_IMPL_VERSION.to_string(),
+            tool_versions: Vec::new(),
+            env_projection: Vec::new(),
+            instruction_epoch: None,
+            criteria,
+            reviewer_digest: None,
+            evidence_digests: Vec::new(),
+        })
     }
 
     /// Drive the root task row across the machine's legal edges to
@@ -3902,10 +4111,11 @@ fn record_completion_contract(
 }
 
 /// TRUE when the durable verification fact of the session's latest genuine
-/// end says the deterministic verification PASSED. This is the executor's
-/// fail-closed gate for running completion steps: no fact, a failed fact or
-/// a pending fact means the run is not (yet) at a verified end, so nothing
-/// is committed, pushed or opened.
+/// end says the deterministic verification PASSED. UI/reporting ONLY (the
+/// `SettlementOutcome.verified` projection): it is NEVER an authorization
+/// for a completion side effect — those run exclusively through
+/// [`CompletionStepRunner::run_completion_steps`] with an immutable
+/// verification-record proof.
 fn verification_passed(handle: &faktor_session::SessionHandle) -> bool {
     let Ok(facts) = handle.memory_facts() else {
         return false;
@@ -3922,11 +4132,77 @@ fn verification_passed(handle: &faktor_session::SessionHandle) -> bool {
     value.get("status").and_then(|s| s.as_str()) == Some("passed")
 }
 
+/// The bounded v20 environment fingerprint of one orchestrated ROOT record:
+/// the proof-basis digest (the reuse key), the task-contract digest and the
+/// check-basis digest, all deterministic for identical inputs. Empty tool/
+/// manifest/env projections are HONEST absences at the executor layer (the
+/// agent's attempt records carry their own observed fingerprint).
+fn root_verification_fingerprint(
+    handle: &faktor_session::SessionHandle,
+    task_id: TaskId,
+    basis: &ProofBasis,
+) -> Result<EnvironmentFingerprint, ExecError> {
+    let task = handle
+        .get_task(task_id)
+        .map_err(|e| ExecError::Internal(format!("root task row read: {e}")))?
+        .ok_or_else(|| ExecError::Internal(format!("root task {task_id} missing")))?;
+    let check_basis: Vec<String> = basis
+        .checks
+        .iter()
+        .map(|c| format!("{}|{}|{}", c.check_id, c.program, c.args.join(" ")))
+        .collect();
+    Ok(EnvironmentFingerprint {
+        platform: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        toolchain_versions: Vec::new(),
+        manifest_hashes: Vec::new(),
+        lockfile_hashes: Vec::new(),
+        instruction_epoch: None,
+        base_tree_hash: None,
+        task_contract_hash: stable_list_digest(&task.acceptance_criteria),
+        check_argv_cwd_env_hash: stable_list_digest(&check_basis),
+        verification_impl_version: faktor_agent::runtime::VERIFICATION_IMPL_VERSION.to_string(),
+        proof_basis_digest: Some(basis.digest()),
+    })
+}
+
+/// The compact candidate-proof reference of one orchestrated ROOT record:
+/// the immutable run base, the verified candidate snapshot, the integration
+/// sources digest and the changed-file digest, so both IDEs can show what
+/// the proof was based on and completion can re-derive it.
+fn root_verification_candidate_proof(
+    handle: &faktor_session::SessionHandle,
+    task_id: TaskId,
+    revision: TaskRevision,
+    final_snapshot: &str,
+    prepared: &PreparedRunIntegration,
+    run: &faktor_agent::IntegratedRootVerification,
+) -> Result<CandidateProofRef, ExecError> {
+    let accounting = handle
+        .accounting_snapshot_digest(task_id)
+        .map_err(|e| ExecError::Internal(format!("accounting snapshot digest: {e}")))?;
+    Ok(CandidateProofRef {
+        task_revision: revision,
+        base_manifest_hash: stable_list_digest(&[]),
+        candidate_manifest_hash: stable_list_digest(&[final_snapshot.to_string()]),
+        source_diff_evidence: None,
+        risk_report_evidence: None,
+        accounting_snapshot_digest: accounting,
+        run_id: Some(prepared.run_id.clone()),
+        run_base_snapshot: Some(prepared.base_snapshot.clone()),
+        candidate_snapshot: Some(final_snapshot.to_string()),
+        sources_digest: (!prepared.sources_digest.is_empty())
+            .then(|| prepared.sources_digest.clone()),
+        changed_files_digest: (!run.changed.is_empty()).then(|| stable_list_digest(&run.changed)),
+    })
+}
+
 /// Write the REAL root verification fact of an orchestrated run (the SAME
 /// `verification`/`last` shape the agent's genuine ends write): the executed
 /// checks with their real pass/fail verdicts and the integrated change. The
-/// durable completion-step runner reads THIS fact as its fail-closed guard —
-/// only a real passing run lets the steps run.
+/// fact is the UI/reporting projection of the run's verification state — the
+/// production authorization for completion steps is exclusively the
+/// immutable verification-record proof, never this advisory row.
 fn persist_root_verification_fact(
     handle: &faktor_session::SessionHandle,
     status: &str,

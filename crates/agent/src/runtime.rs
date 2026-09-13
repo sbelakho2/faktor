@@ -6521,6 +6521,23 @@ impl AgentRuntime {
             .workspaces
             .open(row.workspace_id, root.to_path_buf())
             .map_err(|e| format!("integration root could not be opened: {e}"))?;
+        let candidate_snapshot = root_snapshot_best_effort(&ws);
+        let goal = handle
+            .get_task(row.task_id)
+            .ok()
+            .flatten()
+            .map(|t| t.goal)
+            .unwrap_or_default();
+        // An EMPTY aggregate change set derives no checks: the ONLY objective
+        // mechanism left is the independent reviewer's no-op proof. It is a
+        // real review-model call over the candidate snapshot; when no
+        // reviewer can produce a typed verdict the caller refuses completion
+        // (never a synthetic pass from an empty suite).
+        if changed.is_empty() {
+            return self
+                .verify_no_op_root(handle, &ws, criteria, &candidate_snapshot, &goal, cancel)
+                .await;
+        }
         let repo_files = Self::integrated_root_repo_files(&ws, 500, 6);
         if repo_files.is_empty() {
             return Err("repository file map empty (no project type detectable)".into());
@@ -6602,11 +6619,28 @@ impl AgentRuntime {
             results.iter().filter(|(_, ok)| !ok).count(),
             root.display()
         );
+        // The WIRED independent-reviewer port (P0 criteria mandate): the
+        // orchestrated root's own review phase runs over the CANDIDATE (the
+        // same separate, context-isolated review contract the turn path
+        // uses; risky changes force the real review-model call) and its
+        // recorded value answers every AggregateGoal/IndependentReview
+        // criterion through [`RecordedReviewPort`]. With no reviewer record
+        // the criteria stay Unavailable — an honest absence that blocks
+        // completion when the criterion is required, never a pass.
+        let review = independent_completion_review(
+            self.deps.as_ref(),
+            handle,
+            &ws,
+            changed,
+            &goal,
+            &repo_files,
+            cancel,
+        )
+        .await;
         // Typed criterion verdicts (P0): evaluated through each criterion's
         // OWN binding. The blanket `passed = integrated checks passed`
         // mapping is GONE; a criterion without a binding the evaluator can
         // resolve is Unavailable, never Passed.
-        let candidate_snapshot = root_snapshot_best_effort(&ws);
         let criteria_rows = criterion_verdicts_from_attempt(
             criteria,
             &checks,
@@ -6614,9 +6648,9 @@ impl AgentRuntime {
             &unavailable,
             changed,
             &ws,
-            None,
+            review.as_ref(),
             &candidate_snapshot,
-            "",
+            &goal,
         )
         .await;
         Ok(IntegratedRootVerification {
@@ -6625,6 +6659,103 @@ impl AgentRuntime {
             criteria: criteria_rows,
             changed: changed.to_vec(),
             summary,
+        })
+    }
+
+    /// Verify an EMPTY aggregate change set through the independent reviewer
+    /// (P0 no-op policy): with no change there are no derived checks, so the
+    /// ONLY objective mechanism is a reviewer-proved "no changes were
+    /// necessary" verdict tied to the candidate snapshot. The review-model
+    /// call is FORCED here (an empty local scan proves nothing); every
+    /// acceptance criterion is then evaluated through its own binding with
+    /// the reviewer record — RequiredCheck rows cannot pass over the missing
+    /// check outcomes, so only criteria the reviewer can actually certify
+    /// (`IndependentReview`/`AggregateGoal`) may pass. No reviewer verdict is
+    /// a typed `Err`: the caller refuses completion, never mints proof.
+    async fn verify_no_op_root(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        ws: &faktor_fs::WorkspaceHandle,
+        criteria: &[String],
+        candidate_snapshot: &str,
+        goal: &str,
+        cancel: &CancellationToken,
+    ) -> Result<IntegratedRootVerification, String> {
+        if criteria.is_empty() {
+            return Err(
+                "a no-op root carries no acceptance criterion to prove; no reviewer proof is possible"
+                    .into(),
+            );
+        }
+        let criteria_bounded: Vec<String> = criteria
+            .iter()
+            .take(REVIEW_NO_OP_MAX_CRITERIA)
+            .map(|c| truncate(c, 300))
+            .collect();
+        let package = serde_json::json!({
+            "kind": "no_op",
+            "candidate_snapshot": candidate_snapshot,
+            "changed_files": [],
+            "criteria": criteria_bounded,
+        })
+        .to_string();
+        let outcome = run_independent_review_call(
+            self.deps.as_ref(),
+            handle,
+            &package,
+            criteria,
+            None,
+            cancel,
+        )
+        .await;
+        let Some(verdict) = outcome.verdict else {
+            return Err(format!(
+                "no independent reviewer verdict for the no-op root: {}",
+                outcome
+                    .refused
+                    .unwrap_or_else(|| "the review call produced no typed verdict".into())
+            ));
+        };
+        if verdict.verdict != faktor_verify::review::ReviewVerdictKind::Clean {
+            return Err(format!(
+                "the independent reviewer refused the no-op root: {:?} with findings {:?}",
+                verdict.verdict,
+                verdict.findings.iter().take(4).collect::<Vec<_>>()
+            ));
+        }
+        let review = serde_json::json!({
+            "verdict": "pass",
+            "findings": [],
+            "evidence": [format!("no-op:{candidate_snapshot}")],
+        });
+        let criteria_rows = criterion_verdicts_from_attempt(
+            criteria,
+            &[],
+            &[],
+            &[],
+            &[],
+            ws,
+            Some(&review),
+            candidate_snapshot,
+            goal,
+        )
+        .await;
+        let passed = criteria_rows.iter().filter(|c| c.passed).count();
+        if criteria_rows.is_empty() || passed != criteria_rows.len() {
+            return Err(format!(
+                "the independent reviewer's no-op proof does not certify every acceptance criterion ({passed} of {} passed)",
+                criteria_rows.len()
+            ));
+        }
+        Ok(IntegratedRootVerification {
+            status: VerificationStatus::Passed,
+            checks: Vec::new(),
+            criteria: criteria_rows,
+            changed: Vec::new(),
+            summary: format!(
+                "no-op root certified by the independent reviewer ({} criterion proof(s), candidate {candidate_snapshot})",
+                criteria.len()
+            ),
         })
     }
 
@@ -10596,6 +10727,10 @@ const REVIEW_EVIDENCE_MAX_FILES: usize = 24;
 const REVIEW_EVIDENCE_MAX_HUNK_ROWS: usize = 24;
 const REVIEW_EVIDENCE_MAX_PATH_ENTRIES: usize = 16;
 const REVIEW_EVIDENCE_MAX_CRITERIA: usize = 8;
+/// Bounded criteria rendered into the no-op reviewer package (the same cap
+/// the structured package uses; the no-op proof is a review of the goal,
+/// not of an unbounded criterion list).
+const REVIEW_NO_OP_MAX_CRITERIA: usize = 8;
 
 /// The independent reviewer's system prompt: a SEPARATE contract from the
 /// agent instructions and the transcript. The reviewer receives ONLY the
@@ -12525,7 +12660,26 @@ impl IndependentReviewer for RecordedReviewPort {
                     .unwrap_or_default()
             };
             let findings = strings("findings");
-            let evidence = strings("evidence");
+            let mut evidence = strings("evidence");
+            if evidence.is_empty() {
+                // Reviewer-record mapping: the recorded review (the local
+                // structured review record, or the review model's clean
+                // verdict) lists no explicit refs, so bind the verdict to
+                // the attempt's OWN observed artifacts instead — every ref
+                // resolves through the same attempt evidence resolver and
+                // carries the same candidate snapshot. A reviewer pass still
+                // never validates without resolving evidence.
+                for row in &request.check_outcomes {
+                    if !row.check_id.is_empty() {
+                        evidence.push(row.check_id.clone());
+                    }
+                }
+                for entry in &request.change_set {
+                    if !entry.path.is_empty() {
+                        evidence.push(format!("file:{}", entry.path));
+                    }
+                }
+            }
             let explanation = if findings.is_empty() {
                 format!("independent reviewer verdict {verdict_text:?}")
             } else {
@@ -12535,7 +12689,10 @@ impl IndependentReviewer for RecordedReviewPort {
                 criterion_id: request.criterion_id.clone(),
                 snapshot: request.candidate_snapshot.clone(),
                 verdict,
-                evidence_refs: evidence.into_iter().take(16).collect(),
+                evidence_refs: evidence
+                    .into_iter()
+                    .take(faktor_verify::criteria::MAX_REVIEW_EVIDENCE_REFS)
+                    .collect(),
                 explanation,
             })
         })
