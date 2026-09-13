@@ -853,6 +853,276 @@ pub struct CriterionVerification {
     pub criterion_key: String,
     pub passed: bool,
     pub evidence: Option<String>,
+    /// The typed binding the verdict was produced through (P0 criteria
+    /// mandate). `None` on legacy rows: a verdict without a binding is never
+    /// treated as a pass by the evaluator, and the completion coverage check
+    /// accepts it only for legacy task criteria that carry no binding either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<CriterionBinding>,
+}
+
+// ------------------------------------------------------- criterion bindings
+
+/// Hard bound on the free-text members of a [`CriterionBinding`] (check id,
+/// path, evidence id, reviewer id, reason).
+pub const MAX_CRITERION_BINDING_TEXT_BYTES: usize = 512;
+/// Hard bound on the digest members of a [`CriterionBinding`] (a hex BLAKE3
+/// is 64 chars; the FNV fallback carries an algorithm prefix).
+pub const MAX_CRITERION_BINDING_DIGEST_BYTES: usize = 128;
+/// Hard bound on the required work items of one `IntegrationCoverage` binding.
+pub const MAX_CRITERION_BINDING_WORK_ITEMS: usize = 64;
+
+/// The typed binding of one acceptance criterion (the mandate's replacement
+/// for the unsound "criterion text == a global suite status" mapping): a
+/// criterion may only be certified PASSED through the evidence its OWN
+/// binding names. Legacy criteria migrate deterministically
+/// ([`legacy_binding_for_criterion_text`]); a binding the evaluator cannot
+/// resolve is [`CriterionBinding::Unavailable`] — never a pass.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CriterionBinding {
+    /// The criterion is certified by exactly ONE derived check result (its
+    /// id plus the digest of its command basis).
+    RequiredCheck {
+        check_id: String,
+        command_digest: String,
+    },
+    /// The criterion is certified only when every required work item
+    /// contributed its intended source/change set and none disappeared.
+    IntegrationCoverage { required_work_items: Vec<String> },
+    /// The criterion is certified by hashing the named path in the VERIFIED
+    /// CANDIDATE.
+    FileState {
+        path: String,
+        expected_digest: String,
+    },
+    /// The criterion is certified by resolving immutable evidence and
+    /// verifying its digest (and its candidate snapshot).
+    Evidence {
+        evidence_id: String,
+        evidence_digest: String,
+    },
+    /// The criterion is certified by a structured independent-review record
+    /// tied to the exact candidate snapshot AND criterion id.
+    IndependentReview { reviewer_id: String },
+    /// The criterion is certified only when every required subordinate
+    /// criterion passes AND the independent final reviewer passes.
+    AggregateGoal,
+    /// The explicit honest-unknown binding: the criterion can never pass
+    /// through it (no global suite status may substitute).
+    Unavailable { reason: String },
+}
+
+impl CriterionBinding {
+    /// Structural bounds check; every violation is reported, never the first.
+    pub fn validate(&self) -> Result<(), Vec<FingerprintViolation>> {
+        let mut out = Vec::new();
+        match self {
+            CriterionBinding::RequiredCheck {
+                check_id,
+                command_digest,
+            } => {
+                // The check id may be EMPTY on a legacy-migrated binding: the
+                // legacy text did not carry it, so the evaluator resolves by
+                // the command digest instead (exactly one match required).
+                if check_id.is_empty() {
+                    // no id to validate
+                } else {
+                    validate_binding_text(
+                        "check_id",
+                        check_id,
+                        MAX_CRITERION_BINDING_TEXT_BYTES,
+                        &mut out,
+                    );
+                }
+                validate_binding_text(
+                    "command_digest",
+                    command_digest,
+                    MAX_CRITERION_BINDING_DIGEST_BYTES,
+                    &mut out,
+                );
+            }
+            CriterionBinding::IntegrationCoverage {
+                required_work_items,
+            } => {
+                if required_work_items.len() > MAX_CRITERION_BINDING_WORK_ITEMS {
+                    out.push(FingerprintViolation {
+                        field: "required_work_items",
+                        detail: format!(
+                            "{} work items exceed MAX_CRITERION_BINDING_WORK_ITEMS ({MAX_CRITERION_BINDING_WORK_ITEMS})",
+                            required_work_items.len()
+                        ),
+                        oversized: true,
+                    });
+                }
+                for item in required_work_items {
+                    validate_binding_text(
+                        "required_work_items",
+                        item,
+                        MAX_CRITERION_BINDING_TEXT_BYTES,
+                        &mut out,
+                    );
+                }
+            }
+            CriterionBinding::FileState {
+                path,
+                expected_digest,
+            } => {
+                validate_binding_text("path", path, MAX_CRITERION_BINDING_TEXT_BYTES, &mut out);
+                validate_binding_text(
+                    "expected_digest",
+                    expected_digest,
+                    MAX_CRITERION_BINDING_DIGEST_BYTES,
+                    &mut out,
+                );
+            }
+            CriterionBinding::Evidence {
+                evidence_id,
+                evidence_digest,
+            } => {
+                validate_binding_text(
+                    "evidence_id",
+                    evidence_id,
+                    MAX_CRITERION_BINDING_TEXT_BYTES,
+                    &mut out,
+                );
+                validate_binding_text(
+                    "evidence_digest",
+                    evidence_digest,
+                    MAX_CRITERION_BINDING_DIGEST_BYTES,
+                    &mut out,
+                );
+            }
+            CriterionBinding::IndependentReview { reviewer_id } => {
+                validate_binding_text(
+                    "reviewer_id",
+                    reviewer_id,
+                    MAX_CRITERION_BINDING_TEXT_BYTES,
+                    &mut out,
+                );
+            }
+            CriterionBinding::AggregateGoal => {}
+            CriterionBinding::Unavailable { reason } => {
+                validate_binding_text("reason", reason, MAX_CRITERION_BINDING_TEXT_BYTES, &mut out);
+            }
+        }
+        if out.is_empty() {
+            Ok(())
+        } else {
+            Err(out)
+        }
+    }
+
+    /// The stable machine label (equals the serde tag).
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            CriterionBinding::RequiredCheck { .. } => "required_check",
+            CriterionBinding::IntegrationCoverage { .. } => "integration_coverage",
+            CriterionBinding::FileState { .. } => "file_state",
+            CriterionBinding::Evidence { .. } => "evidence",
+            CriterionBinding::IndependentReview { .. } => "independent_review",
+            CriterionBinding::AggregateGoal => "aggregate_goal",
+            CriterionBinding::Unavailable { .. } => "unavailable",
+        }
+    }
+
+    /// A stable content digest of this binding (used by the proof basis).
+    pub fn content_digest(&self) -> String {
+        let encoded = serde_json::to_vec(self).unwrap_or_default();
+        fnv1a64_hex(b"criterion-binding:v1\0", &encoded)
+    }
+}
+
+/// The deterministic FNV-1a 64 digest of a check command's canonical text:
+/// the `command_digest` half of a `RequiredCheck` binding. Prefix-labelled so
+/// a digest can never be mistaken for a raw command.
+pub fn command_binding_digest(command: &str) -> String {
+    format!(
+        "fnv1a64:{}",
+        fnv1a64_hex(b"check-command:v1\0", command.as_bytes())
+    )
+}
+
+fn fnv1a64_hex(domain: &[u8], bytes: &[u8]) -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    for b in domain.iter().chain(bytes.iter()) {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+/// Migrate one legacy criterion TEXT to its typed binding (V2-compatible
+/// decode): the canonical `goal: ` rows become [`CriterionBinding::AggregateGoal`]
+/// (the independent final review), canonical `required check: ` rows become a
+/// [`CriterionBinding::RequiredCheck`] whose command digest resolves against
+/// the derived check set (the legacy text does not carry a check id), and
+/// every other text becomes [`CriterionBinding::Unavailable`] — never an
+/// implicit pass.
+pub fn legacy_binding_for_criterion_text(text: &str) -> CriterionBinding {
+    if text.starts_with("goal: ") {
+        return CriterionBinding::AggregateGoal;
+    }
+    if let Some(command) = text.strip_prefix("required check: ") {
+        return CriterionBinding::RequiredCheck {
+            check_id: String::new(),
+            command_digest: command_binding_digest(command),
+        };
+    }
+    CriterionBinding::Unavailable {
+        reason: "legacy criterion text carries no typed binding".into(),
+    }
+}
+
+// ------------------------------------------------------------- no-op policy
+
+/// What an EMPTY aggregate change set may do (P0 no-op policy): a task whose
+/// implementation produced no change must never complete on tests alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoOpDisposition {
+    /// The no-op is acceptable without criterion proof (e.g. an explicitly
+    /// investigative task).
+    Allowed,
+    /// The no-op may complete ONLY through a reviewer-proven "no changes
+    /// were necessary" criterion proof — never by a green suite alone.
+    RequiresCriterionProof,
+    /// The no-op can never complete.
+    Refused,
+}
+
+impl NoOpDisposition {
+    /// The stable machine label (equals the serde spelling).
+    pub const fn tag(self) -> &'static str {
+        match self {
+            NoOpDisposition::Allowed => "allowed",
+            NoOpDisposition::RequiresCriterionProof => "requires_criterion_proof",
+            NoOpDisposition::Refused => "refused",
+        }
+    }
+
+    /// Whether this disposition leaves any completion path open.
+    pub const fn permits_completion(self) -> bool {
+        !matches!(self, NoOpDisposition::Refused)
+    }
+
+    /// The default for implementation/fix tasks: an empty aggregate change
+    /// set requires criterion proof.
+    pub const fn default_for_mutating_task() -> Self {
+        NoOpDisposition::RequiresCriterionProof
+    }
+
+    /// Whether a no-op under this disposition may complete, given whether a
+    /// passing IndependentReview/AggregateGoal criterion proof exists.
+    pub const fn completion_allowed(self, criterion_proof: bool) -> bool {
+        match self {
+            NoOpDisposition::Allowed => true,
+            NoOpDisposition::RequiresCriterionProof => criterion_proof,
+            NoOpDisposition::Refused => false,
+        }
+    }
 }
 
 /// Who authored one acceptance criterion (audits 56/57): the origin decides
@@ -1062,7 +1332,9 @@ pub const MAX_ENVIRONMENT_FINGERPRINT_HASH_BYTES: usize = 128;
 /// stored value is a loud typed error — never a silent truncation.
 pub const MAX_ENVIRONMENT_FINGERPRINT_JSON_BYTES: usize = 4096;
 /// Serialized bound of one candidate-proof reference JSON.
-pub const MAX_CANDIDATE_PROOF_REF_JSON_BYTES: usize = 1024;
+pub const MAX_CANDIDATE_PROOF_REF_JSON_BYTES: usize = 4096;
+/// Hard bound on the candidate reference's orchestrated run id.
+pub const MAX_CANDIDATE_PROOF_REF_RUN_ID_BYTES: usize = 128;
 
 /// One `(tool, version)` pair of an [`EnvironmentFingerprint`]. Toolchains
 /// are recorded from available metadata only (compile-time build metadata and
@@ -1127,6 +1399,11 @@ pub struct EnvironmentFingerprint {
     pub check_argv_cwd_env_hash: String,
     /// The verification implementation version that produced the record.
     pub verification_impl_version: String,
+    /// The proof-basis digest the record was produced against (P0 proof
+    /// binding): a record may be reused only while this digest is identical.
+    /// `None` on legacy records — an absent basis is never reusable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_basis_digest: Option<String>,
 }
 
 impl EnvironmentFingerprint {
@@ -1208,6 +1485,14 @@ impl EnvironmentFingerprint {
             MAX_ENVIRONMENT_FINGERPRINT_VERSION_BYTES,
             &mut out,
         );
+        if let Some(basis) = &self.proof_basis_digest {
+            validate_text(
+                "proof_basis_digest",
+                basis,
+                MAX_ENVIRONMENT_FINGERPRINT_HASH_BYTES,
+                &mut out,
+            );
+        }
         if out.is_empty() {
             Ok(())
         } else {
@@ -1245,6 +1530,22 @@ pub struct CandidateProofRef {
     pub risk_report_evidence: Option<u64>,
     /// Digest of the durable completion-accounting picture at record build.
     pub accounting_snapshot_digest: String,
+    /// The orchestrated run this candidate belongs to (`None` for direct,
+    /// non-orchestrated runtime records).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// The IMMUTABLE run-base snapshot the candidate was derived from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_base_snapshot: Option<String>,
+    /// The verified candidate's whole-root snapshot digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_snapshot: Option<String>,
+    /// Digest over the integrated sources/change set the candidate carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources_digest: Option<String>,
+    /// Digest over the candidate's changed-file evidence rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_files_digest: Option<String>,
 }
 
 impl CandidateProofRef {
@@ -1264,6 +1565,29 @@ impl CandidateProofRef {
             MAX_ENVIRONMENT_FINGERPRINT_HASH_BYTES,
             &mut out,
         );
+        if let Some(run_id) = &self.run_id {
+            validate_text(
+                "run_id",
+                run_id,
+                MAX_CANDIDATE_PROOF_REF_RUN_ID_BYTES,
+                &mut out,
+            );
+        }
+        for (field, value) in [
+            ("run_base_snapshot", &self.run_base_snapshot),
+            ("candidate_snapshot", &self.candidate_snapshot),
+            ("sources_digest", &self.sources_digest),
+            ("changed_files_digest", &self.changed_files_digest),
+        ] {
+            if let Some(value) = value {
+                validate_text(
+                    field,
+                    value,
+                    MAX_ENVIRONMENT_FINGERPRINT_HASH_BYTES,
+                    &mut out,
+                );
+            }
+        }
         if out.is_empty() {
             Ok(())
         } else {
@@ -1352,6 +1676,36 @@ fn validate_text(
         out.push(FingerprintViolation {
             field,
             detail: format!("value {value:?} is not ASCII-printable"),
+            oversized: false,
+        });
+    }
+}
+
+/// Bounded single-line binding text: spaces are legal (human reasons and
+/// work-item labels), empty and control bytes are malformed, overlong input
+/// is oversized.
+fn validate_binding_text(
+    field: &'static str,
+    value: &str,
+    max: usize,
+    out: &mut Vec<FingerprintViolation>,
+) {
+    if value.is_empty() {
+        out.push(FingerprintViolation {
+            field,
+            detail: "value is empty".into(),
+            oversized: false,
+        });
+    } else if value.len() > max {
+        out.push(FingerprintViolation {
+            field,
+            detail: format!("value of {} bytes exceeds {max}", value.len()),
+            oversized: true,
+        });
+    } else if !value.bytes().all(|b| b.is_ascii_graphic() || b == b' ') {
+        out.push(FingerprintViolation {
+            field,
+            detail: format!("value {value:?} is not printable single-line text"),
             oversized: false,
         });
     }
@@ -2088,6 +2442,7 @@ mod tests {
             criterion_key: "cargo check passes".into(),
             passed: true,
             evidence: Some("exit 0".into()),
+            binding: None,
         };
         let check = CheckExecution {
             check: "compile".into(),
@@ -2276,6 +2631,7 @@ mod fingerprint_tests {
             task_contract_hash: hex64(3),
             check_argv_cwd_env_hash: hex64(4),
             verification_impl_version: "faktor-agent/0.1.0".into(),
+            proof_basis_digest: Some(format!("blake3:{}", hex64(7))),
         }
     }
 
@@ -2287,6 +2643,11 @@ mod fingerprint_tests {
             source_diff_evidence: Some(11),
             risk_report_evidence: None,
             accounting_snapshot_digest: "accounting:v1:0000000000000001".into(),
+            run_id: None,
+            run_base_snapshot: None,
+            candidate_snapshot: None,
+            sources_digest: None,
+            changed_files_digest: None,
         }
     }
 
@@ -2357,5 +2718,97 @@ mod fingerprint_tests {
         let mut bad = candidate();
         bad.candidate_manifest_hash = "zz".into();
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn criterion_bindings_are_typed_bounded_and_v2_migration_is_deterministic() {
+        for binding in [
+            CriterionBinding::RequiredCheck {
+                check_id: "rust_check".into(),
+                command_digest: command_binding_digest("cargo check"),
+            },
+            CriterionBinding::IntegrationCoverage {
+                required_work_items: vec!["wi-1".into()],
+            },
+            CriterionBinding::FileState {
+                path: "src/lib.rs".into(),
+                expected_digest: hex64(1),
+            },
+            CriterionBinding::Evidence {
+                evidence_id: "e1".into(),
+                evidence_digest: hex64(2),
+            },
+            CriterionBinding::IndependentReview {
+                reviewer_id: "reviewer-1".into(),
+            },
+            CriterionBinding::AggregateGoal,
+            CriterionBinding::Unavailable {
+                reason: "no mechanism".into(),
+            },
+        ] {
+            binding.validate().unwrap();
+            let json = serde_json::to_string(&binding).unwrap();
+            assert_eq!(
+                serde_json::from_str::<CriterionBinding>(&json).unwrap(),
+                binding
+            );
+        }
+        // A hostile tag and an empty text member are refused.
+        assert!(serde_json::from_str::<CriterionBinding>(r#"{"kind":"guess"}"#).is_err());
+        assert!(CriterionBinding::Unavailable {
+            reason: String::new()
+        }
+        .validate()
+        .is_err());
+        // Legacy migration: goal -> AggregateGoal, check-derived -> its
+        // command digest, anything else -> Unavailable (never a pass).
+        assert_eq!(
+            legacy_binding_for_criterion_text("goal: ship it"),
+            CriterionBinding::AggregateGoal
+        );
+        assert_eq!(
+            legacy_binding_for_criterion_text("required check: cargo test --lib"),
+            CriterionBinding::RequiredCheck {
+                check_id: String::new(),
+                command_digest: command_binding_digest("cargo test --lib"),
+            }
+        );
+        assert!(matches!(
+            legacy_binding_for_criterion_text("the code is nice"),
+            CriterionBinding::Unavailable { .. }
+        ));
+        assert_eq!(
+            command_binding_digest("cargo check"),
+            command_binding_digest("cargo check"),
+            "digest must be deterministic"
+        );
+        assert_ne!(
+            command_binding_digest("cargo check"),
+            command_binding_digest("cargo test")
+        );
+    }
+
+    #[test]
+    fn no_op_policy_never_completes_a_required_proof_without_one() {
+        assert_eq!(
+            NoOpDisposition::default_for_mutating_task(),
+            NoOpDisposition::RequiresCriterionProof
+        );
+        assert!(NoOpDisposition::Allowed.permits_completion());
+        // The implementation/fix default: no criterion proof => no
+        // completion, even when every test in the world passed.
+        assert!(!NoOpDisposition::RequiresCriterionProof.completion_allowed(false));
+        assert!(NoOpDisposition::RequiresCriterionProof.completion_allowed(true));
+        assert!(!NoOpDisposition::Refused.permits_completion());
+        assert!(!NoOpDisposition::Refused.completion_allowed(true));
+        assert_eq!(NoOpDisposition::Allowed.tag(), "allowed");
+        assert_eq!(
+            NoOpDisposition::RequiresCriterionProof.tag(),
+            "requires_criterion_proof"
+        );
+        assert_eq!(
+            serde_json::to_string(&NoOpDisposition::Refused).unwrap(),
+            "\"refused\""
+        );
     }
 }

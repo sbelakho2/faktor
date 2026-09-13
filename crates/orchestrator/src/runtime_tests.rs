@@ -3050,6 +3050,7 @@ async fn graph_hostile_assignment_rows_are_typed_errors_never_silent_skips() {
         plan_step_index: 0,
         child_id: "child-9".into(),
         ownership: OwnershipSpec::NoWrites,
+        run_base_snapshot: None,
     };
     let parent_h = env_c.manager.get_session(env_c.parent).unwrap().unwrap();
     parent_h
@@ -3097,6 +3098,7 @@ async fn graph_hostile_assignment_rows_are_typed_errors_never_silent_skips() {
         plan_step_index: 0,
         child_id: "child-0".into(),
         ownership: OwnershipSpec::NoWrites,
+        run_base_snapshot: None,
     };
     env_d
         .manager
@@ -3893,6 +3895,7 @@ fn craft_child_row(
         created_ms: 1,
         updated_ms: 1,
         base_snapshot_id: None,
+        run_base_snapshot: None,
         env_snapshot_id: None,
         execution_phase: ExecutionPhase::default(),
     };

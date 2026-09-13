@@ -196,6 +196,11 @@ pub enum ExecError {
     /// papers over it.
     #[error("integration conflict: {0}")]
     IntegrationConflict(String),
+    /// The owner root (or the immutable run base) moved while an
+    /// operation was being prepared/checked: the workspace drifted and the
+    /// operation refuses rather than deriving from a moving generation.
+    #[error("workspace drift: {0}")]
+    WorkspaceDrift(String),
     /// An AUTHORITATIVE durable write or control-queue ack failed. The
     /// transition was NOT claimed applied, the effect is idempotent, and the
     /// underlying failure classifies as retryable — the SAME call may be
@@ -288,7 +293,38 @@ pub enum CrashSeam {
     /// SAME child ids (the assignment rows are durable; nothing was minted
     /// at spawn).
     AfterAssignmentsPersisted,
+    /// Settlement: fires after the immutable run base was recorded, BEFORE
+    /// any child spawn (the run is re-openable from the durable base row).
+    AfterRunBaseRecorded,
+    /// Settlement: fires after the child change sets were staged and the
+    /// candidate was composed, before any verification runs.
+    AfterCandidatePrepared,
+    /// Settlement: fires after a passing verification record + fact landed,
+    /// before the landing transaction's first durable row.
+    AfterPreparedVerification,
+    /// Settlement: fires after the landing transaction's record-first row
+    /// committed, before the first owner write.
+    AfterIntegrationTxnRecord,
+    /// Settlement: fires once `after` owner paths of the landing apply loop
+    /// were processed (any outcome), leaving a recoverable partial landing.
+    IntegrationApply { after: usize },
+    /// Settlement: fires while a rollback loop is running.
+    DuringRollback,
+    /// Settlement: fires after the landed owner digest was computed, before
+    /// the overall integration record is finalized.
+    AfterFinalOwnerSnapshot,
+    /// Settlement: fires before `complete_verified_task` is consumed.
+    BeforeTaskCompletion,
 }
+
+/// Directories the immutable run-base copy never walks (VCS bookkeeping is
+/// daemon/owner bookkeeping, never content the root snapshot digests).
+const SPAWN_BASE_SKIP_DIRS: &[&str] = &[".git", ".hg", ".svn"];
+/// Entry cap of ONE isolated-child run-base copy (a larger tree fails the
+/// spawn loudly instead of silently truncating).
+const MAX_SPAWN_COPY_ENTRIES: usize = 100_000;
+/// Total-byte cap of ONE isolated-child run-base copy.
+const MAX_SPAWN_COPY_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// The child's model policy (typed, bounded, durable).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -413,6 +449,13 @@ pub struct ChildRuntime {
     /// `None` (field-level serde default).
     #[serde(default)]
     pub base_snapshot_id: Option<String>,
+    /// The IMMUTABLE run-base snapshot hash this child was derived from
+    /// (the run's recorded generation). Recorded at spawn for isolated
+    /// worktree children when the run carries a run base; staging refuses a
+    /// child whose recorded generation differs from the durable run base.
+    /// Old durable rows decode with `None` (field-level serde default).
+    #[serde(default)]
+    pub run_base_snapshot: Option<String>,
     /// The durable env-snapshot id (audit 97): the child is bound to the
     /// IMMUTABLE instruction-epoch snapshot taken from its environment at
     /// spawn. Context building for this child reads ONLY that snapshot —
@@ -575,6 +618,12 @@ pub struct WorkItemAssignment {
     /// without it are hostile/stale (never spawned under a re-derived
     /// ownership).
     pub ownership: OwnershipSpec,
+    /// The run-base generation this assignment derives from (the run's
+    /// recorded snapshot hash). Stamped durably before the first spawn for
+    /// runs carrying a run base; `None` on legacy rows (field-level serde
+    /// default).
+    #[serde(default)]
+    pub run_base_snapshot: Option<String>,
 }
 
 /// The read-only global orphan-child scan (`doctor --deep`, P0-97): every
@@ -682,6 +731,13 @@ struct ExecState {
     outcomes: Arc<Mutex<HashMap<OpId, DriveResult>>>,
     next_child_seq: u64,
     crash_fired: bool,
+    /// The IMMUTABLE run-base generation of the run (its snapshot hash),
+    /// loaded from the durable record before any spawn; every isolated
+    /// child records it and staging refuses a child naming another one.
+    run_base_snapshot: Option<String>,
+    /// The daemon-owned run-base root every isolated child worktree is
+    /// copied from at spawn (`None` = legacy empty isolated dir).
+    run_base_root: Option<PathBuf>,
     /// Highest-severity semantic risk any SETTLED child drive reported for
     /// this run (audits 54/119): drives the child-parallelism reduction in
     /// [`Self::admit_ready`]. `None` = no provider was consulted (parity).
@@ -838,6 +894,49 @@ impl OrchestratorRuntime {
         Ok(rows)
     }
 
+    /// The durable IMMUTABLE run base of one run (point 2), decoded from the
+    /// parent session's typed ledger. `None` = the run never recorded one
+    /// (direct-runtime legacy runs); a corrupt row refuses loudly.
+    pub(crate) fn run_base_of(
+        manager: Arc<SessionManager>,
+        parent: SessionId,
+        run_id: &str,
+    ) -> Result<Option<faktor_session::ledger::RunBaseRecord>, ExecError> {
+        let handle = manager
+            .get_session(parent)?
+            .ok_or_else(|| ExecError::NotFound(format!("parent session {parent}")))?;
+        handle
+            .ledger_run_base_get(run_id)
+            .map_err(|e| ExecError::Internal(format!("run base read: {e}")))
+    }
+
+    /// Stamp the run's durable assignment rows with the run-base generation
+    /// they derive from (point 2: every isolated child assignment records
+    /// `run_base_snapshot`). Idempotent: a replay re-stamps the identical
+    /// digest; rows already carrying a DIFFERENT generation are a typed
+    /// Conflict (a run's base is immutable).
+    pub fn record_run_base_on_assignments(
+        &self,
+        parent: SessionId,
+        run_id: &str,
+        snapshot_hash: &str,
+    ) -> Result<(), ExecError> {
+        let mut rows = Self::assignment_rows(self.manager.clone(), parent, run_id)?;
+        for row in &mut rows {
+            match row.run_base_snapshot.as_deref() {
+                None => row.run_base_snapshot = Some(snapshot_hash.to_string()),
+                Some(recorded) if recorded == snapshot_hash => {}
+                Some(recorded) => {
+                    return Err(ExecError::IntegrationConflict(format!(
+                        "assignment {} of run {run_id} carries run base {recorded}; a run base is immutable ({snapshot_hash} was given)",
+                        row.item_id
+                    )));
+                }
+            }
+        }
+        self.put_assignments(parent, &rows)
+    }
+
     /// Mint the run's item → child bindings in DETERMINISTIC plan order:
     /// every SPAWN work item gets its child id from the shared child
     /// sequence (`child-0`, `child-1`, ...). Auto items (spawn == false)
@@ -867,6 +966,7 @@ impl OrchestratorRuntime {
                 plan_step_index: index,
                 child_id: format!("child-{seq}"),
                 ownership: item.ownership.clone(),
+                run_base_snapshot: None,
             });
             seq += 1;
         }
@@ -1347,13 +1447,21 @@ impl OrchestratorRuntime {
         // (wave A3) The item → child bindings of the WHOLE plan are minted
         // here — before anything spawns — in deterministic plan order and
         // committed in ONE store transaction. Every row carries the item's
-        // OWN explicit ownership; spawn (and re-attach) look the ids + the
+        // OWN explicit ownership AND (point 2) the run-base generation the
+        // child derives from; spawn (and re-attach) look the ids + the
         // ownership up from these durable rows; nobody re-derives either
         // after a crash.
-        let assignments = Self::compile_assignments(&config.run_id, &plan, &spec_map);
+        let run_base =
+            Self::run_base_of(self.manager.clone(), owner.parent_session, &config.run_id)?;
+        let mut assignments = Self::compile_assignments(&config.run_id, &plan, &spec_map);
+        for assignment in &mut assignments {
+            assignment.run_base_snapshot = run_base.as_ref().map(|rb| rb.snapshot_hash.clone());
+        }
         self.put_assignments(owner.parent_session, &assignments)?;
         let run_id = config.run_id.clone();
-        let state = self.build_exec_state(plan, owner, config, spec_map);
+        let mut state = self.build_exec_state(plan, owner, config, spec_map);
+        state.run_base_snapshot = run_base.as_ref().map(|rb| rb.snapshot_hash.clone());
+        state.run_base_root = run_base.as_ref().map(|rb| PathBuf::from(&rb.root));
         self.install_run(state)?;
         // Crash seam: this exact window — assignments durable, no child
         // spawned yet — must re-open with the SAME child ids.
@@ -1407,6 +1515,7 @@ impl OrchestratorRuntime {
             })?;
         }
         let _ = isolated_root;
+        let run_base = Self::run_base_of(self.manager.clone(), parent, run_id)?;
         let config = ExecConfig {
             run_id: run_id.to_string(),
             ceilings,
@@ -1421,6 +1530,11 @@ impl OrchestratorRuntime {
             crash_seam,
         };
         let mut state = self.build_exec_state(plan, owner, config, specs);
+        // Point 2: a re-attached run re-binds the SAME immutable run base
+        // from its durable record (never memory); a run without one keeps
+        // the legacy empty-isolated behavior.
+        state.run_base_snapshot = run_base.as_ref().map(|rb| rb.snapshot_hash.clone());
+        state.run_base_root = run_base.as_ref().map(|rb| PathBuf::from(&rb.root));
         self.reconcile_from_registry(&mut state)?;
         self.install_run(state)?;
         self.drive_to_outcome(run_id).await
@@ -1759,6 +1873,8 @@ impl OrchestratorRuntime {
             outcomes: Arc::new(Mutex::new(HashMap::new())),
             next_child_seq,
             crash_fired: false,
+            run_base_snapshot: None,
+            run_base_root: None,
             semantic_risk: None,
         }
     }
@@ -2559,6 +2675,17 @@ impl OrchestratorRuntime {
                 ))
             })?;
         let child_id = assignment.child_id.clone();
+        // Point 2: the spawn binds the SAME run-base generation the durable
+        // assignment names. A mirror/durable disagreement is corruption and
+        // fails loudly (a child is never spawned under a re-derived base).
+        if assignment.run_base_snapshot.is_some()
+            && assignment.run_base_snapshot != exec.run_base_snapshot
+        {
+            return Err(ExecError::Conflict(format!(
+                "work item {} assignment carries run base {:?} but the run executes under {:?}",
+                item.id, assignment.run_base_snapshot, exec.run_base_snapshot
+            )));
+        }
         let seq = child_seq_of(&child_id).ok_or_else(|| {
             ExecError::Conflict(format!(
                 "assignment of work item {} names the non-plan child id {child_id}",
@@ -2609,6 +2736,22 @@ impl OrchestratorRuntime {
                     .join(&child_id);
                 std::fs::create_dir_all(&dir)
                     .map_err(|e| ExecError::Internal(format!("isolated child dir {dir:?}: {e}")))?;
+                // Point 2: every isolated child derives from the SAME
+                // immutable run-base generation — its worktree is seeded
+                // with the run base (never the live owner). Bounded copy;
+                // an un-copyable or oversized tree fails the spawn loudly.
+                if let Some(base_root) = &exec.run_base_root {
+                    faktor_fs::copy_tree_skip(
+                        base_root,
+                        &dir,
+                        MAX_SPAWN_COPY_ENTRIES,
+                        MAX_SPAWN_COPY_BYTES,
+                        SPAWN_BASE_SKIP_DIRS,
+                    )
+                    .map_err(|e| {
+                        ExecError::from_fs("isolated child run-base copy", base_root, e)
+                    })?;
+                }
                 let dir_str = dir.to_string_lossy().into_owned();
                 let ws = self
                     .manager
@@ -2702,6 +2845,7 @@ impl OrchestratorRuntime {
             created_ms: now,
             updated_ms: now,
             base_snapshot_id: None,
+            run_base_snapshot: None,
             env_snapshot_id: None,
             execution_phase: ExecutionPhase::Planning,
         };
@@ -2718,10 +2862,17 @@ impl OrchestratorRuntime {
         // at spawn (parent worktree map = the merge CAS anchors; the
         // child's own start map when it already holds content). A huge
         // parent tree fails the spawn loudly (typed Oversized) — the base
-        // snapshot never silently truncates.
+        // snapshot never silently truncates. Point 2: when the run carries
+        // an immutable run base, the anchor map is the RUN BASE (never the
+        // live owner) and the row records the generation it derived from.
         if row.ownership == ChildOwnership::IsolatedWorktree {
+            row.run_base_snapshot = exec.run_base_snapshot.clone();
+            let anchor = exec
+                .run_base_root
+                .clone()
+                .unwrap_or_else(|| exec.owner.root.clone());
             let base_id =
-                self.record_spawn_base(exec.parent_session, &exec.run_id, &exec.owner.root, &row)?;
+                self.record_spawn_base(exec.parent_session, &exec.run_id, &anchor, &row)?;
             row.base_snapshot_id = Some(base_id);
         }
         // Audit 97: the child binds its IMMUTABLE env snapshot at spawn —

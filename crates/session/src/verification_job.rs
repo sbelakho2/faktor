@@ -1590,6 +1590,7 @@ mod tests {
             task_contract_hash: "ef".repeat(32),
             check_argv_cwd_env_hash: "12".repeat(32),
             verification_impl_version: "faktor-agent/0.1.0".into(),
+            proof_basis_digest: None,
         }
     }
 

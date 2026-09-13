@@ -3958,6 +3958,7 @@ mod tests {
                     criterion_key: "c1".into(),
                     passed: true,
                     evidence: None,
+                    binding: None,
                 }],
                 vec![],
                 vec![],
@@ -4071,6 +4072,7 @@ mod tests {
                 created_ms: 1,
                 updated_ms: 1,
                 base_snapshot_id: None,
+                run_base_snapshot: None,
                 env_snapshot_id: None,
             };
             let value = serde_json::to_string(&runtime).unwrap();
@@ -4419,6 +4421,7 @@ mod tests {
                 created_ms: 1,
                 updated_ms: 1,
                 base_snapshot_id: None,
+                run_base_snapshot: None,
                 env_snapshot_id: None,
             };
             let value = serde_json::to_string(&runtime).unwrap();

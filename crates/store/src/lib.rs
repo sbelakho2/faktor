@@ -14901,6 +14901,7 @@ mod typed_ledger_tests {
                     criterion_key: c.clone(),
                     passed: true,
                     evidence: Some("exit 0".into()),
+                    binding: None,
                 })
                 .collect(),
             checks: vec![],
@@ -15036,6 +15037,7 @@ mod typed_ledger_tests {
             criterion_key: "c3".into(),
             passed: true,
             evidence: None,
+            binding: None,
         });
         let e_id = store.verification_record_put(&extra).unwrap();
         let ok4 = store

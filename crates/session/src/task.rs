@@ -65,9 +65,9 @@ use faktor_core::id::{
     SessionId, TaskId, TaskRevision, VerificationRecordId, WorkspaceId, WorktreeId,
 };
 use faktor_core::state::{
-    CandidateProofRef, CheckExecution, CriterionOrigin, CriterionRequirement,
-    CriterionVerification, EnvironmentFingerprint, FileStateEvidence, TaskState, TaskTransition,
-    VerificationStatus,
+    legacy_binding_for_criterion_text, CandidateProofRef, CheckExecution, CriterionBinding,
+    CriterionOrigin, CriterionRequirement, CriterionVerification, EnvironmentFingerprint,
+    FileStateEvidence, TaskState, TaskTransition, ToolVersion, VerificationStatus,
 };
 
 use crate::handle::SessionHandle;
@@ -426,6 +426,13 @@ pub struct Criterion {
     pub requirement: CriterionRequirement,
     pub evidence_source: Option<u64>,
     pub semantic_snapshot: Option<String>,
+    /// The typed verification binding (P0 criteria mandate). `None` on
+    /// criteria that carry no objective binding yet; the evaluator never
+    /// passes such a criterion. Decoding a legacy/V2 entry WITHOUT a binding
+    /// migrates it deterministically
+    /// ([`faktor_core::state::legacy_binding_for_criterion_text`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<CriterionBinding>,
 }
 
 /// The on-disk V2 envelope (private: the in-band representation is an
@@ -443,6 +450,8 @@ struct CriterionEnvelope {
     evidence_source: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     semantic_snapshot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding: Option<CriterionBinding>,
 }
 
 impl Criterion {
@@ -462,6 +471,7 @@ impl Criterion {
             requirement: CriterionRequirement::Required,
             evidence_source: None,
             semantic_snapshot: None,
+            binding: None,
         }
     }
 
@@ -482,7 +492,16 @@ impl Criterion {
             requirement,
             evidence_source: None,
             semantic_snapshot,
+            binding: None,
         }
+    }
+
+    /// Re-bind the criterion's typed verification binding (the criterion's
+    /// id does not change: a binding is a verification contract, not
+    /// identity).
+    pub fn with_binding(mut self, binding: CriterionBinding) -> Self {
+        self.binding = Some(binding);
+        self
     }
 
     /// Re-bind the criterion's evidence source (the criterion's id does not
@@ -500,6 +519,14 @@ impl Criterion {
                 "criterion text of {} bytes exceeds MAX_TASK_CRITERION_TEXT_BYTES ({MAX_TASK_CRITERION_TEXT_BYTES})",
                 self.text.len()
             )));
+        }
+        if let Some(binding) = &self.binding {
+            binding.validate().map_err(|violations| {
+                TaskError::Malformed(format!(
+                    "criterion {:?} carries an invalid binding: {violations:?}",
+                    self.text
+                ))
+            })?;
         }
         if let Some(snapshot) = &self.semantic_snapshot {
             if snapshot.len() > MAX_CRITERION_SNAPSHOT_BYTES {
@@ -555,6 +582,7 @@ impl Criterion {
             requirement: self.requirement,
             evidence_source: self.evidence_source,
             semantic_snapshot: self.semantic_snapshot.clone(),
+            binding: self.binding.clone(),
         };
         format!(
             "{CRITERION_V2_PREFIX}{}",
@@ -590,6 +618,7 @@ impl Criterion {
             requirement: envelope.requirement,
             evidence_source: envelope.evidence_source,
             semantic_snapshot: envelope.semantic_snapshot,
+            binding: envelope.binding,
         })
     }
 
@@ -614,6 +643,7 @@ impl Criterion {
             CriterionRequirement::Required,
             None,
         )
+        .with_binding(legacy_binding_for_criterion_text(entry))
     }
 
     /// The human text of one persisted entry (typed entries decode to their
@@ -623,6 +653,17 @@ impl Criterion {
         Self::decode(entry)
             .map(|c| c.text)
             .unwrap_or_else(|| entry.to_string())
+    }
+
+    /// The binding the EVALUATOR must use: an explicit binding wins; a
+    /// binding-less criterion (a pre-binding V2 row or a plain legacy entry)
+    /// migrates deterministically from its text — `goal: ` rows become
+    /// AggregateGoal, check-derived rows bind their command digest, and
+    /// anything else is Unavailable. Never a guessed pass mechanism.
+    pub fn effective_binding(&self) -> CriterionBinding {
+        self.binding
+            .clone()
+            .unwrap_or_else(|| legacy_binding_for_criterion_text(&self.text))
     }
 }
 
@@ -1226,6 +1267,93 @@ pub fn root_snapshot_digest(
         fold.update(b"\n");
     }
     Ok(fold.finalize().to_hex().to_string())
+}
+
+// ---------------------------------------------------- proof basis (P0)
+
+/// Hard bound on the ordered entry lists of one [`ProofBasis`].
+pub const MAX_PROOF_BASIS_ENTRIES: usize = 256;
+
+/// One ordered check of the proof basis: the check id plus its typed
+/// (program, argv) basis.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProofBasisCheck {
+    pub check_id: String,
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+/// One criterion of the proof basis: id plus its binding's content digest
+/// (`None` = the criterion carries no binding).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProofBasisCriterion {
+    pub criterion_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_digest: Option<String>,
+}
+
+/// The exact basis a verification proof is bound to (P0 proof binding): a
+/// record may be REUSED only while every component below is identical.
+/// Deliberately one fingerprint system: this feeds
+/// [`EnvironmentFingerprint::proof_basis_digest`], never a parallel one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProofBasis {
+    pub task_id: u64,
+    pub task_revision: u64,
+    pub task_contract_digest: String,
+    pub candidate_snapshot: String,
+    pub integration_sources_digest: String,
+    pub changed_files_digest: String,
+    pub checks: Vec<ProofBasisCheck>,
+    pub verification_impl_version: String,
+    pub tool_versions: Vec<ToolVersion>,
+    /// The documented verification-relevant environment projection.
+    pub env_projection: Vec<(String, String)>,
+    pub instruction_epoch: Option<u64>,
+    pub criteria: Vec<ProofBasisCriterion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_digest: Option<String>,
+    #[serde(default)]
+    pub evidence_digests: Vec<String>,
+}
+
+impl ProofBasis {
+    /// The canonical digest of this basis (`blake3:` prefixed).
+    pub fn digest(&self) -> String {
+        let bytes = serde_json::to_vec(self).unwrap_or_default();
+        format!("blake3:{}", blake3::hash(&bytes).to_hex())
+    }
+}
+
+/// The result of asking whether an existing proof record may be reused under
+/// a current basis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProofReuse {
+    /// The record's basis is byte-identical to the current basis.
+    Allowed,
+    /// Reuse is refused (the reason names the basis mismatch class).
+    Refused { reason: String },
+}
+
+impl ProofReuse {
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, ProofReuse::Allowed)
+    }
+}
+
+/// The immutable binding of a completion proof, returned by
+/// [`SessionHandle::verify_completion_proof_binding`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionProofBinding {
+    pub record_id: VerificationRecordId,
+    pub task_id: TaskId,
+    pub revision: TaskRevision,
+    pub tree_hash: Option<String>,
+    pub criterion_count: usize,
+    pub check_count: usize,
 }
 
 impl SessionHandle {
@@ -1877,15 +2005,34 @@ impl SessionHandle {
                 status: rec.status,
             });
         }
-        let missing: Vec<String> = row
+        let expected: Vec<(String, CriterionBinding)> = row
             .acceptance_criteria
             .iter()
-            .filter(|c| {
-                !rec.criteria
-                    .iter()
-                    .any(|cv| cv.passed && &cv.criterion_key == *c)
+            .map(|entry| {
+                let effective = Criterion::decode(entry)
+                    .map(|c| c.effective_binding())
+                    .unwrap_or_else(|| legacy_binding_for_criterion_text(entry));
+                (entry.clone(), effective)
             })
-            .cloned()
+            .collect();
+        let missing: Vec<String> = expected
+            .iter()
+            .filter(|(key, binding)| {
+                // A criterion is covered only by a PASSED verdict through its
+                // OWN binding. Legacy records carry no binding: they keep the
+                // V2 key+passed contract (a pre-binding record cannot be
+                // retroactively re-bound here), while every new record's
+                // binding must match the task criterion's effective binding.
+                !rec.criteria.iter().any(|cv| {
+                    cv.passed
+                        && &cv.criterion_key == key
+                        && match &cv.binding {
+                            Some(recorded) => recorded == binding,
+                            None => true,
+                        }
+                })
+            })
+            .map(|(key, _)| key.clone())
             .collect();
         if !missing.is_empty() {
             return Err(TaskError::CriteriaNotCovered {
@@ -2312,6 +2459,79 @@ impl SessionHandle {
                 verification_record_from_row_with_evidence(row, fingerprint_json, candidate_json)
             })
             .collect()
+    }
+
+    /// Whether one immutable proof record may be REUSED under the CURRENT
+    /// proof basis (P0 proof binding): only an identical basis is reusable.
+    /// A legacy record without a recorded basis is never reusable (an absent
+    /// basis is an honest unknown, not a license).
+    pub fn verification_record_reusable(
+        &self,
+        record_id: VerificationRecordId,
+        basis: &ProofBasis,
+    ) -> Result<ProofReuse, TaskError> {
+        let Some(record) = self.get_verification_record(record_id)? else {
+            return Ok(ProofReuse::Refused {
+                reason: format!("record {record_id} does not exist"),
+            });
+        };
+        let Some(recorded) = record
+            .environment_fingerprint
+            .as_ref()
+            .and_then(|f| f.proof_basis_digest.as_deref())
+        else {
+            return Ok(ProofReuse::Refused {
+                reason: format!("record {record_id} carries no proof basis; it is never reusable"),
+            });
+        };
+        let current = basis.digest();
+        if recorded == current {
+            Ok(ProofReuse::Allowed)
+        } else {
+            Ok(ProofReuse::Refused {
+                reason: format!(
+                    "record {record_id} is bound to proof basis {recorded}, but the current basis is {current}; reuse requires an identical basis"
+                ),
+            })
+        }
+    }
+
+    /// Validate one completion proof as the immutable completion basis of
+    /// `task_id` at its CURRENT revision, and — when the record carries a
+    /// final tree hash and a candidate root is supplied — require the
+    /// candidate root to digest to the SAME tree hash. Read-only: the
+    /// atomic completion gate in [`SessionHandle::complete_verified_task`]
+    /// remains the only completion authority.
+    pub fn verify_completion_proof_binding(
+        &self,
+        task_id: TaskId,
+        proof: VerificationRecordId,
+        candidate_root: Option<&std::path::Path>,
+    ) -> Result<CompletionProofBinding, TaskError> {
+        let revision = self.task_revision(task_id)?;
+        self.validate_completion_proof(task_id, revision, proof)?;
+        let record = self
+            .get_verification_record(proof)?
+            .ok_or(TaskError::RecordNotFound(proof))?;
+        if let (Some(recorded), Some(root)) = (record.tree_hash.as_deref(), candidate_root) {
+            let current = root_snapshot_digest(root, MAX_ROOT_SNAPSHOT_ENTRIES)?;
+            if current != recorded {
+                return Err(TaskError::IntegrationSnapshotMismatch {
+                    task_id,
+                    record: proof,
+                    recorded: recorded.to_string(),
+                    current,
+                });
+            }
+        }
+        Ok(CompletionProofBinding {
+            record_id: proof,
+            task_id,
+            revision,
+            tree_hash: record.tree_hash,
+            criterion_count: record.criteria.len(),
+            check_count: record.checks.len(),
+        })
     }
 
     /// The deterministic digest of the task's durable completion-accounting
@@ -2857,6 +3077,7 @@ mod tests {
                 criterion_key: c.clone(),
                 passed: true,
                 evidence: Some("exit 0".into()),
+                binding: None,
             })
             .collect();
         s.create_verification_record(
@@ -3366,6 +3587,7 @@ mod tests {
                     criterion_key: "c1".into(),
                     passed: true,
                     evidence: None,
+                    binding: None,
                 }],
                 vec![],
                 vec![],
@@ -3425,6 +3647,7 @@ mod tests {
                     criterion_key: "c1".into(),
                     passed: false,
                     evidence: None,
+                    binding: None,
                 }],
                 vec![],
                 vec![],
@@ -3752,6 +3975,7 @@ mod tests {
                 criterion_key: format!("{i:03}").repeat(MAX_VERIFICATION_CRITERION_KEY_BYTES / 4),
                 passed: true,
                 evidence: None,
+                binding: None,
             })
             .collect();
         assert!(
@@ -3814,6 +4038,7 @@ mod tests {
                     criterion_key: "c1".into(),
                     passed: true,
                     evidence: None,
+                    binding: None,
                 }],
                 vec![],
                 vec![FileStateEvidence {
@@ -3836,6 +4061,7 @@ mod tests {
                     criterion_key: "c1".into(),
                     passed: true,
                     evidence: Some("e".repeat(MAX_VERIFICATION_EVIDENCE_BYTES + 1)),
+                    binding: None,
                 }],
                 vec![],
                 vec![],
@@ -4544,6 +4770,7 @@ mod tests {
             requirement: CriterionRequirement::Required,
             evidence_source: None,
             semantic_snapshot: None,
+            binding: None,
         };
         legacy_criterion.validate().unwrap();
         let mut hostile = legacy_criterion;
@@ -4676,6 +4903,7 @@ mod tests {
             task_contract_hash: "ef".repeat(32),
             check_argv_cwd_env_hash: "12".repeat(32),
             verification_impl_version: "faktor-agent/0.1.0".into(),
+            proof_basis_digest: None,
         }
     }
 
@@ -4687,6 +4915,11 @@ mod tests {
             source_diff_evidence: Some(7),
             risk_report_evidence: None,
             accounting_snapshot_digest: "accounting:v1:0000000000000001".into(),
+            run_id: None,
+            run_base_snapshot: None,
+            candidate_snapshot: None,
+            sources_digest: None,
+            changed_files_digest: None,
         }
     }
 
@@ -4919,6 +5152,7 @@ mod tests {
                     criterion_key: "c1".into(),
                     passed: true,
                     evidence: Some("exit 0".into()),
+                    binding: None,
                 }],
                 vec![],
                 vec![],
@@ -5419,6 +5653,7 @@ mod tests {
                 criterion_key: c.clone(),
                 passed: true,
                 evidence: Some("exit 0".into()),
+                binding: None,
             })
             .collect();
         s.create_verification_record(
@@ -5629,5 +5864,245 @@ mod tests {
             matches!(err, TaskError::RootSnapshotUnavailable(_)),
             "{err}"
         );
+    }
+
+    // ------------------------------------------- typed criterion bindings (P0)
+
+    #[test]
+    fn legacy_goal_criterion_requires_aggregate_review() {
+        // A legacy plain-text goal criterion decodes with the AggregateGoal
+        // binding: it may only pass through the aggregate review, never by
+        // the suite status. A check-derived legacy row binds its command; an
+        // arbitrary prose entry binds Unavailable.
+        let goal = Criterion::legacy("goal: ship the feature");
+        assert_eq!(
+            goal.binding,
+            Some(faktor_core::state::CriterionBinding::AggregateGoal)
+        );
+        let check = Criterion::legacy("required check: cargo check");
+        assert_eq!(
+            check.binding,
+            Some(faktor_core::state::CriterionBinding::RequiredCheck {
+                check_id: String::new(),
+                command_digest: faktor_core::state::command_binding_digest("cargo check"),
+            })
+        );
+        let prose = Criterion::legacy("the code is nice");
+        assert!(matches!(
+            prose.binding,
+            Some(faktor_core::state::CriterionBinding::Unavailable { .. })
+        ));
+        // A V2 envelope written before bindings existed decodes faithfully
+        // (binding None) and the EVALUATOR migrates it from its text; the
+        // migration never changes the content id.
+        let user = Criterion::user("goal: ship the feature");
+        let encoded = user.encode();
+        let decoded = Criterion::decode(&encoded).expect("v2 decode");
+        assert_eq!(decoded.binding, None);
+        assert_eq!(
+            decoded.effective_binding(),
+            faktor_core::state::CriterionBinding::AggregateGoal
+        );
+        assert_eq!(decoded.id, user.id);
+    }
+
+    #[test]
+    fn one_failed_required_criterion_blocks_task() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let t = s
+            .create_task(criteria_task(&s, s.task_id().unwrap(), vec![]))
+            .unwrap();
+        // Two typed criteria, each bound to its OWN required check.
+        let c1 = Criterion::derived(
+            "required check: cargo check",
+            CriterionOrigin::ProjectPolicy,
+            CriterionRequirement::Required,
+            None,
+        )
+        .with_binding(faktor_core::state::CriterionBinding::RequiredCheck {
+            check_id: "rust_check".into(),
+            command_digest: faktor_core::state::command_binding_digest("cargo check"),
+        });
+        let c2 = Criterion::derived(
+            "required check: cargo test",
+            CriterionOrigin::ProjectPolicy,
+            CriterionRequirement::Required,
+            None,
+        )
+        .with_binding(faktor_core::state::CriterionBinding::RequiredCheck {
+            check_id: "rust_test".into(),
+            command_digest: faktor_core::state::command_binding_digest("cargo test"),
+        });
+        s.set_task_criteria(t.task_id, vec![c1.clone(), c2.clone()])
+            .unwrap();
+        let rev = drive_to_verifying(&s, t.task_id);
+        // A record whose c2 verdict is present but NOT passed: the task must
+        // stay Verifying and completion must refuse, even though every other
+        // criterion and every check passed.
+        let record = s
+            .create_verification_record(
+                t.task_id,
+                None,
+                vec![
+                    CriterionVerification {
+                        criterion_key: c1.encode(),
+                        passed: true,
+                        evidence: Some("exit 0".into()),
+                        binding: c1.binding.clone(),
+                    },
+                    CriterionVerification {
+                        criterion_key: c2.encode(),
+                        passed: false,
+                        evidence: Some("required check 'rust_test' failed".into()),
+                        binding: c2.binding.clone(),
+                    },
+                ],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Passed,
+                1,
+            )
+            .unwrap();
+        let err = s
+            .complete_verified_task(t.task_id, rev, record)
+            .unwrap_err();
+        assert!(
+            matches!(err, TaskError::CriteriaNotCovered { ref missing, .. } if missing == &vec![c2.encode()]),
+            "{err}"
+        );
+        assert_eq!(
+            s.get_task(t.task_id).unwrap().unwrap().state,
+            TaskState::Verifying,
+            "a failed required criterion must block the task"
+        );
+    }
+
+    #[test]
+    fn proof_record_cannot_be_reused_after_check_basis_change() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let t = s
+            .create_task(criteria_task(&s, s.task_id().unwrap(), vec!["c1".into()]))
+            .unwrap();
+        let rev = s.task_revision(t.task_id).unwrap();
+        let basis = proof_basis_fixture(t.task_id.raw(), rev.raw(), "check-basis-a");
+        let (fp, cref) = fingerprint_with_basis(&basis, rev);
+        let record = s
+            .create_verification_record_with_evidence(
+                t.task_id,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Passed,
+                1,
+                Some(fp),
+                Some(cref),
+            )
+            .unwrap();
+        assert!(s
+            .verification_record_reusable(record, &basis)
+            .unwrap()
+            .is_allowed());
+        // A different check (id) basis: same criteria, same snapshot — the
+        // record must NOT be reusable.
+        let changed = proof_basis_fixture(t.task_id.raw(), rev.raw(), "check-basis-b");
+        match s.verification_record_reusable(record, &changed).unwrap() {
+            ProofReuse::Refused { reason } => {
+                assert!(reason.contains("identical basis"), "{reason}")
+            }
+            ProofReuse::Allowed => panic!("a moved check basis must refuse reuse"),
+        }
+        // A legacy record without a basis is never reusable either.
+        let legacy = passed_record(&s, t.task_id, &["c1".into()]);
+        assert!(!s
+            .verification_record_reusable(legacy, &basis)
+            .unwrap()
+            .is_allowed());
+    }
+
+    #[test]
+    fn proof_record_cannot_be_reused_after_tool_version_change() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let t = s
+            .create_task(criteria_task(&s, s.task_id().unwrap(), vec!["c1".into()]))
+            .unwrap();
+        let rev = s.task_revision(t.task_id).unwrap();
+        let mut basis = proof_basis_fixture(t.task_id.raw(), rev.raw(), "check-basis-a");
+        let (fp, cref) = fingerprint_with_basis(&basis, rev);
+        let record = s
+            .create_verification_record_with_evidence(
+                t.task_id,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Passed,
+                1,
+                Some(fp),
+                Some(cref),
+            )
+            .unwrap();
+        assert!(s
+            .verification_record_reusable(record, &basis)
+            .unwrap()
+            .is_allowed());
+        // The ONLY change is a tool version: still a different basis.
+        basis.tool_versions.push(ToolVersion {
+            tool: "rustup-toolchain".into(),
+            version: "nightly-2099".into(),
+        });
+        assert!(!s
+            .verification_record_reusable(record, &basis)
+            .unwrap()
+            .is_allowed());
+    }
+
+    fn proof_basis_fixture(task_id: u64, revision: u64, check: &str) -> ProofBasis {
+        ProofBasis {
+            task_id,
+            task_revision: revision,
+            task_contract_digest: "ab".repeat(32),
+            candidate_snapshot: "cd".repeat(32),
+            integration_sources_digest: "ef".repeat(32),
+            changed_files_digest: "12".repeat(32),
+            checks: vec![ProofBasisCheck {
+                check_id: "rust_check".into(),
+                program: check.into(),
+                args: vec!["--workspace".into()],
+            }],
+            verification_impl_version: "faktor-agent/0.1.0".into(),
+            tool_versions: vec![ToolVersion {
+                tool: "faktor-agent".into(),
+                version: "0.1.0".into(),
+            }],
+            env_projection: vec![("RUSTFLAGS".into(), "<absent>".into())],
+            instruction_epoch: Some(3),
+            criteria: vec![ProofBasisCriterion {
+                criterion_id: "c1".into(),
+                binding_digest: None,
+            }],
+            reviewer_digest: None,
+            evidence_digests: vec![],
+        }
+    }
+
+    fn fingerprint_with_basis(
+        basis: &ProofBasis,
+        rev: TaskRevision,
+    ) -> (EnvironmentFingerprint, CandidateProofRef) {
+        let mut fp = fingerprint_fixture();
+        fp.proof_basis_digest = Some(basis.digest());
+        let mut cref = candidate_fixture(rev);
+        cref.run_id = None;
+        (fp, cref)
     }
 }

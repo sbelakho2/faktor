@@ -56,7 +56,7 @@ use std::time::Duration;
 
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::completion::{CompletionStep, CompletionStepOutcome};
-use faktor_core::id::TaskId;
+use faktor_core::id::{TaskId, VerificationRecordId};
 use faktor_git::{CommitOutcome, PushOutcome, WorktreeManager};
 use faktor_session::{SessionHandle, MAX_COMPLETION_STEP_DETAIL};
 use faktor_terminal::{EnvSpec, ProcessOwner, ProcessSupervisor, SpawnConfig};
@@ -224,6 +224,15 @@ impl CompletionStepReport {
             .find(|r| r.status == CompletionStepOutcome::Failed)
             .map(|r| r.step)
     }
+
+    /// The first invalidated step, if any (the verified root moved; the run
+    /// must be re-integrated and re-verified before the step may run).
+    pub fn invalidated_step(&self) -> Option<CompletionStep> {
+        self.records
+            .iter()
+            .find(|r| r.status == CompletionStepOutcome::Invalidated)
+            .map(|r| r.step)
+    }
 }
 
 /// Typed failure of the runner's OWN plumbing (contract/ledger reads, config
@@ -279,6 +288,11 @@ pub struct CompletionStepRunner {
     supervisor: Arc<ProcessSupervisor>,
     egress: Arc<dyn EgressPolicy>,
     config: CompletionStepsConfig,
+    /// Test-only seam: invoked immediately BEFORE the per-step proof
+    /// revalidation, so adversarial tests can inject an edit at the exact
+    /// verification/step boundary. Never compiled in production.
+    #[cfg(test)]
+    pre_step_hook: Option<Arc<dyn Fn(CompletionStep) + Send + Sync>>,
 }
 
 impl std::fmt::Debug for CompletionStepRunner {
@@ -303,7 +317,17 @@ impl CompletionStepRunner {
             supervisor,
             egress,
             config,
+            #[cfg(test)]
+            pre_step_hook: None,
         })
+    }
+
+    /// Test-only: install a hook invoked before every step's proof
+    /// revalidation (adversarial race injection).
+    #[cfg(test)]
+    pub fn with_pre_step_hook(mut self, hook: Arc<dyn Fn(CompletionStep) + Send + Sync>) -> Self {
+        self.pre_step_hook = Some(hook);
+        self
     }
 
     pub fn config(&self) -> &CompletionStepsConfig {
@@ -389,8 +413,11 @@ impl CompletionStepRunner {
                     });
                     continue;
                 }
-                Some((CompletionStepOutcome::Skipped, _)) => {
-                    // Retryable unmet: fall through and execute again.
+                Some((CompletionStepOutcome::Skipped, _))
+                | Some((CompletionStepOutcome::Invalidated, _)) => {
+                    // Retryable unmet: fall through and execute again (the
+                    // proof revalidation decides whether the side effect may
+                    // run at all).
                 }
                 Some((CompletionStepOutcome::Failed, _)) => unreachable!("pre-scanned above"),
                 None => {}
@@ -447,6 +474,214 @@ impl CompletionStepRunner {
             }
         }
         Ok(report)
+    }
+
+    /// Execute the requested steps of the task's accepted contract ONLY
+    /// while `proof` remains the immutable completion basis of the current
+    /// task revision (P0 completion-side-effect gating).
+    ///
+    /// Before ANY step runs, [`SessionHandle::verify_completion_proof_binding`]
+    /// validates the immutable record: task/revision/status/coverage/
+    /// workspace/worktree/tree hash, the integration record's final snapshot
+    /// equal to the record's tree hash, and the CURRENT candidate root
+    /// digesting to that same tree hash. Each side effect revalidates again
+    /// IMMEDIATELY before it executes; a moved root records the step (and
+    /// every remaining requested step) `Invalidated` — a retryable refusal:
+    /// the task stays Verifying and the gate reports the unmet step, never a
+    /// terminal failure and never a silent success.
+    pub async fn run_completion_steps(
+        &self,
+        handle: &SessionHandle,
+        task_id: TaskId,
+        proof: VerificationRecordId,
+        ctx: &CompletionStepContext,
+    ) -> Result<CompletionStepReport, CompletionStepError> {
+        let Some((revision, contract)) = handle.completion_contract(task_id)? else {
+            return Ok(CompletionStepReport::default());
+        };
+        let requested = contract.requested_steps();
+        if requested.is_empty() {
+            return Ok(CompletionStepReport::default());
+        }
+        // ---- gate 1: validate the immutable proof BEFORE anything runs ----
+        if let Err(err) =
+            handle.verify_completion_proof_binding(task_id, proof, Some(ctx.root.as_path()))
+        {
+            let detail = format!(
+                "completion proof {proof} is not the current immutable basis of task {task_id}: {err}"
+            );
+            return self
+                .record_invalidated(handle, task_id, &requested, &detail)
+                .map(|records| CompletionStepReport {
+                    records,
+                    pr_url: None,
+                });
+        }
+        let rows = handle.ledger_completion_step_statuses(task_id.raw(), revision.raw())?;
+        let mut latest: BTreeMap<CompletionStep, (CompletionStepOutcome, String)> = BTreeMap::new();
+        for row in rows {
+            latest.insert(row.step, (row.status, row.detail));
+        }
+        if latest
+            .values()
+            .any(|(status, _)| *status == CompletionStepOutcome::Failed)
+        {
+            return self.terminal_report(&requested, &latest);
+        }
+        let mut report = CompletionStepReport::default();
+        for step in requested {
+            #[cfg(test)]
+            if let Some(hook) = &self.pre_step_hook {
+                hook(step);
+            }
+            // ---- gate 2: revalidate IMMEDIATELY before this side effect ----
+            if let Err(err) =
+                handle.verify_completion_proof_binding(task_id, proof, Some(ctx.root.as_path()))
+            {
+                let detail = format!("verified root invalidated before step {step:?}: {err}");
+                let remaining: Vec<CompletionStep> = contract
+                    .requested_steps()
+                    .into_iter()
+                    .filter(|s| !report.records.iter().any(|r| r.step == *s))
+                    .collect();
+                let records = self.record_invalidated(handle, task_id, &remaining, &detail)?;
+                report.records.extend(records);
+                return Ok(report);
+            }
+            match latest.get(&step) {
+                Some((CompletionStepOutcome::Succeeded, detail)) => {
+                    report.records.push(CompletionStepRecord {
+                        step,
+                        status: CompletionStepOutcome::Succeeded,
+                        detail: bounded_detail(&format!(
+                            "already succeeded (idempotent replay): {detail}"
+                        )),
+                        seq: None,
+                    });
+                    continue;
+                }
+                Some((CompletionStepOutcome::Skipped, _))
+                | Some((CompletionStepOutcome::Invalidated, _)) => {}
+                Some((CompletionStepOutcome::Failed, _)) => unreachable!("pre-scanned above"),
+                None => {}
+            }
+            let execution = self.execute(step, ctx).await;
+            let detail = bounded_detail(execution.detail());
+            let seq = handle
+                .set_completion_step_status(task_id, step, execution.status(), &detail)
+                .map_err(CompletionStepError::Session)?;
+            if let StepExecution::Succeeded {
+                pr_url: Some(url), ..
+            } = &execution
+            {
+                report.pr_url = Some(url.clone());
+            }
+            report.records.push(CompletionStepRecord {
+                step,
+                status: execution.status(),
+                detail,
+                seq: Some(seq),
+            });
+            if execution.status() == CompletionStepOutcome::Failed {
+                break;
+            }
+        }
+        if let Some(failed) = report.failed_step() {
+            let failed = failed.tag();
+            let remaining: Vec<CompletionStep> = contract
+                .requested_steps()
+                .into_iter()
+                .filter(|s| !report.records.iter().any(|r| r.step == *s))
+                .collect();
+            for step in remaining {
+                let detail = bounded_detail(&format!(
+                    "not attempted: {failed} failed (terminal for this contract revision)"
+                ));
+                let seq = handle
+                    .set_completion_step_status(
+                        task_id,
+                        step,
+                        CompletionStepOutcome::Skipped,
+                        &detail,
+                    )
+                    .map_err(CompletionStepError::Session)?;
+                report.records.push(CompletionStepRecord {
+                    step,
+                    status: CompletionStepOutcome::Skipped,
+                    detail,
+                    seq: Some(seq),
+                });
+            }
+        }
+        Ok(report)
+    }
+
+    /// Record every named step `Invalidated` with the shared reason and
+    /// return the records in gate order.
+    fn record_invalidated(
+        &self,
+        handle: &SessionHandle,
+        task_id: TaskId,
+        steps: &[CompletionStep],
+        reason: &str,
+    ) -> Result<Vec<CompletionStepRecord>, CompletionStepError> {
+        let mut records = Vec::with_capacity(steps.len());
+        for step in steps {
+            let detail = bounded_detail(reason);
+            let seq = handle
+                .set_completion_step_status(
+                    task_id,
+                    *step,
+                    CompletionStepOutcome::Invalidated,
+                    &detail,
+                )
+                .map_err(CompletionStepError::Session)?;
+            records.push(CompletionStepRecord {
+                step: *step,
+                status: CompletionStepOutcome::Invalidated,
+                detail,
+                seq: Some(seq),
+            });
+        }
+        Ok(records)
+    }
+
+    /// The deterministic report of a contract revision already carrying a
+    /// terminal `Failed` row: nothing is re-executed and nothing new is
+    /// written.
+    fn terminal_report(
+        &self,
+        requested: &[CompletionStep],
+        latest: &BTreeMap<CompletionStep, (CompletionStepOutcome, String)>,
+    ) -> Result<CompletionStepReport, CompletionStepError> {
+        let failed_tag = latest
+            .iter()
+            .find(|(_, (status, _))| *status == CompletionStepOutcome::Failed)
+            .map(|(step, (_, _))| step.tag())
+            .unwrap_or("a prior step");
+        Ok(CompletionStepReport {
+            records: requested
+                .iter()
+                .map(|step| {
+                    let (status, detail) = match latest.get(step) {
+                        Some((status, detail)) => (*status, detail.clone()),
+                        None => (
+                            CompletionStepOutcome::Skipped,
+                            format!(
+                                "not attempted: {failed_tag} failed terminally under this contract revision"
+                            ),
+                        ),
+                    };
+                    CompletionStepRecord {
+                        step: *step,
+                        status,
+                        detail,
+                        seq: None,
+                    }
+                })
+                .collect(),
+            pr_url: None,
+        })
     }
 
     async fn execute(&self, step: CompletionStep, ctx: &CompletionStepContext) -> StepExecution {
@@ -1857,6 +2092,293 @@ mod tests {
         assert!(
             validate_pr_argv("gh pr create --head {branch}; rm -rf /", &[]).is_ok(),
             "typed argv never splits or shells: spaces/metacharacters are plain characters"
+        );
+    }
+
+    // ------------------- verified-root race injection (P0 completion gates)
+
+    fn repo_tree(repo: &Path) -> String {
+        faktor_session::root_snapshot_digest(repo, faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES)
+            .unwrap()
+    }
+
+    /// A session whose workspace root IS `root`, with a durable integration
+    /// record whose final snapshot equals `root`'s current digest — exactly
+    /// the world an orchestrated verified run lives in.
+    fn session_bound_to_root(
+        m: &Arc<SessionManager>,
+        root: &Path,
+        goal: &str,
+        contract: Option<CompletionContract>,
+    ) -> (SessionHandle, TaskId, String) {
+        let ws = m.create_workspace(root.to_str().unwrap()).unwrap();
+        let h = m
+            .create_session(ws, "completion-race", "fake", "fake")
+            .unwrap();
+        let task_id = h.task_id().unwrap();
+        let now = h.now_ms();
+        h.create_task(Task {
+            task_id,
+            session_id: h.id(),
+            goal: goal.into(),
+            acceptance_criteria: vec![],
+            plan: vec![],
+            attachments: Vec::new(),
+            budget: TaskBudget::default(),
+            state: TaskState::Pending,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .unwrap();
+        if let Some(contract) = contract {
+            let rev = h.task_revision(task_id).unwrap();
+            h.set_completion_contract(task_id, rev, contract).unwrap();
+        }
+        let tree = repo_tree(root);
+        h.ledger_integration_record_set(&faktor_session::IntegrationRecordRow {
+            run_id: "run-race".into(),
+            task_id: task_id.raw(),
+            base_revision: None,
+            base_snapshot: None,
+            final_root: root.to_string_lossy().into_owned(),
+            final_snapshot_hash: tree.clone(),
+            integrated_files: vec![],
+            integrated_file_count: 0,
+            integrated_files_digest: String::new(),
+            conflicts: vec![],
+            conflict_count: 0,
+            sources: vec![],
+            source_count: 0,
+            sources_digest: String::new(),
+            at_ms: now,
+        })
+        .unwrap();
+        (h, task_id, tree)
+    }
+
+    fn passing_record_with_tree(
+        h: &SessionHandle,
+        task_id: TaskId,
+        tree: &str,
+    ) -> VerificationRecordId {
+        h.create_verification_record(
+            task_id,
+            Some(tree.to_string()),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+            VerificationStatus::Passed,
+            h.now_ms(),
+        )
+        .unwrap()
+    }
+
+    fn assert_task_stays_verifying_and_steps_invalidated(h: &SessionHandle, task_id: TaskId) {
+        assert_eq!(
+            h.get_task(task_id).unwrap().unwrap().state,
+            TaskState::Verifying,
+            "an invalidated completion must never complete the task"
+        );
+        // The gate reports the unmet step EITHER as Invalidated (the step
+        // itself was refused before its side effect) or as the durable
+        // snapshot mismatch of an already-succeeded step whose root moved —
+        // both are RETRYABLE refusals, never a terminal failure.
+        match h.completion_contract_gate(task_id).unwrap() {
+            CompletionContractGate::Refused(TaskError::CompletionStepNotSucceeded {
+                status,
+                ..
+            }) => assert_eq!(status, CompletionStepOutcome::Invalidated),
+            CompletionContractGate::Refused(TaskError::CompletionStepSnapshotMismatch {
+                ..
+            }) => {}
+            other => panic!("expected a retryable refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_edit_after_verification_before_commit_blocks_the_commit() {
+        let (dir, m) = manager();
+        let repo = init_repo(dir.path());
+        std::fs::write(repo.join("feature.txt"), "verified content\n").unwrap();
+        let (h, task_id, tree) =
+            session_bound_to_root(&m, &repo, "race commit", Some(contract(true, false, false)));
+        drive_to_verifying(&h, task_id);
+        let proof = passing_record_with_tree(&h, task_id, &tree);
+        // The injected edit lands AFTER the proof was minted and BEFORE the
+        // commit step runs: the per-step revalidation must refuse.
+        let repo_hook = repo.clone();
+        let runner = runner(dir.path(), CompletionStepsConfig::default(), allow_all())
+            .with_pre_step_hook(Arc::new(move |step| {
+                if step == CompletionStep::Commit {
+                    std::fs::write(repo_hook.join("feature.txt"), "injected edit\n").unwrap();
+                }
+            }));
+        let report = runner
+            .run_completion_steps(&h, task_id, proof, &ctx(&repo, "race commit"))
+            .await
+            .unwrap();
+        assert_eq!(
+            report.outcome_of(CompletionStep::Commit),
+            Some(CompletionStepOutcome::Invalidated),
+            "{report:?}"
+        );
+        // No commit happened: the init commit is the only one.
+        let log = git_output(&repo, &["log", "--oneline"]);
+        assert_eq!(log.lines().count(), 1, "no injected commit may land: {log}");
+        assert_task_stays_verifying_and_steps_invalidated(&h, task_id);
+    }
+
+    #[tokio::test]
+    async fn injected_edit_after_commit_before_push_blocks_the_push() {
+        let (dir, m) = manager();
+        let repo = init_repo(dir.path());
+        let bare = add_bare_remote(dir.path(), &repo);
+        std::fs::write(repo.join("feature.txt"), "verified content\n").unwrap();
+        let (h, task_id, tree) =
+            session_bound_to_root(&m, &repo, "race push", Some(contract(true, true, false)));
+        drive_to_verifying(&h, task_id);
+        let proof = passing_record_with_tree(&h, task_id, &tree);
+        let repo_hook = repo.clone();
+        let runner = runner(dir.path(), CompletionStepsConfig::default(), allow_all())
+            .with_pre_step_hook(Arc::new(move |step| {
+                if step == CompletionStep::Push {
+                    std::fs::write(repo_hook.join("feature.txt"), "injected after commit\n")
+                        .unwrap();
+                }
+            }));
+        let report = runner
+            .run_completion_steps(&h, task_id, proof, &ctx(&repo, "race push"))
+            .await
+            .unwrap();
+        assert_eq!(
+            report.outcome_of(CompletionStep::Commit),
+            Some(CompletionStepOutcome::Succeeded),
+            "{report:?}"
+        );
+        assert_eq!(
+            report.outcome_of(CompletionStep::Push),
+            Some(CompletionStepOutcome::Invalidated),
+            "{report:?}"
+        );
+        // The commit landed; the push must NOT have reached the remote.
+        assert_eq!(git_output(&repo, &["log", "--oneline"]).lines().count(), 2);
+        let pushed = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "main"])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        assert!(
+            pushed.status.code() != Some(0),
+            "the remote must have no branch after an invalidated push"
+        );
+        assert_task_stays_verifying_and_steps_invalidated(&h, task_id);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn injected_edit_after_push_before_pr_blocks_the_pr() {
+        let (dir, m) = manager();
+        let repo = init_repo(dir.path());
+        add_bare_remote(dir.path(), &repo);
+        std::fs::write(repo.join("feature.txt"), "verified content\n").unwrap();
+        let marker = dir.path().join("pr-ran.marker");
+        let script = fake_pr_script(
+            dir.path(),
+            &format!(
+                "echo ran > {}\necho https://example.test/pr/9",
+                marker.display()
+            ),
+        );
+        let config = CompletionStepsConfig {
+            pr_command: Some(format!("{} {{branch}}", script.display())),
+            ..Default::default()
+        };
+        let (h, task_id, tree) =
+            session_bound_to_root(&m, &repo, "race pr", Some(contract(true, true, true)));
+        drive_to_verifying(&h, task_id);
+        let proof = passing_record_with_tree(&h, task_id, &tree);
+        let repo_hook = repo.clone();
+        let runner =
+            runner(dir.path(), config, allow_all()).with_pre_step_hook(Arc::new(move |step| {
+                if step == CompletionStep::Pr {
+                    std::fs::write(repo_hook.join("feature.txt"), "injected after push\n").unwrap();
+                }
+            }));
+        let report = runner
+            .run_completion_steps(&h, task_id, proof, &ctx(&repo, "race pr"))
+            .await
+            .unwrap();
+        assert_eq!(
+            report.outcome_of(CompletionStep::Pr),
+            Some(CompletionStepOutcome::Invalidated),
+            "{report:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "the PR command must not run against a moved root"
+        );
+        assert!(report.pr_url.is_none());
+        let bare = dir.path().join("remote.git");
+        let head = git_output(&repo, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            git_output(&bare, &["rev-parse", "main"]),
+            head,
+            "the push that ran before the edit stays landed"
+        );
+        assert_task_stays_verifying_and_steps_invalidated(&h, task_id);
+    }
+
+    #[tokio::test]
+    async fn crash_after_push_before_status_row_is_idempotent_via_remote_tracking() {
+        let (dir, m) = manager();
+        let repo = init_repo(dir.path());
+        let bare = add_bare_remote(dir.path(), &repo);
+        std::fs::write(repo.join("work.txt"), "landed before the crash\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "faktor: land the work"]);
+        // The commit+push happened, but the durable step row never landed
+        // (the "crash"). The runner must detect the pushed HEAD through the
+        // remote-tracking ref and record Succeeded WITHOUT pushing again.
+        git(&repo, &["push", "-q", "origin", "main"]);
+        let (h, task_id, tree) = session_bound_to_root(
+            &m,
+            &repo,
+            "crash after push",
+            Some(contract(false, true, false)),
+        );
+        drive_to_verifying(&h, task_id);
+        let proof = passing_record_with_tree(&h, task_id, &tree);
+        let runner = runner(dir.path(), CompletionStepsConfig::default(), allow_all());
+        let report = runner
+            .run_completion_steps(&h, task_id, proof, &ctx(&repo, "crash after push"))
+            .await
+            .unwrap();
+        assert_eq!(
+            report.outcome_of(CompletionStep::Push),
+            Some(CompletionStepOutcome::Succeeded),
+            "{report:?}"
+        );
+        let detail = &report
+            .records
+            .iter()
+            .find(|r| r.step == CompletionStep::Push)
+            .unwrap()
+            .detail;
+        assert!(detail.contains("idempotent replay"), "{detail}");
+        let head = git_output(&repo, &["rev-parse", "HEAD"]);
+        assert_eq!(git_output(&bare, &["rev-parse", "main"]), head);
+        let rows = step_rows(&h, task_id);
+        assert_eq!(
+            rows.len(),
+            1,
+            "one durable row, no duplicate push: {rows:?}"
+        );
+        assert_eq!(rows[0].status, CompletionStepOutcome::Succeeded);
+        assert_eq!(
+            h.completion_contract_gate(task_id).unwrap(),
+            CompletionContractGate::Satisfied
         );
     }
 }

@@ -52,13 +52,17 @@ impl CompletionStep {
 /// The durable outcome of one requested step. `Succeeded` is the only
 /// status that satisfies the gate; a `Failed` row is a TERMINAL refusal
 /// (the run can never certify under its contract revision), `Skipped` is a
-/// non-succeeded refusal that stays retryable like a missing row.
+/// non-succeeded refusal that stays retryable like a missing row, and
+/// `Invalidated` (the verified root moved after verification) is a
+/// retryable refusal too: the run must be re-integrated and re-verified
+/// before the step may run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompletionStepOutcome {
     Succeeded,
     Failed,
     Skipped,
+    Invalidated,
 }
 
 impl CompletionStepOutcome {
@@ -68,6 +72,7 @@ impl CompletionStepOutcome {
             CompletionStepOutcome::Succeeded => "succeeded",
             CompletionStepOutcome::Failed => "failed",
             CompletionStepOutcome::Skipped => "skipped",
+            CompletionStepOutcome::Invalidated => "invalidated",
         }
     }
 }

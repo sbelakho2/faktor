@@ -54,6 +54,7 @@ use faktor_agent::AgentRuntime;
 use faktor_core::attachment::AttachmentId;
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::completion::CompletionContract;
+use faktor_core::hash::FileHash;
 use faktor_core::id::{OpId, SessionId, TaskId, VerificationRecordId, WorktreeId};
 use faktor_core::state::{TaskState, TaskTransition, VerificationStatus};
 use faktor_session::{
@@ -81,6 +82,16 @@ pub const TASK_RUN_ROW_KIND: &str = "taskexec_run";
 /// Bound on a linkage-row value (the memory-fact store caps values at 4096
 /// bytes; we refuse loudly before the write instead of losing the row).
 const MAX_TASK_RUN_ROW_BYTES: usize = 3500;
+/// Entry cap of ONE run-base copy (a larger owner tree fails the run loudly).
+const MAX_RUN_BASE_ENTRIES: usize = 100_000;
+/// Total-byte cap of ONE run-base copy.
+const MAX_RUN_BASE_BYTES: u64 = 1024 * 1024 * 1024;
+/// Directories the run base never copies (VCS bookkeeping is not content;
+/// the root snapshot digest skips exactly these).
+const RUN_BASE_SKIP_DIRS: &[&str] = &[".git", ".hg", ".svn"];
+/// Bounded retries of the stable run-base copy before a typed
+/// [`ExecError::WorkspaceDrift`].
+const RUN_BASE_COPY_ATTEMPTS: usize = 3;
 
 /// How one [`TaskRunRequest`] executes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -392,17 +403,57 @@ pub struct SettlementOutcome {
     pub finalize: Option<ShadowFinalize>,
 }
 
-/// The materialized integration of one orchestrated run's isolated mutating
-/// children (the exact inputs the root verification binds to).
+/// One staged child change set of a prepared run integration: the child,
+/// its isolated root, the STAGED candidate and the content digest of that
+/// root at staging time.
 #[derive(Debug, Clone)]
-struct RunIntegration {
-    /// The full sorted union of the staged change-set paths (the derived
-    /// check set's change input).
-    changed: Vec<String>,
-    /// The ACTUAL final integration root (owner checkout).
-    final_root: PathBuf,
-    /// The final root's snapshot digest the verification record binds.
-    final_snapshot: String,
+pub struct PreparedChildChangeSet {
+    pub child_id: String,
+    pub child_root: PathBuf,
+    pub change_set: crate::runtime::merge::ChangeSet,
+    pub candidate_root_hash: String,
+}
+
+/// The prepared integration candidate of one orchestrated run — composed
+/// from the IMMUTABLE run base and verified BEFORE any owner mutation. The
+/// verifier consumes `candidate_root`/`candidate_snapshot`; only the landing
+/// phase may touch `owner_root`.
+#[derive(Debug, Clone)]
+pub struct PreparedRunIntegration {
+    pub run_id: String,
+    pub task_id: TaskId,
+    pub owner_root: PathBuf,
+    pub base_root: PathBuf,
+    pub candidate_root: PathBuf,
+    /// The run base's snapshot digest (the owner equality anchor).
+    pub base_snapshot: String,
+    /// The COMPOSED candidate root's snapshot digest (what verification
+    /// binds and what the landed owner must equal).
+    pub candidate_snapshot: String,
+    /// The full sorted union of staged change-set paths.
+    pub changed: Vec<String>,
+    pub sources: Vec<faktor_session::IntegrationSourceRow>,
+    pub sources_digest: String,
+    pub staged: Vec<PreparedChildChangeSet>,
+}
+
+/// A passing verification of one [`PreparedRunIntegration`]: the proof the
+/// landing phase consumes (typed refusal when the verifier cannot run).
+#[derive(Debug, Clone)]
+pub struct VerifiedRunIntegration {
+    pub prepared: PreparedRunIntegration,
+    pub record: VerificationRecordId,
+}
+
+/// The materialized landing of one verified integration: owner now holds the
+/// candidate content, with a FRESH whole-root digest equal to the verified
+/// candidate snapshot.
+#[derive(Debug, Clone)]
+pub struct LandedRunIntegration {
+    pub prepared: PreparedRunIntegration,
+    pub record: VerificationRecordId,
+    /// The fresh whole-root digest taken AFTER the landing.
+    pub landed_snapshot: String,
 }
 
 /// One active orchestrated execution of the executor (audits 7/8/21/22:
@@ -506,6 +557,11 @@ pub struct TaskExecutor {
     /// egress policy). `None` runner = no completion step is ever invoked;
     /// an uncontracted run never touches this field beyond `None`.
     completion_steps: Mutex<CompletionStepsWiring>,
+    /// Deterministic settlement crash seam (adversarial tests only): the
+    /// NEXT settlement (or run-base creation) returns
+    /// [`ExecError::InjectedCrashSeam`] at the FIRST matching boundary,
+    /// leaving every durable row exactly as a real crash would. One-shot.
+    settlement_seam: Mutex<Option<(CrashSeam, bool)>>,
 }
 
 /// The completion-step wiring of one executor: the configured template
@@ -583,7 +639,119 @@ impl TaskExecutor {
             mode,
             run_roots,
             completion_steps: Mutex::new(CompletionStepsWiring::default()),
+            settlement_seam: Mutex::new(None),
         })
+    }
+
+    /// Install (or clear) the ONE-SHOT settlement crash seam (tests). The
+    /// seam fires at the FIRST matching boundary of the next settlement and
+    /// is consumed; clearing it lets the recovery pass run.
+    pub fn set_settlement_crash_seam(&self, seam: Option<CrashSeam>) {
+        *self
+            .settlement_seam
+            .lock()
+            .expect("settlement-seam lock poisoned") = seam.map(|s| (s, false));
+    }
+
+    /// Consume the configured settlement seam when `seam` matches it. The
+    /// first match fires exactly once; later calls (the recovery pass) pass.
+    fn check_settlement_seam(&self, seam: CrashSeam) -> Result<(), ExecError> {
+        let mut guard = self
+            .settlement_seam
+            .lock()
+            .expect("settlement-seam lock poisoned");
+        if let Some((configured, fired)) = guard.as_mut() {
+            if *configured == seam && !*fired {
+                *fired = true;
+                return Err(ExecError::InjectedCrashSeam(format!("{seam:?}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Create (once) the IMMUTABLE run base of one orchestrated run (point
+    /// 2): a stable copy of the owner root accepted only when
+    /// `before == after == copied`, with bounded retries and a typed
+    /// [`ExecError::WorkspaceDrift`] when the owner keeps moving. The
+    /// durable [`faktor_session::ledger::RunBaseRecord`] is written BEFORE
+    /// the first child spawn; a replay converges on the recorded base and
+    /// refuses a run whose owner/base moved away from it.
+    fn create_run_base(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        run_id: &str,
+        owner_root: &std::path::Path,
+        base_root: &std::path::Path,
+        workspace_id: u64,
+        worktree_id: u64,
+    ) -> Result<faktor_session::ledger::RunBaseRecord, ExecError> {
+        let digest = |root: &std::path::Path| -> Result<String, ExecError> {
+            faktor_session::root_snapshot_digest(root, faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES)
+                .map_err(|e| {
+                    ExecError::WorkspaceDrift(format!("root snapshot of {}: {e}", root.display()))
+                })
+        };
+        if let Some(existing) = handle
+            .ledger_run_base_get(run_id)
+            .map_err(|e| ExecError::Internal(format!("run base read: {e}")))?
+        {
+            let copied = digest(base_root)?;
+            let owner = digest(owner_root)?;
+            if copied == existing.snapshot_hash && owner == existing.snapshot_hash {
+                return Ok(existing);
+            }
+            return Err(ExecError::WorkspaceDrift(format!(
+                "run {run_id} already recorded base {} but the owner digests to {owner} and the base copy to {copied}; a new generation is never silently minted",
+                existing.snapshot_hash
+            )));
+        }
+        let mut detail = String::new();
+        for attempt in 1..=RUN_BASE_COPY_ATTEMPTS {
+            if base_root.exists() {
+                std::fs::remove_dir_all(base_root).map_err(|e| {
+                    ExecError::Internal(format!("run base reset {}: {e}", base_root.display()))
+                })?;
+            }
+            std::fs::create_dir_all(base_root).map_err(|e| {
+                ExecError::Internal(format!("run base dir {}: {e}", base_root.display()))
+            })?;
+            let before = digest(owner_root)?;
+            let manifest = faktor_fs::copy_tree_skip(
+                owner_root,
+                base_root,
+                MAX_RUN_BASE_ENTRIES,
+                MAX_RUN_BASE_BYTES,
+                RUN_BASE_SKIP_DIRS,
+            )
+            .map_err(|e| ExecError::from_fs("run base copy", owner_root, e))?;
+            let after = digest(owner_root)?;
+            let copied = digest(base_root)?;
+            if before == after && after == copied {
+                let rows: Vec<String> = manifest
+                    .iter()
+                    .map(|e| format!("{}|{}", e.path.to_string_lossy(), e.hash.to_hex()))
+                    .collect();
+                let record = faktor_session::ledger::RunBaseRecord {
+                    run_id: run_id.to_string(),
+                    workspace_id,
+                    worktree_id,
+                    snapshot_hash: copied,
+                    manifest_digest: stable_list_digest(&rows),
+                    root: base_root.to_string_lossy().into_owned(),
+                    created_ms: handle.now_ms(),
+                };
+                handle
+                    .ledger_run_base_set(&record)
+                    .map_err(|e| ExecError::Internal(format!("run base record write: {e}")))?;
+                return Ok(record);
+            }
+            detail = format!("attempt {attempt}: before={before} after={after} copied={copied}");
+        }
+        let _ = std::fs::remove_dir_all(base_root);
+        Err(ExecError::WorkspaceDrift(format!(
+            "owner root {} did not stabilize during the run-base copy after {RUN_BASE_COPY_ATTEMPTS} attempts ({detail}); refusing to derive children from a drifting generation",
+            owner_root.display()
+        )))
     }
 
     /// Configure the PR/push/commit execution policy of the completion-step
@@ -1225,25 +1393,15 @@ impl TaskExecutor {
                 "session {parent} carries no provider/model; cannot orchestrate"
             )));
         }
-        // The orchestrated run's ROOT book (audit 9/H + criteria): when the
-        // request carries a monetary cap OR acceptance criteria, the parent
-        // session gets a task row for the run (seeded like the single-item
-        // path, re-goaling/patching a live row; a terminal row is frozen).
-        // Child budget scopes enroll under THIS row, so the run's cap bounds
-        // its children's collective spend once children carry their own cost
-        // caps. Without a cap, criteria, binary attachments or a non-default
-        // completion contract no root row is created — previous-wave
-        // behavior stays byte-identical.
-        if req.max_cost_micro.is_some()
-            || !req.criteria.is_empty()
-            || !req.attachments.is_empty()
-            || req.completion_contract.is_some_and(|c| !c.is_default())
+        // Point 7: EVERY orchestrated run owns a durable ROOT task row,
+        // created (or re-goaled) BEFORE the first child spawn or model call.
+        // There is no conditional concept and no settlement path for a run
+        // without a root row to certify; a terminal row stays frozen.
+        let task_id = handle.task_id()?;
         {
-            let task_id = handle.task_id()?;
             let now = handle.now_ms();
             let goal = truncate_bytes(&req.goal, MAX_TASK_GOAL_BYTES);
-            let existing = handle.get_task(task_id)?;
-            match existing {
+            match handle.get_task(task_id)? {
                 Some(t) if t.state.is_terminal() => {
                     return Err(ExecError::Conflict(format!(
                         "session task {task_id} is terminal ({:?}); its row is frozen once certified — start the task on a fresh session",
@@ -1251,28 +1409,25 @@ impl TaskExecutor {
                     )));
                 }
                 Some(_) => {
-                    if !req.criteria.is_empty() || !req.attachments.is_empty() {
-                        handle
-                            .update_task(
-                                task_id,
-                                faktor_session::TaskPatch {
-                                    acceptance_criteria: if req.criteria.is_empty() {
-                                        None
-                                    } else {
-                                        Some(req.criteria.clone())
-                                    },
-                                    attachments: if req.attachments.is_empty() {
-                                        None
-                                    } else {
-                                        Some(req.attachments.clone())
-                                    },
-                                    ..Default::default()
+                    handle
+                        .update_task(
+                            task_id,
+                            faktor_session::TaskPatch {
+                                goal: Some(goal.clone()),
+                                acceptance_criteria: if req.criteria.is_empty() {
+                                    None
+                                } else {
+                                    Some(req.criteria.clone())
                                 },
-                            )
-                            .map_err(|e| {
-                                ExecError::Internal(format!("root task row criteria: {e}"))
-                            })?;
-                    }
+                                attachments: if req.attachments.is_empty() {
+                                    None
+                                } else {
+                                    Some(req.attachments.clone())
+                                },
+                                ..Default::default()
+                            },
+                        )
+                        .map_err(|e| ExecError::Internal(format!("root task row update: {e}")))?;
                 }
                 None => {
                     handle
@@ -1291,15 +1446,15 @@ impl TaskExecutor {
                         .map_err(|e| ExecError::Internal(format!("root task row seed: {e}")))?;
                 }
             }
-            if let Some(max_cost_micro) = req.max_cost_micro {
-                faktor_session::DurableBudgetLedger::new(self.session.clone())
-                    .set_task_max_cost(parent, task_id, Some(max_cost_micro))
-                    .map_err(|e| ExecError::Conflict(format!("root task cost cap seed: {e}")))?;
-            }
-            // P2 record-first: the run's contract lands durably BEFORE any
-            // child session (its first model call) is spawned.
-            record_completion_contract(&handle, task_id, req.completion_contract)?;
         }
+        if let Some(max_cost_micro) = req.max_cost_micro {
+            faktor_session::DurableBudgetLedger::new(self.session.clone())
+                .set_task_max_cost(parent, task_id, Some(max_cost_micro))
+                .map_err(|e| ExecError::Conflict(format!("root task cost cap seed: {e}")))?;
+        }
+        // P2 record-first: the run's contract lands durably BEFORE any child
+        // session (its first model call) is spawned.
+        record_completion_contract(&handle, task_id, req.completion_contract)?;
         let plan = req.plan_for_validation();
         let mut specs = Vec::with_capacity(req.work_items.len());
         for w in &req.work_items {
@@ -1343,6 +1498,30 @@ impl TaskExecutor {
         } else {
             req.isolated_root.clone()
         };
+        // Point 2: the IMMUTABLE run base is created BEFORE the first child
+        // spawn — a stable copy of the owner root at run start (before ==
+        // after == copied, bounded retries, typed WorkspaceDrift). Every
+        // isolated child and the integration candidate derive from THIS
+        // generation; the live owner is never a staging source.
+        let run_exec_dir = isolated_root.join(&run_id);
+        std::fs::create_dir_all(&run_exec_dir)
+            .map_err(|e| ExecError::Internal(format!("run exec dir {run_exec_dir:?}: {e}")))?;
+        let base_root = run_exec_dir.join("base");
+        if let Err(e) = self.create_run_base(
+            &handle,
+            &run_id,
+            &owner_root,
+            &base_root,
+            row.workspace_id.raw(),
+            row.worktree_id.raw(),
+        ) {
+            self.clear_active_if(parent, &run_id);
+            return Err(e);
+        }
+        if let Err(e) = self.check_settlement_seam(CrashSeam::AfterRunBaseRecorded) {
+            self.clear_active_if(parent, &run_id);
+            return Err(e);
+        }
         let orch = self.orchestrator.clone();
         let exec = self.clone();
         let owner = super::OwnerContext {
@@ -1441,6 +1620,76 @@ impl TaskExecutor {
             Some(root) => root,
             None => self.owner_root_of(parent, &handle)?,
         };
+        self.run_completion_steps_at(parent, root).await
+    }
+
+    /// The steps of a VERIFIED orchestrated landing: execute the accepted
+    /// contract against the LANDED owner root after the whole-root equality
+    /// proof holds. The durable verification fact + record were written by
+    /// the verify phase; the fail-closed guard is unchanged.
+    pub async fn run_completion_steps_against_proof(
+        &self,
+        parent: SessionId,
+        landed: &LandedRunIntegration,
+    ) -> Result<Option<CompletionStepReport>, ExecError> {
+        let handle = self
+            .session
+            .get_session(parent)?
+            .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        let current = faktor_session::root_snapshot_digest(
+            &landed.prepared.owner_root,
+            faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES,
+        )
+        .map_err(|e| ExecError::WorkspaceDrift(format!("landed root snapshot: {e}")))?;
+        if current != landed.landed_snapshot
+            || landed.landed_snapshot != landed.prepared.candidate_snapshot
+        {
+            return Err(ExecError::WorkspaceDrift(format!(
+                "completion steps refused: owner root {} no longer equals the verified candidate snapshot {}",
+                landed.prepared.owner_root.display(),
+                landed.prepared.candidate_snapshot
+            )));
+        }
+        if !verification_passed(&handle) {
+            return Ok(None);
+        }
+        self.run_completion_steps_at(parent, landed.prepared.owner_root.clone())
+            .await
+    }
+
+    /// The shared completion-step body: contract lookup, terminal/guard
+    /// checks and the runner invocation against one explicit root.
+    async fn run_completion_steps_at(
+        &self,
+        parent: SessionId,
+        root: PathBuf,
+    ) -> Result<Option<CompletionStepReport>, ExecError> {
+        let handle = self
+            .session
+            .get_session(parent)?
+            .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        let task_id = handle.task_id()?;
+        let Some((_revision, contract)) = handle
+            .completion_contract(task_id)
+            .map_err(|e| ExecError::Internal(format!("completion contract read: {e}")))?
+        else {
+            return Ok(None);
+        };
+        if contract.is_default() {
+            return Ok(None);
+        }
+        let Some(task) = handle
+            .get_task(task_id)
+            .map_err(|e| ExecError::Internal(format!("completion task read: {e}")))?
+        else {
+            return Ok(None);
+        };
+        if task.state.is_terminal() {
+            return Ok(None);
+        }
+        if !verification_passed(&handle) {
+            return Ok(None);
+        }
         let Some(runner) = self.completion_step_runner()? else {
             return Err(ExecError::Conflict(
                 "completion steps are requested but the daemon has no process supervisor; no step can be executed".into(),
@@ -1546,6 +1795,27 @@ impl TaskExecutor {
     /// A run that is not fully Done, or whose task row is terminal, is a
     /// deterministic no-op. Errors from the step runner are logged (the
     /// durable rows carry the typed outcome); the function itself converges.
+    /// The orchestrated arm of [`Self::settle_run`] — prepare -> verify
+    /// (candidate) -> land (owner) -> completion steps -> completion gate:
+    ///
+    /// 1. **prepare** ([`Self::prepare_run_integration`]): the run's
+    ///    IMMUTABLE base is copied into a candidate root, every Done
+    ///    mutating child stages its change set against the same generation,
+    ///    the children are precomposed (convergent-or-conflict) and applied
+    ///    to the candidate. The OWNER is never touched;
+    /// 2. **verify** ([`Self::verify_prepared_integration`]): the shared
+    ///    deterministic verification runs over the CANDIDATE root and a
+    ///    passing record bound to the candidate snapshot is created;
+    /// 3. **land** ([`Self::land_verified_integration`]): the transactional
+    ///    owner landing (record-first decisions + rollback blobs, per-path
+    ///    CAS applies, whole-root equality check);
+    /// 4. **completion steps against the proof** and the durable completion
+    ///    gate (`complete_verified_task`).
+    ///
+    /// A run that is not fully Done, or whose task row is terminal, is a
+    /// deterministic no-op. Errors from the step runner are logged (the
+    /// durable rows carry the typed outcome); preparation/landing refusals
+    /// propagate typed.
     async fn settle_orchestrated(
         self: &Arc<Self>,
         parent: SessionId,
@@ -1582,19 +1852,47 @@ impl TaskExecutor {
             .filter(|s| s.spawn)
             .map(|s| s.item_id)
             .collect();
-        let all_done = spawn_items.iter().all(|item| {
-            rows.iter()
-                .any(|r| &r.item_id == item && r.state == ChildState::Done)
-        });
         let merge_proposals: Vec<String> = rows
             .iter()
             .filter(|r| r.ownership == faktor_session::child::ChildOwnership::IsolatedWorktree)
             .map(|r| r.child_id.clone())
             .collect();
-        // The run's integration/finalize is never automatic: no shadow is
-        // ever live for an orchestrated run (multi-item runs never shadow);
-        // the finalize read is kept so a stale row still settles.
         let finalize = self.finalize_shadow_run(parent)?;
+        // Point 8: a tournament run lands through THIS SAME pipeline once
+        // its durable decision names a winner; until then it keeps the
+        // explicit-merge proposal behavior (no auto integration).
+        let tournament = crate::tournament::Tournament::reopen(&handle)
+            .map_err(tournament_exec_error)?
+            .into_iter()
+            .find(|t| t.run_family == run_id);
+        let tournament_decided = tournament
+            .as_ref()
+            .is_some_and(|t| t.state == crate::tournament::TournamentState::Decided);
+        let tournament_aborted = tournament
+            .as_ref()
+            .is_some_and(|t| t.state == crate::tournament::TournamentState::Aborted);
+        let winner: Option<String> = tournament
+            .as_ref()
+            .filter(|_| tournament_decided)
+            .and_then(|t| t.winner.clone());
+        let eligible: Vec<&super::ChildRuntime> = if let Some(winner) = &winner {
+            rows.iter().filter(|r| &r.child_id == winner).collect()
+        } else {
+            rows.iter()
+                .filter(|r| {
+                    r.ownership == faktor_session::child::ChildOwnership::IsolatedWorktree
+                        && spawn_items.iter().any(|i| i == &r.item_id)
+                })
+                .collect()
+        };
+        let all_done = if tournament_decided {
+            !eligible.is_empty() && eligible.iter().all(|r| r.state == ChildState::Done)
+        } else {
+            spawn_items.iter().all(|item| {
+                rows.iter()
+                    .any(|r| &r.item_id == item && r.state == ChildState::Done)
+            })
+        };
         let mut outcome = SettlementOutcome {
             run_id: run_id.clone(),
             orchestrated: true,
@@ -1607,11 +1905,38 @@ impl TaskExecutor {
             finalize,
         };
         let task_id = handle.task_id()?;
-        let Some(task) = handle
+        // Point 7: the root task row is created unconditionally at start;
+        // a legacy run whose row is missing is SEEDED here — the settlement
+        // never returns early merely because no row exists.
+        let task = match handle
             .get_task(task_id)
             .map_err(|e| ExecError::Internal(format!("root task row read: {e}")))?
-        else {
-            return Ok(outcome);
+        {
+            Some(t) => t,
+            None => {
+                let plan = self.orchestrator.plan_row(parent, &run_id)?.plan;
+                let now = handle.now_ms();
+                handle
+                    .create_task(faktor_session::Task {
+                        task_id,
+                        session_id: parent,
+                        goal: truncate_bytes(&plan.goal, MAX_TASK_GOAL_BYTES),
+                        acceptance_criteria: Vec::new(),
+                        plan: Vec::new(),
+                        attachments: Vec::new(),
+                        budget: TaskBudget::default(),
+                        state: TaskState::Pending,
+                        created_ms: now,
+                        updated_ms: now,
+                    })
+                    .map_err(|e| ExecError::Internal(format!("root task row seed: {e}")))?;
+                handle
+                    .get_task(task_id)
+                    .map_err(|e| ExecError::Internal(format!("root task row re-read: {e}")))?
+                    .ok_or_else(|| {
+                        ExecError::Internal("root task row vanished after seeding".into())
+                    })?
+            }
         };
         if task.state == TaskState::VerifiedComplete {
             outcome.completed = true;
@@ -1621,30 +1946,13 @@ impl TaskExecutor {
         if !all_done || task.state.is_terminal() {
             return Ok(outcome);
         }
-        // Tournaments KEEP no auto-integration: the winner's worktree is only
-        // PROPOSED for the explicit approved-merge path, so a tournament run
-        // never integrates here and never mints root completion from the
-        // owner checkout's unrelated life.
-        let is_tournament = crate::tournament::Tournament::reopen(&handle)
-            .map_err(tournament_exec_error)?
-            .iter()
-            .any(|t| t.run_family == run_id);
-        if is_tournament {
+        if tournament.is_some() && !tournament_decided {
+            // An open/aborted tournament never auto-integrates.
+            if tournament_aborted {
+                outcome.complete = false;
+            }
             return Ok(outcome);
         }
-        // (1) Integrate EVERY mutating isolated child into the final root
-        // BEFORE any root verification. The integration record is written
-        // record-first and is the durable binding of the root verification
-        // below; a CAS conflict with the owner checkout is a typed refusal
-        // that blocks completion until the drift is resolved.
-        let integration = self.integrate_isolated_children(
-            &handle,
-            parent,
-            &run_id,
-            task_id,
-            &rows,
-            &spawn_items,
-        )?;
         if !self.route_root_to_verifying(&handle, task_id)? {
             return Ok(outcome);
         }
@@ -1653,71 +1961,43 @@ impl TaskExecutor {
             .map_err(|e| ExecError::Internal(format!("root task row read: {e}")))?
             .map(|t| t.acceptance_criteria)
             .unwrap_or_default();
-        // (2) The REAL shared verification service over the ACTUAL final
-        // integration root: checks derive from the root's component profile
-        // and the integrated change, never from a synthetic aggregate. A
-        // service that cannot run (disabled, no derivation, infra) leaves
-        // the run unverified — completion is refused, never faked.
-        let token = CancellationToken::new();
-        let run = match self
-            .orchestrator
-            .agent()
-            .verify_integrated_root(
-                &handle,
-                &integration.final_root,
-                &integration.changed,
-                &criteria,
-                &token,
-            )
+        // (1) PREPARE: compose the candidate from the immutable run base.
+        // The owner is byte-untouched by this phase.
+        let candidate_ids: Vec<String> = eligible.iter().map(|r| r.child_id.clone()).collect();
+        let prepared =
+            self.prepare_run_integration(&handle, parent, &run_id, task_id, &candidate_ids)?;
+        self.check_settlement_seam(CrashSeam::AfterCandidatePrepared)?;
+        // (2) VERIFY the CANDIDATE (never the owner).
+        let Some(proof) = self
+            .verify_prepared_integration(&handle, task_id, &criteria, &prepared)
+            .await?
+        else {
+            return Ok(outcome);
+        };
+        outcome.verification = Some(proof.record);
+        outcome.verified = true;
+        // (3) LAND the verified candidate transactionally.
+        let landed = self.land_verified_integration(&handle, &proof)?;
+        // (4) The accepted contract's steps against the landed proof.
+        outcome.steps = match self
+            .run_completion_steps_against_proof(parent, &landed)
             .await
         {
-            Ok(run) => run,
-            Err(e) => {
-                persist_root_verification_fact(&handle, "pending", &[], &integration.changed)?;
-                eprintln!(
-                    "root verification unavailable for orchestrated run {run_id}: {e}; run stays unverified"
-                );
-                return Ok(outcome);
-            }
-        };
-        let record = self.find_or_create_root_verification_record(
-            &handle,
-            task_id,
-            &criteria,
-            &integration.final_snapshot,
-            &run,
-        )?;
-        persist_root_verification_fact(
-            &handle,
-            match run.status {
-                VerificationStatus::Passed => "passed",
-                VerificationStatus::Failed => "failed",
-                _ => "pending",
-            },
-            &run.checks,
-            &integration.changed,
-        )?;
-        outcome.verification = Some(record);
-        outcome.verified = run.status == VerificationStatus::Passed;
-        if !outcome.verified {
-            return Ok(outcome);
-        }
-        // (3) The accepted contract's steps against the run's own root.
-        outcome.steps = match self.run_completion_steps(parent).await {
             Ok(report) => report,
             Err(e) => {
                 eprintln!("completion-step execution failed for orchestrated run {run_id}: {e}");
                 None
             }
         };
-        // (4) Completion gate: the durable contract gate must be satisfied
+        self.check_settlement_seam(CrashSeam::BeforeTaskCompletion)?;
+        // (5) Completion gate: the durable contract gate must be satisfied
         // (all requested step rows Succeeded) before the record is consumed.
         match handle.completion_contract_gate(task_id) {
             Ok(CompletionContractGate::Satisfied) => {
                 let revision = handle
                     .task_revision(task_id)
                     .map_err(|e| ExecError::Internal(format!("root task revision read: {e}")))?;
-                match handle.complete_verified_task(task_id, revision, record) {
+                match handle.complete_verified_task(task_id, revision, proof.record) {
                     Ok(_) => {
                         outcome.completed = true;
                     }
@@ -1742,70 +2022,128 @@ impl TaskExecutor {
         Ok(outcome)
     }
 
-    /// Integrate EVERY mutating isolated child of a settled run into the
-    /// final root through the existing [`OrchestratorRuntime::stage_child_changes`]
-    /// and approved-merge path (all staged files approved; the CAS remains the
-    /// conflict authority). Record-first: the integration record is written
-    /// BEFORE any file apply and finalized with the actual final root
-    /// snapshot after the last apply; a replay of the same run resumes the
-    /// idempotent CAS applies and converges.
-    ///
-    /// Reuse: when the task already holds a FINALIZED integration record
-    /// whose snapshot still digests to the CURRENT root and whose staged
-    /// source set is byte-identical, the integration is already in place and
-    /// nothing is applied again (the reattach convergence).
-    fn integrate_isolated_children(
+    /// PREPARE phase (point 1): build the [`PreparedRunIntegration`]
+    /// candidate of one run from its IMMUTABLE base — never from the live
+    /// owner. Every Done isolated child stages against the recorded run
+    /// generation, the whole set is precomposed (convergent-or-conflict,
+    /// order-independent) and applied once per path into the candidate.
+    /// Idempotent: a replay over the same durable state rebuilds the
+    /// byte-identical candidate (CAS applies are idempotent).
+    pub fn prepare_run_integration(
         &self,
         handle: &faktor_session::SessionHandle,
         parent: SessionId,
         run_id: &str,
         task_id: TaskId,
-        rows: &[super::ChildRuntime],
-        spawn_items: &[String],
-    ) -> Result<RunIntegration, ExecError> {
+        candidate_ids: &[String],
+    ) -> Result<PreparedRunIntegration, ExecError> {
+        let digest = |root: &std::path::Path| -> Result<String, ExecError> {
+            faktor_session::root_snapshot_digest(root, faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES)
+                .map_err(|e| {
+                    ExecError::WorkspaceDrift(format!("root snapshot of {}: {e}", root.display()))
+                })
+        };
         let owner_root = self.owner_root_of(parent, handle)?;
-        let mut candidates: Vec<&super::ChildRuntime> = rows
-            .iter()
-            .filter(|r| {
-                r.ownership == faktor_session::child::ChildOwnership::IsolatedWorktree
-                    && spawn_items.iter().any(|i| i == &r.item_id)
-            })
-            .collect();
-        candidates.sort_by(|a, b| a.child_id.cmp(&b.child_id));
-        let mut staged: Vec<(String, crate::runtime::merge::ChangeSet)> = Vec::new();
+        let rb = handle
+            .ledger_run_base_get(run_id)
+            .map_err(|e| ExecError::Internal(format!("run base read: {e}")))?
+            .ok_or_else(|| {
+                ExecError::IntegrationConflict(format!(
+                    "orchestrated run {run_id} has no recorded run base; refusing to stage against the live owner"
+                ))
+            })?;
+        let base_root = PathBuf::from(&rb.root);
+        let base_snapshot = digest(&base_root)?;
+        if base_snapshot != rb.snapshot_hash {
+            return Err(ExecError::WorkspaceDrift(format!(
+                "run base of {run_id} digests to {base_snapshot} but the durable record says {}; the generation moved",
+                rb.snapshot_hash
+            )));
+        }
+        let plan = self.orchestrator.plan_row(parent, run_id)?;
+        let run_exec_dir = plan.isolated_root.join(run_id);
+        std::fs::create_dir_all(&run_exec_dir)
+            .map_err(|e| ExecError::Internal(format!("run exec dir {run_exec_dir:?}: {e}")))?;
+        let candidate_root = run_exec_dir.join("candidate");
+        std::fs::create_dir_all(&candidate_root)
+            .map_err(|e| ExecError::Internal(format!("candidate root {candidate_root:?}: {e}")))?;
+        let mut candidate_snapshot = digest(&candidate_root)?;
+        if candidate_snapshot != rb.snapshot_hash {
+            // (Re)build the candidate from the run base: remove residue,
+            // copy the immutable generation, re-digest. A candidate that
+            // still cannot reproduce the base is a typed drift refusal.
+            std::fs::remove_dir_all(&candidate_root).map_err(|e| {
+                ExecError::Internal(format!("candidate reset {}: {e}", candidate_root.display()))
+            })?;
+            std::fs::create_dir_all(&candidate_root).map_err(|e| {
+                ExecError::Internal(format!("candidate dir {}: {e}", candidate_root.display()))
+            })?;
+            faktor_fs::copy_tree_skip(
+                &base_root,
+                &candidate_root,
+                MAX_RUN_BASE_ENTRIES,
+                MAX_RUN_BASE_BYTES,
+                RUN_BASE_SKIP_DIRS,
+            )
+            .map_err(|e| ExecError::from_fs("candidate run-base copy", &base_root, e))?;
+            candidate_snapshot = digest(&candidate_root)?;
+            if candidate_snapshot != rb.snapshot_hash {
+                return Err(ExecError::WorkspaceDrift(format!(
+                    "candidate of {run_id} digests to {candidate_snapshot} after copying the run base {}; refusing to verify a drifted candidate",
+                    rb.snapshot_hash
+                )));
+            }
+        }
+        // Stage every eligible child against the SAME generation.
+        let mut ids: Vec<String> = candidate_ids.to_vec();
+        ids.sort();
+        ids.dedup();
+        let rows = OrchestratorRuntime::registry_rows(self.session.clone(), parent, run_id)?;
+        let mut staged_sets: Vec<crate::runtime::merge::ChangeSet> = Vec::new();
+        let mut staged: Vec<PreparedChildChangeSet> = Vec::new();
         let mut sources: Vec<faktor_session::IntegrationSourceRow> = Vec::new();
-        let mut all_paths: BTreeSet<String> = BTreeSet::new();
-        for child in candidates {
+        for child_id in &ids {
+            let child = rows
+                .iter()
+                .find(|r| &r.child_id == child_id)
+                .ok_or_else(|| ExecError::NotFound(format!("child {child_id}")))?;
             if child.state != ChildState::Done {
                 return Err(ExecError::InvalidState(format!(
                     "cannot integrate non-Done isolated child {} (state {:?})",
                     child.child_id, child.state
                 )));
             }
-            let cs = self.orchestrator.stage_child_changes(&child.child_id)?;
-            let child_dir = self.orchestrator.child_worktree_dir(child)?;
-            let candidate_root_hash = faktor_session::root_snapshot_digest(
-                &child_dir,
-                faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES,
-            )
-            .map_err(|e| {
-                ExecError::Internal(format!(
-                    "candidate root snapshot of child {}: {e}",
-                    child.child_id
-                ))
-            })?;
-            for f in &cs.files {
-                all_paths.insert(f.path.to_string_lossy().into_owned());
+            if child.ownership != faktor_session::child::ChildOwnership::IsolatedWorktree {
+                continue;
             }
+            let cs = self.orchestrator.stage_child_changes(child_id)?;
+            let child_root = self.orchestrator.child_worktree_dir(child)?;
+            let candidate_root_hash = digest(&child_root)?;
             sources.push(faktor_session::IntegrationSourceRow {
                 child_id: child.child_id.clone(),
                 change_set_id: cs.id(),
+                candidate_root_hash: candidate_root_hash.clone(),
+            });
+            staged_sets.push(cs.clone());
+            staged.push(PreparedChildChangeSet {
+                child_id: child.child_id.clone(),
+                child_root,
+                change_set: cs,
                 candidate_root_hash,
             });
-            staged.push((child.child_id.clone(), cs));
         }
         sources.sort_by(|a, b| a.child_id.cmp(&b.child_id));
-        let full_paths: Vec<String> = all_paths.iter().cloned().collect();
+        // Precompose: convergent children apply ONCE; any divergence (or
+        // delete-vs-modify) is a typed conflict before any owner mutation.
+        let composed = crate::runtime::merge::compose_child_changes(&staged_sets)?;
+        for change in &composed {
+            self.apply_composed_path_to_candidate(&candidate_root, &staged, change)?;
+        }
+        candidate_snapshot = digest(&candidate_root)?;
+        let changed: Vec<String> = composed
+            .iter()
+            .map(|c| c.path.to_string_lossy().into_owned())
+            .collect();
         let sources_digest = if sources.is_empty() {
             String::new()
         } else {
@@ -1821,146 +2159,739 @@ impl TaskExecutor {
                     .collect::<Vec<_>>(),
             )
         };
-        let files_digest = if full_paths.is_empty() {
-            String::new()
-        } else {
-            stable_list_digest(&full_paths)
+        Ok(PreparedRunIntegration {
+            run_id: run_id.to_string(),
+            task_id,
+            owner_root,
+            base_root,
+            candidate_root,
+            base_snapshot,
+            candidate_snapshot,
+            changed,
+            sources,
+            sources_digest,
+            staged,
+        })
+    }
+
+    /// Apply ONE composed per-path decision into the candidate root, using
+    /// the deterministic representative child for the source content.
+    fn apply_composed_path_to_candidate(
+        &self,
+        candidate_root: &std::path::Path,
+        staged: &[PreparedChildChangeSet],
+        change: &crate::runtime::merge::ComposedPathChange,
+    ) -> Result<(), ExecError> {
+        match change.child_hash {
+            Some(hash) => {
+                let source = staged
+                    .iter()
+                    .filter(|s| change.sources.contains(&s.child_id))
+                    .min_by(|a, b| a.child_id.cmp(&b.child_id))
+                    .ok_or_else(|| {
+                        ExecError::Internal(format!(
+                            "composed path {:?} names no staged source",
+                            change.path
+                        ))
+                    })?;
+                faktor_fs::merge_apply_content(
+                    candidate_root,
+                    &change.path,
+                    &source.child_root,
+                    &change.path,
+                    hash,
+                    change.base_hash,
+                )
+                .map_err(|e| {
+                    ExecError::from_fs(
+                        &format!("candidate composition of {:?}", change.path),
+                        candidate_root,
+                        e,
+                    )
+                })?;
+            }
+            None => {
+                let base = change.base_hash.ok_or_else(|| {
+                    ExecError::Internal(format!(
+                        "composed deletion {:?} has no base anchor",
+                        change.path
+                    ))
+                })?;
+                faktor_fs::merge_delete(candidate_root, &change.path, base).map_err(|e| {
+                    ExecError::from_fs(
+                        &format!("candidate composition of {:?}", change.path),
+                        candidate_root,
+                        e,
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// VERIFY phase (points 1/2/6): run the shared deterministic
+    /// verification over the CANDIDATE root, persist the durable fact and a
+    /// verification record bound to the CANDIDATE snapshot. `Ok(None)` for
+    /// a failed/unavailable run (completion stays refused); a passing run
+    /// returns the proof the landing phase consumes.
+    pub async fn verify_prepared_integration(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
+        criteria: &[String],
+        prepared: &PreparedRunIntegration,
+    ) -> Result<Option<VerifiedRunIntegration>, ExecError> {
+        let token = CancellationToken::new();
+        let run = match self
+            .orchestrator
+            .agent()
+            .verify_integrated_root(
+                handle,
+                &prepared.candidate_root,
+                &prepared.changed,
+                criteria,
+                &token,
+            )
+            .await
+        {
+            Ok(run) => run,
+            Err(e) => {
+                persist_root_verification_fact(handle, "pending", &[], &prepared.changed)?;
+                eprintln!(
+                    "root verification unavailable for orchestrated run {}: {e}; run stays unverified",
+                    prepared.run_id
+                );
+                return Ok(None);
+            }
         };
-        let before = faktor_session::root_snapshot_digest(
+        let record = self.find_or_create_root_verification_record(
+            handle,
+            task_id,
+            criteria,
+            &prepared.candidate_snapshot,
+            &run,
+        )?;
+        persist_root_verification_fact(
+            handle,
+            match run.status {
+                VerificationStatus::Passed => "passed",
+                VerificationStatus::Failed => "failed",
+                _ => "pending",
+            },
+            &run.checks,
+            &prepared.changed,
+        )?;
+        if run.status != VerificationStatus::Passed {
+            return Ok(None);
+        }
+        self.check_settlement_seam(CrashSeam::AfterPreparedVerification)?;
+        Ok(Some(VerifiedRunIntegration {
+            prepared: prepared.clone(),
+            record,
+        }))
+    }
+
+    /// LAND phase (points 5/6): transactionally apply the VERIFIED
+    /// candidate into the owner. Record-first decisions + rollback blobs,
+    /// owner-equals-run-base recheck, per-path CAS applies, fresh whole-root
+    /// equality against the verified candidate, then the finalized
+    /// integration record. Never called before a passing verification.
+    pub fn land_verified_integration(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        proof: &VerifiedRunIntegration,
+    ) -> Result<LandedRunIntegration, ExecError> {
+        let prepared = &proof.prepared;
+        let owner_root = &prepared.owner_root;
+        let digest = |root: &std::path::Path| -> Result<String, ExecError> {
+            faktor_session::root_snapshot_digest(root, faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES)
+                .map_err(|e| {
+                    ExecError::WorkspaceDrift(format!("root snapshot of {}: {e}", root.display()))
+                })
+        };
+        // Crash recovery: inspect the durable transaction of this run and
+        // deterministically finish landing or roll back.
+        if let Some(mut txn) = handle
+            .ledger_integration_txn_for_run(&prepared.run_id)
+            .map_err(|e| ExecError::Internal(format!("integration txn read: {e}")))?
+        {
+            let same_candidate = txn.verified_candidate_snapshot == prepared.candidate_snapshot;
+            match txn.phase {
+                faktor_session::ledger::IntegrationTxnPhase::Landed if same_candidate => {
+                    let landed = digest(owner_root)?;
+                    if landed != prepared.candidate_snapshot {
+                        return Err(ExecError::WorkspaceDrift(format!(
+                            "owner root {} digests to {landed} but the Landed transaction binds {}",
+                            owner_root.display(),
+                            prepared.candidate_snapshot
+                        )));
+                    }
+                    self.finalize_integration_record(handle, prepared, &landed)?;
+                    return Ok(LandedRunIntegration {
+                        prepared: prepared.clone(),
+                        record: proof.record,
+                        landed_snapshot: landed,
+                    });
+                }
+                faktor_session::ledger::IntegrationTxnPhase::Landing if same_candidate => {
+                    return self.resume_landing(handle, proof, &mut txn);
+                }
+                faktor_session::ledger::IntegrationTxnPhase::RollingBack if same_candidate => {
+                    self.rollback_integration(handle, &mut txn)?;
+                    return Err(ExecError::IntegrationConflict(format!(
+                        "integration transaction of run {} was rolled back; the run must re-settle",
+                        prepared.run_id
+                    )));
+                }
+                faktor_session::ledger::IntegrationTxnPhase::RolledBack if same_candidate => {
+                    // The rolled-back attempt is finished; fall through to a
+                    // FRESH attempt (owner may have been restored).
+                }
+                _ => {}
+            }
+        }
+        // Fresh attempt: the WHOLE owner root must still equal the run base
+        // BEFORE the first durable decision row or owner write.
+        let owner_now = digest(owner_root)?;
+        if owner_now != prepared.base_snapshot {
+            let reason = format!(
+                "owner root {} digests to {owner_now} but the run base is {}; a drifted owner blocks landing before any write",
+                owner_root.display(),
+                prepared.base_snapshot
+            );
+            self.record_blocked_txn(handle, prepared, &reason)?;
+            return Err(ExecError::IntegrationConflict(reason));
+        }
+        let decisions = self.build_path_decisions(prepared)?;
+        let mut txn = faktor_session::ledger::IntegrationTxnRow {
+            run_id: prepared.run_id.clone(),
+            task_id: prepared.task_id.raw(),
+            owner_root: owner_root.to_string_lossy().into_owned(),
+            candidate_root: prepared.candidate_root.to_string_lossy().into_owned(),
+            run_base_snapshot: prepared.base_snapshot.clone(),
+            verified_candidate_snapshot: prepared.candidate_snapshot.clone(),
+            sources_digest: prepared.sources_digest.clone(),
+            phase: faktor_session::ledger::IntegrationTxnPhase::Prepared,
+            paths: decisions,
+            path_count: prepared.changed.len() as u64,
+            applied_count: 0,
+            conflicts: Vec::new(),
+            at_ms: handle.now_ms(),
+        };
+        // Record-first: every decision + rollback blob (already in the CAS)
+        // is durable BEFORE any owner write.
+        handle
+            .ledger_integration_txn_set(&txn)
+            .map_err(|e| ExecError::Internal(format!("integration txn write: {e}")))?;
+        txn.phase = faktor_session::ledger::IntegrationTxnPhase::Verified;
+        txn.at_ms = handle.now_ms();
+        handle
+            .ledger_integration_txn_set(&txn)
+            .map_err(|e| ExecError::Internal(format!("integration txn write: {e}")))?;
+        // Recheck the owner under the durable decisions; a drift here still
+        // lands nothing.
+        let owner_now = digest(owner_root)?;
+        if owner_now != prepared.base_snapshot {
+            let reason = format!(
+                "owner root {} moved to {owner_now} after the landing decisions were recorded (run base {})",
+                owner_root.display(),
+                prepared.base_snapshot
+            );
+            txn.phase = faktor_session::ledger::IntegrationTxnPhase::Blocked;
+            txn.conflicts.push(truncate_bytes(&reason, 256));
+            txn.at_ms = handle.now_ms();
+            handle
+                .ledger_integration_txn_set(&txn)
+                .map_err(|e| ExecError::Internal(format!("integration txn write: {e}")))?;
+            return Err(ExecError::IntegrationConflict(reason));
+        }
+        txn.phase = faktor_session::ledger::IntegrationTxnPhase::Landing;
+        txn.at_ms = handle.now_ms();
+        handle
+            .ledger_integration_txn_set(&txn)
+            .map_err(|e| ExecError::Internal(format!("integration txn write: {e}")))?;
+        self.check_settlement_seam(CrashSeam::AfterIntegrationTxnRecord)?;
+        self.apply_landing_loop(handle, proof, &mut txn)
+    }
+
+    /// Finish a durable `Landing` transaction: re-apply every Pending path
+    /// (CAS-idempotent) and reconcile a conflict into a rollback.
+    fn resume_landing(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        proof: &VerifiedRunIntegration,
+        txn: &mut faktor_session::ledger::IntegrationTxnRow,
+    ) -> Result<LandedRunIntegration, ExecError> {
+        self.apply_landing_loop(handle, proof, txn)
+    }
+
+    /// The per-path apply loop of a landing transaction. Every applied path
+    /// is journaled immediately; a conflict enters the rollback path (the
+    /// owner is never left half-landed without a durable recovery row).
+    fn apply_landing_loop(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        proof: &VerifiedRunIntegration,
+        txn: &mut faktor_session::ledger::IntegrationTxnRow,
+    ) -> Result<LandedRunIntegration, ExecError> {
+        let prepared = &proof.prepared;
+        let owner_root = PathBuf::from(&txn.owner_root);
+        for i in 0..txn.paths.len() {
+            if txn.paths[i].state != faktor_session::ledger::IntegrationPathTxnState::Pending {
+                continue;
+            }
+            let path_txn = txn.paths[i].clone();
+            match self.apply_landing_path(&owner_root, &prepared.candidate_root, &path_txn) {
+                Ok(()) => {
+                    txn.paths[i].state = faktor_session::ledger::IntegrationPathTxnState::Applied;
+                    txn.applied_count = txn
+                        .paths
+                        .iter()
+                        .filter(|p| {
+                            p.state == faktor_session::ledger::IntegrationPathTxnState::Applied
+                        })
+                        .count() as u64;
+                    txn.at_ms = handle.now_ms();
+                    handle
+                        .ledger_integration_txn_set(txn)
+                        .map_err(|e| ExecError::Internal(format!("integration txn write: {e}")))?;
+                }
+                Err(detail) => {
+                    txn.paths[i].state = faktor_session::ledger::IntegrationPathTxnState::Conflict;
+                    let line = format!("{}: {detail}", txn.paths[i].path);
+                    txn.conflicts.push(truncate_bytes(&line, 256));
+                    txn.at_ms = handle.now_ms();
+                    handle
+                        .ledger_integration_txn_set(txn)
+                        .map_err(|e| ExecError::Internal(format!("integration txn write: {e}")))?;
+                    self.record_blocked_integration(handle, prepared, &txn.conflicts)?;
+                    self.rollback_integration(handle, txn)?;
+                    return Err(ExecError::IntegrationConflict(format!(
+                        "owner landing of run {} conflicted at {}; the applied paths were rolled back",
+                        prepared.run_id, txn.paths[i].path
+                    )));
+                }
+            }
+            self.check_settlement_seam(CrashSeam::IntegrationApply { after: i + 1 })?;
+        }
+        // Final equality (point 6): the landed owner root must EXACTLY
+        // equal the verified candidate snapshot — never "merge returned ok".
+        let landed = faktor_session::root_snapshot_digest(
             &owner_root,
             faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES,
         )
         .map_err(|e| {
-            ExecError::Internal(format!(
-                "pre-integration root snapshot of {}: {e}",
+            ExecError::WorkspaceDrift(format!(
+                "landed root snapshot of {}: {e}",
                 owner_root.display()
             ))
         })?;
-        // Reattach convergence: the finalized record still binds the CURRENT
-        // root and the staged source set is identical -> nothing to apply.
-        if let Some(existing) = handle
-            .ledger_integration_record_for_task(task_id.raw())
-            .map_err(|e| ExecError::Internal(format!("integration record read: {e}")))?
-        {
-            if !existing.final_snapshot_hash.is_empty()
-                && existing.final_snapshot_hash == before
-                && existing.source_count == sources.len() as u64
-                && existing.sources_digest == sources_digest
-            {
-                return Ok(RunIntegration {
-                    changed: full_paths,
-                    final_root: owner_root,
-                    final_snapshot: before,
-                });
+        if landed != prepared.candidate_snapshot {
+            let reason = format!(
+                "landed owner root {} digests to {landed} but the verified candidate is {}",
+                owner_root.display(),
+                prepared.candidate_snapshot
+            );
+            self.rollback_integration(handle, txn)?;
+            txn.conflicts.push(truncate_bytes(&reason, 256));
+            return Err(ExecError::WorkspaceDrift(reason));
+        }
+        self.check_settlement_seam(CrashSeam::AfterFinalOwnerSnapshot)?;
+        txn.phase = faktor_session::ledger::IntegrationTxnPhase::Landed;
+        txn.at_ms = handle.now_ms();
+        handle
+            .ledger_integration_txn_set(txn)
+            .map_err(|e| ExecError::Internal(format!("integration txn write: {e}")))?;
+        self.finalize_integration_record(handle, prepared, &landed)?;
+        Ok(LandedRunIntegration {
+            prepared: prepared.clone(),
+            record: proof.record,
+            landed_snapshot: landed,
+        })
+    }
+
+    /// Apply ONE per-path landing decision to the owner through the shared
+    /// CAS primitives. The candidate bytes are re-verified against the
+    /// decision's candidate hash before the write; the owner's expected
+    /// state is the recorded base hash.
+    fn apply_landing_path(
+        &self,
+        owner_root: &std::path::Path,
+        candidate_root: &std::path::Path,
+        path_txn: &faktor_session::ledger::IntegrationPathTxn,
+    ) -> Result<(), String> {
+        match &path_txn.candidate_hash {
+            Some(hex) => {
+                let expected = FileHash::from_hex(hex).ok_or_else(|| {
+                    format!("hostile candidate hash {hex:?} in the landing transaction")
+                })?;
+                let source = candidate_root.join(&path_txn.path);
+                let meta = std::fs::metadata(&source)
+                    .map_err(|e| format!("candidate source {}: {e}", source.display()))?;
+                if meta.len() > faktor_fs::MAX_MERGE_FILE_BYTES {
+                    return Err(format!(
+                        "candidate source {} is {} bytes (cap {})",
+                        source.display(),
+                        meta.len(),
+                        faktor_fs::MAX_MERGE_FILE_BYTES
+                    ));
+                }
+                let bytes = std::fs::read(&source)
+                    .map_err(|e| format!("candidate source {}: {e}", source.display()))?;
+                let stored = self
+                    .session
+                    .cas()
+                    .put_bounded(&bytes, faktor_fs::MAX_MERGE_FILE_BYTES as usize)
+                    .map_err(|e| format!("candidate content CAS: {e}"))?;
+                if stored != expected {
+                    return Err(format!(
+                        "candidate {} drifted since staging (expected {}, found {})",
+                        path_txn.path,
+                        expected.to_hex(),
+                        stored.to_hex()
+                    ));
+                }
+                let base = match &path_txn.base_hash {
+                    Some(hex) => Some(FileHash::from_hex(hex).ok_or_else(|| {
+                        format!("hostile base hash {hex:?} in the landing transaction")
+                    })?),
+                    None => None,
+                };
+                faktor_fs::cas_write_content(
+                    owner_root,
+                    std::path::Path::new(&path_txn.path),
+                    &bytes,
+                    base,
+                )
+                .map(|_| ())
+                .map_err(|e| e.message)
+            }
+            None => {
+                let base = path_txn.base_hash.as_deref().and_then(FileHash::from_hex);
+                let base = base.ok_or_else(|| {
+                    format!(
+                        "deletion decision of {:?} has no base anchor",
+                        path_txn.path
+                    )
+                })?;
+                faktor_fs::merge_delete(owner_root, std::path::Path::new(&path_txn.path), base)
+                    .map(|_| ())
+                    .map_err(|e| e.message)
             }
         }
-        let now = handle.now_ms();
-        let in_flight = faktor_session::IntegrationRecordRow {
-            run_id: run_id.to_string(),
-            task_id: task_id.raw(),
-            base_revision: sources.first().map(|s| s.change_set_id.clone()),
-            base_snapshot: Some(before.clone()),
-            final_root: owner_root.to_string_lossy().into_owned(),
+    }
+
+    /// Build the record-first per-path decisions of a fresh landing: base
+    /// hash + CAS base blob (the rollback authority) and the verified
+    /// candidate hash (`None` = deletion).
+    fn build_path_decisions(
+        &self,
+        prepared: &PreparedRunIntegration,
+    ) -> Result<Vec<faktor_session::ledger::IntegrationPathTxn>, ExecError> {
+        let base_map: std::collections::HashMap<PathBuf, FileHash> =
+            faktor_fs::snapshot_tree(&prepared.base_root, MAX_RUN_BASE_ENTRIES)
+                .map_err(|e| ExecError::from_fs("run base snapshot", &prepared.base_root, e))?
+                .into_iter()
+                .map(|e| (e.path, e.hash))
+                .collect();
+        let candidate_map: std::collections::HashMap<PathBuf, FileHash> =
+            faktor_fs::snapshot_tree(&prepared.candidate_root, MAX_RUN_BASE_ENTRIES)
+                .map_err(|e| ExecError::from_fs("candidate snapshot", &prepared.candidate_root, e))?
+                .into_iter()
+                .map(|e| (e.path, e.hash))
+                .collect();
+        let mut decisions = Vec::with_capacity(prepared.changed.len());
+        for rel in &prepared.changed {
+            let path = PathBuf::from(rel);
+            let base_hash = base_map.get(&path).copied();
+            let candidate_hash = candidate_map.get(&path).copied();
+            let base_blob = match base_hash {
+                Some(_) => {
+                    let source = prepared.base_root.join(&path);
+                    let bytes = std::fs::read(&source).map_err(|e| {
+                        ExecError::WorkspaceDrift(format!(
+                            "run base content {}: {e}",
+                            source.display()
+                        ))
+                    })?;
+                    let stored = self
+                        .session
+                        .cas()
+                        .put_bounded(&bytes, faktor_fs::MAX_MERGE_FILE_BYTES as usize)
+                        .map_err(|e| ExecError::Internal(format!("run base blob of {rel}: {e}")))?;
+                    Some(stored.to_hex())
+                }
+                None => None,
+            };
+            decisions.push(faktor_session::ledger::IntegrationPathTxn {
+                path: rel.clone(),
+                base_hash: base_hash.map(|h| h.to_hex()),
+                candidate_hash: candidate_hash.map(|h| h.to_hex()),
+                base_blob,
+                state: faktor_session::ledger::IntegrationPathTxnState::Pending,
+            });
+        }
+        Ok(decisions)
+    }
+
+    /// Roll back every Applied path of a landing transaction: restore the
+    /// base content ONLY while the owner path still holds OUR written
+    /// candidate state; a later user edit is never overwritten (the path is
+    /// marked [`faktor_session::ledger::IntegrationPathTxnState::RollbackConflict`]).
+    fn rollback_integration(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        txn: &mut faktor_session::ledger::IntegrationTxnRow,
+    ) -> Result<(), ExecError> {
+        txn.phase = faktor_session::ledger::IntegrationTxnPhase::RollingBack;
+        txn.at_ms = handle.now_ms();
+        handle
+            .ledger_integration_txn_set(txn)
+            .map_err(|e| ExecError::Internal(format!("integration txn write: {e}")))?;
+        let owner_root = PathBuf::from(&txn.owner_root);
+        for i in (0..txn.paths.len()).rev() {
+            if txn.paths[i].state != faktor_session::ledger::IntegrationPathTxnState::Applied {
+                continue;
+            }
+            let path_txn = txn.paths[i].clone();
+            match self.restore_base_path(&owner_root, &path_txn) {
+                Ok(()) => {
+                    txn.paths[i].state = faktor_session::ledger::IntegrationPathTxnState::RolledBack
+                }
+                Err(detail) => {
+                    txn.paths[i].state =
+                        faktor_session::ledger::IntegrationPathTxnState::RollbackConflict;
+                    let line = format!("{}: {detail}", path_txn.path);
+                    txn.conflicts.push(truncate_bytes(&line, 256));
+                }
+            }
+            txn.at_ms = handle.now_ms();
+            handle
+                .ledger_integration_txn_set(txn)
+                .map_err(|e| ExecError::Internal(format!("integration txn write: {e}")))?;
+            self.check_settlement_seam(CrashSeam::DuringRollback)?;
+        }
+        txn.phase = faktor_session::ledger::IntegrationTxnPhase::RolledBack;
+        txn.at_ms = handle.now_ms();
+        handle
+            .ledger_integration_txn_set(txn)
+            .map_err(|e| ExecError::Internal(format!("integration txn write: {e}")))?;
+        Ok(())
+    }
+
+    /// Restore ONE applied path to its base state, refusing to clobber a
+    /// post-landing user edit.
+    fn restore_base_path(
+        &self,
+        owner_root: &std::path::Path,
+        path_txn: &faktor_session::ledger::IntegrationPathTxn,
+    ) -> Result<(), String> {
+        let target = owner_root.join(&path_txn.path);
+        let current = match std::fs::metadata(&target) {
+            Ok(meta) if meta.is_file() => {
+                let bytes = std::fs::read(&target)
+                    .map_err(|e| format!("rollback probe {}: {e}", target.display()))?;
+                let stored = self
+                    .session
+                    .cas()
+                    .put_bounded(&bytes, faktor_fs::MAX_MERGE_FILE_BYTES as usize)
+                    .map_err(|e| format!("rollback probe CAS: {e}"))?;
+                Some(stored.to_hex())
+            }
+            _ => None,
+        };
+        match &path_txn.candidate_hash {
+            Some(candidate) => {
+                if current.as_deref() == Some(candidate.as_str()) {
+                    match (&path_txn.base_hash, &path_txn.base_blob) {
+                        (Some(_), Some(blob)) => {
+                            let hash = FileHash::from_hex(blob)
+                                .ok_or_else(|| format!("hostile rollback blob {blob:?}"))?;
+                            let bytes = self
+                                .session
+                                .cas()
+                                .get_bounded(hash, faktor_fs::MAX_MERGE_FILE_BYTES as usize)
+                                .map_err(|e| format!("rollback blob read: {e}"))?
+                                .ok_or_else(|| "rollback blob missing from the CAS".to_string())?;
+                            let expected = FileHash::from_hex(candidate)
+                                .ok_or_else(|| format!("hostile candidate hash {candidate:?}"))?;
+                            faktor_fs::cas_write_content(
+                                owner_root,
+                                std::path::Path::new(&path_txn.path),
+                                &bytes,
+                                Some(expected),
+                            )
+                            .map(|_| ())
+                            .map_err(|e| e.message)
+                        }
+                        _ => {
+                            // The base had no such file: our landing CREATED
+                            // it; remove it while it is still ours.
+                            let expected = FileHash::from_hex(candidate)
+                                .ok_or_else(|| format!("hostile candidate hash {candidate:?}"))?;
+                            faktor_fs::merge_delete(
+                                owner_root,
+                                std::path::Path::new(&path_txn.path),
+                                expected,
+                            )
+                            .map(|_| ())
+                            .map_err(|e| e.message)
+                        }
+                    }
+                } else if current.as_deref() == path_txn.base_hash.as_deref() {
+                    // Already restored (a replay) — nothing to do.
+                    Ok(())
+                } else {
+                    Err("a post-landing user edit was preserved (never overwritten)".into())
+                }
+            }
+            None => {
+                if current.is_none() {
+                    // We deleted the file; restore the base content with an
+                    // exclusive create (any concurrent creation is preserved).
+                    let blob = path_txn
+                        .base_blob
+                        .as_deref()
+                        .ok_or_else(|| "deletion rollback has no base blob".to_string())?;
+                    let hash = FileHash::from_hex(blob)
+                        .ok_or_else(|| format!("hostile rollback blob {blob:?}"))?;
+                    let bytes = self
+                        .session
+                        .cas()
+                        .get_bounded(hash, faktor_fs::MAX_MERGE_FILE_BYTES as usize)
+                        .map_err(|e| format!("rollback blob read: {e}"))?
+                        .ok_or_else(|| "rollback blob missing from the CAS".to_string())?;
+                    faktor_fs::cas_write_content(
+                        owner_root,
+                        std::path::Path::new(&path_txn.path),
+                        &bytes,
+                        None,
+                    )
+                    .map(|_| ())
+                    .map_err(|e| e.message)
+                } else {
+                    Err("a post-landing user edit was preserved (never overwritten)".into())
+                }
+            }
+        }
+    }
+
+    /// Record a Blocked landing attempt (owner drift before the first
+    /// write): a durable in-flight integration record with the typed reason
+    /// and the staged sources, so nothing about the run is lost.
+    fn record_blocked_txn(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        prepared: &PreparedRunIntegration,
+        reason: &str,
+    ) -> Result<(), ExecError> {
+        self.record_blocked_integration(handle, prepared, &[truncate_bytes(reason, 256)])
+    }
+
+    fn record_blocked_integration(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        prepared: &PreparedRunIntegration,
+        conflicts: &[String],
+    ) -> Result<(), ExecError> {
+        let files_digest = if prepared.changed.is_empty() {
+            String::new()
+        } else {
+            stable_list_digest(&prepared.changed)
+        };
+        let row = faktor_session::IntegrationRecordRow {
+            run_id: prepared.run_id.clone(),
+            task_id: prepared.task_id.raw(),
+            base_revision: prepared.sources.first().map(|s| s.change_set_id.clone()),
+            base_snapshot: Some(prepared.base_snapshot.clone()),
+            final_root: prepared.owner_root.to_string_lossy().into_owned(),
             final_snapshot_hash: String::new(),
-            integrated_files: full_paths
+            integrated_files: prepared
+                .changed
                 .iter()
                 .take(faktor_session::MAX_INTEGRATION_FILES)
                 .cloned()
                 .collect(),
-            integrated_file_count: full_paths.len() as u64,
-            integrated_files_digest: files_digest.clone(),
-            conflicts: Vec::new(),
-            conflict_count: 0,
-            sources: sources
+            integrated_file_count: prepared.changed.len() as u64,
+            integrated_files_digest: files_digest,
+            conflicts: conflicts
+                .iter()
+                .take(faktor_session::MAX_INTEGRATION_CONFLICTS)
+                .cloned()
+                .collect(),
+            conflict_count: conflicts.len() as u64,
+            sources: prepared
+                .sources
                 .iter()
                 .take(faktor_session::MAX_INTEGRATION_SOURCES)
                 .cloned()
                 .collect(),
-            source_count: sources.len() as u64,
-            sources_digest: sources_digest.clone(),
-            at_ms: now,
+            source_count: prepared.sources.len() as u64,
+            sources_digest: prepared.sources_digest.clone(),
+            at_ms: handle.now_ms(),
         };
-        // Record-first: the in-flight record (empty final hash) is durable
-        // BEFORE any file apply.
         handle
-            .ledger_integration_record_set(&in_flight)
-            .map_err(|e| ExecError::Internal(format!("integration record write: {e}")))?;
-        let mut merged_paths: BTreeSet<String> = BTreeSet::new();
-        for (child_id, cs) in &staged {
-            let approved: Vec<std::path::PathBuf> =
-                cs.files.iter().map(|f| f.path.clone()).collect();
-            let outcome =
-                self.orchestrator
-                    .approve_and_merge(child_id, &cs.id(), &approved, &[])?;
-            for p in &outcome.merged {
-                merged_paths.insert(p.to_string_lossy().into_owned());
-            }
-            if !outcome.conflicts.is_empty() {
-                let conflicts: Vec<String> = outcome
-                    .conflicts
-                    .iter()
-                    .take(faktor_session::MAX_INTEGRATION_CONFLICTS)
-                    .map(|(p, d)| truncate_bytes(&format!("{}: {d}", p.display()), 256))
-                    .collect();
-                let blocked = faktor_session::IntegrationRecordRow {
-                    final_snapshot_hash: String::new(),
-                    integrated_files: Vec::new(),
-                    integrated_file_count: 0,
-                    integrated_files_digest: String::new(),
-                    conflicts: conflicts.clone(),
-                    conflict_count: outcome.conflicts.len() as u64,
-                    at_ms: handle.now_ms(),
-                    ..in_flight
-                };
-                handle
-                    .ledger_integration_record_set(&blocked)
-                    .map_err(|e| ExecError::Internal(format!("integration record write: {e}")))?;
-                let first = conflicts.first().cloned().unwrap_or_default();
-                return Err(ExecError::IntegrationConflict(format!(
-                    "child {child_id} could not be integrated into {} ({} conflict(s); first: {first}); completion is refused until the drift is resolved and the run re-integrated",
-                    owner_root.display(),
-                    outcome.conflicts.len()
-                )));
+            .ledger_integration_record_set(&row)
+            .map(|_| ())
+            .map_err(|e| ExecError::Internal(format!("integration record write: {e}")))
+    }
+
+    /// Finalize the integration record with the FRESH whole-root digest
+    /// taken after the landing (point 6). Idempotent for an already
+    /// finalized identical landing.
+    fn finalize_integration_record(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        prepared: &PreparedRunIntegration,
+        landed: &str,
+    ) -> Result<(), ExecError> {
+        if let Some(existing) = handle
+            .ledger_integration_record_for_task(prepared.task_id.raw())
+            .map_err(|e| ExecError::Internal(format!("integration record read: {e}")))?
+        {
+            if existing.final_snapshot_hash == landed
+                && existing.sources_digest == prepared.sources_digest
+                && existing.run_id == prepared.run_id
+            {
+                return Ok(());
             }
         }
-        let final_snapshot = faktor_session::root_snapshot_digest(
-            &owner_root,
-            faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES,
-        )
-        .map_err(|e| {
-            ExecError::Internal(format!(
-                "final integration root snapshot of {}: {e}",
-                owner_root.display()
-            ))
-        })?;
-        let integrated: Vec<String> = merged_paths.iter().cloned().collect();
-        let integrated_digest = if integrated.is_empty() {
+        let files_digest = if prepared.changed.is_empty() {
             String::new()
         } else {
-            stable_list_digest(&integrated)
+            stable_list_digest(&prepared.changed)
         };
-        let finalized = faktor_session::IntegrationRecordRow {
-            final_snapshot_hash: final_snapshot.clone(),
-            integrated_files: integrated
+        let row = faktor_session::IntegrationRecordRow {
+            run_id: prepared.run_id.clone(),
+            task_id: prepared.task_id.raw(),
+            base_revision: prepared.sources.first().map(|s| s.change_set_id.clone()),
+            base_snapshot: Some(prepared.base_snapshot.clone()),
+            final_root: prepared.owner_root.to_string_lossy().into_owned(),
+            final_snapshot_hash: landed.to_string(),
+            integrated_files: prepared
+                .changed
                 .iter()
                 .take(faktor_session::MAX_INTEGRATION_FILES)
                 .cloned()
                 .collect(),
-            integrated_file_count: integrated.len() as u64,
-            integrated_files_digest: integrated_digest,
+            integrated_file_count: prepared.changed.len() as u64,
+            integrated_files_digest: files_digest,
             conflicts: Vec::new(),
             conflict_count: 0,
+            sources: prepared
+                .sources
+                .iter()
+                .take(faktor_session::MAX_INTEGRATION_SOURCES)
+                .cloned()
+                .collect(),
+            source_count: prepared.sources.len() as u64,
+            sources_digest: prepared.sources_digest.clone(),
             at_ms: handle.now_ms(),
-            ..in_flight
         };
         handle
-            .ledger_integration_record_set(&finalized)
-            .map_err(|e| ExecError::Internal(format!("integration record write: {e}")))?;
-        Ok(RunIntegration {
-            changed: full_paths,
-            final_root: owner_root,
-            final_snapshot,
-        })
+            .ledger_integration_record_set(&row)
+            .map(|_| ())
+            .map_err(|e| ExecError::Internal(format!("integration record write: {e}")))
     }
 
     /// Find-or-create the root verification record of one orchestrated run at

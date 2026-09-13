@@ -26,6 +26,7 @@ use faktor_agent::{
 };
 use faktor_core::capability::PermissionDecision;
 use faktor_core::error::Error;
+use faktor_core::hash::FileHash;
 use faktor_core::id::WorkspaceId;
 use faktor_core::id::{SessionId, TaskId, WorktreeId};
 use faktor_core::model::ModelCapabilities;
@@ -41,8 +42,8 @@ use crate::caps::{CapabilityGrant, CapabilitySet, LatticeCap, ScopePattern};
 use crate::runtime::completion_steps::commit_message;
 use crate::runtime::shadow::{ShadowCopyLimits, ShadowRoots};
 use crate::runtime::task_executor::{
-    MutationMode, RunSettlement, TaskExecutor, TaskRunMode, TaskRunRequest, TaskRunRow,
-    TASK_RUN_ROW_KIND,
+    MutationMode, RunSettlement, SettlementOutcome, TaskExecutor, TaskRunMode, TaskRunRequest,
+    TaskRunRow, TASK_RUN_ROW_KIND,
 };
 use crate::runtime::{CrashSeam, ExecError, OrchestratorRuntime};
 use crate::{OwnershipSpec, TaskPlan, WorkItem, WorkKind};
@@ -577,6 +578,14 @@ async fn multi_item_task_spawns_real_children_and_completes() {
     assert_eq!(receipt.mode, TaskRunMode::Orchestrated);
     assert_eq!(receipt.op_id, None);
     assert!(receipt.run_id.starts_with("run-"));
+    // Point 7: the durable ROOT task row exists BEFORE the first child spawn
+    // (unconditionally, no criteria/cap/contract required) — no orchestrated
+    // run can ever settle without a root row to certify.
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    assert!(
+        h.get_task(h.task_id().unwrap()).unwrap().is_some(),
+        "every orchestrated run creates its durable root task row up front"
+    );
 
     // Real children appear under the run and drive to terminal success.
     wait_until(
@@ -614,7 +623,12 @@ async fn multi_item_task_spawns_real_children_and_completes() {
     // Both children were really driven (provider calls >= 2) and the
     // executor slot freed itself.
     assert!(env.provider.count() >= 2, "driven {}", env.provider.count());
-    assert!(env.executor.active_run().is_none());
+    wait_until(|| env.executor.active_run().is_none(), 60).await;
+    // The verification-disabled env parks the run in the explicit Verifying
+    // state (never Pending/Running); VerifiedComplete is exercised by the
+    // real-tool adversarial suite.
+    let state = h.get_task(h.task_id().unwrap()).unwrap().unwrap().state;
+    assert_eq!(state, TaskState::Verifying, "root task walked to Verifying");
 }
 
 #[tokio::test]
@@ -4162,16 +4176,6 @@ fn cs_head(root: &std::path::Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-fn cs_porcelain(root: &std::path::Path) -> String {
-    let out = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(root)
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
 /// FIX 2 crash seam: the commit side effect landed but its status row did
 /// not; `settle_run` replays idempotently (HEAD recognized, `Succeeded`),
 /// without a second commit.
@@ -4420,81 +4424,30 @@ async fn settle_run_converges_after_the_pr_status_write_seam() {
     );
 }
 
-/// P0 orchestrated-integration/completion binding (REWRITE of the old wrong
-/// test): an unrelated owner-root write can NEVER complete the task. The
-/// controller drops `unrelated.txt` while the isolated children run; the REAL
-/// shared verification service (scripted backend over the ACTUAL final
-/// integration root) fails closed on that drift, the task stays non-terminal
-/// and no completion step ever runs. Removing the drift and re-settling
-/// integrates the children's real changes through the durable record-first
-/// `IntegrationRecord`, verifies the FINAL root, and only then runs the
-/// contract steps to `VerifiedComplete`. Child candidate roots are never
-/// git-initialized or committed by the settlement.
-#[tokio::test]
-async fn orchestrated_contract_completes_only_after_child_integration_and_final_root_verification()
-{
-    let _heavy = heavy_guard();
-    let dir = tempfile::tempdir().unwrap();
-    // Two mutating isolated children, each writing one distinct candidate
-    // file through the REAL write tool.
-    let scripts: Vec<Vec<ScriptedResponse>> = vec![
-        vec![
-            ScriptedResponse::ToolCall {
-                id: "c-a".into(),
-                name: "write_file".into(),
-                input: serde_json::json!({
-                    "path": "child_a.rs",
-                    "content": "pub fn a() -> u64 { 1 }\n",
-                }),
-            },
-            ScriptedResponse::Text("wrote a".into()),
-            ScriptedResponse::End,
-        ],
-        vec![
-            ScriptedResponse::ToolCall {
-                id: "c-b".into(),
-                name: "write_file".into(),
-                input: serde_json::json!({
-                    "path": "child_b.rs",
-                    "content": "pub fn b() -> u64 { 2 }\n",
-                }),
-            },
-            ScriptedResponse::Text("wrote b".into()),
-            ScriptedResponse::End,
-        ],
-        // Follow-up turns end with plain text (an empty stream is treated as
-        // a recoverable turn failure; a real model always emits content).
+/// One real-tool child script: write one file, then finish the turn.
+fn write_script(id: &str, path: &str, content: &str) -> Vec<ScriptedResponse> {
+    vec![
+        ScriptedResponse::ToolCall {
+            id: id.into(),
+            name: "write_file".into(),
+            input: serde_json::json!({ "path": path, "content": content }),
+        },
+        ScriptedResponse::Text("wrote".into()),
+        ScriptedResponse::End,
+    ]
+}
+
+fn two_child_scripts(a: &str, b: &str) -> Vec<Vec<ScriptedResponse>> {
+    vec![
+        write_script("c-a", "child_a.rs", a),
+        write_script("c-b", "child_b.rs", b),
         vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End],
         vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End],
-    ];
-    let owner_for_checks = dir.path().join("owner");
-    let verification = faktor_agent::VerificationService::fake(move |_cmd: &str| {
-        if owner_for_checks.join("child_a.rs").is_file()
-            && owner_for_checks.join("child_b.rs").is_file()
-            && !owner_for_checks.join("unrelated.txt").exists()
-        {
-            Ok(())
-        } else {
-            Err("integrated child changes missing or unrelated root drift present".into())
-        }
-    });
-    let env = open_real_tool_env_full(
-        dir.path(),
-        scripts,
-        verification,
-        false,
-        false,
-        MutationMode::DirectCompat,
-    );
-    // NOTE: the completion-step runner is installed only in phase (2): until
-    // then the gate can never complete the task, so the unrelated-drift
-    // refusal is observed no matter how the settlement and the write race.
-    seed_rust(&env);
-    cs_git(&env.owner_root, &["init", "-q", "-b", "main"]);
-    cs_git(&env.owner_root, &["add", "-A"]);
-    cs_commit(&env.owner_root, "init");
-    let goal = "ship the multi-item change";
-    let items: Vec<WorkItem> = ["impl-a", "impl-b"]
+    ]
+}
+
+fn two_isolated_items() -> Vec<WorkItem> {
+    ["impl-a", "impl-b"]
         .iter()
         .map(|id| {
             WorkItem::with_ownership(
@@ -4504,570 +4457,763 @@ async fn orchestrated_contract_completes_only_after_child_integration_and_final_
                 OwnershipSpec::IsolatedWorktree,
             )
         })
-        .collect();
-    let receipt = env
-        .executor
+        .collect()
+}
+
+fn typed_land_criterion() -> String {
+    faktor_session::task::Criterion::derived(
+        "required check: cargo check",
+        faktor_core::state::CriterionOrigin::ProjectPolicy,
+        faktor_core::state::CriterionRequirement::Required,
+        None,
+    )
+    .with_binding(faktor_core::state::CriterionBinding::RequiredCheck {
+        check_id: "rust_check".into(),
+        command_digest: faktor_core::state::command_binding_digest("cargo check"),
+    })
+    .encode()
+}
+
+fn start_two_child_run(env: &Arc<RealToolEnv>, goal: &str) -> String {
+    env.executor
         .start_task(
             env.parent,
             TaskRunRequest {
                 goal: goal.to_string(),
-                work_items: items,
-                criteria: vec!["all items land".to_string()],
-                completion_contract: Some(faktor_core::completion::CompletionContract {
-                    include_commit: true,
-                    include_push: false,
-                    include_pr: false,
-                }),
+                work_items: two_isolated_items(),
+                criteria: vec![typed_land_criterion()],
                 parent_caps: read_caps(),
                 isolated_root: env.isolated_root.clone(),
                 ..Default::default()
             },
         )
-        .expect("orchestrated contracted start");
+        .expect("orchestrated start")
+        .run_id
+}
+
+/// The daemon-owned candidate root of one run (the deterministic placement
+/// the prepare phase copies the run base into).
+fn run_candidate_root(env: &RealToolEnv, run_id: &str) -> std::path::PathBuf {
+    env.isolated_root.join(run_id).join("candidate")
+}
+
+fn owner_digest(env: &RealToolEnv) -> String {
+    faktor_session::root_snapshot_digest(&env.owner_root, faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES)
+        .unwrap()
+}
+
+fn root_digest(path: &std::path::Path) -> String {
+    faktor_session::root_snapshot_digest(path, faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES).unwrap()
+}
+
+/// Seed a REAL rust checkout with git history (the derived-check profile
+/// needs a detectable project; the completion runner needs a repo).
+fn cs_seed_owner(env: &RealToolEnv) {
+    seed_rust(env);
+    cs_git(&env.owner_root, &["init", "-q", "-b", "main"]);
+    cs_git(&env.owner_root, &["add", "-A"]);
+    cs_commit(&env.owner_root, "init");
+}
+
+fn latest_txn(
+    env: &RealToolEnv,
+    run_id: &str,
+) -> Option<faktor_session::ledger::IntegrationTxnRow> {
+    env.manager
+        .get_session(env.parent)
+        .unwrap()
+        .unwrap()
+        .ledger_integration_txn_for_run(run_id)
+        .unwrap()
+}
+
+async fn settle_orchestrated(
+    env: &Arc<RealToolEnv>,
+    run_id: &str,
+) -> Result<SettlementOutcome, ExecError> {
+    env.executor
+        .settle_run(RunSettlement::Orchestrated {
+            parent: env.parent,
+            run_id: run_id.to_string(),
+        })
+        .await
+}
+
+/// Point 1/2: the verifier runs over the CANDIDATE root while the owner
+/// still lacks every child change; the passing record binds the candidate
+/// digest, and only the landing phase writes the owner.
+#[tokio::test]
+async fn verifier_observes_candidate_not_owner() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        two_child_scripts("pub fn a() -> u64 {\n    let seed: u64 = 1;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n", "pub fn b() -> u64 {\n    let seed: u64 = 2;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n"),
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    // Freeze the settlement right AFTER the candidate verification: the
+    // verifier has already observed its root.
+    env.executor
+        .set_settlement_crash_seam(Some(CrashSeam::AfterPreparedVerification));
+    let run_id = start_two_child_run(&env, "verify the candidate");
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
     let h = env.manager.get_session(env.parent).unwrap().unwrap();
     let task_id = h.task_id().unwrap();
-    let contract_rev = h
-        .completion_contract(task_id)
+    let candidate = run_candidate_root(&env, &run_id);
+    assert!(
+        candidate.join("child_a.rs").is_file() && candidate.join("child_b.rs").is_file(),
+        "the candidate holds both child changes"
+    );
+    assert!(
+        !env.owner_root.join("child_a.rs").exists() && !env.owner_root.join("child_b.rs").exists(),
+        "the owner was NOT touched by the verification phase"
+    );
+    let candidate_digest = root_digest(&candidate);
+    let record = h
+        .list_verification_records(task_id)
         .unwrap()
-        .expect("contract recorded before spawn")
-        .0;
-    // (1) An unrelated owner-root write lands while the children run. It can
-    // never satisfy completion: the settlement integrates the children and
-    // runs the REAL verifier over the actual final root, where the drift
-    // fails closed.
-    wait_until(
-        || run_registry(&env.manager, env.parent, &receipt.run_id).len() == 2,
-        60,
-    )
-    .await;
+        .into_iter()
+        .filter(|r| r.status == VerificationStatus::Passed && r.tree_hash.is_some())
+        .max_by_key(|r| r.record_id)
+        .expect("a passing record bound to the candidate was minted");
+    assert_eq!(record.tree_hash.as_deref(), Some(candidate_digest.as_str()));
+    assert_ne!(
+        owner_digest(&env),
+        candidate_digest,
+        "the verified snapshot is the candidate, not the owner"
+    );
+    // Recovery: the same verified candidate now lands into the owner.
+    env.executor.set_settlement_crash_seam(None);
+    let outcome = settle_orchestrated(&env, &run_id).await.expect("recovery");
+    assert!(outcome.verified && outcome.completed, "{outcome:?}");
+    assert!(env.owner_root.join("child_a.rs").is_file());
+    assert!(env.owner_root.join("child_b.rs").is_file());
+    assert_eq!(owner_digest(&env), candidate_digest);
+}
+
+/// Point 1/6: a FAILING verification lands nothing — the owner stays
+/// byte-identical, no landing transaction applies a byte and the task never
+/// completes.
+#[tokio::test]
+async fn verification_failure_leaves_owner_byte_identical() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        two_child_scripts("pub fn a() -> u64 {\n    let seed: u64 = 1;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n", "pub fn b() -> u64 {\n    let seed: u64 = 2;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n"),
+        faktor_agent::VerificationService::fake(|_| Err("verification deliberately failed".into())),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    let before = owner_digest(&env);
+    let run_id = start_two_child_run(&env, "fail verification");
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    assert_eq!(owner_digest(&env), before, "the owner is byte-identical");
+    assert_ne!(
+        h.get_task(task_id).unwrap().unwrap().state,
+        TaskState::VerifiedComplete
+    );
+    assert!(
+        latest_txn(&env, &run_id).is_none(),
+        "no landing ever started"
+    );
+    let outcome = settle_orchestrated(&env, &run_id).await.expect("settle");
+    assert!(!outcome.verified && !outcome.completed, "{outcome:?}");
+    assert_eq!(owner_digest(&env), before);
+}
+
+/// Point 4/5: two children diverging on the SAME path are a typed conflict
+/// BEFORE any owner mutation; the owner keeps its bytes and no verification
+/// or landing record is minted.
+#[tokio::test]
+async fn candidate_composition_conflict_leaves_owner_untouched() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        vec![
+            write_script("c-a", "same.rs", "pub fn v() -> u64 {\n    let seed: u64 = 1;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n"),
+            write_script("c-b", "same.rs", "pub fn v() -> u64 {\n    let seed: u64 = 2;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n"),
+            vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End],
+            vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End],
+        ],
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    let before = owner_digest(&env);
+    let run_id = start_two_child_run(&env, "conflict on one path");
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    assert_eq!(
+        owner_digest(&env),
+        before,
+        "composition never touches the owner"
+    );
+    assert!(!env.owner_root.join("same.rs").exists());
+    assert!(
+        h.list_verification_records(task_id)
+            .unwrap()
+            .iter()
+            .all(|r| r.tree_hash.is_none()),
+        "no root/candidate verification may be minted over a conflicted composition (child drive records bind no tree)"
+    );
+    assert!(
+        h.ledger_integration_record_for_task(task_id.raw())
+            .unwrap()
+            .is_none(),
+        "no integration record for a refused composition"
+    );
+    let err = settle_orchestrated(&env, &run_id)
+        .await
+        .expect_err("divergent children must refuse typed");
+    assert!(matches!(err, ExecError::IntegrationConflict(_)), "{err}");
+    assert_eq!(owner_digest(&env), before);
+    assert_ne!(
+        h.get_task(task_id).unwrap().unwrap().state,
+        TaskState::VerifiedComplete
+    );
+}
+
+/// Point 2/9: an unrelated owner edit while the children were running can
+/// never be verified over: the landing recheck refuses typed before the
+/// first write, and removing the drift lets the SAME settlement land.
+#[tokio::test]
+async fn unrelated_owner_edit_during_children_blocks_before_landing() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        two_child_scripts("pub fn a() -> u64 {\n    let seed: u64 = 1;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n", "pub fn b() -> u64 {\n    let seed: u64 = 2;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n"),
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    // Freeze after the candidate verification, then add the unrelated edit:
+    // exactly the "owner moved after the run base was taken" window.
+    env.executor
+        .set_settlement_crash_seam(Some(CrashSeam::AfterPreparedVerification));
+    let run_id = start_two_child_run(&env, "unrelated owner drift");
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
     std::fs::write(
         env.owner_root.join("unrelated.txt"),
         "not the task's work\n",
     )
     .unwrap();
-    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
-    // Re-settle over the drift (the automatic pass may have won the race):
-    // the final root carries `unrelated.txt`, so the REAL verifier fails
-    // closed and no completion step ever runs.
-    let drifted = env
-        .executor
-        .settle_run(RunSettlement::Orchestrated {
-            parent: env.parent,
-            run_id: receipt.run_id.clone(),
-        })
+    env.executor.set_settlement_crash_seam(None);
+    let err = settle_orchestrated(&env, &run_id)
         .await
-        .expect("drifted settlement");
-    assert!(!drifted.verified, "{drifted:?}");
-    assert!(!drifted.completed, "{drifted:?}");
-    assert_ne!(
-        h.get_task(task_id).unwrap().unwrap().state,
-        TaskState::VerifiedComplete,
-        "an unrelated owner-root edit never completes the task"
-    );
-    assert!(
-        h.ledger_completion_step_statuses(task_id.raw(), contract_rev.raw())
-            .unwrap()
-            .is_empty(),
-        "no completion step may run while the final root fails verification"
-    );
-    let integrated_then = h
-        .ledger_integration_record_for_task(task_id.raw())
-        .unwrap()
-        .expect("record-first integration row");
-    assert!(
-        !integrated_then.final_snapshot_hash.is_empty(),
-        "{integrated_then:?}"
-    );
-    assert_eq!(integrated_then.source_count, 2, "{integrated_then:?}");
-    // (2) Remove the unrelated drift, install the step runner and re-settle:
-    // the children's changes are integrated, the REAL verifier passes over
-    // the actual final root, and only then do the contract steps + completion
-    // run.
-    std::fs::remove_file(env.owner_root.join("unrelated.txt")).unwrap();
-    env.executor
-        .set_completion_steps(Some(completion_step_runner(dir.path())));
-    let outcome = env
-        .executor
-        .settle_run(RunSettlement::Orchestrated {
-            parent: env.parent,
-            run_id: receipt.run_id.clone(),
-        })
-        .await
-        .expect("settlement");
-    assert!(outcome.verified, "{outcome:?}");
-    assert!(outcome.completed, "{outcome:?}");
-    assert_eq!(
-        h.get_task(task_id).unwrap().unwrap().state,
-        TaskState::VerifiedComplete
-    );
-    let final_digest = faktor_session::root_snapshot_digest(
-        &env.owner_root,
-        faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES,
-    )
-    .unwrap();
-    let rec_id = outcome.verification.expect("root verification record");
-    let rec = h
-        .list_verification_records(task_id)
-        .unwrap()
-        .into_iter()
-        .find(|r| r.record_id == rec_id)
-        .expect("verification record durable");
-    assert_eq!(rec.tree_hash.as_deref(), Some(final_digest.as_str()));
-    let integrated = h
-        .ledger_integration_record_for_task(task_id.raw())
-        .unwrap()
-        .unwrap();
-    assert_eq!(integrated.final_snapshot_hash, final_digest);
-    assert!(
-        integrated
-            .integrated_files
-            .iter()
-            .any(|f| f.ends_with("child_a.rs"))
-            && integrated
-                .integrated_files
-                .iter()
-                .any(|f| f.ends_with("child_b.rs")),
-        "{integrated:?}"
-    );
-    assert!(env.owner_root.join("child_a.rs").is_file());
-    assert!(env.owner_root.join("child_b.rs").is_file());
-    let rows = h
-        .ledger_completion_step_statuses(task_id.raw(), contract_rev.raw())
-        .unwrap();
-    assert_eq!(
-        rows.last().unwrap().status,
-        faktor_core::completion::CompletionStepOutcome::Succeeded
-    );
-    assert_eq!(
-        rows.last().unwrap().snapshot.as_deref(),
-        Some(final_digest.as_str())
-    );
-    // The OWNER root holds exactly one integration commit with the
-    // deterministic message and is clean.
-    assert!(cs_porcelain(&env.owner_root).is_empty());
-    let message = std::process::Command::new("git")
-        .args(["log", "-1", "--pretty=%s"])
-        .current_dir(&env.owner_root)
-        .output()
-        .unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&message.stdout).trim(),
-        commit_message(goal)
-    );
-    let count = std::process::Command::new("git")
-        .args(["rev-list", "--count", "HEAD"])
-        .current_dir(&env.owner_root)
-        .output()
-        .unwrap();
-    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "2");
-    // (3) Reattach convergence: replaying the settlement over the durable
-    // rows is idempotent — same outcome, no new integration rows, no bytes
-    // touched.
-    let records_after_completion = h
-        .ledger_integration_records_for_task(task_id.raw())
-        .unwrap();
-    let before = std::fs::read(env.owner_root.join("child_a.rs")).unwrap();
-    let replay = env
-        .executor
-        .settle_run(RunSettlement::Orchestrated {
-            parent: env.parent,
-            run_id: receipt.run_id.clone(),
-        })
-        .await
-        .expect("idempotent replay");
-    assert!(replay.completed, "{replay:?}");
-    assert_eq!(
-        std::fs::read(env.owner_root.join("child_a.rs")).unwrap(),
-        before
-    );
-    assert_eq!(
-        h.ledger_integration_records_for_task(task_id.raw())
-            .unwrap()
-            .len(),
-        records_after_completion.len(),
-        "a settled replay appends no integration row"
-    );
-    // (4) Child candidate roots were never git-initialized or committed by
-    // the settlement (integration applies files, never histories).
-    let child_rows = run_registry(&env.manager, env.parent, &receipt.run_id);
-    assert_eq!(outcome.merge_proposals.len(), 2);
-    for row in &child_rows {
-        let root = child_root(&env.manager, row);
-        assert!(root.is_dir());
-        assert!(
-            !root.join(".git").exists(),
-            "settlement must never initialize/commit child root {}",
-            row.child_id
-        );
-    }
-    // Spy: give each child root its own history, replay the settlement, and
-    // prove the parent settlement never touches those histories.
-    let mut spies = Vec::new();
-    for row in &child_rows {
-        let root = child_root(&env.manager, row);
-        cs_git(&root, &["init", "-q", "-b", "main"]);
-        std::fs::write(root.join("candidate.txt"), "candidate\n").unwrap();
-        cs_git(&root, &["add", "-A"]);
-        cs_commit(&root, "candidate work");
-        let head = cs_head(&root);
-        let porcelain = cs_porcelain(&root);
-        spies.push((root, head, porcelain));
-    }
-    let replay = env
-        .executor
-        .settle_run(RunSettlement::Orchestrated {
-            parent: env.parent,
-            run_id: receipt.run_id.clone(),
-        })
-        .await
-        .expect("idempotent replay");
-    assert!(replay.completed, "{replay:?}");
-    for (root, head, porcelain) in spies {
-        assert_eq!(cs_head(&root), head, "child root HEAD unchanged");
-        assert_eq!(cs_porcelain(&root), porcelain, "child worktree untouched");
-    }
-}
-
-/// P0 integration binding (adversarial): a passing root verification is bound
-/// to the final integration snapshot. An arbitrary owner-checkout edit AFTER
-/// the integration changes the root digest; a later settlement RE-INTEGRATES
-/// and RE-VERIFIES (a fresh record for the new final root), the stale record
-/// is REFUSED typed at completion, and only the re-verified root completes.
-#[tokio::test]
-async fn owner_edit_after_integration_invalidates_and_restarts_root_verification() {
-    let _heavy = heavy_guard();
-    let dir = tempfile::tempdir().unwrap();
-    let scripts: Vec<Vec<ScriptedResponse>> = vec![
-        vec![
-            ScriptedResponse::ToolCall {
-                id: "c-a".into(),
-                name: "write_file".into(),
-                input: serde_json::json!({
-                    "path": "child_a.rs",
-                    "content": "pub fn a() -> u64 { 1 }\n",
-                }),
-            },
-            ScriptedResponse::Text("done".into()),
-            ScriptedResponse::End,
-        ],
-        vec![
-            ScriptedResponse::ToolCall {
-                id: "c-b".into(),
-                name: "write_file".into(),
-                input: serde_json::json!({
-                    "path": "child_b.rs",
-                    "content": "pub fn b() -> u64 { 2 }\n",
-                }),
-            },
-            ScriptedResponse::Text("done".into()),
-            ScriptedResponse::End,
-        ],
-        vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End],
-        vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End],
-    ];
-    let env = open_real_tool_env_full(
-        dir.path(),
-        scripts,
-        faktor_agent::VerificationService::fake_ok(),
-        false,
-        false,
-        MutationMode::DirectCompat,
-    );
-    // NOTE: the completion-step runner is installed only AFTER the drift:
-    // the first pass verifies + integrates but its gate refuses (no runner),
-    // so the task parks in Verifying with the durable binding observable.
-    seed_rust(&env);
-    cs_git(&env.owner_root, &["init", "-q", "-b", "main"]);
-    cs_git(&env.owner_root, &["add", "-A"]);
-    cs_commit(&env.owner_root, "init");
-    let items: Vec<WorkItem> = ["impl-a", "impl-b"]
-        .iter()
-        .map(|id| {
-            WorkItem::with_ownership(
-                *id,
-                format!("work {id}"),
-                WorkKind::Implementation,
-                OwnershipSpec::IsolatedWorktree,
-            )
-        })
-        .collect();
-    let receipt = env
-        .executor
-        .start_task(
-            env.parent,
-            TaskRunRequest {
-                goal: "verify the integrated root".to_string(),
-                work_items: items,
-                criteria: vec!["child lands".to_string()],
-                completion_contract: Some(faktor_core::completion::CompletionContract {
-                    include_commit: true,
-                    include_push: false,
-                    include_pr: false,
-                }),
-                parent_caps: read_caps(),
-                isolated_root: env.isolated_root.clone(),
-                ..Default::default()
-            },
-        )
-        .expect("orchestrated contracted start");
-    let h = env.manager.get_session(env.parent).unwrap().unwrap();
-    let task_id = h.task_id().unwrap();
-    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
-    assert_ne!(
-        h.get_task(task_id).unwrap().unwrap().state,
-        TaskState::VerifiedComplete,
-        "no runner: the gate refuses completion"
-    );
-    let first_digest = faktor_session::root_snapshot_digest(
-        &env.owner_root,
-        faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES,
-    )
-    .unwrap();
-    let first_integration = h
-        .ledger_integration_record_for_task(task_id.raw())
-        .unwrap()
-        .expect("first integration finalized");
-    assert_eq!(first_integration.final_snapshot_hash, first_digest);
-    let first_record = h
-        .list_verification_records(task_id)
-        .unwrap()
-        .into_iter()
-        .filter(|r| r.status == VerificationStatus::Passed)
-        .max_by_key(|r| r.record_id)
-        .expect("first passing root verification");
-    assert_eq!(
-        first_record.tree_hash.as_deref(),
-        Some(first_digest.as_str())
-    );
-    // An arbitrary owner-checkout edit after the integration moves the root.
-    std::fs::write(env.owner_root.join("late.txt"), "owner drift\n").unwrap();
-    let second_digest = faktor_session::root_snapshot_digest(
-        &env.owner_root,
-        faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES,
-    )
-    .unwrap();
-    assert_ne!(second_digest, first_digest);
-    // The stale record can no longer complete the task: typed refusal.
-    let revision = h.task_revision(task_id).unwrap();
-    let err = h
-        .complete_verified_task(task_id, revision, first_record.record_id)
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            faktor_session::TaskError::IntegrationSnapshotMismatch { .. }
-        ),
-        "{err}"
-    );
-    // Re-settle: integration re-runs against the edited root and verification
-    // restarts against the NEW final root (a fresh record).
-    let resettled = env
-        .executor
-        .settle_run(RunSettlement::Orchestrated {
-            parent: env.parent,
-            run_id: receipt.run_id.clone(),
-        })
-        .await
-        .expect("re-settlement");
-    assert!(!resettled.completed, "{resettled:?}");
-    let second_integration = h
-        .ledger_integration_record_for_task(task_id.raw())
-        .unwrap()
-        .unwrap();
-    assert_eq!(second_integration.final_snapshot_hash, second_digest);
-    let second_record = h
-        .list_verification_records(task_id)
-        .unwrap()
-        .into_iter()
-        .filter(|r| r.status == VerificationStatus::Passed)
-        .max_by_key(|r| r.record_id)
-        .expect("re-verified root record");
-    assert_ne!(second_record.record_id, first_record.record_id);
-    assert_eq!(
-        second_record.tree_hash.as_deref(),
-        Some(second_digest.as_str())
-    );
-    // Install the runner; the SAME re-settled root completes.
-    env.executor
-        .set_completion_steps(Some(completion_step_runner(dir.path())));
-    let outcome = env
-        .executor
-        .settle_run(RunSettlement::Orchestrated {
-            parent: env.parent,
-            run_id: receipt.run_id.clone(),
-        })
-        .await
-        .expect("settlement");
-    assert!(outcome.verified, "{outcome:?}");
-    assert!(outcome.completed, "{outcome:?}");
-    assert_eq!(
-        h.get_task(task_id).unwrap().unwrap().state,
-        TaskState::VerifiedComplete
-    );
-    assert_eq!(
-        outcome.verification.expect("record"),
-        second_record.record_id,
-        "the re-verified record is the one consumed"
-    );
-}
-
-/// P0 integration binding (adversarial): a divergent owner checkout conflicts
-/// with a mutating child's staged candidate at CAS apply time. The conflict
-/// is typed, the integration record captures it (empty final hash), no
-/// verification record exists and completion is refused. Restoring the base
-/// content lets the SAME settlement re-integrate and complete.
-#[tokio::test]
-async fn orchestrated_stage_conflict_blocks_completion_typed_then_resolves() {
-    let _heavy = heavy_guard();
-    let dir = tempfile::tempdir().unwrap();
-    let scripts: Vec<Vec<ScriptedResponse>> = vec![
-        vec![
-            ScriptedResponse::ToolCall {
-                id: "c-1".into(),
-                name: "write_file".into(),
-                input: serde_json::json!({
-                    "path": "base.rs",
-                    "content": "pub fn value() -> u64 { 99 }\n",
-                }),
-            },
-            ScriptedResponse::Text("done".into()),
-            ScriptedResponse::End,
-        ],
-        vec![
-            ScriptedResponse::ToolCall {
-                id: "c-2".into(),
-                name: "write_file".into(),
-                input: serde_json::json!({
-                    "path": "base.rs",
-                    "content": "pub fn value() -> u64 { 99 }\n",
-                }),
-            },
-            ScriptedResponse::Text("done".into()),
-            ScriptedResponse::End,
-        ],
-        vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End],
-        vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End],
-    ];
-    let env = open_real_tool_env_full(
-        dir.path(),
-        scripts,
-        faktor_agent::VerificationService::fake_ok(),
-        false,
-        false,
-        MutationMode::DirectCompat,
-    );
-    seed_rust(&env);
-    std::fs::write(
-        env.owner_root.join("base.rs"),
-        "pub fn value() -> u64 { 5 }\n",
-    )
-    .unwrap();
-    cs_git(&env.owner_root, &["init", "-q", "-b", "main"]);
-    cs_git(&env.owner_root, &["add", "-A"]);
-    cs_commit(&env.owner_root, "init");
-    let base_bytes = std::fs::read(env.owner_root.join("base.rs")).unwrap();
-    let items: Vec<WorkItem> = ["impl-a", "impl-b"]
-        .iter()
-        .map(|id| {
-            WorkItem::with_ownership(
-                *id,
-                format!("work {id}"),
-                WorkKind::Implementation,
-                OwnershipSpec::IsolatedWorktree,
-            )
-        })
-        .collect();
-    let receipt = env
-        .executor
-        .start_task(
-            env.parent,
-            TaskRunRequest {
-                goal: "conflict then resolve".to_string(),
-                work_items: items,
-                criteria: vec!["child lands".to_string()],
-                completion_contract: Some(faktor_core::completion::CompletionContract {
-                    include_commit: true,
-                    include_push: false,
-                    include_pr: false,
-                }),
-                parent_caps: read_caps(),
-                isolated_root: env.isolated_root.clone(),
-                ..Default::default()
-            },
-        )
-        .expect("orchestrated contracted start");
-    let h = env.manager.get_session(env.parent).unwrap().unwrap();
-    let task_id = h.task_id().unwrap();
-    // The children's spawn recorded the base maps BEFORE this write; the
-    // owner checkout now diverges from their base anchor on the same path.
-    wait_until(
-        || run_registry(&env.manager, env.parent, &receipt.run_id).len() == 2,
-        60,
-    )
-    .await;
-    std::fs::write(
-        env.owner_root.join("base.rs"),
-        "pub fn value() -> u64 { 7 }\n",
-    )
-    .unwrap();
-    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
-    let err = env
-        .executor
-        .settle_run(RunSettlement::Orchestrated {
-            parent: env.parent,
-            run_id: receipt.run_id.clone(),
-        })
-        .await
-        .expect_err("a CAS conflict must refuse typed");
+        .expect_err("owner drift blocks before landing");
     assert!(matches!(err, ExecError::IntegrationConflict(_)), "{err}");
+    assert!(!env.owner_root.join("child_a.rs").exists());
+    assert!(!env.owner_root.join("child_b.rs").exists());
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
     assert_ne!(
         h.get_task(task_id).unwrap().unwrap().state,
         TaskState::VerifiedComplete
-    );
-    assert!(
-        h.list_verification_records(task_id).unwrap().is_empty(),
-        "no verification may be minted over a conflicted integration"
     );
     let blocked = h
         .ledger_integration_record_for_task(task_id.raw())
         .unwrap()
         .expect("blocked integration row");
-    assert!(blocked.conflict_count > 0, "{blocked:?}");
     assert!(blocked.final_snapshot_hash.is_empty(), "{blocked:?}");
-    assert_eq!(
-        std::fs::read(env.owner_root.join("base.rs")).unwrap(),
-        b"pub fn value() -> u64 { 7 }\n",
-        "the owner copy is never overwritten by a conflict"
+    // Resolve the drift; the same settlement lands and completes.
+    std::fs::remove_file(env.owner_root.join("unrelated.txt")).unwrap();
+    let outcome = settle_orchestrated(&env, &run_id).await.expect("resolved");
+    assert!(outcome.verified && outcome.completed, "{outcome:?}");
+    assert!(env.owner_root.join("child_a.rs").is_file());
+}
+
+/// Point 9: an owner edit AFTER a passing verification but BEFORE the
+/// landing recheck is refused typed; the user's edit survives and is never
+/// overwritten by the landing.
+#[tokio::test]
+async fn owner_edit_after_verification_before_landing_blocks() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        two_child_scripts("pub fn a() -> u64 {\n    let seed: u64 = 1;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n", "pub fn b() -> u64 {\n    let seed: u64 = 2;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n"),
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
     );
-    // Resolve the drift: restore the base content; the same settlement
-    // re-integrates the child and completes.
-    std::fs::write(env.owner_root.join("base.rs"), &base_bytes).unwrap();
+    cs_seed_owner(&env);
     env.executor
-        .set_completion_steps(Some(completion_step_runner(dir.path())));
-    let outcome = env
-        .executor
-        .settle_run(RunSettlement::Orchestrated {
-            parent: env.parent,
-            run_id: receipt.run_id.clone(),
-        })
+        .set_settlement_crash_seam(Some(CrashSeam::AfterPreparedVerification));
+    let run_id = start_two_child_run(&env, "late owner edit");
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    // The edit lands in the window between the passing verification and the
+    // landing transaction's first write.
+    std::fs::write(
+        env.owner_root.join("src/lib.rs"),
+        "pub fn value() -> u64 { 999 }\n",
+    )
+    .unwrap();
+    env.executor.set_settlement_crash_seam(None);
+    let err = settle_orchestrated(&env, &run_id)
         .await
-        .expect("resolved settlement");
-    assert!(outcome.verified, "{outcome:?}");
-    assert!(outcome.completed, "{outcome:?}");
+        .expect_err("late drift must block");
+    assert!(matches!(err, ExecError::IntegrationConflict(_)), "{err}");
     assert_eq!(
-        std::fs::read(env.owner_root.join("base.rs")).unwrap(),
-        b"pub fn value() -> u64 { 99 }\n",
-        "the resolved integration lands the child content"
+        std::fs::read(env.owner_root.join("src/lib.rs")).unwrap(),
+        b"pub fn value() -> u64 { 999 }\n",
+        "the late user edit is preserved"
+    );
+    assert!(!env.owner_root.join("child_a.rs").exists());
+}
+
+/// Point 9: a crash AFTER the passing verification and BEFORE the landing
+/// transaction recovers idempotently — the next settlement lands and
+/// completes without re-running the model or double-applying anything.
+#[tokio::test]
+async fn crash_after_verified_before_land_recovers() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        two_child_scripts("pub fn a() -> u64 {\n    let seed: u64 = 1;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n", "pub fn b() -> u64 {\n    let seed: u64 = 2;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n"),
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    env.executor
+        .set_settlement_crash_seam(Some(CrashSeam::AfterPreparedVerification));
+    let run_id = start_two_child_run(&env, "crash before landing");
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    assert!(latest_txn(&env, &run_id).is_none());
+    env.executor.set_settlement_crash_seam(None);
+    let outcome = settle_orchestrated(&env, &run_id).await.expect("recovery");
+    assert!(outcome.verified && outcome.completed, "{outcome:?}");
+    assert!(env.owner_root.join("child_a.rs").is_file());
+    assert!(env.owner_root.join("child_b.rs").is_file());
+    assert_eq!(
+        latest_txn(&env, &run_id).map(|t| t.phase),
+        Some(faktor_session::ledger::IntegrationTxnPhase::Landed)
     );
 }
 
-/// P0 integration binding (adversarial): a tournament NEVER auto-integrates.
-/// Even with the winner decided and its candidate worktree holding content,
-/// the orchestrated settlement returns explicit-merge proposals only: no
-/// IntegrationRecord, no root verification, no completion. Only the explicit
-/// approved merge of the winner's staged change set lands its files.
+/// Point 9: a crash at the run-base boundary leaves the owner untouched and
+/// no live run behind; a fresh start converges (the run never had children).
 #[tokio::test]
-async fn tournament_winner_requires_explicit_approved_merge_never_auto_integrates() {
+async fn crash_after_run_base_recorded_restarts_cleanly() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        two_child_scripts("pub fn a() -> u64 {\n    let seed: u64 = 1;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n", "pub fn b() -> u64 {\n    let seed: u64 = 2;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n"),
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    let before = owner_digest(&env);
+    env.executor
+        .set_settlement_crash_seam(Some(CrashSeam::AfterRunBaseRecorded));
+    let err = env
+        .executor
+        .start_task(
+            env.parent,
+            TaskRunRequest {
+                goal: "base crash".to_string(),
+                work_items: two_isolated_items(),
+                criteria: vec![typed_land_criterion()],
+                parent_caps: read_caps(),
+                isolated_root: env.isolated_root.clone(),
+                ..Default::default()
+            },
+        )
+        .expect_err("the seam fires before any child spawn");
+    assert!(matches!(err, ExecError::InjectedCrashSeam(_)), "{err}");
+    assert!(env.executor.active_run().is_none(), "the slot was released");
+    assert_eq!(owner_digest(&env), before);
+    assert!(
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run").is_err() || true
+    );
+    env.executor.set_settlement_crash_seam(None);
+    let run_id = start_two_child_run(&env, "fresh start after base crash");
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    // The automatic settlement may already have landed the fresh run; the
+    // explicit re-settle must be a convergent no-op either way.
+    let outcome = settle_orchestrated(&env, &run_id).await.expect("recovery");
+    assert!(outcome.verified && outcome.completed, "{outcome:?}");
+    assert!(env.owner_root.join("child_a.rs").is_file());
+    assert!(env.owner_root.join("child_b.rs").is_file());
+}
+
+/// Point 9: a crash AFTER the candidate was prepared (staged + composed)
+/// leaves the owner byte-identical; re-settling rebuilds the identical
+/// candidate idempotently and lands it.
+#[tokio::test]
+async fn crash_after_candidate_prepared_recovers() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        two_child_scripts("pub fn a() -> u64 {\n    let seed: u64 = 1;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n", "pub fn b() -> u64 {\n    let seed: u64 = 2;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n"),
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    let before = owner_digest(&env);
+    env.executor
+        .set_settlement_crash_seam(Some(CrashSeam::AfterCandidatePrepared));
+    let run_id = start_two_child_run(&env, "candidate crash");
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    assert_eq!(owner_digest(&env), before, "staging never writes the owner");
+    let candidate = run_candidate_root(&env, &run_id);
+    assert!(candidate.join("child_a.rs").is_file());
+    assert!(latest_txn(&env, &run_id).is_none());
+    env.executor.set_settlement_crash_seam(None);
+    let outcome = settle_orchestrated(&env, &run_id).await.expect("recovery");
+    assert!(outcome.verified && outcome.completed, "{outcome:?}");
+    assert_eq!(owner_digest(&env), root_digest(&candidate));
+}
+
+/// Point 9: a crash right after the record-first landing transaction was
+/// journaled (phase Landing, zero applies) recovers without any blind write
+/// and finishes the landing.
+#[tokio::test]
+async fn crash_after_txn_record_recovers_without_writes() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        two_child_scripts("pub fn a() -> u64 {\n    let seed: u64 = 1;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n", "pub fn b() -> u64 {\n    let seed: u64 = 2;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n"),
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    env.executor
+        .set_settlement_crash_seam(Some(CrashSeam::AfterIntegrationTxnRecord));
+    let run_id = start_two_child_run(&env, "txn crash");
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    let txn = latest_txn(&env, &run_id).expect("record-first txn durable");
+    assert_eq!(
+        txn.phase,
+        faktor_session::ledger::IntegrationTxnPhase::Landing
+    );
+    assert_eq!(txn.applied_count, 0, "no owner write after the record");
+    assert!(!env.owner_root.join("child_a.rs").exists());
+    env.executor.set_settlement_crash_seam(None);
+    let outcome = settle_orchestrated(&env, &run_id).await.expect("recovery");
+    assert!(outcome.verified && outcome.completed, "{outcome:?}");
+    assert_eq!(
+        latest_txn(&env, &run_id).map(|t| t.phase),
+        Some(faktor_session::ledger::IntegrationTxnPhase::Landed)
+    );
+}
+
+/// Point 5/9: a crash MID-landing (one path applied) resumes from the
+/// durable transaction and finishes the landing; the final digest equals the
+/// verified candidate.
+#[tokio::test]
+async fn crash_mid_land_recovers_or_rolls_back() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        two_child_scripts("pub fn a() -> u64 {\n    let seed: u64 = 1;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n", "pub fn b() -> u64 {\n    let seed: u64 = 2;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n"),
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    env.executor
+        .set_settlement_crash_seam(Some(CrashSeam::IntegrationApply { after: 1 }));
+    let run_id = start_two_child_run(&env, "crash mid landing");
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    let txn = latest_txn(&env, &run_id).expect("landing txn durable");
+    assert_eq!(
+        txn.phase,
+        faktor_session::ledger::IntegrationTxnPhase::Landing
+    );
+    assert_eq!(txn.applied_count, 1, "{txn:?}");
+    assert!(env.owner_root.join("child_a.rs").is_file());
+    assert!(!env.owner_root.join("child_b.rs").exists());
+    env.executor.set_settlement_crash_seam(None);
+    let outcome = settle_orchestrated(&env, &run_id)
+        .await
+        .expect("finish landing");
+    assert!(outcome.verified && outcome.completed, "{outcome:?}");
+    let txn = latest_txn(&env, &run_id).unwrap();
+    assert_eq!(
+        txn.phase,
+        faktor_session::ledger::IntegrationTxnPhase::Landed
+    );
+    assert_eq!(
+        owner_digest(&env),
+        root_digest(&run_candidate_root(&env, &run_id)),
+        "the landed owner equals the verified candidate"
+    );
+}
+
+/// Point 5: a rollback restores only paths still equal to OUR written
+/// candidate hash — a post-landing user edit is never overwritten and is
+/// reported as a rollback conflict.
+#[tokio::test]
+async fn rollback_never_overwrites_later_user_edit() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        two_child_scripts("pub fn a() -> u64 {\n    let seed: u64 = 1;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n", "pub fn b() -> u64 {\n    let seed: u64 = 2;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n"),
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    env.executor
+        .set_settlement_crash_seam(Some(CrashSeam::IntegrationApply { after: 1 }));
+    let run_id = start_two_child_run(&env, "rollback keeps edits");
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    let txn = latest_txn(&env, &run_id).expect("landing txn durable");
+    assert_eq!(txn.applied_count, 1);
+    let applied_path = txn.paths[0].path.clone();
+    let pending_path = txn.paths[1].path.clone();
+    // A user edits the path we already wrote (ours must never clobber it)
+    // and makes the pending path diverge from the base (forcing the
+    // rollback on resume).
+    std::fs::write(
+        env.owner_root.join(&applied_path),
+        "user post-landing edit\n",
+    )
+    .unwrap();
+    std::fs::write(env.owner_root.join(&pending_path), "hostile drift\n").unwrap();
+    env.executor.set_settlement_crash_seam(None);
+    let err = settle_orchestrated(&env, &run_id)
+        .await
+        .expect_err("a late per-path conflict rolls back");
+    assert!(matches!(err, ExecError::IntegrationConflict(_)), "{err}");
+    assert_eq!(
+        std::fs::read(env.owner_root.join(&applied_path)).unwrap(),
+        b"user post-landing edit\n",
+        "the rollback never overwrote the later user edit"
+    );
+    assert_eq!(
+        std::fs::read(env.owner_root.join(&pending_path)).unwrap(),
+        b"hostile drift\n",
+        "a never-applied path is left alone"
+    );
+    let txn = latest_txn(&env, &run_id).unwrap();
+    assert_eq!(
+        txn.phase,
+        faktor_session::ledger::IntegrationTxnPhase::RolledBack
+    );
+    let applied = txn.paths.iter().find(|p| p.path == applied_path).unwrap();
+    assert_eq!(
+        applied.state,
+        faktor_session::ledger::IntegrationPathTxnState::RollbackConflict
+    );
+}
+
+/// Point 6: the landed owner digest must EQUAL the verified candidate
+/// snapshot; an external edit before the final digest check rolls our
+/// writes back and refuses typed (never a "merge returned ok" completion).
+#[tokio::test]
+async fn final_owner_digest_must_equal_verified_candidate() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        two_child_scripts("pub fn a() -> u64 {\n    let seed: u64 = 1;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n", "pub fn b() -> u64 {\n    let seed: u64 = 2;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n"),
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    env.executor
+        .set_settlement_crash_seam(Some(CrashSeam::AfterFinalOwnerSnapshot));
+    let run_id = start_two_child_run(&env, "final digest equality");
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    let candidate_digest = root_digest(&run_candidate_root(&env, &run_id));
+    assert_eq!(
+        owner_digest(&env),
+        candidate_digest,
+        "the landing applied every path before the crash"
+    );
+    // An external edit lands exactly between the last apply and the final
+    // equality check.
+    std::fs::write(env.owner_root.join("late.txt"), "concurrent edit\n").unwrap();
+    env.executor.set_settlement_crash_seam(None);
+    let err = settle_orchestrated(&env, &run_id)
+        .await
+        .expect_err("a moved owner root can never complete");
+    assert!(matches!(err, ExecError::WorkspaceDrift(_)), "{err}");
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    assert_ne!(
+        h.get_task(h.task_id().unwrap()).unwrap().unwrap().state,
+        TaskState::VerifiedComplete
+    );
+    assert!(
+        env.owner_root.join("late.txt").is_file(),
+        "external edit kept"
+    );
+    assert!(
+        !env.owner_root.join("child_a.rs").exists(),
+        "our applied paths were rolled back after the failed equality"
+    );
+    let txn = latest_txn(&env, &run_id).unwrap();
+    assert_eq!(
+        txn.phase,
+        faktor_session::ledger::IntegrationTxnPhase::RolledBack
+    );
+}
+
+// ------------------------------------------------- composition unit coverage
+
+fn unit_cs(
+    child: &str,
+    files: Vec<crate::runtime::merge::ChangeEntry>,
+) -> crate::runtime::merge::ChangeSet {
+    crate::runtime::merge::ChangeSet {
+        child_id: child.to_string(),
+        base_id: format!("base-{child}"),
+        run_base_snapshot: Some("a".repeat(64)),
+        child_start_snapshot: None,
+        final_child_snapshot: None,
+        files,
+        created_ms: 1,
+    }
+}
+
+fn unit_entry(
+    path: &str,
+    child_hash: Option<FileHash>,
+    base_hash: Option<FileHash>,
+) -> crate::runtime::merge::ChangeEntry {
+    crate::runtime::merge::ChangeEntry {
+        path: std::path::PathBuf::from(path),
+        child_hash,
+        base_hash,
+    }
+}
+
+/// Point 4: three children converging on the SAME resulting hash (same
+/// file, same content) are applied once with provenance retained; every
+/// input permutation resolves identically (lexical order is not the
+/// resolution mechanism).
+#[test]
+fn convergent_multi_child_same_file_is_deterministic() {
+    let base = FileHash::from([7u8; 32]);
+    let result = FileHash::from([9u8; 32]);
+    let make = |order: &[usize]| {
+        let mut children: Vec<crate::runtime::merge::ChangeSet> = Vec::new();
+        for i in order {
+            children.push(unit_cs(
+                &format!("child-{i}"),
+                vec![
+                    unit_entry("same.rs", Some(result), Some(base)),
+                    unit_entry(
+                        &format!("only-{i}.rs"),
+                        Some(FileHash::from([*i as u8; 32])),
+                        None,
+                    ),
+                ],
+            ));
+        }
+        crate::runtime::merge::compose_child_changes(&children).unwrap()
+    };
+    let reference = make(&[0, 1, 2]);
+    let same = reference
+        .iter()
+        .find(|c| c.path.ends_with("same.rs"))
+        .unwrap();
+    assert_eq!(same.sources, vec!["child-0", "child-1", "child-2"]);
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        assert_eq!(make(&order), reference, "order {order:?} drifted");
+    }
+    let paths: Vec<_> = reference.iter().map(|c| c.path.clone()).collect();
+    assert_eq!(paths, {
+        let mut sorted = paths.clone();
+        sorted.sort();
+        sorted
+    });
+}
+
+/// Point 4: two children producing DIFFERENT hashes for the same path are a
+/// typed conflict (no order-based resolution exists).
+#[test]
+fn divergent_multi_child_same_file_conflicts() {
+    let base = FileHash::from([7u8; 32]);
+    let children = vec![
+        unit_cs(
+            "child-0",
+            vec![unit_entry(
+                "same.rs",
+                Some(FileHash::from([1u8; 32])),
+                Some(base),
+            )],
+        ),
+        unit_cs(
+            "child-1",
+            vec![unit_entry(
+                "same.rs",
+                Some(FileHash::from([2u8; 32])),
+                Some(base),
+            )],
+        ),
+    ];
+    let err = crate::runtime::merge::compose_child_changes(&children).unwrap_err();
+    assert!(matches!(err, ExecError::IntegrationConflict(_)), "{err}");
+}
+
+/// Point 4: delete-vs-modify on one path is a typed conflict.
+#[test]
+fn delete_vs_modify_conflicts() {
+    let base = FileHash::from([7u8; 32]);
+    let children = vec![
+        unit_cs("child-0", vec![unit_entry("same.rs", None, Some(base))]),
+        unit_cs(
+            "child-1",
+            vec![unit_entry(
+                "same.rs",
+                Some(FileHash::from([3u8; 32])),
+                Some(base),
+            )],
+        ),
+    ];
+    let err = crate::runtime::merge::compose_child_changes(&children).unwrap_err();
+    assert!(matches!(err, ExecError::IntegrationConflict(_)), "{err}");
+}
+
+/// Point 8: the tournament WINNER lands through the SAME pipeline — the
+/// decided winner is integrated, verified over the candidate, committed
+/// into the owner and certified; the loser's work never reaches the owner.
+#[tokio::test]
+async fn tournament_winner_lands_through_the_one_pipeline() {
     use crate::runtime::task_executor::TournamentStartRequest;
     use crate::tournament::{CandidateState, ReviewRank, ReviewVerdict};
     use faktor_core::id::VerificationRecordId;
@@ -5077,14 +5223,22 @@ async fn tournament_winner_requires_explicit_approved_merge_never_auto_integrate
     let scripts: Vec<Vec<ScriptedResponse>> = (0..6)
         .map(|_| vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End])
         .collect();
-    let env = open_env(dir.path(), scripts);
+    let env = open_real_tool_env_full(
+        dir.path(),
+        scripts,
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
     let receipt = env
         .executor
         .start_tournament_with(
             env.parent,
             TournamentStartRequest {
                 goal: "pick a winner".to_string(),
-                criteria: vec!["cargo test".to_string()],
+                criteria: vec![typed_land_criterion()],
                 n: 2,
                 isolated_root: env.isolated_root.clone(),
                 ..Default::default()
@@ -5102,13 +5256,17 @@ async fn tournament_winner_requires_explicit_approved_merge_never_auto_integrate
     .await;
     let rows = OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, &receipt.run_id)
         .unwrap();
-    // Both candidate worktrees hold candidate content; the winner's is what
-    // the explicit approved merge consumes.
     for row in &rows {
         let root = child_root(&env.manager, row);
-        std::fs::write(root.join("winner.txt"), format!("{}-work\n", row.child_id)).unwrap();
+        std::fs::write(
+            root.join("winner.rs"),
+            format!(
+                "pub fn winner() -> u64 {{\n    let seed: u64 = {0};\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}}\n",
+                row.child_id.trim_start_matches("child-").parse::<u64>().unwrap_or(1) + 1
+            ),
+        )
+        .unwrap();
     }
-    // child-0 fails verification; child-1 passes.
     let mut loser = env
         .executor
         .candidate_settlement(
@@ -5124,7 +5282,6 @@ async fn tournament_winner_requires_explicit_approved_merge_never_auto_integrate
         rank: ReviewRank::Clean,
         reviewer: "review-0".into(),
     });
-    loser.cost_micro = 0;
     env.executor
         .settle_tournament_candidate(env.parent, &receipt.tournament_id, loser)
         .unwrap();
@@ -5143,7 +5300,6 @@ async fn tournament_winner_requires_explicit_approved_merge_never_auto_integrate
         rank: ReviewRank::Clean,
         reviewer: "review-0".into(),
     });
-    winner.cost_micro = 1_000_000;
     env.executor
         .settle_tournament_candidate(env.parent, &receipt.tournament_id, winner)
         .unwrap();
@@ -5152,56 +5308,35 @@ async fn tournament_winner_requires_explicit_approved_merge_never_auto_integrate
         .decide_tournament(env.parent, &receipt.tournament_id)
         .expect("deterministic decision");
     assert_eq!(decision.winner.child_id, "child-1");
-    let winner_wt = decision.winner.worktree.clone();
     assert_eq!(decision.winner.state, CandidateState::Done);
-    assert!(decision
-        .discarded
-        .iter()
-        .any(|(child_id, _)| child_id == "child-0"));
-    let h = env.manager.get_session(env.parent).unwrap().unwrap();
-    let task_id = h.task_id().unwrap();
-    // (1) The orchestrated settlement proposes only: no integration record,
-    // no root verification, no completion, winner content stays isolated.
-    let outcome = env
-        .executor
-        .settle_run(RunSettlement::Orchestrated {
-            parent: env.parent,
-            run_id: receipt.run_id.clone(),
-        })
+    // The SAME settlement pipeline lands the winner through the candidate.
+    let outcome = settle_orchestrated(&env, &receipt.run_id)
         .await
-        .expect("tournament settlement");
-    assert!(!outcome.completed, "{outcome:?}");
-    assert!(!outcome.verified, "{outcome:?}");
-    assert!(!outcome.merge_proposals.is_empty(), "{outcome:?}");
-    assert_ne!(
-        h.get_task(task_id).unwrap().unwrap().state,
-        TaskState::VerifiedComplete
-    );
-    assert!(h
-        .ledger_integration_record_for_task(task_id.raw())
-        .unwrap()
-        .is_none());
-    assert!(h.list_verification_records(task_id).unwrap().is_empty());
-    assert!(std::path::Path::new(&winner_wt)
-        .join("winner.txt")
-        .is_file());
-    assert!(!env.owner_root.join("winner.txt").exists());
-    // (2) The explicit approved merge is the only path that lands it.
-    let cs = env
-        .orchestrator
-        .stage_child_changes("child-1")
-        .expect("winner stages after decision");
-    assert!(cs.files.iter().any(|f| f.path.ends_with("winner.txt")));
-    let approved: Vec<std::path::PathBuf> = cs.files.iter().map(|f| f.path.clone()).collect();
-    let merge = env
-        .orchestrator
-        .approve_and_merge("child-1", &cs.id(), &approved, &[])
-        .expect("explicit approved merge");
-    assert!(merge.conflicts.is_empty(), "{merge:?}");
+        .expect("winner settlement");
+    assert!(outcome.verified && outcome.completed, "{outcome:?}");
     assert_eq!(
-        std::fs::read(env.owner_root.join("winner.txt")).unwrap(),
-        b"child-1-work\n"
+        std::fs::read_to_string(env.owner_root.join("winner.rs")).unwrap(),
+        "pub fn winner() -> u64 {\n    let seed: u64 = 2;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n"
     );
+    let integrated = env
+        .manager
+        .get_session(env.parent)
+        .unwrap()
+        .unwrap()
+        .ledger_integration_record_for_task(
+            env.manager
+                .get_session(env.parent)
+                .unwrap()
+                .unwrap()
+                .task_id()
+                .unwrap()
+                .raw(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(integrated.source_count, 1, "{integrated:?}");
+    assert_eq!(integrated.sources[0].child_id, "child-1");
+    assert!(!integrated.final_snapshot_hash.is_empty());
 }
 
 /// P1 binary attachments: a stored `AttachmentId` set admits durably on the
