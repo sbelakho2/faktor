@@ -78,10 +78,16 @@ pub(crate) async fn native_session_verification(
 
 /// The typed evidence projection of ONE durable verification record
 /// (wave-16 table, audit P0-64): checks/criteria/changed-files with the
-/// record's certification envelope. Field names are camelCase; content is
-/// the record's stored, bounded data.
+/// record's certification envelope, PLUS the P0 proof-binding payload —
+/// the compact candidate-proof reference, the verified candidate snapshot,
+/// the run base it was based on, the integration source count and the
+/// landed (final) snapshot of its integration record. Field names are
+/// camelCase; content is the record's stored, bounded data. `candidateProof`
+/// is `null` on a legacy record without the v20 evidence column (honest
+/// absence, never a synthesized value).
 pub(crate) fn native_verification_record_row(
-    r: &faktor_store::VerificationRecordRow,
+    r: &faktor_session::VerificationRecord,
+    integration: Option<&faktor_session::ledger::IntegrationRecordRow>,
 ) -> serde_json::Value {
     let criteria: Vec<serde_json::Value> = r
         .criteria
@@ -125,8 +131,35 @@ pub(crate) fn native_verification_record_row(
             })
         })
         .collect();
+    let candidate = r.candidate_proof_ref.as_ref();
+    let candidate_proof = match candidate {
+        Some(c) => serde_json::json!({
+            "taskRevision": c.task_revision.to_string(),
+            "baseManifestHash": c.base_manifest_hash,
+            "candidateManifestHash": c.candidate_manifest_hash,
+            "sourceDiffEvidence": c.source_diff_evidence,
+            "riskReportEvidence": c.risk_report_evidence,
+            "accountingSnapshotDigest": c.accounting_snapshot_digest,
+            "runId": c.run_id,
+            "runBaseSnapshot": c.run_base_snapshot,
+            "candidateSnapshot": c.candidate_snapshot,
+            "sourcesDigest": c.sources_digest,
+            "changedFilesDigest": c.changed_files_digest,
+        }),
+        None => serde_json::Value::Null,
+    };
+    let verified_snapshot = candidate
+        .and_then(|c| c.candidate_snapshot.clone())
+        .or_else(|| r.tree_hash.clone());
+    let based_on_snapshot = candidate
+        .and_then(|c| c.run_base_snapshot.clone())
+        .or_else(|| integration.and_then(|i| i.base_snapshot.clone()));
+    let source_count = integration.map(|i| i.source_count);
+    let landed_snapshot = integration
+        .map(|i| i.final_snapshot_hash.clone())
+        .filter(|s| !s.is_empty());
     serde_json::json!({
-        "recordId": r.id.to_string(),
+        "recordId": r.record_id.to_string(),
         "revision": r.revision.to_string(),
         "workspaceId": r.workspace_id.to_string(),
         "worktreeId": r.worktree_id.to_string(),
@@ -139,6 +172,11 @@ pub(crate) fn native_verification_record_row(
         "status": serde_json::to_string(&r.status).unwrap_or_default().trim_matches('"'),
         "startedMs": r.started_ms,
         "completedMs": r.completed_ms,
+        "candidateProof": candidate_proof,
+        "verifiedSnapshot": verified_snapshot,
+        "basedOnSnapshot": based_on_snapshot,
+        "sourceCount": source_count,
+        "landedSnapshot": landed_snapshot,
     })
 }
 
@@ -196,15 +234,26 @@ pub(crate) async fn native_task_verification(
         };
         return wire_status(e);
     }
-    let store = state.deps.session.store();
-    let records = match store.verification_record_list_by_task(requested) {
+    // The session-layer read parses the v20 evidence columns STRICTLY (a
+    // corrupt fingerprint/candidate column is a loud typed error, never a
+    // partially fabricated record).
+    let records = match state
+        .deps
+        .session
+        .verification_records(handle.id(), requested)
+        .await
+    {
         Ok(r) => r,
-        Err(e) => return api_err(&store_err_to_core(e)),
+        Err(e) => return api_err(&e),
+    };
+    let integration = match handle.ledger_integration_record_for_task(requested.raw()) {
+        Ok(r) => r,
+        Err(e) => return api_err(&e),
     };
     // Records certify a task revision inside the session's workspace; the
     // workspace guard keeps same-numeric-id tasks of OTHER workspaces out of
     // this session's view.
-    let records: Vec<&faktor_store::VerificationRecordRow> = records
+    let records: Vec<&faktor_session::VerificationRecord> = records
         .iter()
         .filter(|r| r.workspace_id == row.workspace_id)
         .collect();
@@ -212,7 +261,7 @@ pub(crate) async fn native_task_verification(
         .iter()
         .rev()
         .take(MAX_NATIVE_LIST)
-        .map(|r| native_verification_record_row(r))
+        .map(|r| native_verification_record_row(r, integration.as_ref()))
         .collect();
     Json(serde_json::json!({
         "sessionId": handle.id().to_string(),

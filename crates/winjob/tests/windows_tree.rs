@@ -140,7 +140,7 @@ fn closing_the_last_job_handle_kills_the_tree() {
     let pid_file = pid_file_path();
     let mut child = {
         let job = JobGuard::create().expect("CreateJobObject must succeed on CI");
-        let mut child = spawn_sleeper_tree(&sleeper_tree_script(&pid_file));
+        let child = spawn_sleeper_tree(&sleeper_tree_script(&pid_file));
         job.assign(child.id());
         let grandchild = read_grandchild_pid(&pid_file);
         assert!(

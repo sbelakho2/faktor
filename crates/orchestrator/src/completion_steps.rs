@@ -334,6 +334,14 @@ impl CompletionStepRunner {
         &self.config
     }
 
+    /// LEGACY TEST-ONLY authorization path (the P0 residual is closed):
+    /// production callers MUST use [`Self::run_completion_steps`] with an
+    /// explicit [`VerificationRecordId`] proof — the durable verification
+    /// fact alone (`verification_passed`) is never a production
+    /// authorization. This shim exists only for the runner's own unit tests,
+    /// which call it directly; the executor's production drivers compile
+    /// against the proof-validated API exclusively.
+    ///
     /// Execute and durably record every requested step of the task's
     /// ACCEPTED contract. With no contract (or the all-false default) this
     /// is a pure no-op: no runner step runs and no durable row is written,
@@ -343,6 +351,7 @@ impl CompletionStepRunner {
     /// `Succeeded` is not re-executed and not re-recorded; a terminal
     /// `Failed` row stops everything (nothing new is written); a `Skipped`
     /// row is retried (it is the retryable unmet state).
+    #[cfg(test)]
     pub async fn run(
         &self,
         handle: &SessionHandle,

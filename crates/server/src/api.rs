@@ -8997,8 +8997,29 @@ mod tests {
         let row_a = a.row().unwrap();
         let row_b = b.row().unwrap();
         let rev = faktor_core::id::TaskRevision::new(1);
+        // A's record carries the full v20 candidate-proof evidence; B's is a
+        // legacy NULL-evidence row (both must project honestly).
+        let candidate = faktor_core::state::CandidateProofRef {
+            task_revision: rev,
+            base_manifest_hash: "11".repeat(32),
+            candidate_manifest_hash: "22".repeat(32),
+            source_diff_evidence: None,
+            risk_report_evidence: None,
+            accounting_snapshot_digest: "accounting:v1:feedfacefeedface".into(),
+            run_id: Some("run-ver-a".into()),
+            run_base_snapshot: Some("33".repeat(32)),
+            candidate_snapshot: Some("44".repeat(32)),
+            sources_digest: Some("55".repeat(32)),
+            changed_files_digest: Some("66".repeat(32)),
+        };
+        let candidate_json = serde_json::to_string(&candidate).unwrap();
         let put =
             |row: &faktor_store::VerificationRecordRow| store.verification_record_put(row).unwrap();
+        let put_with_evidence = |row: &faktor_store::VerificationRecordRow| {
+            store
+                .verification_record_put_with_evidence(row, None, Some(&candidate_json))
+                .unwrap()
+        };
         let rec_for = |session_row: &faktor_store::SessionRow, task_id: u64, check: &str| {
             faktor_store::VerificationRecordRow {
                 id: faktor_core::id::VerificationRecordId::new(1),
@@ -9037,8 +9058,28 @@ mod tests {
                 completed_ms: Some(2),
             }
         };
-        let ra = put(&rec_for(&row_a, 7, "cargo test -p faktor-session"));
+        let ra = put_with_evidence(&rec_for(&row_a, 7, "cargo test -p faktor-session"));
         let rb = put(&rec_for(&row_b, 9, "cargo test -p faktor-server"));
+        // A's integration record: 3 aggregate sources landing the candidate
+        // snapshot (the proof payload's source count + landed snapshot).
+        a.ledger_integration_record_set(&faktor_session::ledger::IntegrationRecordRow {
+            run_id: "run-ver-a".into(),
+            task_id: 7,
+            base_revision: None,
+            base_snapshot: Some("33".repeat(32)),
+            final_root: "/ver-a".into(),
+            final_snapshot_hash: "44".repeat(32),
+            integrated_files: vec!["src/lib.rs".into()],
+            integrated_file_count: 1,
+            integrated_files_digest: "77".repeat(32),
+            conflicts: Vec::new(),
+            conflict_count: 0,
+            sources: Vec::new(),
+            source_count: 3,
+            sources_digest: "55".repeat(32),
+            at_ms: 3,
+        })
+        .unwrap();
 
         // A's task-7 evidence: checks/criteria/changed files all present.
         let resp = native_get(
@@ -9069,6 +9110,19 @@ mod tests {
         assert_eq!(rec["changedFiles"][0]["size"], 42);
         assert_eq!(rec["unrelatedChanges"], serde_json::json!(["README.md"]));
         assert_eq!(rec["completedMs"], 2);
+        // P0 proof payload (additive strict fields): the CandidateProofRef,
+        // the verified candidate snapshot, the run base it was based on, the
+        // integration source count and the landed final snapshot.
+        assert_eq!(rec["candidateProof"]["taskRevision"], "1");
+        assert_eq!(rec["candidateProof"]["runId"], "run-ver-a");
+        assert_eq!(rec["candidateProof"]["candidateSnapshot"], "44".repeat(32));
+        assert_eq!(rec["candidateProof"]["runBaseSnapshot"], "33".repeat(32));
+        assert_eq!(rec["candidateProof"]["sourcesDigest"], "55".repeat(32));
+        assert_eq!(rec["candidateProof"]["changedFilesDigest"], "66".repeat(32));
+        assert_eq!(rec["verifiedSnapshot"], "44".repeat(32));
+        assert_eq!(rec["basedOnSnapshot"], "33".repeat(32));
+        assert_eq!(rec["sourceCount"], 3);
+        assert_eq!(rec["landedSnapshot"], "44".repeat(32));
 
         // B never sees A's task-7 evidence: 7 is not B's task → typed 404.
         let resp = native_get(
@@ -9106,6 +9160,14 @@ mod tests {
             records[0]["checks"][0]["check"],
             "cargo test -p faktor-server"
         );
+        // Legacy NULL-evidence row: the P0 fields are honest absences (the
+        // verified snapshot falls back to the stored tree hash; no
+        // integration exists for task 9).
+        assert_eq!(records[0]["candidateProof"], serde_json::Value::Null);
+        assert_eq!(records[0]["verifiedSnapshot"], "ab".repeat(32));
+        assert_eq!(records[0]["basedOnSnapshot"], serde_json::Value::Null);
+        assert_eq!(records[0]["sourceCount"], serde_json::Value::Null);
+        assert_eq!(records[0]["landedSnapshot"], serde_json::Value::Null);
         // C (another workspace, SAME numeric task id 7) cannot reach A's
         // record: records certify A's workspace, so C's view is the honest
         // empty list — evidence never crosses sessions or workspaces.

@@ -23,10 +23,14 @@
 //! dead child or a closed session ends the thread on its own and `Drop`
 //! never races an outstanding read.
 //!
-//! Job-object enforcement is deliberately NOT duplicated here: `faktor-pty`
-//! does not depend on `faktor-winjob` (scope is ConPTY only), so killing a
-//! pty terminates the direct child, while grandchildren-tree guarantees
-//! stay with winjob's own call sites.
+//! Job-object containment is integrated here (audit P0-59): `Pty::spawn`
+//! creates a `faktor-winjob::JobGuard` configured with
+//! `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, spawns the child `CREATE_SUSPENDED`,
+//! assigns it to that job, and only then resumes it — a child is never
+//! exposed to callers outside the job, so descendants inherit containment
+//! from birth even when the child spawns immediately. The guard lives in
+//! `Pty`: `kill`/`Drop` close the last job handle, and the OS terminates the
+//! whole tree (kill-on-close); no taskkill/pid-tree walk is involved.
 //!
 //! Certification status: code is `cargo check`/`clippy`-verified against
 //! `x86_64-pc-windows-msvc`; runtime certification requires a Windows
@@ -52,10 +56,13 @@ use windows_sys::Win32::System::Console::{
 use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
-    InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTUPINFOEXW,
+    InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+    STARTUPINFOEXW,
 };
+
+use faktor_winjob::JobGuard;
 
 use crate::ring::Ring;
 use crate::validation::validate_spawn_config;
@@ -254,7 +261,8 @@ fn resolve_application(command: &str) -> Result<Vec<u16>, Error> {
 /// One live ConPTY pty. Sync API with identical semantics to the unix
 /// backend: writes block until accepted, reads are non-blocking snapshots
 /// of a ring drained by a background thread, `kill`/`Drop` close the
-/// pseudoconsole and terminate the child with a bounded fallback.
+/// pseudoconsole and terminate the whole child tree through the containment
+/// job (bounded `TerminateProcess` fallback for the direct child only).
 pub struct Pty {
     /// Pseudoconsole handle; 0 once closed (kill/Drop).
     pc: HPCON,
@@ -267,6 +275,11 @@ pub struct Pty {
     /// Child process handle (wait/terminate; never inherited).
     child: HANDLE,
     pid: u32,
+    /// Containment job (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`). The child is
+    /// a member before `spawn` returns; descendants inherit membership.
+    /// `kill`/`Drop` take the guard, closing the last handle — the OS
+    /// terminates every member (the daemon-crash guarantee).
+    job: Option<JobGuard>,
     /// Last size applied through ResizePseudoConsole (ConPTY exposes no
     /// size query, so this is the honest source of truth).
     last_size: AtomicU32,
@@ -309,6 +322,13 @@ impl Pty {
         // Malformed here and a PATH miss is a typed SearchPathW error, so no
         // pipe or pseudoconsole ever has to be reaped on the failure path.
         let app_wide = resolve_application(&cfg.command)?;
+        // Containment FIRST, before any pipe/pseudoconsole handle exists:
+        // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` means the OS terminates the
+        // whole tree when the guard closes, with no taskkill and no pid walk.
+        // Creation failure refuses the spawn — a pty is never returned
+        // uncontained (the guarantee is not a warning).
+        let job = JobGuard::create_strict()
+            .map_err(|code| win_err("CreateJobObject(pty containment)", code))?;
 
         let mut pc: HPCON = 0;
         // ConPTY input pipe: input_read is consumed by the pseudoconsole,
@@ -486,7 +506,11 @@ impl Pty {
         let app_display = win_common::module_display(&app_wide);
         let mut cmdline_wide = win_common::build_spawn_command_line(&app_wide, &cfg.args);
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-        let creation_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
+        // CREATE_SUSPENDED is REQUIRED: the child must not execute one
+        // instruction — let alone spawn a descendant — before it is assigned
+        // to the containment job. `ResumeThread` below is the exposure point.
+        let creation_flags =
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
         // lpApplicationName must be NUL-terminated: resolve_application
         // returns the logical (unterminated) path, so terminate here.
         let mut app_wide_z = app_wide.clone();
@@ -535,6 +559,42 @@ impl Pty {
                 "CreateProcessW returned an invalid process",
             ));
         }
+        // (5a) containment, then exposure: the child is still suspended, so
+        // assignment is deterministic — it is IN the job (and every future
+        // descendant inherits membership) before it can execute. A failed
+        // assignment refuses the spawn; an uncontained pty is never exposed.
+        if let Err(code) = job.assign_strict(pi.dwProcessId) {
+            unsafe {
+                TerminateProcess(pi.hProcess, 1);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                CloseHandle(input_read);
+                CloseHandle(input_write);
+                CloseHandle(output_read);
+                CloseHandle(output_write);
+                ClosePseudoConsole(pc);
+            }
+            return Err(win_err(
+                &format!("AssignProcessToJobObject(pty child {})", pi.dwProcessId),
+                code,
+            ));
+        }
+        // ResumeThread returns the previous suspend count, or (DWORD)-1 on
+        // failure; a child that cannot be resumed must never be handed out.
+        if unsafe { ResumeThread(pi.hThread) } == u32::MAX {
+            let code = last_error();
+            unsafe {
+                TerminateProcess(pi.hProcess, 1);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                CloseHandle(input_read);
+                CloseHandle(input_write);
+                CloseHandle(output_read);
+                CloseHandle(output_write);
+                ClosePseudoConsole(pc);
+            }
+            return Err(win_err("ResumeThread(pty child)", code));
+        }
         unsafe {
             CloseHandle(pi.hThread);
         }
@@ -568,6 +628,9 @@ impl Pty {
         };
         if duplicated == 0 || !valid_handle(reader_dup) {
             let code = last_error();
+            // The resumed child may already have descendants: terminate the
+            // whole job tree, not just the direct child.
+            job.terminate();
             unsafe {
                 TerminateProcess(pi.hProcess, 1);
                 CloseHandle(pi.hProcess);
@@ -588,6 +651,9 @@ impl Pty {
         {
             Ok(_handle) => {} // detached: exits on its own when the channel dies
             Err(e) => {
+                // The resumed child may already have descendants: terminate
+                // the whole job tree, not just the direct child.
+                job.terminate();
                 unsafe {
                     CloseHandle(reader_dup);
                     TerminateProcess(pi.hProcess, 1);
@@ -608,6 +674,7 @@ impl Pty {
             output: output_read,
             child: pi.hProcess,
             pid: pi.dwProcessId,
+            job: Some(job),
             last_size,
             shared,
             reader_stop: stop,
@@ -739,14 +806,21 @@ impl Pty {
         !self.child.is_null() && unsafe { WaitForSingleObject(self.child, 0) } == WAIT_TIMEOUT
     }
 
-    /// Terminate the child: ClosePseudoConsole (the attached client is
-    /// terminated by the OS when the session closes), then a bounded
-    /// TerminateProcess fallback if it does not exit within the grace
-    /// period. Idempotent; Drop runs the same path.
+    /// Terminate the whole session tree: ClosePseudoConsole (attached
+    /// clients are terminated by the OS when the session closes), then take
+    /// the containment job — closing the last job handle is the
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` terminate of EVERY member, the
+    /// direct child and its descendants alike, with no taskkill and no pid
+    /// walk. The bounded TerminateProcess below only covers the direct child
+    /// should it somehow outlive the job close. Idempotent; Drop runs the
+    /// same path, so a never-explicitly-killed Pty also dies tree-wide.
     pub fn kill(&mut self) {
         self.closed.store(true, Ordering::SeqCst);
         self.reader_stop.store(true, Ordering::SeqCst);
         self.close_pc();
+        // `take` runs once (idempotent kill): the guard drop closes the last
+        // job handle, which the OS turns into a whole-tree kill.
+        drop(self.job.take());
         if self.child.is_null() {
             return;
         }
@@ -1010,6 +1084,7 @@ mod tests {
             output: std::ptr::null_mut(),
             child: std::ptr::null_mut(),
             pid: 0,
+            job: None,
             last_size: AtomicU32::new(pack_size(24, 80)),
             shared: Arc::new((Mutex::new(Ring::new()), Condvar::new())),
             reader_stop: Arc::new(AtomicBool::new(false)),
@@ -1028,6 +1103,7 @@ mod tests {
             output: std::ptr::null_mut(),
             child: std::ptr::null_mut(),
             pid: 0,
+            job: None,
             last_size: AtomicU32::new(pack_size(24, 80)),
             shared: Arc::new((Mutex::new(Ring::new()), Condvar::new())),
             reader_stop: Arc::new(AtomicBool::new(false)),
@@ -1049,6 +1125,7 @@ mod tests {
             output: std::ptr::null_mut(),
             child: std::ptr::null_mut(),
             pid: 0,
+            job: None,
             last_size: AtomicU32::new(pack_size(24, 80)),
             shared: Arc::new((Mutex::new(Ring::new()), Condvar::new())),
             reader_stop: Arc::new(AtomicBool::new(false)),
@@ -1056,5 +1133,40 @@ mod tests {
         };
         pty.kill();
         pty.kill(); // double kill must not panic or double-close
+    }
+
+    #[test]
+    fn spawn_assigns_the_child_to_the_kill_on_close_job_before_returning() {
+        // REAL spawn (Windows host only): the child must be a member of this
+        // Pty's job the moment `spawn` returns. The
+        // CREATE_SUSPENDED → assign → resume order above is what makes the
+        // guarantee independent of how fast the child starts spawning
+        // descendants: it cannot execute before membership exists.
+        let cfg = PtyConfig {
+            command: "cmd.exe".into(),
+            args: vec![
+                "/d".into(),
+                "/c".into(),
+                "ping -n 30 127.0.0.1 > NUL".into(),
+            ],
+            ..Default::default()
+        };
+        let mut pty = Pty::spawn(&cfg).expect("ConPTY spawn on a Windows host");
+        let child = pty.pid();
+        assert!(
+            pty.job
+                .as_ref()
+                .expect("every Pty carries its containment job")
+                .contains(child),
+            "child {child} must be a job member before Pty::spawn returns"
+        );
+        // kill() takes the guard (closing the last handle = kill-on-close)
+        // and the direct child is gone by the time the bounded path returns.
+        pty.kill();
+        assert!(pty.job.is_none(), "kill takes the job guard exactly once");
+        assert!(
+            !pty.is_alive(),
+            "the contained child must be dead after kill"
+        );
     }
 }

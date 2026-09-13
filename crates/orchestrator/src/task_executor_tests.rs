@@ -42,11 +42,12 @@ use crate::caps::{CapabilityGrant, CapabilitySet, LatticeCap, ScopePattern};
 use crate::runtime::completion_steps::commit_message;
 use crate::runtime::shadow::{ShadowCopyLimits, ShadowRoots};
 use crate::runtime::task_executor::{
-    MutationMode, RunSettlement, SettlementOutcome, TaskExecutor, TaskRunMode, TaskRunRequest,
-    TaskRunRow, TASK_RUN_ROW_KIND,
+    MutationMode, PreparedRunIntegration, RunSettlement, SettlementOutcome, TaskExecutor,
+    TaskRunMode, TaskRunRequest, TaskRunRow, TASK_RUN_ROW_KIND,
 };
 use crate::runtime::{CrashSeam, ExecError, OrchestratorRuntime};
 use crate::{OwnershipSpec, TaskPlan, WorkItem, WorkKind};
+use faktor_agent::IntegratedRootVerification;
 use faktor_session::child::ChildOwnership;
 
 // ------------------------------------------------------------------ fixture
@@ -1463,7 +1464,10 @@ fn hostile_requests_are_rejected_before_any_write() {
 // the durable workspace root directly, so the wiring is verified against
 // the durable shadow machinery (begin/finalize/commit) instead.
 
-use faktor_core::state::{TaskState, TaskTransition, VerificationStatus};
+use faktor_core::state::{
+    CriterionBinding, CriterionOrigin, CriterionRequirement, NoOpDisposition, TaskState,
+    TaskTransition, VerificationStatus,
+};
 use faktor_session::ShadowRowState;
 
 fn seed_owner(root: &std::path::Path) {
@@ -3702,11 +3706,44 @@ fn cs_seed_repo(root: &std::path::Path) {
     cs_commit(root, "init");
 }
 
-/// Adversarial executor-level cover of the additive invocation: an
-/// uncontracted or unverified run NEVER invokes the runner (no rows, no git
-/// side effects), while a contracted run whose durable verification passed
-/// executes the requested step against the owner root and records the
-/// outcome durably.
+/// Drive a real-env task row to Verifying and land one passing record at
+/// the resulting revision — the durable proof an in-session completion step
+/// must be authorized by (the advisory verification fact is NOT enough).
+fn seed_passing_proof(env: &RealToolEnv, task_id: TaskId) -> faktor_core::id::VerificationRecordId {
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    for _ in 0..8 {
+        let task = h.get_task(task_id).unwrap().unwrap();
+        let target = match task.state {
+            TaskState::Pending => TaskTransition::StartRunning,
+            TaskState::Planning => TaskTransition::PlanComplete,
+            TaskState::Running => TaskTransition::RequestVerification,
+            TaskState::Waiting => TaskTransition::ResumeFromWaiting,
+            TaskState::Blocked => TaskTransition::Unblock,
+            TaskState::NeedsVerification => TaskTransition::StartVerification,
+            TaskState::Verifying => break,
+            s => panic!("cannot reach Verifying from {s:?}"),
+        };
+        let rev = h.task_revision(task_id).unwrap();
+        h.transition_task(task_id, rev, target, None).unwrap();
+    }
+    h.create_verification_record(
+        task_id,
+        None,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        None,
+        VerificationStatus::Passed,
+        h.now_ms(),
+    )
+    .unwrap()
+}
+
+/// Adversarial executor-level cover of the PROOF-VALIDATED invocation: an
+/// uncontracted run never invokes the runner, a bogus/nonexistent proof is a
+/// typed Invalidated refusal (no side effect), while a proof-bound run
+/// executes the requested step against the owner root and records it.
 #[tokio::test]
 async fn completion_steps_are_additive_and_fail_closed() {
     let _heavy = heavy_guard();
@@ -3738,16 +3775,18 @@ async fn completion_steps_are_additive_and_fail_closed() {
         updated_ms: now,
     })
     .unwrap();
+    let _proof = seed_passing_proof(&env, task_id);
     // (1) No contract: the runner is never invoked — the deliberately
     // uninitialized root in the injected runner would have failed loudly.
     assert!(env
         .executor
-        .run_completion_steps(env.parent)
+        .run_completion_steps(env.parent, faktor_core::id::VerificationRecordId::new(1))
         .await
         .unwrap()
         .is_none());
-    // (2) Contract recorded, but the durable verification fact says nothing
-    // (or failed): fail-closed — no step runs, no row lands.
+    // (2) Contract recorded, but the proof does not exist: the runner's
+    // proof gate refuses EVERY requested step as Invalidated (retryable)
+    // and no side effect runs.
     let rev = h.task_revision(task_id).unwrap();
     h.set_completion_contract(
         task_id,
@@ -3759,42 +3798,49 @@ async fn completion_steps_are_additive_and_fail_closed() {
         },
     )
     .unwrap();
-    assert!(env
-        .executor
-        .run_completion_steps(env.parent)
-        .await
-        .unwrap()
-        .is_none());
-    h.upsert_memory_fact("verification", "last", r#"{"status":"failed"}"#)
-        .unwrap();
-    assert!(env
-        .executor
-        .run_completion_steps(env.parent)
-        .await
-        .unwrap()
-        .is_none());
-    assert!(h
-        .ledger_completion_step_statuses(task_id.raw(), rev.raw())
-        .unwrap()
-        .is_empty());
-    // (3) Verification passed with a real change: the commit step runs
-    // against the session's owner root and the durable row is Succeeded.
+    // A dirty tree is waiting to be committed: a bogus proof must leave it
+    // dirty (no side effect) even though the work is there.
     std::fs::write(env.owner_root.join("feature.txt"), "content\n").unwrap();
-    h.upsert_memory_fact("verification", "last", r#"{"status":"passed"}"#)
+    let refused = env
+        .executor
+        .run_completion_steps(env.parent, faktor_core::id::VerificationRecordId::new(9001))
+        .await
+        .unwrap()
+        .expect("a contracted run consults the proof and reports Invalidated");
+    assert!(
+        refused
+            .records
+            .iter()
+            .all(|r| r.status != faktor_core::completion::CompletionStepOutcome::Succeeded),
+        "{refused:?}"
+    );
+    let porcelain = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&env.owner_root)
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&porcelain.stdout).trim().is_empty(),
+        "no proof, no commit"
+    );
+    // (3) The durable PASSED record authorizes the commit step against the
+    // session's owner root: the row is Succeeded and the tree is clean. The
+    // advisory fact is deliberately left FAILED: it is UI-only and must not
+    // influence the proof-validated path.
+    h.upsert_memory_fact("verification", "last", r#"{"status":"failed"}"#)
         .unwrap();
     let report = env
         .executor
-        .run_completion_steps(env.parent)
+        .run_completion_steps(env.parent, _proof)
         .await
         .unwrap()
-        .expect("a contracted verified run must execute");
+        .expect("a contracted proof-bound run must execute");
     assert!(report.all_succeeded(), "{report:?}");
     let rows = h
         .ledger_completion_step_statuses(task_id.raw(), rev.raw())
         .unwrap();
-    assert_eq!(rows.len(), 1);
     assert_eq!(
-        rows[0].status,
+        rows.last().unwrap().status,
         faktor_core::completion::CompletionStepOutcome::Succeeded
     );
     let porcelain = std::process::Command::new("git")
@@ -4159,10 +4205,30 @@ fn seed_contract_task(
         updated_ms: now,
     })
     .unwrap();
+    for target in [
+        TaskTransition::StartRunning,
+        TaskTransition::RequestVerification,
+        TaskTransition::StartVerification,
+    ] {
+        let rev = h.task_revision(task_id).unwrap();
+        h.transition_task(task_id, rev, target, None).unwrap();
+    }
     let rev = h.task_revision(task_id).unwrap();
     h.set_completion_contract(task_id, rev, contract).unwrap();
-    h.upsert_memory_fact("verification", "last", r#"{"status":"passed"}"#)
-        .unwrap();
+    // The proof-validated step path needs the durable PASSED record at the
+    // current revision (the advisory fact is UI-only).
+    h.create_verification_record(
+        task_id,
+        None,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        None,
+        VerificationStatus::Passed,
+        h.now_ms(),
+    )
+    .unwrap();
     task_id
 }
 
@@ -4593,6 +4659,420 @@ async fn verifier_observes_candidate_not_owner() {
     assert!(env.owner_root.join("child_a.rs").is_file());
     assert!(env.owner_root.join("child_b.rs").is_file());
     assert_eq!(owner_digest(&env), candidate_digest);
+}
+
+// ----------------------------------------------- P0 criterion-proof residuals
+
+/// A reviewer-bound acceptance criterion (the "independent reviewer proves
+/// the no-op" shape): the wired reviewer port is the ONLY binding that can
+/// certify it.
+fn typed_reviewer_criterion(reviewer_id: &str) -> String {
+    faktor_session::task::Criterion::derived(
+        "independent reviewer proves the no-op",
+        CriterionOrigin::ProjectPolicy,
+        CriterionRequirement::Required,
+        None,
+    )
+    .with_binding(CriterionBinding::IndependentReview {
+        reviewer_id: reviewer_id.into(),
+    })
+    .encode()
+}
+
+/// An aggregate-goal criterion: passes only when every required subordinate
+/// passed AND the wired independent reviewer passed over the candidate.
+fn typed_aggregate_goal_criterion() -> String {
+    faktor_session::task::Criterion::derived(
+        "ship the goal",
+        CriterionOrigin::User,
+        CriterionRequirement::Required,
+        None,
+    )
+    .with_binding(CriterionBinding::AggregateGoal)
+    .encode()
+}
+
+/// Two isolated children that change NOTHING (the empty aggregate change
+/// set the no-op policy governs).
+fn idle_child_scripts() -> Vec<Vec<ScriptedResponse>> {
+    vec![
+        vec![
+            ScriptedResponse::Text("nothing to change".into()),
+            ScriptedResponse::End,
+        ],
+        vec![
+            ScriptedResponse::Text("nothing to change".into()),
+            ScriptedResponse::End,
+        ],
+    ]
+}
+
+/// The typed verdict a review MODEL is contract-bound to emit.
+fn review_verdict_script(verdict: &str) -> Vec<ScriptedResponse> {
+    vec![
+        ScriptedResponse::Text(serde_json::json!({"verdict": verdict, "findings": []}).to_string()),
+        ScriptedResponse::End,
+    ]
+}
+
+fn start_no_op_run(env: &Arc<RealToolEnv>, goal: &str, disposition: NoOpDisposition) -> String {
+    env.executor
+        .start_task(
+            env.parent,
+            TaskRunRequest {
+                goal: goal.to_string(),
+                work_items: two_isolated_items(),
+                criteria: vec![typed_reviewer_criterion("review-0")],
+                parent_caps: read_caps(),
+                isolated_root: env.isolated_root.clone(),
+                no_op_disposition: Some(disposition),
+                ..Default::default()
+            },
+        )
+        .expect("no-op orchestrated start")
+        .run_id
+}
+
+/// Residual (5) path A: an empty aggregate change set with
+/// `RequiresCriterionProof` completes ONLY through the reviewer-proved no-op
+/// criterion — the review model call runs over the candidate snapshot and
+/// its pass is the record's criterion proof; the owner is never rewritten.
+#[tokio::test]
+async fn no_op_run_completes_only_through_the_reviewer_proof() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let mut scripts = idle_child_scripts();
+    scripts.push(review_verdict_script("clean"));
+    let env = open_real_tool_env_full(
+        dir.path(),
+        scripts,
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    let before = owner_digest(&env);
+    let run_id = start_no_op_run(
+        &env,
+        "decide whether any change is needed",
+        NoOpDisposition::RequiresCriterionProof,
+    );
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    let outcome = settle_orchestrated(&env, &run_id).await.expect("settle");
+    assert!(outcome.verified && outcome.completed, "{outcome:?}");
+    assert_eq!(
+        owner_digest(&env),
+        before,
+        "a reviewer-proved no-op never rewrites the owner"
+    );
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    assert_eq!(
+        h.get_task(task_id).unwrap().unwrap().state,
+        TaskState::VerifiedComplete
+    );
+    let record = h
+        .list_verification_records(task_id)
+        .unwrap()
+        .into_iter()
+        .max_by_key(|r| r.record_id)
+        .expect("the no-op proof record");
+    assert_eq!(record.status, VerificationStatus::Passed);
+    assert!(record.tree_hash.is_some(), "{record:?}");
+    assert!(
+        record.criteria.iter().any(|c| c.passed
+            && c.binding
+                == Some(CriterionBinding::IndependentReview {
+                    reviewer_id: "review-0".into()
+                })),
+        "the no-op criterion is certified through the reviewer binding: {record:?}"
+    );
+    // The proof was a REAL review-model call (2 child drives + 1 review).
+    assert_eq!(
+        env.provider.request_count.load(Ordering::SeqCst),
+        3,
+        "the no-op proof is a reviewer call, not a local empty-suite pass"
+    );
+    let txn = latest_txn(&env, &run_id).expect("no-op integration record");
+    assert_eq!(txn.path_count, 0);
+    assert_eq!(txn.applied_count, 0);
+}
+
+/// Residual (5) path B: with the reviewer GENUINELY absent (no typed verdict)
+/// the same empty change set stays unverified — no record, no landing, no
+/// completion. Unavailable stays honest.
+#[tokio::test]
+async fn no_op_run_without_a_reviewer_verdict_refuses_completion() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        idle_child_scripts(),
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    let before = owner_digest(&env);
+    let run_id = start_no_op_run(
+        &env,
+        "decide whether any change is needed",
+        NoOpDisposition::RequiresCriterionProof,
+    );
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    let outcome = settle_orchestrated(&env, &run_id).await.expect("settle");
+    assert!(outcome.complete, "the children finished");
+    assert!(!outcome.verified && !outcome.completed, "{outcome:?}");
+    assert_eq!(owner_digest(&env), before);
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    assert_ne!(
+        h.get_task(task_id).unwrap().unwrap().state,
+        TaskState::VerifiedComplete
+    );
+    assert!(
+        h.list_verification_records(task_id)
+            .unwrap()
+            .iter()
+            .all(|r| r.tree_hash.is_none() || r.status != VerificationStatus::Passed),
+        "no passing root record without a reviewer verdict"
+    );
+    assert!(
+        h.ledger_integration_record_for_task(task_id.raw())
+            .unwrap()
+            .is_none(),
+        "no landing for an unproved no-op"
+    );
+}
+
+/// Residual (5) path C: an explicitly REFUSED no-op disposition never even
+/// asks the reviewer — the run stays unverified and the review script stays
+/// unconsumed.
+#[tokio::test]
+async fn no_op_run_with_refused_disposition_never_completes() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let mut scripts = idle_child_scripts();
+    scripts.push(review_verdict_script("clean"));
+    let env = open_real_tool_env_full(
+        dir.path(),
+        scripts,
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    let before = owner_digest(&env);
+    let run_id = start_no_op_run(&env, "no changes are acceptable", NoOpDisposition::Refused);
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    let outcome = settle_orchestrated(&env, &run_id).await.expect("settle");
+    assert!(!outcome.verified && !outcome.completed, "{outcome:?}");
+    assert_eq!(owner_digest(&env), before);
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    assert_ne!(
+        h.get_task(task_id).unwrap().unwrap().state,
+        TaskState::VerifiedComplete
+    );
+    assert!(h
+        .ledger_integration_record_for_task(task_id.raw())
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        env.provider.request_count.load(Ordering::SeqCst),
+        2,
+        "a refused no-op never spends a review-model call"
+    );
+}
+
+/// Residual (1) present side: an AggregateGoal criterion over a REAL changed
+/// candidate is certified through the WIRED reviewer — the required
+/// subordinate check passed and the recorded candidate review answered the
+/// aggregate; the task completes and lands.
+#[tokio::test]
+async fn aggregate_goal_criterion_is_reviewer_certified_over_the_candidate() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        two_child_scripts(
+            "pub fn a() -> u64 {\n    let seed: u64 = 1;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n",
+            "pub fn b() -> u64 {\n    let seed: u64 = 2;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n",
+        ),
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    let run_id = env
+        .executor
+        .start_task(
+            env.parent,
+            TaskRunRequest {
+                goal: "aggregate the goal".to_string(),
+                work_items: two_isolated_items(),
+                criteria: vec![typed_land_criterion(), typed_aggregate_goal_criterion()],
+                parent_caps: read_caps(),
+                isolated_root: env.isolated_root.clone(),
+                ..Default::default()
+            },
+        )
+        .expect("orchestrated start")
+        .run_id;
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    let outcome = settle_orchestrated(&env, &run_id).await.expect("settle");
+    assert!(outcome.verified && outcome.completed, "{outcome:?}");
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    let record = h
+        .list_verification_records(task_id)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.tree_hash.is_some())
+        .max_by_key(|r| r.record_id)
+        .expect("the candidate-bound record");
+    assert!(
+        record
+            .criteria
+            .iter()
+            .any(|c| c.passed && c.binding == Some(CriterionBinding::AggregateGoal)),
+        "the aggregate goal passed through the wired reviewer: {record:?}"
+    );
+    assert!(env.owner_root.join("child_a.rs").is_file());
+    assert!(env.owner_root.join("child_b.rs").is_file());
+}
+
+/// Residual (3): the reuse consult is real — an identical basis reuses the
+/// record, a DIFFERENT basis (different derived checks at the same
+/// snapshot/revision/criteria) mints a fresh basis-bound record, and the
+/// fresh record carries its candidate proof + proof-basis digest.
+#[tokio::test]
+async fn root_record_reuse_consults_the_proof_basis() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        vec![],
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    // Freeze right after the candidate was prepared: no root record exists
+    // yet and the task is already routed to Verifying (deterministic basis
+    // construction; no settlement race).
+    env.executor
+        .set_settlement_crash_seam(Some(CrashSeam::AfterCandidatePrepared));
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let run_id = start_two_child_run(&env, "basis consult");
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    env.executor.set_settlement_crash_seam(None);
+    let task_id = h.task_id().unwrap();
+    let snapshot = owner_digest(&env);
+    let check = |program: &str, arg: &str| faktor_core::state::CheckExecution {
+        check: "rust_check".into(),
+        program: program.into(),
+        args: vec![arg.into()],
+        category: "compile".into(),
+        required: true,
+        status: VerificationStatus::Passed,
+        started_ms: 1,
+        finished_ms: Some(2),
+        exit: Some(0),
+        summary: Some("ok".into()),
+    };
+    let prepared = PreparedRunIntegration {
+        run_id: run_id.clone(),
+        task_id,
+        owner_root: env.owner_root.clone(),
+        base_root: env.owner_root.clone(),
+        candidate_root: env.owner_root.clone(),
+        base_snapshot: snapshot.clone(),
+        candidate_snapshot: snapshot.clone(),
+        changed: Vec::new(),
+        sources: Vec::new(),
+        sources_digest: String::new(),
+        staged: Vec::new(),
+    };
+    let criteria = h
+        .get_task(task_id)
+        .unwrap()
+        .unwrap()
+        .acceptance_criteria
+        .clone();
+    let criterion_verdict = faktor_core::state::CriterionVerification {
+        criterion_key: criteria[0].clone(),
+        passed: true,
+        evidence: Some("basis consult".into()),
+        binding: Some(CriterionBinding::RequiredCheck {
+            check_id: "rust_check".into(),
+            command_digest: faktor_core::state::command_binding_digest("cargo check"),
+        }),
+    };
+    let run = |program: &str, arg: &str| IntegratedRootVerification {
+        status: VerificationStatus::Passed,
+        checks: vec![check(program, arg)],
+        criteria: vec![criterion_verdict.clone()],
+        changed: Vec::new(),
+        summary: "basis consult".into(),
+    };
+    let first = env
+        .executor
+        .find_or_create_root_verification_record(
+            &h,
+            task_id,
+            &criteria,
+            &snapshot,
+            &run("cargo", "check"),
+            &prepared,
+        )
+        .unwrap();
+    let reused = env
+        .executor
+        .find_or_create_root_verification_record(
+            &h,
+            task_id,
+            &criteria,
+            &snapshot,
+            &run("cargo", "check"),
+            &prepared,
+        )
+        .unwrap();
+    assert_eq!(first, reused, "an identical basis is replay-idempotent");
+    let fresh = env
+        .executor
+        .find_or_create_root_verification_record(
+            &h,
+            task_id,
+            &criteria,
+            &snapshot,
+            &run("cargo", "clippy"),
+            &prepared,
+        )
+        .unwrap();
+    assert_ne!(
+        fresh, first,
+        "a different check basis must NEVER reuse the old record"
+    );
+    let fresh_record = h.get_verification_record(fresh).unwrap().unwrap();
+    assert_eq!(fresh_record.status, VerificationStatus::Passed);
+    assert!(
+        fresh_record.candidate_proof_ref.is_some(),
+        "the fresh record carries its candidate proof: {fresh_record:?}"
+    );
+    assert!(
+        fresh_record
+            .environment_fingerprint
+            .as_ref()
+            .and_then(|f| f.proof_basis_digest.as_ref())
+            .is_some(),
+        "the fresh record carries its proof-basis digest"
+    );
 }
 
 /// Point 1/6: a FAILING verification lands nothing — the owner stays
