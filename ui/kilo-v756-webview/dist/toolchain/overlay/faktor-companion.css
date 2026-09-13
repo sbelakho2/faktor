@@ -192,6 +192,54 @@
   margin: 4px 0;
 }
 
+/* Acceptance-criterion proof rows: pass / fail / unavailable each carry a
+ * distinct visual state; unavailable is a dashed warning marker and must
+ * never read as a pass. */
+.faktor-criterion {
+  border-left: 3px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  margin: 4px 0;
+  padding: 2px 0 2px 6px;
+  overflow-wrap: anywhere;
+}
+
+.faktor-criterion-pass {
+  border-left-color: var(--vscode-testing-iconPassed, #3fb950);
+}
+
+.faktor-criterion-fail {
+  border-left-color: var(--vscode-testing-iconFailed, #f85149);
+}
+
+.faktor-criterion-unavailable {
+  border-left-color: var(--vscode-editorWarning-foreground, #d29922);
+  border-left-style: dashed;
+}
+
+.faktor-criterion-unavailable .faktor-criterion-ref {
+  font-style: italic;
+  opacity: 0.85;
+}
+
+.faktor-criterion-ref {
+  margin-right: 2px;
+}
+
+.faktor-badge-pass {
+  border-color: var(--vscode-testing-iconPassed, #3fb950);
+  color: var(--vscode-testing-iconPassed, #3fb950);
+}
+
+.faktor-badge-fail {
+  border-color: var(--vscode-testing-iconFailed, #f85149);
+  color: var(--vscode-testing-iconFailed, #f85149);
+}
+
+.faktor-badge-unavailable {
+  border-style: dashed;
+  border-color: var(--vscode-editorWarning-foreground, #d29922);
+  color: var(--vscode-editorWarning-foreground, #d29922);
+}
+
 .faktor-evidence {
   max-height: 220px;
   overflow: auto;

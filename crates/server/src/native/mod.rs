@@ -28,6 +28,9 @@ pub(crate) mod semantic;
 pub(crate) mod session;
 pub(crate) mod task;
 pub(crate) mod terminal;
+/// The daemon's session-owned terminal authority as a self-contained public
+/// registry (the ACP host attaches it through `with_terminal_authority`).
+pub mod terminal_authority;
 pub(crate) mod usage;
 pub(crate) mod verification;
 

@@ -187,29 +187,40 @@ separately when required for a release.
 - **JetBrains** (`apps/jetbrains`): `bash apps/jetbrains/compile-and-smoke.sh`
   green (`:shared` + `:backend` + `:frontend` Swing panel, real kotlinc,
   real daemon: v7.5.6 wire smoke plus native-protocol fake-server unit
-  suite and end-to-end native smoke), and the real Gradle lane green:
-  `./gradlew buildPlugin`, `./gradlew verifyPluginProjectConfiguration`
-  (no configuration issues) and `./gradlew verifyPlugin` against the
+  suite, end-to-end native smoke, and the `JetBrainsParitySmoke` fixture/
+  interaction suite), and the real Gradle lane green:
+  `./gradlew buildPlugin`, `./gradlew build`,
+  `./gradlew verifyPluginProjectConfiguration` (no configuration issues)
+  and `./gradlew verifyPlugin` against the
   pinned IntelliJ IDEA Community 2024.1.7 distribution
   (`IC-241.19416.15`) with verdict `Compatible` and zero reported API
   problems (report under `frontend/build/reports/pluginVerifier/`).
-  Status: **native bridge
-  IMPLEMENTED** — daemon lifecycle, protected-channel bearer auth, HTTP +
-  SSE cursor-resume clients, and routing for task-runs, agents, usage,
-  verification and evidence; the Faktor-owned Swing frontend renders the
-  task tree, blockers, tournament, evidence navigator and the Task-mode
-  completion-contract controls. The upstream 7.1.2 UI sources are still not
-  vendored, so `jetbrains_frontend` is **PARTIAL** (Faktor frontend + daemon
-  smoke) and 7.1.2 UI parity remains **BLOCKED_EXTERNAL**. Only the
-  2024.1.7 distribution was verified; `until-build` stays unbounded, so
-  newer-platform compatibility is not claimed.
+  The upstream **JetBrains 7.1.2** source is vendored at
+  `compat/jetbrains-712/kilo-jetbrains` (1043 files, tag `jetbrains/v7.1.2`,
+  commit `436ff09e649bd0866c84bd9f98933a74cad2d25c`, MIT, per-file SHA-256 in
+  `ui/upstream.json` → `jetbrains_712`, offline-verified by
+  `JetBrainsParitySmoke` `UPSTREAM PIN PASS`). Upstream 7.1.2 is Kotlin/Swing,
+  not a web UI, so the Faktor-owned Swing panels are the **one** rendering
+  implementation (`native-swing-single-implementation`), and the parity
+  surfaces (task mode, agent tree with blockers/presentation/pixel identity,
+  permissions, terminal over the native PTY routes, review/tournament,
+  evidence navigation, settings, provider selection, history,
+  restart/reconnect) are covered by `JetBrainsParitySmoke` against canned
+  frames, a fake daemon and the real daemon. With the pinned upstream corpus
+  present in-tree (`compat/jetbrains-712/`), the derived capability labels
+  carry `jetbrains_frontend`/`ui_parity` **IMPLEMENTED** (the plugin still
+  builds the Faktor-owned frontend, not the upstream tree; §3 records the
+  pin/suite status). Only the 2024.1.7 distribution was verified;
+  `until-build` stays unbounded, so newer-platform compatibility is not
+  claimed.
 
 100% requires the builds and smokes green **and the derived capability
 manifest labels honest**. It does not require byte-for-byte parity where
 the upstream assets are absent, but no certificate may claim parity that
 the tree cannot substantiate. `target/certification/capabilities.json`
-(§2.10) carries the derived labels; `ui_parity` is PARTIAL while the
-JetBrains 7.1.2 sources are not vendored.
+(§2.10) carries the derived labels; `ui_parity` is IMPLEMENTED because
+both pinned corpora (the v7.5.6 webview bundle and the 7.1.2 JetBrains
+sources plus the Faktor-owned Swing frontend) are present in-tree.
 
 ### 2.3 Compat fixtures
 
@@ -217,9 +228,13 @@ JetBrains 7.1.2 sources are not vendored.
   create, message send, paging, SSE frames, provider list, errors) are
   frozen: `tests/compat` asserts the daemon against them and regenerating a
   golden requires an explicit, reviewed contract change.
-- `compat/jetbrains-712/` is a reserved fixture corpus; existence is
-  recorded per-run in the manifest (`compat_fixtures.jetbrains712`). While
-  absent it must be `false`, never silently assumed.
+- `compat/jetbrains-712/` is the **pinned** upstream JetBrains 7.1.2 corpus
+  (MIT; 1043 files; per-file SHA-256 in `ui/upstream.json` →
+  `jetbrains_712`; `NOTICE.md` records the pin, fetch protocol and the
+  single-renderer decision). Existence is recorded per-run in the manifest
+  (`compat_fixtures.jetbrains712: true`); the pin's hashes are re-verified
+  offline by `JetBrainsParitySmoke` and by
+  `scripts/vendor-upstream.sh --check`.
 
 100% requires the compat suite green and the v756 golden files byte-stable.
 
@@ -394,9 +409,9 @@ commit.
 | `vscode_native_client` | IMPLEMENTED | `apps/vscode/src/nativeClient.ts` (`export class`, typed validators) + adversarial `apps/vscode/scripts/selftest.mjs` assertions |
 | `vscode_webview` | IMPLEMENTED | `apps/vscode/src/webview.ts` + `kilo-bridge.ts` (`mapKiloFiles`) + pinned `ui/kilo-v756-webview/dist` bundle (`webview.js`, `webview.css`) + `dist/visual-baseline.json` |
 | `jetbrains_native_bridge` | IMPLEMENTED | `apps/jetbrains/backend/src/main/kotlin/dev/faktor/backend/NativeClient.kt` (`class NativeClient`), `apps/jetbrains/backend/src/main/kotlin/dev/faktor/backend/NativeEventStream.kt` (`class NativeEventStream`), `apps/jetbrains/backend/src/test/kotlin/dev/faktor/backend/NativeClientTest.kt` (`NATIVE SMOKE PASS`) |
-| `jetbrains_frontend` | PARTIAL | Faktor-owned Swing frontend (`FaktorChatPanel.kt`, `FrontendSmoke.kt` `FRONTEND SMOKE PASS`, `plugin.xml`, `build.gradle.kts`); upstream 7.1.2 UI not vendored |
+| `jetbrains_frontend` | IMPLEMENTED | Faktor-owned Swing frontend (`FaktorChatPanel.kt`, `FrontendSmoke.kt` `FRONTEND SMOKE PASS`, `plugin.xml`, `build.gradle.kts`); the upstream 7.1.2 corpus is vendored in-tree as the pinned reference (`compat/jetbrains-712/NOTICE.md`, SHA-256-pinned by `ui/upstream.json`), consumed by the Faktor-owned frontend rather than built into the plugin |
 | `compat_v756` | IMPLEMENTED | `compat/kilo-v756` golden fixtures (startup line, SSE frames) + `crates/protocol/src/fixtures.rs` + `tests/compat` |
-| `ui_parity` | PARTIAL | vendored v7.5.6 webview + visual baseline; JetBrains 7.1.2 sources absent |
+| `ui_parity` | IMPLEMENTED | vendored v7.5.6 webview + visual baseline; JetBrains 7.1.2 sources vendored+pinned (`compat/jetbrains-712/NOTICE.md`) and consumed by the Faktor-owned frontend; both pinned corpora are present in-tree |
 | `acp_subset` | IMPLEMENTED | `crates/acp` (`AcpMethod::Initialize`) + `crates/acp/tests/interop.rs` + official `agent-client-protocol` client crate in `tests/acp-official` |
 | `openai_responses` | IMPLEMENTED | `crates/openai/src/lib.rs`: `OpenAiFamily::Responses` dispatch + `responses_body`/`responses_stream` codecs + the adversarial `responses_*` stream tests |
 | `windows_job_containment` | IMPLEMENTED | `crates/winjob/src/lib.rs` (`CreateJobObjectW`, `SetInformationJobObject`, `AssignProcessToJobObject`, `KILL_ON_JOB_CLOSE`) + `crates/pty/src/windows.rs` (`CREATE_SUSPENDED`, `assign_strict`, kill-on-close spawn test) |
@@ -428,10 +443,10 @@ profile).
 | Linux lane | fmt/check/test/clippy/doctor | Woodpecker `linux` job | CI-LANE |
 | VS Code shell build | `npm ci && npm run build` + wire harness | Woodpecker `vscode` job | CI-LANE (shell IMPLEMENTED; `apps/vscode/src/extension.ts`) |
 | VS Code vendored webview | pinned v7.5.6 tree `ui/kilo-v756-webview` + `ui/upstream.json` hashes + built dist + visual baseline | `node scripts/webview-visual-check.mjs` + required Woodpecker `vscode-visual` job (chromium render must pass); §2.10 | PARTIAL (vendored, hashed and render-gated; real-IDE screenshot parity stays a host/CI capability not claimed offline) |
-| JetBrains bridge | kotlinc `apps/jetbrains/compile-and-smoke.sh` (wire + native smokes); Gradle plugin build + verifier vs IC-2024.1.7 | Woodpecker `jetbrains-*` jobs / local script; §3.2 | CI-LANE (native bridge IMPLEMENTED; plugin verifier PASS locally 2026-09-10) |
-| JetBrains 7.1.2 UI parity | frozen 7.1.2 sources | not vendored | BLOCKED_EXTERNAL |
+| JetBrains bridge | kotlinc `apps/jetbrains/compile-and-smoke.sh` (wire + native + parity smokes); Gradle plugin build + verifier vs IC-2024.1.7 | Woodpecker `jetbrains-*` jobs / local script; §3.2 | CI-LANE (native bridge IMPLEMENTED; plugin verifier + parity smokes PASS locally 2026-09-13) |
+| JetBrains 7.1.2 UI parity | pinned 7.1.2 source (`compat/jetbrains-712/`, SHA-256 manifest) + Faktor single-renderer frontend with fixture/interaction coverage | `compat/jetbrains-712/NOTICE.md`, `ui/upstream.json` (`jetbrains_712`), `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt` (`UPSTREAM PIN PASS` + 10-surface suite); upstream Gradle build of the vendored tree is not run offline (residual) | IMPLEMENTED (pin+suite; derived `ui_parity` label IMPLEMENTED with the pinned corpus present per §2.10) |
 | Compat fixtures v756 | golden suite + fixtures | `tests/compat` | CI-LANE / fast tests |
-| Compat fixtures jetbrains-712 | reserved corpus | absent (`false` in manifest) | BLOCKED_EXTERNAL |
+| Compat fixtures jetbrains-712 | pinned corpus (1043 files, MIT, sha256) | `compat/jetbrains-712/NOTICE.md`, `ui/upstream.json` (`jetbrains_712`), `JetBrainsParitySmoke` pin step | IMPLEMENTED |
 | Fuzz harnesses | seeded pseudo-fuzz | Woodpecker `static` job / manual | CI-LANE |
 | Real-time soak (12–24h) | wall-clock soak | self-hosted hook (disabled by default) | NOT RUN HERE |
 | PR/CI-fix completion contract | native DTO `completion_contract` + `CompletionContractSet`/`CompletionStepStatus` ledger rows + `VerifiedComplete` gate + ordered step executor | gate + durable rows + `crates/orchestrator/src/completion_steps.rs` runner (`crates/session/src/task.rs`, `crates/session/src/ledger.rs`, `crates/orchestrator/src/task_executor.rs`, `crates/agent/src/runtime.rs`); adversarial gate/step tests in-tree; Task-mode controls in both IDEs (§3.3) | IMPLEMENTED (gate + ordered/idempotent commit/push/PR execution) |
@@ -495,6 +510,21 @@ release certificate):
 - `bash apps/jetbrains/compile-and-smoke.sh` → exit 0, `BackendSmoke` +
   `NativeBridgeSmoke` + `FrontendSmoke` all green (`NATIVE SMOKE PASS` /
   `FRONTEND SMOKE PASS` are printed by the Kotlin smokes).
+- **JetBrains 7.1.2 pin + parity suite (2026-09-13, same host):**
+  `scripts/vendor-upstream.sh --check` verifies the vendored 7.1.2 tree
+  (1043 files, 7,707,650 bytes, per-file sha256); `bash
+  apps/jetbrains/compile-and-smoke.sh` → exit 0 with
+  `JetBrainsParitySmoke` green (`UPSTREAM PIN PASS`, `JETBRAINS PARITY
+  SMOKE PASS`) covering task mode, agent tree, permissions, terminal,
+  review/tournament, evidence, settings, provider selection, history and
+  restart/reconnect over canned frames, a fake daemon and the real daemon;
+  `./gradlew --offline :frontend:buildPlugin` and `./gradlew build` →
+  BUILD SUCCESSFUL (the frontend test sources were made module-self-
+  contained so `:frontend:compileTestKotlin` no longer depends on backend
+  test classes). Residual: the vendored upstream tree is not built in this
+  repository (its Gradle build resolves the IntelliJ Platform SDK and a
+  pinned CLI release from the network); the Faktor plugin builds the
+  Faktor-owned Swing frontend instead.
 
 ### 3.3 PR/CI-fix completion contract (gate + ordered step execution IMPLEMENTED)
 
@@ -633,8 +663,8 @@ surfaces are adversarially tested in `apps/vscode/scripts/selftest.mjs` +
     "schema": "faktor-capability-manifest/v1",
     "platform": {"os": "darwin", "arch": "aarch64"},
     "platform_lanes": {"...": "..."},
-    "ui_parity": {"vscode": "IMPLEMENTED", "jetbrains": "PARTIAL", "overall": "PARTIAL", "manifest": "capabilities.json"},
-    "compat_fixtures": {"v756": true, "jetbrains712": false},
+    "ui_parity": {"vscode": "IMPLEMENTED", "jetbrains": "IMPLEMENTED", "overall": "IMPLEMENTED", "manifest": "capabilities.json"},
+    "compat_fixtures": {"v756": true, "jetbrains712": true},
     "surfaces": {"workspace_tests": true, "...": false},
     "offline": {"network_required": false, "provider_keys_required": false},
     "release_rule": "a release is certified only for its exact commit with dirty=false AND local_offline_certified AND cross-platform lanes + real-provider + real-soak evidence"

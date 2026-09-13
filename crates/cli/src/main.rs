@@ -1472,8 +1472,19 @@ async fn acp(data_dir: PathBuf) {
     // store) — ACP translates its wire prompts, it never drives the agent.
     let prompts =
         faktor_server::native::PromptExecutionService::new(graph.tasks.clone(), session.clone());
+    // The negotiated `faktor.terminal` seam: the daemon's session-owned
+    // terminal authority (the same faktor-pty + ownership-row registry the
+    // native terminal surface serves) over the SAME session manager the
+    // backend drives. Without this the extension is never negotiated and
+    // every `terminal/*` method stays the official -32601.
+    let terminal_authority: Arc<dyn faktor_acp::TerminalAuthority> =
+        Arc::new(DaemonTerminalAuthority::new(session.clone()));
     let backend = DaemonAcpBackend::new(session, agent, prompts);
-    match AcpServer::new(backend).run_stdio().await {
+    match AcpServer::new(backend)
+        .with_terminal_authority(terminal_authority)
+        .run_stdio()
+        .await
+    {
         Ok(()) => {}
         Err(e) => {
             eprintln!("acp server error: {e}");
@@ -1686,6 +1697,100 @@ fn parse_session_id(s: &str) -> Result<SessionId, String> {
         return Err("invalid session id \"0\"".into());
     }
     Ok(SessionId::new(raw))
+}
+
+/// The daemon's session-owned terminal authority as the ACP
+/// `faktor.terminal` seam: a thin adapter over
+/// [`faktor_server::native::terminal_authority::TerminalRegistry`] — the same
+/// `faktor-pty` + ownership-row authority the native terminal surface uses —
+/// so the ACP server answers terminal methods only when the capability is
+/// negotiated AND this authority is attached. Without it (or without
+/// negotiation) every `terminal/*` method stays the official `-32601`.
+struct DaemonTerminalAuthority {
+    registry: Arc<faktor_server::native::terminal_authority::TerminalRegistry>,
+}
+
+impl DaemonTerminalAuthority {
+    /// The authority is rooted at the SAME session manager the ACP backend
+    /// drives, so a terminal can only be created for a real durable session
+    /// and its row carries that session's durable task/operation identity.
+    fn new(session: Arc<SessionManager>) -> Self {
+        Self {
+            registry: faktor_server::native::terminal_authority::TerminalRegistry::new(session),
+        }
+    }
+}
+
+/// Map the daemon registry error onto the ACP terminal error taxonomy
+/// (invalid params vs internal refusal).
+fn map_terminal_registry_error(
+    error: faktor_server::native::terminal_authority::TerminalRegistryError,
+) -> faktor_acp::TerminalError {
+    use faktor_server::native::terminal_authority::TerminalRegistryError as RegistryError;
+    match error {
+        RegistryError::Invalid(message) => faktor_acp::TerminalError::Invalid(message),
+        RegistryError::Refused(message) => faktor_acp::TerminalError::Refused(message),
+        RegistryError::Unavailable(message) => faktor_acp::TerminalError::Unavailable(message),
+    }
+}
+
+impl faktor_acp::TerminalAuthority for DaemonTerminalAuthority {
+    fn create(
+        &self,
+        session_id: &str,
+        spec: &faktor_acp::TerminalSpec,
+    ) -> Result<Arc<dyn faktor_acp::TerminalHandle>, faktor_acp::TerminalError> {
+        let request = faktor_server::native::terminal_authority::TerminalSpawnRequest {
+            command: spec.command.clone(),
+            args: spec.args.clone(),
+            cwd: spec.cwd.clone(),
+            env: spec.env.clone(),
+            rows: spec.rows,
+            cols: spec.cols,
+        };
+        let handle = self
+            .registry
+            .create(session_id, &request)
+            .map_err(map_terminal_registry_error)?;
+        Ok(Arc::new(DaemonTerminalHandle { handle }))
+    }
+}
+
+/// One live daemon terminal behind the ACP [`faktor_acp::TerminalHandle`]
+/// trait (delegation only; the authority owns the process).
+struct DaemonTerminalHandle {
+    handle: faktor_server::native::terminal_authority::TerminalHandle,
+}
+
+impl faktor_acp::TerminalHandle for DaemonTerminalHandle {
+    fn terminal_id(&self) -> &str {
+        self.handle.terminal_id()
+    }
+    fn pid(&self) -> u32 {
+        self.handle.pid()
+    }
+    fn is_alive(&self) -> bool {
+        self.handle.is_alive()
+    }
+    fn ownership_id(&self) -> &str {
+        self.handle.ownership_id()
+    }
+    fn write(&self, bytes: &[u8]) -> Result<(), faktor_acp::TerminalError> {
+        self.handle
+            .write(bytes)
+            .map_err(map_terminal_registry_error)
+    }
+    fn resize(&self, rows: u16, cols: u16) -> Result<(), faktor_acp::TerminalError> {
+        self.handle
+            .resize(rows, cols)
+            .map_err(map_terminal_registry_error)
+    }
+    fn drain_output(&self) -> Vec<u8> {
+        self.handle.drain_output()
+    }
+    fn kill(&self) -> Result<(), faktor_acp::TerminalError> {
+        self.handle.kill().map_err(map_terminal_registry_error)
+    }
 }
 
 /// Human-readable outcome of one doctor run. The shell wrapper prints the
@@ -5057,5 +5162,331 @@ mod tests {
         );
         assert_eq!(verdict, faktor_hooks::HookVerdict::Allow);
         assert_eq!(registry.audit().len(), 1);
+    }
+
+    // ------------- daemon ACP terminal round-trip (the REAL authority) -----
+
+    /// Byte-level ACP client over the client half of an in-memory duplex.
+    #[cfg(unix)]
+    struct AcpWire {
+        read: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        buf: Vec<u8>,
+        next_id: u64,
+    }
+
+    #[cfg(unix)]
+    impl AcpWire {
+        async fn expect_message(&mut self) -> Value {
+            use tokio::io::AsyncReadExt;
+            loop {
+                match faktor_acp::protocol::parse_frame(&self.buf) {
+                    Ok(Some((consumed, value))) => {
+                        self.buf.drain(..consumed);
+                        return value;
+                    }
+                    Ok(None) => {
+                        let mut chunk = [0u8; 8192];
+                        let n = tokio::time::timeout(
+                            std::time::Duration::from_secs(20),
+                            self.read.read(&mut chunk),
+                        )
+                        .await
+                        .expect("server answers within the test bound")
+                        .expect("server read");
+                        assert!(n > 0, "server closed the pipe before answering");
+                        self.buf.extend_from_slice(&chunk[..n]);
+                    }
+                    Err(e) => panic!("client framing error: {e}"),
+                }
+            }
+        }
+
+        async fn send(&mut self, method: &str, params: Value) -> u64 {
+            use tokio::io::AsyncWriteExt;
+            let id = self.next_id;
+            self.next_id += 1;
+            let bytes = faktor_acp::protocol::frame(method.to_string(), id, params);
+            self.write.write_all(&bytes).await.expect("client write");
+            self.write.flush().await.expect("client flush");
+            id
+        }
+
+        async fn request(&mut self, method: &str, params: Value) -> Value {
+            let id = self.send(method, params).await;
+            loop {
+                let msg = self.expect_message().await;
+                let is_response = msg.get("result").is_some() || msg.get("error").is_some();
+                if msg["id"] == json!(id) && is_response {
+                    return msg;
+                }
+            }
+        }
+
+        /// Send one request and read until BOTH its response and a
+        /// `terminalOutput` frame whose data contains `needle` have arrived
+        /// (the two race, and neither may be dropped).
+        async fn request_until_output(
+            &mut self,
+            method: &str,
+            params: Value,
+            terminal_id: &str,
+            needle: &str,
+        ) -> (Value, Vec<String>) {
+            let id = self.send(method, params).await;
+            let mut updates: Vec<String> = Vec::new();
+            let mut response: Option<Value> = None;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for terminal output {needle:?}"
+                );
+                let msg = self.expect_message().await;
+                if msg.get("method").and_then(Value::as_str) == Some("session/update") {
+                    let update = &msg["params"]["update"];
+                    if update["kind"] == "terminalOutput"
+                        && update["terminalId"] == json!(terminal_id)
+                    {
+                        updates.push(update["data"].as_str().unwrap_or_default().to_string());
+                    }
+                } else if msg["id"] == json!(id) {
+                    response = Some(msg);
+                }
+                if updates.iter().any(|data| data.contains(needle)) {
+                    if let Some(response) = response {
+                        return (response, updates);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spawn the ACP server over a duplex; returns the client plus the serve
+    /// task. `authority` is attached when present (the production wiring).
+    #[cfg(unix)]
+    fn start_daemon_terminal_server(
+        backend: DaemonAcpBackend,
+        authority: Option<Arc<dyn faktor_acp::TerminalAuthority>>,
+    ) -> (AcpWire, tokio::task::JoinHandle<Result<(), String>>) {
+        let server = match authority {
+            Some(authority) => AcpServer::new(backend).with_terminal_authority(authority),
+            None => AcpServer::new(backend),
+        };
+        let (server_side, client_side) = tokio::io::duplex(1024 * 1024);
+        let (server_r, server_w) = tokio::io::split(server_side);
+        let (client_r, client_w) = tokio::io::split(client_side);
+        let task = tokio::spawn(async move { server.serve_connection(server_r, server_w).await });
+        (
+            AcpWire {
+                read: client_r,
+                write: client_w,
+                buf: Vec::new(),
+                next_id: 1,
+            },
+            task,
+        )
+    }
+
+    /// Create one REAL durable session through the ACP wire, returning its id.
+    #[cfg(unix)]
+    async fn acp_new_real_session(client: &mut AcpWire, workspace: &std::path::Path) -> String {
+        std::fs::create_dir_all(workspace).unwrap();
+        let new = client
+            .request(
+                "session/new",
+                json!({ "workspace": workspace.to_str().unwrap() }),
+            )
+            .await;
+        assert_eq!(new["error"], Value::Null, "session/new failed: {new}");
+        new["result"]["sessionId"]
+            .as_str()
+            .expect("sessionId")
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    fn pid_alive(pid: u32) -> bool {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -0 {pid} 2>/dev/null"))
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    /// The production wiring end-to-end: an ACP client negotiates
+    /// `faktor.terminal` and drives create → input → output → kill against
+    /// the daemon's REAL session-owned authority (faktor-pty rows over the
+    /// SAME session manager the backend uses). The terminal output must
+    /// round-trip through a real PTY; the kill must take the real child.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acp_terminal_round_trip_runs_on_the_daemon_authority() {
+        let rig = acp_shadow_rig(Vec::new());
+        let authority_impl = Arc::new(DaemonTerminalAuthority::new(rig.session.clone()));
+        let registry = authority_impl.registry.clone();
+        let authority: Arc<dyn faktor_acp::TerminalAuthority> = authority_impl.clone();
+        let (mut client, task) = start_daemon_terminal_server(rig.backend, Some(authority));
+
+        let init = client
+            .request(
+                "initialize",
+                json!({ "protocolVersion": 1, "extensions": ["faktor.terminal"] }),
+            )
+            .await;
+        assert!(
+            init["result"]["extensions"]
+                .as_array()
+                .map(|names| names.iter().any(|n| n == "faktor.terminal"))
+                .unwrap_or(false),
+            "the attached authority must negotiate faktor.terminal: {init}"
+        );
+
+        let workspace = rig.dir.path().join("ws");
+        let sid = acp_new_real_session(&mut client, &workspace).await;
+
+        let created = client
+            .request(
+                "terminal/create",
+                json!({
+                    "sessionId": sid,
+                    "command": "sh",
+                    "args": ["-c", "stty -echo; read x; echo got:$x; sleep 30"],
+                    "env": ["PATH"],
+                    "rows": 24,
+                    "cols": 80,
+                }),
+            )
+            .await;
+        assert_eq!(created["error"], Value::Null, "create failed: {created}");
+        let tid = created["result"]["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+        let pid = created["result"]["pid"].as_u64().expect("pid") as u32;
+        let ownership = created["result"]["ownershipId"]
+            .as_str()
+            .expect("ownershipId")
+            .to_string();
+        assert!(pid > 0, "a real pty pid");
+        assert_eq!(created["result"]["sessionId"], json!(sid));
+        assert!(pid_alive(pid), "the pty child is alive after create");
+
+        // The row is session-owned in the daemon registry: the durable
+        // session id, the operation id and the pid all match the wire.
+        let rows = registry.session_rows(SessionId::new(sid.parse().unwrap()));
+        assert_eq!(rows.len(), 1, "one session-owned row: {rows:?}");
+        assert_eq!(rows[0].0, tid);
+        assert_eq!(rows[0].1.pid, pid);
+        assert_eq!(rows[0].1.operation_id.to_string(), ownership);
+        assert_eq!(rows[0].1.session_id.to_string(), sid);
+
+        // Input → real tty → terminalOutput frames.
+        let (response, updates) = client
+            .request_until_output(
+                "terminal/input",
+                json!({ "sessionId": sid, "terminalId": tid, "data": "hello\n" }),
+                &tid,
+                "got:hello",
+            )
+            .await;
+        assert_eq!(response["result"], json!({}), "{response}");
+        assert!(
+            !updates.is_empty(),
+            "the real tty output must arrive as terminalOutput frames"
+        );
+
+        // Kill takes the real child; the bounded wait proves it.
+        let killed = client
+            .request(
+                "terminal/kill",
+                json!({ "sessionId": sid, "terminalId": tid }),
+            )
+            .await;
+        assert_eq!(killed["result"], json!({}), "{killed}");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pid_alive(pid) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "terminal/kill must terminate the real child"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        drop(client);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+    }
+
+    /// The negative contract on the wire: without a negotiated capability
+    /// (or without an attached authority) every `terminal/*` method keeps
+    /// the official `-32601` — never a partial success.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acp_terminal_methods_are_method_not_found_when_not_negotiated() {
+        // (a) Authority attached, extension NOT negotiated.
+        let rig = acp_shadow_rig(Vec::new());
+        let authority: Arc<dyn faktor_acp::TerminalAuthority> =
+            Arc::new(DaemonTerminalAuthority::new(rig.session.clone()));
+        let (mut client, task) = start_daemon_terminal_server(rig.backend, Some(authority));
+        client
+            .request("initialize", json!({ "protocolVersion": 1 }))
+            .await;
+        let workspace = rig.dir.path().join("ws-no-neg");
+        let sid = acp_new_real_session(&mut client, &workspace).await;
+        let msg = client
+            .request(
+                "terminal/create",
+                json!({ "sessionId": sid, "command": "sh", "args": ["-c", "true"] }),
+            )
+            .await;
+        assert_eq!(
+            msg["error"]["code"],
+            json!(faktor_acp::METHOD_NOT_FOUND),
+            "unnegotiated terminal/create must stay -32601: {msg}"
+        );
+        let msg = client
+            .request("terminal/list", json!({ "sessionId": sid }))
+            .await;
+        assert_eq!(
+            msg["error"]["code"],
+            json!(faktor_acp::METHOD_NOT_FOUND),
+            "unnegotiated terminal/list must stay -32601: {msg}"
+        );
+        drop(client);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+
+        // (b) Extension negotiated, but NO authority attached.
+        let rig = acp_shadow_rig(Vec::new());
+        let (mut client, task) = start_daemon_terminal_server(rig.backend, None);
+        let init = client
+            .request(
+                "initialize",
+                json!({ "protocolVersion": 1, "extensions": ["faktor.terminal"] }),
+            )
+            .await;
+        assert!(
+            init["result"].get("extensions").is_none()
+                || !init["result"]["extensions"]
+                    .as_array()
+                    .map(|names| names.iter().any(|n| n == "faktor.terminal"))
+                    .unwrap_or(false),
+            "without an authority the extension is not negotiated: {init}"
+        );
+        let workspace = rig.dir.path().join("ws-no-authority");
+        let sid = acp_new_real_session(&mut client, &workspace).await;
+        let msg = client
+            .request(
+                "terminal/create",
+                json!({ "sessionId": sid, "command": "sh", "args": ["-c", "true"] }),
+            )
+            .await;
+        assert_eq!(
+            msg["error"]["code"],
+            json!(faktor_acp::METHOD_NOT_FOUND),
+            "without an authority terminal/create must stay -32601: {msg}"
+        );
+        drop(client);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
     }
 }

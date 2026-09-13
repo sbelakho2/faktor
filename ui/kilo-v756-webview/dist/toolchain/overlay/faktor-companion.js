@@ -402,6 +402,49 @@
 
   // --------------------------------------------------------- cockpit block
 
+  /**
+   * One acceptance-criterion PROOF line. The host prefixes each line with
+   * `[pass]`, `[fail]` or `[unavailable]` so the verdict survives the
+   * bridge's line-only cockpit frame; this renderer maps it to a distinct
+   * class (an unavailable row is never styled as a pass) and turns every
+   * `evidence:<n>` token into a typed retrieval button.
+   */
+  function criterionText(parent, value) {
+    var text = String(value);
+    var pattern = /evidence:(\d+)/g;
+    var last = 0;
+    var match = pattern.exec(text);
+    while (match !== null && parent.children.length < 64) {
+      if (match.index > last) {
+        parent.appendChild(el('span', 'faktor-criterion-ref', text.slice(last, match.index)));
+      }
+      (function (id) {
+        button(parent, 'evidence:' + id, 'faktor-btn faktor-btn-link', function () {
+          post({ type: 'faktorEvidenceExpand', evidenceId: id });
+        });
+      })(Number(match[1]));
+      last = match.index + match[0].length;
+      match = pattern.exec(text);
+    }
+    if (last < text.length) {
+      parent.appendChild(el('span', 'faktor-criterion-ref', text.slice(last)));
+    }
+  }
+
+  function renderCriterionLine(parent, value) {
+    var lineText = String(value);
+    var match = /^\[(pass|fail|unavailable)\]\s*([\s\S]*)$/.exec(lineText);
+    var verdict = match ? match[1] : 'unavailable';
+    var body = match ? match[2] : lineText;
+    var row = el('div', 'faktor-criterion faktor-criterion-' + verdict);
+    row.setAttribute('data-verdict', verdict);
+    var head = el('div', 'faktor-row');
+    badge(head, verdict.toUpperCase(), verdict);
+    row.appendChild(head);
+    criterionText(row, body);
+    parent.appendChild(row);
+  }
+
   function renderCockpit(root) {
     var data = state.cockpit;
     var sections = array(data && data.sections);
@@ -420,7 +463,11 @@
       block.appendChild(el('div', 'faktor-label', text(item.title || item.key, 80)));
       var lines = array(item.lines).slice(0, MAX_LINES);
       for (var l = 0; l < lines.length; l += 1) {
-        line(block, text(lines[l]), 'faktor-line');
+        if (item.key === 'acceptance') {
+          renderCriterionLine(block, lines[l]);
+        } else {
+          line(block, text(lines[l]), 'faktor-line');
+        }
       }
       node.appendChild(block);
     }

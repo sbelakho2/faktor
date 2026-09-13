@@ -26,11 +26,17 @@ sealed class TaskTreeNode(val label: String) {
     class Goal(label: String) : TaskTreeNode(label)
     class Child(val child: ChildNode) : TaskTreeNode("")
     class Evidence(val ref: EvidenceRef) : TaskTreeNode("")
+    class Criterion(val row: CriterionProofRow) : TaskTreeNode("")
     class Plain(label: String) : TaskTreeNode(label)
 }
 
 /** Dimmed label color of background children (a presentation-only concept). */
 private val BACKGROUND_DIM = java.awt.Color(140, 140, 140)
+
+/** Verdict tones: pass (green), fail (red), unavailable (amber, italic). */
+private val CRITERION_PASS_COLOR = java.awt.Color(63, 185, 80)
+private val CRITERION_FAIL_COLOR = java.awt.Color(248, 81, 73)
+private val CRITERION_UNAVAILABLE_COLOR = java.awt.Color(210, 153, 34)
 
 class TaskTreePanel : JPanel(BorderLayout()) {
 
@@ -121,6 +127,24 @@ class TaskTreePanel : JPanel(BorderLayout()) {
     }
 
     private fun criteriaNode(model: TaskTreeModel): DefaultMutableTreeNode {
+        // Per-criterion PROOF rows: verdict, requirement/origin, binding kind
+        // with its exact reference, the proven snapshots, the verification
+        // timestamps and the retrievable evidence refs. Rows are always
+        // rendered from the served DTO facts; missing members stay explicit
+        // "unavailable" text, never a fabricated pass.
+        if (model.criteriaProof.isNotEmpty()) {
+            val node = DefaultMutableTreeNode(
+                TaskTreeNode.Plain("acceptance criteria · proof (${model.criteriaProof.size})")
+            )
+            for (row in model.criteriaProof) {
+                val criterionNode = DefaultMutableTreeNode(TaskTreeNode.Criterion(row))
+                node.add(criterionNode)
+                for (ref in row.evidenceRefs) {
+                    criterionNode.add(DefaultMutableTreeNode(TaskTreeNode.Evidence(ref)))
+                }
+            }
+            return node
+        }
         val node = DefaultMutableTreeNode(
             TaskTreeNode.Plain("acceptance criteria (${model.acceptanceCriteria.size})")
         )
@@ -321,6 +345,49 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         return text.toString()
     }
 
+    /** The tone color of one criterion verdict (unavailable stays distinct). */
+    fun criterionColor(tone: CriterionVerdictTone): java.awt.Color = when (tone) {
+        CriterionVerdictTone.PASS -> CRITERION_PASS_COLOR
+        CriterionVerdictTone.FAIL -> CRITERION_FAIL_COLOR
+        CriterionVerdictTone.UNAVAILABLE -> CRITERION_UNAVAILABLE_COLOR
+    }
+
+    /**
+     * The label of one criterion proof row, surfacing every member the wire
+     * serves (verdict, requirement, origin, binding kind + exact reference,
+     * the proven snapshots, the verification timestamps) plus the explicit
+     * unavailable markers for members a predating daemon does not carry.
+     * `[verdict]` leads so the state survives any bound.
+     */
+    fun criterionLabel(row: CriterionProofRow): String {
+        val text = StringBuilder()
+        text.append("[").append(row.verdict).append("] ")
+        text.append(
+            if (row.criterionKey.isEmpty()) "(unnamed criterion — malformed row)" else row.criterionKey
+        )
+        text.append(" · requirement ").append(row.requirement)
+        text.append(" · origin ").append(row.origin)
+        text.append(" · binding ").append(row.bindingKind)
+        if (row.bindingSource == "derived") {
+            text.append(" (").append(row.bindingSource).append(")")
+        }
+        row.bindingReference?.let { text.append(" ref ").append(it) }
+        text.append(" · ").append(row.snapshot)
+        text.append(" · ").append(row.verificationTimestamp)
+        row.recordId?.let {
+            text.append(" · record ").append(it).append(" [").append(row.recordStatus ?: "?").append("]")
+        }
+        row.verdictReason?.let { text.append(" · ").append(it) }
+        if (row.unavailable.isNotEmpty()) {
+            text.append(" · unavailable: ").append(row.unavailable.joinToString(", "))
+        }
+        return bound(text.toString(), 420)
+    }
+
+    /** The rendered labels of every proof row (smoke + inspection). */
+    fun criterionLabels(model: TaskTreeModel): List<String> =
+        model.criteriaProof.map { criterionLabel(it) }
+
     private inner class TaskTreeRenderer : DefaultTreeCellRenderer() {
         private var spriteId: String? = null
         private var sprite: PixelSprite? = null
@@ -337,6 +404,18 @@ class TaskTreePanel : JPanel(BorderLayout()) {
             hasFocus: Boolean
         ): Component {
             val payload = ((value as? DefaultMutableTreeNode)?.userObject)
+            if (payload is TaskTreeNode.Criterion) {
+                val component = super.getTreeCellRendererComponent(
+                    tree, value, selected, expanded, leaf, row, hasFocus
+                )
+                val proof = payload.row
+                text = bound(criterionLabel(proof), 420)
+                foreground = if (selected) textSelectionColor else criterionColor(proof.tone)
+                font = font.deriveFont(
+                    if (proof.tone == CriterionVerdictTone.UNAVAILABLE) Font.ITALIC else Font.PLAIN
+                )
+                return component
+            }
             if (payload is TaskTreeNode.Child) {
                 val child = payload.child
                 if (spriteId != child.childId) {

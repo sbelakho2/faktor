@@ -7,10 +7,12 @@ runtime while targeting the frozen Kilo v7.5.6 IDE UX. The v7.5.6 VS Code
 webview sources are vendored under `ui/` (pinned at commit `fa02955` with a
 SHA-256 manifest) and served through `apps/vscode`; the pinned closure plus
 the Faktor companion overlay are staged into the extension's `media/` and
-ship inside the VSIX. The JetBrains 7.1.2 Kotlin shell is NOT vendored —
-`apps/jetbrains` carries the real Faktor-owned frontend/backend panels
-(task tree, blockers, tournament, board, evidence, attachments) that talk
-to the native daemon.
+ship inside the VSIX. The JetBrains 7.1.2 sources are vendored at
+`compat/jetbrains-712/` (tag `jetbrains/v7.1.2`, commit
+`436ff09e649bd0866c84bd9f98933a74cad2d25c`, also SHA-256-pinned in
+`ui/upstream.json`); `apps/jetbrains` carries the real Faktor-owned
+frontend/backend panels (task tree, blockers, tournament, board, evidence,
+attachments) that talk to the native daemon.
 
 ```
 same UI
@@ -80,8 +82,10 @@ ui/          (vendored frozen upstream UI: kilo-v756-webview/ + kilo-ui/, pinned
   VSIX ships the vendored UI self-contained (hash-asserted at package
   time); without a staged bundle the built-in Faktor chat panel is the
   fallback. Later releases are never merged wholesale.
-- **JetBrains:** JetBrains 7.1.2 (Kotlin frontend stays; process manager is
-  modified only to launch the Faktor binary).
+- **JetBrains:** pinned upstream JetBrains 7.1.2 sources
+  (`compat/jetbrains-712/`, SHA-256 in `ui/upstream.json`) with the
+  Faktor-owned Swing frontend; the process manager launches the Faktor
+  binary.
 - **Protocol (glue; full parity TARGET):** the real v7.5.6 contract remains
   the compatibility destination; `compat/kilo-v756/` golden fixtures are
   frozen and exercised byte-for-byte by `tests/compat` for the wired subset

@@ -630,11 +630,50 @@ data class NativeSessionUsage(
     val tasks: List<NativeSessionTaskUsage>
 )
 
-/** One durable criterion verdict of a verification record. */
+/** The seven typed criterion-binding kinds plus the honest `unavailable`. */
+data class NativeCriterionBinding(
+    val kind: String,
+    val checkId: String? = null,
+    val commandDigest: String? = null,
+    val requiredWorkItems: List<String> = emptyList(),
+    val path: String? = null,
+    val expectedDigest: String? = null,
+    val evidenceId: String? = null,
+    val evidenceDigest: String? = null,
+    val reviewerId: String? = null,
+    val reason: String? = null
+)
+
+/**
+ * One durable criterion verdict of a verification record. The additive
+ * proof annotations are served by the current daemon (binding/origin/
+ * requirement + the three-way `verdict`); a daemon predating them leaves
+ * them null and the model degrades honestly (never to a pass).
+ */
 data class NativeCriterionVerdict(
     val criterionKey: String,
     val passed: Boolean,
-    val evidence: String?
+    val evidence: String?,
+    val binding: NativeCriterionBinding? = null,
+    val origin: String? = null,
+    val requirement: String? = null,
+    /** pass | fail | unavailable (the daemon's three-way vocabulary). */
+    val verdict: String? = null
+)
+
+/** The compact candidate-proof reference of one verification record (P0). */
+data class NativeCandidateProof(
+    val taskRevision: String?,
+    val baseManifestHash: String?,
+    val candidateManifestHash: String?,
+    val sourceDiffEvidence: String?,
+    val riskReportEvidence: String?,
+    val accountingSnapshotDigest: String?,
+    val runId: String?,
+    val runBaseSnapshot: String?,
+    val candidateSnapshot: String?,
+    val sourcesDigest: String?,
+    val changedFilesDigest: String?
 )
 
 data class NativeVerificationRecord(
@@ -645,7 +684,15 @@ data class NativeVerificationRecord(
     val checks: List<String>,
     val changedFiles: List<String>,
     val criteria: List<NativeCriterionVerdict> = emptyList(),
-    val checkSummaries: List<String> = emptyList()
+    val checkSummaries: List<String> = emptyList(),
+    /** The P0 proof payload; null members are honest absences. */
+    val candidateProof: NativeCandidateProof? = null,
+    val verifiedSnapshot: String? = null,
+    val basedOnSnapshot: String? = null,
+    val sourceCount: Long? = null,
+    val landedSnapshot: String? = null,
+    val startedMs: Long? = null,
+    val completedMs: Long? = null
 )
 
 data class NativeTaskVerification(
@@ -753,6 +800,91 @@ data class NativePermissionEntry(
 )
 
 data class NativePermissionAck(val ok: Boolean)
+
+// ------------------------------------------- provider registry (native P0-64)
+//
+// `GET /native/providers` — the registered provider instances and their
+// known models. The (provider, model) pair is the only safe catalog join
+// key; a provider-less row never guesses by model alone.
+
+data class NativeProviderModel(
+    val model: String,
+    val context: Long,
+    val maxOutput: Long,
+    val tools: Boolean,
+    val parallelTools: Boolean,
+    val reasoning: Boolean,
+    val thinking: Boolean,
+    val vision: Boolean,
+    val streaming: Boolean,
+    val source: String
+)
+
+data class NativeProviderInfo(
+    val instanceId: String,
+    val family: String,
+    val models: List<NativeProviderModel>,
+    val runtimeContextLimitSupported: Boolean,
+    val healthStatus: String,
+    val healthNote: String
+)
+
+// ---------------------------------------------------- terminals (native P0-62)
+//
+// Session-owned PTY projection: `GET /native/terminals?session=<id>`,
+// `GET /native/session/{id}/terminal/events`,
+// `POST /native/session/{id}/terminal` and the legacy output snapshot
+// `GET /pty/{ptyId}/output`. Unowned legacy rows are never projected into a
+// session view; the page names them in `unowned`/`note` instead.
+
+data class NativeTerminal(
+    val id: String,
+    val pid: Long,
+    val alive: Boolean,
+    val sessionId: String?,
+    val taskId: String?,
+    val agentId: String?,
+    val operationId: String?,
+    val spawnedMs: Long?
+)
+
+data class NativeTerminalPage(
+    val sessionId: String,
+    val terminals: List<NativeTerminal>,
+    val unowned: Long,
+    val note: String
+)
+
+data class NativeTerminalEvent(
+    val id: Long,
+    val type: String,
+    val ptyId: String,
+    val pid: Long,
+    val tsMs: Long,
+    val sessionId: String
+)
+
+data class NativeTerminalEventPage(
+    val sessionId: String,
+    val events: List<NativeTerminalEvent>,
+    val hasMore: Boolean,
+    val nextCursor: Long?
+)
+
+data class NativeTerminalSpawned(
+    val ptyId: String,
+    val pid: Long,
+    val sessionId: String,
+    val taskId: String,
+    val agentId: String?,
+    val operationId: String
+)
+
+data class NativeTerminalOutput(
+    val ptyId: String,
+    val output: String,
+    val alive: Boolean
+)
 
 data class NativeEvidence(
     val id: Long,
@@ -1200,6 +1332,35 @@ fun parseNativeVerificationView(json: String): NativeVerificationView {
     )
 }
 
+/** One additive typed criterion binding (serde snake_case or camelCase). */
+private fun parseCriterionBinding(v: JsonView): NativeCriterionBinding = NativeCriterionBinding(
+    kind = v.field("kind").string(),
+    checkId = optionalAny(v, "check_id", "checkId")?.string(),
+    commandDigest = optionalAny(v, "command_digest", "commandDigest")?.string(),
+    requiredWorkItems = optionalStrings(v, "required_work_items", "requiredWorkItems"),
+    path = v.optionalField("path")?.string(),
+    expectedDigest = optionalAny(v, "expected_digest", "expectedDigest")?.string(),
+    evidenceId = optionalAny(v, "evidence_id", "evidenceId")?.string(),
+    evidenceDigest = optionalAny(v, "evidence_digest", "evidenceDigest")?.string(),
+    reviewerId = optionalAny(v, "reviewer_id", "reviewerId")?.string(),
+    reason = v.optionalField("reason")?.string()
+)
+
+/** The additive P0 candidate-proof reference (all members optional). */
+private fun parseCandidateProof(v: JsonView): NativeCandidateProof = NativeCandidateProof(
+    taskRevision = v.optionalField("taskRevision")?.string(),
+    baseManifestHash = v.optionalField("baseManifestHash")?.string(),
+    candidateManifestHash = v.optionalField("candidateManifestHash")?.string(),
+    sourceDiffEvidence = v.optionalField("sourceDiffEvidence")?.string(),
+    riskReportEvidence = v.optionalField("riskReportEvidence")?.string(),
+    accountingSnapshotDigest = v.optionalField("accountingSnapshotDigest")?.string(),
+    runId = v.optionalField("runId")?.string(),
+    runBaseSnapshot = v.optionalField("runBaseSnapshot")?.string(),
+    candidateSnapshot = v.optionalField("candidateSnapshot")?.string(),
+    sourcesDigest = v.optionalField("sourcesDigest")?.string(),
+    changedFilesDigest = v.optionalField("changedFilesDigest")?.string()
+)
+
 fun parseNativeTaskVerification(json: String): NativeTaskVerification {
     val v = JsonCodec.parse(json).view("GET /native/session/{id}/tasks/{task_id}/verification")
     return NativeTaskVerification(
@@ -1222,11 +1383,26 @@ fun parseNativeTaskVerification(json: String): NativeTaskVerification {
                     NativeCriterionVerdict(
                         criterionKey = criterion.field("criterionKey").string(),
                         passed = criterion.field("passed").bool(),
-                        evidence = criterion.optionalField("evidence")?.let { e -> jsonText(e) }
+                        evidence = criterion.optionalField("evidence")?.let { e -> jsonText(e) },
+                        binding = criterion.optionalField("binding")?.let { b ->
+                            parseCriterionBinding(b)
+                        },
+                        origin = criterion.optionalField("origin")?.string(),
+                        requirement = criterion.optionalField("requirement")?.string(),
+                        verdict = criterion.optionalField("verdict")?.string()
                     )
                 },
                 checkSummaries = record.field("checks").array()
-                    .mapNotNull { check -> check.optionalField("summary")?.let { s -> jsonText(s) } }
+                    .mapNotNull { check -> check.optionalField("summary")?.let { s -> jsonText(s) } },
+                candidateProof = record.optionalField("candidateProof")?.let { p ->
+                    parseCandidateProof(p)
+                },
+                verifiedSnapshot = record.optionalField("verifiedSnapshot")?.string(),
+                basedOnSnapshot = record.optionalField("basedOnSnapshot")?.string(),
+                sourceCount = record.optionalField("sourceCount")?.long(),
+                landedSnapshot = record.optionalField("landedSnapshot")?.string(),
+                startedMs = record.optionalField("startedMs")?.long(),
+                completedMs = record.optionalField("completedMs")?.long()
             )
         }
     )
@@ -1364,6 +1540,101 @@ fun parseNativePermissionList(json: String): List<NativePermissionEntry> {
 
 fun parseNativePermissionAck(json: String): NativePermissionAck =
     NativePermissionAck(JsonCodec.parse(json).view("POST /permission/reply").field("ok").bool())
+
+// -------------------------------------------------- provider registry parse
+
+fun parseNativeProviders(json: String): List<NativeProviderInfo> {
+    val v = JsonCodec.parse(json).view("GET /native/providers")
+    return v.array().map {
+        val health = it.field("health")
+        NativeProviderInfo(
+            instanceId = it.field("instanceId").string(),
+            family = it.field("family").string(),
+            models = it.field("models").array().map { model ->
+                NativeProviderModel(
+                    model = model.field("model").string(),
+                    context = model.field("context").long(),
+                    maxOutput = model.field("maxOutput").long(),
+                    tools = model.field("tools").bool(),
+                    parallelTools = model.field("parallelTools").bool(),
+                    reasoning = model.field("reasoning").bool(),
+                    thinking = model.field("thinking").bool(),
+                    vision = model.field("vision").bool(),
+                    streaming = model.field("streaming").bool(),
+                    source = model.field("source").string()
+                )
+            },
+            runtimeContextLimitSupported = it.field("runtimeContextLimitSupported").bool(),
+            healthStatus = health.field("status").string(),
+            healthNote = health.optionalField("note")?.string() ?: ""
+        )
+    }
+}
+
+// ------------------------------------------------------- terminal page parse
+
+fun parseNativeTerminalPage(json: String): NativeTerminalPage {
+    val v = JsonCodec.parse(json).view("GET /native/terminals")
+    return NativeTerminalPage(
+        sessionId = v.field("sessionId").string(),
+        terminals = v.field("terminals").array().map { row ->
+            NativeTerminal(
+                id = row.field("id").string(),
+                pid = row.field("pid").long(),
+                alive = row.field("alive").bool(),
+                sessionId = row.optionalField("sessionId")?.string(),
+                taskId = row.optionalField("taskId")?.string(),
+                agentId = row.optionalField("agentId")?.string(),
+                operationId = row.optionalField("operationId")?.string(),
+                spawnedMs = row.optionalField("spawnedMs")?.long()
+            )
+        },
+        unowned = v.optionalField("unowned")?.long() ?: 0L,
+        note = v.optionalField("note")?.string() ?: ""
+    )
+}
+
+fun parseNativeTerminalEventPage(json: String): NativeTerminalEventPage {
+    val v = JsonCodec.parse(json).view("GET /native/session/{id}/terminal/events")
+    return NativeTerminalEventPage(
+        sessionId = v.field("sessionId").string(),
+        events = v.field("events").array().map { row ->
+            NativeTerminalEvent(
+                id = row.field("id").long(),
+                type = row.field("type").string(),
+                ptyId = row.field("ptyId").string(),
+                pid = row.field("pid").long(),
+                tsMs = row.field("tsMs").long(),
+                sessionId = row.field("sessionId").string()
+            )
+        },
+        hasMore = v.field("hasMore").bool(),
+        nextCursor = v.optionalField("nextCursor")?.long()
+    )
+}
+
+fun parseNativeTerminalSpawned(json: String): NativeTerminalSpawned {
+    val v = JsonCodec.parse(json).view("POST /native/session/{id}/terminal")
+    if (!v.field("ok").bool()) v.fail("server did not acknowledge the terminal spawn")
+    return NativeTerminalSpawned(
+        ptyId = v.field("ptyId").string(),
+        pid = v.field("pid").long(),
+        sessionId = v.field("sessionId").string(),
+        taskId = v.field("taskId").string(),
+        agentId = v.optionalField("agentId")?.string(),
+        operationId = v.field("operationId").string()
+    )
+}
+
+fun parseNativeTerminalOutput(ptyId: String, json: String): NativeTerminalOutput {
+    val v = JsonCodec.parse(json).view("GET /pty/{id}/output")
+    if (!v.field("ok").bool()) v.fail("server did not acknowledge the terminal output read")
+    return NativeTerminalOutput(
+        ptyId = ptyId,
+        output = v.field("output").string(),
+        alive = v.field("alive").bool()
+    )
+}
 
 fun parseNativeEvidence(json: String): NativeEvidence {
     val v = JsonCodec.parse(json).view("GET /native/evidence/{id}")
@@ -1596,4 +1867,24 @@ object NativeRequests {
             .put("permission_id", permissionId)
             .put("decision", decision)
             .toJson()
+
+    /**
+     * One session-owned terminal spawn (`POST /native/session/{id}/terminal`).
+     * The strict daemon DTO mirrors `/pty/create`: `{command, args?, cwd?,
+     * rows?, cols?}`; a typo is a 400. The session id rides the path, never
+     * the body.
+     */
+    fun spawnTerminal(
+        command: String,
+        args: List<String>? = null,
+        cwd: String? = null,
+        rows: Long? = null,
+        cols: Long? = null
+    ): String = JsonObjectBuilder()
+        .put("command", command)
+        .putStrings("args", args)
+        .put("cwd", cwd)
+        .put("rows", rows)
+        .put("cols", cols)
+        .toJson()
 }

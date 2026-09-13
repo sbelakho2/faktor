@@ -2,8 +2,10 @@
 # JetBrains split-mode smoke (no Gradle, no network):
 #   1. build faktor-cli if missing
 #   2. compile shared + backend + test + frontend (Swing panel) with kotlinc
-#   3. run BackendSmoke (v7.5.6 wire) and NativeBridgeSmoke (native protocol
-#      v1 + fake-server unit suite) against the real daemon; exit 0/1
+#   3. run BackendSmoke (v7.5.6 wire), NativeBridgeSmoke (native protocol v1 +
+#      fake-server unit suite), FrontendSmoke (panels + canned frames) and
+#      JetBrainsParitySmoke (upstream 7.1.2 pin hashes + fake daemon + parity
+#      families + real daemon restart/reconnect) against the real daemon; exit 0/1
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,7 +19,9 @@ $JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/NativeClient.kt
 $JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/NativeEventStream.kt"
 TEST_SRC="$JETBRAINS/backend/src/test/kotlin/dev/faktor/backend/BackendProcessManagerTest.kt
 $JETBRAINS/backend/src/test/kotlin/dev/faktor/backend/NativeClientTest.kt
-$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/FrontendSmoke.kt"
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/FrontendTestSupport.kt
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/FrontendSmoke.kt
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt"
 FRONTEND_SRC="$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorFrontendService.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/PanelSupport.kt
@@ -28,7 +32,11 @@ $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/BlockersPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/TournamentPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/BoardPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/EvidenceNavigatorPanel.kt
-$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/AttachmentsPanel.kt"
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/AttachmentsPanel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/HistoryPanel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/PermissionsPanel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/SettingsPanel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/TerminalPanel.kt"
 
 BIN="${FAKTOR_CLI_BIN:-$ROOT/target/debug/faktor-cli}"
 
@@ -192,7 +200,7 @@ compile_kotlin || {
 run_smoke() {
   local name="$1"
   local err="$WORK/${name}.stderr"
-  java -cp "$SMOKE_JAR" "$2" "$BIN" 2>"$err"
+  java -Dfaktor.repo.root="$ROOT" -cp "$SMOKE_JAR" "$2" "$BIN" 2>"$err"
   local rc=$?
   if [ $rc -ne 0 ]; then
     echo "[compile-and-smoke] $name FAILED (rc=$rc); daemon stderr tail ($err):" >&2
@@ -209,4 +217,7 @@ run_smoke NativeBridgeSmoke dev.faktor.backend.NativeBridgeSmoke || exit $?
 
 echo "[compile-and-smoke] running FrontendSmoke (panels + canned native JSON + real daemon) against $BIN"
 run_smoke FrontendSmoke dev.faktor.frontend.FrontendSmoke
+
+echo "[compile-and-smoke] running JetBrainsParitySmoke (pin hashes + fake daemon + real daemon parity) against $BIN"
+run_smoke JetBrainsParitySmoke dev.faktor.frontend.JetBrainsParitySmoke
 exit $?
