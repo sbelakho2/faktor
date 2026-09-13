@@ -28,11 +28,13 @@ historical turns, and deterministic bookkeeping are local.
 
 **Frozen baselines (never merged wholesale from later releases):**
 
-- **VS Code UI:** v7.5.6-**derived** client shell in `apps/vscode/` — a
-  launcher + wire harness only; the real v7.5.6 webview/CSS/images/message
-  layout is NOT vendored, so byte-for-byte UI parity is
-  **BLOCKED_EXTERNAL**. The derived shell itself is IMPLEMENTED and
-  CI-tested against the daemon.
+- **VS Code UI:** the v7.5.6 webview/CSS/images/message layout is vendored
+  under `ui/` at commit `fa02955` (SHA-256 manifest `ui/upstream.json`),
+  built into the pinned closure (`ui/kilo-v756-webview/dist`), staged into
+  the VSIX and render-gated (`vscode-visual`); the derived shell in
+  `apps/vscode/` is IMPLEMENTED and CI-tested against the daemon. Client UI
+  parity is **PARTIAL** only because the JetBrains 7.1.2 sources are not
+  vendored; the blanket byte-for-byte claim is retired (§1).
 - **JetBrains shell:** native Kotlin bridge in `apps/jetbrains/`
   (`:shared` + `:backend` + `:frontend` compile and smoke-test against the
   real daemon). The frontend is a native Swing tool-window panel
@@ -134,7 +136,7 @@ Rules that shape the diagram (Commandments):
 
 ```
 apps/        frozen UI compatibility fixtures
-  vscode/       v7.5.6-derived client shell (UI parity: BLOCKED_EXTERNAL)
+  vscode/       v7.5.6-derived client shell (webview vendored; UI parity: PARTIAL — JetBrains 7.1.2 absent)
   jetbrains/    native Kotlin bridge + Swing panel (upstream 7.1.2 UI not vendored)
 compat/      optional v7.5.6 migration/test glue against the old UI
   kilo-v756/    frozen v7.5.6 wire contract fixtures (golden JSON); the
@@ -166,7 +168,8 @@ Crate responsibilities (each crate's module doc is authoritative):
 | `deepseek` | First-class DeepSeek profiles (direct, OpenRouter, Kilo Gateway, arbitrary compatible, local derivatives); capability normalization after discovery. |
 | `gateway` | Kilo/OpenRouter-style gateway adapters: OpenAI-compatible endpoint with model routing and extra headers; BYOK preserved, gateway key never persisted. |
 | `scheduler` | Tool/subagent concurrency as a dependency DAG with resource-class budgets, state-aware retries with jitter, circuit breakers. Independent reads/subagents run concurrently; edits touching overlapping ownership sets do not. |
-| `terminal` | Process supervision: no orphans, process groups (Unix); Job Objects (Windows): **UNIMPLEMENTED** (Windows kill is taskkill today), 200-line ring buffer live with CAS-artifact spill, dedicated reader threads. |
+| `terminal` | Process supervision: no orphans, process groups (Unix); Windows assigns every supervised child to a `faktor-winjob` Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) with `taskkill /T` as the escalation path, 200-line ring buffer live with CAS-artifact spill, dedicated reader threads. |
+| `pty` | Session-owned pseudo-terminal authority (unix PTY + Windows ConPTY): bounded drop-oldest output ring, pre-spawn config validation, and Windows children spawned `CREATE_SUSPENDED`, assigned to a `KILL_ON_JOB_CLOSE` job, then resumed before exposure — no taskkill-based guarantee. |
 | `edit` | Transactional patch engine: `expected_hash` versioning, validate-against-copy then ONE atomic write, parse-before-accept via tree-sitter for supported languages. |
 | `snapshot` | Native content-addressed checkpoints: before-content stored once in CAS (dedup free), rollback verifies current == recorded after-hash then atomically writes before; an independently changed file is a `Conflict`, never silently overwritten. |
 | `fs` | File service and watcher: explicit workspace identity on every call, traversal/symlink-safe path resolution, bounded reads, atomic writes, idle unload of heavyweight resources. |
@@ -614,10 +617,17 @@ hard-coded lists.
 
 - **Zero orphans.** Every child has a runtime owner (`ProcessOwner`:
   `Session | Workspace | Daemon`); kill targets the whole process group
-  (Unix); Windows kill is via taskkill — Job Objects: **UNIMPLEMENTED**
-  (planned behind `cfg`); `transfer` is the deliberate ownership
+  (Unix). On Windows every supervised child is assigned to a
+  `faktor-winjob` Job created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+  (`crates/winjob`, re-exported as `JobGuard` through `faktor-terminal`);
+  `taskkill /T` remains only the escalation path — daemon death terminates
+  the whole tree through the OS. `transfer` is the deliberate ownership
   handoff; `kill_all_for(owner)` runs on session death. Children
   registered on a session block `end_session` until released/transferred.
+  The session PTY authority lives in `crates/pty` (unix PTY; Windows ConPTY
+  via `CreatePseudoConsole`): its children spawn `CREATE_SUSPENDED`, are
+  assigned to the kill-on-close job, and are resumed before `Pty::spawn`
+  returns, so no PTY child ever executes outside the job.
 - **Bounded output.** A 200-line ring buffer is live; overflow spills to a
   CAS artifact (`artifact_max` default 100 MiB) — a 300 MB log never
   becomes a 300 MB RAM object. `CommandOutput { excerpt, exit_code,
@@ -825,8 +835,9 @@ Ignore conventions (AGENTS.md, verified by CI):
 
 **Build:** a single Rust workspace (`cargo build --workspace`); no
 external runtime beyond the native binary and SQLite. Native targets:
-macOS, Linux, Windows (process groups on Unix; Windows Job Objects:
-**UNIMPLEMENTED** — taskkill is the current Windows kill path).
+macOS, Linux, Windows (process groups on Unix; Windows children are
+assigned to `faktor-winjob` kill-on-close Job Objects, with ConPTY children
+spawned suspended → assigned → resumed before exposure).
 
 **Migration stages A–K** (from the original spec) — the derived client
 compatibility shells (status labels in §1) are served at every stage, so

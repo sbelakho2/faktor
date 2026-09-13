@@ -1,0 +1,66 @@
+{
+  "schema": "faktor.compat.sdk-traces/v1",
+  "sdk": {
+    "commit": "fa02955bfa17b60e57e0d7406d200a73337472ee",
+    "package": "@kilocode/sdk",
+    "path": "packages/sdk/js",
+    "version": "7.5.6"
+  },
+  "steps": [
+    {
+      "args": {},
+      "call": "global.health",
+      "id": "auth.missing",
+      "note": "The unmodified client without the Basic header is refused 401 {error:{code,message,retryable}}; the frozen contract is the header FORM (Basic base64(\"kilo:\"+password)), which the authenticated steps lock byte-for-byte. The vendored types declare no 401 body for global.health, so the error body cannot be golden-compared against them.",
+      "request": {
+        "method": "GET",
+        "path": "/global/health",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "error": {
+            "code": "unauthorized",
+            "message": "missing or invalid server password",
+            "retryable": false
+          }
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 401
+      },
+      "sdk_requires": [],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#GlobalHealthResponses (no error type declared)",
+      "status": "divergence",
+      "unauthenticated": true
+    },
+    {
+      "args": {
+        "auth": {
+          "key": "wire-trace",
+          "type": "api"
+        },
+        "providerID": "fake"
+      },
+      "call": "auth.set",
+      "id": "auth.provider-set",
+      "note": "The upstream SDK auth surface is PROVIDER OAuth at PUT /auth/{providerID}. The daemon's POST /auth/set rotates the SERVER PASSWORD and /auth/{providerID} is not registered (404): a different operation that happens to share a name.",
+      "request": {
+        "body": "{\"key\":\"wire-trace\",\"type\":\"api\"}",
+        "content_type": "application/json",
+        "method": "PUT",
+        "path": "/auth/fake",
+        "query": ""
+      },
+      "response": {
+        "body": null,
+        "content_type": "",
+        "event_stream": false,
+        "status": 404
+      },
+      "sdk_requires": [],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#AuthSetResponses",
+      "status": "divergence"
+    }
+  ]
+}

@@ -16,7 +16,7 @@ an LLM: everything below is deterministic and offline.
 
 | Command | Profile | What it establishes |
 | --- | --- | --- |
-| `bash scripts/certify-local.sh fast` | fast (default) | The change-level gate for the host lane: formatting, check, derived capability manifest + docs drift, clippy, workspace tests, static-authority scans, fault smoke, doctor `--deep`, branding scan, release CLI doctor. Minutes. |
+| `bash scripts/certify-local.sh fast` | fast (default) | The change-level gate for the host lane: formatting, check, derived capability manifest + docs drift, certification-evidence verifier selftest, clippy, workspace tests, static-authority scans, fault smoke, doctor `--deep`, branding scan, release CLI doctor. Minutes. |
 | `bash scripts/certify-local.sh full` | full | Everything in fast plus the long lanes: release `[perf]` distribution gates, `[fault]` campaigns at scale, coding-benchmark harness smoke, efficiency harness, ACP interop, artifact packaging and the installation matrix. Longer. The packaging section is the only one that may fetch npm packages (VSIX tooling); an unreachable registry is a recorded skip. |
 | `CERTIFY_SELFTEST=force_fail CERTIFY_OUT_DIR=/tmp/cert-selftest bash scripts/certify-local.sh fast` | selftest | Injects a synthetic failing section and proves the harness exits non-zero, records the failure, fail-fast marks the remainder skipped, and the manifest carries the certification schema with every flag false. Does not touch the real certificate. |
 | `CERTIFY_SELFTEST=release_gates bash scripts/certify-local.sh fast` | selftest | Proves the pure release rule: `release_certified` requires `local_offline_certified` AND all three external evidence gates (cross-platform lanes, real provider, real soak). Exits 0 only when every assertion holds. |
@@ -39,41 +39,51 @@ The manifest records exactly one `certification_level`:
 | `release` | `local_offline` **plus all three** external evidence gates at the same SHA | A shippable release certificate. |
 
 The three external evidence gates are inputs the offline harness can never
-produce by itself and must never fabricate:
+produce by itself and must never fabricate. Each gate is a
+`faktor-cert-evidence/v1` object at
+`target/certification/evidence/<kind>.json` (§6), verified against the exact
+HEAD commit **and** HEAD tree hash, with matching command/artifact digests
+and an ed25519 signature from an allowlisted CI identity:
 
-| Env var | Gate |
+| Evidence file (`kind`) | Gate |
 | --- | --- |
-| `CERTIFY_CROSS_PLATFORM_LANES=1` | Every CI platform lane (§2.1) green at this exact SHA. |
-| `CERTIFY_REAL_PROVIDER=1` | A recorded real-provider (keyed) run at this SHA. |
-| `CERTIFY_REAL_SOAK=1` | A recorded wall-clock soak at this SHA. |
+| `target/certification/evidence/cross_platform_lanes.json` | Every CI platform lane (§2.1) green at this exact SHA/tree. |
+| `target/certification/evidence/real_provider.json` | A recorded real-provider (keyed) run at this SHA/tree. |
+| `target/certification/evidence/real_soak.json` | A recorded wall-clock soak at this SHA/tree. |
 
-`release_certified` is `false` whenever any gate is absent, however green
-the local run is. `FAST_TESTS_SKIP=1` is a **dry-run aid only**: it records
-`workspace-tests` as a skipped section with the reason instead of running
-it. Such a manifest can never be `local_offline` or release certified.
+The old environment booleans (`CERTIFY_CROSS_PLATFORM_LANES`,
+`CERTIFY_REAL_PROVIDER`, `CERTIFY_REAL_SOAK`) are **inert**: they remain only
+as self-test inputs, never certify, and setting one without a verifying
+signed evidence file fails the run loudly. `release_certified` is `false`
+whenever any evidence file is missing, stale, unsigned, or bound to another
+commit/tree, however green the local run is. `FAST_TESTS_SKIP=1` is a
+**dry-run aid only**: it records `workspace-tests` as a skipped section with
+the reason instead of running it. Such a manifest can never be
+`local_offline` or release certified.
 
 ### Fast section order (fail-fast)
 
 1. `cargo fmt --check`
 2. `cargo check --workspace`
 3. capability manifest + docs drift (`node scripts/capabilities-manifest.mjs`, skipped when node is absent)
-4. `cargo clippy --workspace --all-targets -- -D warnings`
-5. `cargo test --workspace` (wrapped in `caffeinate -i` on macOS)
-6. static-authority scans (`faktor-tests-static-authority`)
-7. fault campaign smoke (`faktor-tests-fault`, non-ignored)
-8. `doctor --deep` on a fresh temp data dir
-9. branding scan (`scripts/branding-scan.sh`, plus packaged artifacts when present)
-10. release CLI build + `doctor --deep` on an empty data dir
+4. certification-evidence verifier selftest (`node scripts/certification/evidence.mjs selftest`: marker rejection matrix, commit/tree binding, signature allowlist, `.woodpecker` marker/command drift; skipped when node is absent)
+5. `cargo clippy --workspace --all-targets -- -D warnings`
+6. `cargo test --workspace` (wrapped in `caffeinate -i` on macOS)
+7. static-authority scans (`faktor-tests-static-authority`)
+8. fault campaign smoke (`faktor-tests-fault`, non-ignored)
+9. `doctor --deep` on a fresh temp data dir
+10. branding scan (`scripts/branding-scan.sh`, plus packaged artifacts when present)
+11. release CLI build + `doctor --deep` on an empty data dir
 
 ### Full adds (after fast, same order)
 
-11. `[perf]` release distribution gates (`faktor-tests-performance --release -- --ignored`)
-12. `[fault]` campaigns at scale (`faktor-tests-fault --release -- --ignored`)
-13. coding-benchmark smoke (`faktor-tests-coding-benchmark --test smoke`)
-14. efficiency harness (`faktor-tests-efficiency`)
-15. ACP interop (`faktor-acp --test interop`)
-16. artifact packaging (`scripts/package-artifacts.sh` → `artifacts.json`)
-17. installation matrix (`node scripts/install-matrix.mjs` → `install-matrix.json`)
+12. `[perf]` release distribution gates (`faktor-tests-performance --release -- --ignored`)
+13. `[fault]` campaigns at scale (`faktor-tests-fault --release -- --ignored`)
+14. coding-benchmark smoke (`faktor-tests-coding-benchmark --test smoke`)
+15. efficiency harness (`faktor-tests-efficiency`)
+16. ACP interop (`faktor-acp --test interop`)
+17. artifact packaging (`scripts/package-artifacts.sh` → `artifacts.json`)
+18. installation matrix (`node scripts/install-matrix.mjs` → `install-matrix.json`)
 
 The first failure stops the run; every unrun section is recorded in
 `skipped[]` with `fail-fast: not run after section '<id>' failed`. The
@@ -112,15 +122,27 @@ when CI migrated (historical note only, no workflow files remain under
 | `certificate-darwin` / `certificate-windows` | self-hosted platform agent | per-platform aggregate marker/status gate |
 
 Aggregation is marker-based because Woodpecker workflows are
-filesystem-isolated: every lane writes
-`target/certification/lanes/<lane>.json` (`faktor-woodpecker-lane/v1`) into
+filesystem-isolated: every lane ends by emitting
+`target/certification/lanes/<lane>.json` (`faktor-woodpecker-lane/v2`) into
 the shared workflow workspace, and the `certificate` step `depends_on` every
 lane and runs with `when.status: [success, failure]` (dependents are skipped
-by default when a dependency fails). A missing, failed, stale or unexpected
-marker — or a non-success `CI_PIPELINE_STATUS` — fails the certificate, so an
-unexpected skip cannot masquerade as a pass. `scripts/woodpecker/setup.md`
-documents the agent labels, self-hosted macOS/Windows agents, trusted-volume
-caching and the free cloud tier (linux runners only).
+by default when a dependency fails). Each marker carries the evidence
+fields — schema, lane, pass/fail, exact `commit`, exact `tree`
+(`git rev-parse 'HEAD^{tree}'`), runner `{os, arch, ci, run_id}`, ISO
+timestamps, the lane's command set (`commands_b64` + `commands_digest`) and
+artifact hashes (`artifacts[]` + `artifact_digest`) — and is verified by
+`node scripts/certification/evidence.mjs verify-markers --workflow <name>`
+(run in the certificate job), which writes
+`target/certification/ci-certification.json`. The certificate rejects the
+full matrix: missing, unexpected, unreadable, duplicate, wrong-schema,
+lane-name-mismatch, marker-from-another-commit, tree-mismatch, stale-run
+(a marker from a different pipeline), failed lane, skipped-required lane,
+silent skip (a skippable lane without a reason), `commands_digest`
+mismatch, command-set drift against the lane's actual `.woodpecker/`
+commands, artifact hash/missing mismatch, timestamp order, and a
+non-success `CI_PIPELINE_STATUS`. `scripts/woodpecker/setup.md` documents
+the agent labels, self-hosted macOS/Windows agents, trusted-volume caching
+and the free cloud tier (linux runners only).
 
 The table above is the **trusted** lane set (`trusted.yaml`: `push`/`tag`, with
 the named-volume caches and the release `[perf]` budgets). PRs run the reduced,
@@ -354,24 +376,31 @@ succeeding — a failure is recorded as a skip with the exact error.
 ### 2.10 Capability manifest (derived, machine-readable)
 
 `node scripts/capabilities-manifest.mjs` derives every surface status from
-repository files and scripts — never from prose — and writes
+**hard markers** in the tree — code symbols, test names and files, never
+prose or a bare file name — and writes
 `target/certification/capabilities.json`. Its default mode (also invoked by
 `bash scripts/certify-local.sh fast`) is the drift test: it exits non-zero
 when the table below disagrees with the derived manifest, when a surface row
-is missing, or when the table lists an unknown surface. The manifest is
-bound to the commit it was generated on; a stale file from a different SHA
-is not evidence. Any change to the probed files that moves a status must
-update this table in the same commit.
+is missing, or when the table lists an unknown surface. It additionally
+fails when any table row in this document or `README.md` claims
+`IMPLEMENTED` without at least one backticked evidence path that exists in
+the tree. The manifest is bound to the commit it was generated on; a stale
+file from a different SHA is not evidence. Any change to the probed
+symbols/tests/files that moves a status must update this table in the same
+commit.
 
 | Capability | Status | Derived from |
 | --- | --- | --- |
-| `vscode_native_client` | IMPLEMENTED | `apps/vscode/src/nativeClient.ts` + `apps/vscode/scripts/selftest.mjs` |
-| `vscode_webview` | IMPLEMENTED | `apps/vscode/src/webview.ts` + pinned `ui/kilo-v756-webview/dist` bundle (`webview.js`, `webview.css`) + `dist/visual-baseline.json` |
-| `jetbrains_native_bridge` | IMPLEMENTED | `NativeClient.kt`, `NativeEventStream.kt`, `apps/jetbrains/compile-and-smoke.sh` |
-| `jetbrains_frontend` | PARTIAL | Faktor-owned Swing frontend (`FaktorChatPanel.kt`, `TaskTreePanel.kt`, `plugin.xml`, `build.gradle.kts`); upstream 7.1.2 UI not vendored |
-| `compat_v756` | IMPLEMENTED | `compat/kilo-v756` golden fixtures + `tests/compat` |
+| `vscode_native_client` | IMPLEMENTED | `apps/vscode/src/nativeClient.ts` (`export class`, typed validators) + adversarial `apps/vscode/scripts/selftest.mjs` assertions |
+| `vscode_webview` | IMPLEMENTED | `apps/vscode/src/webview.ts` + `kilo-bridge.ts` (`mapKiloFiles`) + pinned `ui/kilo-v756-webview/dist` bundle (`webview.js`, `webview.css`) + `dist/visual-baseline.json` |
+| `jetbrains_native_bridge` | IMPLEMENTED | `apps/jetbrains/backend/src/main/kotlin/dev/faktor/backend/NativeClient.kt` (`class NativeClient`), `apps/jetbrains/backend/src/main/kotlin/dev/faktor/backend/NativeEventStream.kt` (`class NativeEventStream`), `apps/jetbrains/backend/src/test/kotlin/dev/faktor/backend/NativeClientTest.kt` (`NATIVE SMOKE PASS`) |
+| `jetbrains_frontend` | PARTIAL | Faktor-owned Swing frontend (`FaktorChatPanel.kt`, `FrontendSmoke.kt` `FRONTEND SMOKE PASS`, `plugin.xml`, `build.gradle.kts`); upstream 7.1.2 UI not vendored |
+| `compat_v756` | IMPLEMENTED | `compat/kilo-v756` golden fixtures (startup line, SSE frames) + `crates/protocol/src/fixtures.rs` + `tests/compat` |
 | `ui_parity` | PARTIAL | vendored v7.5.6 webview + visual baseline; JetBrains 7.1.2 sources absent |
-| `acp_subset` | IMPLEMENTED | `crates/acp` + `tests/acp-official` official-client interop |
+| `acp_subset` | IMPLEMENTED | `crates/acp` (`AcpMethod::Initialize`) + `crates/acp/tests/interop.rs` + official `agent-client-protocol` client crate in `tests/acp-official` |
+| `openai_responses` | IMPLEMENTED | `crates/openai/src/lib.rs`: `OpenAiFamily::Responses` dispatch + `responses_body`/`responses_stream` codecs + the adversarial `responses_*` stream tests |
+| `windows_job_containment` | IMPLEMENTED | `crates/winjob/src/lib.rs` (`CreateJobObjectW`, `SetInformationJobObject`, `AssignProcessToJobObject`, `KILL_ON_JOB_CLOSE`) + `crates/pty/src/windows.rs` (`CREATE_SUSPENDED`, `assign_strict`, kill-on-close spawn test) |
+| `certification_evidence_chain` | IMPLEMENTED | `scripts/certification/evidence.mjs` (`faktor-cert-evidence/v1`, `verify-markers`, `faktor-woodpecker-lane/v2`) + `scripts/certification/evidence.schema.json` + `scripts/certify-local.sh` (`evidence_gate`) + v2 lane markers in `.woodpecker/pr.yaml` |
 
 ---
 
@@ -397,9 +426,9 @@ profile).
 | IDE-launched install | `code --install-extension` / JetBrains sandbox install | requires an IDE host; the Woodpecker `vscode` job owns it | NOT RUN HERE (residual, recorded in `install-matrix.json`) |
 | Windows lane | check + workspace tests incl. agent/verify/sandbox/index/cas/snapshot | Woodpecker `windows-*` jobs | CI-LANE |
 | Linux lane | fmt/check/test/clippy/doctor | Woodpecker `linux` job | CI-LANE |
-| VS Code shell build | `npm ci && npm run build` + wire harness | Woodpecker `vscode` job | CI-LANE (shell IMPLEMENTED) |
+| VS Code shell build | `npm ci && npm run build` + wire harness | Woodpecker `vscode` job | CI-LANE (shell IMPLEMENTED; `apps/vscode/src/extension.ts`) |
 | VS Code vendored webview | pinned v7.5.6 tree `ui/kilo-v756-webview` + `ui/upstream.json` hashes + built dist + visual baseline | `node scripts/webview-visual-check.mjs` + required Woodpecker `vscode-visual` job (chromium render must pass); §2.10 | PARTIAL (vendored, hashed and render-gated; real-IDE screenshot parity stays a host/CI capability not claimed offline) |
-| JetBrains bridge | kotlinc `compile-and-smoke.sh` (wire + native smokes); Gradle plugin build + verifier vs IC-2024.1.7 | Woodpecker `jetbrains-*` jobs / local script; §3.2 | CI-LANE (native bridge IMPLEMENTED; plugin verifier PASS locally 2026-09-10) |
+| JetBrains bridge | kotlinc `apps/jetbrains/compile-and-smoke.sh` (wire + native smokes); Gradle plugin build + verifier vs IC-2024.1.7 | Woodpecker `jetbrains-*` jobs / local script; §3.2 | CI-LANE (native bridge IMPLEMENTED; plugin verifier PASS locally 2026-09-10) |
 | JetBrains 7.1.2 UI parity | frozen 7.1.2 sources | not vendored | BLOCKED_EXTERNAL |
 | Compat fixtures v756 | golden suite + fixtures | `tests/compat` | CI-LANE / fast tests |
 | Compat fixtures jetbrains-712 | reserved corpus | absent (`false` in manifest) | BLOCKED_EXTERNAL |
@@ -419,6 +448,11 @@ profile).
 | Vendored bridge completeness | every frozen inbound message bounded/validated with typed drops; additive `faktor*` frames + companion overlay; durable pages and SSE frames both mapped | `apps/vscode/src/kilo-bridge.ts` + `apps/vscode/scripts/bridge-selftest.mjs`, `apps/vscode/scripts/selftest.mjs` | IMPLEMENTED (adversarial bridge selftests green) |
 | Attachment durability | workspace-relative file paths + content-addressed binary refs; per-message durable `data.files` rows and the run's immutable `files` set persisted before the drive (byte-identical after reopen); malformed entries refused individually (never a whole-message drop) | `crates/session/src/handle.rs` (`submit_prompt` `data.files`), `crates/session/src/task.rs` + `crates/orchestrator/src/task_executor.rs` (run `files`), `apps/vscode/src/kilo-bridge.ts` (`mapKiloFiles`), JetBrains `AttachmentsPanel.kt` | IMPLEMENTED (both IDEs; bridge + native smokes green) |
 | Unified run settlement | one `settle_run` for both execution shapes (`InSession`/`Orchestrated`), idempotent replay after every step-status write seam | `crates/orchestrator/src/task_executor.rs` (`settle_run`), `crates/orchestrator/src/task_executor_tests.rs` | IMPLEMENTED (fast tests green) |
+| Materialize → verify → land | isolated child candidates materialize through a durable `IntegrationRecord` (`IntegrationRecorded`), land with real final-root verification, snapshot-pinned record/step statuses; owner edits invalidate the record and a wrong synthetic PASS is rejected | `crates/session/src/ledger.rs` (`IntegrationRecordRow`, `final_root`), `crates/orchestrator/src/task_executor.rs` | IMPLEMENTED (fast tests green; the previous synthetic-PASS test was rewritten) |
+| Typed criterion proofs | a mutating no-op disposition default (`NoOpDisposition::RequiresCriterionProof`) completes only through an independent reviewer port's validated criterion proof or an explicit disposition; completion steps refuse execution without a validated proof | `crates/core/src/state.rs` (`NoOpDisposition::RequiresCriterionProof`), `crates/orchestrator/src/task_executor.rs` (`run_completion_steps_against_proof`), `crates/orchestrator/src/task_executor_tests.rs` | IMPLEMENTED (fast tests green) |
+| OpenAI Responses family | first-class Responses dispatch (`OpenAiFamily::Responses`), native item serializer + SSE stream parser, CLI `api=chat\|responses` with the modern endpoint default; strict parsing and adversarial streaming/deadline/retry/terminal tests | `crates/openai/src/lib.rs` (`responses_body`, `responses_stream`, `responses_*` tests), `crates/cli/src/config.rs` (`OpenAiApi`) | IMPLEMENTED (fast tests green) |
+| Windows containment (Job Objects + ConPTY) | `faktor-winjob` creates `KILL_ON_JOB_CLOSE` jobs; the terminal supervisor assigns every child (`JobGuard`) and `faktor-pty` creates ConPTY children `CREATE_SUSPENDED`, assigns them to the job, then resumes before exposure; `taskkill /T` remains the escalation path | `crates/winjob/src/lib.rs`, `crates/terminal/src/lib.rs`, `crates/pty/src/windows.rs` (`spawn_assigns_the_child_to_the_kill_on_close_job_before_returning`) | IMPLEMENTED (Windows-targeted code + spawn-order test; CI `windows-*` lane owns the real host run) |
+| Certification evidence chain | `faktor-cert-evidence/v1` objects + `faktor-woodpecker-lane/v2` markers, verifier rejection matrix, signed release gates; capability labels derive from hard code/test markers | `scripts/certification/evidence.mjs`, `scripts/certification/evidence.schema.json`, `scripts/certify-local.sh` (`evidence_gate`), `.woodpecker/*.yaml` | IMPLEMENTED (verifier selftest proves every rejection; see §6) |
 | VSIX packaging (P0) | pinned vendored closure + companion overlay staged under `media/kilo-v756-webview`; extensionUri-only resolution; package → unzip → hash verify → IDE-load record | `apps/vscode/scripts/prepare-vendored-webview.mjs`, `apps/vscode/scripts/verify-vsix.mjs`, Woodpecker `vscode` job | CLOSED (self-contained VSIX; the IDE-load step records its exact skip when no `code` CLI exists) |
 | Repo rename (faktor) | external GitHub repository name/description | `gh repo rename` performed; in-tree metadata was already Faktor-branded and is unchanged | DONE (external; no in-tree evidence beyond branding scan) |
 
@@ -458,8 +492,9 @@ release certificate):
   the harness after 300 s (`timeout` exit 124) and the IDE logged a clean
   `IDE SHUTDOWN`. No project was opened, so tool-window behavior was not
   exercised by this run.
-- `bash apps/jetbrains/compile-and-smoke.sh` → exit 0, `SMOKE PASS` plus
-  `NATIVE SMOKE PASS`.
+- `bash apps/jetbrains/compile-and-smoke.sh` → exit 0, `BackendSmoke` +
+  `NativeBridgeSmoke` + `FrontendSmoke` all green (`NATIVE SMOKE PASS` /
+  `FRONTEND SMOKE PASS` are printed by the Kotlin smokes).
 
 ### 3.3 PR/CI-fix completion contract (gate + ordered step execution IMPLEMENTED)
 
@@ -569,7 +604,14 @@ surfaces are adversarially tested in `apps/vscode/scripts/selftest.mjs` +
   "release_gates": {
     "cross_platform_lanes": false,
     "real_provider": false,
-    "real_soak": false
+    "real_soak": false,
+    "evidence_required": true,
+    "boolean_inputs_ignored": true
+  },
+  "evidence": {
+    "cross_platform_lanes": {"file": "target/certification/evidence/cross_platform_lanes.json", "verified": false, "release_grade": false},
+    "real_provider": {"file": "target/certification/evidence/real_provider.json", "verified": false, "release_grade": false},
+    "real_soak": {"file": "target/certification/evidence/real_soak.json", "verified": false, "release_grade": false}
   },
   "commit": "<40-hex sha>",
   "dirty_count": 0,
@@ -604,35 +646,41 @@ Field semantics:
 
 | Field | Meaning |
 | --- | --- |
-| `commit` | `git rev-parse HEAD` at run start; evidence is bound to this SHA only |
+| `commit` | `git rev-parse HEAD` at run start; evidence is bound to this SHA only; the tree hash used by evidence objects is `git rev-parse 'HEAD^{tree}'` |
 | `dirty_count` | `git status --porcelain` line count; any non-zero invalidates every certificate |
-| `status` | `pass` iff every attempted section passed; `fail` otherwise |
+| `status` | `pass` iff every attempted section passed and no release-gate boolean was asserted without verifying evidence; `fail` otherwise |
 | `certification_level` | `none`, `local_offline` or `release` (see §1) |
 | `local_offline_certified` | `true` only for `full` + `status=pass` + `dirty_count=0` + `fast_tests_skipped=false` |
-| `release_gates` | The three external evidence inputs (`CERTIFY_CROSS_PLATFORM_LANES`, `CERTIFY_REAL_PROVIDER`, `CERTIFY_REAL_SOAK`); each defaults `false` and is never inferred |
+| `release_gates` | The three external evidence gates, each `true` only when `evidence/<kind>.json` verifies (`evidence_required: true`); `boolean_inputs_ignored: true` records that the `CERTIFY_*` booleans never certify |
+| `evidence` | Per-gate evidence file path plus `verified`/`release_grade` (both true only for a schema-valid, commit+tree-bound, allowlisted-signature object; §6) |
 | `release_certified` | `true` only when `local_offline_certified` AND all three `release_gates` are true |
 | `sections[].status` | `pass` or `fail`; failed sections carry the first error line in `detail` |
 | `sections[].duration_ms` | wall time of that section |
 | `skipped[]` | sections not attempted, each with the exact reason (profile, fail-fast, offline contract, platform) |
 | `capabilities` | capability manifest for this host/profile: platform lanes, derived UI parity labels (from `capabilities.json`, §2.10; `unknown` when absent/stale), compat fixture presence, surface pass flags, offline contract, release rule |
 
-Per-section logs live in `target/certification/logs/<name>.log`.
+Per-section logs live in `target/certification/logs/<name>.log`; each gate's
+verification transcript is `target/certification/logs/evidence-<kind>.log`.
 
 Sibling evidence written by the `full` profile (never a substitute for the
 certificate manifest): `target/certification/capabilities.json` (derived
 capability manifest, §2.10; written by every profile that has node),
 `target/certification/artifacts.json` (packaging
 manifest, §2.9), `target/certification/install-matrix.json` (host
-installation matrix, §2.9) and `target/certification/install-matrix-tamper.json`
-(the `TAMPER=1` self-test evidence).
+installation matrix, §2.9), `target/certification/install-matrix-tamper.json`
+(the `TAMPER=1` self-test evidence) and
+`target/certification/evidence/local_offline.json` (this host's own
+`faktor-cert-evidence/v1` record, unsigned unless a signing key is
+configured).
 
 ---
 
 ## 5. Release certification rule
 
 > **A release is certified only for its exact commit with `dirty_count = 0`,
-> `local_offline_certified = true`, and all three external evidence gates
-> (`cross_platform_lanes`, `real_provider`, `real_soak`) recorded true.**
+> `local_offline_certified = true`, and all three external evidence objects
+> (`cross_platform_lanes`, `real_provider`, `real_soak`) verified at the same
+> commit and tree.** Booleans never certify.
 
 Concretely, to ship:
 
@@ -640,20 +688,114 @@ Concretely, to ship:
 2. `bash scripts/certify-local.sh full` on the release host ends with
    `CERTIFICATION: PASS` and `"local_offline_certified": true` in the
    manifest. A `full` pass alone is **local offline certification**, never
-   release certification.
-3. Every CI lane in §2.1 is green for the same commit SHA; the release run
-   is invoked with `CERTIFY_CROSS_PLATFORM_LANES=1` to record that gate.
+   release certification. Setting any `CERTIFY_*` boolean without the
+   corresponding evidence file makes the run **fail** (inert-flag rule).
+3. Every CI lane in §2.1 is green for the same commit SHA; the aggregated
+   `ci-certification.json` manifests (linux + darwin + windows) are
+   combined with `node scripts/certification/evidence.mjs write --kind
+   cross_platform_lanes --from-markers <lanes-dir> --artifacts
+   <ci-certification-*.json>` and the resulting
+   `target/certification/evidence/cross_platform_lanes.json` carries the
+   exact commit and tree.
 4. A real-provider (keyed) benchmark/economics run is attached for the same
-   SHA and recorded with `CERTIFY_REAL_PROVIDER=1`; the offline certificate
-   never implies it.
-5. A wall-clock soak is attached for the same SHA and recorded with
-   `CERTIFY_REAL_SOAK=1`.
-6. The manifest now reports `"certification_level": "release"` and
-   `"release_certified": true`; any missing gate keeps both
+   SHA as `evidence/real_provider.json`; the offline certificate never
+   implies it.
+5. A wall-clock soak is attached for the same SHA as
+   `evidence/real_soak.json`.
+6. Every evidence object is signed with an allowlisted ed25519 identity:
+   `node scripts/certification/evidence.mjs sign --file
+   target/certification/evidence/<kind>.json --key <private.pem> --key-id
+   <identity>`. Unsigned evidence verifies as honest but **never
+   release-grade**; `verify --require-signed` is what certify-local runs.
+7. The manifest now reports `"certification_level": "release"` and
+   `"release_certified": true`; any missing/invalid gate keeps both
    `release_certified=false` and the level at `local_offline` (or `none`).
-7. The manifest's `capabilities` labels are honest: `BLOCKED_EXTERNAL` and
+8. The manifest's `capabilities` labels are honest: `BLOCKED_EXTERNAL` and
    `PARTIAL` surfaces are carried into the release notes; no parity claim is
    made for unvendored assets.
 
 Any new commit — including a docs-only change — invalidates the previous
 certificate and requires a fresh run.
+
+---
+
+## 6. Certification evidence objects (`faktor-cert-evidence/v1`)
+
+Every gate and every lane's proof is an **exact-SHA evidence object**, never
+a boolean. The JSON Schema is
+`scripts/certification/evidence.schema.json`; the implementation (writer,
+signature verifier, marker verifier, self-tests) is
+`scripts/certification/evidence.mjs`.
+
+```json
+{
+  "schema": "faktor-cert-evidence/v1",
+  "repository": "git remote URL or an explicit name",
+  "commit_sha": "<40-hex sha>",
+  "tree_hash": "<40-hex sha>",
+  "kind": "cross_platform_lanes | real_provider | real_soak | local_offline | ...",
+  "status": "passed | failed | skipped",
+  "started_at": "2026-01-01T00:00:00Z",
+  "finished_at": "2026-01-01T00:01:00Z",
+  "commands_digest": "sha256:<64 hex>",
+  "artifact_digest": "sha256:<64 hex>",
+  "repository_tree_verified": true,
+  "runner": {"os": "linux", "arch": "amd64", "ci": "woodpecker", "run_id": "42"},
+  "artifacts": [{"path": "target/...", "sha256": "sha256:<64 hex>"}],
+  "signature": {
+    "algorithm": "ed25519",
+    "identity": "<allowlisted identity>",
+    "public_key": "<base64 raw 32-byte key>",
+    "value": "<base64 signature>"
+  }
+}
+```
+
+Exact binding rules:
+
+- **Commit:** `commit_sha` must equal `git rev-parse HEAD` when the loader
+  runs. A file from any other commit is rejected (`other-commit`).
+- **Tree:** `tree_hash` must equal `git rev-parse 'HEAD^{tree}'` at write
+  time and at load time. This is the documented tree-hash command: the
+  commit's own tree object. (`git write-tree` hashes the mutable index and
+  is deliberately NOT used.)
+- **Commands:** `commands_digest` is `sha256` of the canonical command-set
+  text — the exact commands joined with `\n`, no trailing newline. Lanes
+  additionally encode the text as base64 (`commands_b64`) in their markers
+  so the certificate can recompute the digest and detect drift against the
+  commands actually written in `.woodpecker/`.
+- **Artifacts:** `artifact_digest` is `sha256` of the canonical artifact
+  list: one line per artifact sorted by path, `sha256:<hex>\t<path>\n`;
+  `sha256` of the empty string when there are no artifacts. Recorded
+  artifact files are re-hashed by the loader.
+- **Signature:** the ed25519 signature is over the canonical JSON of the
+  object without the `signature` field (keys sorted recursively). The
+  `public_key` must equal the allowlisted key for `identity`; the allowlist
+  comes from `--keys <file>` or `CERTIFY_EVIDENCE_KEYS`
+  (`{"identities":{"<identity>":{"ed25519_public_key":"<base64>"}}}`).
+  Unsigned or foreign-key evidence fails `--require-signed` (release-grade).
+
+Usage:
+
+```bash
+# write an evidence object for this exact commit/tree
+node scripts/certification/evidence.mjs write --kind real_provider \
+  --status passed --out-dir target/certification/evidence \
+  --from-markers target/certification/lanes --only-lane coding-benchmark-real-model
+
+# verify one gate (exit non-zero on any problem; --json for machine output)
+node scripts/certification/evidence.mjs verify --kind real_provider \
+  --evidence-dir target/certification/evidence --require-signed
+
+# verify a workflow's markers and write ci-certification.json
+node scripts/certification/evidence.mjs verify-markers --workflow pr \
+  --lanes-dir target/certification/lanes --out target/certification/ci-certification.json \
+  --pipeline-status "$CI_PIPELINE_STATUS" --run-id "$CI_PIPELINE_NUMBER"
+
+# add a signature with an offline key
+node scripts/certification/evidence.mjs sign --file target/certification/evidence/real_soak.json \
+  --key /secure/ci-ed25519.pem --key-id ci-soak
+
+# prove the whole rejection matrix + signature allowlist + repo drift
+node scripts/certification/evidence.mjs selftest
+```

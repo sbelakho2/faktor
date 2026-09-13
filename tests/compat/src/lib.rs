@@ -62,7 +62,7 @@ mod tests {
     /// (mirror of `tests/integration`'s harness). The returned password is
     /// generated AFTER construction so no ambient `FAKTOR_SERVER_PASSWORD`
     /// can make the authenticated probes nondeterministic.
-    fn server_deps(root: &Path) -> (ServerDeps, ServerPassword) {
+    pub(crate) fn server_deps(root: &Path) -> (ServerDeps, ServerPassword) {
         let mut registry = ProviderRegistry::new();
         registry
             .try_register(Arc::new(FakeProvider::with_script(
@@ -113,7 +113,7 @@ mod tests {
         (deps, password)
     }
 
-    async fn spawn_server(deps: ServerDeps) -> (ServerHandle, String) {
+    pub(crate) async fn spawn_server(deps: ServerDeps) -> (ServerHandle, String) {
         let handle = serve(deps, 0).await.unwrap();
         let base = format!("http://{}", handle.addr);
         (handle, base)
@@ -568,6 +568,7 @@ mod tests {
             "provider_list.json",
             "sse_frames.json",
             "startup_line.json",
+            "upstream.json",
             "wire_message_send.json",
             "wire_part_union.json",
             "wire_session_create.json",
@@ -802,6 +803,42 @@ mod tests {
                         );
                     }
                 }
+                "upstream.json" => {
+                    // Vendored upstream-client pin: repository/tag/commit +
+                    // per-file blake3 hashes + license, regenerated only by
+                    // `FAKTOR_COMPAT_REGEN_SDK_MANIFEST=1` (see upstream.rs).
+                    let o = object(&raw, &file, "root");
+                    assert_eq!(
+                        str_key(o, &file, "repository"),
+                        "https://github.com/Kilo-Org/kilocode"
+                    );
+                    assert_eq!(str_key(o, &file, "tag"), "v7.5.6");
+                    assert_eq!(
+                        str_key(o, &file, "commit"),
+                        "fa02955bfa17b60e57e0d7406d200a73337472ee"
+                    );
+                    assert_eq!(str_key(o, &file, "hashAlgorithm"), "blake3");
+                    let paths = object(key(o, &file, "paths"), &file, "paths");
+                    assert!(
+                        paths.contains_key("packages/sdk/js"),
+                        "fixture {file}: the upstream client path must stay pinned"
+                    );
+                    let count = int_key(o, &file, "fileCount");
+                    assert!(count > 0, "fixture {file}: empty vendored tree");
+                    assert!(int_key(o, &file, "totalBytes") > 0);
+                    let hashes = object(key(o, &file, "file_hashes"), &file, "file_hashes");
+                    assert_eq!(
+                        hashes.len() as u64,
+                        count,
+                        "fixture {file}: fileCount must equal the hash set size"
+                    );
+                    let licenses = object(key(o, &file, "licenses"), &file, "licenses");
+                    assert_eq!(
+                        str_key(licenses, &file, "package"),
+                        "MIT",
+                        "fixture {file}: license provenance drifted"
+                    );
+                }
                 _unknown => {
                     let shape = match &raw {
                         Value::Object(o) => {
@@ -821,3 +858,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod upstream;

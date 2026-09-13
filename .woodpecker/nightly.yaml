@@ -47,11 +47,23 @@ steps:
       - faktor-nightly-target-fault:/woodpecker-cache/target
     commands:
       - cargo test -p faktor-tests-fault --release -- --ignored
-      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"fault-scale","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/fault-scale.json
-
-  # --------------------------------------------------------------- longrun --
-  # The long-run durability suite in release mode (the 24h wall-clock test
-  # stays #[ignore] and is owned by soak.yaml).
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        cargo test -p faktor-tests-fault --release -- --ignored
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        artifacts="[]"
+        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"fault-scale","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/fault-scale.json
   - name: longrun
     image: rust:1.98
     environment:
@@ -63,9 +75,23 @@ steps:
       - faktor-nightly-target-longrun:/woodpecker-cache/target
     commands:
       - cargo test -p faktor-tests-longrun --release
-      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"longrun","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/longrun.json
-
-  # ------------------------------------------------------------ efficiency --
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        cargo test -p faktor-tests-longrun --release
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        artifacts="[]"
+        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"longrun","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/longrun.json
   - name: efficiency
     image: rust:1.98
     environment:
@@ -77,9 +103,23 @@ steps:
       - faktor-nightly-target-efficiency:/woodpecker-cache/target
     commands:
       - cargo test -p faktor-tests-efficiency
-      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"efficiency","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/efficiency.json
-
-  # --------------------------------------------------------------- economy --
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        cargo test -p faktor-tests-efficiency
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        artifacts="[]"
+        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"efficiency","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/efficiency.json
   - name: economy
     image: rust:1.98
     environment:
@@ -91,10 +131,23 @@ steps:
       - faktor-nightly-target-economy:/woodpecker-cache/target
     commands:
       - cargo test -p faktor-tests-economy
-      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"economy","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/economy.json
-
-  # ------------------------------------------------------- coding-benchmark --
-  # Harness smoke (no provider keys, no network).
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        cargo test -p faktor-tests-economy
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        artifacts="[]"
+        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"economy","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/economy.json
   - name: coding-benchmark
     image: rust:1.98
     environment:
@@ -106,15 +159,23 @@ steps:
       - faktor-nightly-target-bench:/woodpecker-cache/target
     commands:
       - cargo test -p faktor-tests-coding-benchmark --test smoke
-      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"coding-benchmark","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/coding-benchmark.json
-
-  # -------------------------------------------------- coding-benchmark-real --
-  # Provider-key run. NO secret is required and none is referenced: secrets
-  # referenced via `from_secret` that do not exist are a config error, so the
-  # opt-in happens through the agent/step environment instead. Without
-  # FAKTOR_BENCH_PROVIDER/MODEL/API_KEY the step records an explicit,
-  # reviewable SKIP marker (the rust test itself is also skip-safe); with the
-  # three variables present it runs the real-model corpus.
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        cargo test -p faktor-tests-coding-benchmark --test smoke
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        artifacts="[]"
+        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"coding-benchmark","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/coding-benchmark.json
   - name: coding-benchmark-real-model
     image: rust:1.98
     environment:
@@ -127,7 +188,6 @@ steps:
     commands:
       - |
         set -u
-        mkdir -p target/certification/lanes
         if [ -n "${FAKTOR_BENCH_API_KEY:-}" ] && [ -n "${FAKTOR_BENCH_PROVIDER:-}" ] && [ -n "${FAKTOR_BENCH_MODEL:-}" ]; then
           cargo test -p faktor-tests-coding-benchmark --test real -- --ignored
           status="passed"; reason=""
@@ -135,11 +195,35 @@ steps:
           status="skipped"
           reason="provider-key run recorded as a skip: FAKTOR_BENCH_PROVIDER/FAKTOR_BENCH_MODEL/FAKTOR_BENCH_API_KEY are not configured; nightly never spends by default"
         fi
-        printf '{"schema":"faktor-woodpecker-lane/v1","lane":"coding-benchmark-real-model","status":"%s","reason":"%s","commit":"%s"}\n' \
-          "$status" "$reason" "$CI_COMMIT_SHA" > target/certification/lanes/coding-benchmark-real-model.json
+      - |
+        set -u
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        set -u
+        if [ -n "${FAKTOR_BENCH_API_KEY:-}" ] && [ -n "${FAKTOR_BENCH_PROVIDER:-}" ] && [ -n "${FAKTOR_BENCH_MODEL:-}" ]; then
+        cargo test -p faktor-tests-coding-benchmark --test real -- --ignored
+        status="passed"; reason=""
+        else
+        status="skipped"
+        reason="provider-key run recorded as a skip: FAKTOR_BENCH_PROVIDER/FAKTOR_BENCH_MODEL/FAKTOR_BENCH_API_KEY are not configured; nightly never spends by default"
+        fi
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        if [ -n "${FAKTOR_BENCH_API_KEY:-}" ] && [ -n "${FAKTOR_BENCH_PROVIDER:-}" ] && [ -n "${FAKTOR_BENCH_MODEL:-}" ]; then
+          status="passed"; reason=""
+        else
+          status="skipped"
+          reason="provider-key run recorded as a skip: FAKTOR_BENCH_PROVIDER/FAKTOR_BENCH_MODEL/FAKTOR_BENCH_API_KEY are not configured; nightly never spends by default"
+        fi
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"coding-benchmark-real-model","status":"%s","reason":"%s","commit":"%s","tree":"%s","runner":{"os":"linux","arch":"amd64","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":[],"artifact_digest":"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}\n' \
+          "$status" "$reason" "$CI_COMMIT_SHA" "$tree" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" > target/certification/lanes/coding-benchmark-real-model.json
         echo "coding-benchmark-real-model: $status ${reason:+(recorded skip)}"
-
-  # ----------------------------------------------------------- supply-chain --
   - name: supply-chain
     image: rust:1.98
     environment:
@@ -151,14 +235,25 @@ steps:
       - faktor-nightly-target-supply:/woodpecker-cache/target
     commands:
       - SUPPLY_CHAIN_BUILD=1 SUPPLY_CHAIN_ARTIFACTS="$CARGO_TARGET_DIR/release/faktor-cli" bash scripts/supply-chain.sh
-      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"supply-chain","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/supply-chain.json
-
-  # --------------------------------------------------- certificate-nightly --
-  # Same marker mechanism as the push/PR certificates. `skipped` is accepted
-  # ONLY for coding-benchmark-real-model and only with a recorded reason;
-  # every other lane must be `passed` for this exact commit.
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        SUPPLY_CHAIN_BUILD=1 SUPPLY_CHAIN_ARTIFACTS="$CARGO_TARGET_DIR/release/faktor-cli" bash scripts/supply-chain.sh
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        artifacts="[]"
+        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"supply-chain","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/supply-chain.json
   - name: certificate-nightly
-    image: python:3.13-slim
+    image: node:24
     depends_on:
       - fault-scale
       - longrun
@@ -170,89 +265,11 @@ steps:
     when:
       status: [success, failure]
     commands:
+      - node scripts/certification/evidence.mjs verify-markers --workflow nightly --lanes-dir target/certification/lanes --out target/certification/ci-certification.json --pipeline-status "$CI_PIPELINE_STATUS" --run-id "$CI_PIPELINE_NUMBER"
+      - node scripts/certification/evidence.mjs write --kind ci_certification_nightly --status passed --from-markers target/certification/lanes --commands "woodpecker nightly campaign certificate"
       - |
-        python3 - <<'PY'
-        import json, os, pathlib, sys
-
-        EXPECTED = [
-            "fault-scale",
-            "longrun",
-            "efficiency",
-            "economy",
-            "coding-benchmark",
-            "coding-benchmark-real-model",
-            "supply-chain",
-        ]
-        SKIPPABLE_WITH_REASON = {"coding-benchmark-real-model"}
-        SCHEMA = "faktor-woodpecker-lane/v1"
-        commit = os.environ.get("CI_COMMIT_SHA", "")
-        lanes_dir = pathlib.Path("target/certification/lanes")
-        out_dir = pathlib.Path("target/certification")
-        results = {}
-        problems = []
-
-        for lane in EXPECTED:
-            path = lanes_dir / (lane + ".json")
-            if not path.is_file():
-                results[lane] = "missing"
-                problems.append("lane " + lane + " wrote no marker (skipped, failed, or killed before its evidence step)")
-                continue
-            try:
-                record = json.loads(path.read_text(encoding="utf-8"))
-            except Exception as exc:
-                results[lane] = "unreadable"
-                problems.append("lane " + lane + " marker is not valid JSON: " + str(exc))
-                continue
-            status = str(record.get("status", "unknown"))
-            if record.get("schema") != SCHEMA:
-                results[lane] = "wrong-schema"
-                problems.append("lane " + lane + " marker schema=" + str(record.get("schema")))
-            elif status == "skipped" and lane in SKIPPABLE_WITH_REASON:
-                if not str(record.get("reason", "")).strip():
-                    results[lane] = "silent-skip"
-                    problems.append("lane " + lane + " recorded a skip without a reason")
-                else:
-                    results[lane] = "skipped"
-            elif status != "passed":
-                results[lane] = status
-                problems.append("lane " + lane + " marker status=" + status)
-            elif commit and record.get("commit") != commit:
-                results[lane] = "stale"
-                problems.append("lane " + lane + " marker commit=" + str(record.get("commit")) + " != " + commit)
-            else:
-                results[lane] = "passed"
-
-        unexpected = sorted(
-            p.stem for p in lanes_dir.glob("*.json") if p.stem not in EXPECTED
-        ) if lanes_dir.is_dir() else []
-        for lane in unexpected:
-            problems.append("unexpected marker for lane " + lane)
-
-        pipeline_status = os.environ.get("CI_PIPELINE_STATUS", "unknown")
-        if pipeline_status != "success":
-            problems.append("workflow status before this step is " + pipeline_status + " (a campaign lane failed)")
-
-        status = "pass" if not problems else "fail"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        manifest = {
-            "schema": "faktor-ci-certification/v1",
-            "platform": "linux-nightly",
-            "workflow": "nightly",
-            "commit": commit,
-            "pipeline": os.environ.get("CI_PIPELINE_NUMBER", ""),
-            "pipeline_url": os.environ.get("CI_PIPELINE_URL", ""),
-            "status": status,
-            "lanes": results,
-        }
-        (out_dir / "ci-certification.json").write_text(
-            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-        )
-
-        for lane in EXPECTED:
-            print("passed " + lane) if results.get(lane) == "passed" else print(str(results.get(lane)).upper() + " " + lane)
-        if problems:
-            for problem in problems:
-                print("certification problem: " + problem, file=sys.stderr)
-            sys.exit(1)
-        print("certification: PASS (nightly campaign lanes verified)")
-        PY
+        if node -e 'process.exit(require("./target/certification/lanes/coding-benchmark-real-model.json").status === "passed" ? 0 : 1)'; then
+          node scripts/certification/evidence.mjs write --kind real_provider --status passed --from-markers target/certification/lanes --only-lane coding-benchmark-real-model --commands "provider-key real-model run at this commit"
+        else
+          echo "real_provider evidence not written: coding-benchmark-real-model recorded a skip (no keys)"
+        fi

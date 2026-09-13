@@ -1,0 +1,75 @@
+{
+  "schema": "faktor.compat.sdk-traces/v1",
+  "sdk": {
+    "commit": "fa02955bfa17b60e57e0d7406d200a73337472ee",
+    "package": "@kilocode/sdk",
+    "path": "packages/sdk/js",
+    "version": "7.5.6"
+  },
+  "steps": [
+    {
+      "args": {},
+      "call": "config.get",
+      "id": "config.get",
+      "note": "The SDK reads the daemon config at GET /config; the daemon only registers the legacy GET /config/get, so the real client gets 404.",
+      "request": {
+        "method": "GET",
+        "path": "/config",
+        "query": ""
+      },
+      "response": {
+        "body": null,
+        "content_type": "",
+        "event_stream": false,
+        "status": 404
+      },
+      "sdk_requires": [],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#ConfigGetResponses.200 (Config)",
+      "status": "divergence"
+    },
+    {
+      "args": {},
+      "call": "config.warnings",
+      "id": "config.warnings",
+      "note": "SDK 200: bare array of {path,message,detail?}; daemon 200: {warnings:[...]}.",
+      "request": {
+        "method": "GET",
+        "path": "/config/warnings",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "warnings": []
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "#array"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#ConfigWarningsResponses.200 (Array<{path,message,detail?}>)",
+      "status": "divergence"
+    },
+    {
+      "args": {},
+      "call": "config.overlay",
+      "id": "config.overlay",
+      "note": "The SDK reads the overlay with GET /config/overlay; the daemon only registers POST /config/overlay, so the real client gets 405.",
+      "request": {
+        "method": "GET",
+        "path": "/config/overlay",
+        "query": ""
+      },
+      "response": {
+        "body": null,
+        "content_type": "",
+        "event_stream": false,
+        "status": 405
+      },
+      "sdk_requires": [],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#ConfigOverlayResponses.200 (ConfigOverlayResponse)",
+      "status": "divergence"
+    }
+  ]
+}

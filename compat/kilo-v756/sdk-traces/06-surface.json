@@ -1,0 +1,214 @@
+{
+  "schema": "faktor.compat.sdk-traces/v1",
+  "sdk": {
+    "commit": "fa02955bfa17b60e57e0d7406d200a73337472ee",
+    "package": "@kilocode/sdk",
+    "path": "packages/sdk/js",
+    "version": "7.5.6"
+  },
+  "steps": [
+    {
+      "args": {},
+      "call": "provider.list",
+      "id": "provider.list",
+      "note": "The SDK reads GET /provider; the daemon registers the legacy GET /provider/list (shape {providers:[...]}), so the real client gets 404. Provider/model metadata therefore never reaches an unmodified v7.5.6 client.",
+      "request": {
+        "method": "GET",
+        "path": "/provider",
+        "query": ""
+      },
+      "response": {
+        "body": null,
+        "content_type": "",
+        "event_stream": false,
+        "status": 404
+      },
+      "sdk_requires": [],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#ProviderListResponses.200 ({all,default,connected,failed})",
+      "status": "divergence"
+    },
+    {
+      "args": {
+        "args": [],
+        "command": "sh",
+        "cwd": ".",
+        "size": {
+          "cols": 80,
+          "rows": 24
+        },
+        "title": "wire-trace"
+      },
+      "call": "pty.create",
+      "id": "pty.create",
+      "note": "The SDK creates terminals at POST /pty; the daemon's PTY ops live at /pty/create and REJECT explicitly 409 (no PTY abstraction in the supervisor). The unmodified client sees a 404, not the documented refusal.",
+      "request": {
+        "body": "{\"args\":[],\"command\":\"sh\",\"cwd\":\".\",\"size\":{\"cols\":80,\"rows\":24},\"title\":\"wire-trace\"}",
+        "content_type": "application/json",
+        "method": "POST",
+        "path": "/pty",
+        "query": ""
+      },
+      "response": {
+        "body": null,
+        "content_type": "",
+        "event_stream": false,
+        "status": 404
+      },
+      "sdk_requires": [],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#PtyCreateResponses.200 (Pty)",
+      "status": "divergence"
+    },
+    {
+      "args": {},
+      "call": "permission.list",
+      "id": "permission.list",
+      "note": "The SDK reads GET /permission; the daemon registers GET /permission/list. 404.",
+      "request": {
+        "method": "GET",
+        "path": "/permission",
+        "query": ""
+      },
+      "response": {
+        "body": null,
+        "content_type": "",
+        "event_stream": false,
+        "status": 404
+      },
+      "sdk_requires": [],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#PermissionListResponses.200 (Array<PermissionRequest>)",
+      "status": "divergence"
+    },
+    {
+      "args": {},
+      "call": "question.list",
+      "id": "question.list",
+      "note": "The SDK reads GET /question; the daemon registers GET /question/list. 404.",
+      "request": {
+        "method": "GET",
+        "path": "/question",
+        "query": ""
+      },
+      "response": {
+        "body": null,
+        "content_type": "",
+        "event_stream": false,
+        "status": 404
+      },
+      "sdk_requires": [],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#QuestionListResponses.200 (Array<QuestionRequest>)",
+      "status": "divergence"
+    },
+    {
+      "args": {},
+      "call": "network.list",
+      "id": "network.list",
+      "note": "The SDK reads GET /network; the daemon registers GET /network/list. 404.",
+      "request": {
+        "method": "GET",
+        "path": "/network",
+        "query": ""
+      },
+      "response": {
+        "body": null,
+        "content_type": "",
+        "event_stream": false,
+        "status": 404
+      },
+      "sdk_requires": [],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#NetworkListResponses.200 (Array<SessionNetworkWait>)",
+      "status": "divergence"
+    },
+    {
+      "args": {},
+      "call": "global.event",
+      "id": "global.event",
+      "note": "Streaming: the request (GET /global/event, auth header) is locked byte-for-byte and the stream opens 200 text/event-stream; the daemon's journal/global event payload union differs from the SDK's GlobalEvent union, and no event is emitted on an idle session, so the frame bodies are recorded but not golden-compared.",
+      "request": {
+        "method": "GET",
+        "path": "/global/event",
+        "query": ""
+      },
+      "response": {
+        "body": "@sse",
+        "content_type": "text/event-stream",
+        "event_stream": true,
+        "status": 200
+      },
+      "sdk_requires": [],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#GlobalEventResponses.200 (GlobalEvent SSE union)",
+      "status": "divergence"
+    },
+    {
+      "args": {},
+      "call": "global.dispose",
+      "id": "global.dispose",
+      "note": "Daemon answers {ok:true} (idempotent, ends every session); the SDK declares 200: boolean.",
+      "request": {
+        "method": "POST",
+        "path": "/global/dispose",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "ok": true
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "#bool"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#GlobalDisposeResponses.200 (boolean)",
+      "status": "divergence"
+    },
+    {
+      "args": {},
+      "call": "instance.dispose",
+      "id": "instance.dispose",
+      "note": "Alias of /global/dispose; same {ok:true} vs boolean divergence.",
+      "request": {
+        "method": "POST",
+        "path": "/instance/dispose",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "ok": true
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "#bool"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#InstanceDisposeResponses.200 (boolean)",
+      "status": "divergence"
+    },
+    {
+      "args": {},
+      "call": "instance.reload",
+      "id": "instance.reload",
+      "note": "Daemon answers {ok:true} after re-running recover(); the SDK declares 200: boolean.",
+      "request": {
+        "method": "POST",
+        "path": "/instance/reload",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "ok": true
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "#bool"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#InstanceReloadResponses.200 (boolean)",
+      "status": "divergence"
+    }
+  ]
+}

@@ -9,11 +9,12 @@ use faktor_core::id::SessionId;
 use faktor_protocol::error::ApiError;
 use faktor_protocol::v756::*;
 use faktor_protocol::v756::{
-    mapper as wire_mapper, wire::AbortBody, wire::DiffStatus, wire::MessageSendRequest,
-    wire::MessageSendResponse, wire::RevertBody, wire::SessionCreateRequest,
-    wire::SessionCreateResponse, wire::SessionListResponse, wire::SessionSummarizeResponse,
-    wire::SessionSummary, wire::SessionUpdateRequest, wire::SessionUpdateResponse,
-    wire::SnapshotFileDiff, wire::WireMessageEntry, wire::WireMessageInfo, wire::WirePart,
+    mapper as wire_mapper, wire::AbortBody, wire::DiffStatus, wire::MessageModel,
+    wire::MessageSendRequest, wire::MessageSendResponse, wire::RevertBody,
+    wire::SessionCreateRequest, wire::SessionCreateResponse, wire::SessionListResponse,
+    wire::SessionSummarizeResponse, wire::SessionSummary, wire::SessionUpdateRequest,
+    wire::SessionUpdateResponse, wire::SnapshotFileDiff, wire::WireMessageEntry,
+    wire::WireMessageInfo, wire::WirePart,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -147,6 +148,99 @@ pub(crate) async fn wire_session_state(
     }
 }
 
+/// The per-message model selection inside the accepted send body. Every
+/// field is optional: the real upstream SDK leaves `model` off entirely
+/// (the daemon then uses the session row's provider/model).
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompatMessageModel {
+    #[serde(rename = "providerID", default)]
+    provider_id: String,
+    #[serde(rename = "modelID", default)]
+    model_id: String,
+}
+
+/// Incoming body of `POST /session/{sessionID}/message`. Accepts BOTH the
+/// frozen scaffold DTO and the real `@kilocode/sdk` v2 input union:
+/// `model` optional, `tools` a name→bool map (the scaffold used `string[]`),
+/// `snapshotInitialization` `"wait"` (the scaffold used a bool), and the
+/// four real input part kinds (`text`/`file`/`agent`/`subtask`) with the
+/// SDK's extra optional fields (`synthetic`, `time`, `mime`, `url`, …).
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct WireMessageSendCompat {
+    #[serde(rename = "messageID")]
+    message_id: Option<String>,
+    model: Option<CompatMessageModel>,
+    agent: Option<String>,
+    no_reply: Option<bool>,
+    #[allow(dead_code)]
+    tools: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    format: Option<serde_json::Value>,
+    system: Option<String>,
+    variant: Option<String>,
+    #[allow(dead_code)]
+    snapshot_initialization: Option<serde_json::Value>,
+    editor_context: Option<serde_json::Value>,
+    parts: Vec<serde_json::Value>,
+}
+
+/// Translate one incoming part: the real SDK input union first, then the
+/// frozen scaffold part union verbatim (control-plane kinds included).
+#[allow(clippy::result_large_err)]
+fn compat_part_to_wire(part: &serde_json::Value) -> Result<WirePart, Response> {
+    let string =
+        |key: &str| -> Option<String> { part.get(key).and_then(|v| v.as_str()).map(String::from) };
+    match part.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+        "text" => Ok(WirePart::Text {
+            text: string("text").unwrap_or_default(),
+        }),
+        "file" => match (string("path"), string("filename"), string("url")) {
+            (Some(path), _, _) => Ok(WirePart::File {
+                path,
+                content: string("content"),
+                mode: string("mode"),
+            }),
+            (None, Some(filename), _) => Ok(WirePart::File {
+                path: filename,
+                content: None,
+                mode: None,
+            }),
+            (None, None, Some(url)) => Ok(WirePart::File {
+                path: url,
+                content: None,
+                mode: None,
+            }),
+            _ => Err(compat_malformed("file part carries no path/filename/url")),
+        },
+        "agent" => Ok(WirePart::Agent {
+            id: string("id"),
+            name: string("name"),
+            state: None,
+        }),
+        "subtask" => Ok(WirePart::Subtask {
+            label: string("description").or_else(|| string("label")),
+            note: string("prompt").or_else(|| string("note")),
+        }),
+        _ => serde_json::from_value::<WirePart>(part.clone())
+            .map_err(|e| compat_malformed(&format!("unknown message part: {e}"))),
+    }
+}
+
+fn compat_malformed(message: &str) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({
+            "ok": false,
+            "code": "malformed",
+            "message": message,
+            "retryable": false,
+        })),
+    )
+        .into_response()
+}
+
 /// `POST /session/{sessionID}/message` — send one message and return the
 /// frozen `{info: AssistantMessage, parts: Part[]}` shape for the durable
 /// assistant message the accepted turn produced.
@@ -166,19 +260,21 @@ pub(crate) async fn wire_session_state(
 /// rejects unknown fields (deny_unknown_fields), so a `queued` flag inside
 /// the DTO would be protocol drift.
 ///
-/// The per-message `model` override APPLIES: the provider must equal the
-/// session's provider (else an honest 409), and the model id is used for
-/// this turn only — the journaled session row keeps its configured model.
+/// The per-message `model` override APPLIES when present: the provider must
+/// equal the session's provider (else an honest 409), and the model id is
+/// used for this turn only — the journaled session row keeps its configured
+/// model. When `model` is absent (the real SDK leaves it optional) the
+/// session row's provider/model drive the turn.
 pub(crate) async fn wire_message_send(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(session_id): Path<String>,
-    Json(req): Json<MessageSendRequest>,
+    Json(body): Json<WireMessageSendCompat>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    if req.parts.is_empty() {
+    if body.parts.is_empty() {
         let e = ApiError {
             code: "malformed",
             message: "message parts must not be empty".into(),
@@ -187,7 +283,31 @@ pub(crate) async fn wire_message_send(
         };
         return (StatusCode::BAD_REQUEST, Json(e.to_json())).into_response();
     }
-    let args = match wire_mapper::prompt_args(&req) {
+    let mut parts = Vec::with_capacity(body.parts.len());
+    for part in &body.parts {
+        match compat_part_to_wire(part) {
+            Ok(part) => parts.push(part),
+            Err(resp) => return resp,
+        }
+    }
+    let args = match wire_mapper::prompt_args(&MessageSendRequest {
+        message_id: body.message_id.clone(),
+        // Only `parts` feed the mapper; the model is resolved against the
+        // session row below.
+        model: MessageModel {
+            provider_id: String::new(),
+            model_id: String::new(),
+        },
+        agent: body.agent.clone(),
+        no_reply: body.no_reply,
+        tools: None,
+        format: None,
+        system: body.system.clone(),
+        variant: body.variant.clone(),
+        snapshot_initialization: None,
+        editor_context: body.editor_context.clone(),
+        parts,
+    }) {
         Ok(a) => a,
         Err(e) => return api_err(&e),
     };
@@ -213,14 +333,22 @@ pub(crate) async fn wire_message_send(
         Ok(r) => r,
         Err(e) => return api_err(&e),
     };
-    // The per-message override is a model id WITHIN the session's provider;
-    // a provider mismatch is protocol drift (the frozen client never sends
-    // one) and is refused honestly — nothing is spawned, nothing mutates.
-    if req.model.provider_id != row.provider {
-        return wire_refused("provider mismatch");
+    // The per-message override (when present) is a model id WITHIN the
+    // session's provider; a provider mismatch is protocol drift (the frozen
+    // client never sends one) and is refused honestly — nothing is spawned.
+    let override_model = body.model.as_ref().filter(|m| !m.provider_id.is_empty());
+    if let Some(model) = override_model {
+        if model.provider_id != row.provider {
+            return wire_refused("provider mismatch");
+        }
     }
     let provider_id = Some(row.provider.clone());
-    let model_id = Some(req.model.model_id.clone());
+    let model_id = Some(
+        override_model
+            .map(|m| m.model_id.clone())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| row.model.clone()),
+    );
     // The sequence the user message will occupy (its row is created inside
     // submit); every durable row after it belongs to this turn.
     let user_seq = match handle.proposed_message_seq() {
@@ -607,7 +735,7 @@ pub(crate) async fn wire_diff(
     // Full content needs the CAS blobs of both sides.
     for row in rows.into_iter().rev() {
         let status = checkpoint_diff_status(&row);
-        let diff = if q.full.as_deref() == Some("1") {
+        let diff = if wire_flag(&q.full) {
             let before_bytes = if row.before_exists {
                 match diff_cas_bytes(&cas, &row.before_hash) {
                     Ok(b) => b,
@@ -651,16 +779,25 @@ pub(crate) async fn wire_diff(
     Json(entries).into_response()
 }
 
-/// The query parameters of `GET /session/{sessionID}/diff`.
+/// The query parameters of `GET /session/{sessionID}/diff`. The real
+/// upstream SDK spells the message filter `messageID` and `full` as
+/// `"true"`/`"false"`; the scaffold spellings (`message`, `full=1`) stay
+/// accepted for old callers.
 #[derive(serde::Deserialize)]
 pub(crate) struct WireDiffQuery {
     /// Message sequence (or id — identical on single-session stores)
     /// limiting the projection to one checkpoint.
+    #[serde(alias = "messageID")]
     message: Option<String>,
     /// Exact relative path filter.
     file: Option<String>,
-    /// `1` = include the full unified diff content per entry.
+    /// `1`/`true` = include the full unified diff content per entry.
     full: Option<String>,
+}
+
+/// The SDK's boolean-ish query flags: `1` (scaffold) and `true` (real SDK).
+pub(crate) fn wire_flag(value: &Option<String>) -> bool {
+    matches!(value.as_deref(), Some("1") | Some("true"))
 }
 
 /// The frozen diff status of one checkpoint row, derived from the recorded
@@ -838,15 +975,23 @@ pub(crate) async fn wire_revert(
 /// `POST /session/{sessionID}/unrevert` — redo: restore the checkpoint's
 /// AFTER state (the mirror of revert). Same conflict rules: only rewrites
 /// when the current content still matches the state revert left behind.
+/// The real upstream SDK sends NO body: without a target the handler
+/// refuses honestly (409) instead of failing extraction.
 pub(crate) async fn wire_unrevert(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(session_id): Path<String>,
-    Json(req): Json<RevertBody>,
+    body: Option<Json<RevertBody>>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let Some(Json(req)) = body else {
+        return wire_refused(
+            "unrevert unavailable: no revert target (the SDK sends no message id; \
+             the daemon keeps no durable revert state in this slice)",
+        );
+    };
     let message_seq = match wire_mapper::wire_id_to_u64(&req.message_id) {
         Ok(s) => s as i64,
         Err(e) => return api_err(&e),

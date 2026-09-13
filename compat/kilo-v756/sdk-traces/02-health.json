@@ -1,0 +1,37 @@
+{
+  "schema": "faktor.compat.sdk-traces/v1",
+  "sdk": {
+    "commit": "fa02955bfa17b60e57e0d7406d200a73337472ee",
+    "package": "@kilocode/sdk",
+    "path": "packages/sdk/js",
+    "version": "7.5.6"
+  },
+  "steps": [
+    {
+      "args": {},
+      "call": "global.health",
+      "id": "global.health",
+      "note": "daemon 200: {ok,version,protocol}; SDK 200: {healthy: true, version: string}.",
+      "request": {
+        "method": "GET",
+        "path": "/global/health",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "ok": true,
+          "protocol": "v756",
+          "version": "0.1.0"
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "healthy"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#GlobalHealthResponses.200",
+      "status": "divergence"
+    }
+  ]
+}
