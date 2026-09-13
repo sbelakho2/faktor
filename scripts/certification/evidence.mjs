@@ -444,6 +444,7 @@ function verifyEvidenceObject(evidence, options = {}) {
 const WORKFLOWS = {
   pr: {
     expected: [
+      'kilo-compat',
       'linux',
       'static',
       'docs',
@@ -456,6 +457,7 @@ const WORKFLOWS = {
   },
   trusted: {
     expected: [
+      'kilo-compat',
       'linux',
       'static',
       'docs',
@@ -469,6 +471,7 @@ const WORKFLOWS = {
   },
   nightly: {
     expected: [
+      'kilo-compat',
       'fault-scale',
       'longrun',
       'efficiency',

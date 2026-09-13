@@ -42,8 +42,9 @@ use crate::caps::{CapabilityGrant, CapabilitySet, LatticeCap, ScopePattern};
 use crate::runtime::completion_steps::commit_message;
 use crate::runtime::shadow::{ShadowCopyLimits, ShadowRoots};
 use crate::runtime::task_executor::{
-    MutationMode, PreparedRunIntegration, RunSettlement, SettlementOutcome, TaskExecutor,
-    TaskRunMode, TaskRunRequest, TaskRunRow, TASK_RUN_ROW_KIND,
+    compose_no_op_root_verification_status, compose_root_verification_status, MutationMode,
+    PreparedRunIntegration, RunSettlement, SettlementOutcome, TaskExecutor, TaskRunMode,
+    TaskRunRequest, TaskRunRow, TASK_RUN_ROW_KIND,
 };
 use crate::runtime::{CrashSeam, ExecError, OrchestratorRuntime};
 use crate::{OwnershipSpec, TaskPlan, WorkItem, WorkKind};
@@ -1465,8 +1466,8 @@ fn hostile_requests_are_rejected_before_any_write() {
 // the durable shadow machinery (begin/finalize/commit) instead.
 
 use faktor_core::state::{
-    CriterionBinding, CriterionOrigin, CriterionRequirement, NoOpDisposition, TaskState,
-    TaskTransition, VerificationStatus,
+    CheckExecution, CriterionBinding, CriterionOrigin, CriterionRequirement, CriterionVerification,
+    NoOpDisposition, TaskState, TaskTransition, VerificationStatus,
 };
 use faktor_session::ShadowRowState;
 
@@ -2357,6 +2358,39 @@ fn open_real_tool_env_full(
     service: bool,
     mode: MutationMode,
 ) -> Arc<RealToolEnv> {
+    open_real_tool_env_inner(
+        root,
+        scripts,
+        verification,
+        parked_write,
+        service,
+        mode,
+        false,
+    )
+}
+
+/// [`open_real_tool_env_full`] with the daemon's process supervisor wired
+/// (the proof-basis probe path in production always has one; the default
+/// fixture deliberately runs without it so probes degrade explicitly).
+fn open_real_tool_env_supervised(
+    root: &std::path::Path,
+    scripts: Vec<Vec<ScriptedResponse>>,
+    verification: Arc<faktor_agent::VerificationService>,
+    mode: MutationMode,
+) -> Arc<RealToolEnv> {
+    open_real_tool_env_inner(root, scripts, verification, true, true, mode, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_real_tool_env_inner(
+    root: &std::path::Path,
+    scripts: Vec<Vec<ScriptedResponse>>,
+    verification: Arc<faktor_agent::VerificationService>,
+    parked_write: bool,
+    service: bool,
+    mode: MutationMode,
+    with_supervisor: bool,
+) -> Arc<RealToolEnv> {
     let manager = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
     let caps = ModelCapabilities {
         tools: true,
@@ -2376,6 +2410,11 @@ fn open_real_tool_env_full(
     }
     tools.register(parking_tool("pause", gate.clone(), fired.clone()));
     let resolver = real_resolver(&manager);
+    let supervisor = if with_supervisor {
+        Some(faktor_terminal::ProcessSupervisor::new(manager.cas()))
+    } else {
+        None
+    };
     let agent = AgentRuntime::new(AgentDeps {
         session: manager.clone(),
         providers: Arc::new(registry),
@@ -2388,7 +2427,7 @@ fn open_real_tool_env_full(
         edit: None,
         snapshots: None,
         sandbox: None,
-        supervisor: None,
+        supervisor,
         verification,
         hooks: None,
         instructions_resolver: resolver,
@@ -4540,6 +4579,38 @@ fn typed_land_criterion() -> String {
     .encode()
 }
 
+/// A REQUIRED criterion whose binding can never pass while every derived
+/// check is green: the file-state binding pins a digest the candidate cannot
+/// have.
+fn typed_failed_file_state_criterion() -> String {
+    faktor_session::task::Criterion::derived(
+        "src/lib.rs is frozen at an impossible digest",
+        CriterionOrigin::ProjectPolicy,
+        CriterionRequirement::Required,
+        None,
+    )
+    .with_binding(CriterionBinding::FileState {
+        path: "src/lib.rs".into(),
+        expected_digest: "0".repeat(64),
+    })
+    .encode()
+}
+
+/// A REQUIRED criterion carrying the explicit honest-unknown binding: the
+/// evaluator can only ever return Unavailable for it, never a pass.
+fn typed_explicit_unknown_criterion() -> String {
+    faktor_session::task::Criterion::derived(
+        "no objective mechanism certifies this criterion",
+        CriterionOrigin::ProjectPolicy,
+        CriterionRequirement::Required,
+        None,
+    )
+    .with_binding(CriterionBinding::Unavailable {
+        reason: "the criterion is explicitly honest-unknown".into(),
+    })
+    .encode()
+}
+
 fn start_two_child_run(env: &Arc<RealToolEnv>, goal: &str) -> String {
     env.executor
         .start_task(
@@ -4659,6 +4730,167 @@ async fn verifier_observes_candidate_not_owner() {
     assert!(env.owner_root.join("child_a.rs").is_file());
     assert!(env.owner_root.join("child_b.rs").is_file());
     assert_eq!(owner_digest(&env), candidate_digest);
+}
+
+// ---------------------------------------------- ExclusivePaths isolation
+
+/// A run whose plan mixes a read-only AUTO item with one `Paths`-owned
+/// mutating item: the executor must spawn the Paths child in its OWN overlay
+/// and route its change set through stage -> compose -> verify -> land. The
+/// auto item keeps the run orchestrated without opening the shared owner
+/// workspace (the only provider call is the Paths child's, so the script
+/// index is deterministic).
+fn start_paths_run(env: &Arc<RealToolEnv>, goal: &str, paths: &[&str]) -> String {
+    env.executor
+        .start_task(
+            env.parent,
+            TaskRunRequest {
+                goal: goal.to_string(),
+                work_items: vec![
+                    wi("prep", WorkKind::Analysis, &[]),
+                    path_item("impl", WorkKind::Implementation, &["prep"], paths),
+                ],
+                auto_items: vec!["prep".to_string()],
+                criteria: vec![typed_land_criterion()],
+                parent_caps: read_caps(),
+                isolated_root: env.isolated_root.clone(),
+                ..Default::default()
+            },
+        )
+        .expect("paths orchestrated start")
+        .run_id
+}
+
+fn run_child_row(env: &RealToolEnv, run_id: &str, item: &str) -> crate::runtime::ChildRuntime {
+    OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, run_id)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.item_id == item)
+        .unwrap_or_else(|| panic!("no child row for item {item}"))
+}
+
+fn child_overlay(env: &RealToolEnv, row: &crate::runtime::ChildRuntime) -> std::path::PathBuf {
+    env.manager
+        .workspace_root(WorkspaceId::new(row.workspace_id))
+        .unwrap()
+        .expect("overlay root registered")
+}
+
+/// A `Paths` child writes ONLY inside its daemon-owned overlay: the owner
+/// digest stays stable through the whole drive AND the candidate
+/// verification, and the change set lands exclusively through the shared
+/// integration transaction once verification passed.
+#[tokio::test]
+async fn paths_child_changes_stay_in_its_overlay_until_the_verified_land() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        vec![write_script(
+            "c-impl",
+            "src/impl.rs",
+            "pub fn p() -> u64 {\n    let seed: u64 = 7;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n",
+        )],
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    let before = owner_digest(&env);
+    env.executor
+        .set_settlement_crash_seam(Some(CrashSeam::AfterCandidatePrepared));
+    let run_id = start_paths_run(&env, "land the declared path", &["src"]);
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    let row = run_child_row(&env, &run_id, "impl");
+    assert_eq!(row.ownership, ChildOwnership::ExclusivePaths);
+    assert_eq!(row.ownership_paths, vec!["src".to_string()]);
+    let overlay = child_overlay(&env, &row);
+    assert!(
+        overlay.ends_with(&row.child_id),
+        "the Paths child owns an overlay named after its child id: {overlay:?}"
+    );
+    assert_ne!(overlay, env.owner_root);
+    assert!(
+        overlay.join("src/impl.rs").is_file(),
+        "the write landed in the child's own overlay"
+    );
+    let candidate = run_candidate_root(&env, &run_id);
+    assert!(candidate.join("src/impl.rs").is_file());
+    assert!(
+        !env.owner_root.join("src/impl.rs").exists(),
+        "the owner is byte-untouched before the landing"
+    );
+    assert_eq!(
+        owner_digest(&env),
+        before,
+        "owner digest stable while the Paths child ran and its candidate was verified"
+    );
+    // Recovery settles the SAME verified candidate through the txn.
+    env.executor.set_settlement_crash_seam(None);
+    let outcome = settle_orchestrated(&env, &run_id).await.expect("settle");
+    assert!(outcome.verified && outcome.completed, "{outcome:?}");
+    assert!(env.owner_root.join("src/impl.rs").is_file());
+    let candidate_digest = root_digest(&candidate);
+    assert_eq!(
+        owner_digest(&env),
+        candidate_digest,
+        "the owner equals the verified candidate only after landing"
+    );
+    let txn = latest_txn(&env, &run_id).expect("the integration transaction");
+    assert_eq!(txn.path_count, 1, "{txn:?}");
+    assert_eq!(txn.applied_count, 1, "{txn:?}");
+}
+
+/// The declared path set is the tool-boundary write allowlist: a mutating
+/// write outside it is typed-refused (journaled PermissionDenied) and never
+/// reaches the overlay — long before staging.
+#[tokio::test]
+async fn paths_child_out_of_scope_write_is_refused_typed_at_the_tool_gate() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        vec![write_script(
+            "c-evil",
+            "evil.rs",
+            "outside the declared set\n",
+        )],
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    let run_id = start_paths_run(&env, "refuse the out-of-scope write", &["src"]);
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    let row = run_child_row(&env, &run_id, "impl");
+    assert_eq!(row.ownership, ChildOwnership::ExclusivePaths);
+    let overlay = child_overlay(&env, &row);
+    assert!(
+        !overlay.join("evil.rs").exists(),
+        "the denied write never reached the overlay"
+    );
+    assert!(!env.owner_root.join("evil.rs").exists());
+    let handle = env
+        .manager
+        .get_session(SessionId::new(row.session_id))
+        .unwrap()
+        .unwrap();
+    let events = handle.events_range(1, None).unwrap();
+    let denial = events
+        .iter()
+        .find(|e| e.kind == faktor_core::event::EventKind::PermissionDenied)
+        .expect("the edit gate journals the out-of-scope refusal");
+    let payload = denial.payload.as_ref().expect("denial carries a payload");
+    assert_eq!(payload["tool"], "write_file");
+    assert!(
+        payload["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("change budget refused the edit"),
+        "{payload:?}"
+    );
 }
 
 // ----------------------------------------------- P0 criterion-proof residuals
@@ -5021,7 +5253,7 @@ async fn root_record_reuse_consults_the_proof_basis() {
         changed: Vec::new(),
         summary: "basis consult".into(),
     };
-    let first = env
+    let (first, first_basis) = env
         .executor
         .find_or_create_root_verification_record(
             &h,
@@ -5030,9 +5262,11 @@ async fn root_record_reuse_consults_the_proof_basis() {
             &snapshot,
             &run("cargo", "check"),
             &prepared,
+            VerificationStatus::Passed,
         )
+        .await
         .unwrap();
-    let reused = env
+    let (reused, reused_basis) = env
         .executor
         .find_or_create_root_verification_record(
             &h,
@@ -5041,10 +5275,16 @@ async fn root_record_reuse_consults_the_proof_basis() {
             &snapshot,
             &run("cargo", "check"),
             &prepared,
+            VerificationStatus::Passed,
         )
+        .await
         .unwrap();
     assert_eq!(first, reused, "an identical basis is replay-idempotent");
-    let fresh = env
+    assert_eq!(
+        first_basis, reused_basis,
+        "two identical production builds must produce the byte-identical basis digest"
+    );
+    let (fresh, fresh_basis) = env
         .executor
         .find_or_create_root_verification_record(
             &h,
@@ -5053,11 +5293,17 @@ async fn root_record_reuse_consults_the_proof_basis() {
             &snapshot,
             &run("cargo", "clippy"),
             &prepared,
+            VerificationStatus::Passed,
         )
+        .await
         .unwrap();
     assert_ne!(
         fresh, first,
         "a different check basis must NEVER reuse the old record"
+    );
+    assert_ne!(
+        fresh_basis, first_basis,
+        "a changed check program changes the probed tool/basis digest"
     );
     let fresh_record = h.get_verification_record(fresh).unwrap().unwrap();
     assert_eq!(fresh_record.status, VerificationStatus::Passed);
@@ -5065,13 +5311,401 @@ async fn root_record_reuse_consults_the_proof_basis() {
         fresh_record.candidate_proof_ref.is_some(),
         "the fresh record carries its candidate proof: {fresh_record:?}"
     );
-    assert!(
+    assert_eq!(
         fresh_record
             .environment_fingerprint
             .as_ref()
-            .and_then(|f| f.proof_basis_digest.as_ref())
-            .is_some(),
-        "the fresh record carries its proof-basis digest"
+            .and_then(|f| f.proof_basis_digest.as_deref()),
+        Some(fresh_basis.as_str()),
+        "the record carries the exact basis digest the builder produced"
+    );
+}
+
+/// Build a probe-session task row plus the prepared integration the basis
+/// builder consumes (production call shape, no synthetic basis injection).
+fn probe_task_and_prepared(
+    env: &Arc<RealToolEnv>,
+    run_id: &str,
+) -> (
+    faktor_session::SessionHandle,
+    TaskId,
+    PreparedRunIntegration,
+    Vec<String>,
+) {
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    let now = h.now_ms();
+    h.create_task(faktor_session::Task {
+        task_id,
+        session_id: h.id(),
+        goal: "proof-basis probe hardening".into(),
+        acceptance_criteria: vec!["c1".into()],
+        plan: Vec::new(),
+        attachments: Vec::new(),
+        budget: faktor_session::TaskBudget::default(),
+        state: faktor_core::state::TaskState::Pending,
+        created_ms: now,
+        updated_ms: now,
+    })
+    .unwrap();
+    let snapshot = owner_digest(env);
+    let criteria = h
+        .get_task(task_id)
+        .unwrap()
+        .unwrap()
+        .acceptance_criteria
+        .clone();
+    let prepared = PreparedRunIntegration {
+        run_id: run_id.to_string(),
+        task_id,
+        owner_root: env.owner_root.clone(),
+        base_root: env.owner_root.clone(),
+        candidate_root: env.owner_root.clone(),
+        base_snapshot: snapshot.clone(),
+        candidate_snapshot: snapshot,
+        changed: Vec::new(),
+        sources: Vec::new(),
+        sources_digest: String::new(),
+        staged: Vec::new(),
+    };
+    (h, task_id, prepared, criteria)
+}
+
+fn probe_run(program: &str) -> IntegratedRootVerification {
+    let check = faktor_core::state::CheckExecution {
+        check: "rust_check".into(),
+        program: program.into(),
+        args: vec!["--version".into()],
+        category: "compile".into(),
+        required: true,
+        status: VerificationStatus::Passed,
+        started_ms: 1,
+        finished_ms: Some(2),
+        exit: Some(0),
+        summary: Some("ok".into()),
+    };
+    let criterion = faktor_core::state::CriterionVerification {
+        criterion_key: "c1".into(),
+        passed: true,
+        evidence: Some("probe evidence".into()),
+        binding: Some(CriterionBinding::RequiredCheck {
+            check_id: "rust_check".into(),
+            command_digest: faktor_core::state::command_binding_digest("cargo --version"),
+        }),
+    };
+    IntegratedRootVerification {
+        status: VerificationStatus::Passed,
+        checks: vec![check],
+        criteria: vec![criterion],
+        changed: Vec::new(),
+        summary: "proof-basis probe".into(),
+    }
+}
+
+/// Production hardening: the basis is rebuilt immediately before every reuse
+/// consult, PROBING the real toolchain through the daemon supervisor — a
+/// tool-version change under the daemon PATH invalidates reuse in
+/// production (a fresh record is minted), while an unchanged toolchain
+/// reuses the record byte-identically.
+#[cfg(unix)]
+#[tokio::test]
+async fn production_tool_version_change_invalidates_proof_reuse() {
+    use std::os::unix::fs::PermissionsExt;
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_supervised(
+        dir.path(),
+        vec![],
+        faktor_agent::VerificationService::fake_ok(),
+        MutationMode::DirectCompat,
+    );
+    let (h, task_id, prepared, criteria) = probe_task_and_prepared(&env, "probe-run");
+    let fake_bin = dir.path().join("probe-bin");
+    std::fs::create_dir_all(&fake_bin).unwrap();
+    let fake_rustc = fake_bin.join("rustc");
+    let write_tool = |version: &str| {
+        std::fs::write(&fake_rustc, format!("#!/bin/sh\necho \"{version}\"\n")).unwrap();
+        let mut perms = std::fs::metadata(&fake_rustc).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_rustc, perms).unwrap();
+    };
+    write_tool("rustc 0.0.1-production-fake");
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let fake_path = format!("{}:{}", fake_bin.display(), original_path.to_string_lossy());
+    std::env::set_var("PATH", &fake_path);
+    let snapshot = prepared.candidate_snapshot.clone();
+    let (first, first_basis) = env
+        .executor
+        .find_or_create_root_verification_record(
+            &h,
+            task_id,
+            &criteria,
+            &snapshot,
+            &probe_run("cargo"),
+            &prepared,
+            VerificationStatus::Passed,
+        )
+        .await
+        .unwrap();
+    let (reused, reused_basis) = env
+        .executor
+        .find_or_create_root_verification_record(
+            &h,
+            task_id,
+            &criteria,
+            &snapshot,
+            &probe_run("cargo"),
+            &prepared,
+            VerificationStatus::Passed,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first, reused, "an unchanged toolchain reuses the record");
+    assert_eq!(first_basis, reused_basis);
+    // The tool version actually changed.
+    write_tool("rustc 0.0.2-production-fake");
+    let (fresh, fresh_basis) = env
+        .executor
+        .find_or_create_root_verification_record(
+            &h,
+            task_id,
+            &criteria,
+            &snapshot,
+            &probe_run("cargo"),
+            &prepared,
+            VerificationStatus::Passed,
+        )
+        .await
+        .unwrap();
+    std::env::set_var("PATH", &original_path);
+    assert_ne!(
+        fresh, first,
+        "a production tool-version change must NEVER reuse the old record"
+    );
+    assert_ne!(fresh_basis, first_basis);
+    assert_eq!(
+        h.get_verification_record(first)
+            .unwrap()
+            .unwrap()
+            .environment_fingerprint
+            .as_ref()
+            .and_then(|f| f.proof_basis_digest.as_deref()),
+        Some(first_basis.as_str())
+    );
+}
+
+/// Production hardening: a daemon WITHOUT a supervisor still produces a
+/// fully-populated basis on every consult (every probe is an explicit
+/// marker, never silently empty), and two identical builds are
+/// byte-identical so the replay is deterministic.
+#[tokio::test]
+async fn production_basis_degrades_explicitly_and_is_reproducible() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        vec![],
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    let (h, task_id, prepared, criteria) = probe_task_and_prepared(&env, "probe-no-supervisor");
+    let snapshot = prepared.candidate_snapshot.clone();
+    let (first, first_basis) = env
+        .executor
+        .find_or_create_root_verification_record(
+            &h,
+            task_id,
+            &criteria,
+            &snapshot,
+            &probe_run("cargo"),
+            &prepared,
+            VerificationStatus::Passed,
+        )
+        .await
+        .unwrap();
+    let (reused, reused_basis) = env
+        .executor
+        .find_or_create_root_verification_record(
+            &h,
+            task_id,
+            &criteria,
+            &snapshot,
+            &probe_run("cargo"),
+            &prepared,
+            VerificationStatus::Passed,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first, reused);
+    assert_eq!(
+        first_basis, reused_basis,
+        "identical inputs, identical basis"
+    );
+    // The production probe input shape degrades to explicit markers.
+    let report = crate::proof_probe::probe_proof_basis(None, &["cargo".to_string()]).await;
+    assert!(!report.tools.is_empty(), "tool_versions are never empty");
+    assert!(
+        report
+            .tools
+            .iter()
+            .filter(|t| t.tool != "faktor-verifier")
+            .all(|t| t.version.starts_with('<')),
+        "no supervisor means explicit probe markers: {:?}",
+        report.tools
+    );
+    assert!(
+        report
+            .tools
+            .iter()
+            .any(|t| t.tool == "faktor-verifier" && t.version.contains("blake3:")),
+        "the custom verifier binary carries its version+digest: {:?}",
+        report.tools
+    );
+    assert!(
+        report
+            .env_projection
+            .iter()
+            .any(|(k, v)| k == "target_triple" && v.starts_with("<probe-unavailable")),
+        "target triple is an explicit marker: {:?}",
+        report.env_projection
+    );
+}
+
+/// The basis evidence/reviewer folds are pure, deterministic, bound to the
+/// exact evidence (a changed check program or reviewer identity changes the
+/// fold) and only count PASSED criteria — failed and unavailable verdicts
+/// contribute nothing.
+#[test]
+fn basis_evidence_and_reviewer_digests_are_exact_and_deterministic() {
+    use super::{criterion_pass_evidence_digests, reviewer_proof_basis_digest};
+    let (dir, m) = {
+        let dir = tempfile::tempdir().unwrap();
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        (dir, m)
+    };
+    let ws = m.create_workspace("/w").unwrap();
+    let h = m.create_session(ws, "t", "ollama", "qwen3.8").unwrap();
+    let task_id = h.task_id().unwrap();
+    let now = h.now_ms();
+    h.create_task(faktor_session::Task {
+        task_id,
+        session_id: h.id(),
+        goal: "g".into(),
+        acceptance_criteria: vec!["c1".into(), "c2".into()],
+        plan: Vec::new(),
+        attachments: Vec::new(),
+        budget: faktor_session::TaskBudget::default(),
+        state: TaskState::Pending,
+        created_ms: now,
+        updated_ms: now,
+    })
+    .unwrap();
+    let check = faktor_core::state::CheckExecution {
+        check: "rust_check".into(),
+        program: "cargo".into(),
+        args: vec!["check".into()],
+        category: "compile".into(),
+        required: true,
+        status: VerificationStatus::Passed,
+        started_ms: 1,
+        finished_ms: Some(2),
+        exit: Some(0),
+        summary: None,
+    };
+    let passed_check = faktor_core::state::CriterionVerification {
+        criterion_key: "c1".into(),
+        passed: true,
+        evidence: Some("evidence-a".into()),
+        binding: Some(CriterionBinding::RequiredCheck {
+            check_id: "rust_check".into(),
+            command_digest: faktor_core::state::command_binding_digest("cargo check"),
+        }),
+    };
+    let failed = faktor_core::state::CriterionVerification {
+        criterion_key: "c2".into(),
+        passed: false,
+        evidence: Some("evidence-b".into()),
+        binding: None,
+    };
+    let review = faktor_core::state::CriterionVerification {
+        criterion_key: "c1".into(),
+        passed: true,
+        evidence: Some("review payload".into()),
+        binding: Some(CriterionBinding::AggregateGoal),
+    };
+    let prepared = PreparedRunIntegration {
+        run_id: "basis-fold".into(),
+        task_id,
+        owner_root: dir.path().join("owner"),
+        base_root: dir.path().join("owner"),
+        candidate_root: dir.path().join("owner"),
+        base_snapshot: "a".repeat(64),
+        candidate_snapshot: "b".repeat(64),
+        changed: Vec::new(),
+        sources: Vec::new(),
+        sources_digest: String::new(),
+        staged: Vec::new(),
+    };
+    let run_with =
+        |criteria: Vec<faktor_core::state::CriterionVerification>| IntegratedRootVerification {
+            status: VerificationStatus::Passed,
+            checks: vec![check.clone()],
+            criteria,
+            changed: Vec::new(),
+            summary: "fold".into(),
+        };
+    let run = run_with(vec![passed_check.clone(), failed.clone()]);
+    let first = criterion_pass_evidence_digests(&prepared, &run);
+    assert_eq!(
+        first,
+        criterion_pass_evidence_digests(&prepared, &run),
+        "two folds of identical evidence are identical"
+    );
+    assert!(first.iter().any(|e| e.starts_with("binding:c1:")));
+    assert!(first.iter().any(|e| e.starts_with("command:c1:")));
+    assert!(first.iter().any(|e| e.starts_with("check:c1:")));
+    assert!(first.iter().any(|e| e.starts_with("evidence:c1:")));
+    assert!(
+        !first.iter().any(|e| e.contains(":c2:")),
+        "a failed criterion contributes no evidence: {first:?}"
+    );
+    // The check program is immutable evidence: changing it changes the fold.
+    let mut other_check = check.clone();
+    other_check.program = "clippy".into();
+    let other_run = IntegratedRootVerification {
+        status: VerificationStatus::Passed,
+        checks: vec![other_check],
+        criteria: vec![passed_check.clone(), failed.clone()],
+        changed: Vec::new(),
+        summary: "fold".into(),
+    };
+    assert_ne!(
+        first,
+        criterion_pass_evidence_digests(&prepared, &other_run)
+    );
+    assert_eq!(
+        reviewer_proof_basis_digest(&h, &run_with(vec![passed_check.clone()])),
+        None,
+        "no reviewer-bearing pass means an honest None"
+    );
+    let reviewer = reviewer_proof_basis_digest(&h, &run_with(vec![review.clone()])).unwrap();
+    assert!(reviewer.starts_with("blake3:"));
+    assert_eq!(
+        reviewer,
+        reviewer_proof_basis_digest(&h, &run_with(vec![review.clone()])).unwrap(),
+        "reviewer folds are deterministic"
+    );
+    let mut changed_reviewer = review.clone();
+    changed_reviewer.binding = Some(CriterionBinding::IndependentReview {
+        reviewer_id: "review-9".into(),
+    });
+    assert_ne!(
+        reviewer,
+        reviewer_proof_basis_digest(&h, &run_with(vec![changed_reviewer])).unwrap(),
+        "reviewer identity is part of the digest"
     );
 }
 
@@ -5108,6 +5742,235 @@ async fn verification_failure_leaves_owner_byte_identical() {
     let outcome = settle_orchestrated(&env, &run_id).await.expect("settle");
     assert!(!outcome.verified && !outcome.completed, "{outcome:?}");
     assert_eq!(owner_digest(&env), before);
+}
+
+/// Start a two-child isolated run over an explicit criterion set with a REAL
+/// commit completion step armed: the pre-fix defect would land AND commit.
+fn start_two_child_run_with_criteria(
+    env: &Arc<RealToolEnv>,
+    goal: &str,
+    criteria: Vec<String>,
+) -> String {
+    env.executor
+        .start_task(
+            env.parent,
+            TaskRunRequest {
+                goal: goal.to_string(),
+                work_items: two_isolated_items(),
+                criteria,
+                parent_caps: read_caps(),
+                isolated_root: env.isolated_root.clone(),
+                completion_contract: Some(faktor_core::completion::CompletionContract {
+                    include_commit: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("orchestrated start")
+        .run_id
+}
+
+/// The shared refusal harness of the two decisive landing-authority tests:
+/// every check ran green, the composed verdict is non-passing, and NOTHING
+/// may land — owner bytes, integration transaction, completion steps.
+fn assert_no_landing_at_all(
+    env: &Arc<RealToolEnv>,
+    run_id: &str,
+    before_digest: &str,
+    before_head: &str,
+) {
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    assert_eq!(
+        owner_digest(env),
+        before_digest,
+        "the owner tree digest is byte-identical"
+    );
+    assert!(
+        latest_txn(env, run_id).is_none(),
+        "no IntegrationTxnPhase::Landing row exists"
+    );
+    let revision = h.task_revision(task_id).unwrap();
+    assert!(
+        h.ledger_completion_step_statuses(task_id.raw(), revision.raw())
+            .unwrap()
+            .is_empty(),
+        "no completion step ran"
+    );
+    assert_eq!(
+        cs_head(&env.owner_root),
+        before_head,
+        "no commit completion step ran"
+    );
+    assert_ne!(
+        h.get_task(task_id).unwrap().unwrap().state,
+        TaskState::VerifiedComplete
+    );
+    assert!(
+        h.ledger_integration_record_for_task(task_id.raw())
+            .unwrap()
+            .is_none(),
+        "no integration record exists"
+    );
+}
+
+/// P0 LANDING AUTHORITY: every derived check runs GREEN, but one REQUIRED
+/// criterion's own binding fails. The composed root verdict is `Failed`, so
+/// `verify_prepared_integration` must refuse — the owner stays byte-identical,
+/// no Landing transaction row appears and no completion step (armed commit)
+/// ever runs.
+#[tokio::test]
+async fn green_checks_but_failed_criterion_never_starts_landing() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        two_child_scripts(
+            "pub fn a() -> u64 {\n    let seed: u64 = 1;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n",
+            "pub fn b() -> u64 {\n    let seed: u64 = 2;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n",
+        ),
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    env.executor
+        .set_completion_steps(Some(completion_step_runner_with(
+            dir.path(),
+            crate::runtime::completion_steps::CompletionStepsConfig::default(),
+        )));
+    let before = owner_digest(&env);
+    let before_head = cs_head(&env.owner_root);
+    let failed_key = typed_failed_file_state_criterion();
+    let run_id = start_two_child_run_with_criteria(
+        &env,
+        "green checks but a failed criterion",
+        vec![typed_land_criterion(), failed_key.clone()],
+    );
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    // The automatic settlement already had its chance: nothing landed.
+    assert_no_landing_at_all(&env, &run_id, &before, &before_head);
+    // Replay converges to the same refusal.
+    let outcome = settle_orchestrated(&env, &run_id).await.expect("settle");
+    assert!(!outcome.verified && !outcome.completed, "{outcome:?}");
+    assert_no_landing_at_all(&env, &run_id, &before, &before_head);
+    // The durable record carries the COMPOSED verdict: green checks, failed
+    // required criterion => status Failed (never Passed, never Pending).
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    let record = h
+        .list_verification_records(task_id)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.status == VerificationStatus::Failed && r.tree_hash.is_some())
+        .max_by_key(|r| r.record_id)
+        .expect("the composed Failed root record");
+    assert!(
+        !record.checks.is_empty()
+            && record
+                .checks
+                .iter()
+                .all(|c| c.status == VerificationStatus::Passed),
+        "every executed check was green: {record:?}"
+    );
+    assert!(
+        record
+            .criteria
+            .iter()
+            .any(|c| !c.passed && c.criterion_key == failed_key),
+        "the failed required criterion is recorded as not passed: {record:?}"
+    );
+}
+
+/// P0 LANDING AUTHORITY: every derived check runs GREEN, but one REQUIRED
+/// criterion carries the explicit honest-unknown binding. The composed root
+/// verdict is `Unavailable`, so landing must refuse exactly like a failure —
+/// byte-identical owner, no Landing row, no completion step.
+#[tokio::test]
+async fn green_checks_but_unavailable_criterion_never_starts_landing() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        two_child_scripts(
+            "pub fn a() -> u64 {\n    let seed: u64 = 1;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n",
+            "pub fn b() -> u64 {\n    let seed: u64 = 2;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n",
+        ),
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    cs_seed_owner(&env);
+    env.executor
+        .set_completion_steps(Some(completion_step_runner_with(
+            dir.path(),
+            crate::runtime::completion_steps::CompletionStepsConfig::default(),
+        )));
+    let before = owner_digest(&env);
+    let before_head = cs_head(&env.owner_root);
+    let unknown_key = typed_explicit_unknown_criterion();
+    let run_id = start_two_child_run_with_criteria(
+        &env,
+        "green checks but an unavailable criterion",
+        vec![typed_land_criterion(), unknown_key.clone()],
+    );
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    assert_no_landing_at_all(&env, &run_id, &before, &before_head);
+    let outcome = settle_orchestrated(&env, &run_id).await.expect("settle");
+    assert!(!outcome.verified && !outcome.completed, "{outcome:?}");
+    assert_no_landing_at_all(&env, &run_id, &before, &before_head);
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    let record = h
+        .list_verification_records(task_id)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.status == VerificationStatus::Unavailable && r.tree_hash.is_some())
+        .max_by_key(|r| r.record_id)
+        .expect("the composed Unavailable root record");
+    assert!(
+        !record.checks.is_empty()
+            && record
+                .checks
+                .iter()
+                .all(|c| c.status == VerificationStatus::Passed),
+        "every executed check was green: {record:?}"
+    );
+    assert!(
+        record
+            .criteria
+            .iter()
+            .any(|c| !c.passed && c.criterion_key == unknown_key),
+        "the unavailable required criterion is recorded as not passed: {record:?}"
+    );
+    // The new explicit variant round-trips durably across a real store reopen.
+    let record_id = record.record_id;
+    let parent = env.parent;
+    drop(h);
+    drop(env);
+    let reopened =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let h2 = reopened.get_session(parent).unwrap().unwrap();
+    let reopened_record = h2
+        .get_verification_record(record_id)
+        .unwrap()
+        .expect("the Unavailable record survives the reopen");
+    assert_eq!(
+        reopened_record.status,
+        VerificationStatus::Unavailable,
+        "the Unavailable status round-trips through the store codec"
+    );
+    let fact = h2
+        .memory_facts()
+        .unwrap()
+        .into_iter()
+        .find(|(kind, key, _)| kind == "verification" && key == "last")
+        .expect("the root verification fact");
+    let fact: serde_json::Value = serde_json::from_str(&fact.2).unwrap();
+    assert_eq!(fact["status"], "unavailable", "{fact:?}");
 }
 
 /// Point 4/5: two children diverging on the SAME path are a typed conflict
@@ -5567,6 +6430,317 @@ async fn final_owner_digest_must_equal_verified_candidate() {
 
 // ------------------------------------------------- composition unit coverage
 
+fn verdict_check(id: &str, required: bool, status: VerificationStatus) -> CheckExecution {
+    CheckExecution {
+        check: id.into(),
+        program: "cargo".into(),
+        args: vec!["check".into()],
+        category: "compile".into(),
+        required,
+        status,
+        started_ms: 1,
+        finished_ms: Some(2),
+        exit: None,
+        summary: None,
+    }
+}
+
+fn verdict_criterion(
+    criterion_key: &str,
+    passed: bool,
+    evidence: Option<&str>,
+) -> CriterionVerification {
+    CriterionVerification {
+        criterion_key: criterion_key.into(),
+        passed,
+        evidence: evidence.map(str::to_string),
+        binding: None,
+    }
+}
+
+fn required_criterion_entry(text: &str) -> String {
+    faktor_session::task::Criterion::derived(
+        text,
+        CriterionOrigin::ProjectPolicy,
+        CriterionRequirement::Required,
+        None,
+    )
+    .encode()
+}
+
+fn advisory_criterion_entry(text: &str) -> String {
+    faktor_session::task::Criterion::derived(
+        text,
+        CriterionOrigin::User,
+        CriterionRequirement::Preferred,
+        None,
+    )
+    .encode()
+}
+
+/// P0: the composer passes ONLY when every required check AND every required
+/// criterion passes; advisory verdicts never block; no unknown state ever
+/// surfaces as `Pending` (unavailable/missing evidence becomes the explicit
+/// `Unavailable`).
+#[test]
+fn compose_root_verdict_is_required_only_and_never_pending() {
+    let required_key = required_criterion_entry("the build is green");
+    let advisory_key = advisory_criterion_entry("the docs read nicely");
+    let green = vec![verdict_check(
+        "rust_check",
+        true,
+        VerificationStatus::Passed,
+    )];
+    let all_pass = vec![verdict_criterion(
+        &required_key,
+        true,
+        Some("check:rust_check"),
+    )];
+    // Control: every required check and criterion passes.
+    assert_eq!(
+        compose_root_verification_status(&green, &all_pass),
+        VerificationStatus::Passed
+    );
+    // Advisory failure (and advisory unavailability) never blocks.
+    assert_eq!(
+        compose_root_verification_status(
+            &green,
+            &[
+                verdict_criterion(&required_key, true, Some("check:rust_check")),
+                verdict_criterion(&advisory_key, false, Some("style note")),
+                verdict_criterion(&advisory_key, false, None),
+            ],
+        ),
+        VerificationStatus::Passed
+    );
+    // A required criterion with missing evidence is Unavailable, never
+    // Pending and never a pass.
+    assert_eq!(
+        compose_root_verification_status(&green, &[verdict_criterion(&required_key, false, None)]),
+        VerificationStatus::Unavailable
+    );
+    // The explicit honest-unknown binding is Unavailable even with prose
+    // "evidence".
+    let explicit_unknown = faktor_session::task::Criterion::derived(
+        "honest unknown",
+        CriterionOrigin::ProjectPolicy,
+        CriterionRequirement::Required,
+        None,
+    )
+    .with_binding(CriterionBinding::Unavailable {
+        reason: "no mechanism".into(),
+    })
+    .encode();
+    let mut unknown_verdict = verdict_criterion(&explicit_unknown, false, Some("no mechanism"));
+    unknown_verdict.binding = Some(CriterionBinding::Unavailable {
+        reason: "no mechanism".into(),
+    });
+    assert_eq!(
+        compose_root_verification_status(&green, &[unknown_verdict]),
+        VerificationStatus::Unavailable
+    );
+    // A failed required criterion with evidence is Failed.
+    assert_eq!(
+        compose_root_verification_status(
+            &green,
+            &[verdict_criterion(&required_key, false, Some("file:x.rs"))],
+        ),
+        VerificationStatus::Failed
+    );
+    // A required-check binding that resolves to nothing is missing evidence.
+    let mut unresolved = verdict_criterion(&required_key, false, Some("check:rust_check"));
+    unresolved.binding = Some(CriterionBinding::RequiredCheck {
+        check_id: "rust_check".into(),
+        command_digest: "digest-that-never-ran".into(),
+    });
+    assert_eq!(
+        compose_root_verification_status(&green, &[unresolved]),
+        VerificationStatus::Unavailable
+    );
+    // Legacy plain-text criteria stay Required (`Criterion::legacy`).
+    assert_eq!(
+        compose_root_verification_status(
+            &green,
+            &[verdict_criterion("plain legacy prose", false, Some("note"))],
+        ),
+        VerificationStatus::Failed
+    );
+    // Check side: failed => Failed; unavailable/pending => Unavailable;
+    // optional checks never block.
+    assert_eq!(
+        compose_root_verification_status(
+            &[verdict_check(
+                "rust_check",
+                true,
+                VerificationStatus::Failed
+            )],
+            &[],
+        ),
+        VerificationStatus::Failed
+    );
+    for status in [
+        VerificationStatus::Unavailable,
+        VerificationStatus::Pending,
+        VerificationStatus::Running,
+    ] {
+        assert_eq!(
+            compose_root_verification_status(&[verdict_check("rust_check", true, status)], &[]),
+            VerificationStatus::Unavailable,
+            "{status:?} must never compose Pending"
+        );
+    }
+    assert_eq!(
+        compose_root_verification_status(
+            &[
+                verdict_check("rust_check", true, VerificationStatus::Passed),
+                verdict_check("advisory_bench", false, VerificationStatus::Failed),
+            ],
+            &[verdict_criterion(&required_key, true, Some("ok"))],
+        ),
+        VerificationStatus::Passed
+    );
+    // Failure dominates unavailability when both required sides are bad.
+    assert_eq!(
+        compose_root_verification_status(
+            &[verdict_check(
+                "rust_check",
+                true,
+                VerificationStatus::Failed
+            )],
+            &[verdict_criterion(&required_key, false, None)],
+        ),
+        VerificationStatus::Failed
+    );
+}
+
+/// The no-op rule is STRICTER: on an empty aggregate change set an advisory
+/// failure also blocks (there is no check evidence to lean on).
+#[test]
+fn compose_no_op_verdict_requires_every_criterion() {
+    let required_key = required_criterion_entry("the build is green");
+    let advisory_key = advisory_criterion_entry("the docs read nicely");
+    let all_pass = vec![
+        verdict_criterion(&required_key, true, Some("check:rust_check")),
+        verdict_criterion(&advisory_key, true, Some("prose reviewed")),
+    ];
+    assert_eq!(
+        compose_no_op_root_verification_status(&[], &all_pass),
+        VerificationStatus::Passed
+    );
+    assert_eq!(
+        compose_no_op_root_verification_status(
+            &[],
+            &[verdict_criterion(&advisory_key, false, Some("style note"))],
+        ),
+        VerificationStatus::Failed,
+        "an advisory failure cannot pass the no-op rule"
+    );
+    assert_eq!(
+        compose_no_op_root_verification_status(
+            &[],
+            &[verdict_criterion(&advisory_key, false, None)],
+        ),
+        VerificationStatus::Unavailable
+    );
+    // The required-only composer, by contrast, ignores the same advisory
+    // failure.
+    assert_eq!(
+        compose_root_verification_status(
+            &[],
+            &[verdict_criterion(&advisory_key, false, Some("style note"))],
+        ),
+        VerificationStatus::Passed
+    );
+}
+
+/// The new explicit variant is a first-class durable value: a record written
+/// with `Unavailable` survives a real store reopen byte-for-byte, and the
+/// root verification fact carries its own durable tag.
+#[tokio::test]
+async fn unavailable_verdict_round_trips_through_a_store_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        vec![],
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    let parent = env.parent;
+    let h = env.manager.get_session(parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    let now = h.now_ms();
+    h.create_task(faktor_session::Task {
+        task_id,
+        session_id: parent,
+        goal: "round-trip".into(),
+        acceptance_criteria: vec![],
+        plan: vec![],
+        attachments: Vec::new(),
+        budget: faktor_session::TaskBudget::default(),
+        state: TaskState::Pending,
+        created_ms: now,
+        updated_ms: now,
+    })
+    .unwrap();
+    let record_id = h
+        .create_verification_record(
+            task_id,
+            Some("a".repeat(64)),
+            vec![CriterionVerification {
+                criterion_key: "criterion".into(),
+                passed: false,
+                evidence: Some("no objective mechanism ran".into()),
+                binding: Some(CriterionBinding::Unavailable {
+                    reason: "no objective mechanism ran".into(),
+                }),
+            }],
+            vec![verdict_check(
+                "rust_check",
+                true,
+                VerificationStatus::Unavailable,
+            )],
+            vec![],
+            vec![],
+            None,
+            VerificationStatus::Unavailable,
+            now,
+        )
+        .unwrap();
+    crate::runtime::task_executor::persist_root_verification_fact(&h, "unavailable", &[], &[])
+        .unwrap();
+    drop(h);
+    drop(env);
+    let reopened =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let h2 = reopened.get_session(parent).unwrap().unwrap();
+    let record = h2
+        .get_verification_record(record_id)
+        .unwrap()
+        .expect("the Unavailable record survives the reopen");
+    assert_eq!(record.status, VerificationStatus::Unavailable);
+    assert_eq!(
+        record.checks[0].status,
+        VerificationStatus::Unavailable,
+        "check rows round-trip the variant too"
+    );
+    assert_eq!(
+        record.criteria[0].binding,
+        Some(CriterionBinding::Unavailable {
+            reason: "no objective mechanism ran".into()
+        })
+    );
+    let fact = h2
+        .memory_facts()
+        .unwrap()
+        .into_iter()
+        .find(|(kind, key, _)| kind == "verification" && key == "last")
+        .expect("the root verification fact");
+    let fact: serde_json::Value = serde_json::from_str(&fact.2).unwrap();
+    assert_eq!(fact["status"], "unavailable");
+}
+
 fn unit_cs(
     child: &str,
     files: Vec<crate::runtime::merge::ChangeEntry>,
@@ -5817,13 +6991,62 @@ async fn tournament_winner_lands_through_the_one_pipeline() {
     assert_eq!(integrated.source_count, 1, "{integrated:?}");
     assert_eq!(integrated.sources[0].child_id, "child-1");
     assert!(!integrated.final_snapshot_hash.is_empty());
+    // Hardening: the explicit identity fields are populated from the run's
+    // real base/candidate/landed snapshots — and the overloaded
+    // `base_revision` (formerly derived from `sources.first()`) stays
+    // unpopulated.
+    assert!(
+        integrated.base_revision.is_none(),
+        "sources.first() derivation is gone: {integrated:?}"
+    );
+    assert_eq!(
+        integrated.base_snapshot, integrated.run_base_snapshot,
+        "deprecated alias and explicit run base agree"
+    );
+    assert!(integrated.run_base_snapshot.is_some());
+    assert!(integrated.candidate_snapshot.is_some());
+    assert_eq!(
+        integrated.landed_snapshot.as_deref(),
+        Some(integrated.final_snapshot_hash.as_str()),
+        "landed identity equals the finalized snapshot"
+    );
+    let (txn, txn_id) = {
+        let h = env.manager.get_session(env.parent).unwrap().unwrap();
+        let txn = h
+            .ledger_integration_txn_for_run(&receipt.run_id)
+            .unwrap()
+            .unwrap();
+        (txn.clone(), txn.txn_id())
+    };
+    assert_eq!(
+        integrated.integration_txn_id.as_deref(),
+        Some(txn_id.as_str()),
+        "the record names the exact landing transaction: {txn:?}"
+    );
+    let basis_digest = {
+        let h = env.manager.get_session(env.parent).unwrap().unwrap();
+        let task_id = h.task_id().unwrap();
+        h.list_verification_records(task_id)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.status == VerificationStatus::Passed)
+            .max_by_key(|r| r.record_id)
+            .and_then(|r| r.environment_fingerprint.and_then(|f| f.proof_basis_digest))
+            .expect("the passing root record carries its proof basis")
+    };
+    assert_eq!(
+        integrated.proof_basis_digest.as_deref(),
+        Some(basis_digest.as_str()),
+        "the integration record binds the exact verification basis"
+    );
 }
 
 /// P1 binary attachments: a stored `AttachmentId` set admits durably on the
 /// task row AND the run's linkage row (SEPARATE from `files`), survives a
 /// store reopen, and an unknown digest is refused BEFORE any run/task row —
-/// no partial durable admission. Image ids are refused loudly by the shared
-/// rule (provider media/content parts are not wired).
+/// no partial durable admission. Image ids are structurally valid here;
+/// model-aware delivery (vision/mime/size) is validated at the server DTO
+/// and resolved into media parts at agent request construction.
 #[tokio::test]
 async fn binary_attachments_admit_durably_and_unknown_digests_leave_no_run() {
     let dir = tempfile::tempdir().unwrap();
@@ -5887,11 +7110,11 @@ async fn binary_attachments_admit_durably_and_unknown_digests_leave_no_run() {
         b"%PDF-1.4 spec"
     );
 
-    // Image ids are refused loudly by the shared admission rule (no
-    // provider media/content parts exist to carry bytes to a provider).
+    // Image ids are structurally valid at this layer; the server DTO gates
+    // delivery on the chosen model's vision capability and the adapters
+    // encode the resolved bytes per wire.
     let image = h2
         .put_attachment("image/png", Some("shot.png"), b"\x89PNG")
         .unwrap();
-    let err = crate::runtime::validate_attachment_ids(&[image]).expect_err("images refused");
-    assert!(err.to_string().contains("provider media"), "{err}");
+    crate::runtime::validate_attachment_ids(&[image]).expect("image id is structurally valid");
 }

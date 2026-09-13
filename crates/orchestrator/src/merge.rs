@@ -967,6 +967,32 @@ pub(crate) fn compute_change_entries(
     Ok(entries)
 }
 
+/// The first change entry of an `ExclusivePaths` child that falls OUTSIDE
+/// its declared exclusive path set (component-boundary containment over
+/// [`faktor_core::NormalizedWorkspacePath`]s). An entry exactly at or below
+/// a declared path is inside; an empty declared set refuses every change,
+/// and an entry that cannot be canonicalized (traversal/alias/absolute
+/// spelling) is ALWAYS outside — the write-boundary check fails closed.
+/// Pure and order-stable: entries are path-sorted by
+/// [`compute_change_entries`].
+fn out_of_scope_change(files: &[ChangeEntry], declared: &[String]) -> Option<String> {
+    use faktor_core::NormalizedWorkspacePath;
+    let declared: Vec<NormalizedWorkspacePath> = declared
+        .iter()
+        .filter_map(|p| NormalizedWorkspacePath::new(p).ok())
+        .collect();
+    files.iter().find_map(|entry| {
+        let inside = NormalizedWorkspacePath::new(&entry.path.to_string_lossy())
+            .map(|path| declared.iter().any(|allowed| allowed.covers(&path)))
+            .unwrap_or(false);
+        if inside {
+            None
+        } else {
+            Some(entry.path.to_string_lossy().into_owned())
+        }
+    })
+}
+
 // -------------------------------------------------- multi-child composition
 
 /// One child's change to one path, with the child provenance retained.
@@ -1251,7 +1277,10 @@ impl OrchestratorRuntime {
         owner_root: &Path,
         child: &ChildRuntime,
     ) -> Result<String, ExecError> {
-        if child.ownership != ChildOwnership::IsolatedWorktree {
+        if !matches!(
+            child.ownership,
+            ChildOwnership::IsolatedWorktree | ChildOwnership::ExclusivePaths
+        ) {
             return Ok(base_id_of(&child.child_id));
         }
         let parent_snap = faktor_fs::snapshot_tree(owner_root, MAX_BASE_ENTRIES).map_err(|e| {
@@ -1451,9 +1480,12 @@ impl OrchestratorRuntime {
                 child.state
             )));
         }
-        if child.ownership != ChildOwnership::IsolatedWorktree {
+        if !matches!(
+            child.ownership,
+            ChildOwnership::IsolatedWorktree | ChildOwnership::ExclusivePaths
+        ) {
             return Err(ExecError::InvalidState(format!(
-                "cannot stage child {child_id}: only IsolatedWorktree children own a change set (ownership {:?}); ExclusivePaths changes already live in the shared parent tree by wave-12 semantics",
+                "cannot stage child {child_id}: only children owning an isolated overlay (IsolatedWorktree/ExclusivePaths) own a change set (ownership {:?})",
                 child.ownership
             )));
         }
@@ -1486,11 +1518,43 @@ impl OrchestratorRuntime {
         let start_map = read_base_map(&self.manager, parent, &run, child_id, "start")?;
         let start_map = start_map.unwrap_or_default();
         let child_dir = self.child_worktree_dir(&child)?;
+        // Legacy rows (durable state written before ExclusivePaths became an
+        // overlay mode) have no recorded spawn base and their worktree IS
+        // the shared owner checkout: staging them as an overlay would
+        // misread the owner as candidate content. Typed refusal — a legacy
+        // run is re-planned under isolation, never silently reinterpreted.
+        if child.ownership == ChildOwnership::ExclusivePaths {
+            if child.base_snapshot_id.is_none() {
+                return Err(ExecError::ExclusivePathViolation(format!(
+                    "exclusive child {child_id} records no spawn base snapshot; a legacy shared-owner row is not an overlay and is refused (re-run the plan under isolation)"
+                )));
+            }
+            let owner_root = self.plan_row(parent, &run)?.owner.root;
+            if child_dir == owner_root {
+                return Err(ExecError::ExclusivePathViolation(format!(
+                    "exclusive child {child_id} owns the shared owner worktree {:?}, not an isolated overlay; a legacy shared-owner row is refused",
+                    child_dir.display()
+                )));
+            }
+        }
         let now_snap = faktor_fs::snapshot_tree(&child_dir, MAX_BASE_ENTRIES)
             .map_err(|e| ExecError::from_fs("snapshot of the child worktree", &child_dir, e))?;
         let now: Vec<(PathBuf, FileHash)> =
             now_snap.iter().map(|e| (e.path.clone(), e.hash)).collect();
         let files = compute_change_entries(child_id, &start_map, &now, &parent_map)?;
+        // ExclusivePaths: the declared write set is a HARD boundary inside
+        // the overlay. If the overlay staged a path outside it (a tool that
+        // bypassed the edit-gate allowlist, a hostile writer), the change
+        // set is refused entirely — nothing outside the declared ownership
+        // ever composes into a candidate or lands.
+        if child.ownership == ChildOwnership::ExclusivePaths {
+            if let Some(path) = out_of_scope_change(&files, &child.ownership_paths) {
+                return Err(ExecError::ExclusivePathViolation(format!(
+                    "child {child_id} staged {path:?}, outside its declared exclusive paths {:?}",
+                    child.ownership_paths
+                )));
+            }
+        }
         let cs = ChangeSet {
             child_id: child_id.to_string(),
             base_id: child
@@ -1673,9 +1737,12 @@ impl OrchestratorRuntime {
                 child.state
             )));
         }
-        if child.ownership != ChildOwnership::IsolatedWorktree {
+        if !matches!(
+            child.ownership,
+            ChildOwnership::IsolatedWorktree | ChildOwnership::ExclusivePaths
+        ) {
             return Err(ExecError::InvalidState(format!(
-                "cannot merge child {child_id}: only IsolatedWorktree children own a change set (ownership {:?})",
+                "cannot merge child {child_id}: only children owning an isolated overlay (IsolatedWorktree/ExclusivePaths) own a change set (ownership {:?})",
                 child.ownership
             )));
         }

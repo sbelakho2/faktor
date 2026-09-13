@@ -459,8 +459,9 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
         // Native binary attachments (additive, strict): upload ONE bounded
         // payload into the session's durable CAS-backed store, resolve its
         // typed metadata by digest, and fetch the verified bytes. IMAGES are
-        // refused loudly with code `unsupported` until provider
-        // media/content parts can carry bytes to a model.
+        // stored here and validated against the CHOSEN model's capabilities
+        // (vision, deliverable mime, per-provider byte bound) at task
+        // admission, where a refusal keeps the draft and bytes intact.
         .route(
             "/native/session/{id}/attachments",
             post(native_attachment_upload),
@@ -9067,6 +9068,11 @@ mod tests {
             task_id: 7,
             base_revision: None,
             base_snapshot: Some("33".repeat(32)),
+            run_base_snapshot: Some("33".repeat(32)),
+            candidate_snapshot: Some("44".repeat(32)),
+            landed_snapshot: Some("44".repeat(32)),
+            proof_basis_digest: None,
+            integration_txn_id: None,
             final_root: "/ver-a".into(),
             final_snapshot_hash: "44".repeat(32),
             integrated_files: vec!["src/lib.rs".into()],

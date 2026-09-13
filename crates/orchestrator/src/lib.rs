@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod caps;
+pub mod proof_probe;
 pub mod runtime;
 pub mod tournament;
 

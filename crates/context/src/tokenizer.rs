@@ -38,7 +38,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use faktor_provider::TokenizerId;
+use faktor_provider::{TokenFamily, TokenizerId};
 
 use crate::estimator::Estimator;
 use crate::{TokenCache, TokenEstimate, TokenEstimateKind};
@@ -50,6 +50,60 @@ use crate::{TokenCache, TokenEstimate, TokenEstimateKind};
 /// the cap are counted by the conservative generic estimator and labeled
 /// [`TokenEstimateKind::UpperBound`](crate::TokenEstimateKind::UpperBound).
 pub const MAX_EXACT_BYTES: usize = 1 << 20;
+
+/// The ONE locally implemented vocabulary version of each OpenAI family:
+/// `o200k_base@v1` and `cl100k_base@v1` (the tiktoken assets embedded in the
+/// binary). A family version ABOVE the implemented one has NO local
+/// vocabulary at all — see [`TokenizerSelectionError`].
+pub const O200K_IMPLEMENTED_VERSION: u32 = 1;
+/// See [`O200K_IMPLEMENTED_VERSION`].
+pub const CL100K_IMPLEMENTED_VERSION: u32 = 1;
+
+/// Typed refusal of an exact-tokenizer selection. There is deliberately NO
+/// silently selectable fallback for an unimplemented OpenAI vocabulary
+/// version: `o200k_base@v2` (or any future bump) has different merge rules
+/// from v1, so neither v1 counts nor a relabeled estimator may masquerade as
+/// the model's tokenizer. The accounting path may still budget with the
+/// conservative estimator, but SELECTION is refused here and callers that
+/// need an exact backend must handle the typed error.
+///
+/// Why v2 is not implemented: the workspace embeds exactly the tiktoken
+/// `o200k_base`/`cl100k_base` v1 vocabularies (`tiktoken-rs`, offline); no
+/// v2 vocabulary artifact exists locally, and a fabricated vocabulary would
+/// be a verification hazard (counts that look exact but are not). Choosing
+/// "unselectable" keeps every v2 count honestly labeled, and a future
+/// vocabulary ships by bumping [`O200K_IMPLEMENTED_VERSION`] together with
+/// its asset.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TokenizerSelectionError {
+    /// The identity names a family generation with no local vocabulary. The
+    /// requested version is NOT counted through the older generation's
+    /// vocabulary.
+    #[error(
+        "{family} version {requested} is not implemented locally (implemented: {implemented}); refusing a silent fallback that could distort context accounting"
+    )]
+    UnsupportedVersion {
+        family: TokenFamily,
+        requested: u32,
+        implemented: u32,
+    },
+}
+
+impl TokenizerSelectionError {
+    /// The family whose version is unsupported.
+    pub fn family(&self) -> TokenFamily {
+        match self {
+            Self::UnsupportedVersion { family, .. } => *family,
+        }
+    }
+
+    /// The requested (unsupported) version.
+    pub fn requested_version(&self) -> u32 {
+        match self {
+            Self::UnsupportedVersion { requested, .. } => *requested,
+        }
+    }
+}
 
 /// A local tokenizer implementation with a stable versioned identity.
 ///
@@ -108,7 +162,8 @@ impl TiktokenTokenizer {
     /// ([`TokenizerId::O200K_BASE`], [`TokenizerId::CL100K_BASE`]) with the
     /// default [`MAX_EXACT_BYTES`] cap. Any other family or version returns
     /// `None` (unknown identities must fall back conservatively — a version
-    /// bump never silently reuses the old vocabulary's counts).
+    /// bump never silently reuses the old vocabulary's counts); notably
+    /// `o200k_base@v2` is NOT selectable through this constructor.
     pub fn new(id: TokenizerId) -> Option<Self> {
         Self::with_max_exact_bytes(id, MAX_EXACT_BYTES)
     }
@@ -192,14 +247,61 @@ impl TokenizerRegistry {
         self.tokenizers.contains_key(&id)
     }
 
-    /// Count `text` under `id`: the registered exact backend when one
-    /// exists, otherwise the conservative generic estimator labeled
-    /// `UpperBound`.
-    pub fn count(&self, id: TokenizerId, text: &str) -> TokenEstimate {
-        match self.resolve(id) {
-            Some(tokenizer) => tokenizer.count(text),
-            None => ConservativeEstimatorTokenizer::new(id).count(text),
+    /// Select the tokenizer for `id`, TYPED:
+    ///
+    /// - a registered exact backend wins;
+    /// - a family with NO local vocabulary at all (Anthropic/Gemini/Llama/
+    ///   GenericEstimator) resolves to the conservative estimator — an
+    ///   explicit [`TokenEstimateKind::UpperBound`] contract, never exact;
+    /// - an OpenAI family (`o200k_base`/`cl100k_base`) whose requested
+    ///   version has no local vocabulary is [`TokenizerSelectionError::
+    ///   UnsupportedVersion`]: the older generation's vocabulary is NEVER
+    ///   silently substituted, because that would silently distort every
+    ///   context-accounting number computed for the new model.
+    pub fn select(&self, id: TokenizerId) -> Result<Arc<dyn Tokenizer>, TokenizerSelectionError> {
+        if let Some(exact) = self.resolve(id) {
+            return Ok(exact);
         }
+        match id.family {
+            TokenFamily::O200kBase => Err(TokenizerSelectionError::UnsupportedVersion {
+                family: TokenFamily::O200kBase,
+                requested: id.version,
+                implemented: O200K_IMPLEMENTED_VERSION,
+            }),
+            TokenFamily::Cl100kBase => Err(TokenizerSelectionError::UnsupportedVersion {
+                family: TokenFamily::Cl100kBase,
+                requested: id.version,
+                implemented: CL100K_IMPLEMENTED_VERSION,
+            }),
+            _ => Ok(Arc::new(ConservativeEstimatorTokenizer::new(id))),
+        }
+    }
+
+    /// Count `text` under `id`: the registered exact backend when one
+    /// exists, the conservative generic estimator for no-vocabulary
+    /// families, and — for an unimplemented OpenAI generation — the
+    /// conservative estimator labeled `UpperBound`. This infallible
+    /// streaming path never substitutes the older generation's exact
+    /// vocabulary; callers that must distinguish "exact" from "estimated"
+    /// use [`Self::select`] / [`Self::count_checked`] and get the typed
+    /// [`TokenizerSelectionError`].
+    pub fn count(&self, id: TokenizerId, text: &str) -> TokenEstimate {
+        match self.select(id) {
+            Ok(tokenizer) => tokenizer.count(text),
+            Err(_) => ConservativeEstimatorTokenizer::new(id).count(text),
+        }
+    }
+
+    /// [`Self::count`] with the selection refusal surfaced: an unimplemented
+    /// OpenAI vocabulary version is the typed error, never a relabeled
+    /// count.
+    pub fn count_checked(
+        &self,
+        id: TokenizerId,
+        text: &str,
+    ) -> Result<TokenEstimate, TokenizerSelectionError> {
+        let tokenizer = self.select(id)?;
+        Ok(tokenizer.count(text))
     }
 
     /// Number of registered exact backends.
@@ -470,14 +572,6 @@ fn main() {
             TokenizerId::LLAMA,
             TokenizerId::GENERIC_ESTIMATOR,
             TokenizerId {
-                family: TokenFamily::O200kBase,
-                version: 2, // not implemented: v1 vocab only
-            },
-            TokenizerId {
-                family: TokenFamily::Cl100kBase,
-                version: 0xDEAD_BEEF,
-            },
-            TokenizerId {
                 family: TokenFamily::GenericEstimator,
                 version: 0,
             },
@@ -490,6 +584,117 @@ fn main() {
             );
             assert_eq!(got.kind, TokenEstimateKind::UpperBound);
         }
+    }
+
+    /// The hardening choice for `o200k_base@v2` (and every unimplemented
+    /// OpenAI generation): UNSELECTABLE with a typed error. The v1
+    /// vocabulary is never silently substituted for v2, because that would
+    /// silently distort every context number computed for a v2 model.
+    #[test]
+    fn o200k_v2_is_typed_unselectable_and_never_counts_as_v1() {
+        let registry = TokenizerRegistry::with_builtin_backends();
+        let v2 = TokenizerId {
+            family: TokenFamily::O200kBase,
+            version: 2,
+        };
+        assert!(!registry.is_registered(v2));
+        assert!(registry.resolve(v2).is_none());
+        assert!(TiktokenTokenizer::new(v2).is_none());
+        match registry.select(v2) {
+            Err(err) => {
+                assert_eq!(err.family(), TokenFamily::O200kBase);
+                assert_eq!(err.requested_version(), 2);
+                assert!(
+                    err.to_string().contains("not implemented")
+                        && err.to_string().contains("distort"),
+                    "typed refusal names the reason: {err}"
+                );
+            }
+            Ok(_) => panic!("o200k_base@v2 must never be selectable"),
+        }
+        let text = "fn main() { println!(\"v2 must not reuse v1\"); }";
+        assert!(registry.count_checked(v2, text).is_err());
+        // The infallible streaming path is an explicitly labeled estimator,
+        // never the v1 exact count.
+        let fallback = registry.count(v2, text);
+        assert_eq!(fallback.kind, TokenEstimateKind::UpperBound);
+        assert_eq!(fallback.count, estimator_count(text));
+        let v1 = registry.count(TokenizerId::O200K_BASE, text);
+        assert_eq!(v1.kind, TokenEstimateKind::Exact);
+        assert_ne!(
+            fallback.count, v1.count,
+            "v2 must not silently reuse v1's exact count"
+        );
+        // Symmetric hardening for cl100k generations.
+        for version in [0, 2, 0xDEAD_BEEF] {
+            let id = TokenizerId {
+                family: TokenFamily::Cl100kBase,
+                version,
+            };
+            assert!(registry.select(id).is_err(), "{id}");
+            assert!(registry.count_checked(id, text).is_err(), "{id}");
+        }
+        // No-vocabulary families stay explicitly selectable as conservative
+        // estimators (the documented fallback contract — never exact).
+        for id in [TokenizerId::ANTHROPIC, TokenizerId::GEMINI] {
+            let selected = registry.select(id).expect("conservative backend");
+            assert_eq!(selected.count(text).kind, TokenEstimateKind::UpperBound);
+        }
+    }
+
+    /// Correctness of the real embedded BPE: exact counts for canonical
+    /// strings whose tokenization is fixed by the frozen `o200k_base` /
+    /// `cl100k_base` vocabularies, plus byte-exact decode round-trips (a
+    /// real vocabulary is invertible; a heuristic estimator is not).
+    #[test]
+    fn embedded_bpe_matches_known_token_counts_and_round_trips() {
+        let o200k = TiktokenTokenizer::new(TokenizerId::O200K_BASE).unwrap();
+        let cl100k = TiktokenTokenizer::new(TokenizerId::CL100K_BASE).unwrap();
+        // Canonical OpenAI vocabulary facts: "hello world" is 2 tokens and
+        // "hello" is 1 token under BOTH frozen vocabularies.
+        for (tokenizer, family) in [(&o200k, "o200k_base"), (&cl100k, "cl100k_base")] {
+            assert_eq!(
+                tokenizer.count("hello world"),
+                TokenEstimate::exact(2),
+                "{family}"
+            );
+            assert_eq!(
+                tokenizer.count("hello"),
+                TokenEstimate::exact(1),
+                "{family}"
+            );
+            assert_eq!(tokenizer.count(""), TokenEstimate::exact(0), "{family}");
+            // Invertibility on a mixed corpus: decode(encode(x)) == x.
+            for text in [
+                "hello world",
+                "fn main() { println!(\"hi\"); }",
+                "汉字😀 mixed 123",
+                "the quick brown fox jumps over the lazy dog",
+                "x".repeat(2000).as_str(),
+            ] {
+                let tokens = tokenizer.bpe.encode_with_special_tokens(text);
+                assert_eq!(
+                    tokenizer.bpe.decode(&tokens).unwrap(),
+                    text,
+                    "{family} round-trip failed for {text:?}"
+                );
+                assert_eq!(
+                    tokenizer.count(text),
+                    TokenEstimate::exact(tokens.len() as u64),
+                    "{family} count must be the real BPE length"
+                );
+            }
+        }
+        // The families are different vocabularies (a shared backend bug
+        // would be silent mis-accounting): a corpus where the counts differ.
+        let corpus = [
+            "fn main() { let x = 1; } // quick brown fox",
+            "def calculate_total(items, tax_rate=0.2):",
+            "汉字与😀混排的样本",
+        ];
+        assert!(corpus
+            .iter()
+            .any(|text| { o200k.count(text).count != cl100k.count(text).count }));
     }
 
     #[test]

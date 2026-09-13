@@ -53,6 +53,11 @@ use faktor_provider::{
     ProviderError, ProviderErrorKind, ProviderStream, RequestMessage, Role,
 };
 
+/// Documented OpenAI per-image ceiling for chat/responses image parts
+/// (raw bytes before base64 inflation). The agent/admission paths stay at
+/// the daemon default unless this adapter's value authorizes more.
+pub const OPENAI_MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAiFamily {
     /// POST /chat/completions (OpenAI, DeepSeek, most compatible servers).
@@ -245,6 +250,15 @@ fn lower_role_message(
                             "image_url": { "url": url }
                         }));
                     }
+                    ContentKind::ImageData { mime, data } => {
+                        // Resolved attachment bytes: Chat Completions takes a
+                        // data URL under the same `image_url` shape as a
+                        // remote URL.
+                        content.push(serde_json::json!({
+                            "type": "image_url",
+                            "image_url": { "url": data.to_data_url(mime) }
+                        }));
+                    }
                     _ => {} // reasoning/tool parts are not user wire content
                 }
             }
@@ -399,6 +413,14 @@ pub fn responses_body(req: &GenericAgentRequest) -> serde_json::Value {
                             content.push(serde_json::json!({
                                 "type": "input_image",
                                 "image_url": url,
+                            }));
+                        }
+                        ContentKind::ImageData { mime, data } => {
+                            // Resolved attachment bytes: the native Responses
+                            // `input_image` part accepts a data URL.
+                            content.push(serde_json::json!({
+                                "type": "input_image",
+                                "image_url": data.to_data_url(mime),
                             }));
                         }
                         _ => {}
@@ -1021,11 +1043,24 @@ impl Provider for OpenAiProvider {
         }
     }
 
+    fn max_image_bytes(&self) -> usize {
+        OPENAI_MAX_IMAGE_BYTES
+    }
+
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
         let deadlines = stream_deadlines(&req);
         let cancel = req.meta.cancellation.clone();
         let transport = self.transport.clone();
         let headers = authorization_headers(self.config.api_key.as_deref());
+        // Delivery gate BEFORE any wire decision: vision capability, image
+        // mime allowlist and the provider's per-image byte bound. A refusal
+        // is a typed terminal error frame (nothing was sent).
+        let caps = self.capabilities(&req.model);
+        if let Err(e) =
+            faktor_provider::validate_media_delivery(&req, &caps, self.max_image_bytes())
+        {
+            return faktor_provider::provider_error_stream(e);
+        }
         // The family decides the wire body AND the endpoint + parser pair.
         let body = self.wire_body(&req);
         match self.config.family {
@@ -1495,6 +1530,160 @@ mod tests {
             }
         }
         assert_eq!(texts, "ok");
+    }
+
+    /// Resolved image attachments lower BYTE-EXACTLY on both wire families:
+    /// Chat gets `image_url` with a base64 data URL, Responses gets
+    /// `input_image` with the same data URL. The base64 and media type are
+    /// asserted exactly, not approximately.
+    #[tokio::test]
+    async fn image_data_lowers_byte_exact_on_chat_and_responses() {
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 7, 8, 9];
+        let media = faktor_provider::MediaBytes::new(png.clone()).unwrap();
+        let expected_url = media.to_data_url("image/png");
+        assert_eq!(
+            expected_url,
+            format!("data:image/png;base64,{}", media.to_base64()),
+            "the data URL is the standard-alphabet base64 of the raw bytes"
+        );
+        // Chat family.
+        let server = MockServer::new();
+        let expected_chat = expected_url.clone();
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::AssertThenRespond {
+                status: 200,
+                body: sse_body(&[
+                    serde_json::json!({"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}),
+                ]),
+                assert: Arc::new(move |body: &serde_json::Value| {
+                    assert_eq!(
+                        body["messages"][1]["content"],
+                        serde_json::json!([
+                            { "type": "text", "text": "look" },
+                            {
+                                "type": "image_url",
+                                "image_url": { "url": expected_chat }
+                            }
+                        ]),
+                        "Chat image lowering must be byte-exact"
+                    );
+                }),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        assert_eq!(provider.max_image_bytes(), OPENAI_MAX_IMAGE_BYTES);
+        let mut r = req("m1");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::text("look"),
+                ContentPart::image_data("image/png", png.clone()).unwrap(),
+            ],
+        });
+        let mut stream = provider.stream(r);
+        while let Some(chunk) = stream.next().await {
+            if matches!(chunk.unwrap(), ProviderChunk::Done) {
+                break;
+            }
+        }
+        assert_eq!(server.request_count(), 1);
+
+        // Responses family: the native item protocol.
+        let server = MockServer::new();
+        let expected_responses = expected_url.clone();
+        server.route(
+            "POST",
+            "/responses",
+            MockAction::AssertThenRespond {
+                status: 200,
+                body: sse_body(&[
+                    serde_json::json!({"type":"response.output_text.delta","delta":"ok"}),
+                    serde_json::json!({"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}),
+                ]),
+                assert: Arc::new(move |body: &serde_json::Value| {
+                    assert_eq!(
+                        body["input"][1]["content"],
+                        serde_json::json!([
+                            { "type": "input_text", "text": "look" },
+                            {
+                                "type": "input_image",
+                                "image_url": expected_responses
+                            }
+                        ]),
+                        "Responses image lowering must be byte-exact"
+                    );
+                }),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OpenAiProvider::build(OpenAiConfig::responses(base, None));
+        let mut r = req("m1");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::text("look"),
+                ContentPart::image_data("image/png", png).unwrap(),
+            ],
+        });
+        let mut stream = provider.stream(r);
+        while let Some(chunk) = stream.next().await {
+            if matches!(chunk.unwrap(), ProviderChunk::Done) {
+                break;
+            }
+        }
+        assert_eq!(server.request_count(), 1);
+    }
+
+    /// A vision-less model and an over-bound image are refused by the
+    /// adapter delivery gate BEFORE any wire byte (request count stays 0).
+    #[tokio::test]
+    async fn image_delivery_gate_is_typed_and_pre_wire() {
+        let server = MockServer::new();
+        let base = server.base_url().await;
+        let provider = OpenAiProvider::build(OpenAiConfig::chat(base.clone(), None).with_model(
+            "m1",
+            ModelCapabilities {
+                vision: false,
+                ..Default::default()
+            },
+        ));
+        let mut r = req("m1");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::image_data("image/png", vec![0x89, b'P', b'N', b'G']).unwrap(),
+            ],
+        });
+        let err = provider.stream(r).next().await.unwrap().unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
+        assert!(err.message.contains("vision"), "{err}");
+        assert_eq!(server.request_count(), 0, "no wire byte on a gate refusal");
+
+        // Over the provider's own per-image bound: typed, pre-wire.
+        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let mut r = req("m1");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![ContentPart {
+                kind: ContentKind::ImageData {
+                    mime: "image/png".into(),
+                    data: faktor_provider::MediaBytes::new(vec![0u8; OPENAI_MAX_IMAGE_BYTES + 1])
+                        .unwrap(),
+                },
+                tool_call_id: None,
+            }],
+        });
+        let err = provider.stream(r).next().await.unwrap().unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
+        assert!(err.message.contains("exceeds"), "{err}");
+        assert_eq!(
+            server.request_count(),
+            0,
+            "no wire byte on an oversize refusal"
+        );
     }
 
     #[test]

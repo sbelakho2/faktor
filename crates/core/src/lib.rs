@@ -26,6 +26,7 @@ pub mod hash;
 pub mod id;
 pub mod model;
 pub mod op;
+pub mod path;
 pub mod resource;
 pub mod retry;
 pub mod state;
@@ -52,6 +53,9 @@ pub use hash::FileHash;
 pub use id::{EventSeq, OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
 pub use model::{ModelCapabilities, ReasoningMode};
 pub use op::{EffectStatus, OpMeta, OpState, RecoveryStrategy};
+pub use path::{
+    NormalizedWorkspacePath, PathViolation, PathViolationKind, MAX_NORMALIZED_WORKSPACE_PATH_BYTES,
+};
 pub use resource::{ResourceClass, ResourceLimits};
 pub use retry::{RetryClass, RetryPolicy};
 pub use state::{AgentState, SessionLifecycle, StateMachine};

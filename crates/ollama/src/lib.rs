@@ -1015,6 +1015,14 @@ fn lower_native_message(
                 let a = acc.as_mut().expect("switch_role guarantees an accumulator");
                 a.images.push(native_image_payload(url));
             }
+            ContentKind::ImageData { data, .. } => {
+                // Resolved attachment bytes: native /api/chat takes raw
+                // base64 (no data-URI prefix) — the same shape the legacy
+                // URL path strips down to.
+                switch_role(&mut acc, &mut out, role_name(&m.role));
+                let a = acc.as_mut().expect("switch_role guarantees an accumulator");
+                a.images.push(data.to_base64());
+            }
         }
     }
     flush_native(&mut acc, &mut out);
@@ -1549,6 +1557,46 @@ mod tests {
             body["messages"][1]["images"],
             serde_json::Value::Null,
             "image-less messages omit images"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_image_data_lowers_to_native_base64_array() {
+        // Resolved `ImageData` parts lower to the SAME native `images`
+        // array as a data-URI URL: raw standard base64, no prefix.
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 1, 2, 3];
+        let expected = faktor_provider::MediaBytes::new(png.clone())
+            .unwrap()
+            .to_base64();
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/api/chat",
+            MockAction::Respond {
+                status: 200,
+                body: r#"{"done":true}"#.into(),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OllamaProvider::build(OllamaConfig::new(Some(base)));
+        let mut r = req("qwen3.8");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::text("what is this?"),
+                ContentPart::image_data("image/png", png).unwrap(),
+            ],
+        });
+        let chunks = stream_chunks(&*provider, r).await;
+        assert!(matches!(chunks.last(), Some(ProviderChunk::Done)));
+        let (_, _, raw) = server.last_request().unwrap();
+        let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let msg = &body["messages"][2];
+        assert_eq!(msg["content"], "what is this?");
+        assert_eq!(
+            msg["images"],
+            serde_json::json!([expected]),
+            "resolved bytes lower byte-exactly to raw base64"
         );
     }
 

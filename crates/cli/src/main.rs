@@ -1280,6 +1280,83 @@ async fn serve(port: u16, data_dir: PathBuf, config_path: Option<PathBuf>) {
     }
 }
 
+/// Daemon startup verification recovery sweep (audit P0-5/26 production
+/// wiring): every session's stale `Running` verification jobs are re-queued
+/// before the executor starts, so a check whose executor died mid-run is
+/// retried honestly — never silently dropped, never a pass. Runs BEFORE
+/// readiness is announced, like every other crash-recovery step.
+fn recover_verification_jobs_at_startup(session: &Arc<faktor_session::SessionManager>) {
+    let ids = match session.store().session_ids() {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::error!("verification recovery could not scan sessions: {e}");
+            return;
+        }
+    };
+    let (mut requeued, mut orphaned, mut touched) = (0usize, 0usize, 0usize);
+    for sid in ids {
+        let Ok(Some(handle)) = session.get_session(sid) else {
+            continue;
+        };
+        match handle.recover_verification_jobs_after_restart() {
+            Ok(report) if report.requeued + report.orphaned > 0 => {
+                requeued += report.requeued;
+                orphaned += report.orphaned;
+                touched += 1;
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("verification recovery for session {sid} failed: {e}"),
+        }
+    }
+    if requeued + orphaned > 0 {
+        tracing::info!(
+            "verification recovery: {requeued} stale job(s) requeued, {orphaned} orphaned across {touched} session(s)"
+        );
+    }
+}
+
+/// The daemon verification executor (audit P0-5/26 production wiring): a
+/// background loop that claims Queued durable verification jobs of every
+/// session, executes them through the REAL [`faktor_agent::AgentRuntime`]
+/// execution primitive (claim -> execute -> resolve), and then re-settles a
+/// run whose EXACT root verification attempt became terminal. Without this
+/// executor a pending attempt would only ever settle on the next genuine
+/// turn; with it, an ordinary background check resolves asynchronously and
+/// the task's completion waits for exactly that result.
+fn spawn_verification_executor(graph: &DaemonGraph) -> tokio::task::JoinHandle<()> {
+    let session = graph.session.clone();
+    let agent = graph.agent.clone();
+    let tasks = graph.tasks.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let ids = match session.store().session_ids() {
+                Ok(ids) => ids,
+                Err(_) => continue,
+            };
+            for sid in ids {
+                let Ok(Some(handle)) = session.get_session(sid) else {
+                    continue;
+                };
+                let resolved = match agent.execute_open_verification_jobs(&handle).await {
+                    Ok(resolved) => resolved,
+                    // No current attempt / unresolvable root: nothing to
+                    // execute (never an error loop).
+                    Err(_) => continue,
+                };
+                if resolved == 0 {
+                    continue;
+                }
+                if let Err(e) = tasks.settle_resolved_verifications(sid).await {
+                    tracing::warn!("post-executor settlement of session {sid} failed: {e}");
+                }
+            }
+        }
+    })
+}
+
 /// Shared daemon serve core (audit 44 ordering): `agent.recover()` -> bind
 /// -> print the frozen startup line -> spawn the gated backup task. A backup
 /// can NEVER delay readiness: the task is spawned only after the startup
@@ -1323,6 +1400,10 @@ async fn serve_impl(
     if let Err(e) = agent.recover() {
         tracing::error!("recovery failed: {e}");
     }
+    // Durable verification-job recovery: stale Running rows of a previous
+    // daemon are requeued BEFORE the executor can claim anything, so a
+    // crashed check is retried rather than lost.
+    recover_verification_jobs_at_startup(&session);
     // Step 17 — the server surface consumes the graph's authorities: the
     // orchestrator and the TaskExecutor of ServerDeps are the SAME
     // instances the graph built (no second execution authority is ever
@@ -1391,12 +1472,16 @@ async fn serve_impl(
     // for the whole snapshot); the async wrapper only sleeps, gates, and
     // joins.
     let backup_task = spawn_startup_backup(store, data_dir.clone());
+    // The daemon verification executor: post-readiness, it claims and
+    // resolves durable verification jobs of every session asynchronously.
+    let verification_executor = spawn_verification_executor(&graph);
     // Keep the daemon alive; when a shutdown is signaled, DRAIN the backup
     // task (bounded) before the daemon returns, aborting only the async
     // wrapper on timeout — a snapshot can never outlive its owning runtime.
     match shutdown_rx {
         Some(rx) => {
             let _ = rx.await;
+            verification_executor.abort();
             drain_startup_backup(backup_task).await;
         }
         None => std::future::pending::<()>().await,
@@ -3007,6 +3092,80 @@ mod tests {
                 .any(|i| i.content.contains("durable daemon rules")),
             "a pinned old epoch must still serve the old tree"
         );
+    }
+
+    #[test]
+    fn daemon_startup_recovery_requeues_stale_running_jobs_only() {
+        // Audit P0-5/26 production wiring: the startup sweep re-queues the
+        // stale Running row a dead executor left behind and NEVER touches a
+        // terminal row.
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap(),
+        );
+        let ws = manager.create_workspace("/w").unwrap();
+        let sid = manager
+            .create_session(ws, "recover", "fake", "m")
+            .unwrap()
+            .id();
+        let handle = manager.get_session(sid).unwrap().unwrap();
+        let task = handle.task_id().unwrap();
+        let op = manager.next_op_id().raw();
+        let check = |id: &str| faktor_session::VerificationAttemptCheck {
+            check_id: id.into(),
+            command: format!("make {id}"),
+            inline: None,
+        };
+        let job = |id: &str| faktor_session::VerificationJobInput {
+            check_id: id.into(),
+            kind: "test".into(),
+            command: format!("make {id}"),
+            program: "make".into(),
+            args: vec![id.into()],
+            spec_json: "{}".into(),
+            budget_ms: 10_000,
+        };
+        handle
+            .begin_verification_attempt(
+                task.raw(),
+                1,
+                op,
+                "/w",
+                &[],
+                &[check("make_test"), check("make_check")],
+                &[job("make_test"), job("make_check")],
+            )
+            .unwrap();
+        // One executor died mid-check (Running); one finished (Passed).
+        handle
+            .claim_verification_job(task.raw(), "make_test", op, manager.next_op_id().raw())
+            .unwrap();
+        handle
+            .claim_verification_job(task.raw(), "make_check", op, manager.next_op_id().raw())
+            .unwrap();
+        handle
+            .resolve_verification_job(
+                task.raw(),
+                "make_check",
+                op,
+                faktor_session::VerificationJobState::Passed,
+                None,
+                Some("{}".into()),
+            )
+            .unwrap();
+        recover_verification_jobs_at_startup(&manager);
+        let jobs = handle.verification_attempt_jobs(task.raw(), op).unwrap();
+        let stale = jobs
+            .iter()
+            .find(|j| j.check_id == "make_test")
+            .expect("stale row");
+        assert_eq!(stale.state, faktor_session::VerificationJobState::Queued);
+        assert!(stale.note.as_deref().unwrap().contains("restart"));
+        let done = jobs
+            .iter()
+            .find(|j| j.check_id == "make_check")
+            .expect("terminal row");
+        assert_eq!(done.state, faktor_session::VerificationJobState::Passed);
     }
     #[test]
     fn daemon_instructions_resolver_reads_the_live_shadow_of_a_shadowed_workspace() {

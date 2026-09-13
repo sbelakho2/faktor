@@ -34,16 +34,34 @@
 //!    docs update.
 //!
 //!    Node is a harness dependency of the upstream TypeScript client. When
-//!    `node` is absent the test SKIPS with an explicit message (CI's rust
-//!    image has no node); `FAKTOR_COMPAT_REQUIRE_NODE=1` turns the skip into
-//!    a failure for lanes that must run it. Regeneration of the recorded
-//!    request/response goldens: `FAKTOR_COMPAT_FREEZE_TRACES=1`.
+//!    `node` is absent the test records the REQUIRED report as failed (and
+//!    panics) under `FAKTOR_COMPAT_REQUIRE_NODE=1`, and otherwise records an
+//!    explicit skip and returns. Either way it writes the certification
+//!    report consumed by `scripts/capabilities-manifest.mjs`:
+//!
+//!    ```json
+//!    {"schema": "faktor-kilo-compat/v1", "commit": "<repo HEAD>",
+//!     "sdk_version": "7.5.6",
+//!     "requests": {"passed": N, "total": N},
+//!     "responses": {"passed": N, "total": N},
+//!     "required_divergences": N,
+//!     "status": "passed|partial|failed|skipped"}
+//!    ```
+//!
+//!    at `target/certification/kilo-compat.json`. `status` is `passed` only
+//!    when every corpus step is an exact pass (zero required divergences);
+//!    `partial` records the measured ratio while documented divergences
+//!    remain. Regeneration of the recorded request/response goldens:
+//!    `FAKTOR_COMPAT_FREEZE_TRACES=1`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{json, Map, Value};
+
+const REPORT_SCHEMA: &str = "faktor-kilo-compat/v1";
+const SDK_VERSION: &str = "7.5.6";
 
 const REPOSITORY: &str = "https://github.com/Kilo-Org/kilocode";
 const TAG: &str = "v7.5.6";
@@ -64,6 +82,95 @@ const TRACE_SCHEMA: &str = "faktor.compat.sdk-traces/v1";
 
 fn compat_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../compat/kilo-v756")
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// The certification report path (`target/certification/kilo-compat.json`
+/// under the workspace root — CI runs `cargo test` from that root, so the
+/// capabilities manifest and the Woodpecker lane consume the same file).
+fn report_path() -> PathBuf {
+    workspace_root().join("target/certification/kilo-compat.json")
+}
+
+/// The repository HEAD the replay ran on (`unknown` without git metadata;
+/// the manifest treats a non-HEAD report as stale and stays PARTIAL).
+fn repo_head_commit() -> String {
+    Command::new("git")
+        .arg("-C")
+        .arg(workspace_root())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// Every step id → its corpus status (`passing`/`divergence`), read offline.
+fn corpus_step_statuses() -> BTreeMap<String, String> {
+    let mut statuses = BTreeMap::new();
+    for file in trace_files() {
+        let group = load_json(&file);
+        for step in group["steps"].as_array().unwrap() {
+            statuses.insert(
+                step["id"].as_str().unwrap().to_string(),
+                step["status"].as_str().unwrap().to_string(),
+            );
+        }
+    }
+    statuses
+}
+
+/// `faktor-kilo-compat/v1` report, written on Drop so a mid-replay panic
+/// still leaves `status: failed` evidence with the counts measured so far.
+/// A run with documented divergences left records `partial`; only a corpus
+/// whose every step is an exact pass records `passed`.
+struct KiloCompatReport {
+    path: PathBuf,
+    commit: String,
+    total: usize,
+    required_divergences: usize,
+    requests_passed: usize,
+    responses_passed: usize,
+    status: &'static str,
+}
+
+impl Drop for KiloCompatReport {
+    fn drop(&mut self) {
+        let body = json!({
+            "schema": REPORT_SCHEMA,
+            "commit": self.commit,
+            "sdk_version": SDK_VERSION,
+            "requests": { "passed": self.requests_passed, "total": self.total },
+            "responses": { "passed": self.responses_passed, "total": self.total },
+            "required_divergences": self.required_divergences,
+            "status": self.status,
+        });
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(&body) {
+            let _ = std::fs::write(&self.path, format!("{text}\n"));
+        }
+    }
+}
+
+fn new_report() -> KiloCompatReport {
+    let statuses = corpus_step_statuses();
+    KiloCompatReport {
+        path: report_path(),
+        commit: repo_head_commit(),
+        total: statuses.len(),
+        required_divergences: statuses.values().filter(|s| *s == "divergence").count(),
+        requests_passed: 0,
+        responses_passed: 0,
+        status: "failed",
+    }
 }
 
 fn manifest_path() -> PathBuf {
@@ -626,22 +733,29 @@ fn compare_request(id: &str, scenario: &Value, trace: &Value, password: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unmodified_upstream_client_replays_against_the_real_daemon() {
     let freeze = std::env::var("FAKTOR_COMPAT_FREEZE_TRACES").as_deref() == Ok("1");
+    // The report guard is created before anything can fail: a panic anywhere
+    // in the replay still leaves failed evidence for the required CI lane.
+    let mut report = new_report();
     let dir = tempfile::tempdir().unwrap();
     let (deps, password) = super::tests::server_deps(dir.path());
     let (handle, base) = super::tests::spawn_server(deps).await;
 
     if !node_available() {
         if std::env::var("FAKTOR_COMPAT_REQUIRE_NODE").as_deref() == Ok("1") {
+            report.status = "failed";
             let _ = handle.shutdown.send(());
             panic!(
                 "node is required for the unmodified-upstream-client replay \
-                 (FAKTOR_COMPAT_REQUIRE_NODE=1) but was not found on PATH"
+                 (FAKTOR_COMPAT_REQUIRE_NODE=1) but was not found on PATH; \
+                 target/certification/kilo-compat.json records status=failed"
             );
         }
+        report.status = "skipped";
         eprintln!(
             "SKIP unmodified_upstream_client_replays_against_the_real_daemon: \
              node not found on PATH; the recorded sdk-traces goldens were not replayed \
-             (set FAKTOR_COMPAT_REQUIRE_NODE=1 to make this fatal)"
+             (set FAKTOR_COMPAT_REQUIRE_NODE=1 to make this fatal). \
+             target/certification/kilo-compat.json records status=skipped"
         );
         let _ = handle.shutdown.send(());
         return;
@@ -693,6 +807,7 @@ async fn unmodified_upstream_client_replays_against_the_real_daemon() {
                 continue;
             }
             compare_request(&id, step, trace, password.as_str());
+            report.requests_passed += 1;
             let response = &trace["response"];
             assert!(
                 !response.is_null(),
@@ -767,6 +882,9 @@ async fn unmodified_upstream_client_replays_against_the_real_daemon() {
                 "{id}: client-side error without an HTTP error response: {}",
                 trace["error"]
             );
+            if step["status"] == "passing" {
+                report.responses_passed += 1;
+            }
             checked += 1;
         }
         if freeze {
@@ -776,6 +894,25 @@ async fn unmodified_upstream_client_replays_against_the_real_daemon() {
         }
     }
     assert!(checked >= 20, "trace corpus too thin: {checked} steps");
+    report.status = if freeze {
+        // Freeze runs regenerate goldens; they do not replay them.
+        "skipped"
+    } else if report.responses_passed == report.total {
+        "passed"
+    } else {
+        "partial"
+    };
+    eprintln!(
+        "kilo-compat report {}: requests {}/{} exact, responses {}/{} exact, \
+         {} required divergences, status={}",
+        report.path.display(),
+        report.requests_passed,
+        report.total,
+        report.responses_passed,
+        report.total,
+        report.required_divergences,
+        report.status,
+    );
     let _ = handle.shutdown.send(());
 }
 

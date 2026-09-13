@@ -177,7 +177,7 @@
       },
       "call": "session.fork",
       "id": "session.fork",
-      "note": "The SDK's optional {messageID} body is accepted (the daemon forks the whole history); the response is the daemon {sessionID,title,createdMs} instead of the SDK rich Session5.",
+      "note": "The SDK's optional {messageID} body is accepted (the daemon forks the whole history). Exact pass: the response now serves the rich SDK Session5 fields (id, slug, projectID, workspaceID, directory, model, version, time) additively next to the frozen aliases (sessionID, title, createdMs).",
       "request": {
         "body": {
           "messageID": "@string"
@@ -190,8 +190,24 @@
       "response": {
         "body": {
           "createdMs": "@int",
+          "directory": ".",
+          "id": "@string",
+          "model": {
+            "id": "m",
+            "providerID": "fake"
+          },
+          "projectID": "@string",
           "sessionID": "@string",
-          "title": "wire trace (fork)"
+          "slug": "@string",
+          "state": "idle",
+          "time": {
+            "created": "@int",
+            "updated": "@int"
+          },
+          "title": "wire trace (fork)",
+          "updatedMs": "@int",
+          "version": "0.1.0",
+          "workspaceID": "@string"
         },
         "content_type": "application/json",
         "event_stream": false,
@@ -202,7 +218,7 @@
         "time.created"
       ],
       "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionForkResponses.200 (Session5)",
-      "status": "divergence"
+      "status": "passing"
     },
     {
       "args": {

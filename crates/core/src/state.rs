@@ -252,21 +252,39 @@ impl OwnershipSpec {
         }
     }
 
-    /// Lexical normalization of one ownership path: trailing `/` is
-    /// trimmed; an empty result is a violation (reported by
-    /// [`Self::validate`]).
-    fn norm_path(p: &str) -> String {
-        let mut s = p.trim_end_matches('/');
-        while s.ends_with("/.") {
-            s = s.trim_end_matches('/').trim_end_matches("/.");
+    /// The EXCLUSIVE PATH SET as canonical [`NormalizedWorkspacePath`]s: the
+    /// only form any overlap/write-authority decision may consume. Every
+    /// raw spelling is validated here (absolute/rooted prefixes, `..`/`.`,
+    /// empty components, alternate separators, NUL/control chars and
+    /// platform aliases are all refused) — a spec carrying any such path
+    /// yields typed violations, never a silently normalized comparison.
+    pub fn normalized_paths(
+        &self,
+    ) -> Result<Vec<crate::path::NormalizedWorkspacePath>, Vec<OwnershipSpecViolation>> {
+        let Self::Paths { paths } = self else {
+            return Ok(Vec::new());
+        };
+        let mut errs = Vec::new();
+        let mut out = Vec::with_capacity(paths.len());
+        for p in paths {
+            match crate::path::NormalizedWorkspacePath::new(p) {
+                Ok(normalized) => out.push(normalized),
+                Err(v) => errs.push(OwnershipSpecViolation {
+                    what: "paths",
+                    value: p.clone(),
+                    message: format!(
+                        "ownership path {p:?} is not a canonical workspace path ({}: {})",
+                        v.kind.as_str(),
+                        v
+                    ),
+                }),
+            }
         }
-        s.to_string()
-    }
-
-    fn path_overlaps(a: &str, b: &str) -> bool {
-        a == b
-            || (a.starts_with(b) && a.as_bytes().get(b.len()) == Some(&b'/'))
-            || (b.starts_with(a) && b.as_bytes().get(a.len()) == Some(&b'/'))
+        if errs.is_empty() {
+            Ok(out)
+        } else {
+            Err(errs)
+        }
     }
 
     /// Structural sanity of one spec (bounded entries, sane strings, and —
@@ -309,15 +327,8 @@ impl OwnershipSpec {
                         ),
                     });
                 }
-                let norm: Vec<String> = paths.iter().map(|p| Self::norm_path(p)).collect();
-                for (i, p) in paths.iter().enumerate() {
-                    if norm[i].is_empty() {
-                        errs.push(OwnershipSpecViolation {
-                            what: "paths",
-                            value: p.clone(),
-                            message: format!("empty ownership path {p:?}"),
-                        });
-                    } else if !sane(p) {
+                for p in paths.iter() {
+                    if !sane(p) {
                         errs.push(OwnershipSpecViolation {
                             what: "paths",
                             value: p.clone(),
@@ -327,23 +338,28 @@ impl OwnershipSpec {
                         });
                     }
                 }
-                for i in 0..norm.len() {
-                    for j in (i + 1)..norm.len() {
-                        if norm[i].is_empty() || norm[j].is_empty() {
-                            continue;
-                        }
-                        if Self::path_overlaps(&norm[i], &norm[j]) {
-                            errs.push(OwnershipSpecViolation {
-                                what: "paths",
-                                value: p_display(&paths[i], &paths[j]),
-                                message: format!(
-                                    "ownership paths {p:?} and {q:?} overlap",
-                                    p = paths[i],
-                                    q = paths[j]
-                                ),
-                            });
+                // The canonical vocabulary check runs on every entry: a
+                // traversal/alias spelling is a typed violation even when it
+                // is ASCII-printable (`.`/`..`/backslash/drive prefixes).
+                match self.normalized_paths() {
+                    Ok(normalized) => {
+                        for i in 0..normalized.len() {
+                            for j in (i + 1)..normalized.len() {
+                                if normalized[i].overlaps(&normalized[j]) {
+                                    errs.push(OwnershipSpecViolation {
+                                        what: "paths",
+                                        value: p_display(&paths[i], &paths[j]),
+                                        message: format!(
+                                            "ownership paths {p:?} and {q:?} overlap",
+                                            p = paths[i],
+                                            q = paths[j]
+                                        ),
+                                    });
+                                }
+                            }
                         }
                     }
+                    Err(mut violations) => errs.append(&mut violations),
                 }
             }
             Self::IsolatedWorktree => {}
@@ -414,7 +430,11 @@ impl OwnershipSpec {
     /// Whether two mutating ownership specs COLLIDE (may never both be the
     /// write authority of two mutating work items of one plan):
     ///
-    /// - two path sets overlap on a normalized path boundary;
+    /// - two path sets overlap on a canonical path-component boundary (the
+    ///   comparison runs exclusively over [`NormalizedWorkspacePath`]s; a
+    ///   spec whose paths cannot be canonicalized fails CLOSED — it is
+    ///   treated as colliding with every other path mutator — so an invalid
+    ///   spelling can never widen write authority);
     /// - two semantic-entity specs over the SAME provider snapshot share an
     ///   entity;
     /// - an isolated worktree never collides with anything; a path mutator
@@ -424,15 +444,11 @@ impl OwnershipSpec {
         match (self, other) {
             (Self::NoWrites, _) | (_, Self::NoWrites) => false,
             (Self::IsolatedWorktree, _) | (_, Self::IsolatedWorktree) => false,
-            (Self::Paths { paths: a }, Self::Paths { paths: b }) => {
-                let na: Vec<String> = a.iter().map(|p| Self::norm_path(p)).collect();
-                let nb: Vec<String> = b.iter().map(|p| Self::norm_path(p)).collect();
-                na.iter().any(|p| {
-                    !p.is_empty()
-                        && nb
-                            .iter()
-                            .any(|q| !q.is_empty() && Self::path_overlaps(p, q))
-                })
+            (Self::Paths { .. }, Self::Paths { .. }) => {
+                let (Ok(a), Ok(b)) = (self.normalized_paths(), other.normalized_paths()) else {
+                    return true;
+                };
+                a.iter().any(|p| b.iter().any(|q| p.overlaps(q)))
             }
             (Self::SemanticEntities { .. }, Self::Paths { .. })
             | (Self::Paths { .. }, Self::SemanticEntities { .. }) => false,
@@ -618,6 +634,90 @@ mod ownership_spec_tests {
         assert!(!sem_a.overlaps(&Paths {
             paths: vec!["src".into()],
         }));
+    }
+
+    /// Adversarial ownership spellings: every alias/traversal form must be a
+    /// typed violation, and a spec carrying one must fail CLOSED in overlap
+    /// analysis (collide with the other mutator) instead of silently
+    /// normalizing into a different write authority.
+    #[test]
+    fn hostile_ownership_paths_are_refused_and_fail_closed() {
+        for hostile in [
+            "/abs",
+            "//server/share",
+            "C:/windows",
+            "C:src",
+            "..",
+            "../src",
+            "src/..",
+            ".",
+            "./src",
+            "src/.",
+            "a//b",
+            "src\\a",
+            "a\0b",
+            "a\nb",
+            "src/../evil",
+            "src/a.",
+            "src/a ",
+            "CON",
+            "src/COM1.txt",
+            "src/LPT9",
+            "src/a.rs:stream",
+        ] {
+            let spec = OwnershipSpec::Paths {
+                paths: vec![hostile.into()],
+            };
+            assert!(
+                spec.validate().is_err(),
+                "ownership path {hostile:?} must be refused"
+            );
+            assert!(
+                spec.normalized_paths().is_err(),
+                "{hostile:?} must not canonicalize"
+            );
+            assert!(
+                spec.overlaps(&OwnershipSpec::Paths {
+                    paths: vec!["src".into()],
+                }),
+                "{hostile:?} must fail CLOSED in overlap analysis"
+            );
+        }
+    }
+
+    /// Canonical equality: two spellings that normalize to the same path
+    /// overlap, while a component-boundary sibling never does.
+    #[test]
+    fn canonical_equality_governs_overlap() {
+        assert!(OwnershipSpec::Paths {
+            paths: vec!["src/".into()],
+        }
+        .overlaps(&OwnershipSpec::Paths {
+            paths: vec!["src".into()],
+        }));
+        assert!(OwnershipSpec::Paths {
+            paths: vec!["src/a".into()],
+        }
+        .overlaps(&OwnershipSpec::Paths {
+            paths: vec!["src/a/".into()],
+        }));
+        assert!(!OwnershipSpec::Paths {
+            paths: vec!["src/a".into()],
+        }
+        .overlaps(&OwnershipSpec::Paths {
+            paths: vec!["src/a2".into()],
+        }));
+        assert!(!OwnershipSpec::Paths {
+            paths: vec!["src/a".into()],
+        }
+        .overlaps(&OwnershipSpec::Paths {
+            paths: vec!["src/a.rs".into()],
+        }));
+        // A path mutator and an isolated/semantic one still never collide.
+        assert!(!OwnershipSpec::Paths {
+            paths: vec!["src".into()],
+        }
+        .overlaps(&OwnershipSpec::IsolatedWorktree));
     }
 }
 ///

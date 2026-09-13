@@ -211,13 +211,16 @@ impl SearchService {
             .collect())
     }
 
-    /// Reciprocal-rank fusion over symbol/lexical (+ semantic when present).
+    /// Reciprocal-rank fusion over exact/lexical/symbol (+ semantic when
+    /// present). Every ranking is bounded and deterministic; the fused list
+    /// is the ranked evidence package the context compiler consumes.
     pub fn fused(&self, ws: WorkspaceId, query: &str, limit: usize) -> Vec<Hit> {
         if self.check_query(query).is_err() {
             return vec![];
         }
         let mut rankings: Vec<(f64, Vec<Hit>)> = Vec::new();
         rankings.push((2.0, self.symbol(ws, query, limit * 4)));
+        rankings.push((1.5, self.exact(ws, query, limit * 4)));
         rankings.push((1.0, self.lexical(ws, query, limit * 4)));
         if self.embedder.is_some() {
             if let Ok(sem) = self.semantic(ws, query, limit * 4) {
@@ -470,6 +473,35 @@ mod tests {
         assert!(hits.iter().any(|h| h.path.contains("parser.rs")));
         let hits = svc.exact(ws, "src/lexer", 10);
         assert!(hits.iter().any(|h| h.path.contains("lexer.rs")));
+    }
+
+    #[test]
+    fn exact_path_hit_survives_fusion_without_lexical_or_symbol_evidence() {
+        // A path-only exact match (the query token appears in no token,
+        // symbol or content posting) must still be ranked: the evidence
+        // package's exact leg is fused, not dropped.
+        let mut idx = WI::new();
+        let ws = WorkspaceId::new(7);
+        idx.index_file(
+            ws,
+            std::path::Path::new("src/ziggurat_vault.rs"),
+            b"fn unrelated() {}\n",
+            1,
+        )
+        .unwrap();
+        let svc = SearchService::new(Arc::new(Mutex::new(idx)), None);
+        assert!(svc.lexical(ws, "ziggurat_vault", 10).is_empty());
+        assert!(svc.symbol(ws, "ziggurat_vault", 10).is_empty());
+        let exact = svc.exact(ws, "ziggurat_vault", 10);
+        assert_eq!(exact.len(), 1, "the path is an exact hit: {exact:?}");
+        let fused = svc.fused(ws, "ziggurat_vault", 10);
+        assert!(
+            fused.iter().any(|h| h.path == "src/ziggurat_vault.rs"),
+            "the exact-only path must survive fusion: {fused:?}"
+        );
+        let pkg = svc.evidence_package(ws, &["ziggurat_vault".into()], 4);
+        assert_eq!(pkg.len(), 1);
+        assert_eq!(pkg[0].path, "src/ziggurat_vault.rs");
     }
 
     #[test]

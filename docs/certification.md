@@ -206,21 +206,24 @@ separately when required for a release.
   permissions, terminal over the native PTY routes, review/tournament,
   evidence navigation, settings, provider selection, history,
   restart/reconnect) are covered by `JetBrainsParitySmoke` against canned
-  frames, a fake daemon and the real daemon. With the pinned upstream corpus
-  present in-tree (`compat/jetbrains-712/`), the derived capability labels
-  carry `jetbrains_frontend`/`ui_parity` **IMPLEMENTED** (the plugin still
-  builds the Faktor-owned frontend, not the upstream tree; §3 records the
-  pin/suite status). Only the 2024.1.7 distribution was verified;
-  `until-build` stays unbounded, so newer-platform compatibility is not
-  claimed.
+  frames, a fake daemon and the real daemon. That suite is a regression
+  suite, **not** a parity result: the derived capability labels carry
+  `jetbrains_frontend` **IMPLEMENTED** (the Faktor-owned frontend operates),
+  `jetbrains_upstream_assets` **VENDORED** (the pin is present) and
+  `jetbrains_behavioral_parity`/`jetbrains_visual_parity` **PARTIAL** until
+  real executable parity matrices exist (§2.10, §3). Only the 2024.1.7
+  distribution was verified; `until-build` stays unbounded, so
+  newer-platform compatibility is not claimed.
 
 100% requires the builds and smokes green **and the derived capability
 manifest labels honest**. It does not require byte-for-byte parity where
-the upstream assets are absent, but no certificate may claim parity that
-the tree cannot substantiate. `target/certification/capabilities.json`
-(§2.10) carries the derived labels; `ui_parity` is IMPLEMENTED because
-both pinned corpora (the v7.5.6 webview bundle and the 7.1.2 JetBrains
-sources plus the Faktor-owned Swing frontend) are present in-tree.
+no executable parity matrix exists, but no certificate may claim parity
+that the tree cannot substantiate: `target/certification/capabilities.json`
+(§2.10) carries the derived labels, `compat_v756` is bound to the
+HEAD-exact `target/certification/kilo-compat.json` replay report, and
+`ui_parity` is IMPLEMENTED only when every executable parity axis (VS Code
+visual render, frozen-upstream replay, JetBrains behavioral/visual matrices)
+passes.
 
 ### 2.3 Compat fixtures
 
@@ -391,15 +394,19 @@ succeeding — a failure is recorded as a skip with the exact error.
 ### 2.10 Capability manifest (derived, machine-readable)
 
 `node scripts/capabilities-manifest.mjs` derives every surface status from
-**hard markers** in the tree — code symbols, test names and files, never
-prose or a bare file name — and writes
+**hard markers** in the tree — code symbols, test names, files, and
+**HEAD-bound executable reports** (`target/certification/kilo-compat.json`
+for `compat_v756`; the `ui/kilo-v756-webview/dist/visual-report.json` render
+report and the `jetbrains-*-parity.json` matrices for `ui_parity`) — never
+from prose or a bare file name — and writes
 `target/certification/capabilities.json`. Its default mode (also invoked by
 `bash scripts/certify-local.sh fast`) is the drift test: it exits non-zero
 when the table below disagrees with the derived manifest, when a surface row
-is missing, or when the table lists an unknown surface. It additionally
-fails when any table row in this document or `README.md` claims
-`IMPLEMENTED` without at least one backticked evidence path that exists in
-the tree. The manifest is bound to the commit it was generated on; a stale
+is missing, or when the table lists an unknown surface. Declared-but-unproven
+claims fail: an IMPLEMENTED row without an existing backticked evidence path
+is rejected, `compat_v756` cannot claim IMPLEMENTED without an N/N report at
+the exact SHA, and the parity labels cannot claim IMPLEMENTED without a real
+matrix. The manifest is bound to the commit it was generated on; a stale
 file from a different SHA is not evidence. Any change to the probed
 symbols/tests/files that moves a status must update this table in the same
 commit.
@@ -409,9 +416,12 @@ commit.
 | `vscode_native_client` | IMPLEMENTED | `apps/vscode/src/nativeClient.ts` (`export class`, typed validators) + adversarial `apps/vscode/scripts/selftest.mjs` assertions |
 | `vscode_webview` | IMPLEMENTED | `apps/vscode/src/webview.ts` + `kilo-bridge.ts` (`mapKiloFiles`) + pinned `ui/kilo-v756-webview/dist` bundle (`webview.js`, `webview.css`) + `dist/visual-baseline.json` |
 | `jetbrains_native_bridge` | IMPLEMENTED | `apps/jetbrains/backend/src/main/kotlin/dev/faktor/backend/NativeClient.kt` (`class NativeClient`), `apps/jetbrains/backend/src/main/kotlin/dev/faktor/backend/NativeEventStream.kt` (`class NativeEventStream`), `apps/jetbrains/backend/src/test/kotlin/dev/faktor/backend/NativeClientTest.kt` (`NATIVE SMOKE PASS`) |
-| `jetbrains_frontend` | IMPLEMENTED | Faktor-owned Swing frontend (`FaktorChatPanel.kt`, `FrontendSmoke.kt` `FRONTEND SMOKE PASS`, `plugin.xml`, `build.gradle.kts`); the upstream 7.1.2 corpus is vendored in-tree as the pinned reference (`compat/jetbrains-712/NOTICE.md`, SHA-256-pinned by `ui/upstream.json`), consumed by the Faktor-owned frontend rather than built into the plugin |
-| `compat_v756` | IMPLEMENTED | `compat/kilo-v756` golden fixtures (startup line, SSE frames) + `crates/protocol/src/fixtures.rs` + `tests/compat` |
-| `ui_parity` | IMPLEMENTED | vendored v7.5.6 webview + visual baseline; JetBrains 7.1.2 sources vendored+pinned (`compat/jetbrains-712/NOTICE.md`) and consumed by the Faktor-owned frontend; both pinned corpora are present in-tree |
+| `jetbrains_frontend` | IMPLEMENTED | Faktor-owned Swing frontend operates: `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt`, `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/FrontendSmoke.kt` (`FRONTEND SMOKE PASS`), `plugin.xml`, `build.gradle.kts`. Upstream provenance is the separate `jetbrains_upstream_assets` row |
+| `jetbrains_upstream_assets` | VENDORED | pinned upstream 7.1.2 source in `compat/jetbrains-712` with per-file SHA-256 manifest in `ui/upstream.json` (`jetbrains_712`) + `compat/jetbrains-712/NOTICE.md`; VENDORED is a provenance claim, never a parity claim |
+| `jetbrains_behavioral_parity` | PARTIAL | executable parity matrix `target/certification/jetbrains-behavioral-parity.json` is absent; the kotlinc/daemon smokes are regression tests, not parity results |
+| `jetbrains_visual_parity` | PARTIAL | executable parity matrix `target/certification/jetbrains-visual-parity.json` is absent; the `JetBrainsParitySmoke` fixture suite is canned and not a visual matrix |
+| `compat_v756` | PARTIAL | measured replay report `target/certification/kilo-compat.json` (`faktor-kilo-compat/v1`): responses 10/36 exact, requests 36/36, 26 required divergences; corpus `compat/kilo-v756/sdk-traces` + `tests/compat`; IMPLEMENTED only at responses N/N bound to the exact HEAD |
+| `ui_parity` | PARTIAL | executable parity axes only: `ui/kilo-v756-webview/dist/visual-report.json` (VS Code visual), `target/certification/kilo-compat.json` (frozen-upstream behavioral), `target/certification/jetbrains-behavioral-parity.json`, `target/certification/jetbrains-visual-parity.json`; vendored files or pinned corpora alone never flip it |
 | `acp_subset` | IMPLEMENTED | `crates/acp` (`AcpMethod::Initialize`) + `crates/acp/tests/interop.rs` + official `agent-client-protocol` client crate in `tests/acp-official` |
 | `openai_responses` | IMPLEMENTED | `crates/openai/src/lib.rs`: `OpenAiFamily::Responses` dispatch + `responses_body`/`responses_stream` codecs + the adversarial `responses_*` stream tests |
 | `windows_job_containment` | IMPLEMENTED | `crates/winjob/src/lib.rs` (`CreateJobObjectW`, `SetInformationJobObject`, `AssignProcessToJobObject`, `KILL_ON_JOB_CLOSE`) + `crates/pty/src/windows.rs` (`CREATE_SUSPENDED`, `assign_strict`, kill-on-close spawn test) |
@@ -423,9 +433,10 @@ commit.
 
 Status labels used: **CERTIFIED** (evidence exists at the referenced
 commit), **CI-LANE** (owned and run by CI, not by the local harness),
-**PARTIAL** (implemented subset), **BLOCKED_EXTERNAL** (needs assets not in
-this repository), **NOT RUN HERE** (deliberately out of the offline local
-profile).
+**PARTIAL** (implemented subset), **VENDORED** (pinned/attributed source is
+in-tree; a provenance claim, not a parity claim), **BLOCKED_EXTERNAL** (needs
+assets not in this repository), **NOT RUN HERE** (deliberately out of the
+offline local profile).
 
 | Surface | Gate | Evidence | Status |
 | --- | --- | --- | --- |
@@ -444,9 +455,11 @@ profile).
 | VS Code shell build | `npm ci && npm run build` + wire harness | Woodpecker `vscode` job | CI-LANE (shell IMPLEMENTED; `apps/vscode/src/extension.ts`) |
 | VS Code vendored webview | pinned v7.5.6 tree `ui/kilo-v756-webview` + `ui/upstream.json` hashes + built dist + visual baseline | `node scripts/webview-visual-check.mjs` + required Woodpecker `vscode-visual` job (chromium render must pass); §2.10 | PARTIAL (vendored, hashed and render-gated; real-IDE screenshot parity stays a host/CI capability not claimed offline) |
 | JetBrains bridge | kotlinc `apps/jetbrains/compile-and-smoke.sh` (wire + native + parity smokes); Gradle plugin build + verifier vs IC-2024.1.7 | Woodpecker `jetbrains-*` jobs / local script; §3.2 | CI-LANE (native bridge IMPLEMENTED; plugin verifier + parity smokes PASS locally 2026-09-13) |
-| JetBrains 7.1.2 UI parity | pinned 7.1.2 source (`compat/jetbrains-712/`, SHA-256 manifest) + Faktor single-renderer frontend with fixture/interaction coverage | `compat/jetbrains-712/NOTICE.md`, `ui/upstream.json` (`jetbrains_712`), `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt` (`UPSTREAM PIN PASS` + 10-surface suite); upstream Gradle build of the vendored tree is not run offline (residual) | IMPLEMENTED (pin+suite; derived `ui_parity` label IMPLEMENTED with the pinned corpus present per §2.10) |
-| Compat fixtures v756 | golden suite + fixtures | `tests/compat` | CI-LANE / fast tests |
-| Compat fixtures jetbrains-712 | pinned corpus (1043 files, MIT, sha256) | `compat/jetbrains-712/NOTICE.md`, `ui/upstream.json` (`jetbrains_712`), `JetBrainsParitySmoke` pin step | IMPLEMENTED |
+| JetBrains 7.1.2 upstream assets | pinned 7.1.2 source (`compat/jetbrains-712/`, per-file SHA-256 manifest) | `compat/jetbrains-712/NOTICE.md`, `ui/upstream.json` (`jetbrains_712`) | VENDORED |
+| JetBrains behavioral parity | executable parity matrix (`target/certification/jetbrains-behavioral-parity.json`) | absent; kotlinc/daemon smokes are regression tests, not parity results | PARTIAL |
+| JetBrains visual parity | executable parity matrix (`target/certification/jetbrains-visual-parity.json`) | absent; `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt` (`UPSTREAM PIN PASS`) is a canned fixture/interaction suite, not a visual matrix; upstream Gradle build not run offline | PARTIAL |
+| Compat fixtures v756 | golden suite + fixtures + required replay report | `tests/compat`, `target/certification/kilo-compat.json` (10/36 responses exact; 26 locked divergences) | CI-LANE / fast tests; derived `compat_v756`=PARTIAL until responses N/N |
+| Compat fixtures jetbrains-712 | pinned corpus (1043 files, MIT, sha256) | `compat/jetbrains-712/NOTICE.md`, `ui/upstream.json` (`jetbrains_712`), `JetBrainsParitySmoke` pin step | VENDORED |
 | Fuzz harnesses | seeded pseudo-fuzz | Woodpecker `static` job / manual | CI-LANE |
 | Real-time soak (12–24h) | wall-clock soak | self-hosted hook (disabled by default) | NOT RUN HERE |
 | PR/CI-fix completion contract | native DTO `completion_contract` + `CompletionContractSet`/`CompletionStepStatus` ledger rows + `VerifiedComplete` gate + ordered step executor | gate + durable rows + `crates/orchestrator/src/completion_steps.rs` runner (`crates/session/src/task.rs`, `crates/session/src/ledger.rs`, `crates/orchestrator/src/task_executor.rs`, `crates/agent/src/runtime.rs`); adversarial gate/step tests in-tree; Task-mode controls in both IDEs (§3.3) | IMPLEMENTED (gate + ordered/idempotent commit/push/PR execution) |
@@ -517,7 +530,10 @@ release certificate):
   `JetBrainsParitySmoke` green (`UPSTREAM PIN PASS`, `JETBRAINS PARITY
   SMOKE PASS`) covering task mode, agent tree, permissions, terminal,
   review/tournament, evidence, settings, provider selection, history and
-  restart/reconnect over canned frames, a fake daemon and the real daemon;
+  restart/reconnect over canned frames, a fake daemon and the real daemon
+  (a fixture/interaction regression suite — NOT an executable parity
+  matrix; the derived `jetbrains_*_parity` labels therefore stay PARTIAL,
+  §2.10);
   `./gradlew --offline :frontend:buildPlugin` and `./gradlew build` →
   BUILD SUCCESSFUL (the frontend test sources were made module-self-
   contained so `:frontend:compileTestKotlin` no longer depends on backend
@@ -663,7 +679,7 @@ surfaces are adversarially tested in `apps/vscode/scripts/selftest.mjs` +
     "schema": "faktor-capability-manifest/v1",
     "platform": {"os": "darwin", "arch": "aarch64"},
     "platform_lanes": {"...": "..."},
-    "ui_parity": {"vscode": "IMPLEMENTED", "jetbrains": "IMPLEMENTED", "overall": "IMPLEMENTED", "manifest": "capabilities.json"},
+    "ui_parity": {"vscode": "IMPLEMENTED", "jetbrains": "IMPLEMENTED", "overall": "PARTIAL", "manifest": "capabilities.json"},
     "compat_fixtures": {"v756": true, "jetbrains712": true},
     "surfaces": {"workspace_tests": true, "...": false},
     "offline": {"network_required": false, "provider_keys_required": false},
@@ -740,9 +756,13 @@ Concretely, to ship:
 7. The manifest now reports `"certification_level": "release"` and
    `"release_certified": true`; any missing/invalid gate keeps both
    `release_certified=false` and the level at `local_offline` (or `none`).
-8. The manifest's `capabilities` labels are honest: `BLOCKED_EXTERNAL` and
-   `PARTIAL` surfaces are carried into the release notes; no parity claim is
-   made for unvendored assets.
+8. The manifest's `capabilities` labels are honest and derived from
+   artifacts: `compat_v756` comes from the HEAD-bound
+   `target/certification/kilo-compat.json` report (PARTIAL until responses
+   are N/N), the JetBrains labels split provenance (`VENDORED`) from
+   executable parity matrices, and `ui_parity` requires every executable
+   parity axis. `BLOCKED_EXTERNAL`/`PARTIAL` surfaces are carried into the
+   release notes; no parity claim is made for unproven assets.
 
 Any new commit — including a docs-only change — invalidates the previous
 certificate and requires a fresh run.

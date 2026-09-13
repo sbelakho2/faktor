@@ -1279,6 +1279,27 @@ pub struct IntegratedRootVerification {
     pub summary: String,
 }
 
+/// The outcome of one ATTEMPT-BASED integrated-root verification (audit
+/// P0-5/26 production wiring): the EXACT durable verification attempt the
+/// verdict belongs to, whether its expensive checks are still open, and the
+/// verdict once the attempt is terminal. The caller persists `attempt_op`
+/// and, on a later settlement, consumes EXACTLY that attempt — never
+/// "whatever the newest attempt happens to be".
+#[derive(Debug, Clone)]
+pub struct IntegratedRootAttemptOutcome {
+    /// The exact durable attempt op this outcome belongs to. When an older
+    /// attempt was superseded mid-flight this is the FRESH op, and the older
+    /// attempt's open jobs were structurally cancelled (late results can
+    /// never resolve this one — the store refuses).
+    pub attempt_op: u64,
+    /// True when at least one required durable job is still open: the run is
+    /// not certified, must not land, and waits for the executor (or a later
+    /// settlement) to settle this exact attempt.
+    pub pending: bool,
+    /// The verdict once the attempt is terminal; `None` while pending.
+    pub verification: Option<IntegratedRootVerification>,
+}
+
 pub struct AgentRuntime {
     deps: Arc<AgentDeps>,
     /// Sessions with a live queue-runner task (single runner per session).
@@ -2307,6 +2328,67 @@ impl AgentRuntime {
             Err(faktor_session::TaskError::TerminalTask { .. }) => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Inherit the run's durable BINARY attachment set into one child
+    /// session BEFORE its drive begins (the orchestrated-child path; the
+    /// parent's rows are session-scoped, so each id is re-admitted here):
+    ///
+    /// - every id is structurally validated and its CAS blob is verified by
+    ///   a streamed re-hash ([`faktor_session::SessionHandle::inherit_attachment`])
+    ///   — no bytes materialize and a missing/tampered blob is typed;
+    /// - the session's durable Task row then carries the set, so request
+    ///   construction resolves the byte-identical bytes on every hop and
+    ///   after a crash re-attach (never expanded in durable JSON).
+    ///
+    /// An empty set is a no-op (byte-parity for attachment-free children);
+    /// a terminal row is frozen (the set cannot be changed after the
+    /// child's task ended).
+    pub fn seed_task_attachments(
+        &self,
+        session: SessionId,
+        attachments: &[faktor_core::attachment::AttachmentId],
+    ) -> faktor_core::Result<()> {
+        if attachments.is_empty() {
+            return Ok(());
+        }
+        let handle = self
+            .deps
+            .session
+            .get_session(session)?
+            .ok_or_else(|| Error::not_found(format!("session {session}")))?;
+        for id in attachments {
+            handle.inherit_attachment(id)?;
+        }
+        let task_id = handle.task_id()?;
+        if let Some(task) = handle.get_task(task_id)? {
+            if task.state.is_terminal() {
+                return Ok(());
+            }
+            handle.update_task(
+                task_id,
+                faktor_session::TaskPatch {
+                    attachments: Some(attachments.to_vec()),
+                    ..Default::default()
+                },
+            )?;
+            return Ok(());
+        }
+        let now = handle.now_ms();
+        let goal = truncate(&handle.title()?, 200);
+        handle.create_task(Task {
+            task_id,
+            session_id: session,
+            goal,
+            acceptance_criteria: Vec::new(),
+            plan: Vec::new(),
+            attachments: attachments.to_vec(),
+            budget: faktor_session::TaskBudget::default(),
+            state: TaskState::Pending,
+            created_ms: now,
+            updated_ms: now,
+        })?;
+        Ok(())
     }
 
     /// Persist a child drive's coarse execution phase at a safe boundary
@@ -3945,6 +4027,12 @@ impl AgentRuntime {
                 format!("{project_rules}\n{memory_data}")
             };
             let mut history = self.history_messages(handle, &budget).await?;
+            // Request construction (media): resolve the task's durable image
+            // attachments from the CAS into bounded in-memory parts BEFORE
+            // the plan is measured, so their token cost is budgeted and a
+            // vision-less model refuses here (typed) rather than after a
+            // paid call. Never persisted: the durable row keeps ids.
+            self.inject_attachment_media(handle, &mut history, &effective_caps, provider.as_ref())?;
             // The wire-plan entry (P0-27): ONE selector. The planner picks
             // the conversation window and the evidence by utility per token
             // over the whole loaded content; plan_wire_turn hands the
@@ -3996,6 +4084,16 @@ impl AgentRuntime {
                     outcome.compacted = true;
                     ledger = plan.ledger.clone();
                     history = recent_turns_to_messages(&plan.kept_recent);
+                    // Compaction may have dropped the prompt message that
+                    // carried the turn's images; re-inject so the media
+                    // survives the re-plan (a synthesized user message is
+                    // appended when no text-bearing user turn remains).
+                    self.inject_attachment_media(
+                        handle,
+                        &mut history,
+                        &effective_caps,
+                        provider.as_ref(),
+                    )?;
                     wire_plan = plan_wire_turn_with_prior(
                         &self.deps.instructions,
                         &system_extra,
@@ -6538,7 +6636,37 @@ impl AgentRuntime {
                 .verify_no_op_root(handle, &ws, criteria, &candidate_snapshot, &goal, cancel)
                 .await;
         }
-        let repo_files = Self::integrated_root_repo_files(&ws, 500, 6);
+        // Bounded repository discovery with an EXPLICIT completeness verdict
+        // (audit: verification must not certify a partial repo view). A
+        // non-Complete inventory can never authorize a passing suite: the
+        // derivation input would silently miss manifests/sources beyond a
+        // cap, so the whole integrated-root verification is Unavailable with
+        // the typed reason.
+        let inventory = faktor_verify::discover_repo_inventory(root);
+        let repo_files = inventory.files.clone();
+        if let Some(reason) = inventory.refusal_reason() {
+            let criteria_rows = criterion_verdicts_from_attempt(
+                criteria,
+                &[],
+                &[],
+                &[],
+                changed,
+                &ws,
+                None,
+                &candidate_snapshot,
+                &goal,
+            )
+            .await;
+            return Ok(IntegratedRootVerification {
+                status: VerificationStatus::Unavailable,
+                checks: Vec::new(),
+                criteria: criteria_rows,
+                changed: changed.to_vec(),
+                summary: format!(
+                    "integrated-root verification unavailable: repository inventory incomplete ({reason})"
+                ),
+            });
+        }
         if repo_files.is_empty() {
             return Err("repository file map empty (no project type detectable)".into());
         }
@@ -6662,6 +6790,511 @@ impl AgentRuntime {
         })
     }
 
+    /// Attempt-based twin of [`AgentRuntime::verify_integrated_root`] (audit
+    /// P0-5/26 production wiring): the shared derivation runs over the SAME
+    /// candidate root, cheap required checks execute INLINE, and expensive
+    /// `RunAsTaskOwnedOperation` checks become durable Queued jobs of the
+    /// exact `attempt_op`. While any job is open the method returns
+    /// `pending = true` (the caller leaves the run unverified); a later call
+    /// with the SAME `attempt_op` consumes the EXACT attempt — never
+    /// "whatever attempt is newest". When the exact attempt was superseded
+    /// by a newer one, its open jobs are cancelled and a FRESH attempt is
+    /// begun: late results for the old attempt are structurally refused by
+    /// the store and can never resolve the new one. The daemon verification
+    /// executor is the normal resolver of the queued jobs.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn verify_integrated_root_attempt(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        root: &std::path::Path,
+        changed: &[String],
+        criteria: &[String],
+        cancel: &CancellationToken,
+        attempt_op: u64,
+    ) -> Result<IntegratedRootAttemptOutcome, String> {
+        if attempt_op == 0 {
+            return Err("root verification attempt op must be non-zero".into());
+        }
+        let service = self.deps.verification.clone();
+        if service.is_disabled() {
+            return Err(
+                "no verifier configured (no objective mechanism for this deployment)".into(),
+            );
+        }
+        // Scripted/embedded backends cannot persist jobs: the inline path is
+        // byte-identical to [`Self::verify_integrated_root`].
+        if !service.can_persist_jobs() {
+            let verification = self
+                .verify_integrated_root(handle, root, changed, criteria, cancel)
+                .await?;
+            return Ok(IntegratedRootAttemptOutcome {
+                attempt_op,
+                pending: false,
+                verification: Some(verification),
+            });
+        }
+        if !root.is_dir() {
+            return Err(format!(
+                "integration root {} is not a directory",
+                root.display()
+            ));
+        }
+        let row = handle
+            .row()
+            .map_err(|e| format!("session row unresolvable: {e}"))?;
+        let task_id = row.task_id;
+        let ws = self
+            .deps
+            .workspaces
+            .open(row.workspace_id, root.to_path_buf())
+            .map_err(|e| format!("integration root could not be opened: {e}"))?;
+        let candidate_snapshot = root_snapshot_best_effort(&ws);
+        let goal = handle
+            .get_task(task_id)
+            .ok()
+            .flatten()
+            .map(|t| t.goal)
+            .unwrap_or_default();
+        if changed.is_empty() {
+            let verification = self
+                .verify_no_op_root(handle, &ws, criteria, &candidate_snapshot, &goal, cancel)
+                .await?;
+            return Ok(IntegratedRootAttemptOutcome {
+                attempt_op,
+                pending: false,
+                verification: Some(verification),
+            });
+        }
+        let inventory = faktor_verify::discover_repo_inventory(root);
+        let repo_files = inventory.files.clone();
+        if let Some(reason) = inventory.refusal_reason() {
+            let criteria_rows = criterion_verdicts_from_attempt(
+                criteria,
+                &[],
+                &[],
+                &[],
+                changed,
+                &ws,
+                None,
+                &candidate_snapshot,
+                &goal,
+            )
+            .await;
+            return Ok(IntegratedRootAttemptOutcome {
+                attempt_op,
+                pending: false,
+                verification: Some(IntegratedRootVerification {
+                    status: VerificationStatus::Unavailable,
+                    checks: Vec::new(),
+                    criteria: criteria_rows,
+                    changed: changed.to_vec(),
+                    summary: format!(
+                        "integrated-root verification unavailable: repository inventory incomplete ({reason})"
+                    ),
+                }),
+            });
+        }
+        // The EXACT attempt exists: consume it (or supersede it).
+        if let Some(attempt) = handle
+            .verification_attempt(task_id.raw(), attempt_op)
+            .map_err(|e| format!("verification attempt read: {e}"))?
+        {
+            let newest = handle
+                .current_verification_attempt(task_id.raw())
+                .map_err(|e| format!("verification attempt read: {e}"))?;
+            if newest.as_ref().map(|a| a.op_id) != Some(attempt.op_id) {
+                // A newer attempt exists: this one is structurally frozen.
+                // Cancel its open jobs and begin a FRESH attempt under a new
+                // op; only the fresh attempt may ever settle this run.
+                let note = format!(
+                    "superseded by the newer verification attempt {:?}",
+                    newest.as_ref().map(|a| a.op_id)
+                );
+                let _ = handle.cancel_verification_attempt(task_id.raw(), attempt.op_id, &note);
+                let fresh = self.deps.session.next_op_id().raw();
+                return self
+                    .begin_integrated_root_attempt(
+                        handle,
+                        root,
+                        changed,
+                        criteria,
+                        cancel,
+                        fresh,
+                        &ws,
+                        &candidate_snapshot,
+                        &goal,
+                        &repo_files,
+                    )
+                    .await;
+            }
+            let rows = handle
+                .verification_attempt_jobs(task_id.raw(), attempt.op_id)
+                .map_err(|e| format!("verification job rows: {e}"))?;
+            if rows.iter().any(|j| j.state.is_open()) {
+                // The exact attempt is still executing (the daemon executor
+                // owns it): the run must NOT re-derive and must NOT land.
+                return Ok(IntegratedRootAttemptOutcome {
+                    attempt_op,
+                    pending: true,
+                    verification: None,
+                });
+            }
+            let review = independent_completion_review(
+                self.deps.as_ref(),
+                handle,
+                &ws,
+                changed,
+                &goal,
+                &repo_files,
+                cancel,
+            )
+            .await;
+            let rebuild = rebuild_attempt_verification(&attempt, &rows);
+            let verification = self
+                .root_verification_from_rebuild(
+                    root,
+                    criteria,
+                    changed,
+                    &ws,
+                    &candidate_snapshot,
+                    &goal,
+                    review.as_ref(),
+                    rebuild,
+                )
+                .await;
+            return Ok(IntegratedRootAttemptOutcome {
+                attempt_op,
+                pending: false,
+                verification: Some(verification),
+            });
+        }
+        self.begin_integrated_root_attempt(
+            handle,
+            root,
+            changed,
+            criteria,
+            cancel,
+            attempt_op,
+            &ws,
+            &candidate_snapshot,
+            &goal,
+            &repo_files,
+        )
+        .await
+    }
+
+    /// First call of one root-verification attempt: derive the required
+    /// checks over the candidate root, execute the cheap ones inline and
+    /// persist the attempt with one Queued job per expensive check. An open
+    /// job of a crashed EARLIER attempt is superseded once (typed Cancelled
+    /// rows) before the fresh attempt commits.
+    #[allow(clippy::too_many_arguments)]
+    async fn begin_integrated_root_attempt(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        root: &std::path::Path,
+        changed: &[String],
+        criteria: &[String],
+        cancel: &CancellationToken,
+        attempt_op: u64,
+        ws: &faktor_fs::WorkspaceHandle,
+        candidate_snapshot: &str,
+        goal: &str,
+        repo_files: &[String],
+    ) -> Result<IntegratedRootAttemptOutcome, String> {
+        let service = self.deps.verification.clone();
+        let row = handle
+            .row()
+            .map_err(|e| format!("session row unresolvable: {e}"))?;
+        let task_id = row.task_id;
+        let revision = handle
+            .task_revision(task_id)
+            .map_err(|e| format!("task revision read: {e}"))?
+            .raw();
+        let profile = faktor_verify::derive::detect_project_profile(root, repo_files);
+        let changed_paths: Vec<std::path::PathBuf> =
+            changed.iter().map(std::path::PathBuf::from).collect();
+        let specs = faktor_verify::derive::derive_checks(&profile, &changed_paths)
+            .map_err(|e| format!("verification derivation refused: {e}"))?;
+        if specs.is_empty() {
+            return Err("no derived checks apply to the integrated change".into());
+        }
+        let checks: Vec<faktor_verify::Check> = specs.iter().map(legacy_mirror_of_spec).collect();
+        let order: std::collections::HashMap<String, String> = checks
+            .iter()
+            .map(|c| (c.id.clone(), c.command.clone()))
+            .collect();
+        let base_ctx = faktor_verify::exec::VerificationContext {
+            session_id: handle.id().raw(),
+            task_id: task_id.raw(),
+            operation_id: attempt_op,
+            workspace_id: row.workspace_id.raw(),
+            worktree_id: row.worktree_id.raw(),
+            root: root.to_path_buf(),
+            deadline: std::time::Instant::now(),
+            cancellation: cancel.child(),
+        };
+        let mut results: Vec<(String, bool)> = Vec::new();
+        let mut executed: Vec<CheckExecution> = Vec::new();
+        let mut unavailable: Vec<(String, String)> = Vec::new();
+        let mut ordered: Vec<faktor_session::VerificationAttemptCheck> = Vec::new();
+        let mut job_inputs: Vec<faktor_session::VerificationJobInput> = Vec::new();
+        for spec in specs.iter().filter(|s| s.required) {
+            let command = order.get(&spec.id).cloned().unwrap_or_default();
+            let background = matches!(
+                service.budget_for(spec),
+                BudgetDecision::RunAsTaskOwnedOperation
+            );
+            if background {
+                ordered.push(faktor_session::VerificationAttemptCheck {
+                    check_id: spec.id.clone(),
+                    command: command.clone(),
+                    inline: None,
+                });
+                job_inputs.push(faktor_session::VerificationJobInput {
+                    check_id: spec.id.clone(),
+                    kind: format!("{:?}", spec.kind).to_ascii_lowercase(),
+                    command: command.clone(),
+                    program: spec.program.to_string_lossy().into_owned(),
+                    args: spec
+                        .args
+                        .iter()
+                        .map(|a| a.to_string_lossy().into_owned())
+                        .collect(),
+                    spec_json: serde_json::to_string(spec)
+                        .map_err(|e| format!("job spec serialization: {e}"))?,
+                    budget_ms: service.policy().unit_max.as_millis() as u64,
+                });
+                continue;
+            }
+            let budget = match service.budget_for(spec) {
+                BudgetDecision::RunInline(budget) => budget,
+                BudgetDecision::RunAsTaskOwnedOperation => service.policy().unit_max,
+            };
+            if budget.is_zero() {
+                unavailable.push((spec.id.clone(), command.clone()));
+                ordered.push(faktor_session::VerificationAttemptCheck {
+                    check_id: spec.id.clone(),
+                    command,
+                    inline: Some(faktor_session::VerificationInlineStatus::Unavailable),
+                });
+                continue;
+            }
+            let mut vctx = base_ctx.clone();
+            vctx.deadline = std::time::Instant::now() + budget;
+            let outcome = service.execute(spec, &vctx).await;
+            let status = match outcome.status {
+                CheckRunStatus::Passed => VerificationStatus::Passed,
+                CheckRunStatus::Failed => VerificationStatus::Failed,
+                CheckRunStatus::Unavailable => VerificationStatus::Unavailable,
+            };
+            let inline = match outcome.status {
+                CheckRunStatus::Passed => faktor_session::VerificationInlineStatus::Passed,
+                CheckRunStatus::Failed => faktor_session::VerificationInlineStatus::Failed,
+                CheckRunStatus::Unavailable => {
+                    faktor_session::VerificationInlineStatus::Unavailable
+                }
+            };
+            order.get(&spec.id);
+            ordered.push(faktor_session::VerificationAttemptCheck {
+                check_id: spec.id.clone(),
+                command: command.clone(),
+                inline: Some(inline),
+            });
+            match outcome.status {
+                CheckRunStatus::Passed => results.push((spec.id.clone(), true)),
+                CheckRunStatus::Failed => results.push((spec.id.clone(), false)),
+                CheckRunStatus::Unavailable => {
+                    unavailable.push((spec.id.clone(), command.clone()));
+                }
+            }
+            executed.push(CheckExecution {
+                check: spec.id.clone(),
+                program: spec.program.to_string_lossy().into_owned(),
+                args: spec
+                    .args
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect(),
+                category: format!("{:?}", spec.category).to_ascii_lowercase(),
+                required: spec.required,
+                status,
+                started_ms: outcome.started_ms,
+                finished_ms: Some(outcome.finished_ms),
+                exit: outcome.exit,
+                summary: outcome.summary.clone(),
+            });
+        }
+        let root_str = root.to_string_lossy().into_owned();
+        if job_inputs.is_empty() {
+            // Every required check ran inline: no durable attempt is needed
+            // (there is nothing an executor could settle later).
+            let review = independent_completion_review(
+                self.deps.as_ref(),
+                handle,
+                ws,
+                changed,
+                goal,
+                repo_files,
+                cancel,
+            )
+            .await;
+            let status = match faktor_verify::acceptance(&checks, &results) {
+                faktor_verify::Acceptance::Pass => VerificationStatus::Passed,
+                faktor_verify::Acceptance::Fail => VerificationStatus::Failed,
+                faktor_verify::Acceptance::Pending => VerificationStatus::Unavailable,
+            };
+            let criteria_rows = criterion_verdicts_from_attempt(
+                criteria,
+                &checks,
+                &results,
+                &unavailable,
+                changed,
+                ws,
+                review.as_ref(),
+                candidate_snapshot,
+                goal,
+            )
+            .await;
+            return Ok(IntegratedRootAttemptOutcome {
+                attempt_op,
+                pending: false,
+                verification: Some(IntegratedRootVerification {
+                    status,
+                    checks: executed,
+                    criteria: criteria_rows,
+                    changed: changed.to_vec(),
+                    summary: format!(
+                        "integrated-root verification: {} required check(s) inline over {}",
+                        ordered.len(),
+                        root.display()
+                    ),
+                }),
+            });
+        }
+        // Persist the attempt: ordered checks (inline outcomes + job
+        // definitions) in ONE transaction. An open job of an EARLIER
+        // crashed attempt is superseded first (typed Cancelled rows) — an
+        // open job is never silently replaced.
+        let begin = handle.begin_verification_attempt(
+            task_id.raw(),
+            revision,
+            attempt_op,
+            &root_str,
+            changed,
+            &ordered,
+            &job_inputs,
+        );
+        if let Err(err) = begin {
+            let current = handle
+                .current_verification_attempt(task_id.raw())
+                .map_err(|e| format!("verification attempt read: {e}"))?;
+            let Some(current) = current else {
+                return Err(format!("verification attempt begin refused: {err}"));
+            };
+            let note = format!("superseded by the root verification attempt {attempt_op}");
+            let _ = handle.cancel_verification_attempt(task_id.raw(), current.op_id, &note);
+            handle
+                .begin_verification_attempt(
+                    task_id.raw(),
+                    revision,
+                    attempt_op,
+                    &root_str,
+                    changed,
+                    &ordered,
+                    &job_inputs,
+                )
+                .map_err(|e| format!("verification attempt begin refused: {e}"))?;
+        }
+        // Every enqueued job is still open by construction: the run is
+        // pending exactly until the executor (or a later settlement)
+        // resolves this exact attempt.
+        Ok(IntegratedRootAttemptOutcome {
+            attempt_op,
+            pending: true,
+            verification: None,
+        })
+    }
+
+    /// Build the integrated-root verdict from a TERMINAL attempt rebuild
+    /// (the turn settlement's exact tail): acceptance over the required
+    /// mirrors, criterion verdicts through their own bindings, execution
+    /// proof rows from the durable job results.
+    #[allow(clippy::too_many_arguments)]
+    async fn root_verification_from_rebuild(
+        &self,
+        root: &std::path::Path,
+        criteria: &[String],
+        changed: &[String],
+        ws: &faktor_fs::WorkspaceHandle,
+        candidate_snapshot: &str,
+        goal: &str,
+        review: Option<&serde_json::Value>,
+        rebuild: AttemptRebuild,
+    ) -> IntegratedRootVerification {
+        let AttemptRebuild {
+            mirrors,
+            results,
+            unavailable,
+            executed,
+        } = rebuild;
+        let checks: Vec<CheckExecution> = executed
+            .into_iter()
+            .map(|e| CheckExecution {
+                check: e.id,
+                program: e.program,
+                args: e.args,
+                category: match e.kind {
+                    faktor_verify::CheckKind::Test => "test",
+                    faktor_verify::CheckKind::Lint => "lint",
+                    faktor_verify::CheckKind::Compile => "compile",
+                }
+                .into(),
+                required: true,
+                status: if e.passed {
+                    VerificationStatus::Passed
+                } else {
+                    VerificationStatus::Failed
+                },
+                started_ms: e.started_ms,
+                finished_ms: Some(e.finished_ms),
+                exit: e.exit,
+                summary: e.summary,
+            })
+            .collect();
+        let status = match faktor_verify::acceptance(&mirrors, &results) {
+            faktor_verify::Acceptance::Pass => VerificationStatus::Passed,
+            faktor_verify::Acceptance::Fail => VerificationStatus::Failed,
+            faktor_verify::Acceptance::Pending => VerificationStatus::Unavailable,
+        };
+        let criteria_rows = criterion_verdicts_from_attempt(
+            criteria,
+            &mirrors,
+            &results,
+            &unavailable,
+            changed,
+            ws,
+            review,
+            candidate_snapshot,
+            goal,
+        )
+        .await;
+        IntegratedRootVerification {
+            status,
+            checks,
+            criteria: criteria_rows,
+            changed: changed.to_vec(),
+            summary: format!(
+                "integrated-root verification: {} required check(s) from the settled durable attempt ({} passed, {} failed, {} unavailable); root {}",
+                mirrors.len(),
+                results.iter().filter(|(_, ok)| *ok).count(),
+                results.iter().filter(|(_, ok)| !ok).count(),
+                unavailable.len(),
+                root.display()
+            ),
+        }
+    }
+
     /// Verify an EMPTY aggregate change set through the independent reviewer
     /// (P0 no-op policy): with no change there are no derived checks, so the
     /// ONLY objective mechanism is a reviewer-proved "no changes were
@@ -6757,52 +7390,6 @@ impl AgentRuntime {
                 criteria.len()
             ),
         })
-    }
-
-    /// Bounded deterministic repo file map of one integrated root (the same
-    /// skip set and caps `repo_knowledge` uses): sorted relative paths, depth
-    /// capped, unreadable directories skipped — the derivation input only,
-    /// never a claim about the tree.
-    fn integrated_root_repo_files(
-        ws: &faktor_fs::WorkspaceHandle,
-        max_entries: usize,
-        max_depth: usize,
-    ) -> Vec<String> {
-        const SKIP: &[&str] = &[".git", "target", "node_modules", ".venv", "dist", ".hg"];
-        let mut entries: Vec<String> = Vec::new();
-        let mut stack: Vec<(usize, String)> = vec![(0, String::new())];
-        while let Some((depth, rel)) = stack.pop() {
-            if depth > max_depth || entries.len() >= max_entries {
-                break;
-            }
-            let Ok(list) = ws.list(std::path::Path::new(&rel), 200) else {
-                continue;
-            };
-            for meta in list {
-                if entries.len() >= max_entries {
-                    break;
-                }
-                let name = meta
-                    .path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let child = if rel.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{rel}/{name}")
-                };
-                if meta.path.is_dir() {
-                    if !SKIP.contains(&name.as_str()) {
-                        stack.push((depth + 1, child));
-                    }
-                } else {
-                    entries.push(child);
-                }
-            }
-        }
-        entries.sort();
-        entries
     }
 
     /// End-of-turn verification + completion gating (audits 4/6/7 — the
@@ -6912,7 +7499,29 @@ impl AgentRuntime {
                                 handle.cancel_verification_attempt(task_id, attempt.op_id, &note);
                         }
                     }
-                    Ok(_) => {}
+                    Ok(_) => {
+                        // No OPEN job remains, but the newest attempt may
+                        // have been resolved by the DAEMON verification
+                        // executor and not yet consumed: a non-terminal task
+                        // with a durable current attempt settles from its
+                        // exact rows (the executor never settles the task
+                        // itself).
+                        if changed.is_empty() {
+                            let non_terminal = handle
+                                .task_id()
+                                .ok()
+                                .and_then(|t| handle.get_task(t).ok().flatten())
+                                .is_some_and(|t| !t.state.is_terminal());
+                            let attempt_exists = handle
+                                .current_verification_attempt(task_id)
+                                .ok()
+                                .flatten()
+                                .is_some();
+                            if non_terminal && attempt_exists {
+                                return self.settle_verification_jobs(handle, cancel).await;
+                            }
+                        }
+                    }
                     Err(_) => {}
                 }
             }
@@ -6963,16 +7572,21 @@ impl AgentRuntime {
                 )
             }
         };
-        // Bounded repo file map (repo-knowledge walk: sorted, depth-capped,
-        // skip dirs excluded); empty → nothing to detect against. Computed
-        // BEFORE the review decision: the structured diff package reuses the
-        // map for the derived-check rows the reviewer model sees (P0-12).
-        let repo_files: Vec<String> = self
-            .repo_knowledge(handle)
-            .1
-            .lines()
-            .map(|l| l.to_string())
-            .collect();
+        // Bounded repository discovery with an EXPLICIT completeness verdict
+        // (audit: a partial repo view can never derive a smaller passing
+        // suite). ANY non-Complete inventory classifies the turn Unavailable
+        // with the typed reason BEFORE any review or derivation: the model's
+        // claim is never gated by checks derived from a truncated tree.
+        let inventory = faktor_verify::discover_repo_inventory(&root);
+        if let Some(reason) = inventory.refusal_reason() {
+            return self.unverified_verdict(
+                handle,
+                changed,
+                None,
+                &format!("repository inventory incomplete: {reason}"),
+            );
+        }
+        let repo_files: Vec<String> = inventory.files;
         // Independent completion review (audit round 15, P0-12/80 + P0-13):
         // the legacy bounded head scan PLUS a structured diff package built
         // from the checkpoint/CAS base (hunks, statuses, inventory delta)
@@ -7441,84 +8055,66 @@ impl AgentRuntime {
     ///
     /// A turn that ends mid-settlement (cancellation) returns a pending
     /// verdict: open jobs stay open and the task stays Verifying.
-    async fn settle_verification_jobs(
+    /// The daemon verification executor's primitive (audit P0-5/26
+    /// production wiring): claim -> execute -> resolve every OPEN job of the
+    /// session's CURRENT verification attempt. It never derives checks and
+    /// never settles the task — a resolved job is consumed by the next
+    /// settlement of the exact attempt. Returns the number of jobs resolved
+    /// (0 when nothing was open). A job claimed by a concurrent executor is
+    /// skipped (the guarded CAS decides exactly one winner).
+    pub async fn execute_open_verification_jobs(
         &self,
         handle: &faktor_session::SessionHandle,
-        cancel: &CancellationToken,
-    ) -> TurnEndVerdict {
-        let row = match handle.row() {
-            Ok(r) => r,
-            Err(_) => {
-                return self.verification_pending_verdict(handle, &[], "session row unresolvable")
-            }
-        };
-        let root = match self.deps.session.resolve_workspace_root(handle.id()) {
-            Ok(Some(r)) => r,
-            _ => {
-                return self.verification_pending_verdict(
-                    handle,
-                    &[],
-                    "session workspace root unresolvable; background jobs stay open",
-                )
-            }
-        };
-        let ws = match self.deps.workspaces.open(row.workspace_id, root.clone()) {
-            Ok(w) => w,
-            Err(_) => {
-                return self.verification_pending_verdict(
-                    handle,
-                    &[],
-                    "workspace could not be opened; background jobs stay open",
-                )
-            }
-        };
-        let task_id = row.task_id;
-        let task_raw = task_id.raw();
-        // Honest recovery at every settlement entry (idempotent; a Running
-        // row here is residue of an interrupted executor — never a live one,
-        // because job execution never spans settlement calls).
-        let _ = handle.recover_verification_jobs_after_restart();
-        let attempt = match handle.current_verification_attempt(task_raw) {
-            Ok(Some(a)) => a,
-            Ok(None) => {
-                return self.verification_pending_verdict(
-                    handle,
-                    &[],
-                    "open verification jobs have no attempt record (crash residue); \
-                     recovery resolved them; nothing to settle",
-                )
-            }
-            Err(e) => {
-                return self.verification_pending_verdict(
-                    handle,
-                    &[],
-                    &format!("verification attempt read failed: {e}"),
-                )
-            }
-        };
-        let service = self.deps.verification.clone();
+    ) -> Result<usize, String> {
+        let row = handle
+            .row()
+            .map_err(|e| format!("session row unresolvable: {e}"))?;
+        let root = self
+            .deps
+            .session
+            .resolve_workspace_root(handle.id())
+            .ok()
+            .flatten()
+            .ok_or_else(|| "session workspace root unresolvable".to_string())?;
+        self.deps
+            .workspaces
+            .open(row.workspace_id, root.clone())
+            .map_err(|e| format!("workspace could not be opened: {e}"))?;
+        let attempt = handle
+            .current_verification_attempt(row.task_id.raw())
+            .map_err(|e| format!("verification attempt read: {e}"))?
+            .ok_or_else(|| "no current verification attempt".to_string())?;
         let base_ctx = faktor_verify::exec::VerificationContext {
             session_id: handle.id().raw(),
-            task_id: task_raw,
+            task_id: row.task_id.raw(),
             operation_id: attempt.op_id,
             workspace_id: row.workspace_id.raw(),
             worktree_id: row.worktree_id.raw(),
-            root: root.clone(),
+            root,
             deadline: std::time::Instant::now(),
-            cancellation: cancel.child(),
+            cancellation: CancellationToken::new().child(),
         };
-        let mut rows = match handle.verification_attempt_jobs(task_raw, attempt.op_id) {
-            Ok(r) => r,
-            Err(e) => {
-                return self.verification_pending_verdict(
-                    handle,
-                    &[],
-                    &format!("job rows unreadable: {e}"),
-                )
-            }
+        Ok(self.execute_attempt_jobs(handle, &attempt, &base_ctx).await)
+    }
+
+    /// The shared claim -> execute -> resolve loop of one attempt's open
+    /// jobs. Never fails the caller: a concurrent claim loss skips the job
+    /// (another executor owns it), a corrupt spec row resolves Unavailable
+    /// (never left open, never a silent pass), and a resolve that loses the
+    /// race is ignored (the store's CAS keeps exactly one terminal write).
+    async fn execute_attempt_jobs(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        attempt: &faktor_session::VerificationAttempt,
+        base_ctx: &faktor_verify::exec::VerificationContext,
+    ) -> usize {
+        let task_raw = attempt.task_id;
+        let service = self.deps.verification.clone();
+        let rows = match handle.verification_attempt_jobs(task_raw, attempt.op_id) {
+            Ok(rows) => rows,
+            Err(_) => return 0,
         };
-        // Execution loop: every open job of the attempt, claimed exactly
-        // once and resolved exactly once.
+        let mut resolved = 0usize;
         for job in rows.iter().filter(|j| j.state.is_open()) {
             let claimed = handle.claim_verification_job(
                 task_raw,
@@ -7530,14 +8126,12 @@ impl AgentRuntime {
                 Ok(j) => j,
                 Err(_) => continue, // superseded/resolved concurrently — settled elsewhere
             };
+            resolved += 1;
             let spec: Result<faktor_verify::exec::CheckSpec, _> =
                 serde_json::from_str(&job_row.spec_json);
             let spec = match spec {
                 Ok(s) => s,
                 Err(e) => {
-                    // A hostile/corrupt spec row can never produce a verdict:
-                    // resolve it Unavailable with the typed note (never leave
-                    // it open, never a silent pass).
                     let _ = handle.resolve_verification_job(
                         task_raw,
                         &job_row.check_id,
@@ -7568,7 +8162,86 @@ impl AgentRuntime {
                 result_json,
             );
         }
-        rows = match handle.verification_attempt_jobs(task_raw, attempt.op_id) {
+        resolved
+    }
+
+    async fn settle_verification_jobs(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        cancel: &CancellationToken,
+    ) -> TurnEndVerdict {
+        let row = match handle.row() {
+            Ok(row) => row,
+            Err(e) => {
+                return self.verification_pending_verdict(
+                    handle,
+                    &[],
+                    &format!("session row unresolvable: {e}"),
+                )
+            }
+        };
+        let root = match self.deps.session.resolve_workspace_root(handle.id()) {
+            Ok(Some(r)) => r,
+            _ => {
+                return self.verification_pending_verdict(
+                    handle,
+                    &[],
+                    "session workspace root unresolvable; background jobs stay open",
+                )
+            }
+        };
+
+        let ws = match self.deps.workspaces.open(row.workspace_id, root.clone()) {
+            Ok(w) => w,
+            Err(_) => {
+                return self.verification_pending_verdict(
+                    handle,
+                    &[],
+                    "workspace could not be opened; background jobs stay open",
+                )
+            }
+        };
+        let task_id = row.task_id;
+        let task_raw = task_id.raw();
+        // Honest restart recovery happens ONCE at daemon startup (the CLI's
+        // recovery sweep), never per settlement: with the daemon-level
+        // verification executor a `Running` row here can be a LIVE claim
+        // from that executor, and re-queueing it would clobber a valid
+        // execution. The settlement below only ever claims `Queued` rows
+        // through the guarded CAS, so it can never steal a live job.
+        let attempt = match handle.current_verification_attempt(task_raw) {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                return self.verification_pending_verdict(
+                    handle,
+                    &[],
+                    "open verification jobs have no attempt record (crash residue); \
+                     recovery resolved them; nothing to settle",
+                )
+            }
+            Err(e) => {
+                return self.verification_pending_verdict(
+                    handle,
+                    &[],
+                    &format!("verification attempt read failed: {e}"),
+                )
+            }
+        };
+        let base_ctx = faktor_verify::exec::VerificationContext {
+            session_id: handle.id().raw(),
+            task_id: task_raw,
+            operation_id: attempt.op_id,
+            workspace_id: row.workspace_id.raw(),
+            worktree_id: row.worktree_id.raw(),
+            root: root.clone(),
+            deadline: std::time::Instant::now(),
+            cancellation: cancel.child(),
+        };
+        // Execution loop (the ONE executor primitive, shared with the
+        // daemon verification executor): every open job of the attempt,
+        // claimed exactly once and resolved exactly once.
+        self.execute_attempt_jobs(handle, &attempt, &base_ctx).await;
+        let rows = match handle.verification_attempt_jobs(task_raw, attempt.op_id) {
             Ok(r) => r,
             Err(e) => {
                 return self.verification_pending_verdict(
@@ -7597,65 +8270,13 @@ impl AgentRuntime {
             .load_ledger(handle)
             .map(|l| l.goal.clone())
             .unwrap_or_default();
-        let mut mirrors: Vec<faktor_verify::Check> = Vec::with_capacity(attempt.checks.len());
-        let mut results: Vec<(String, bool)> = Vec::new();
-        let mut unavailable: Vec<(String, String)> = Vec::new();
-        let mut executed: Vec<ExecutedCheck> = Vec::new();
+        let AttemptRebuild {
+            mirrors,
+            results,
+            unavailable,
+            executed,
+        } = rebuild_attempt_verification(&attempt, &rows);
         let changed: Vec<String> = attempt.changed.clone();
-        for entry in &attempt.checks {
-            let mirror = faktor_verify::Check {
-                id: entry.check_id.clone(),
-                kind: faktor_verify::CheckKind::Compile,
-                command: entry.command.clone(),
-                affects: Vec::new(),
-                required: true,
-            };
-            mirrors.push(mirror.clone());
-            match entry.inline {
-                Some(faktor_session::VerificationInlineStatus::Passed) => {
-                    results.push((entry.check_id.clone(), true));
-                }
-                Some(faktor_session::VerificationInlineStatus::Failed) => {
-                    results.push((entry.check_id.clone(), false));
-                }
-                Some(faktor_session::VerificationInlineStatus::Unavailable) => {
-                    unavailable.push((entry.check_id.clone(), entry.command.clone()));
-                }
-                None => {
-                    // A background check: its job row must exist and be
-                    // terminal. Missing/corrupt rows mean the durable
-                    // attempt is torn (hostile write or a crash): the check
-                    // can never certify — unavailable with the typed
-                    // refusal (never a silent skip, never a pass).
-                    let job = rows.iter().find(|j| j.check_id == entry.check_id);
-                    let settled = match job {
-                        Some(j) if j.state == faktor_session::VerificationJobState::Passed => {
-                            let kind = check_kind_of(j);
-                            let mut m = mirror.clone();
-                            m.kind = kind;
-                            executed_from_job(&m, j).map(|(e, ok)| {
-                                executed.push(e);
-                                results.push((entry.check_id.clone(), ok));
-                            })
-                        }
-                        Some(j) if j.state == faktor_session::VerificationJobState::Failed => {
-                            let kind = check_kind_of(j);
-                            let mut m = mirror.clone();
-                            m.kind = kind;
-                            executed_from_job(&m, j).map(|(e, ok)| {
-                                executed.push(e);
-                                results.push((entry.check_id.clone(), ok));
-                            })
-                        }
-                        // Unavailable/Cancelled/missing: no verdict.
-                        _ => None,
-                    };
-                    if settled.is_none() {
-                        unavailable.push((entry.check_id.clone(), entry.command.clone()));
-                    }
-                }
-            }
-        }
         for check in mirrors.iter().filter(|c| c.required) {
             if unavailable.iter().any(|(id, _)| id == &check.id) {
                 let _ = handle.upsert_memory_fact(
@@ -9070,6 +9691,21 @@ impl AgentRuntime {
             .ok_or_else(|| Error::not_found(format!("provider {provider_id} not registered")))
     }
 
+    /// Admission-time provider facts for media validation: the capabilities
+    /// of `provider`/`model` plus the provider's per-image byte bound.
+    /// `None` when the provider is not registered — admission callers fail
+    /// closed (a typed refusal, never an assume-vision default).
+    pub fn provider_media_caps(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Option<(faktor_core::model::ModelCapabilities, usize)> {
+        self.deps
+            .providers
+            .get(provider)
+            .map(|p| (p.capabilities(model), p.max_image_bytes()))
+    }
+
     /// Deterministic conversation-window bounds for one logical turn
     /// (audit 29). The window is sized from the budget class reserved for
     /// recent conversation (spec §8 class 4) with a token floor for tiny
@@ -9257,6 +9893,110 @@ impl AgentRuntime {
             }
         }
         Ok(out)
+    }
+
+    /// Resolve the durable task's IMAGE attachments into bounded in-memory
+    /// media parts at REQUEST CONSTRUCTION and append them (input order
+    /// preserved) to the newest user message carrying TEXT — the turn's own
+    /// prompt — synthesizing one only when the history has none (e.g. after
+    /// compaction dropped it). Non-image attachments are not model content
+    /// and stay CAS-only.
+    ///
+    /// Every failure is typed and happens BEFORE any provider call:
+    ///
+    /// - a model without [`ModelCapabilities::vision`] refuses loudly (never
+    ///   a silently dropped image);
+    /// - the mime must be one of the provider's supported image types;
+    /// - the provider's per-image bound and the request-wide media bound are
+    ///   checked from DURABLE sizes before any blob read;
+    /// - a missing/tampered CAS blob is a typed error (the session layer
+    ///   re-hashes every blob against its digest).
+    ///
+    /// The bytes exist only in this request: the durable task row keeps
+    /// `AttachmentId`s, so re-attach re-resolves the byte-identical set.
+    fn inject_attachment_media(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        history: &mut Vec<RequestMessage>,
+        caps: &faktor_core::model::ModelCapabilities,
+        provider: &dyn faktor_provider::Provider,
+    ) -> faktor_core::Result<()> {
+        let Some(task) = handle.get_task(handle.task_id()?)? else {
+            return Ok(());
+        };
+        let images: Vec<faktor_core::attachment::AttachmentId> = task
+            .attachments
+            .iter()
+            .filter(|a| a.is_image())
+            .cloned()
+            .collect();
+        if images.is_empty() {
+            return Ok(());
+        }
+        if !caps.vision {
+            return Err(Error::malformed(format!(
+                "model {} does not support vision, but task {} carries {} image attachment(s); remove them or select a vision model",
+                handle.model().unwrap_or_default(),
+                task.task_id,
+                images.len()
+            )));
+        }
+        for id in &images {
+            if !faktor_provider::is_supported_image_mime(&id.mime) {
+                return Err(Error::new(
+                    ErrorKind::Malformed,
+                    format!(
+                        "image attachment {} has unsupported mime {:?}; deliverable types: {}",
+                        id.digest,
+                        id.mime,
+                        faktor_provider::SUPPORTED_IMAGE_MIMES.join(", ")
+                    ),
+                ));
+            }
+        }
+        // Defense in depth behind admission: the provider bound and the
+        // request-wide media bound are re-checked here, from durable sizes.
+        let per_image = provider
+            .max_image_bytes()
+            .min(faktor_provider::MAX_MEDIA_BYTES_HARD);
+        let resolved = handle.resolve_attachment_bytes(
+            &images,
+            per_image,
+            faktor_provider::MAX_REQUEST_IMAGE_BYTES,
+        )?;
+        // The prompt message: the newest user message that carries text —
+        // never a tool-result-only user message. Deduped if this history
+        // was injected already in-process.
+        let target = history
+            .iter()
+            .rposition(|m| {
+                m.role == Role::User
+                    && m.content.iter().any(|p| {
+                        matches!(&p.kind, faktor_provider::ContentKind::Text { text } if !text.is_empty())
+                    })
+            })
+            .or_else(|| history.iter().rposition(|m| m.role == Role::User));
+        let already = target.is_some_and(|i| {
+            history[i]
+                .content
+                .iter()
+                .any(|p| matches!(p.kind, faktor_provider::ContentKind::ImageData { .. }))
+        });
+        if already {
+            return Ok(());
+        }
+        let mut parts = Vec::with_capacity(resolved.len());
+        for r in resolved {
+            parts.push(ContentPart::image_data(&r.id.mime, r.bytes)?);
+        }
+        match target {
+            Some(i) => history[i].content.extend(parts),
+            None => history.push(RequestMessage {
+                role: Role::User,
+                content: parts,
+            }),
+        }
+        Ok(())
     }
 
     /// Thin adapter: the wire request IS the budgeted plan — `system`,
@@ -12339,6 +13079,83 @@ fn check_kind_of(job: &faktor_session::VerificationJob) -> faktor_verify::CheckK
     }
 }
 
+/// One durable attempt's COMPLETE required-check picture, rebuilt from its
+/// ordered attempt record (inline outcomes frozen at enqueue) plus its job
+/// rows (background outcomes resolved by an executor). Shared by the turn
+/// settlement and the attempt-based integrated-root verification so the two
+/// settlement paths can never reconstruct an attempt differently.
+struct AttemptRebuild {
+    mirrors: Vec<faktor_verify::Check>,
+    results: Vec<(String, bool)>,
+    unavailable: Vec<(String, String)>,
+    executed: Vec<ExecutedCheck>,
+}
+
+/// Rebuild one attempt's mirrors/results from durable rows. A background
+/// check whose job row is missing, Cancelled or Unavailable carries NO
+/// verdict (unavailable, never a silent pass).
+fn rebuild_attempt_verification(
+    attempt: &faktor_session::VerificationAttempt,
+    rows: &[faktor_session::VerificationJob],
+) -> AttemptRebuild {
+    let mut mirrors: Vec<faktor_verify::Check> = Vec::with_capacity(attempt.checks.len());
+    let mut results: Vec<(String, bool)> = Vec::new();
+    let mut unavailable: Vec<(String, String)> = Vec::new();
+    let mut executed: Vec<ExecutedCheck> = Vec::new();
+    for entry in &attempt.checks {
+        let mirror = faktor_verify::Check {
+            id: entry.check_id.clone(),
+            kind: faktor_verify::CheckKind::Compile,
+            command: entry.command.clone(),
+            affects: Vec::new(),
+            required: true,
+        };
+        mirrors.push(mirror.clone());
+        match entry.inline {
+            Some(faktor_session::VerificationInlineStatus::Passed) => {
+                results.push((entry.check_id.clone(), true));
+            }
+            Some(faktor_session::VerificationInlineStatus::Failed) => {
+                results.push((entry.check_id.clone(), false));
+            }
+            Some(faktor_session::VerificationInlineStatus::Unavailable) => {
+                unavailable.push((entry.check_id.clone(), entry.command.clone()));
+            }
+            None => {
+                let job = rows.iter().find(|j| j.check_id == entry.check_id);
+                let settled = match job {
+                    Some(j)
+                        if matches!(
+                            j.state,
+                            faktor_session::VerificationJobState::Passed
+                                | faktor_session::VerificationJobState::Failed
+                        ) =>
+                    {
+                        let kind = check_kind_of(j);
+                        let mut m = mirror.clone();
+                        m.kind = kind;
+                        executed_from_job(&m, j).map(|(e, ok)| {
+                            executed.push(e);
+                            results.push((entry.check_id.clone(), ok));
+                        })
+                    }
+                    // Unavailable/Cancelled/missing: no verdict.
+                    _ => None,
+                };
+                if settled.is_none() {
+                    unavailable.push((entry.check_id.clone(), entry.command.clone()));
+                }
+            }
+        }
+    }
+    AttemptRebuild {
+        mirrors,
+        results,
+        unavailable,
+        executed,
+    }
+}
+
 /// The legacy [`faktor_verify::Check`] mirror of a typed spec (builder
 /// families, wave 17): the SAME id/kind/required semantics with the
 /// canonical command text (`program arg...` — simple tokens by
@@ -14542,6 +15359,269 @@ mod tests {
             AgentState::ReadyForNextTurn,
             "the second turn only completes when reasoning roundtrips as ContentKind::Reasoning"
         );
+    }
+
+    /// Request construction (media): durable `AttachmentId`s resolve to
+    /// bounded in-memory `ImageData` parts at request time — order
+    /// preserved, non-images excluded — and NO expanded byte ever reaches
+    /// durable state (the task row keeps ids only).
+    #[tokio::test]
+    async fn attachment_media_reaches_the_request_byte_exact_and_never_persists() {
+        fn vision_caps() -> ModelCapabilities {
+            ModelCapabilities {
+                vision: true,
+                ..Default::default()
+            }
+        }
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
+        let jpg: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0, 9, 8, 7];
+        let captured: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_hook = captured.clone();
+        let expected_png = png.clone();
+        let expected_jpg = jpg.clone();
+        let wrapper = Arc::new(InspectingProvider::new(
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                vision_caps(),
+                vec![ScriptedResponse::Text("seen".into()), ScriptedResponse::End],
+            )),
+            move |_n, req| {
+                let mut media = Vec::new();
+                for m in &req.messages {
+                    for p in &m.content {
+                        if let faktor_provider::ContentKind::ImageData { mime, data } = &p.kind {
+                            assert!(
+                                mime == "image/png" || mime == "image/jpeg",
+                                "unexpected mime {mime}"
+                            );
+                            media.push((mime.clone(), data.as_slice().to_vec()));
+                        }
+                    }
+                }
+                if media.len() != 2 {
+                    return Err(format!("expected 2 resolved images, got {}", media.len()));
+                }
+                if media[0].0 != "image/png" || media[0].1 != expected_png {
+                    return Err("first image is not the byte-exact PNG".into());
+                }
+                if media[1].0 != "image/jpeg" || media[1].1 != expected_jpg {
+                    return Err("second image is not the byte-exact JPEG (order lost?)".into());
+                }
+                *captured_hook.lock().unwrap() = media.into_iter().map(|(_, b)| b).collect();
+                Ok(())
+            },
+        ));
+        let (deps, _dir) = deps_with(wrapper, vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let img1 = handle
+            .put_attachment("image/png", Some("a.png"), &png)
+            .unwrap();
+        let img2 = handle
+            .put_attachment("image/jpeg", Some("b.jpg"), &jpg)
+            .unwrap();
+        let pdf = handle
+            .put_attachment("application/pdf", Some("spec.pdf"), b"%PDF-1.4")
+            .unwrap();
+        runtime
+            .seed_task_attachments(session, &[img1.clone(), img2.clone(), pdf.clone()])
+            .unwrap();
+        let outcome = runtime
+            .run_turn(session, "describe both images", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(
+            captured.lock().unwrap().as_slice(),
+            &[png.clone(), jpg.clone()][..],
+            "provider saw the byte-exact ordered images"
+        );
+        // Durable state keeps the typed set ONLY: no expanded bytes and no
+        // base64 anywhere in the task row or the message rows.
+        let task = handle.get_task(handle.task_id().unwrap()).unwrap().unwrap();
+        assert_eq!(task.attachments, vec![img1, img2, pdf]);
+        let page = handle.messages_page(None, 50).unwrap();
+        let durable_json = serde_json::to_string(
+            &page
+                .messages
+                .iter()
+                .map(|m| serde_json::to_value(&m.parts).unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        for secret in [
+            faktor_provider::MediaBytes::new(png.clone())
+                .unwrap()
+                .to_base64(),
+            faktor_provider::MediaBytes::new(jpg.clone())
+                .unwrap()
+                .to_base64(),
+        ] {
+            assert!(
+                !durable_json.contains(&secret),
+                "base64 media leaked into durable message state"
+            );
+        }
+        assert!(!durable_json.contains("0x89") && !durable_json.contains("\\u0089"));
+    }
+
+    /// A vision-less selected model refuses the turn TYPEDLY before any
+    /// provider call and keeps the durable bytes intact.
+    #[tokio::test]
+    async fn attachment_media_visionless_model_is_a_typed_refusal_with_bytes_kept() {
+        let (deps, _dir) = deps(
+            FakeProvider::with_script(
+                "fake",
+                ModelCapabilities::default(),
+                vec![ScriptedResponse::End],
+            ),
+            vec![],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let image = handle
+            .put_attachment("image/png", Some("a.png"), b"\x89PNG")
+            .unwrap();
+        runtime
+            .seed_task_attachments(session, std::slice::from_ref(&image))
+            .unwrap();
+        let provider = runtime.deps.providers.get("fake").unwrap();
+        let caps = provider.capabilities("m");
+        assert!(!caps.vision);
+        let mut history = vec![RequestMessage {
+            role: Role::User,
+            content: vec![ContentPart::text("what is this?")],
+        }];
+        let err = runtime
+            .inject_attachment_media(&handle, &mut history, &caps, provider.as_ref())
+            .expect_err("vision-less model must refuse");
+        assert!(err.message.contains("does not support vision"), "{err:?}");
+        assert_eq!(err.kind, ErrorKind::Malformed);
+        // The draft-equivalent durable bytes and row remain intact.
+        assert_eq!(
+            handle.attachment_bytes(&image, 1 << 20).unwrap(),
+            b"\x89PNG"
+        );
+        assert_eq!(handle.list_attachments(16).unwrap(), vec![image]);
+    }
+
+    /// A missing or tampered CAS blob fails the request typedly — never a
+    /// silent text fallback and never wrong bytes under the digest.
+    #[tokio::test]
+    async fn attachment_media_missing_or_tampered_blob_is_typed() {
+        for tamper in [false, true] {
+            let (deps, _dir) = deps(
+                FakeProvider::with_script(
+                    "fake",
+                    ModelCapabilities {
+                        vision: true,
+                        ..Default::default()
+                    },
+                    vec![ScriptedResponse::End],
+                ),
+                vec![],
+            );
+            let runtime = AgentRuntime::new(deps).unwrap();
+            let session = new_session(runtime.deps());
+            let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+            let image = handle
+                .put_attachment("image/png", Some("a.png"), b"\x89PNG-original")
+                .unwrap();
+            runtime
+                .seed_task_attachments(session, std::slice::from_ref(&image))
+                .unwrap();
+            let blob = runtime
+                .deps
+                .session
+                .cas()
+                .root()
+                .join(image.digest.cas_path());
+            if tamper {
+                std::fs::write(&blob, b"\x89PNG-forged!").unwrap();
+            } else {
+                std::fs::remove_file(&blob).unwrap();
+            }
+            let provider = runtime.deps.providers.get("fake").unwrap();
+            let caps = provider.capabilities("m");
+            let mut history = vec![RequestMessage {
+                role: Role::User,
+                content: vec![ContentPart::text("q")],
+            }];
+            let err = runtime
+                .inject_attachment_media(&handle, &mut history, &caps, provider.as_ref())
+                .expect_err("missing/tampered blob must fail typed");
+            assert!(
+                matches!(err.kind, ErrorKind::NotFound | ErrorKind::Store),
+                "tamper={tamper} => {:?}",
+                err.kind
+            );
+            assert!(
+                !history
+                    .iter()
+                    .flat_map(|m| &m.content)
+                    .any(|p| matches!(p.kind, faktor_provider::ContentKind::ImageData { .. })),
+                "no partial media may survive a failed resolution"
+            );
+        }
+    }
+
+    /// Re-attach reconstructs the same request bytes from durable state
+    /// alone: two independent constructions produce byte-identical
+    /// histories (serde-JSON equal), and a second resolution of the same
+    /// CAS bytes is stable.
+    #[tokio::test]
+    async fn attachment_media_reattach_reconstructs_identical_request_bytes() {
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 4, 5, 6];
+        let (deps, _dir) = deps(
+            FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    vision: true,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::End],
+            ),
+            vec![],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let image = handle
+            .put_attachment("image/png", Some("a.png"), &png)
+            .unwrap();
+        runtime
+            .seed_task_attachments(session, std::slice::from_ref(&image))
+            .unwrap();
+        let provider = runtime.deps.providers.get("fake").unwrap();
+        let caps = provider.capabilities("m");
+        let build = || {
+            let mut history = vec![RequestMessage {
+                role: Role::User,
+                content: vec![ContentPart::text("look")],
+            }];
+            runtime
+                .inject_attachment_media(&handle, &mut history, &caps, provider.as_ref())
+                .unwrap();
+            history
+        };
+        let first = build();
+        let second = build();
+        assert_eq!(first, second, "re-attach must reconstruct equal requests");
+        assert_eq!(
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap(),
+            "the JSON projections (digest+size media carriers) are equal too"
+        );
+        match &first[0].content[1].kind {
+            faktor_provider::ContentKind::ImageData { mime, data } => {
+                assert_eq!(mime, "image/png");
+                assert_eq!(data.as_slice(), &png);
+            }
+            other => panic!("expected resolved image, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -16976,6 +18056,433 @@ mod tests {
                 .expect("the job really executed at settlement")
                 .trim(),
             "ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_executor_resolves_a_background_check_asynchronously_and_completion_waits() {
+        // E2E (audit P0-5/26 production wiring): the exact primitive the
+        // daemon verification executor runs every tick
+        // ([`AgentRuntime::execute_open_verification_jobs`]) resolves the
+        // queued check asynchronously. Until a genuine end consumes the
+        // exact attempt, the task stays Verifying (completion WAITS) even
+        // though the job row is already terminal; the next text turn then
+        // settles from the durable result and completes.
+        if !std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping daemon-executor async resolution: no make on this host");
+            return;
+        }
+        let (manager, session, _dir) =
+            make_background_env("\t@true\n\techo executor-ran > executor-marker.txt\n", None);
+        let (mut deps, _d) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/main.c", "content": "int main(void) {\n    int base = 40;\n    int step = 2;\n    printf(\"%d\\n\", base + step);\n    return 0;\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ])),
+            vec![real_write_tool()],
+        );
+        deps.verification = real_background_verifier();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "change main.c", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.completion,
+            Some(CompletionGate::VerificationPending),
+            "the mutating turn parks on the queued job"
+        );
+        let h = manager.get_session(session).unwrap().unwrap();
+        let task_id = h.task_id().unwrap();
+        let attempt = h
+            .current_verification_attempt(task_id.raw())
+            .unwrap()
+            .unwrap();
+        // ---- the daemon executor primitive: claim -> execute -> resolve ----
+        let resolved = runtime
+            .execute_open_verification_jobs(&h)
+            .await
+            .expect("the executor primitive resolves the queued job");
+        assert_eq!(resolved, 1);
+        let root = manager
+            .resolve_workspace_root(session)
+            .unwrap()
+            .expect("workspace root");
+        assert!(
+            root.join("executor-marker.txt").exists(),
+            "the executor really ran the check process"
+        );
+        let job = h
+            .verification_attempt_jobs(task_id.raw(), attempt.op_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(job.state, faktor_session::VerificationJobState::Passed);
+        // Completion still WAITS: the terminal result belongs to the exact
+        // attempt and only a genuine end may consume it.
+        let task = h.get_task(task_id).unwrap().unwrap();
+        assert_eq!(
+            task.state,
+            TaskState::Verifying,
+            "an executed job alone never completes the task"
+        );
+        // ---- a later text turn consumes the exact attempt and completes ----
+        let (mut deps2, _d2) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::Text("status?".into()),
+                ScriptedResponse::End,
+            ])),
+            vec![real_write_tool()],
+        );
+        deps2.verification = real_background_verifier();
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let settled = runtime2
+            .run_turn(session, "what is the status?", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            settled.completion,
+            Some(CompletionGate::VerifiedComplete),
+            "the async result is consumed exactly once: {settled:?}"
+        );
+        let h2 = manager.get_session(session).unwrap().unwrap();
+        let task = h2.get_task(task_id).unwrap().unwrap();
+        assert_eq!(task.state, TaskState::VerifiedComplete);
+    }
+
+    #[tokio::test]
+    async fn reverify_transition_supersedes_the_old_attempt_and_late_results_are_refused() {
+        // Adversarial (audit P0-5/26): a NEW mutating turn supersedes the
+        // open attempt of the previous content (typed Cancelled rows), and a
+        // late result for the OLD attempt is typed-refused: it can never
+        // resolve the fresh attempt, and the task never completes from it.
+        if !std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping reverify supersede: no make on this host");
+            return;
+        }
+        let (manager, session, _dir) =
+            make_background_env("\tsleep 2\n\techo superseded > never.txt\n", None);
+        let (mut deps, _d) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/main.c", "content": "int main(void) {\n    int base = 40;\n    int step = 1;\n    printf(\"%d\\n\", base + step);\n    return 0;\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ])),
+            vec![real_write_tool()],
+        );
+        deps.verification = real_background_verifier();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let first = runtime
+            .run_turn(session, "change main.c", &[])
+            .await
+            .unwrap();
+        assert_eq!(first.completion, Some(CompletionGate::VerificationPending));
+        let h = manager.get_session(session).unwrap().unwrap();
+        let task_id = h.task_id().unwrap();
+        let old_op = h
+            .current_verification_attempt(task_id.raw())
+            .unwrap()
+            .unwrap()
+            .op_id;
+        // ---- reverify transition: a NEW mutating turn, new content ----
+        let (mut deps2, _d2) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c2".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/main.c", "content": "int main(void) {\n    int base = 40;\n    int step = 3;\n    printf(\"%d\\n\", base + step);\n    return 0;\n}\n"}),
+                },
+                ScriptedResponse::Text("changed again".into()),
+                ScriptedResponse::End,
+            ])),
+            vec![real_write_tool()],
+        );
+        deps2.verification = real_background_verifier();
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let second = runtime2
+            .run_turn(session, "change main.c again", &[])
+            .await
+            .unwrap();
+        // The fresh derivation enqueued the NEW attempt: the turn parks.
+        assert_eq!(second.completion, Some(CompletionGate::VerificationPending));
+        let new_attempt = h
+            .current_verification_attempt(task_id.raw())
+            .unwrap()
+            .unwrap();
+        assert_ne!(new_attempt.op_id, old_op, "a FRESH attempt began");
+        // Every job of the OLD attempt is typed Cancelled (never dropped).
+        let old_rows = h.verification_attempt_jobs(task_id.raw(), old_op).unwrap();
+        assert!(!old_rows.is_empty());
+        assert!(
+            old_rows
+                .iter()
+                .all(|j| j.state == faktor_session::VerificationJobState::Cancelled),
+            "old attempt frozen as cancelled: {old_rows:?}"
+        );
+        // A LATE result for the superseded attempt is typed-refused and can
+        // never resolve the new attempt.
+        let late = h.resolve_verification_job(
+            task_id.raw(),
+            "make_test",
+            old_op,
+            faktor_session::VerificationJobState::Passed,
+            None,
+            Some("{}".into()),
+        );
+        let err = late.expect_err("a superseded attempt must refuse late results");
+        assert!(
+            matches!(err, faktor_session::SessionError::Conflict(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("superseded"), "{err}");
+        let new_rows = h
+            .verification_attempt_jobs(task_id.raw(), new_attempt.op_id)
+            .unwrap();
+        assert!(
+            new_rows
+                .iter()
+                .all(|j| j.state == faktor_session::VerificationJobState::Queued),
+            "the new attempt's jobs are untouched by the old result: {new_rows:?}"
+        );
+        let task = h.get_task(task_id).unwrap().unwrap();
+        assert_eq!(task.state, TaskState::Verifying);
+        // The executor resolves the FRESH attempt; a genuine end completes.
+        assert_eq!(
+            runtime2.execute_open_verification_jobs(&h).await.unwrap(),
+            1
+        );
+        let (mut deps3, _d3) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::Text("status?".into()),
+                ScriptedResponse::End,
+            ])),
+            vec![real_write_tool()],
+        );
+        deps3.verification = real_background_verifier();
+        let runtime3 = AgentRuntime::new(deps3).unwrap();
+        let settled = runtime3.run_turn(session, "status?", &[]).await.unwrap();
+        assert_eq!(settled.completion, Some(CompletionGate::VerifiedComplete));
+        let h3 = manager.get_session(session).unwrap().unwrap();
+        assert_eq!(
+            h3.get_task(task_id).unwrap().unwrap().state,
+            TaskState::VerifiedComplete
+        );
+    }
+
+    #[tokio::test]
+    async fn root_attempt_consumption_is_exact_and_starts_fresh_when_superseded() {
+        // Audit P0-5/26 production wiring: the attempt-based integrated-root
+        // verification consumes EXACTLY the recorded attempt — it never
+        // re-derives/re-runs while the attempt is pending, rebuilds the
+        // verdict from the settled rows when terminal, and starts a FRESH
+        // attempt (structurally superseding the old one) when a newer
+        // attempt exists.
+        if !std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping root attempt consumption: no make on this host");
+            return;
+        }
+        let (manager, session, dir) =
+            make_background_env("\t@true\n\techo root-attempt > root-marker.txt\n", None);
+        let root = dir.path().join("ws");
+        let (mut deps, _d) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ])),
+            vec![real_write_tool()],
+        );
+        deps.verification = real_background_verifier();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let h = manager.get_session(session).unwrap().unwrap();
+        let task_id = h.task_id().unwrap();
+        let now = h.now_ms();
+        h.create_task(Task {
+            task_id,
+            session_id: session,
+            goal: "root attempt".into(),
+            acceptance_criteria: vec![],
+            plan: vec![],
+            attachments: Vec::new(),
+            budget: Default::default(),
+            state: TaskState::Running,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .unwrap();
+        let changed = vec!["src/main.c".to_string()];
+        let cancel = CancellationToken::new();
+        // First call: derives once and enqueues the expensive check.
+        let attempt_op = manager.next_op_id().raw();
+        let first = runtime
+            .verify_integrated_root_attempt(&h, &root, &changed, &[], &cancel, attempt_op)
+            .await
+            .unwrap();
+        assert_eq!(first.attempt_op, attempt_op);
+        assert!(first.pending, "an enqueued job parks the run");
+        assert!(first.verification.is_none());
+        let task_id = h.task_id().unwrap();
+        let attempt = h
+            .verification_attempt(task_id.raw(), attempt_op)
+            .unwrap()
+            .unwrap();
+        assert!(attempt
+            .checks
+            .iter()
+            .any(|c| c.check_id == "make_test" && c.inline.is_none()));
+        // A second call with the SAME op while the job is open is still
+        // pending — nothing is re-derived or re-run inline.
+        let second = runtime
+            .verify_integrated_root_attempt(&h, &root, &changed, &[], &cancel, attempt_op)
+            .await
+            .unwrap();
+        assert!(second.pending);
+        assert!(second.verification.is_none());
+        assert!(
+            !root.join("root-marker.txt").exists(),
+            "the root path never executes the queued job inline"
+        );
+        // The executor primitive resolves the exact attempt.
+        assert_eq!(runtime.execute_open_verification_jobs(&h).await.unwrap(), 1);
+        // Consumption rebuilds the verdict from the EXACT attempt rows.
+        let settled = runtime
+            .verify_integrated_root_attempt(&h, &root, &changed, &[], &cancel, attempt_op)
+            .await
+            .unwrap();
+        assert!(!settled.pending, "the terminal attempt is consumed");
+        let verification = settled.verification.expect("terminal verdict");
+        assert_eq!(verification.status, VerificationStatus::Passed);
+        assert!(
+            verification.checks.iter().any(|c| c.check == "make_test"),
+            "the settled job's execution row rides the verdict: {:?}",
+            verification.checks
+        );
+        // A newer attempt makes the old op structurally superseded: the
+        // consumer starts a FRESH attempt and never consumes the stale one.
+        let newer_op = manager.next_op_id().raw();
+        h.begin_verification_attempt(
+            task_id.raw(),
+            h.task_revision(task_id).unwrap().raw(),
+            newer_op,
+            root.to_str().unwrap(),
+            &changed,
+            &[faktor_session::VerificationAttemptCheck {
+                check_id: "make_test".into(),
+                command: "make test".into(),
+                inline: None,
+            }],
+            &[faktor_session::VerificationJobInput {
+                check_id: "make_test".into(),
+                kind: "test".into(),
+                command: "make test".into(),
+                program: "make".into(),
+                args: vec!["test".into()],
+                spec_json: "{}".into(),
+                budget_ms: 10_000,
+            }],
+        )
+        .unwrap();
+        let superseded = runtime
+            .verify_integrated_root_attempt(&h, &root, &changed, &[], &cancel, attempt_op)
+            .await
+            .unwrap();
+        assert_ne!(
+            superseded.attempt_op, attempt_op,
+            "a superseded attempt can never settle the run again"
+        );
+        assert!(superseded.pending, "the fresh attempt's jobs are open");
+        // A late result for the old attempt is typed-refused and never
+        // resolves the fresh one.
+        let late = h.resolve_verification_job(
+            task_id.raw(),
+            "make_test",
+            attempt_op,
+            faktor_session::VerificationJobState::Passed,
+            None,
+            Some("{}".into()),
+        );
+        assert!(late.is_err(), "old attempt rows are frozen");
+    }
+
+    #[tokio::test]
+    async fn partial_repository_inventory_never_derives_a_passing_suite() {
+        // Adversarial (inventory completeness): a repository exceeding the
+        // bounded inventory caps can never certify completion. The turn
+        // classifies Unavailable BEFORE any review or derivation and mints
+        // no verification record — a truncated view never yields a smaller
+        // passing suite.
+        let (manager, session, dir) = make_background_env("\t@true\n", None);
+        let root = dir.path().join("ws");
+        for i in 0..=faktor_verify::MAX_INVENTORY_FILES {
+            let sub = root.join(format!("gen/g{:02}", i % 40));
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join(format!("f{i:04}.rs")), b"// filler\n").unwrap();
+        }
+        let (mut deps, _d) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/main.c", "content": "int main(void) {\n    return 0;\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ])),
+            vec![real_write_tool()],
+        );
+        deps.verification = crate::VerificationService::fake_ok();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "change main.c", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.completion,
+            Some(CompletionGate::Unverified),
+            "a partial inventory can never pass: {outcome:?}"
+        );
+        assert!(
+            outcome.verification.is_empty(),
+            "no checks were derived from the truncated view"
+        );
+        let h = manager.get_session(session).unwrap().unwrap();
+        let task_id = h.task_id().unwrap();
+        assert!(
+            h.list_verification_records(task_id).unwrap().is_empty(),
+            "a partial inventory mints no proof record"
+        );
+        assert_ne!(
+            h.get_task(task_id).unwrap().unwrap().state,
+            TaskState::VerifiedComplete
         );
     }
 
@@ -29869,6 +31376,100 @@ mod tests {
         assert!(
             !system.contains("src/a2.rs"),
             "the redundant A variant must be dropped: {system}"
+        );
+    }
+
+    /// E2E (hybrid retrieval production wiring): an ORDINARY agent turn —
+    /// the scripted provider makes NO search tool call — must still receive
+    /// the repository evidence relevant to its prompt. The workspace index
+    /// is built to Ready, the turn's prompt seeds a query whose tokens live
+    /// only in one repository file, and the CAPTURED provider request must
+    /// carry that file through the automatically fused (exact + lexical +
+    /// symbol) evidence package.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ordinary_turn_receives_repository_evidence_without_a_search_tool_call() {
+        let captured: Arc<std::sync::Mutex<Vec<GenericAgentRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let inspected: Arc<dyn faktor_provider::Provider> = Arc::new(InspectingProvider::new(
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End],
+            )),
+            move |_n, req| {
+                cap.lock().unwrap().push(req.clone());
+                Ok(())
+            },
+        ));
+        let (deps, dir) = deps_with(inspected, vec![]);
+        // Seed the repository: the ONLY place the query's tokens exist.
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/ziggurat_vault.rs"),
+            b"pub fn tune_ziggurat_vault() -> u32 {\n    7\n}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("Cargo.toml"), b"[package]\nname = \"x\"\n").unwrap();
+        let ws = deps
+            .session
+            .create_workspace(root.to_str().unwrap())
+            .unwrap();
+        let session = deps
+            .session
+            .create_session(ws, "hybrid retrieval", "fake", "m")
+            .unwrap()
+            .id();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        // Workspace open -> index lifecycle: attach + build the generation.
+        let service = runtime.index_service().expect("IndexService hosted");
+        // `block_in_place` (not a blocking-spawn anchor, which the source
+        // scan of this file forbids) keeps the multi-thread test runtime
+        // responsive while the index machine reaches Ready.
+        let view = tokio::task::block_in_place({
+            let service = service.clone();
+            move || {
+                service.attach(ws).unwrap();
+                service
+                    .ensure_ready(
+                        ws,
+                        std::time::Instant::now() + std::time::Duration::from_secs(30),
+                    )
+                    .unwrap()
+            }
+        });
+        assert!(view.index().lock().unwrap().file_count(ws) >= 2);
+        // The ordinary turn: no search tool is scripted or called.
+        let outcome = runtime
+            .run_turn(session, "fix the ziggurat vault handling", &[])
+            .await
+            .unwrap();
+        assert!(
+            !matches!(
+                outcome.final_state,
+                AgentState::FailedRecoverable | AgentState::FailedPermanent
+            ),
+            "turn failed: {:?}",
+            outcome.final_state
+        );
+        let requests = captured.lock().unwrap();
+        assert!(!requests.is_empty(), "the provider must have been called");
+        let system = &requests[0].system;
+        // The EVIDENCE package (its own rendered section), not merely the
+        // repository map, must carry the query-relevant file: the snippet
+        // only exists on the retrieval path.
+        let evidence_section = system.split("## Retrieved evidence").nth(1).unwrap_or("");
+        assert!(
+            evidence_section.contains("src/ziggurat_vault.rs"),
+            "the automatically retrieved repository evidence must ride the provider request: {system}"
+        );
+        assert!(
+            evidence_section.contains("ziggurat"),
+            "the evidence row must carry the query-relevant file: {system}"
         );
     }
 

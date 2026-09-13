@@ -41,7 +41,13 @@ use std::time::Duration;
 pub mod criteria;
 pub mod derive;
 pub mod exec;
+pub mod inventory;
 pub mod review;
+
+pub use inventory::{
+    discover_repo_inventory, InventoryCompleteness, RepoInventory, MAX_INVENTORY_DEPTH,
+    MAX_INVENTORY_DIR_PAGE, MAX_INVENTORY_FILES,
+};
 
 /// Hard cap on the checks one derivation may return. The legacy
 /// single-project derivation ([`derive_checks`]) truncates to it; the

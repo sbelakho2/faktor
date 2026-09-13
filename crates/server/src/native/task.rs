@@ -177,10 +177,11 @@ pub(crate) struct StartTaskRunRequest {
     /// through `POST /native/session/{id}/attachments` BEFORE this start.
     /// SEPARATE from `files`: CAS bytes addressed by digest, never workspace
     /// paths. Strict (`deny_unknown_fields` on the id itself); every digest
-    /// must resolve to a byte-identical durable row of THIS session and an
-    /// image id is refused loudly (code `unsupported`) — provider
-    /// media/content parts are not wired, so the server never pretends an
-    /// attachment reached a model. Absent/empty = the attachment-free path.
+    /// must resolve to a byte-identical durable row of THIS session, and
+    /// every image is validated against the chosen model (vision required,
+    /// deliverable mime, provider per-image bound) with a typed refusal
+    /// that keeps the draft and bytes intact. Absent/empty = the
+    /// attachment-free path.
     #[serde(default)]
     attachments: Option<Vec<faktor_core::attachment::AttachmentId>>,
     /// The PR/CI-fix completion contract of this run (P2): when present with
@@ -316,11 +317,13 @@ pub(crate) async fn native_task_run_start(
         return exec_error_response(&e);
     }
     // Binary attachments: every digest must resolve to a byte-identical
-    // durable row of THIS session (uploaded first) and images are refused
-    // loudly — BEFORE any shadow/task/run row, so a refused start leaves no
-    // partial durable admission.
+    // durable row of THIS session (uploaded first) and every IMAGE is
+    // validated against the CHOSEN model's capabilities (vision, deliverable
+    // mime, provider per-image bound) — BEFORE any shadow/task/run row, so a
+    // refused start leaves no partial durable admission and the draft/bytes
+    // remain intact.
     let attachments = req.attachments.take().unwrap_or_default();
-    if let Err(e) = validate_wire_attachments(&handle, &attachments) {
+    if let Err(e) = validate_wire_attachments(&state, &handle, req.model.as_deref(), &attachments) {
         return wire_status(e);
     }
     // P2: the plain-prompt path (`work_items` absent) carries no completion

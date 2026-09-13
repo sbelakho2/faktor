@@ -958,6 +958,20 @@ pub fn measure_message(counter: &dyn TokenCounter, m: &RequestMessage) -> TokenE
                     kind: estimate.kind,
                 }
             }
+            ContentKind::ImageData { mime, data } => {
+                // Resolved attachment media: a fixed conservative upper-bound
+                // per image plus the mime label. Byte length never scales the
+                // budget (real image tokenization is resolution-based, not
+                // byte-based) but the media can never be free.
+                let estimate = counter.count_text(mime);
+                TokenEstimate {
+                    count: estimate
+                        .count
+                        .saturating_add(faktor_provider::IMAGE_PART_TOKEN_ESTIMATE)
+                        .max(data.len() as u64 / (64 * 1024)),
+                    kind: TokenEstimateKind::UpperBound,
+                }
+            }
             ContentKind::ToolCall { id, name, input } => {
                 let mut t = add_estimate(counter.count_text(id), counter.count_text(name));
                 t = add_estimate(t, counter.count_json(input));
