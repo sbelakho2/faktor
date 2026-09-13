@@ -188,3 +188,36 @@ pub const UPDATE_FRAME_TOOL_RESULT_FAILED: &str = r#"{"content":[{"content":{"te
 /// Official `plan` body with the documented native degradation: ledger
 /// steps carry no priority or status, so both are conservative defaults.
 pub const UPDATE_FRAME_PLAN: &str = r#"{"entries":[{"content":"step one","priority":"medium","status":"pending"},{"content":"step two","priority":"medium","status":"pending"}],"sessionUpdate":"plan"}"#;
+
+// ---------------------------------------------------------------------------
+// Wave: negotiated `faktor.terminal` extension
+// ---------------------------------------------------------------------------
+
+/// `initialize` declaring the terminal extension. Negotiation requires the
+/// server to carry a terminal authority; without one the name is not
+/// echoed and every `terminal/*` request answers `-32601`.
+pub const INITIALIZE_REQUEST_TERMINAL: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"extensions":["faktor.terminal"]}}"#;
+
+/// `initialize` response with the terminal extension negotiated (the echo
+/// carries only the granted subset).
+pub const INITIALIZE_RESPONSE_TERMINAL: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":false,"promptCapabilities":{"audio":false,"embeddedContext":false,"image":false}},"authMethods":[],"extensions":["faktor.terminal"],"protocolVersion":1}}"#;
+
+/// Strict `terminal/create` request: bounded command/args/cwd, env names
+/// only, u16 geometry.
+pub const TERMINAL_CREATE_REQUEST: &str = r#"{"jsonrpc":"2.0","id":9,"method":"terminal/create","params":{"sessionId":"sess-1","command":"sh","args":["-c","echo hi"],"rows":24,"cols":80}}"#;
+
+/// `terminal/create` result: the ownership row's ids and the child pid.
+pub const TERMINAL_CREATE_RESPONSE: &str = r#"{"jsonrpc":"2.0","id":9,"result":{"ownershipId":"own-1","pid":4242,"sessionId":"sess-1","terminalId":"t-1"}}"#;
+
+/// `terminal/list` result: only the requesting session's rows, each row
+/// carrying its ownership id and recorded backpressure counters.
+pub const TERMINAL_LIST_RESPONSE: &str = r#"{"jsonrpc":"2.0","id":10,"result":{"sessionId":"sess-1","terminals":[{"alive":true,"backpressureEvents":0,"droppedBytes":0,"emittedFrames":0,"ownershipId":"own-1","pid":4242,"sessionId":"sess-1","terminalId":"t-1"}]}}"#;
+
+/// `session/update` frame body: terminal output (no dropped counters while
+/// nothing was lost). Raw bytes are exact; `data` is their lossy-UTF-8 view.
+pub const UPDATE_FRAME_TERMINAL_OUTPUT: &str =
+    r#"{"bytes":5,"data":"hello","kind":"terminalOutput","seq":0,"terminalId":"t-1"}"#;
+
+/// `session/update` frame body: terminal output carrying the recorded loss
+/// of the previous window (the counters are the only way bytes disappear).
+pub const UPDATE_FRAME_TERMINAL_OUTPUT_DROPPED: &str = r#"{"backpressureEvents":2,"bytes":3,"data":"abc","droppedBytes":4096,"kind":"terminalOutput","seq":7,"terminalId":"t-1"}"#;

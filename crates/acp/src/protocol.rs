@@ -38,7 +38,18 @@
 //! | [`AcpMethod::RequestPermission`] | `session/request_permission` | agent→client permission round trip |
 //! | [`AcpMethod::FsReadTextFile`] | `fs/read_text_file` | agent→client bounded read |
 //! | [`AcpMethod::FsWriteTextFile`] | `fs/write_text_file` | agent→client write |
+//! | [`AcpMethod::TerminalCreate`] | `terminal/create` | Faktor extension: session-owned PTY |
+//! | [`AcpMethod::TerminalInput`] | `terminal/input` | Faktor extension: bounded input bytes |
+//! | [`AcpMethod::TerminalResize`] | `terminal/resize` | Faktor extension: window size |
+//! | [`AcpMethod::TerminalKill`] | `terminal/kill` | Faktor extension: kill the process tree |
+//! | [`AcpMethod::TerminalClose`] | `terminal/close` | Faktor extension: kill + release the row |
+//! | [`AcpMethod::TerminalList`] | `terminal/list` | Faktor extension: session-scoped rows |
 //! | [`AcpMethod::Shutdown`]    | `shutdown`     | lifecycle end (extension) |
+//!
+//! The `terminal/*` variants are the negotiated `faktor.terminal` extension
+//! (see the crate root): they are handled only when the client declared the
+//! extension during `initialize` *and* the server attached a terminal
+//! authority; every other client keeps the official `-32601`.
 //!
 //! # Bounds (bounded everything)
 //!
@@ -134,6 +145,18 @@ pub enum AcpMethod {
     FsReadTextFile,
     /// Official agent→client `fs/write_text_file`.
     FsWriteTextFile,
+    /// Faktor extension (`faktor.terminal`): create a session-owned PTY.
+    TerminalCreate,
+    /// Faktor extension: write bounded bytes to a terminal.
+    TerminalInput,
+    /// Faktor extension: resize a terminal window.
+    TerminalResize,
+    /// Faktor extension: kill a terminal's process tree.
+    TerminalKill,
+    /// Faktor extension: kill a terminal and release its ownership row.
+    TerminalClose,
+    /// Faktor extension: list the requesting session's terminals.
+    TerminalList,
 }
 
 impl AcpMethod {
@@ -153,6 +176,12 @@ impl AcpMethod {
             AcpMethod::RequestPermission => "session/request_permission",
             AcpMethod::FsReadTextFile => "fs/read_text_file",
             AcpMethod::FsWriteTextFile => "fs/write_text_file",
+            AcpMethod::TerminalCreate => "terminal/create",
+            AcpMethod::TerminalInput => "terminal/input",
+            AcpMethod::TerminalResize => "terminal/resize",
+            AcpMethod::TerminalKill => "terminal/kill",
+            AcpMethod::TerminalClose => "terminal/close",
+            AcpMethod::TerminalList => "terminal/list",
         }
     }
 
@@ -173,6 +202,12 @@ impl AcpMethod {
             "session/request_permission" => AcpMethod::RequestPermission,
             "fs/read_text_file" => AcpMethod::FsReadTextFile,
             "fs/write_text_file" => AcpMethod::FsWriteTextFile,
+            "terminal/create" => AcpMethod::TerminalCreate,
+            "terminal/input" => AcpMethod::TerminalInput,
+            "terminal/resize" => AcpMethod::TerminalResize,
+            "terminal/kill" => AcpMethod::TerminalKill,
+            "terminal/close" => AcpMethod::TerminalClose,
+            "terminal/list" => AcpMethod::TerminalList,
             _ => return None,
         })
     }
@@ -678,6 +713,12 @@ mod tests {
             AcpMethod::RequestPermission,
             AcpMethod::FsReadTextFile,
             AcpMethod::FsWriteTextFile,
+            AcpMethod::TerminalCreate,
+            AcpMethod::TerminalInput,
+            AcpMethod::TerminalResize,
+            AcpMethod::TerminalKill,
+            AcpMethod::TerminalClose,
+            AcpMethod::TerminalList,
         ];
         for m in all {
             assert_eq!(m.as_str().parse::<AcpMethod>(), Ok(m));

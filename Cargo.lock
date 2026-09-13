@@ -740,6 +740,7 @@ dependencies = [
  "faktor-agent",
  "faktor-core",
  "faktor-protocol",
+ "faktor-pty",
  "faktor-server",
  "faktor-session",
  "futures",

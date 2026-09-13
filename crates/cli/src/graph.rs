@@ -966,6 +966,7 @@ mod tests {
             id: "corp-proxy".into(),
             base_url: "https://corp.example.com/v1".into(),
             api_key_env: None,
+            api: None,
             pricing: Some(crate::config::ProviderPricingCfg {
                 pricing_ceiling_micro_usd_per_million_tokens: Some(42_000_000),
                 ..Default::default()
@@ -1292,6 +1293,7 @@ mod tests {
                 id: id.into(),
                 base_url: format!("https://{id}.example.com/v1"),
                 api_key_env: None,
+                api: None,
                 pricing: Some(pricing),
             };
             registry

@@ -1,10 +1,25 @@
-//! faktor-openai — OpenAI Chat Completions and OpenAI-compatible endpoints
-//! (spec §12). The adapter owns provider quirks; the agent never sees them.
-//! The wire serializer produces exactly the frozen OpenAI shapes — internal
-//! option names can never leak onto the wire (locked by tests).
+//! faktor-openai — OpenAI Chat Completions and the native OpenAI Responses
+//! API (spec §12). The adapter owns provider quirks; the agent never sees
+//! them. The wire serializer produces exactly the frozen OpenAI shapes —
+//! internal option names can never leak onto the wire (locked by tests).
 //!
-//! The Responses API is NOT implemented: selecting `OpenAiFamily::Responses`
-//! fails honestly with an explicit error (use the Chat family).
+//! Two selectable wire families ride [`OpenAiFamily`]:
+//!
+//! - [`OpenAiFamily::Chat`]: `POST /chat/completions` with chat-shaped
+//!   bodies (`messages`), the chat SSE parser, and `prompt_tokens` usage
+//!   semantics. This stays the default for OpenAI-COMPATIBLE endpoints
+//!   (DeepSeek, gateways, local servers) that rarely implement `/responses`.
+//! - [`OpenAiFamily::Responses`]: `POST /responses` with the native item
+//!   protocol (`input` items, top-level `function_call` /
+//!   `function_call_output` rows, flattened function tools) and the
+//!   `response.*` event parser: reasoning deltas, item-keyed function-call
+//!   assembly (fragmented arguments, multiple parallel calls), canonical
+//!   usage from `response.completed`, and typed terminal semantics.
+//!
+//! The family is chosen at construction ([`OpenAiConfig::chat`] /
+//! [`OpenAiConfig::responses`] / the `family` field); both families share
+//! the same transport, deadline, cancellation, and HTTP retry
+//! classification behavior.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -120,6 +135,21 @@ pub fn authorization_headers(api_key: Option<&str>) -> reqwest::header::HeaderMa
     h
 }
 
+/// Shared HTTP-status classifier for BOTH wire families. Retryability comes
+/// from the provider crate's [`ProviderErrorKind::retryable`] (429 and 5xx
+/// retry with backoff; auth failures and every other 4xx are terminal), so
+/// the chat and responses paths can never drift apart.
+fn classify_http_status(status: reqwest::StatusCode, body: String) -> ProviderError {
+    let kind = match status.as_u16() {
+        401 | 403 => ProviderErrorKind::Auth,
+        429 => ProviderErrorKind::RateLimited,
+        408 | 504 => ProviderErrorKind::Timeout,
+        500..=599 => ProviderErrorKind::Server,
+        _ => ProviderErrorKind::BadRequest,
+    };
+    ProviderError::with_code(kind, status.as_u16().to_string(), body)
+}
+
 pub struct OpenAiProvider {
     config: OpenAiConfig,
     transport: Arc<dyn HttpTransport>,
@@ -160,7 +190,10 @@ impl OpenAiProvider {
     }
 
     fn wire_body(&self, req: &GenericAgentRequest) -> serde_json::Value {
-        chat_completions_body(req, &self.quirks)
+        match self.config.family {
+            OpenAiFamily::Chat => chat_completions_body(req, &self.quirks),
+            OpenAiFamily::Responses => responses_body(req),
+        }
     }
 }
 
@@ -320,34 +353,59 @@ fn lower_chat_messages(
 
 // ================================================================ Responses
 
-/// Native Responses-API request body (audit round 11): a real codec — the
-/// model's own item protocol, never a chat-shaped body. Tool outputs ride
-/// as `function_call_output` items keyed by `call_id`; assistant tool calls
-/// as `function_call` items.
+/// Native Responses-API request body: the model's own item protocol, never a
+/// chat-shaped body.
+///
+/// - the cacheable system prefix rides the top-level `instructions` field;
+/// - user text/images lower to `role: "user"` input items with `input_text` /
+///   `input_image` parts, tool results to `function_call_output` items keyed
+///   by `call_id`;
+/// - assistant text lowers to a `role: "assistant"` item with `output_text`
+///   parts and assistant tool calls to top-level `function_call` items (the
+///   exact rows the stream parser produces and replays);
+/// - function tools use the FLATTENED Responses shape (`type`/`name`/
+///   `description`/`parameters`, not the Chat `function: {...}` wrapper);
+/// - `stream` is always true here: this adapter's only entry point is the
+///   streaming transport.
 pub fn responses_body(req: &GenericAgentRequest) -> serde_json::Value {
     let mut input: Vec<serde_json::Value> = Vec::new();
-    if !req.system.is_empty() {
-        input.push(serde_json::json!({
-            "role": "system",
-            "content": [{ "type": "input_text", "text": req.system }]
-        }));
-    }
     for m in &req.messages {
         match m.role {
-            Role::User => {
-                // Split the generic message into plain text and tool
-                // outputs; text rides user items, outputs ride items.
-                let mut text = String::new();
+            Role::System => {
+                // Additional system turns (the primary prefix rides
+                // top-level `instructions`) stay native input items.
+                let mut content: Vec<serde_json::Value> = Vec::new();
                 for part in &m.content {
-                    if let ContentKind::Text { text: t } = &part.kind {
-                        text.push_str(t);
+                    if let ContentKind::Text { text } = &part.kind {
+                        content.push(serde_json::json!({ "type": "input_text", "text": text }));
                     }
                 }
-                if !text.is_empty() {
-                    input.push(serde_json::json!({
-                        "role": "user",
-                        "content": [{ "type": "input_text", "text": text }]
-                    }));
+                if !content.is_empty() {
+                    input.push(serde_json::json!({ "role": "system", "content": content }));
+                }
+            }
+            Role::User => {
+                let mut content: Vec<serde_json::Value> = Vec::new();
+                for part in &m.content {
+                    match &part.kind {
+                        ContentKind::Text { text } => {
+                            if !text.is_empty() {
+                                content.push(
+                                    serde_json::json!({ "type": "input_text", "text": text }),
+                                );
+                            }
+                        }
+                        ContentKind::Image { url } => {
+                            content.push(serde_json::json!({
+                                "type": "input_image",
+                                "image_url": url,
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+                if !content.is_empty() {
+                    input.push(serde_json::json!({ "role": "user", "content": content }));
                 }
                 for part in &m.content {
                     if let ContentKind::ToolResult { content, .. } = &part.kind {
@@ -362,37 +420,37 @@ pub fn responses_body(req: &GenericAgentRequest) -> serde_json::Value {
                 }
             }
             Role::Assistant => {
-                let mut text = String::new();
-                let mut calls: Vec<serde_json::Value> = Vec::new();
+                let mut content: Vec<serde_json::Value> = Vec::new();
                 for part in &m.content {
-                    match &part.kind {
-                        ContentKind::Text { text: t } => text.push_str(t),
-                        ContentKind::ToolCall { id, name, input } => {
-                            calls.push(serde_json::json!({
-                                "type": "function_call",
-                                "call_id": id,
-                                "name": name,
-                                "arguments": serde_json::to_string(input)
-                                    .unwrap_or_else(|_| "{}".to_string()),
-                            }));
+                    if let ContentKind::Text { text } = &part.kind {
+                        if !text.is_empty() {
+                            content
+                                .push(serde_json::json!({ "type": "output_text", "text": text }));
                         }
-                        _ => {}
                     }
                 }
-                let mut content: Vec<serde_json::Value> = Vec::new();
-                if !text.is_empty() {
-                    content.push(serde_json::json!({ "type": "output_text", "text": text }));
+                if !content.is_empty() {
+                    input.push(serde_json::json!({ "role": "assistant", "content": content }));
                 }
-                let mut item = serde_json::json!({ "role": "assistant", "content": content });
-                if !calls.is_empty() {
-                    item["tool_calls"] = serde_json::Value::Array(calls);
+                // Function calls are TOP-LEVEL items in the native protocol
+                // (never a `tool_calls` array on the assistant message).
+                for part in &m.content {
+                    if let ContentKind::ToolCall {
+                        id,
+                        name,
+                        input: args,
+                    } = &part.kind
+                    {
+                        input.push(serde_json::json!({
+                            "type": "function_call",
+                            "call_id": id,
+                            "name": name,
+                            "arguments": serde_json::to_string(args)
+                                .unwrap_or_else(|_| "{}".to_string()),
+                        }));
+                    }
                 }
-                input.push(item);
             }
-            // The generic layer has no standalone Tool role today (tool
-            // results ride user messages); unknown roles lower defensively
-            // as user text so history never vanishes from the wire.
-            _ => {}
         }
     }
     let mut body = serde_json::json!({
@@ -400,17 +458,57 @@ pub fn responses_body(req: &GenericAgentRequest) -> serde_json::Value {
         "input": input,
         "stream": true,
     });
+    if !req.system.is_empty() {
+        body["instructions"] = serde_json::json!(req.system);
+    }
     if !req.tools.is_empty() {
-        body["tools"] = serde_json::to_value(&req.tools).unwrap_or(serde_json::Value::Null);
+        let tools: Vec<serde_json::Value> = req
+            .tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                })
+            })
+            .collect();
+        body["tools"] = serde_json::Value::Array(tools);
+        body["tool_choice"] = serde_json::json!("auto");
     }
     if let Some(max_out) = req.max_output {
         body["max_output_tokens"] = serde_json::json!(max_out);
+    }
+    if let Some(reasoning) = req.reasoning {
+        match reasoning {
+            faktor_core::model::ReasoningMode::Off => {}
+            faktor_core::model::ReasoningMode::Low => {
+                body["reasoning"] = serde_json::json!({ "effort": "low" });
+            }
+            faktor_core::model::ReasoningMode::Medium => {
+                body["reasoning"] = serde_json::json!({ "effort": "medium" });
+            }
+            faktor_core::model::ReasoningMode::High => {
+                body["reasoning"] = serde_json::json!({ "effort": "high" });
+            }
+        }
     }
     body
 }
 
 /// Responses SSE transport: the SAME line framing + deadlines as chat, with
-/// a Responses event parser.
+/// the native `response.*` event parser.
+///
+/// Function-call items accumulate per ITEM id (`item_id` on fragment events,
+/// deliberately distinct from the `call_id` a `function_call_output` must
+/// echo); an authoritative `response.output_item.done` replaces fragments.
+/// Terminal events (`response.completed`, `response.incomplete`, `[DONE]`, or
+/// stream end) flush accumulated calls, then the canonical usage frame from
+/// `response.completed` (`input_tokens` is the TOTAL including the cached
+/// portion, exactly the chat wire semantics), then exactly one `Done`.
+/// Malformed frames and error events are typed errors that END the stream —
+/// no chunk ever follows a terminal item.
 pub fn responses_stream(
     transport: Arc<dyn HttpTransport>,
     url: String,
@@ -428,6 +526,9 @@ pub fn responses_stream(
             lines: LineStream,
             pending: std::collections::VecDeque<ProviderChunk>,
             calls: Vec<serde_json::Value>,
+            /// A terminal event was seen: no line is ever read again; the
+            /// queued chunks drain first, then `Done`.
+            finished: bool,
         },
         Done,
     }
@@ -438,7 +539,7 @@ pub fn responses_stream(
         let body = body.clone();
         let cancel = cancel.clone();
         async move {
-            let (mut lines, mut pending, mut calls) = match stage {
+            let (mut lines, mut pending, mut calls, mut finished) = match stage {
                 Stage::Fresh => {
                     let resp = execute_post_json_with_extras(
                         transport.as_ref(),
@@ -453,28 +554,14 @@ pub fn responses_stream(
                             let status = r.status();
                             if !status.is_success() {
                                 let msg = r.text().await.unwrap_or_default();
-                                let kind = match status.as_u16() {
-                                    401 | 403 => ProviderErrorKind::Auth,
-                                    429 => ProviderErrorKind::RateLimited,
-                                    408 | 504 => ProviderErrorKind::Timeout,
-                                    500..=599 => ProviderErrorKind::Server,
-                                    _ => ProviderErrorKind::BadRequest,
-                                };
-                                return Some((
-                                    Err(ProviderError::with_code(
-                                        kind,
-                                        status.as_u16().to_string(),
-                                        msg,
-                                    )),
-                                    Stage::Done,
-                                ));
+                                return Some((Err(classify_http_status(status, msg)), Stage::Done));
                             }
                             let lines: LineStream = Box::pin(guarded_lines(
                                 utf8_line_stream(r.bytes_stream(), MAX_LINE_BYTES),
                                 deadlines,
                                 cancel,
                             ));
-                            (lines, std::collections::VecDeque::new(), Vec::new())
+                            (lines, std::collections::VecDeque::new(), Vec::new(), false)
                         }
                         Err(e) => {
                             return Some((Err(ProviderError::from(e)), Stage::Done));
@@ -485,7 +572,8 @@ pub fn responses_stream(
                     lines,
                     pending,
                     calls,
-                } => (lines, pending, calls),
+                    finished,
+                } => (lines, pending, calls, finished),
                 Stage::Done => return None,
             };
 
@@ -497,31 +585,23 @@ pub fn responses_stream(
                             lines,
                             pending,
                             calls,
+                            finished,
                         },
                     ));
                 }
+                if finished {
+                    return Some((Ok(ProviderChunk::Done), Stage::Done));
+                }
                 let Some(line) = lines.next().await else {
-                    // The inner stream is FINISHED: never re-poll it. Drain
-                    // any flushed tool calls from an empty replacement stream
-                    // (audit streams suite: re-polling the finished inner
-                    // stream panicked the unfold).
-                    let drained: LineStream = Box::pin(futures::stream::empty());
+                    // The inner stream is FINISHED: never re-poll it. Any
+                    // accumulated calls still complete; then exactly one Done.
                     for call in calls.drain(..) {
                         if let Some(chunk) = function_call_chunk(&call) {
                             pending.push_back(chunk);
                         }
                     }
-                    if let Some(chunk) = pending.pop_front() {
-                        return Some((
-                            Ok(chunk),
-                            Stage::Streaming {
-                                lines: drained,
-                                pending,
-                                calls,
-                            },
-                        ));
-                    }
-                    return Some((Ok(ProviderChunk::Done), Stage::Done));
+                    finished = true;
+                    continue;
                 };
                 let line = match line {
                     Ok(l) => l,
@@ -537,21 +617,22 @@ pub fn responses_stream(
                             pending.push_back(chunk);
                         }
                     }
-                    if let Some(chunk) = pending.pop_front() {
-                        return Some((
-                            Ok(chunk),
-                            Stage::Streaming {
-                                lines,
-                                pending,
-                                calls,
-                            },
-                        ));
-                    }
-                    return Some((Ok(ProviderChunk::Done), Stage::Done));
+                    finished = true;
+                    continue;
                 }
                 let ev: serde_json::Value = match serde_json::from_str(data) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    // A data line that is not JSON is a broken stream, not
+                    // forward compatibility: typed Malformed, then done.
+                    Err(_) => {
+                        return Some((
+                            Err(ProviderError::new(
+                                ProviderErrorKind::Malformed,
+                                format!("bad SSE line: {data:?}"),
+                            )),
+                            Stage::Done,
+                        ));
+                    }
                 };
                 let kind = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match kind {
@@ -568,6 +649,7 @@ pub fn responses_stream(
                                     lines,
                                     pending,
                                     calls,
+                                    finished,
                                 },
                             ));
                         }
@@ -585,80 +667,90 @@ pub fn responses_stream(
                                     lines,
                                     pending,
                                     calls,
+                                    finished,
                                 },
                             ));
                         }
                     }
-                    "response.output_item.added" => {
-                        let is_call = ev
-                            .get("item")
-                            .and_then(|i| i.get("type"))
-                            .and_then(|t| t.as_str())
-                            == Some("function_call");
-                        if is_call {
-                            if let Some(item) = ev.get("item") {
-                                calls.push(serde_json::json!({
-                                    "call_id": item.get("call_id").and_then(|c| c.as_str()).unwrap_or_default(),
-                                    "name": item.get("name").and_then(|n| n.as_str()).unwrap_or_default(),
-                                    "arguments": String::new(),
-                                }));
-                            }
-                        }
-                    }
-                    "response.function_call_arguments.delta" => {
-                        if let Some(call_id) = ev.get("item_id").and_then(|c| c.as_str()) {
-                            let frag = ev.get("delta").and_then(|d| d.as_str()).unwrap_or_default();
-                            if let Some(call) = calls.iter_mut().find(|c| c["call_id"] == call_id) {
-                                let cur = call["arguments"].as_str().unwrap_or_default();
-                                call["arguments"] =
-                                    serde_json::Value::String(format!("{cur}{frag}"));
-                            }
-                        }
-                    }
-                    "response.output_item.done" => {
+                    "response.output_item.added" | "response.output_item.done" => {
                         if let Some(item) = ev.get("item") {
                             if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                                let done = serde_json::json!({
-                                    "call_id": item.get("call_id").and_then(|c| c.as_str()).unwrap_or_default(),
-                                    "name": item.get("name").and_then(|n| n.as_str()).unwrap_or_default(),
-                                    "arguments": item.get("arguments").and_then(|a| a.as_str()).unwrap_or_default(),
-                                });
-                                if let Some(c) =
-                                    calls.iter_mut().find(|c| c["call_id"] == done["call_id"])
-                                {
-                                    *c = done;
+                                let item_id =
+                                    item.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                                let call_id = item
+                                    .get("call_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default();
+                                let name = item
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default();
+                                let args = item
+                                    .get("arguments")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default();
+                                let slot = call_slot(&mut calls, item_id, call_id);
+                                if !item_id.is_empty() {
+                                    slot["item_id"] = serde_json::json!(item_id);
+                                }
+                                if !call_id.is_empty() {
+                                    slot["call_id"] = serde_json::json!(call_id);
+                                }
+                                if !name.is_empty() {
+                                    slot["name"] = serde_json::json!(name);
+                                }
+                                // A done item is AUTHORITATIVE: its full
+                                // arguments replace accumulated fragments; an
+                                // added item only seeds the slot.
+                                if !args.is_empty() {
+                                    slot["arguments"] = serde_json::json!(args);
+                                }
+                            }
+                        }
+                    }
+                    "response.function_call_arguments.delta"
+                    | "response.function_call_arguments.done" => {
+                        let item_id = ev
+                            .get("item_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        let frag = ev.get("delta").and_then(|v| v.as_str()).unwrap_or_default();
+                        let done_args = ev.get("arguments").and_then(|v| v.as_str());
+                        // An unknown item id has no accumulation slot: the
+                        // fragment is DROPPED (it can never inject into a
+                        // stored call). Event-order processing, not sequence
+                        // validation.
+                        if !item_id.is_empty() {
+                            if let Some(slot) = find_call_slot(&mut calls, item_id) {
+                                if let Some(full) = done_args.filter(|a| !a.is_empty()) {
+                                    slot["arguments"] = serde_json::json!(full);
+                                } else if !frag.is_empty() {
+                                    let cur = slot["arguments"].as_str().unwrap_or_default();
+                                    slot["arguments"] =
+                                        serde_json::Value::String(format!("{cur}{frag}"));
                                 }
                             }
                         }
                     }
                     "response.completed" | "response.incomplete" => {
+                        let usage = match responses_usage(&ev) {
+                            Ok(u) => u,
+                            Err(e) => return Some((Err(e), Stage::Done)),
+                        };
                         for call in calls.drain(..) {
                             if let Some(chunk) = function_call_chunk(&call) {
                                 pending.push_back(chunk);
                             }
                         }
-                        if let Some(chunk) = pending.pop_front() {
-                            return Some((
-                                Ok(chunk),
-                                Stage::Streaming {
-                                    lines,
-                                    pending,
-                                    calls,
-                                },
-                            ));
+                        // Usage rides LAST so it is always the single final
+                        // chunk before Done.
+                        if let Some(u) = usage {
+                            pending.push_back(ProviderChunk::Usage(u));
                         }
-                        return Some((Ok(ProviderChunk::Done), Stage::Done));
+                        finished = true;
                     }
-                    "error" => {
-                        let msg = ev
-                            .get("message")
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("responses error")
-                            .to_string();
-                        return Some((
-                            Err(ProviderError::new(ProviderErrorKind::BadRequest, msg)),
-                            Stage::Done,
-                        ));
+                    "response.failed" | "error" => {
+                        return Some((Err(responses_event_error(&ev)), Stage::Done));
                     }
                     _ => {}
                 }
@@ -667,18 +759,171 @@ pub fn responses_stream(
     })
 }
 
+/// Get-or-create the accumulation slot for one function-call item. Slots are
+/// keyed by item id then wire call id; both identifiers match so a server
+/// that reuses one for the other still assembles a single call.
+fn call_slot<'a>(
+    calls: &'a mut Vec<serde_json::Value>,
+    item_id: &str,
+    call_id: &str,
+) -> &'a mut serde_json::Value {
+    let found = calls.iter().position(|c| {
+        let id_matches = |id: &str| {
+            !id.is_empty()
+                && (c.get("item_id").and_then(|v| v.as_str()) == Some(id)
+                    || c.get("call_id").and_then(|v| v.as_str()) == Some(id))
+        };
+        id_matches(item_id) || id_matches(call_id)
+    });
+    match found {
+        Some(i) => &mut calls[i],
+        None => {
+            calls.push(serde_json::json!({
+                "item_id": item_id,
+                "call_id": call_id,
+                "name": "",
+                "arguments": "",
+            }));
+            calls.last_mut().expect("just pushed the slot")
+        }
+    }
+}
+
+/// Find the accumulated call slot matching `id` by item id OR wire call id.
+fn find_call_slot<'a>(
+    calls: &'a mut [serde_json::Value],
+    id: &str,
+) -> Option<&'a mut serde_json::Value> {
+    calls.iter_mut().find(|c| {
+        c.get("item_id").and_then(|v| v.as_str()) == Some(id)
+            || c.get("call_id").and_then(|v| v.as_str()) == Some(id)
+    })
+}
+
+/// Canonical usage from a Responses terminal event. Responses reports
+/// `input_tokens` as the TOTAL input INCLUDING
+/// `input_tokens_details.cached_tokens` (exactly the chat `prompt_tokens`
+/// semantics), and `output_tokens` as the total output including the
+/// informational `output_tokens_details.reasoning_tokens` subset. A hostile
+/// row (cache > input, reasoning > output) is typed Malformed, never
+/// saturated; an all-zero row carries nothing.
+fn responses_usage(ev: &serde_json::Value) -> Result<Option<CanonicalUsage>, ProviderError> {
+    // Usage rides the terminal response envelope (`response.usage`); a
+    // bare event-level usage object is not part of the Responses wire and
+    // is deliberately ignored.
+    let response = ev.get("response");
+    let Some(usage) = response.and_then(|r| r.get("usage")) else {
+        return Ok(None);
+    };
+    let total_input_tokens = usage
+        .get("input_tokens")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0);
+    let total_output_tokens = usage
+        .get("output_tokens")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0);
+    let cache_read_tokens = usage
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0);
+    let reasoning_tokens = usage
+        .get("output_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0);
+    if total_input_tokens == 0
+        && total_output_tokens == 0
+        && cache_read_tokens == 0
+        && reasoning_tokens == 0
+    {
+        return Ok(None);
+    }
+    let mut canonical = CanonicalUsage::from_total_including_cache(
+        total_input_tokens,
+        cache_read_tokens,
+        0,
+        total_output_tokens,
+        reasoning_tokens,
+    )
+    .map_err(ProviderError::from)?;
+    canonical.request_id = response
+        .and_then(|r| r.get("id"))
+        .and_then(|i| i.as_str())
+        .map(str::to_string);
+    Ok(Some(canonical))
+}
+
+/// Typed error for a Responses `error` / `response.failed` event. The
+/// structured `code` decides the retry class: auth failures are terminal,
+/// rate-limit codes stay retryable; anything else is a terminal BadRequest.
+/// Message text is never scanned for classification.
+fn responses_event_error(ev: &serde_json::Value) -> ProviderError {
+    let err = ev
+        .get("error")
+        .or_else(|| ev.get("response").and_then(|r| r.get("error")));
+    let message = err
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .or_else(|| ev.get("message").and_then(|m| m.as_str()))
+        .unwrap_or("responses stream error")
+        .to_string();
+    let code = err
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str())
+        .or_else(|| ev.get("code").and_then(|c| c.as_str()))
+        .unwrap_or_default();
+    let folded: String = code
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    let kind = if folded.starts_with("ratelimit")
+        || folded.starts_with("toomany")
+        || folded.starts_with("quota")
+        || folded.starts_with("resourceexhausted")
+        || folded.starts_with("throttl")
+    {
+        ProviderErrorKind::RateLimited
+    } else if folded.contains("auth") || folded.contains("apikey") || folded == "invalidkey" {
+        ProviderErrorKind::Auth
+    } else {
+        ProviderErrorKind::BadRequest
+    };
+    if code.is_empty() {
+        ProviderError::new(kind, message)
+    } else {
+        ProviderError::with_code(kind, code, message)
+    }
+}
+
+/// Lower one accumulated function-call slot into its terminal chunk. The
+/// generic call id is the wire `call_id` (what a `function_call_output` must
+/// echo back); the item id is the fallback when a server omits `call_id`.
 fn function_call_chunk(call: &serde_json::Value) -> Option<ProviderChunk> {
     let name = call
         .get("name")
         .and_then(|n| n.as_str())
         .unwrap_or_default();
-    let id = call
-        .get("call_id")
-        .and_then(|c| c.as_str())
-        .unwrap_or_default();
     if name.is_empty() {
         return None;
     }
+    let call_id = call
+        .get("call_id")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default();
+    let item_id = call
+        .get("item_id")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default();
+    let id = if !call_id.is_empty() {
+        call_id.to_string()
+    } else if !item_id.is_empty() {
+        item_id.to_string()
+    } else {
+        format!("fc_{name}")
+    };
     let args: serde_json::Value = serde_json::from_str(
         call.get("arguments")
             .and_then(|a| a.as_str())
@@ -686,11 +931,7 @@ fn function_call_chunk(call: &serde_json::Value) -> Option<ProviderChunk> {
     )
     .unwrap_or(serde_json::Value::Null);
     Some(ProviderChunk::ToolCall {
-        id: if id.is_empty() {
-            format!("fc_{name}")
-        } else {
-            id.to_string()
-        },
+        id,
         name: name.to_string(),
         input: args,
         complete: true,
@@ -785,31 +1026,36 @@ impl Provider for OpenAiProvider {
         let cancel = req.meta.cancellation.clone();
         let transport = self.transport.clone();
         let headers = authorization_headers(self.config.api_key.as_deref());
-        if self.config.family == OpenAiFamily::Responses {
-            // Native Responses codec (audit round 11): real serializer +
-            // stream parser; never a chat-shaped body on /responses.
-            let body = responses_body(&req);
-            let url = format!("{}/responses", self.config.base_url);
-            return Box::pin(responses_stream(
-                transport,
-                url,
-                headers,
-                body,
-                deadlines,
-                Some(cancel),
-            ));
-        }
+        // The family decides the wire body AND the endpoint + parser pair.
         let body = self.wire_body(&req);
-        let url = format!("{}/chat/completions", self.config.base_url);
-        Box::pin(openai_stream(
-            transport,
-            url,
-            headers,
-            Vec::new(),
-            body,
-            deadlines,
-            Some(cancel),
-        ))
+        match self.config.family {
+            // Native Responses codec: the item-protocol serializer + the
+            // `response.*` stream parser; never a chat-shaped body on
+            // /responses.
+            OpenAiFamily::Responses => {
+                let url = format!("{}/responses", self.config.base_url);
+                Box::pin(responses_stream(
+                    transport,
+                    url,
+                    headers,
+                    body,
+                    deadlines,
+                    Some(cancel),
+                ))
+            }
+            OpenAiFamily::Chat => {
+                let url = format!("{}/chat/completions", self.config.base_url);
+                Box::pin(openai_stream(
+                    transport,
+                    url,
+                    headers,
+                    Vec::new(),
+                    body,
+                    deadlines,
+                    Some(cancel),
+                ))
+            }
+        }
     }
 }
 
@@ -884,19 +1130,8 @@ pub fn openai_stream(
                             let status = r.status();
                             if !status.is_success() {
                                 let text = r.text().await.unwrap_or_default();
-                                let kind = match status.as_u16() {
-                                    401 | 403 => ProviderErrorKind::Auth,
-                                    429 => ProviderErrorKind::RateLimited,
-                                    408 | 504 => ProviderErrorKind::Timeout,
-                                    500..=599 => ProviderErrorKind::Server,
-                                    _ => ProviderErrorKind::BadRequest,
-                                };
                                 return Some((
-                                    Err(ProviderError::with_code(
-                                        kind,
-                                        status.as_u16().to_string(),
-                                        text,
-                                    )),
+                                    Err(classify_http_status(status, text)),
                                     Stage::Done,
                                 ));
                             }
@@ -1477,10 +1712,13 @@ mod tests {
 
     #[tokio::test]
     async fn responses_body_is_native_items_not_chat_shape() {
-        // Audit round 11: the Responses codec lowers to the model's item
-        // protocol — text as input_text, tool calls as assistant function
-        // calls, results as function_call_output keyed by call_id. A
-        // chat-shaped body would fail this assertion.
+        // The Responses codec lowers to the model's OWN item protocol:
+        // system -> top-level instructions; text/images -> input_text /
+        // input_image; assistant tool calls -> top-level function_call
+        // items; results -> function_call_output keyed by call_id; tools ->
+        // the flattened Responses tool shape. A chat-shaped body (messages /
+        // nested function wrapper / assistant tool_calls) fails these
+        // assertions.
         let server = MockServer::new();
         let asserted = Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
         {
@@ -1500,18 +1738,30 @@ mod tests {
         let base = server.base_url().await;
         let provider = OpenAiProvider::build(OpenAiConfig::responses(base, None));
         let mut g = req("m");
+        g.reasoning = Some(faktor_core::model::ReasoningMode::Medium);
         g.messages = vec![
             RequestMessage {
                 role: Role::User,
-                content: vec![ContentPart::text("list src/")],
+                content: vec![
+                    ContentPart::text("list src/"),
+                    ContentPart {
+                        kind: ContentKind::Image {
+                            url: "https://example.test/a.png".into(),
+                        },
+                        tool_call_id: None,
+                    },
+                ],
             },
             RequestMessage {
                 role: Role::Assistant,
-                content: vec![ContentPart::tool_call(
-                    "call_1",
-                    "read_file",
-                    serde_json::json!({"path": "src/a.rs"}),
-                )],
+                content: vec![
+                    ContentPart::text("calling"),
+                    ContentPart::tool_call(
+                        "call_1",
+                        "read_file",
+                        serde_json::json!({"path": "src/a.rs"}),
+                    ),
+                ],
             },
             RequestMessage {
                 role: Role::User,
@@ -1523,23 +1773,48 @@ mod tests {
         let body = asserted.lock().unwrap().clone().expect("request asserted");
         assert_eq!(body["model"], "m");
         assert_eq!(body["stream"], true);
+        // The cacheable prefix rides top-level `instructions`, never an
+        // input message.
+        assert_eq!(body["instructions"], "sys");
+        // Native tools: flattened function rows, never chat nested ones.
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["name"], "read_file");
+        assert_eq!(body["tools"][0]["parameters"]["type"], "object");
+        assert!(
+            body["tools"][0].get("function").is_none(),
+            "tools must not use the chat wrapper: {}",
+            body["tools"][0]
+        );
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["max_output_tokens"], 1000);
+        assert_eq!(body["reasoning"]["effort"], "medium");
         let input = body["input"].as_array().unwrap();
         assert!(
             input.iter().any(|i| i["role"] == "user"
                 && i["content"][0]["type"] == "input_text"
-                && i["content"][0]["text"] == "list src/"),
-            "user text lowers to input_text items: {input:?}"
+                && i["content"][0]["text"] == "list src/"
+                && i["content"][1]["type"] == "input_image"
+                && i["content"][1]["image_url"] == "https://example.test/a.png"),
+            "user text+images lower to native input parts: {input:?}"
+        );
+        let assistant = input
+            .iter()
+            .find(|i| i["role"] == "assistant")
+            .expect("assistant text item present");
+        assert_eq!(assistant["content"][0]["type"], "output_text");
+        assert_eq!(assistant["content"][0]["text"], "calling");
+        assert!(
+            assistant.get("tool_calls").is_none(),
+            "function calls are top-level items, never assistant tool_calls"
         );
         let call = input
             .iter()
-            .find(|i| i.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-            .expect("assistant item present");
-        let tc = call["tool_calls"][0].clone();
-        assert_eq!(tc["type"], "function_call");
-        assert_eq!(tc["call_id"], "call_1");
-        assert_eq!(tc["name"], "read_file");
+            .find(|i| i["type"] == "function_call")
+            .expect("top-level function_call item present");
+        assert_eq!(call["call_id"], "call_1");
+        assert_eq!(call["name"], "read_file");
         let args: serde_json::Value =
-            serde_json::from_str(tc["arguments"].as_str().unwrap()).unwrap();
+            serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["path"], "src/a.rs");
         assert!(
             input.iter().any(|i| i["type"] == "function_call_output"
@@ -1549,19 +1824,94 @@ mod tests {
         );
         // Nothing chat-shaped may appear anywhere in the body.
         let rendered = serde_json::to_string(&body).unwrap();
-        assert!(
-            !rendered.contains("tool_result")
-                && !rendered.contains("\"content\":[{\"type\":\"tool"),
-            "no chat tool blocks in the responses body: {rendered}"
-        );
+        for banned in ["tool_result", "tool_calls", "\"function\":{", "max_tokens"] {
+            assert!(!rendered.contains(banned), "{banned} leaked: {rendered}");
+        }
+        // Internal request metadata never leaks either.
+        for leaked in ["operation_id", "session_id", "deadline_ms", "cancellation"] {
+            assert!(!rendered.contains(leaked), "{leaked} leaked: {rendered}");
+        }
+    }
+
+    /// One `data: <json>` SSE frame.
+    fn ev(v: serde_json::Value) -> String {
+        format!("data: {v}\n\n")
+    }
+
+    fn responses_provider(base: String) -> Arc<dyn Provider> {
+        OpenAiProvider::build(OpenAiConfig::responses(base, None))
+    }
+
+    /// Drain a stream to its full item sequence (errors preserved).
+    async fn drain(mut stream: ProviderStream) -> Vec<Result<ProviderChunk, ProviderError>> {
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(item);
+        }
+        out
+    }
+
+    /// A raw HTTP/1.1 server that answers the first request with SSE chunked
+    /// headers, writes `chunks` (each its own HTTP chunk), then either stalls
+    /// forever with the body open (`stall = true`) or terminates the chunked
+    /// body. Lets cancellation/idle tests run against a genuinely LIVE
+    /// stream, not a completed one.
+    async fn slow_sse_server(chunks: Vec<Vec<u8>>, stall: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let Ok(n) = socket.read(&mut buf).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                head.extend_from_slice(&buf[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await;
+            for chunk in &chunks {
+                let _ = socket
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await;
+                let _ = socket.write_all(chunk).await;
+                let _ = socket.write_all(b"\r\n").await;
+                let _ = socket.flush().await;
+            }
+            if stall {
+                let mut sink = [0u8; 1024];
+                while let Ok(n) = socket.read(&mut sink).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            } else {
+                let _ = socket.write_all(b"0\r\n\r\n").await;
+            }
+        });
+        format!("http://{addr}")
     }
 
     #[tokio::test]
     async fn responses_stream_parses_text_reasoning_and_tool_calls() {
-        // SSE events: reasoning delta, text deltas, a function call added +
-        // argument fragments + item done + completed -> ordered chunks with
-        // fully reassembled arguments.
-        let ev = |v: serde_json::Value| format!("data: {v}\n\n");
+        // Native events: both reasoning delta variants, text deltas, a
+        // function call whose ITEM id differs from its wire call_id and
+        // whose arguments arrive fragmented, an authoritative item-done,
+        // completed with usage. Ordered chunks, one assembled call, usage
+        // LAST, exactly one Done.
         let server = MockServer::new();
         server.route(
             "POST",
@@ -1570,48 +1920,583 @@ mod tests {
                 status: 200,
                 events: vec![
                     ev(serde_json::json!({"type": "response.created", "response": {"id": "r1"}})),
-                    ev(serde_json::json!({"type": "response.reasoning_text.delta", "item_id": "r1", "delta": "thinking hard"})),
-                    ev(serde_json::json!({"type": "response.output_text.delta", "item_id": "m1", "delta": "hello "})),
-                    ev(serde_json::json!({"type": "response.output_text.delta", "item_id": "m1", "delta": "world"})),
-                    ev(serde_json::json!({"type": "response.output_item.added", "item": {"type": "function_call", "call_id": "fc_1", "name": "read_file", "arguments": ""}})),
-                    ev(serde_json::json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "{\"path\":"})),
-                    ev(serde_json::json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "\"a.rs\"}"})),
-                    ev(serde_json::json!({"type": "response.output_item.done", "item": {"type": "function_call", "call_id": "fc_1", "name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}})),
-                    ev(serde_json::json!({"type": "response.completed", "response": {"id": "r1"}})),
+                    ev(serde_json::json!({"type": "response.reasoning_text.delta", "item_id": "rs_1", "delta": "thinking "})),
+                    ev(serde_json::json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1", "delta": "hard"})),
+                    // The real wire frames named events (`event:` line then
+                    // `data:`); the named line must be skipped, never
+                    // mistaken for data.
+                    "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"hello \"}\n\n".to_string(),
+                    ev(serde_json::json!({"type": "response.output_text.delta", "item_id": "msg_1", "delta": "world"})),
+                    ev(serde_json::json!({"type": "response.output_item.added", "output_index": 1, "item": {"type": "function_call", "id": "fc_item_1", "call_id": "call_1", "name": "read_file", "arguments": ""}})),
+                    ev(serde_json::json!({"type": "response.function_call_arguments.delta", "item_id": "fc_item_1", "delta": "{\"path\":"})),
+                    ev(serde_json::json!({"type": "response.function_call_arguments.delta", "item_id": "fc_item_1", "delta": "\"a.rs\"}"})),
+                    ev(serde_json::json!({"type": "response.output_item.done", "item": {"type": "function_call", "id": "fc_item_1", "call_id": "call_1", "name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}})),
+                    ev(serde_json::json!({"type": "response.completed", "response": {"id": "r1", "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}}})),
                     "data: [DONE]\n\n".to_string(),
                 ],
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::responses(base, None));
-        let mut stream = provider.stream(req("m"));
-        let mut chunks = Vec::new();
-        while let Some(c) = stream.next().await {
-            match c {
-                Ok(chunk) => chunks.push(chunk),
-                Err(e) => panic!("unexpected error: {e:?}"),
-            }
-        }
-        let mut text = String::new();
-        let mut reasoning = String::new();
-        let mut calls = Vec::new();
-        for c in &chunks {
-            match c {
-                ProviderChunk::Text { text: t } => text.push_str(t),
-                ProviderChunk::Reasoning { text: t } => reasoning.push_str(t),
-                ProviderChunk::ToolCall { name, input, .. } => {
-                    calls.push((name.clone(), input.clone()))
-                }
-                ProviderChunk::Done => {}
-                _ => {}
-            }
-        }
+        let items = drain(responses_provider(base).stream(req("m"))).await;
+        let text: String = items
+            .iter()
+            .filter_map(|i| match i {
+                Ok(ProviderChunk::Text { text }) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        let reasoning: String = items
+            .iter()
+            .filter_map(|i| match i {
+                Ok(ProviderChunk::Reasoning { text }) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        let calls: Vec<&ProviderChunk> = items
+            .iter()
+            .filter_map(|i| match i {
+                Ok(c @ ProviderChunk::ToolCall { .. }) => Some(c),
+                _ => None,
+            })
+            .collect();
         assert_eq!(text, "hello world");
         assert_eq!(reasoning, "thinking hard");
-        assert_eq!(calls.len(), 1, "one assembled tool call: {calls:?}");
-        assert_eq!(calls[0].0, "read_file");
-        assert_eq!(calls[0].1, serde_json::json!({"path": "a.rs"}));
-        assert!(chunks.iter().any(|c| matches!(c, ProviderChunk::Done)));
+        assert_eq!(calls.len(), 1, "one assembled call: {items:?}");
+        match calls[0] {
+            ProviderChunk::ToolCall {
+                id,
+                name,
+                input,
+                complete,
+            } => {
+                assert_eq!(id, "call_1", "the generic id is the wire call_id");
+                assert_eq!(name, "read_file");
+                assert_eq!(input, &serde_json::json!({"path": "a.rs"}));
+                assert!(*complete);
+            }
+            _ => unreachable!(),
+        }
+        // Usage: 10 total input / 0 cached -> uncached 10; request id kept.
+        let usage_at = items
+            .iter()
+            .position(|i| matches!(i, Ok(ProviderChunk::Usage(_))))
+            .expect("usage frame");
+        assert_eq!(
+            items[usage_at],
+            Ok(ProviderChunk::Usage(CanonicalUsage {
+                uncached_input_tokens: 10,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                output_tokens: 5,
+                reasoning_tokens: 0,
+                reported_cost: None,
+                request_id: Some("r1".into()),
+            }))
+        );
+        // Terminal semantics: exactly one Done, last, usage immediately
+        // before it, nothing after.
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| matches!(i, Ok(ProviderChunk::Done)))
+                .count(),
+            1
+        );
+        assert_eq!(items.last(), Some(&Ok(ProviderChunk::Done)));
+        assert_eq!(usage_at + 1, items.len() - 1);
+        assert!(items[..usage_at].iter().all(|i| i.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn responses_stream_assembles_multiple_calls_with_byte_split_arguments() {
+        // TWO simultaneous function calls with interleaved fragments, the
+        // whole SSE body delivered in 7-byte HTTP chunks (splits fall
+        // mid-line, mid-JSON and mid-string). Item ids differ from call
+        // ids; call B's fragments are overwritten by an authoritative
+        // `function_call_arguments.done`; call A completes from fragments +
+        // `output_item.done`. Both calls must assemble independently.
+        let frame = |v: serde_json::Value| format!("data: {v}\n\n");
+        let frames: Vec<String> = vec![
+            frame(
+                serde_json::json!({"type": "response.output_item.added", "item": {"type": "function_call", "id": "fc_a", "call_id": "call_a", "name": "read_file", "arguments": ""}}),
+            ),
+            frame(
+                serde_json::json!({"type": "response.output_item.added", "item": {"type": "function_call", "id": "fc_b", "call_id": "call_b", "name": "list_dir", "arguments": ""}}),
+            ),
+            frame(
+                serde_json::json!({"type": "response.function_call_arguments.delta", "item_id": "fc_a", "delta": "{\"path\":"}),
+            ),
+            frame(
+                serde_json::json!({"type": "response.function_call_arguments.delta", "item_id": "fc_b", "delta": "{\"depth\":"}),
+            ),
+            frame(
+                serde_json::json!({"type": "response.function_call_arguments.delta", "item_id": "fc_a", "delta": "\"src/"}),
+            ),
+            frame(
+                serde_json::json!({"type": "response.function_call_arguments.delta", "item_id": "fc_b", "delta": "9}"}),
+            ),
+            frame(
+                serde_json::json!({"type": "response.function_call_arguments.done", "item_id": "fc_b", "arguments": "{\"depth\":2}"}),
+            ),
+            frame(
+                serde_json::json!({"type": "response.function_call_arguments.delta", "item_id": "fc_a", "delta": "a.rs\"}"}),
+            ),
+            frame(
+                serde_json::json!({"type": "response.output_item.done", "item": {"type": "function_call", "id": "fc_a", "call_id": "call_a", "name": "read_file", "arguments": "{\"path\":\"src/a.rs\"}"}}),
+            ),
+            frame(serde_json::json!({"type": "response.completed", "response": {"id": "r2"}})),
+            "data: [DONE]\n\n".to_string(),
+        ];
+        let full = frames.concat().into_bytes();
+        let chunks: Vec<Vec<u8>> = full.chunks(7).map(|c| c.to_vec()).collect();
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/responses",
+            MockAction::ChunkedSse {
+                status: 200,
+                chunks,
+            },
+        );
+        let base = server.base_url().await;
+        let items = drain(responses_provider(base).stream(req("m"))).await;
+        let calls: Vec<&ProviderChunk> = items
+            .iter()
+            .filter_map(|i| match i {
+                Ok(c @ ProviderChunk::ToolCall { .. }) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 2, "both calls assemble: {items:?}");
+        match calls[0] {
+            ProviderChunk::ToolCall {
+                id, name, input, ..
+            } => {
+                assert_eq!(id, "call_a");
+                assert_eq!(name, "read_file");
+                assert_eq!(input, &serde_json::json!({"path": "src/a.rs"}));
+            }
+            _ => unreachable!(),
+        }
+        match calls[1] {
+            ProviderChunk::ToolCall {
+                id, name, input, ..
+            } => {
+                assert_eq!(id, "call_b");
+                assert_eq!(name, "list_dir");
+                assert_eq!(
+                    input,
+                    &serde_json::json!({"depth": 2}),
+                    "the authoritative done event replaces fragments"
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| matches!(i, Ok(ProviderChunk::Done)))
+                .count(),
+            1
+        );
+        assert_eq!(items.last(), Some(&Ok(ProviderChunk::Done)));
+    }
+
+    #[tokio::test]
+    async fn responses_usage_flushes_after_tool_calls_and_before_done() {
+        // A completed event carrying BOTH an unflushed function call and a
+        // usage frame: the call comes first, usage is the LAST chunk before
+        // the single Done.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/responses",
+            MockAction::Sse {
+                status: 200,
+                events: vec![
+                    ev(serde_json::json!({"type": "response.output_item.added", "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "echo", "arguments": "{\"x\":1}"}})),
+                    ev(serde_json::json!({"type": "response.completed", "response": {"id": "r1", "usage": {"input_tokens": 7, "input_tokens_details": {"cached_tokens": 2}, "output_tokens": 3, "output_tokens_details": {"reasoning_tokens": 1}}}})),
+                ],
+            },
+        );
+        let base = server.base_url().await;
+        let items = drain(responses_provider(base).stream(req("m"))).await;
+        assert_eq!(items.len(), 3, "{items:?}");
+        assert!(matches!(items[0], Ok(ProviderChunk::ToolCall { .. })));
+        assert_eq!(
+            items[1],
+            Ok(ProviderChunk::Usage(CanonicalUsage {
+                uncached_input_tokens: 5,
+                cache_read_tokens: 2,
+                cache_write_tokens: 0,
+                output_tokens: 3,
+                reasoning_tokens: 1,
+                reported_cost: None,
+                request_id: Some("r1".into()),
+            }))
+        );
+        assert_eq!(items[2], Ok(ProviderChunk::Done));
+    }
+
+    #[tokio::test]
+    async fn responses_malformed_frame_is_typed_malformed_and_terminal() {
+        // A data line that is not JSON is a broken stream: exactly one typed
+        // Malformed error, no chunks after it.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/responses",
+            MockAction::Respond {
+                status: 200,
+                body: "data: {not json}\n\ndata: [DONE]\n\n".into(),
+            },
+        );
+        let base = server.base_url().await;
+        let items = drain(responses_provider(base).stream(req("m"))).await;
+        assert_eq!(items.len(), 1, "{items:?}");
+        let err = items[0].as_ref().expect_err("malformed");
+        assert_eq!(err.kind, ProviderErrorKind::Malformed);
+        assert!(!err.retryable);
+    }
+
+    #[tokio::test]
+    async fn responses_unknown_item_fragment_is_dropped_never_injects() {
+        // A fragment for a function call the server never announced is
+        // DROPPED (event-order processing): no call is fabricated and no
+        // stored call is injected; the announced call still completes.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/responses",
+            MockAction::Sse {
+                status: 200,
+                events: vec![
+                    ev(serde_json::json!({"type": "response.output_item.added", "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "echo", "arguments": ""}})),
+                    ev(serde_json::json!({"type": "response.function_call_arguments.delta", "item_id": "fc_ghost", "delta": "{\"evil\":1}"})),
+                    ev(serde_json::json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "{\"x\":1}"})),
+                    ev(serde_json::json!({"type": "response.completed", "response": {"id": "r1"}})),
+                ],
+            },
+        );
+        let base = server.base_url().await;
+        let items = drain(responses_provider(base).stream(req("m"))).await;
+        assert_eq!(items.len(), 2, "one call then Done: {items:?}");
+        assert_eq!(
+            items[0],
+            Ok(ProviderChunk::ToolCall {
+                id: "call_1".into(),
+                name: "echo".into(),
+                input: serde_json::json!({"x": 1}),
+                complete: true,
+            })
+        );
+        assert_eq!(items[1], Ok(ProviderChunk::Done));
+    }
+
+    #[tokio::test]
+    async fn responses_error_events_are_typed_by_structured_code() {
+        // SSE `error` events carry structured codes: auth is terminal, rate
+        // limits stay retryable, unknown codes are terminal BadRequest. The
+        // stream ends at the error: later deltas never surface.
+        for (code, expect_kind, expect_retryable) in [
+            ("invalid_api_key", ProviderErrorKind::Auth, false),
+            ("rate_limit_exceeded", ProviderErrorKind::RateLimited, true),
+            ("server_error", ProviderErrorKind::BadRequest, false),
+        ] {
+            let server = MockServer::new();
+            server.route(
+                "POST",
+                "/responses",
+                MockAction::Sse {
+                    status: 200,
+                    events: vec![
+                        ev(serde_json::json!({"type": "response.output_text.delta", "item_id": "m1", "delta": "partial"})),
+                        ev(serde_json::json!({"type": "error", "code": code, "message": "boom"})),
+                        ev(serde_json::json!({"type": "response.output_text.delta", "item_id": "m1", "delta": "after"})),
+                    ],
+                },
+            );
+            let base = server.base_url().await;
+            let items = drain(responses_provider(base).stream(req("m"))).await;
+            assert_eq!(items.len(), 2, "{code}: {items:?}");
+            assert!(matches!(items[0], Ok(ProviderChunk::Text { .. })));
+            let err = items[1].as_ref().expect_err("typed error");
+            assert_eq!(err.kind, expect_kind, "{code}");
+            assert_eq!(err.retryable, expect_retryable, "{code}");
+            assert_eq!(err.code.as_deref(), Some(code));
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_no_chunks_survive_any_terminal_event() {
+        // completion is a hard terminal: later text/reasoning deltas and a
+        // trailing [DONE] never produce chunks.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/responses",
+            MockAction::Sse {
+                status: 200,
+                events: vec![
+                    ev(serde_json::json!({"type": "response.output_text.delta", "item_id": "m1", "delta": "before"})),
+                    ev(serde_json::json!({"type": "response.completed", "response": {"id": "r1"}})),
+                    ev(serde_json::json!({"type": "response.output_text.delta", "item_id": "m1", "delta": "after"})),
+                    ev(serde_json::json!({"type": "response.reasoning_text.delta", "item_id": "rs", "delta": "after"})),
+                    "data: [DONE]\n\n".to_string(),
+                ],
+            },
+        );
+        let base = server.base_url().await;
+        let items = drain(responses_provider(base).stream(req("m"))).await;
+        assert_eq!(
+            items,
+            vec![
+                Ok(ProviderChunk::Text {
+                    text: "before".into()
+                }),
+                Ok(ProviderChunk::Done)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_cancellation_mid_stream_is_cancelled_and_terminal() {
+        // The server sends one real delta and then holds the stream open.
+        // Cancelling mid-stream must surface one typed Cancelled error
+        // promptly, then end the stream.
+        let base = slow_sse_server(
+            vec![ev(serde_json::json!({"type": "response.output_text.delta", "item_id": "m1", "delta": "partial"})).into_bytes()],
+            true,
+        )
+        .await;
+        let cancel = CancellationToken::new();
+        let mut g = req("m");
+        g.meta.cancellation = cancel.clone();
+        let mut stream = responses_provider(base).stream(g);
+        match stream.next().await {
+            Some(Ok(ProviderChunk::Text { text })) => assert_eq!(text, "partial"),
+            other => panic!("expected the first delta, got {other:?}"),
+        }
+        let t0 = std::time::Instant::now();
+        cancel.cancel();
+        let item = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("cancellation must wake the live stream")
+            .expect("an error item");
+        let err = item.expect_err("cancelled");
+        assert_eq!(err.kind, ProviderErrorKind::Cancelled);
+        assert!(!err.retryable);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(1500),
+            "cancel must surface promptly: {:?}",
+            t0.elapsed()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), stream.next())
+                .await
+                .expect("terminal error ends the stream")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_request_meta_deadline_bounds_silent_stream() {
+        // `RequestMeta::deadline_ms` is the operation deadline: a silent
+        // server must time out at the overall bound (retryable Timeout),
+        // never wait out the 60s first-byte default, and end the stream.
+        let server = MockServer::new();
+        server.route("POST", "/responses", MockAction::Silent { status: 200 });
+        let base = server.base_url().await;
+        let mut g = req("m");
+        g.meta.deadline_ms = 1200;
+        let t0 = std::time::Instant::now();
+        let mut stream = responses_provider(base).stream(g);
+        let item = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("the meta deadline must terminate the silent stream")
+            .expect("an error item");
+        let err = item.expect_err("must be a timeout");
+        assert_eq!(err.kind, ProviderErrorKind::Timeout);
+        assert!(err.retryable);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(2500),
+            "meta deadline must fire at its overall bound: {:?}",
+            t0.elapsed()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), stream.next())
+                .await
+                .expect("stream must end after the terminal timeout")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_first_byte_and_idle_deadlines_fire() {
+        // First byte: connected + silent -> Timeout before any item.
+        let server = MockServer::new();
+        server.route("POST", "/responses", MockAction::Silent { status: 200 });
+        let base = server.base_url().await;
+        let transport: Arc<dyn HttpTransport> = Arc::new(PolicyCheckedHttpTransport::permissive());
+        let mut stream = Box::pin(responses_stream(
+            transport,
+            format!("{base}/responses"),
+            authorization_headers(None),
+            responses_body(&req("m")),
+            StreamDeadlines {
+                first_byte_ms: 300,
+                idle_ms: 3000,
+                overall_ms: 0,
+            },
+            None,
+        ));
+        let item = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("first-byte bound must fire")
+            .expect("an error item");
+        let err = item.expect_err("timeout");
+        assert_eq!(err.kind, ProviderErrorKind::Timeout);
+        assert!(err.retryable);
+
+        // Idle: one delta arrives, then silence -> the idle bound fires.
+        let base = slow_sse_server(
+            vec![ev(serde_json::json!({"type": "response.output_text.delta", "item_id": "m1", "delta": "tick"})).into_bytes()],
+            true,
+        )
+        .await;
+        let transport: Arc<dyn HttpTransport> = Arc::new(PolicyCheckedHttpTransport::permissive());
+        let mut stream = Box::pin(responses_stream(
+            transport,
+            format!("{base}/responses"),
+            authorization_headers(None),
+            responses_body(&req("m")),
+            StreamDeadlines {
+                first_byte_ms: 5000,
+                idle_ms: 300,
+                overall_ms: 0,
+            },
+            None,
+        ));
+        match stream.next().await {
+            Some(Ok(ProviderChunk::Text { text })) => assert_eq!(text, "tick"),
+            other => panic!("expected the first delta, got {other:?}"),
+        }
+        let t0 = std::time::Instant::now();
+        let item = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("idle bound must fire")
+            .expect("an error item");
+        let err = item.expect_err("idle timeout");
+        assert_eq!(err.kind, ProviderErrorKind::Timeout);
+        assert!(err.retryable);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(1500),
+            "idle bound must fire promptly: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn http_status_retry_classification_is_shared_by_both_families() {
+        // ONE status classifier serves both wire families: 429/5xx are
+        // retryable, auth and every other 4xx are terminal, and the
+        // envelope's retryability is the provider crate's shared
+        // `ProviderErrorKind::retryable()`.
+        for (status, expect_kind, expect_retryable) in [
+            (429u16, ProviderErrorKind::RateLimited, true),
+            (500, ProviderErrorKind::Server, true),
+            (503, ProviderErrorKind::Server, true),
+            (400, ProviderErrorKind::BadRequest, false),
+            (401, ProviderErrorKind::Auth, false),
+            (403, ProviderErrorKind::Auth, false),
+            (404, ProviderErrorKind::BadRequest, false),
+        ] {
+            for responses in [false, true] {
+                let server = MockServer::new();
+                let path = if responses {
+                    "/responses"
+                } else {
+                    "/chat/completions"
+                };
+                server.route(
+                    "POST",
+                    path,
+                    MockAction::Respond {
+                        status,
+                        body: r#"{"error":{"message":"nope"}}"#.into(),
+                    },
+                );
+                let base = server.base_url().await;
+                let provider: Arc<dyn Provider> = if responses {
+                    OpenAiProvider::build(OpenAiConfig::responses(base, None))
+                } else {
+                    OpenAiProvider::build(OpenAiConfig::chat(base, None))
+                };
+                let mut stream = provider.stream(req("m"));
+                let err = stream.next().await.unwrap().unwrap_err();
+                assert_eq!(
+                    err.kind, expect_kind,
+                    "status {status} responses={responses}"
+                );
+                assert_eq!(
+                    err.retryable, expect_retryable,
+                    "status {status} responses={responses}"
+                );
+                assert_eq!(err.retryable, err.kind.retryable());
+                assert_eq!(err.code.as_deref(), Some(status.to_string().as_str()));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_family_dispatch_selects_body_and_endpoint() {
+        // wire_body dispatch: Responses -> native item body, Chat -> chat
+        // body; never both shapes.
+        let responses = OpenAiProvider {
+            config: OpenAiConfig::responses("http://x", None),
+            transport: default_transport(),
+            quirks: OpenAiQuirks::default(),
+        };
+        let chat = OpenAiProvider {
+            config: OpenAiConfig::chat("http://x", None),
+            transport: default_transport(),
+            quirks: OpenAiQuirks::default(),
+        };
+        let r = responses.wire_body(&req("m"));
+        assert!(
+            r.get("input").is_some() && r.get("messages").is_none(),
+            "responses body: {r}"
+        );
+        assert_eq!(r["stream"], true);
+        let c = chat.wire_body(&req("m"));
+        assert!(
+            c.get("messages").is_some() && c.get("input").is_none(),
+            "chat body: {c}"
+        );
+        assert_eq!(c["stream"], true);
+
+        // stream() dispatch: the family picks the endpoint + parser pair
+        // (chat keeps its own URL, locked here for the pair).
+        for (responses, expected_path) in [
+            (true, "http://mock.invalid/responses"),
+            (false, "http://mock.invalid/chat/completions"),
+        ] {
+            let mock = Arc::new(MockHttpTransport::new(200, "data: [DONE]\n\n"));
+            let transport: Arc<dyn HttpTransport> = mock.clone();
+            let config = if responses {
+                OpenAiConfig::responses("http://mock.invalid", None)
+            } else {
+                OpenAiConfig::chat("http://mock.invalid", None)
+            };
+            let provider = OpenAiProvider::build_with_transport(config, transport);
+            let items = drain(provider.stream(req("m"))).await;
+            assert_eq!(items, vec![Ok(ProviderChunk::Done)]);
+            assert_eq!(
+                mock.requests(),
+                vec![("POST".to_string(), expected_path.to_string())],
+                "responses={responses}"
+            );
+        }
     }
     #[tokio::test]
     async fn assistant_tool_call_and_tool_result_lower_to_wire_messages() {
@@ -2276,6 +3161,121 @@ mod tests {
                     "request_id_preserved",
                     sse(usage_frame(1000, 50, None, None, Some("chatcmpl-conf-1"), false)),
                     exp(1000, 0, 50, 0, Some("chatcmpl-conf-1")),
+                ),
+            ]
+        }
+    }
+
+    /// Canonical-usage conformance for the native Responses wire: the usage
+    /// envelope rides `response.completed.response.usage`, and `input_tokens`
+    /// totals INCLUDE the cached portion (InclusiveTotal family). The driver
+    /// proves each frame is canonical and is the LAST chunk before Done;
+    /// hostile rows are typed Malformed.
+    mod responses_canonical_usage_conformance {
+        use super::*;
+        use faktor_provider::canonical_usage_conformance;
+        use faktor_provider::CanonicalUsage;
+
+        /// A real-wire `response.completed` envelope. `junk` adds unknown
+        /// fields at every level (unknown fields must never panic).
+        fn completed(
+            input: u64,
+            output: u64,
+            cached: Option<u64>,
+            reasoning: Option<u64>,
+            id: Option<&str>,
+            junk: bool,
+        ) -> String {
+            let mut usage = serde_json::json!({
+                "input_tokens": input,
+                "output_tokens": output,
+                "total_tokens": input + output,
+            });
+            if let Some(c) = cached {
+                usage["input_tokens_details"] =
+                    serde_json::json!({"cached_tokens": c, "audio_tokens": 0});
+            }
+            if let Some(r) = reasoning {
+                usage["output_tokens_details"] = serde_json::json!({"reasoning_tokens": r});
+            }
+            if junk {
+                usage["unknown_usage_field"] = serde_json::json!("x");
+                usage["input_tokens_details"] =
+                    serde_json::json!({"cached_tokens": 0, "totally_unknown": {"n": [1, 2]}});
+            }
+            let mut response = serde_json::json!({"usage": usage, "status": "completed"});
+            if let Some(id) = id {
+                response["id"] = serde_json::json!(id);
+            }
+            if junk {
+                response["unknown_response_field"] = serde_json::json!([1, {"a": true}]);
+            }
+            let mut event = serde_json::json!({"type": "response.completed", "response": response});
+            if junk {
+                event["unknown_event_field"] = serde_json::json!({"z": 1});
+            }
+            format!("data: {event}\n\ndata: [DONE]\n\n")
+        }
+
+        fn exp(
+            uncached: u64,
+            cache_read: u64,
+            output: u64,
+            reasoning: u64,
+            request_id: Option<&str>,
+        ) -> CanonicalUsage {
+            CanonicalUsage {
+                uncached_input_tokens: uncached,
+                cache_read_tokens: cache_read,
+                cache_write_tokens: 0,
+                output_tokens: output,
+                reasoning_tokens: reasoning,
+                reported_cost: None,
+                request_id: request_id.map(str::to_string),
+            }
+        }
+
+        canonical_usage_conformance! {
+            driver: responses_family_canonical_usage_conformance,
+            family: faktor_provider::usage_conformance::WireFamily::InclusiveTotal,
+            label: "openai responses",
+            request: || req("m1"),
+            provider: |base: String| OpenAiProvider::build(OpenAiConfig::responses(base, None)),
+            method: "POST",
+            path: "/responses",
+            cases: vec![
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "total_incl_cached_split",
+                    completed(1000, 50, Some(600), None, None, false),
+                    exp(400, 600, 50, 0, None),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "cache_detail_missing_uncached_total",
+                    completed(1000, 50, None, None, None, false),
+                    exp(1000, 0, 50, 0, None),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::malformed(
+                    "hostile_cache_over_total",
+                    completed(100, 50, Some(600), None, None, false),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "reasoning_subset_inside_output",
+                    completed(1000, 50, None, Some(30), None, false),
+                    exp(1000, 0, 50, 30, None),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::malformed(
+                    "hostile_reasoning_over_output",
+                    completed(1000, 20, None, Some(30), None, false),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "unknown_fields_never_panic",
+                    completed(1000, 50, Some(0), None, None, true),
+                    exp(1000, 0, 50, 0, None),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "request_id_preserved",
+                    completed(1000, 50, None, None, Some("resp-conf-1"), false),
+                    exp(1000, 0, 50, 0, Some("resp-conf-1")),
                 ),
             ]
         }
