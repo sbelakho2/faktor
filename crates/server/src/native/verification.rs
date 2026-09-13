@@ -4,7 +4,9 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use faktor_core::state::CriterionBinding;
 use faktor_protocol::error::ApiError;
+use faktor_session::task::Criterion;
 
 use super::*;
 use crate::api::AppState;
@@ -76,6 +78,30 @@ pub(crate) async fn native_session_verification(
     .into_response()
 }
 
+/// The three-way verdict of one durable criterion row (additive proof truth):
+/// a recorded boolean becomes `pass`/`fail` only through its OWN typed
+/// binding. A row without a binding (legacy) or with the explicit
+/// `unavailable` binding is `unavailable` — never promoted to a pass (the
+/// evaluator never treats an unbound verdict as one) and never read as a
+/// definitive failure.
+fn criterion_verdict_label(passed: bool, binding: Option<&CriterionBinding>) -> &'static str {
+    match binding {
+        Some(CriterionBinding::Unavailable { .. }) | None => "unavailable",
+        Some(_) if passed => "pass",
+        Some(_) => "fail",
+    }
+}
+
+/// The typed binding of one criterion as the wire serves it: the serde shape
+/// (`kind` plus the variant's own members). `null` = the durable row carries
+/// no binding (honest absence, never synthesized).
+fn criterion_binding_json(binding: Option<&CriterionBinding>) -> serde_json::Value {
+    match binding {
+        Some(b) => serde_json::to_value(b).unwrap_or(serde_json::Value::Null),
+        None => serde_json::Value::Null,
+    }
+}
+
 /// The typed evidence projection of ONE durable verification record
 /// (wave-16 table, audit P0-64): checks/criteria/changed-files with the
 /// record's certification envelope, PLUS the P0 proof-binding payload —
@@ -85,18 +111,38 @@ pub(crate) async fn native_session_verification(
 /// camelCase; content is the record's stored, bounded data. `candidateProof`
 /// is `null` on a legacy record without the v20 evidence column (honest
 /// absence, never a synthesized value).
+///
+/// Each criterion additionally carries its additive proof annotations: the
+/// full typed `binding` object (kind + its own members), the flat
+/// `bindingKind` label, the served three-way `verdict`
+/// (`pass|fail|unavailable`) alongside the recorded `passed` boolean, and
+/// — when a CURRENT typed task criterion matches the record row's key — its
+/// `origin` and `requirement`. A key without a matching typed task
+/// criterion serves `origin`/`requirement` as `null`: never a guessed
+/// value.
 pub(crate) fn native_verification_record_row(
     r: &faktor_session::VerificationRecord,
     integration: Option<&faktor_session::ledger::IntegrationRecordRow>,
+    task_criteria: &[Criterion],
 ) -> serde_json::Value {
     let criteria: Vec<serde_json::Value> = r
         .criteria
         .iter()
         .map(|c| {
+            let typed = task_criteria.iter().find(|t| t.text == c.criterion_key);
             serde_json::json!({
                 "criterionKey": c.criterion_key,
                 "passed": c.passed,
                 "evidence": c.evidence,
+                "binding": criterion_binding_json(c.binding.as_ref()),
+                "bindingKind": c
+                    .binding
+                    .as_ref()
+                    .map(|b| b.kind_label())
+                    .unwrap_or("unavailable"),
+                "origin": typed.map(|t| t.origin.label()),
+                "requirement": typed.map(|t| t.requirement.label()),
+                "verdict": criterion_verdict_label(c.passed, c.binding.as_ref()),
             })
         })
         .collect();
@@ -257,11 +303,20 @@ pub(crate) async fn native_task_verification(
         .iter()
         .filter(|r| r.workspace_id == row.workspace_id)
         .collect();
+    // The typed criteria of the session's OWN task row are the only source
+    // of a criterion's origin/requirement (the durable record stores the
+    // verdict + binding, not the authoring metadata). No row or no matching
+    // key = honest nulls on the wire.
+    let task_criteria: Vec<Criterion> = owned
+        .iter()
+        .find(|t| t.task_id == requested)
+        .map(|t| t.criteria())
+        .unwrap_or_default();
     let out: Vec<serde_json::Value> = records
         .iter()
         .rev()
         .take(MAX_NATIVE_LIST)
-        .map(|r| native_verification_record_row(r, integration.as_ref()))
+        .map(|r| native_verification_record_row(r, integration.as_ref(), &task_criteria))
         .collect();
     Json(serde_json::json!({
         "sessionId": handle.id().to_string(),

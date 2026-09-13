@@ -383,6 +383,79 @@ details summary {
   cursor: not-allowed;
 }
 
+/* Acceptance-criterion proof rows: pass / fail / unavailable each carry a
+   distinct visual state (solid vs dashed marker, color, italics); an
+   unavailable row must never read as a pass. */
+.criterion {
+  border-left: 3px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  margin: 4px 0;
+  padding: 3px 6px;
+}
+
+.criterion-pass {
+  border-left-color: var(--vscode-testing-iconPassed, #3fb950);
+}
+
+.criterion-fail {
+  border-left-color: var(--vscode-testing-iconFailed, #f85149);
+}
+
+.criterion-unavailable {
+  border-left-color: var(--vscode-editorWarning-foreground, #d29922);
+  border-left-style: dashed;
+}
+
+.criterion-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.criterion-verdict {
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 0.8em;
+  letter-spacing: 0.04em;
+}
+
+.criterion-verdict-pass {
+  background: var(--vscode-testing-iconPassed, #3fb950);
+  color: #fff;
+}
+
+.criterion-verdict-fail {
+  background: var(--vscode-testing-iconFailed, #f85149);
+  color: #fff;
+}
+
+.criterion-verdict-unavailable {
+  background: transparent;
+  color: var(--vscode-editorWarning-foreground, #d29922);
+  border: 1px dashed currentColor;
+}
+
+.criterion-key {
+  font-weight: 600;
+}
+
+.criterion-unavailable .criterion-key {
+  font-style: italic;
+  opacity: 0.85;
+}
+
+.criterion-line-pass {
+  color: var(--vscode-testing-iconPassed, #3fb950);
+}
+
+.criterion-line-fail {
+  color: var(--vscode-testing-iconFailed, #f85149);
+}
+
+.criterion-line-unavailable {
+  color: var(--vscode-editorWarning-foreground, #d29922);
+  font-style: italic;
+}
+
 /* Accessibility: with prefers-reduced-motion every .pixel-* animation and
    transform is removed, while each state keeps a STATIC cue (opacity) so
    presence is still legible without motion. */

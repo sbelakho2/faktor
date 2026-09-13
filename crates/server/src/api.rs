@@ -9217,6 +9217,294 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_verification_serves_criterion_binding_origin_requirement_and_verdict() {
+        // P0 UI proof blockers: every criterion row of the task-verification
+        // projection additively carries the typed binding (kind + members),
+        // the flat binding kind, the three-way verdict
+        // (pass|fail|unavailable) alongside the recorded `passed` boolean,
+        // and — when the session's typed task row holds the criterion — its
+        // origin and requirement. All SEVEN binding kinds render; an
+        // unbound (legacy) row is `unavailable`, which is distinct from
+        // both `fail` and `pass`.
+        use faktor_core::state::{
+            CriterionBinding, CriterionOrigin, CriterionRequirement, TaskState,
+        };
+        use faktor_session::task::{encode_criteria, Criterion};
+
+        struct Spec {
+            key: &'static str,
+            binding: CriterionBinding,
+            passed: bool,
+            origin: CriterionOrigin,
+            requirement: CriterionRequirement,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/ver-proof").unwrap();
+        let s = manager
+            .create_session(ws, "t-ver-proof", "fake", "m")
+            .unwrap();
+        let task_id = s.task_id().unwrap();
+
+        let specs = [
+            Spec {
+                key: "required check proof",
+                binding: CriterionBinding::RequiredCheck {
+                    check_id: "rust_check".into(),
+                    command_digest: "digest-check".into(),
+                },
+                passed: true,
+                origin: CriterionOrigin::User,
+                requirement: CriterionRequirement::Required,
+            },
+            Spec {
+                key: "integration coverage proof",
+                binding: CriterionBinding::IntegrationCoverage {
+                    required_work_items: vec!["impl-a".into(), "impl-b".into()],
+                },
+                passed: true,
+                origin: CriterionOrigin::ProjectPolicy,
+                requirement: CriterionRequirement::Required,
+            },
+            Spec {
+                key: "file state proof",
+                binding: CriterionBinding::FileState {
+                    path: "src/a.rs".into(),
+                    expected_digest: "digest-file".into(),
+                },
+                passed: true,
+                origin: CriterionOrigin::VerificationPolicy,
+                requirement: CriterionRequirement::Required,
+            },
+            Spec {
+                key: "evidence proof",
+                binding: CriterionBinding::Evidence {
+                    evidence_id: "41".into(),
+                    evidence_digest: "digest-evidence".into(),
+                },
+                passed: true,
+                origin: CriterionOrigin::SemanticProvider,
+                requirement: CriterionRequirement::Preferred,
+            },
+            Spec {
+                key: "independent review proof",
+                binding: CriterionBinding::IndependentReview {
+                    reviewer_id: "reviewer-1".into(),
+                },
+                passed: true,
+                origin: CriterionOrigin::ProjectPolicy,
+                requirement: CriterionRequirement::Required,
+            },
+            Spec {
+                key: "aggregate goal proof",
+                binding: CriterionBinding::AggregateGoal,
+                passed: false,
+                origin: CriterionOrigin::VerificationPolicy,
+                requirement: CriterionRequirement::Preferred,
+            },
+            Spec {
+                key: "explicitly unavailable proof",
+                binding: CriterionBinding::Unavailable {
+                    reason: "no objective mechanism".into(),
+                },
+                passed: true,
+                origin: CriterionOrigin::User,
+                requirement: CriterionRequirement::Required,
+            },
+        ];
+        let typed: Vec<Criterion> = specs
+            .iter()
+            .map(|spec| {
+                Criterion::derived(spec.key, spec.origin, spec.requirement, None)
+                    .with_binding(spec.binding.clone())
+            })
+            .collect();
+        let now = s.now_ms();
+        s.create_task(faktor_session::Task {
+            task_id,
+            session_id: s.id(),
+            goal: "prove every binding kind".into(),
+            acceptance_criteria: encode_criteria(&typed),
+            plan: Vec::new(),
+            attachments: Vec::new(),
+            budget: Default::default(),
+            state: TaskState::Running,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .unwrap();
+
+        let row = s.row().unwrap();
+        let mut criteria: Vec<faktor_core::state::CriterionVerification> = specs
+            .iter()
+            .map(|spec| faktor_core::state::CriterionVerification {
+                criterion_key: spec.key.into(),
+                passed: spec.passed,
+                evidence: Some(format!("evidence for {}", spec.key)),
+                binding: Some(spec.binding.clone()),
+            })
+            .collect();
+        // A legacy unbound row: the recorded boolean contract survives, the
+        // new three-way verdict must honestly say `unavailable`.
+        criteria.push(faktor_core::state::CriterionVerification {
+            criterion_key: "legacy unbound proof".into(),
+            passed: true,
+            evidence: None,
+            binding: None,
+        });
+        let record = faktor_store::VerificationRecordRow {
+            id: faktor_core::id::VerificationRecordId::new(1),
+            task_id,
+            revision: faktor_core::id::TaskRevision::new(1),
+            workspace_id: row.workspace_id,
+            worktree_id: row.worktree_id,
+            tree_hash: Some("ab".repeat(32)),
+            criteria,
+            checks: Vec::new(),
+            changed_files: Vec::new(),
+            unrelated_changes: Vec::new(),
+            reviewer: None,
+            status: faktor_core::state::VerificationStatus::Passed,
+            started_ms: 11,
+            completed_ms: Some(22),
+        };
+        manager.store().verification_record_put(&record).unwrap();
+
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{}/tasks/{}/verification", s.id(), task_id),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let records = body["records"].as_array().unwrap();
+        assert_eq!(records.len(), 1, "{body}");
+        let rec = &records[0];
+        assert_eq!(rec["startedMs"], 11);
+        assert_eq!(rec["completedMs"], 22);
+        let rows = rec["criteria"].as_array().unwrap();
+        assert_eq!(rows.len(), specs.len() + 1);
+        let find = |key: &str| -> serde_json::Value {
+            rows.iter()
+                .find(|r| r["criterionKey"] == key)
+                .unwrap_or_else(|| panic!("criterion {key} must be served"))
+                .clone()
+        };
+
+        // All seven binding kinds with their served origin/requirement and
+        // the three-way verdict.
+        let expected: [(&str, &str, &str, &str, &str); 7] = [
+            (
+                "required check proof",
+                "required_check",
+                "user",
+                "required",
+                "pass",
+            ),
+            (
+                "integration coverage proof",
+                "integration_coverage",
+                "project_policy",
+                "required",
+                "pass",
+            ),
+            (
+                "file state proof",
+                "file_state",
+                "verification_policy",
+                "required",
+                "pass",
+            ),
+            (
+                "evidence proof",
+                "evidence",
+                "semantic_provider",
+                "preferred",
+                "pass",
+            ),
+            (
+                "independent review proof",
+                "independent_review",
+                "project_policy",
+                "required",
+                "pass",
+            ),
+            (
+                "aggregate goal proof",
+                "aggregate_goal",
+                "verification_policy",
+                "preferred",
+                "fail",
+            ),
+            (
+                "explicitly unavailable proof",
+                "unavailable",
+                "user",
+                "required",
+                "unavailable",
+            ),
+        ];
+        for (key, kind, origin, requirement, verdict) in expected {
+            let row = find(key);
+            assert_eq!(row["bindingKind"], kind, "{row}");
+            assert_eq!(row["origin"], origin, "{row}");
+            assert_eq!(row["requirement"], requirement, "{row}");
+            assert_eq!(row["verdict"], verdict, "{row}");
+            assert_eq!(row["binding"]["kind"], kind, "{row}");
+        }
+        // The typed binding members ride the wire in the serde shape.
+        assert_eq!(
+            find("required check proof")["binding"]["check_id"],
+            "rust_check"
+        );
+        assert_eq!(
+            find("required check proof")["binding"]["command_digest"],
+            "digest-check"
+        );
+        assert_eq!(
+            find("integration coverage proof")["binding"]["required_work_items"],
+            serde_json::json!(["impl-a", "impl-b"])
+        );
+        assert_eq!(find("file state proof")["binding"]["path"], "src/a.rs");
+        assert_eq!(find("evidence proof")["binding"]["evidence_id"], "41");
+        assert_eq!(
+            find("independent review proof")["binding"]["reviewer_id"],
+            "reviewer-1"
+        );
+        assert_eq!(
+            find("explicitly unavailable proof")["binding"]["reason"],
+            "no objective mechanism"
+        );
+        // A verdict without a binding (legacy row) is unavailable, never a
+        // pass — the recorded `passed` boolean stays alongside it.
+        let legacy = find("legacy unbound proof");
+        assert_eq!(legacy["passed"], true);
+        assert_eq!(legacy["binding"], serde_json::Value::Null);
+        assert_eq!(legacy["bindingKind"], "unavailable");
+        assert_eq!(legacy["verdict"], "unavailable");
+        assert_ne!(legacy["verdict"], "pass");
+        // The three-way verdict distinguishes fail from unavailable AND
+        // pass from unavailable.
+        assert_ne!(find("explicitly unavailable proof")["verdict"], "fail");
+        assert_ne!(find("explicitly unavailable proof")["verdict"], "pass");
+        assert_ne!(find("aggregate goal proof")["verdict"], "unavailable");
+        assert_ne!(find("aggregate goal proof")["verdict"], "pass");
+        // No typed task criterion matches the legacy row: honest nulls.
+        assert_eq!(legacy["origin"], serde_json::Value::Null);
+        assert_eq!(legacy["requirement"], serde_json::Value::Null);
+
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
     async fn native_tasks_carry_progress_and_durable_budget() {
         // P0-64d: the /native/session/{id}/tasks entry additively carries
         // `progress` (the live bounded progress record, null when nothing

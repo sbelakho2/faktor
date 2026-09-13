@@ -32,6 +32,7 @@ import dev.faktor.shared.NativePermissionEntry
 import dev.faktor.shared.NativePresentationAck
 import dev.faktor.shared.NativeProjection
 import dev.faktor.shared.NativePromptReceipt
+import dev.faktor.shared.NativeProviderInfo
 import dev.faktor.shared.NativeSessionCreated
 import dev.faktor.shared.NativeSessionSummary
 import dev.faktor.shared.NativeSessionUsage
@@ -40,6 +41,10 @@ import dev.faktor.shared.NativeTaskRunCancelled
 import dev.faktor.shared.NativeTaskRunStarted
 import dev.faktor.shared.NativeTaskVerification
 import dev.faktor.shared.NativeTaskView
+import dev.faktor.shared.NativeTerminalEventPage
+import dev.faktor.shared.NativeTerminalOutput
+import dev.faktor.shared.NativeTerminalPage
+import dev.faktor.shared.NativeTerminalSpawned
 import dev.faktor.shared.NativeTournament
 import dev.faktor.shared.NativeTournamentDecision
 import dev.faktor.shared.NativeTournamentStarted
@@ -72,6 +77,9 @@ class FaktorFrontendService(
     private var client: NativeClient? = null
 
     private var stream: NativeEventStream? = null
+
+    /** Stops an externally adopted connection (test/embedding hook). */
+    private var externalStop: (() -> Unit)? = null
 
     @Volatile
     private var listener: Listener? = null
@@ -134,6 +142,7 @@ class FaktorFrontendService(
     /** Stops the SSE stream and the daemon; idempotent. */
     fun stop() {
         var toStop: Pair<BackendProcessManager, BackendConnection>? = null
+        var adoptedStop: (() -> Unit)? = null
         synchronized(lifecycleLock) {
             stream?.stop()
             stream = null
@@ -145,13 +154,82 @@ class FaktorFrontendService(
             client = null
             if (mgr != null && conn != null) {
                 toStop = Pair(mgr, conn)
+            } else {
+                adoptedStop = externalStop
+                externalStop = null
             }
         }
         val stopPair = toStop
+        val external = adoptedStop
         if (stopPair != null) {
             stopPair.first.stop(stopPair.second)
             listener?.onDaemonStatus("stopped", null)
+        } else if (external != null) {
+            external()
+            listener?.onDaemonStatus("stopped", null)
         }
+    }
+
+    /**
+     * Adopts an ALREADY-RUNNING daemon connection (test/embedding hook): no
+     * child process is owned unless [stopAction] says how to stop it. The
+     * connection is health-checked and readiness-polled exactly like
+     * [start], so an adopted fake/remote daemon cannot silently bypass the
+     * contract. Restarting an adopted connection requires a real [start].
+     */
+    fun attachConnection(
+        backendConnection: BackendConnection,
+        stopAction: (() -> Unit)? = null
+    ): NativeHealth {
+        synchronized(lifecycleLock) {
+            if (client != null) throw BackendException("a daemon connection is already attached")
+        }
+        val cl = NativeClient.forConnection(backendConnection)
+        val health = cl.health()
+        val ready = cl.awaitReady()
+        if (!ready.ready) {
+            throw BackendException("adopted daemon never reported ready")
+        }
+        synchronized(lifecycleLock) {
+            connection = backendConnection
+            client = cl
+            manager = null
+            externalStop = stopAction
+        }
+        listener?.onDaemonStatus(
+            "running",
+            "attached port ${backendConnection.port} version ${health.version}"
+        )
+        return health
+    }
+
+    /**
+     * stop() + start() with the session and the SSE cursor preserved, so a
+     * restarted daemon resumes the journal stream exactly where it stopped
+     * (no duplicate, no skipped frame). The session id is durable on the
+     * daemon, so the reopened stream reads the same journal.
+     */
+    fun restart(): NativeHealth {
+        val resumeSession = sessionId
+        val resumeCursor = streamCursor()
+        stop()
+        val health = start()
+        if (resumeSession != null) {
+            watchSession(resumeSession, resumeCursor)
+        }
+        return health
+    }
+
+    /**
+     * Reopens the current session's SSE stream at the last delivered cursor
+     * (explicit UI reconnect). Returns the resumed cursor, or null when no
+     * session is selected.
+     */
+    fun reconnectStream(): Long? {
+        val id = sessionId ?: return null
+        val cursor = streamCursor()
+        watchSession(id, cursor)
+        return cursor
     }
 
     // ------------------------------------------------------------- sessions
@@ -277,6 +355,30 @@ class FaktorFrontendService(
 
     fun replyPermission(permissionId: String, decision: String): NativePermissionAck =
         clientOrThrow().replyPermission(permissionId, decision)
+
+    // ------------------------------------------------------- provider registry
+
+    /** The registered provider instances with their known models. */
+    fun providers(): List<NativeProviderInfo> = clientOrThrow().providers()
+
+    // -------------------------------------------------------------- terminals
+
+    fun terminals(): NativeTerminalPage = clientOrThrow().terminals(requireSession())
+
+    fun terminalEvents(after: Long? = null, limit: Long? = null): NativeTerminalEventPage =
+        clientOrThrow().terminalEvents(requireSession(), after, limit)
+
+    fun spawnTerminal(
+        command: String,
+        args: List<String>? = null,
+        cwd: String? = null,
+        rows: Long? = null,
+        cols: Long? = null
+    ): NativeTerminalSpawned =
+        clientOrThrow().spawnTerminal(requireSession(), command, args, cwd, rows, cols)
+
+    fun terminalOutput(ptyId: String): NativeTerminalOutput =
+        clientOrThrow().terminalOutput(ptyId)
 
     // --------------------------------------------------------------- agents
 

@@ -31,7 +31,9 @@ import java.awt.BorderLayout
 import java.awt.Dimension
 import java.awt.FlowLayout
 import java.awt.GridLayout
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.swing.BorderFactory
 import javax.swing.DefaultComboBoxModel
@@ -147,6 +149,14 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
 
     private val boardPanel = BoardPanel()
 
+    private val permissionsPanel = PermissionsPanel()
+
+    private val terminalPanel = TerminalPanel()
+
+    private val settingsPanel = SettingsPanel()
+
+    private val historyPanel = HistoryPanel()
+
     private val tabs = JTabbedPane()
 
     private var renderedSeq: Long = 0
@@ -205,9 +215,13 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
         tabs.addTab("Task", buildTaskTab())
         tabs.addTab("Task Tree", buildTaskTreeTab())
         tabs.addTab("Agents", buildAgentsTab())
+        tabs.addTab("Permissions", permissionsPanel)
         tabs.addTab("Tournament", tournamentPanel)
         tabs.addTab("Board", boardPanel)
         tabs.addTab("Evidence", navigator)
+        tabs.addTab("Terminal", terminalPanel)
+        tabs.addTab("Settings", settingsPanel)
+        tabs.addTab("History", historyPanel)
         tabs.preferredSize = Dimension(430, 600)
 
         add(toolbar, BorderLayout.NORTH)
@@ -347,6 +361,49 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
         completionPr.isSelected = false
     }
 
+    /**
+     * The Task composer's start path (also reachable from tests without an
+     * EDT click): criteria, attachments, the settings mutation default and
+     * the checked completion contract ride ONE native task-run request.
+     */
+    private fun startTaskFromControls() {
+        val goal = goalField.text.trim()
+        if (goal.isEmpty()) {
+            appendSystem("task goal must not be empty")
+            return
+        }
+        val criteria = criteriaField.text.split(',')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+        val files = attachments.files()
+        val contract = completionContractFromControls()
+        runAsync("start task") {
+            val started = service.startTaskRun(
+                goal,
+                if (criteria.isEmpty()) null else criteria,
+                mutationMode = settingsPanel.mutationMode(),
+                files = if (files.isEmpty()) null else files,
+                completionContract = contract
+            )
+            submittedCompletion = contract
+            onEdt {
+                val contractText = if (contract == null) {
+                    ""
+                } else {
+                    " completion=" + contract.requestedSteps().joinToString(",")
+                }
+                appendSystem(
+                    "task run ${started.runId} started (${started.state})" +
+                        if (files.isEmpty()) "" else " with ${files.size} attachment(s)" +
+                        contractText
+                )
+                resetCompletionControls()
+            }
+            refreshTaskRunsBlocking()
+            refreshTaskTreeBlocking()
+        }
+    }
+
     private fun wireActions() {
         startButton.addActionListener { startDaemon() }
         stopButton.addActionListener {
@@ -360,20 +417,7 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
                 }
             }
         }
-        newSessionButton.addActionListener {
-            runAsync("new session") {
-                val provider = providerField.text.trim().ifEmpty { "default" }
-                val model = modelField.text.trim().ifEmpty { "default" }
-                val created = service.createSession(provider, model, title = "JetBrains session")
-                submittedCompletion = null
-                onEdt {
-                    boardPanel.reset()
-                    appendSystem("session ${created.id} created (${created.title})")
-                }
-                service.watchSession(created.id, 0)
-                refreshAllBlocking()
-            }
-        }
+        newSessionButton.addActionListener { newSessionFromControls() }
         refreshButton.addActionListener {
             runAsync("refresh") { refreshAllBlocking() }
         }
@@ -384,42 +428,7 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
                 onEdt { appendSystem("abort requested: ${ack.aborted}") }
             }
         }
-        startTaskButton.addActionListener {
-            val goal = goalField.text.trim()
-            if (goal.isEmpty()) {
-                appendSystem("task goal must not be empty")
-                return@addActionListener
-            }
-            val criteria = criteriaField.text.split(',')
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-            val files = attachments.files()
-            val contract = completionContractFromControls()
-            runAsync("start task") {
-                val started = service.startTaskRun(
-                    goal,
-                    if (criteria.isEmpty()) null else criteria,
-                    files = if (files.isEmpty()) null else files,
-                    completionContract = contract
-                )
-                submittedCompletion = contract
-                onEdt {
-                    val contractText = if (contract == null) {
-                        ""
-                    } else {
-                        " completion=" + contract.requestedSteps().joinToString(",")
-                    }
-                    appendSystem(
-                        "task run ${started.runId} started (${started.state})" +
-                            if (files.isEmpty()) "" else " with ${files.size} attachment(s)" +
-                            contractText
-                    )
-                    resetCompletionControls()
-                }
-                refreshTaskRunsBlocking()
-                refreshTaskTreeBlocking()
-            }
-        }
+        startTaskButton.addActionListener { startTaskFromControls() }
         cancelRunButton.addActionListener {
             val run = runsCombo.selectedItem as? NativeTaskRun
             if (run == null) {
@@ -582,6 +591,89 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
                 onEdt { jumpToTranscript(seq) }
             }
         })
+        permissionsPanel.setListener(object : PermissionsPanel.Listener {
+            override fun onPermissionReply(permission: NativePermissionEntry, decision: String) {
+                runAsync("permission ${permission.id} $decision") {
+                    service.replyPermission(permission.id, decision)
+                    onEdt { appendSystem("permission ${permission.id}: $decision") }
+                    refreshPermissionsBlocking()
+                    refreshTaskTreeBlocking()
+                }
+            }
+
+            override fun onRefresh() {
+                runAsync("refresh permissions") { refreshPermissionsBlocking() }
+            }
+        })
+        terminalPanel.setListener(object : TerminalPanel.Listener {
+            override fun onRefresh() {
+                runAsync("refresh terminals") { refreshTerminalsBlocking() }
+            }
+
+            override fun onSpawn(command: String, args: List<String>, cwd: String?) {
+                runAsync("spawn terminal") {
+                    val spawned = service.spawnTerminal(command, args, cwd)
+                    onEdt {
+                        appendSystem(
+                            "terminal ${spawned.ptyId} spawned (pid ${spawned.pid}, " +
+                                "op ${spawned.operationId})"
+                        )
+                    }
+                    refreshTerminalsBlocking()
+                }
+            }
+
+            override fun onOutput(ptyId: String) {
+                runAsync("terminal output $ptyId") {
+                    val output = service.terminalOutput(ptyId)
+                    onEdt { terminalPanel.setOutput(output) }
+                }
+            }
+        })
+        settingsPanel.setListener(object : SettingsPanel.Listener {
+            override fun onRefreshProviders() {
+                runAsync("refresh providers") { refreshProvidersBlocking() }
+            }
+
+            override fun onProviderSelectionChanged(provider: String, model: String) {
+                // The composer text fields mirror the selection so the
+                // existing new-session path keeps one source of truth.
+                onEdt {
+                    providerField.text = provider
+                    modelField.text = model
+                }
+            }
+        })
+        historyPanel.setListener(object : HistoryPanel.Listener {
+            override fun onOpenSession(sessionId: String) {
+                runAsync("open session $sessionId") {
+                    service.useSession(sessionId)
+                    service.watchSession(sessionId, 0)
+                    onEdt { appendSystem("session $sessionId opened from history") }
+                    refreshAllBlocking()
+                }
+            }
+
+            override fun onRestart() {
+                runAsync("restart daemon") {
+                    val health = service.restart()
+                    onEdt { appendSystem("daemon restarted: version ${health.version}") }
+                    refreshAllBlocking()
+                }
+            }
+
+            override fun onReconnect() {
+                runAsync("reconnect stream") {
+                    val cursor = service.reconnectStream()
+                    onEdt { appendSystem("stream reconnected at cursor ${cursor ?: 0}") }
+                    refreshHistoryBlocking()
+                }
+            }
+
+            override fun onRefresh() {
+                runAsync("refresh history") { refreshHistoryBlocking() }
+            }
+        })
     }
 
     /** Starts the daemon off the EDT (public so the app entry point can call it). */
@@ -592,18 +684,29 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
                 setControlsEnabled(true)
                 appendSystem("daemon ready: version ${health.version}")
             }
-            runAsync("new session") {
-                val provider = providerField.text.trim().ifEmpty { "default" }
-                val model = modelField.text.trim().ifEmpty { "default" }
-                val created = service.createSession(provider, model, title = "JetBrains session")
-                submittedCompletion = null
-                onEdt {
-                    boardPanel.reset()
-                    appendSystem("session ${created.id} created")
-                }
-                service.watchSession(created.id, 0)
-                refreshAllBlocking()
+            newSessionFromControls()
+        }
+    }
+
+    /**
+     * The New-session composer path: the Settings provider selection (or the
+     * composer text fields), one native session, then the SSE stream at
+     * cursor 0 and a full refresh.
+     */
+    private fun newSessionFromControls() {
+        runAsync("new session") {
+            val provider = settingsPanel.selectedProvider()
+                ?: providerField.text.trim().ifEmpty { "default" }
+            val model = settingsPanel.selectedModel()
+                ?: modelField.text.trim().ifEmpty { "default" }
+            val created = service.createSession(provider, model, title = "JetBrains session")
+            submittedCompletion = null
+            onEdt {
+                boardPanel.reset()
+                appendSystem("session ${created.id} created (${created.title})")
             }
+            service.watchSession(created.id, 0)
+            refreshAllBlocking()
         }
     }
 
@@ -640,6 +743,117 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
         refreshTournamentsBlocking()
         refreshBoardBlocking()
         refreshTaskTreeBlocking()
+        refreshPermissionsBlocking()
+        refreshTerminalsBlocking()
+        refreshProvidersBlocking()
+        refreshHistoryBlocking()
+    }
+
+    /** Pending permissions of the session; an absent route is recorded. */
+    private fun refreshPermissionsBlocking() {
+        if (!service.isRunning() || service.currentSessionId() == null) return
+        try {
+            val permissions = service.permissions()
+            onEdt { permissionsPanel.update(permissions) }
+        } catch (e: NativeApiException) {
+            onEdt {
+                permissionsPanel.setUnavailable(
+                    "permission read refused (status ${e.status} ${e.code}: ${e.detail})"
+                )
+            }
+        } catch (e: Exception) {
+            onEdt {
+                permissionsPanel.setUnavailable(
+                    "permission read failed: ${e.message ?: e.javaClass.simpleName}"
+                )
+            }
+        }
+    }
+
+    /** Session-owned terminals + lifetime events from the native PTY routes. */
+    private fun refreshTerminalsBlocking() {
+        if (!service.isRunning() || service.currentSessionId() == null) return
+        try {
+            val page = service.terminals()
+            onEdt { terminalPanel.update(page) }
+        } catch (e: NativeApiException) {
+            onEdt {
+                terminalPanel.setUnavailable(
+                    "terminal read refused (status ${e.status} ${e.code}: ${e.detail})"
+                )
+            }
+            return
+        } catch (e: Exception) {
+            onEdt {
+                terminalPanel.setUnavailable(
+                    "terminal read failed: ${e.message ?: e.javaClass.simpleName}"
+                )
+            }
+            return
+        }
+        try {
+            val events = service.terminalEvents(limit = 64L)
+            onEdt { terminalPanel.setEvents(events) }
+        } catch (e: NativeApiException) {
+            onEdt { terminalPanel.setEventsNote("lifetime events refused (status ${e.status} ${e.code})") }
+        }
+    }
+
+    /**
+     * Provider registry view; a daemon without the additive `/native/providers`
+     * route degrades to the `/models` catalog (the same DTOs the tree joins
+     * on), and only a total failure records an unavailable state.
+     */
+    private fun refreshProvidersBlocking() {
+        if (!service.isRunning()) return
+        try {
+            val providers = service.providers()
+            onEdt { settingsPanel.setProviders(providers) }
+            return
+        } catch (e: NativeApiException) {
+            // Fall through to the catalog.
+        } catch (e: Exception) {
+            onEdt {
+                settingsPanel.setUnavailable(
+                    "provider read failed: ${e.message ?: e.javaClass.simpleName}"
+                )
+            }
+            return
+        }
+        try {
+            val catalog = service.modelCatalog()
+            onEdt { settingsPanel.setCatalog(catalog) }
+        } catch (e: Exception) {
+            onEdt {
+                settingsPanel.setUnavailable(
+                    "provider read failed: ${e.message ?: e.javaClass.simpleName}"
+                )
+            }
+        }
+    }
+
+    /** Durable session history + the live stream/daemon readout. */
+    private fun refreshHistoryBlocking() {
+        if (!service.isRunning()) return
+        try {
+            val sessions = service.listSessions()
+            val current = service.currentSessionId()
+            val daemon = service.daemonDescription()
+            val stream = service.streamStatus()
+            val cursor = service.streamCursor()
+            onEdt { historyPanel.update(sessions, current) }
+            onEdt { historyPanel.setConnection(daemon, stream, cursor, current) }
+        } catch (e: NativeApiException) {
+            onEdt {
+                historyPanel.setUnavailable("history read refused (status ${e.status} ${e.code})")
+            }
+        } catch (e: Exception) {
+            onEdt {
+                historyPanel.setUnavailable(
+                    "history read failed: ${e.message ?: e.javaClass.simpleName}"
+                )
+            }
+        }
     }
 
     private fun refreshStatusBlocking() {
@@ -993,6 +1207,9 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
     override fun onStreamStatus(status: String, detail: String?) {
         onEdt {
             streamLabel.text = "stream: $status" + (if (detail == null) "" else " ($detail)")
+            historyPanel.setConnection(
+                service.daemonDescription(), status, service.streamCursor(), service.currentSessionId()
+            )
         }
     }
 
@@ -1040,6 +1257,69 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
     fun shutdown() {
         service.stopStream()
         worker.shutdownNow()
+    }
+
+    // ------------------------------------------------------------- test hooks
+    // Internal (module-visible) seams used by the Kotlin parity smoke to
+    // drive the REAL panel wiring against canned frames / a fake daemon
+    // without a display. Every hook calls the same code path as its control.
+
+    internal fun submitTaskForTest() {
+        startTaskFromControls()
+    }
+
+    internal fun setTaskFieldsForTest(goal: String, criteria: String) {
+        goalField.text = goal
+        criteriaField.text = criteria
+    }
+
+    internal fun attachmentsView(): AttachmentsPanel = attachments
+
+    internal fun newSessionForTest() {
+        newSessionFromControls()
+    }
+
+    /** Runs one refreshAllBlocking cycle on the worker; true when it finished. */
+    internal fun refreshNowForTest(timeoutMs: Long = 30_000L): Boolean {
+        val latch = CountDownLatch(1)
+        worker.execute {
+            try {
+                refreshAllBlocking()
+            } catch (e: Throwable) {
+                // The per-panel refreshers record their own unavailable states.
+            } finally {
+                latch.countDown()
+            }
+        }
+        val finished = latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+        // The refreshers queue their panel updates via onEdt (invokeLater from
+        // the worker); flush the EDT queue so assertions see the applied state.
+        try {
+            if (!SwingUtilities.isEventDispatchThread()) {
+                SwingUtilities.invokeAndWait { }
+            }
+        } catch (e: Exception) {
+            // A headless/short-lived EDT is not fatal for the caller.
+        }
+        return finished
+    }
+
+    internal fun permissionsView(): PermissionsPanel = permissionsPanel
+
+    internal fun taskTreeView(): TaskTreePanel = treePanel
+
+    internal fun blockersView(): BlockersPanel = blockersPanel
+
+    internal fun terminalView(): TerminalPanel = terminalPanel
+
+    internal fun settingsView(): SettingsPanel = settingsPanel
+
+    internal fun historyView(): HistoryPanel = historyPanel
+
+    internal fun tabTitles(): List<String> {
+        val out = ArrayList<String>()
+        for (i in 0 until tabs.tabCount) out.add(tabs.getTitleAt(i))
+        return out
     }
 
     private fun setControlsEnabled(running: Boolean) {

@@ -21,6 +21,8 @@ import dev.faktor.shared.NativeAgentProgress
 import dev.faktor.shared.NativeBlocker
 import dev.faktor.shared.NativeChildResult
 import dev.faktor.shared.NativeCompletionContract
+import dev.faktor.shared.NativeCriterionBinding
+import dev.faktor.shared.NativeCriterionVerdict
 import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.NativeOrchestratorGraph
 import dev.faktor.shared.NativeProjection
@@ -31,13 +33,67 @@ import dev.faktor.shared.NativeTournament
 import dev.faktor.shared.NativeTournamentCandidate
 import dev.faktor.shared.NativeTournamentCriterion
 import dev.faktor.shared.NativeTournamentSummary
+import dev.faktor.shared.NativeVerificationRecord
 import dev.faktor.shared.NativeVerificationView
 
 /** Max evidence refs surfaced by one task tree (bounded like the cockpit). */
 const val MAX_TREE_EVIDENCE = 64
 
+/** Max acceptance-criterion proof rows one task tree renders (bounded). */
+const val MAX_CRITERIA_PROOF_ROWS = 32
+
 /** Max label chars of one evidence ref (free text is kept but bounded). */
 const val MAX_EVIDENCE_LABEL = 300
+
+/** The visual tone of one criterion verdict (unavailable is distinct). */
+enum class CriterionVerdictTone {
+    PASS,
+    FAIL,
+    UNAVAILABLE
+}
+
+/**
+ * One acceptance-criterion PROOF row: why Faktor believes the criterion is
+ * complete. Built from the members the shared task-verification DTO serves:
+ * the criterion key, the recorded boolean verdict, the evidence string, the
+ * TYPED binding (kind + its own members), the served three-way verdict and
+ * the record-level proof snapshots/timestamps. A member the serving daemon
+ * predates stays an explicit unavailable marker that names the missing
+ * member — never a guessed value and never a pass.
+ */
+data class CriterionProofRow(
+    val criterionKey: String,
+    /** required | preferred | unavailable plus the missing DTO field. */
+    val requirement: String,
+    val origin: String,
+    /** required_check | integration_coverage | file_state | evidence |
+     *  independent_review | aggregate_goal | unavailable. */
+    val bindingKind: String,
+    /** daemon | derived | unavailable. */
+    val bindingSource: String,
+    /** The exact check/file/work-item/evidence reference, when identifiable. */
+    val bindingReference: String?,
+    val bindingDetail: String?,
+    /** pass | fail | unavailable — an unavailable row NEVER renders as pass. */
+    val verdict: String,
+    val verdictReason: String?,
+    val evidenceRefs: List<EvidenceRef>,
+    /** The proven snapshots (explicit unavailable text on a legacy wire). */
+    val snapshot: String,
+    /** The verification timestamps (explicit unavailable text on a legacy wire). */
+    val verificationTimestamp: String,
+    val recordId: String?,
+    val recordStatus: String?,
+    /** Names of the proof members this client's DTO genuinely does not carry. */
+    val unavailable: List<String>
+) {
+    val tone: CriterionVerdictTone
+        get() = when (verdict) {
+            "pass" -> CriterionVerdictTone.PASS
+            "fail" -> CriterionVerdictTone.FAIL
+            else -> CriterionVerdictTone.UNAVAILABLE
+        }
+}
 
 /** A blocker action that applies to one blocked child. */
 enum class BlockerAction(val label: String) {
@@ -213,6 +269,8 @@ data class TaskTreeModel(
     val state: String,
     val phase: String,
     val acceptanceCriteria: List<String>,
+    /** Per-criterion proof: why Faktor believes each criterion holds. */
+    val criteriaProof: List<CriterionProofRow> = emptyList(),
     val steps: List<StepNode>,
     val children: List<ChildNode>,
     val blockers: List<BlockerRow>,
@@ -267,6 +325,7 @@ object TaskTree {
             state = state,
             phase = phase,
             acceptanceCriteria = criteria,
+            criteriaProof = criteriaProof(task, taskVerification),
             steps = steps(task, graph, children),
             children = children,
             blockers = children.mapNotNull { blockerRow(it) },
@@ -514,6 +573,291 @@ object TaskTree {
             }
         }
         return fromRecords
+    }
+
+    // --------------------------------------------------- criterion proof
+
+    private const val REQUIREMENT_UNAVAILABLE =
+        "unavailable (the payload serves no criterion requirement member)"
+    private const val ORIGIN_UNAVAILABLE =
+        "unavailable (the payload serves no criterion origin member)"
+    private const val SNAPSHOT_UNAVAILABLE =
+        "unavailable (the record serves no candidateProof/verifiedSnapshot/basedOnSnapshot/landedSnapshot/sourceCount)"
+    private const val TIMESTAMP_UNAVAILABLE =
+        "unavailable (the record serves no startedMs/completedMs)"
+
+    private val EVIDENCE_ID_PATTERN = Regex("^evidence:[0-9]+$")
+
+    private data class DerivedBinding(
+        val kind: String,
+        val reference: String?,
+        val detail: String?
+    )
+
+    /**
+     * The per-criterion proof rows: explicit task criteria first (a missing
+     * verdict is an honest unavailable), then the record's extra certified
+     * criteria. Bounded like every other list.
+     */
+    private fun criteriaProof(
+        task: NativeTaskView?,
+        taskVerification: NativeTaskVerification?
+    ): List<CriterionProofRow> {
+        val records = taskVerification?.records ?: emptyList()
+        val explicit = (task?.acceptanceCriteria ?: emptyList())
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+        val rows = ArrayList<CriterionProofRow>()
+        val explicitSet = explicit.toSet()
+        for (key in explicit) {
+            var matchedRecord: NativeVerificationRecord? = null
+            var matched: NativeCriterionVerdict? = null
+            for (record in records) {
+                val criterion = record.criteria.firstOrNull { it.criterionKey == key }
+                if (criterion != null) {
+                    matchedRecord = record
+                    matched = criterion
+                    break
+                }
+            }
+            rows.add(criterionProofRow(key, matched, matchedRecord))
+            if (rows.size >= MAX_CRITERIA_PROOF_ROWS) return rows
+        }
+        for (record in records) {
+            for (criterion in record.criteria) {
+                if (criterion.criterionKey.isNotEmpty() && explicitSet.contains(criterion.criterionKey)) {
+                    continue
+                }
+                rows.add(criterionProofRow(criterion.criterionKey, criterion, record))
+                if (rows.size >= MAX_CRITERIA_PROOF_ROWS) return rows
+            }
+        }
+        return rows
+    }
+
+    /**
+     * One proof row. The wire-served proof annotations win: the typed binding
+     * (kind + members), the three-way verdict and the record-level
+     * snapshots/timestamps render directly. Only when the serving daemon
+     * predates a member does the row fall back — a binding MAY still be
+     * DERIVED from unambiguous typed evidence refs (check:/file:/work-item:/
+     * evidence:<n>), and every genuinely missing member stays explicit
+     * unavailable text. Nothing is fabricated and an unavailable row can
+     * never render as a pass.
+     */
+    private fun criterionProofRow(
+        criterionKey: String,
+        criterion: NativeCriterionVerdict?,
+        record: NativeVerificationRecord?
+    ): CriterionProofRow {
+        val refs = evidenceRefs(criterion?.evidence)
+        val unavailable = ArrayList<String>()
+
+        val requirement = criterion?.requirement?.takeIf { it.isNotEmpty() }
+        if (requirement == null) unavailable.add("requirement")
+        val origin = criterion?.origin?.takeIf { it.isNotEmpty() }
+        if (origin == null) unavailable.add("origin")
+
+        val served = criterion?.binding
+        val bindingKind: String
+        val bindingSource: String
+        val bindingReference: String?
+        val bindingDetail: String?
+        if (served != null) {
+            bindingKind = served.kind
+            bindingSource = "daemon"
+            bindingReference = bindingReferenceOf(served)
+            bindingDetail = bindingDetailOf(served)
+        } else {
+            val derived = deriveBinding(refs.map { it.label })
+            if (derived != null) {
+                bindingKind = derived.kind
+                bindingSource = "derived"
+                bindingReference = derived.reference
+                bindingDetail = derived.detail
+            } else {
+                bindingKind = "unavailable"
+                bindingSource = "unavailable"
+                bindingReference = null
+                bindingDetail = if (criterion == null) {
+                    "no durable verification record covers this criterion"
+                } else if (refs.isEmpty()) {
+                    "the payload serves no criterion binding and no typed evidence ref identifies one"
+                } else {
+                    "the payload serves no criterion binding and the evidence refs do not identify one kind"
+                }
+                unavailable.add("binding")
+            }
+        }
+
+        var verdict = "unavailable"
+        var verdictReason: String? = null
+        val servedVerdict = normalizeVerdict(criterion?.verdict)
+        if (servedVerdict != null) {
+            verdict = servedVerdict
+        } else if (criterion == null) {
+            verdictReason = "no durable verification record was served for this criterion"
+            unavailable.add("verdict")
+        } else if (criterion.passed) {
+            verdict = "pass"
+        } else {
+            verdict = "fail"
+            verdictReason =
+                "recorded as not passed; this payload serves no three-way verdict, so failed and unavailable cannot be distinguished here"
+        }
+
+        val snapshot = snapshotText(record)
+        if (snapshot == null) unavailable.add("snapshots")
+        val timestamp = timestampText(record)
+        if (timestamp == null) unavailable.add("verification timestamp")
+
+        return CriterionProofRow(
+            criterionKey = criterionKey,
+            requirement = requirement ?: REQUIREMENT_UNAVAILABLE,
+            origin = origin ?: ORIGIN_UNAVAILABLE,
+            bindingKind = bindingKind,
+            bindingSource = bindingSource,
+            bindingReference = bindingReference,
+            bindingDetail = bindingDetail,
+            verdict = verdict,
+            verdictReason = verdictReason,
+            evidenceRefs = refs,
+            snapshot = snapshot ?: SNAPSHOT_UNAVAILABLE,
+            verificationTimestamp = timestamp ?: TIMESTAMP_UNAVAILABLE,
+            recordId = record?.recordId,
+            recordStatus = record?.status,
+            unavailable = unavailable
+        )
+    }
+
+    /** Normalize the daemon's three-way verdict spellings (never a guess). */
+    private fun normalizeVerdict(raw: String?): String? = when (raw) {
+        "pass", "passed" -> "pass"
+        "fail", "failed" -> "fail"
+        "unavailable" -> "unavailable"
+        else -> null
+    }
+
+    /** The exact typed reference of a served binding (mirrors the cockpit). */
+    private fun bindingReferenceOf(binding: NativeCriterionBinding): String? =
+        when (binding.kind) {
+            "required_check" -> binding.checkId?.let { check ->
+                "check:" + check + (binding.commandDigest?.let { ":" + it } ?: "")
+            }
+            "integration_coverage" ->
+                if (binding.requiredWorkItems.isEmpty()) {
+                    null
+                } else {
+                    binding.requiredWorkItems.joinToString(", ") { "work-item:" + it }
+                }
+            "file_state" -> binding.path
+            "evidence" -> binding.evidenceId?.let { "evidence:" + it }
+            "independent_review" -> binding.reviewerId
+            else -> null
+        }
+
+    /** The human detail of a served binding (never synthesizes a member). */
+    private fun bindingDetailOf(binding: NativeCriterionBinding): String? =
+        when (binding.kind) {
+            "required_check" -> binding.checkId?.let { check ->
+                "check " + check +
+                    (binding.commandDigest?.let { " · command digest " + it } ?: "")
+            }
+            "integration_coverage" -> if (binding.requiredWorkItems.isEmpty()) {
+                null
+            } else {
+                binding.requiredWorkItems.size.toString() + " required work item(s)"
+            }
+            "file_state" -> binding.expectedDigest?.let { "expected digest " + it }
+                ?: binding.path?.let { "path " + it }
+            "evidence" -> binding.evidenceDigest?.let { "evidence digest " + it }
+                ?: binding.evidenceId?.let { "evidence " + it }
+            "independent_review" -> binding.reviewerId?.let { "reviewer " + it }
+            "aggregate_goal" -> "all subordinate criteria + the independent final review"
+            "unavailable" -> binding.reason ?: "the served binding is explicitly unavailable"
+            else -> binding.kind
+        }
+
+    /** The served proof snapshots; null only when the record carries none. */
+    private fun snapshotText(record: NativeVerificationRecord?): String? {
+        if (record == null) return null
+        val proof = record.candidateProof
+        val bits = ArrayList<String>()
+        proof?.candidateSnapshot?.let { bits.add("cand " + digestLabel(it)) }
+        record.verifiedSnapshot?.let { bits.add("ver " + digestLabel(it)) }
+        record.basedOnSnapshot?.let { bits.add("base " + digestLabel(it)) }
+        record.landedSnapshot?.let { bits.add("land " + digestLabel(it)) }
+        record.sourceCount?.let { bits.add("src " + it) }
+        return if (bits.isEmpty()) null else bits.joinToString(" · ")
+    }
+
+    /** The served verification timestamps; null only when none is carried. */
+    private fun timestampText(record: NativeVerificationRecord?): String? {
+        if (record == null) return null
+        val bits = ArrayList<String>()
+        record.startedMs?.let { bits.add("started " + it + "ms") }
+        record.completedMs?.let { bits.add("completed " + it + "ms") }
+        return if (bits.isEmpty()) null else bits.joinToString(" · ")
+    }
+
+    /** Bounded digest label so the proof facts survive the panel clamp. */
+    private fun digestLabel(digest: String): String =
+        if (digest.length <= 16) digest else digest.substring(0, 12) + "..."
+
+    /** Split the record's evidence string into its typed refs (bounded). */
+    private fun evidenceRefs(raw: String?): List<EvidenceRef> {
+        if (raw == null || raw.trim().isEmpty()) return emptyList()
+        val out = ArrayList<EvidenceRef>()
+        val seen = HashSet<String>()
+        for (segment in raw.split(";")) {
+            val trimmed = segment.trim()
+            if (trimmed.isEmpty() || out.size >= MAX_TREE_EVIDENCE) continue
+            val ref = EvidenceRefs.parse(trimmed)
+            val dedupe = (ref.id?.toString() ?: "text") + ":" + ref.label
+            if (seen.add(dedupe)) out.add(ref)
+        }
+        return out
+    }
+
+    /** Read the binding kind from the criterion's TYPED evidence refs. */
+    private fun deriveBinding(rawRefs: List<String>): DerivedBinding? {
+        val refs = rawRefs.map { it.trim() }.filter { it.isNotEmpty() }
+        if (refs.isEmpty()) return null
+        if (refs.size == 1 && refs[0].startsWith("check:")) {
+            val rest = refs[0].substring("check:".length)
+            val cut = rest.lastIndexOf(':')
+            return if (cut > 0) {
+                DerivedBinding(
+                    "required_check",
+                    refs[0],
+                    "check " + rest.substring(0, cut) + " · command digest " + rest.substring(cut + 1)
+                )
+            } else {
+                DerivedBinding("required_check", refs[0], "check " + rest)
+            }
+        }
+        if (refs.size == 1 && refs[0].startsWith("file:")) {
+            return DerivedBinding(
+                "file_state",
+                refs[0],
+                "path " + refs[0].substring("file:".length)
+            )
+        }
+        if (refs.all { it.startsWith("work-item:") }) {
+            return DerivedBinding(
+                "integration_coverage",
+                refs.joinToString(", "),
+                refs.size.toString() + " work-item contribution(s)"
+            )
+        }
+        if (refs.size == 1 && EVIDENCE_ID_PATTERN.matches(refs[0])) {
+            return DerivedBinding(
+                "evidence",
+                refs[0],
+                "evidence " + refs[0].substring("evidence:".length)
+            )
+        }
+        return null
     }
 
     private fun evidence(

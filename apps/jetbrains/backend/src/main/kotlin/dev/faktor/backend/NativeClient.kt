@@ -37,6 +37,7 @@ import dev.faktor.shared.NativePermissionAck
 import dev.faktor.shared.NativePermissionEntry
 import dev.faktor.shared.NativePresentationAck
 import dev.faktor.shared.NativeProtocolException
+import dev.faktor.shared.NativeProviderInfo
 import dev.faktor.shared.NativeReady
 import dev.faktor.shared.NativeRequests
 import dev.faktor.shared.NativeSessionCreated
@@ -47,6 +48,10 @@ import dev.faktor.shared.NativeTaskRunCancelled
 import dev.faktor.shared.NativeTaskRunStarted
 import dev.faktor.shared.NativeTaskVerification
 import dev.faktor.shared.NativeTaskView
+import dev.faktor.shared.NativeTerminalEventPage
+import dev.faktor.shared.NativeTerminalOutput
+import dev.faktor.shared.NativeTerminalPage
+import dev.faktor.shared.NativeTerminalSpawned
 import dev.faktor.shared.NativeTournament
 import dev.faktor.shared.NativeTournamentDecision
 import dev.faktor.shared.NativeTournamentStarted
@@ -70,6 +75,7 @@ import dev.faktor.shared.parseNativePermissionList
 import dev.faktor.shared.parseNativePresentationAck
 import dev.faktor.shared.parseNativeProjection
 import dev.faktor.shared.parseNativePromptReceipt
+import dev.faktor.shared.parseNativeProviders
 import dev.faktor.shared.parseNativeReady
 import dev.faktor.shared.parseNativeSessionCreated
 import dev.faktor.shared.parseNativeSessionList
@@ -79,6 +85,10 @@ import dev.faktor.shared.parseNativeTaskRunStarted
 import dev.faktor.shared.parseNativeTaskRuns
 import dev.faktor.shared.parseNativeTaskVerification
 import dev.faktor.shared.parseNativeTaskViews
+import dev.faktor.shared.parseNativeTerminalEventPage
+import dev.faktor.shared.parseNativeTerminalOutput
+import dev.faktor.shared.parseNativeTerminalPage
+import dev.faktor.shared.parseNativeTerminalSpawned
 import dev.faktor.shared.parseNativeTournament
 import dev.faktor.shared.parseNativeTournamentDecision
 import dev.faktor.shared.parseNativeTournamentStarted
@@ -357,6 +367,59 @@ class NativeClient(
                 "POST", "/permission/reply", null,
                 NativeRequests.permissionReply(permissionId, decision)
             )
+        )
+
+    // ------------------------------------------------- provider registry (P0-64)
+
+    /** The registered provider instances with their known models. */
+    fun providers(): List<NativeProviderInfo> =
+        parseNativeProviders(request("GET", "/native/providers"))
+
+    // ---------------------------------------------------- terminals (P0-62)
+
+    /**
+     * The session-scoped terminal projection. Only terminals durably owned by
+     * [sessionId] appear; unowned legacy rows are counted in `unowned` and
+     * named in `note` instead of leaking into the view.
+     */
+    fun terminals(sessionId: String): NativeTerminalPage =
+        parseNativeTerminalPage(
+            request("GET", "/native/terminals", query("session" to sessionId))
+        )
+
+    /** One bounded page of the session's terminal lifetime events. */
+    fun terminalEvents(
+        sessionId: String,
+        after: Long? = null,
+        limit: Long? = null
+    ): NativeTerminalEventPage = parseNativeTerminalEventPage(
+        request(
+            "GET",
+            "/native/session/" + encode(sessionId) + "/terminal/events",
+            query("after" to after?.toString(), "limit" to limit?.toString())
+        )
+    )
+
+    /** Spawn one session-owned terminal; strict body, server owns the bounds. */
+    fun spawnTerminal(
+        sessionId: String,
+        command: String,
+        args: List<String>? = null,
+        cwd: String? = null,
+        rows: Long? = null,
+        cols: Long? = null
+    ): NativeTerminalSpawned = parseNativeTerminalSpawned(
+        request(
+            "POST", "/native/session/" + encode(sessionId) + "/terminal", null,
+            NativeRequests.spawnTerminal(command, args, cwd, rows, cols)
+        )
+    )
+
+    /** Snapshot available output of one PTY (does not drain the buffer). */
+    fun terminalOutput(ptyId: String): NativeTerminalOutput =
+        parseNativeTerminalOutput(
+            ptyId,
+            request("GET", "/pty/" + encode(ptyId) + "/output")
         )
 
     // --------------------------------------------------------------- agents

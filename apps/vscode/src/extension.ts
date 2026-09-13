@@ -802,12 +802,25 @@ function cockpitTaskVerificationView(view: NativeTaskVerification | null): Cockp
   }
   return {
     records: view.records.map((record) => ({
+      recordId: record.recordId,
       status: record.status,
+      startedMs: record.startedMs,
+      completedMs: record.completedMs,
+      treeHash: record.treeHash,
       criteria: record.criteria.map((criterion) => ({
         criterionKey: criterion.criterionKey,
         passed: criterion.passed,
         evidence: criterion.evidence,
+        requirement: criterion.requirement,
+        origin: criterion.origin,
+        verdict: criterion.verdict,
+        binding: criterion.binding,
       })),
+      candidateProof: record.candidateProof,
+      verifiedSnapshot: record.verifiedSnapshot,
+      basedOnSnapshot: record.basedOnSnapshot,
+      sourceCount: record.sourceCount,
+      landedSnapshot: record.landedSnapshot,
       checks: record.checks.map((check) => ({
         check: check.check,
         status: check.status,

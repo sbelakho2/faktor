@@ -8,9 +8,6 @@ package dev.faktor.frontend
 
 import dev.faktor.backend.BackendConnection
 import dev.faktor.backend.BackendProcessManager
-import dev.faktor.backend.assertEquals
-import dev.faktor.backend.assertTrue
-import dev.faktor.backend.fail
 import dev.faktor.backend.NativeClient
 import dev.faktor.shared.NativeApiException
 import dev.faktor.shared.NativeCompletionContract
@@ -98,6 +95,58 @@ private const val TASK_VERIFICATION_JSON = "{" +
     "\"changedFiles\":[{\"path\":\"a.rs\",\"digestHex\":\"aa\",\"size\":3}]," +
     "\"unrelatedChanges\":[],\"reviewer\":null,\"status\":\"passed\"," +
     "\"startedMs\":1,\"completedMs\":2}]}"
+
+// Criterion proof coverage: all SEVEN typed binding kinds served on the wire
+// (the typed binding object + origin/requirement + the three-way verdict)
+// plus a legacy unbound row, and the record-level P0 proof snapshots and
+// timestamps. The model renders the served members directly: no fallback
+// marker may appear for a member the wire carries.
+private const val CRITERION_PROOF_JSON = "{" +
+    "\"sessionId\":\"1\",\"taskId\":\"3\",\"records\":[{" +
+    "\"recordId\":\"r1\",\"revision\":\"rev\",\"workspaceId\":\"1\",\"worktreeId\":\"1\"," +
+    "\"treeHash\":null," +
+    "\"criteria\":[" +
+    "{\"criterionKey\":\"check criterion\",\"passed\":true," +
+    "\"evidence\":\"check:rust_check:digest-check\"," +
+    "\"binding\":{\"kind\":\"required_check\",\"check_id\":\"rust_check\"," +
+    "\"command_digest\":\"digest-check\"}," +
+    "\"origin\":\"user\",\"requirement\":\"required\",\"verdict\":\"pass\"}," +
+    "{\"criterionKey\":\"coverage criterion\",\"passed\":true,\"evidence\":null," +
+    "\"binding\":{\"kind\":\"integration_coverage\"," +
+    "\"required_work_items\":[\"impl-a\",\"impl-b\"]}," +
+    "\"origin\":\"project_policy\",\"requirement\":\"required\",\"verdict\":\"pass\"}," +
+    "{\"criterionKey\":\"file criterion\",\"passed\":true,\"evidence\":\"file:src/a.rs\"," +
+    "\"binding\":{\"kind\":\"file_state\",\"path\":\"src/a.rs\"," +
+    "\"expected_digest\":\"digest-file\"}," +
+    "\"origin\":\"verification_policy\",\"requirement\":\"required\",\"verdict\":\"pass\"}," +
+    "{\"criterionKey\":\"evidence criterion\",\"passed\":true,\"evidence\":\"evidence:41\"," +
+    "\"binding\":{\"kind\":\"evidence\",\"evidence_id\":\"41\"," +
+    "\"evidence_digest\":\"digest-evidence\"}," +
+    "\"origin\":\"user\",\"requirement\":\"required\",\"verdict\":\"pass\"}," +
+    "{\"criterionKey\":\"review criterion\",\"passed\":true,\"evidence\":null," +
+    "\"binding\":{\"kind\":\"independent_review\",\"reviewer_id\":\"reviewer-1\"}," +
+    "\"origin\":\"project_policy\",\"requirement\":\"preferred\",\"verdict\":\"pass\"}," +
+    "{\"criterionKey\":\"aggregate criterion\",\"passed\":true,\"evidence\":null," +
+    "\"binding\":{\"kind\":\"aggregate_goal\"}," +
+    "\"origin\":\"verification_policy\",\"requirement\":\"required\",\"verdict\":\"pass\"}," +
+    "{\"criterionKey\":\"unavailable criterion\",\"passed\":false,\"evidence\":null," +
+    "\"binding\":{\"kind\":\"unavailable\",\"reason\":\"no objective mechanism\"}," +
+    "\"origin\":\"semantic_provider\",\"requirement\":\"required\"," +
+    "\"verdict\":\"unavailable\"}," +
+    "{\"criterionKey\":\"legacy criterion\",\"passed\":true," +
+    "\"evidence\":\"file:src/legacy.rs\"}" +
+    "]," +
+    "\"checks\":[],\"changedFiles\":[],\"unrelatedChanges\":[],\"reviewer\":null," +
+    "\"status\":\"passed\",\"startedMs\":11,\"completedMs\":22," +
+    "\"candidateProof\":{\"taskRevision\":\"rev\",\"baseManifestHash\":\"base-manifest\"," +
+    "\"candidateManifestHash\":\"cand-manifest\",\"sourceDiffEvidence\":null," +
+    "\"riskReportEvidence\":null,\"accountingSnapshotDigest\":\"accounting:v1:feed\"," +
+    "\"runId\":\"run-proof\",\"runBaseSnapshot\":\"base-snap\"," +
+    "\"candidateSnapshot\":\"cand-snap\",\"sourcesDigest\":\"sources-digest\"," +
+    "\"changedFilesDigest\":\"changed-digest\"}," +
+    "\"verifiedSnapshot\":\"verified-snap\",\"basedOnSnapshot\":\"base-snap\"," +
+    "\"sourceCount\":3,\"landedSnapshot\":\"landed-snap\"" +
+    "}]}"
 
 private const val MODELS_JSON = "[" +
     "{\"provider\":\"fake\",\"model\":\"m\",\"context\":1000,\"maxOutput\":100," +
@@ -698,6 +747,178 @@ object FrontendSmoke {
             assertEquals("child-0", model.tournament?.winner)
             assertEquals(true, model.tournament?.candidates?.get(0)?.winner)
             assertEquals(false, model.tournament?.candidates?.get(1)?.winner)
+        }
+
+        step("acceptance-criterion proof rows render every wire-served fact") {
+            val task = parseNativeTaskViews(TASK_JSON)[0]
+            val verification = parseNativeTaskVerification(CRITERION_PROOF_JSON)
+            val record = verification.records[0]
+            // The record-level P0 proof payload is carried and parsed.
+            assertEquals(11L, record.startedMs)
+            assertEquals(22L, record.completedMs)
+            assertEquals(3L, record.sourceCount)
+            assertEquals("cand-snap", record.candidateProof?.candidateSnapshot)
+            assertEquals("run-proof", record.candidateProof?.runId)
+            assertEquals("verified-snap", record.verifiedSnapshot)
+            assertEquals("base-snap", record.basedOnSnapshot)
+            assertEquals("landed-snap", record.landedSnapshot)
+
+            val model = TaskTree.build(task = task, taskVerification = verification)
+            val byKey = model.criteriaProof.associateBy { it.criterionKey }
+
+            // All seven binding kinds render straight from the wire with the
+            // exact reference, served origin/requirement and three-way
+            // verdict — and every string-kind row carries NO fallback marker.
+            val served: List<Triple<String, String, String?>> = listOf(
+                Triple("check criterion", "required_check", "check:rust_check:digest-check"),
+                Triple("coverage criterion", "integration_coverage", "work-item:impl-a, work-item:impl-b"),
+                Triple("file criterion", "file_state", "src/a.rs"),
+                Triple("evidence criterion", "evidence", "evidence:41"),
+                Triple("review criterion", "independent_review", "reviewer-1"),
+                Triple("aggregate criterion", "aggregate_goal", null)
+            )
+            for ((key, kind, reference) in served) {
+                val row = byKey[key] ?: fail("$key must render a proof row")
+                assertEquals(kind, row.bindingKind, key)
+                assertEquals("daemon", row.bindingSource, key)
+                assertEquals(reference, row.bindingReference, key)
+                assertEquals("pass", row.verdict, key)
+                assertEquals(CriterionVerdictTone.PASS, row.tone, key)
+                assertTrue(!row.requirement.contains("unavailable"), "$key ${row.requirement}")
+                assertTrue(!row.origin.contains("unavailable"), "$key ${row.origin}")
+                assertTrue(!row.snapshot.contains("unavailable"), "$key ${row.snapshot}")
+                assertTrue(
+                    !row.verificationTimestamp.contains("unavailable"),
+                    "$key ${row.verificationTimestamp}"
+                )
+                assertTrue(row.unavailable.isEmpty(), "$key ${row.unavailable}")
+            }
+            assertEquals("required", byKey["check criterion"]?.requirement)
+            assertEquals("user", byKey["check criterion"]?.origin)
+            assertEquals("preferred", byKey["review criterion"]?.requirement)
+            assertEquals("project_policy", byKey["review criterion"]?.origin)
+            assertEquals("semantic_provider", byKey["unavailable criterion"]?.origin)
+            assertEquals(
+                "check rust_check · command digest digest-check",
+                byKey["check criterion"]?.bindingDetail
+            )
+            assertEquals("expected digest digest-file", byKey["file criterion"]?.bindingDetail)
+            assertEquals("reviewer reviewer-1", byKey["review criterion"]?.bindingDetail)
+            // The explicitly unavailable binding kind is wire truth: it
+            // renders as unavailable with the served reason, never a pass.
+            val unavailableRow = byKey["unavailable criterion"] ?: fail("unavailable criterion must render")
+            assertEquals("unavailable", unavailableRow.bindingKind)
+            assertEquals("unavailable", unavailableRow.verdict)
+            assertEquals(CriterionVerdictTone.UNAVAILABLE, unavailableRow.tone)
+            assertEquals("daemon", unavailableRow.bindingSource)
+            assertEquals("no objective mechanism", unavailableRow.bindingDetail)
+            assertTrue(!unavailableRow.snapshot.contains("unavailable"), unavailableRow.snapshot)
+            assertTrue(
+                !unavailableRow.verificationTimestamp.contains("unavailable"),
+                unavailableRow.verificationTimestamp
+            )
+            // A legacy unbound row (old daemon) still DERIVES its binding
+            // from typed evidence refs and stays honestly marked.
+            val legacy = byKey["legacy criterion"] ?: fail("legacy criterion must render")
+            assertEquals("file_state", legacy.bindingKind)
+            assertEquals("derived", legacy.bindingSource)
+            assertEquals("file:src/legacy.rs", legacy.bindingReference)
+            assertEquals("pass", legacy.verdict)
+            assertTrue(legacy.unavailable.isNotEmpty(), legacy.unavailable.toString())
+            // The explicit task criterion has no record verdict: unavailable,
+            // with the precise reason — never a fabricated pass.
+            val explicit = byKey["criterion A"] ?: fail("the explicit criterion must render a proof row")
+            assertEquals("unavailable", explicit.verdict)
+            assertEquals("unavailable", explicit.bindingKind)
+            assertEquals(CriterionVerdictTone.UNAVAILABLE, explicit.tone)
+            assertTrue(
+                explicit.verdictReason?.contains("no durable verification record") == true,
+                explicit.verdictReason
+            )
+            assertTrue(explicit.unavailable.contains("verdict"), explicit.unavailable.toString())
+            assertTrue(explicit.unavailable.contains("snapshots"), explicit.unavailable.toString())
+            // Record-derived rows carry their durable identity and the served
+            // proof snapshots/timestamps.
+            assertEquals("r1", byKey["check criterion"]?.recordId)
+            assertEquals("passed", byKey["check criterion"]?.recordStatus)
+            assertEquals(null, explicit.recordId)
+            assertTrue(
+                byKey["check criterion"]?.snapshot?.contains("cand cand-snap") == true,
+                byKey["check criterion"]?.snapshot
+            )
+            assertTrue(
+                byKey["check criterion"]?.snapshot?.contains("src 3") == true,
+                byKey["check criterion"]?.snapshot
+            )
+            assertTrue(
+                byKey["check criterion"]?.verificationTimestamp?.contains("started 11ms") == true,
+                byKey["check criterion"]?.verificationTimestamp
+            )
+            assertTrue(
+                byKey["check criterion"]?.verificationTimestamp?.contains("completed 22ms") == true,
+                byKey["check criterion"]?.verificationTimestamp
+            )
+            // Panel rendering: every served field survives into the label and
+            // the verdict tones are distinct (unavailable is never
+            // pass-styled).
+            val panel = TaskTreePanel()
+            panel.update(model)
+            val labels = panel.criterionLabels(model)
+            assertEquals(model.criteriaProof.size, labels.size)
+            assertTrue(
+                labels.any {
+                    it.startsWith("[pass] check criterion") &&
+                        it.contains("requirement required") &&
+                        it.contains("origin user") &&
+                        it.contains("binding required_check ref check:rust_check:digest-check")
+                },
+                labels.toString()
+            )
+            assertTrue(
+                labels.any {
+                    it.startsWith("[unavailable] unavailable criterion") &&
+                        !it.contains("unavailable:")
+                },
+                labels.toString()
+            )
+            assertTrue(
+                labels.any { it.startsWith("[unavailable] criterion A") },
+                labels.toString()
+            )
+            assertTrue(
+                panel.criterionColor(CriterionVerdictTone.PASS) !=
+                    panel.criterionColor(CriterionVerdictTone.FAIL),
+                "pass/fail tones must differ"
+            )
+            assertTrue(
+                panel.criterionColor(CriterionVerdictTone.PASS) !=
+                    panel.criterionColor(CriterionVerdictTone.UNAVAILABLE),
+                "pass/unavailable tones must differ"
+            )
+            assertTrue(
+                panel.criterionColor(CriterionVerdictTone.FAIL) !=
+                    panel.criterionColor(CriterionVerdictTone.UNAVAILABLE),
+                "fail/unavailable tones must differ"
+            )
+            // Typed retrieval: the criterion's evidence refs are selectable
+            // Evidence nodes (the existing navigator route retrieves id 41).
+            val evidence = byKey["evidence criterion"] ?: fail("evidence criterion must render")
+            assertEquals(1, evidence.evidenceRefs.size)
+            assertEquals(41L, evidence.evidenceRefs[0].id)
+            assertEquals("evidence:41", evidence.evidenceRefs[0].label)
+        }
+
+        step("a missing verification payload degrades every criterion to unavailable, never pass") {
+            val task = parseNativeTaskViews(TASK_JSON)[0]
+            val model = TaskTree.build(task = task)
+            assertTrue(model.criteriaProof.isNotEmpty(), "explicit criteria still render")
+            for (row in model.criteriaProof) {
+                assertEquals("unavailable", row.verdict)
+                assertEquals(CriterionVerdictTone.UNAVAILABLE, row.tone)
+                assertTrue(row.unavailable.contains("verdict"), row.unavailable.toString())
+                assertTrue(row.unavailable.contains("binding"), row.unavailable.toString())
+                assertTrue(row.verdictReason?.contains("no durable verification record") == true, row.verdictReason)
+            }
         }
 
         step("same model two providers: each child joins its OWN provider metadata") {

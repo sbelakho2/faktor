@@ -59,12 +59,23 @@
       var head = document.createElement('h3');
       head.textContent = section.title;
       block.appendChild(head);
-      var lines = Array.isArray(section.lines) ? section.lines : [];
-      for (var j = 0; j < lines.length; j++) {
-        if (section.key === 'evidence') {
-          renderEvidenceLine(block, section, lines[j], j);
-        } else {
-          line(block, lines[j], 'muted');
+      // The acceptance-criteria section renders one PROOF row per criterion
+      // when the host serves the structured rows; older snapshots fall back
+      // to the bounded lines (whose `[verdict]` prefix still styles).
+      var criteria = Array.isArray(section.criteria) ? section.criteria : [];
+      if (section.key === 'acceptance' && criteria.length > 0) {
+        for (var c = 0; c < criteria.length; c++) {
+          renderCriterionRow(block, criteria[c]);
+        }
+      } else {
+        var lines = Array.isArray(section.lines) ? section.lines : [];
+        for (var j = 0; j < lines.length; j++) {
+          if (section.key === 'evidence') {
+            renderEvidenceLine(block, section, lines[j], j);
+          } else {
+            var verdict = /^\[(pass|fail|unavailable)\]/.exec(String(lines[j]));
+            line(block, lines[j], verdict ? 'criterion-line criterion-line-' + verdict[1] : 'muted');
+          }
         }
       }
       // State-gated tournament controls: a disabled action is rendered
@@ -119,6 +130,116 @@
       row.appendChild(button);
     }
     block.appendChild(row);
+  }
+
+  /**
+   * One acceptance-criterion PROOF row: verdict (pass/fail/unavailable,
+   * each with a distinct class), requirement/origin/binding with its exact
+   * reference, the proven snapshots and verification timestamps, and the
+   * typed evidence refs (numeric ids retrieve on click). Missing proof
+   * members render as explicit "unavailable" text — never as a pass.
+   */
+  function renderCriterionRow(block, row) {
+    var value = row || {};
+    var verdict = value.verdict === 'pass' || value.verdict === 'fail' ? value.verdict : 'unavailable';
+    var card = document.createElement('div');
+    card.className = 'criterion criterion-' + verdict;
+    card.setAttribute('data-verdict', verdict);
+    if (typeof value.binding === 'string') {
+      card.setAttribute('data-binding', value.binding);
+    }
+    var head = document.createElement('div');
+    head.className = 'criterion-head';
+    var badge = document.createElement('span');
+    badge.className = 'criterion-verdict criterion-verdict-' + verdict;
+    badge.textContent =
+      verdict === 'pass' ? 'PASS' : verdict === 'fail' ? 'FAIL' : 'UNAVAILABLE';
+    head.appendChild(badge);
+    var key = document.createElement('span');
+    key.className = 'criterion-key';
+    key.textContent =
+      typeof value.criterionKey === 'string' && value.criterionKey.length > 0
+        ? value.criterionKey
+        : '(unnamed criterion — malformed row)';
+    head.appendChild(key);
+    card.appendChild(head);
+
+    var binding = String(value.binding || 'unavailable');
+    if (value.bindingSource && value.bindingSource !== 'daemon') {
+      binding += ' (' + String(value.bindingSource) + ')';
+    }
+    if (value.bindingReference) {
+      binding += ' ref ' + String(value.bindingReference);
+    }
+    line(
+      card,
+      'requirement ' + String(value.requirement || 'unavailable') +
+        ' · origin ' + String(value.origin || 'unavailable') +
+        ' · binding ' + binding,
+      'muted criterion-meta',
+    );
+    if (value.bindingDetail) {
+      line(card, String(value.bindingDetail), 'muted');
+    }
+
+    var snapshot = value.snapshot || {};
+    var snapshotBits = [
+      snapshot.candidate ? 'candidate ' + String(snapshot.candidate) : null,
+      snapshot.verified ? 'verified ' + String(snapshot.verified) : null,
+      snapshot.basedOn ? 'basedOn ' + String(snapshot.basedOn) : null,
+      snapshot.landed ? 'landed ' + String(snapshot.landed) : null,
+      typeof snapshot.sourceCount === 'number' ? 'sources ' + snapshot.sourceCount : null,
+    ].filter(function (bit) {
+      return bit !== null;
+    });
+    line(
+      card,
+      snapshotBits.length > 0 ? 'snapshot ' + snapshotBits.join(' · ') : 'snapshot unavailable',
+      'muted criterion-snapshot',
+    );
+
+    var timestamp = value.timestamp || {};
+    var atBits = [];
+    if (typeof timestamp.startedMs === 'number') {
+      atBits.push('started ' + new Date(timestamp.startedMs).toISOString());
+    }
+    if (typeof timestamp.completedMs === 'number') {
+      atBits.push('completed ' + new Date(timestamp.completedMs).toISOString());
+    }
+    line(
+      card,
+      atBits.length > 0 ? 'verified at ' + atBits.join(' ') : 'verification timestamp unavailable',
+      'muted criterion-timestamp',
+    );
+
+    var refs = Array.isArray(value.evidenceRefs) ? value.evidenceRefs : [];
+    for (var r = 0; r < refs.length; r++) {
+      var ref = refs[r] || {};
+      var refRow = document.createElement('div');
+      refRow.className = 'evidence criterion-evidence';
+      var span = document.createElement('span');
+      span.className = 'muted';
+      span.textContent = ref.label === undefined || ref.label === null ? '' : String(ref.label);
+      refRow.appendChild(span);
+      if (typeof ref.id === 'number' && isFinite(ref.id)) {
+        var id = ref.id;
+        refRow.setAttribute('data-evidence', String(id));
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = 'View evidence #' + id;
+        button.addEventListener('click', function () {
+          vscode.postMessage({ type: 'retrieveEvidence', evidenceId: id });
+        });
+        refRow.appendChild(button);
+      }
+      card.appendChild(refRow);
+    }
+
+    var unavailable = Array.isArray(value.unavailable) ? value.unavailable : [];
+    if (unavailable.length > 0) {
+      line(card, 'unavailable: ' + unavailable.join(', '), 'warn criterion-unavailable');
+    }
+    block.appendChild(card);
   }
 
   function renderTask(task, view) {

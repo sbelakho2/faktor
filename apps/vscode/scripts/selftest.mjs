@@ -2645,6 +2645,445 @@ async function cockpitTests() {
   });
 }
 
+// ------------------------------------------- acceptance-criterion proof
+
+function proofDigest(seed) {
+  return String(seed).repeat(64).slice(0, 64);
+}
+
+function proofRecordJson(overrides = {}) {
+  return {
+    recordId: 'rec-proof',
+    revision: 'rev-9',
+    workspaceId: '1',
+    worktreeId: '1',
+    treeHash: proofDigest('f'),
+    criteria: [],
+    checks: [],
+    changedFiles: [],
+    unrelatedChanges: [],
+    reviewer: null,
+    status: 'passed',
+    startedMs: 1700000000000,
+    completedMs: 1700000002000,
+    candidateProof: {
+      taskRevision: 'rev-9',
+      baseManifestHash: proofDigest('a'),
+      candidateManifestHash: proofDigest('b'),
+      sourceDiffEvidence: 'evidence:7',
+      riskReportEvidence: null,
+      accountingSnapshotDigest: 'accounting:v1:feedface',
+      runId: 'run-proof',
+      runBaseSnapshot: proofDigest('1'),
+      candidateSnapshot: proofDigest('2'),
+      sourcesDigest: proofDigest('3'),
+      changedFilesDigest: proofDigest('4'),
+    },
+    verifiedSnapshot: proofDigest('2'),
+    basedOnSnapshot: proofDigest('1'),
+    sourceCount: 3,
+    landedSnapshot: proofDigest('5'),
+    ...overrides,
+  };
+}
+
+function proofTask(acceptanceCriteria = []) {
+  return {
+    goal: 'prove the criteria',
+    state: 'verifying',
+    completed: [],
+    open: [],
+    testsRun: [],
+    testsFailed: [],
+    changedFiles: [],
+    budget: null,
+    acceptanceCriteria,
+    plan: [],
+    blockers: [],
+    evidenceRefs: [],
+    phase: null,
+    progress: null,
+    completion: null,
+  };
+}
+
+function proofCockpit(taskVerification, acceptanceCriteria = []) {
+  return cp.buildCockpit({
+    task: proofTask(acceptanceCriteria),
+    agents: [],
+    verification: null,
+    usage: null,
+    taskVerification,
+  });
+}
+
+const BINDING_JSON = {
+  required_check: { kind: 'required_check', check_id: 'rust_check', command_digest: 'digest-check' },
+  integration_coverage: {
+    kind: 'integration_coverage',
+    required_work_items: ['impl-a', 'impl-b'],
+  },
+  file_state: { kind: 'file_state', path: 'src/a.rs', expected_digest: 'digest-file' },
+  evidence: { kind: 'evidence', evidence_id: '41', evidence_digest: 'digest-evidence' },
+  independent_review: { kind: 'independent_review', reviewer_id: 'reviewer-1' },
+  aggregate_goal: { kind: 'aggregate_goal' },
+  unavailable: { kind: 'unavailable', reason: 'no objective mechanism' },
+};
+
+async function acceptanceProofTests() {
+  await test('native client parses the additive proof payload and degrades hostile annotations', () => {
+    const record = proofRecordJson({
+      criteria: [
+        {
+          criterionKey: 'c1',
+          passed: true,
+          evidence: 'evidence:41',
+          requirement: 'required',
+          origin: 'user',
+          verdict: 'passed',
+          binding: BINDING_JSON.required_check,
+        },
+      ],
+    });
+    const view = nc.validateTaskVerification({ sessionId: '7', taskId: '3', records: [record] });
+    const parsed = view.records[0];
+    assertEqual(parsed.candidateProof.runId, 'run-proof');
+    assertEqual(parsed.candidateProof.candidateSnapshot, proofDigest('2'));
+    assertEqual(parsed.verifiedSnapshot, proofDigest('2'));
+    assertEqual(parsed.basedOnSnapshot, proofDigest('1'));
+    assertEqual(parsed.sourceCount, 3);
+    assertEqual(parsed.landedSnapshot, proofDigest('5'));
+    assertEqual(parsed.criteria[0].binding.kind, 'required_check');
+    assertEqual(parsed.criteria[0].binding.checkId, 'rust_check');
+    assertEqual(parsed.criteria[0].binding.commandDigest, 'digest-check');
+    assertEqual(parsed.criteria[0].requirement, 'required');
+    assertEqual(parsed.criteria[0].origin, 'user');
+    assertEqual(parsed.criteria[0].verdict, 'passed');
+    // The committed daemon shape (proof keys present, nulls) parses too.
+    const committed = nc.validateTaskVerification({
+      sessionId: '7',
+      taskId: '3',
+      records: [
+        proofRecordJson({
+          candidateProof: null,
+          verifiedSnapshot: null,
+          basedOnSnapshot: null,
+          sourceCount: null,
+          landedSnapshot: null,
+        }),
+      ],
+    }).records[0];
+    assertEqual(committed.candidateProof, null);
+    assertEqual(committed.verifiedSnapshot, null);
+    // A daemon predating the proof payload is tolerated (absent = null).
+    const old = nc.validateTaskVerification({
+      sessionId: '7',
+      taskId: '3',
+      records: [
+        {
+          ...proofRecordJson(),
+          candidateProof: undefined,
+          verifiedSnapshot: undefined,
+          basedOnSnapshot: undefined,
+          sourceCount: undefined,
+          landedSnapshot: undefined,
+          criteria: [{ criterionKey: 'legacy', passed: true, evidence: null }],
+        },
+      ],
+    }).records[0];
+    assertEqual(old.verifiedSnapshot, null);
+    assertEqual(old.criteria[0].binding, null);
+    // Hostile annotations degrade per row: wrong types never throw and never pass.
+    const hostile = nc.validateTaskVerification({
+      sessionId: '7',
+      taskId: '3',
+      records: [
+        proofRecordJson({
+          candidateProof: 'not-an-object',
+          verifiedSnapshot: 42,
+          sourceCount: 'three',
+          criteria: [{}, { criterionKey: 7, passed: 'yes' }, { criterionKey: 'ok', passed: false }],
+        }),
+      ],
+    }).records[0];
+    assertEqual(hostile.candidateProof, null);
+    assertEqual(hostile.verifiedSnapshot, null);
+    assertEqual(hostile.sourceCount, null);
+    assertEqual(hostile.criteria[0].criterionKey, '');
+    assertEqual(hostile.criteria[0].passed, null);
+    assertEqual(hostile.criteria[1].passed, null);
+    assertEqual(hostile.criteria[2].passed, false);
+  });
+
+  await test('every binding kind renders per criterion with its exact reference', () => {
+    const kinds = Object.keys(BINDING_JSON);
+    const record = proofRecordJson({
+      criteria: [
+        {
+          criterionKey: 'check criterion',
+          passed: true,
+          evidence: 'check:rust_check:digest-check',
+          requirement: 'required',
+          origin: 'project_policy',
+          verdict: 'passed',
+          binding: BINDING_JSON.required_check,
+        },
+        {
+          criterionKey: 'coverage criterion',
+          passed: true,
+          evidence: null,
+          requirement: 'required',
+          origin: 'user',
+          binding: BINDING_JSON.integration_coverage,
+        },
+        {
+          criterionKey: 'file criterion',
+          passed: false,
+          evidence: 'file:src/a.rs',
+          requirement: 'required',
+          origin: 'verification_policy',
+          verdict: 'failed',
+          binding: BINDING_JSON.file_state,
+        },
+        {
+          criterionKey: 'evidence criterion',
+          passed: true,
+          evidence: 'evidence:41',
+          requirement: 'required',
+          origin: 'user',
+          binding: BINDING_JSON.evidence,
+        },
+        {
+          criterionKey: 'review criterion',
+          passed: null,
+          evidence: null,
+          requirement: 'preferred',
+          origin: 'semantic_provider',
+          verdict: 'unavailable',
+          binding: BINDING_JSON.independent_review,
+        },
+        {
+          criterionKey: 'goal criterion',
+          passed: true,
+          evidence: null,
+          requirement: 'required',
+          origin: 'user',
+          binding: BINDING_JSON.aggregate_goal,
+        },
+        {
+          criterionKey: 'unavailable criterion',
+          passed: false,
+          evidence: null,
+          requirement: 'required',
+          origin: 'user',
+          verdict: 'unavailable',
+          binding: BINDING_JSON.unavailable,
+        },
+      ],
+    });
+    const view = nc.validateTaskVerification({ sessionId: '7', taskId: '3', records: [record] });
+    const cockpit = proofCockpit(view);
+    assertEqual(cockpit.criteriaProof.length, 7);
+    assertDeepEqual(cockpit.criteriaProof.map((row) => row.binding), kinds);
+    assert(
+      cockpit.criteriaProof.every((row) => row.bindingSource === 'daemon'),
+      'served bindings win',
+    );
+    assertEqual(cockpit.criteriaProof[0].bindingReference, 'check:rust_check:digest-check');
+    assertEqual(cockpit.criteriaProof[1].bindingReference, 'work-item:impl-a, work-item:impl-b');
+    assertEqual(cockpit.criteriaProof[2].bindingReference, 'src/a.rs');
+    assertEqual(cockpit.criteriaProof[3].bindingReference, 'evidence:41');
+    assertEqual(cockpit.criteriaProof[4].bindingReference, 'reviewer-1');
+    assertEqual(cockpit.criteriaProof[5].bindingReference, null);
+    assertDeepEqual(
+      cockpit.criteriaProof.map((row) => row.verdict),
+      ['pass', 'pass', 'fail', 'pass', 'unavailable', 'pass', 'unavailable'],
+    );
+    assertDeepEqual(
+      cockpit.criteriaProof.map((row) => row.requirement),
+      ['required', 'required', 'required', 'required', 'preferred', 'required', 'required'],
+    );
+    assertDeepEqual(
+      cockpit.criteriaProof.map((row) => row.origin),
+      ['project_policy', 'user', 'verification_policy', 'user', 'semantic_provider', 'user', 'user'],
+    );
+    const section = cp.cockpitSections(cockpit).find((entry) => entry.key === 'acceptance');
+    assertEqual(section.criteria.length, 7);
+    assert(section.lines[0].startsWith('[pass] check criterion'), section.lines[0]);
+    assert(
+      section.lines.some((line) => line.startsWith('[fail] file criterion')),
+      JSON.stringify(section.lines),
+    );
+    assert(
+      section.lines.some((line) => line.startsWith('[unavailable] review criterion')),
+      JSON.stringify(section.lines),
+    );
+    assert(
+      section.lines[0].includes('binding required_check ref check:rust_check:digest-check'),
+      section.lines[0],
+    );
+  });
+
+  await test('binding kinds are derived from typed evidence refs only when unambiguous', () => {
+    const record = proofRecordJson({
+      criteria: [
+        { criterionKey: 'd-check', passed: true, evidence: 'check:rust_check:digest-check' },
+        { criterionKey: 'd-file', passed: true, evidence: 'file:src/a.rs' },
+        { criterionKey: 'd-evidence', passed: true, evidence: 'evidence:42' },
+        {
+          criterionKey: 'd-coverage',
+          passed: true,
+          evidence: 'work-item:impl-a:digest-a ; work-item:impl-b:digest-b',
+        },
+        { criterionKey: 'd-mixed', passed: true, evidence: 'check:rust_check:digest-check ; file:src/a.rs' },
+        { criterionKey: 'd-none', passed: false, evidence: 'the reviewer refused to certify' },
+      ],
+    });
+    const view = nc.validateTaskVerification({ sessionId: '7', taskId: '3', records: [record] });
+    const rows = proofCockpit(view).criteriaProof;
+    assertDeepEqual(
+      rows.slice(0, 4).map((row) => row.binding),
+      ['required_check', 'file_state', 'evidence', 'integration_coverage'],
+    );
+    assert(
+      rows.slice(0, 4).every((row) => row.bindingSource === 'derived'),
+      'derived provenance is explicit',
+    );
+    assertEqual(rows[0].bindingReference, 'check:rust_check:digest-check');
+    assertEqual(rows[1].bindingReference, 'file:src/a.rs');
+    assertEqual(rows[2].bindingReference, 'evidence:42');
+    assertEqual(rows[3].bindingReference, 'work-item:impl-a:digest-a, work-item:impl-b:digest-b');
+    // Mixed kinds are never guessed (an aggregate would look mixed).
+    assertEqual(rows[4].binding, 'unavailable');
+    assertEqual(rows[4].bindingSource, 'unavailable');
+    // A prose evidence string with no typed ref identifies no binding.
+    assertEqual(rows[5].binding, 'unavailable');
+    assert(rows[5].verdict === 'fail', 'a recorded false is a fail, never a pass');
+  });
+
+  await test('missing and hostile proof payloads degrade to honest unavailable rows', () => {
+    // No verification record at all: every explicit criterion is unavailable.
+    const bare = proofCockpit(null, ['first criterion', 'second criterion']);
+    assertEqual(bare.criteriaProof.length, 2);
+    assert(
+      bare.criteriaProof.every((row) => row.verdict === 'unavailable'),
+      'no record => no pass',
+    );
+    assert(bare.criteriaProof.every((row) => row.binding === 'unavailable'));
+    assert(bare.criteriaProof.every((row) => row.unavailable.includes('binding')));
+    assert(bare.criteriaProof.every((row) => row.unavailable.includes('verification timestamp')));
+    // A hostile record: malformed rows never throw and never pass.
+    const hostile = proofCockpit({
+      records: [
+        {
+          recordId: 'r',
+          status: 'passed',
+          startedMs: 1,
+          completedMs: 2,
+          criteria: [{}, { criterionKey: 'x', passed: 'yes' }, { criterionKey: 'y', passed: false }],
+          checks: [],
+        },
+      ],
+    });
+    assert(
+      hostile.criteriaProof.every((row) => row.verdict !== 'pass'),
+      'hostile rows never fake a pass',
+    );
+    assertEqual(hostile.criteriaProof[0].criterionKey, '');
+    assertEqual(hostile.criteriaProof[1].verdict, 'unavailable');
+    assertEqual(hostile.criteriaProof[2].verdict, 'fail');
+    assert(
+      String(hostile.criteriaProof[2].verdictReason).includes('cannot be distinguished'),
+      hostile.criteriaProof[2].verdictReason,
+    );
+    // An unrecognized explicit verdict annotation does not override a
+    // recorded pass fact (the recorded boolean is the served proof).
+    const unknownVerdict = proofCockpit({
+      records: [
+        {
+          recordId: 'r',
+          status: 'passed',
+          startedMs: 1,
+          completedMs: 2,
+          criteria: [{ criterionKey: 'z', passed: true, verdict: 'probably-fine' }],
+          checks: [],
+        },
+      ],
+    });
+    assertEqual(unknownVerdict.criteriaProof[0].verdict, 'pass');
+  });
+
+  await test('proof rows carry the proven snapshots and verification timestamps', () => {
+    const view = nc.validateTaskVerification({
+      sessionId: '7',
+      taskId: '3',
+      records: [proofRecordJson({ criteria: [{ criterionKey: 'snap', passed: true, evidence: 'check:c:1' }] })],
+    });
+    const cockpit = proofCockpit(view);
+    const row = cockpit.criteriaProof[0];
+    assertEqual(row.snapshot.candidate, proofDigest('2'));
+    assertEqual(row.snapshot.verified, proofDigest('2'));
+    assertEqual(row.snapshot.basedOn, proofDigest('1'));
+    assertEqual(row.snapshot.landed, proofDigest('5'));
+    assertEqual(row.snapshot.sourceCount, 3);
+    assertEqual(row.snapshot.runId, 'run-proof');
+    assertEqual(row.timestamp.startedMs, 1700000000000);
+    assertEqual(row.timestamp.completedMs, 1700000002000);
+    assertEqual(row.recordId, 'rec-proof');
+    const section = cp.cockpitSections(cockpit).find((entry) => entry.key === 'acceptance');
+    assert(section.lines[0].includes('cand '), section.lines[0]);
+    assert(section.lines[0].includes('ver '), section.lines[0]);
+    assert(section.lines[0].includes('base '), section.lines[0]);
+    assert(section.lines[0].includes('land '), section.lines[0]);
+    assert(section.lines[0].includes('src 3'), section.lines[0]);
+    assert(section.lines[0].includes('2023-11-14T22:13:20Z'), section.lines[0]);
+  });
+
+  await test('fallback webview renders distinct pass/fail/unavailable proof rows with retrieval', () => {
+    const record = proofRecordJson({
+      criteria: [
+        { criterionKey: 'passes', passed: true, evidence: 'check:rust_check:digest-check' },
+        { criterionKey: 'fails', passed: false, evidence: 'check:rust_check:digest-check' },
+        { criterionKey: 'unknown', passed: null, evidence: 'the reviewer was unavailable' },
+        { criterionKey: 'certified', passed: true, evidence: 'evidence:42 tool output' },
+      ],
+    });
+    const view = nc.validateTaskVerification({ sessionId: '7', taskId: '3', records: [record] });
+    const cockpit = proofCockpit(view);
+    const snapshot = webviewSnapshot([]);
+    snapshot.cockpit = cockpit;
+    snapshot.cockpitSections = cp.cockpitSections(cockpit);
+    const { posted, dom } = runChatWebview(snapshot);
+    const cockpitNode = dom.document.getElementById('cockpit');
+    const rowFor = (verdict) =>
+      findFake(cockpitNode, (node) => node.getAttribute('data-verdict') === verdict);
+    const passRow = rowFor('pass');
+    const failRow = rowFor('fail');
+    const unavailableRow = rowFor('unavailable');
+    assert(passRow && failRow && unavailableRow, 'all three verdict rows must render');
+    assert(passRow !== failRow && failRow !== unavailableRow, 'verdict states are distinct rows');
+    assert(String(passRow.className).includes('criterion-pass'), passRow.className);
+    assert(String(failRow.className).includes('criterion-fail'), failRow.className);
+    assert(String(unavailableRow.className).includes('criterion-unavailable'), unavailableRow.className);
+    const passText = fakeText(passRow);
+    assert(passText.includes('binding required_check (derived)'), passText);
+    assert(passText.includes('snapshot candidate'), passText);
+    assert(passText.includes('verified at'), passText);
+    const unavailableText = fakeText(unavailableRow);
+    assert(unavailableText.includes('UNAVAILABLE'), unavailableText);
+    assert(unavailableText.includes('unavailable: requirement'), unavailableText);
+    // The typed evidence ref stays clickable (retrieval goes to the host).
+    const certified = findFake(cockpitNode, (node) => fakeText(node).includes('certified'));
+    const button = findFake(
+      certified,
+      (node) => node.tagName === 'button' && node.textContent === 'View evidence #42',
+    );
+    assert(button, 'an evidence:<n> ref must render a retrieval button');
+    button.click();
+    assertDeepEqual(posted[posted.length - 1], { type: 'retrieveEvidence', evidenceId: 42 });
+  });
+}
+
 // ----------------------------------------- presentation webview (fake DOM)
 
 function makeFakeDom() {
@@ -2731,6 +3170,17 @@ function findFake(root, predicate) {
     }
   });
   return found;
+}
+
+/** Concatenated text of a fake-DOM subtree (assertions only). */
+function fakeText(root) {
+  let out = '';
+  walkFake(root, (node) => {
+    if (node.textContent) {
+      out += `${node.textContent} `;
+    }
+  });
+  return out;
 }
 
 function webviewSnapshot(agents) {
@@ -3494,6 +3944,62 @@ async function companionPanelTests() {
     const abort = findAll(panel, (node) => node.tagName === 'button' && node.textContent === 'Abort', walk)[0];
     assert(abort && abort.disabled === true, 'abort must be disabled on a terminal tournament');
 
+    // Acceptance-criterion proof: the bridge forwards cockpit lines only, so
+    // each `[verdict]`-led line renders as a distinct proof row and every
+    // evidence:<n> token stays a typed retrieval button. Unavailable never
+    // shares the pass styling.
+    companion.handle({
+      type: 'faktorCockpit',
+      present: true,
+      sections: [
+        {
+          key: 'acceptance',
+          title: 'Acceptance criteria · proof',
+          present: true,
+          lines: [
+            '[pass] build passes · requirement required · origin user · binding required_check ref check:rust_check:digest-check · snapshot verified 22ab · verified at completed 2023-11-14T22:13:22.000Z',
+            '[fail] tests pass · requirement required · origin user · binding required_check (derived) ref check:rust_check:digest-check · snapshot unavailable · verification timestamp unavailable',
+            '[unavailable] review · requirement unavailable · origin unavailable · binding unavailable · evidence evidence:42',
+          ],
+          evidence: [],
+          actions: [],
+        },
+      ],
+    });
+    const proofRows = findAll(
+      panel,
+      (node) => node.getAttribute && node.getAttribute('data-verdict') !== null,
+      walk,
+    );
+    assertEqual(proofRows.length, 3, 'one proof row per criterion line');
+    const rowText = (row) =>
+      findAll(row, (node) => true, walk)
+        .map((node) => node.textContent)
+        .join(' ');
+    const passProof = proofRows.find((row) => row.getAttribute('data-verdict') === 'pass');
+    const failProof = proofRows.find((row) => row.getAttribute('data-verdict') === 'fail');
+    const unavailableProof = proofRows.find(
+      (row) => row.getAttribute('data-verdict') === 'unavailable',
+    );
+    assert(passProof && failProof && unavailableProof, 'pass/fail/unavailable are distinct rows');
+    assert(String(passProof.className).includes('faktor-criterion-pass'), passProof.className);
+    assert(String(failProof.className).includes('faktor-criterion-fail'), failProof.className);
+    assert(
+      String(unavailableProof.className).includes('faktor-criterion-unavailable'),
+      unavailableProof.className,
+    );
+    assert(rowText(unavailableProof).includes('UNAVAILABLE'), rowText(unavailableProof));
+    assert(rowText(passProof).includes('binding required_check'), rowText(passProof));
+    assert(rowText(passProof).includes('2023-11-14T22:13:22.000Z'), rowText(passProof));
+    const proofEvidence = findAll(
+      unavailableProof,
+      (node) => node.tagName === 'button' && node.textContent === 'evidence:42',
+      walk,
+    )[0];
+    assert(proofEvidence, 'a criterion evidence ref must render a retrieval button');
+    proofEvidence.click();
+    assertDeepEqual(posted[posted.length - 1], { type: 'faktorEvidenceExpand', evidenceId: 42 });
+
     // Evidence: refs open an expansion; the expansion renders as text.
     companion.handle({ type: 'faktorEvidence', mode: 'refs', refs: [{ id: 41, label: 'evidence:41' }] });
     const ref = findAll(panel, (node) => node.tagName === 'button' && node.textContent === 'evidence:41', walk)[0];
@@ -3583,6 +4089,7 @@ async function main() {
   await childInspectionTests();
   await pixelAgentTests();
   await cockpitTests();
+  await acceptanceProofTests();
   await presentationWebviewTests();
   await tournamentWebviewTests();
   await reducedMotionTests();

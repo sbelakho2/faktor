@@ -9,13 +9,13 @@
   "files": [
     {
       "path": "faktor-companion.js",
-      "sha256": "b87b4fe4cbcbe80d41e07cc138fb33bb0086f91a27b8a9b7a143deb4936aa146",
-      "size": 24998
+      "sha256": "ca8cc8a223d4cb07a6483113b566113ec1bd0f961afba4715031d323faced0c1",
+      "size": 26811
     },
     {
       "path": "faktor-companion.css",
-      "sha256": "6cc357db0cc405790d201aa32bfda7cd01280eb685cf47d9dcd752a5e89f255a",
-      "size": 7070
+      "sha256": "d757f49322af3aeb3710d90c88f97f4e3fb7e020680d7ec0e39ff1340c1c1b3a",
+      "size": 8330
     }
   ]
 }

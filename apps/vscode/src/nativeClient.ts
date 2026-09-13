@@ -223,6 +223,62 @@ function fObjectArray(object: JsonObject, key: string, path: string): JsonObject
   );
 }
 
+// ------------------------------------------------ tolerant proof annotations
+//
+// The acceptance-criteria proof annotations (binding/origin/requirement/
+// verdict, candidate-proof snapshots) are ADDITIVE display metadata. A
+// hostile, missing or wrong-typed annotation degrades to an explicit null so
+// the row renders "unavailable" — it must never throw away the record, and
+// it must never be coerced into a pass. The verdict-bearing `passed` member
+// is the one exception that keeps a strict boolean, except that a missing or
+// non-boolean value degrades to null (unavailable) rather than throwing.
+
+function proofField(object: JsonObject, key: string): Json | undefined {
+  return Object.prototype.hasOwnProperty.call(object, key) ? (object[key] as Json) : undefined;
+}
+
+function looseString(object: JsonObject, key: string): string | null {
+  const value = proofField(object, key);
+  return typeof value === 'string' ? value : null;
+}
+
+function looseBool(object: JsonObject, key: string): boolean | null {
+  const value = proofField(object, key);
+  return typeof value === 'boolean' ? value : null;
+}
+
+function looseInt(object: JsonObject, key: string): number | null {
+  const value = proofField(object, key);
+  return typeof value === 'number' && Number.isInteger(value) ? value : null;
+}
+
+function looseObject(object: JsonObject, key: string): JsonObject | null {
+  const value = proofField(object, key);
+  if (value === undefined) {
+    return null;
+  }
+  return isJsonObject(value) ? value : null;
+}
+
+function looseStringArray(object: JsonObject, key: string): string[] {
+  const value = proofField(object, key);
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((entry): entry is string => typeof entry === 'string');
+}
+
+/** First present string among snake_case/camelCase spellings. */
+function looseAliasString(object: JsonObject, keys: readonly string[]): string | null {
+  for (const key of keys) {
+    const value = looseString(object, key);
+    if (value !== null) {
+      return value;
+    }
+  }
+  return null;
+}
+
 // -------------------------------------------------------------- result types
 
 export interface NativeHealth {
@@ -683,17 +739,80 @@ export interface NativeUsageTotals {
   };
 }
 
+/** The typed criterion-binding kinds of the proof system (`faktor_core`). */
+export type NativeCriterionBindingKind =
+  | 'required_check'
+  | 'integration_coverage'
+  | 'file_state'
+  | 'evidence'
+  | 'independent_review'
+  | 'aggregate_goal'
+  | 'unavailable';
+
+/**
+ * The typed binding of one criterion verdict. The durable record carries it,
+ * but the CURRENT `GET .../tasks/{task_id}/verification` projection only
+ * serializes `criterionKey/passed/evidence` (crates/server/src/native/
+ * verification.rs) — so every member is optional and absence is an honest
+ * `null` (the cockpit renders "binding unavailable", never a guessed kind).
+ * A daemon that starts serving the member is parsed additively; both the
+ * serde snake_case member names and a camelCase projection are accepted.
+ */
+export interface NativeCriterionBinding {
+  readonly kind: NativeCriterionBindingKind;
+  /** Raw served kind when it is not one of the known variants. */
+  readonly servedKind: string | null;
+  readonly checkId: string | null;
+  readonly commandDigest: string | null;
+  readonly requiredWorkItems: readonly string[];
+  readonly path: string | null;
+  readonly expectedDigest: string | null;
+  readonly evidenceId: string | null;
+  readonly evidenceDigest: string | null;
+  readonly reviewerId: string | null;
+  readonly reason: string | null;
+}
+
+/** The compact candidate-proof reference of one verification record. */
+export interface NativeCandidateProof {
+  readonly taskRevision: string | null;
+  readonly baseManifestHash: string | null;
+  readonly candidateManifestHash: string | null;
+  readonly sourceDiffEvidence: string | null;
+  readonly riskReportEvidence: string | null;
+  readonly accountingSnapshotDigest: string | null;
+  readonly runId: string | null;
+  readonly runBaseSnapshot: string | null;
+  readonly candidateSnapshot: string | null;
+  readonly sourcesDigest: string | null;
+  readonly changedFilesDigest: string | null;
+}
+
+/**
+ * One criterion verdict as the native verification route serves it. The
+ * required trio (`criterionKey/passed/evidence`) degrades per row instead of
+ * failing the whole response: a hostile/missing member yields
+ * `key=''`/`passed=null` and the cockpit renders an honest "unavailable"
+ * row, never a fabricated pass.
+ */
+export interface NativeCriterionVerdict {
+  readonly criterionKey: string;
+  readonly passed: boolean | null;
+  readonly evidence: string | null;
+  /** Additive proof annotations; null when the serving daemon omits them. */
+  readonly requirement: string | null;
+  readonly origin: string | null;
+  readonly verdict: string | null;
+  readonly binding: NativeCriterionBinding | null;
+}
+
 export interface NativeVerificationRecord {
   readonly recordId: string;
   readonly revision: string;
   readonly workspaceId: string;
   readonly worktreeId: string;
   readonly treeHash: string | null;
-  readonly criteria: Array<{
-    readonly criterionKey: string;
-    readonly passed: boolean;
-    readonly evidence: string | null;
-  }>;
+  readonly criteria: NativeCriterionVerdict[];
   readonly checks: Array<{
     readonly check: string;
     readonly program: string;
@@ -716,6 +835,16 @@ export interface NativeVerificationRecord {
   readonly status: string;
   readonly startedMs: number;
   readonly completedMs: number | null;
+  /**
+   * P0 proof payload (audit P0-64). The current daemon always emits these
+   * keys (nulls are honest absences); a daemon predating them is tolerated
+   * with explicit nulls so the proof section degrades, never fabricates.
+   */
+  readonly candidateProof: NativeCandidateProof | null;
+  readonly verifiedSnapshot: string | null;
+  readonly basedOnSnapshot: string | null;
+  readonly sourceCount: number | null;
+  readonly landedSnapshot: string | null;
 }
 
 export interface NativeTaskVerification {
@@ -1930,6 +2059,104 @@ export function validateTaskVerification(json: Json): NativeTaskVerification {
   };
 }
 
+/** The known binding kinds of the proof system (never guessed). */
+export const NATIVE_CRITERION_BINDING_KINDS: readonly NativeCriterionBindingKind[] = [
+  'required_check',
+  'integration_coverage',
+  'file_state',
+  'evidence',
+  'independent_review',
+  'aggregate_goal',
+  'unavailable',
+];
+
+/**
+ * Parse one additive criterion binding. The member is absent on the current
+ * wire (honest null); a served binding is parsed into its typed reference
+ * members. An unknown kind is preserved in `servedKind` and degrades to
+ * `unavailable` — a kind this client cannot explain never renders as pass.
+ */
+function parseCriterionBinding(object: JsonObject): NativeCriterionBinding | null {
+  const raw = looseObject(object, 'binding');
+  if (raw === null) {
+    return null;
+  }
+  const servedKind = looseString(raw, 'kind');
+  const kind =
+    servedKind !== null &&
+    (NATIVE_CRITERION_BINDING_KINDS as readonly string[]).includes(servedKind)
+      ? (servedKind as NativeCriterionBindingKind)
+      : 'unavailable';
+  return {
+    kind,
+    servedKind,
+    checkId: looseAliasString(raw, ['check_id', 'checkId']),
+    commandDigest: looseAliasString(raw, ['command_digest', 'commandDigest']),
+    requiredWorkItems: [
+      ...looseStringArray(raw, 'required_work_items'),
+      ...looseStringArray(raw, 'requiredWorkItems'),
+    ],
+    path: looseString(raw, 'path'),
+    expectedDigest: looseAliasString(raw, ['expected_digest', 'expectedDigest']),
+    evidenceId: looseAliasString(raw, ['evidence_id', 'evidenceId']),
+    evidenceDigest: looseAliasString(raw, ['evidence_digest', 'evidenceDigest']),
+    reviewerId: looseAliasString(raw, ['reviewer_id', 'reviewerId']),
+    reason: looseString(raw, 'reason'),
+  };
+}
+
+/** Parse one criterion verdict row, degrading hostile shapes to unavailable. */
+export function validateCriterionVerdict(object: JsonObject): NativeCriterionVerdict {
+  const criterionKey = looseString(object, 'criterionKey') ?? looseString(object, 'criterion_key') ?? '';
+  const passed =
+    looseBool(object, 'passed') ??
+    (() => {
+      // Additive `verdict` spelling of the same fact (a daemon that serves
+      // the three-way vocabulary). Unknown spellings are honest nulls.
+      const verdict = looseString(object, 'verdict');
+      if (verdict === 'passed' || verdict === 'pass') {
+        return true;
+      }
+      if (verdict === 'failed' || verdict === 'fail') {
+        return false;
+      }
+      return null;
+    })();
+  const evidence = looseString(object, 'evidence');
+  const requirement = looseAliasString(object, ['requirement', 'requirementKind']);
+  const origin = looseAliasString(object, ['origin']);
+  const verdict = looseString(object, 'verdict');
+  return {
+    criterionKey,
+    passed,
+    evidence,
+    requirement,
+    origin,
+    verdict,
+    binding: parseCriterionBinding(object),
+  };
+}
+
+/** Parse the additive P0 candidate-proof reference (all members optional). */
+export function parseCandidateProof(object: JsonObject | null): NativeCandidateProof | null {
+  if (object === null) {
+    return null;
+  }
+  return {
+    taskRevision: looseString(object, 'taskRevision'),
+    baseManifestHash: looseString(object, 'baseManifestHash'),
+    candidateManifestHash: looseString(object, 'candidateManifestHash'),
+    sourceDiffEvidence: looseString(object, 'sourceDiffEvidence'),
+    riskReportEvidence: looseString(object, 'riskReportEvidence'),
+    accountingSnapshotDigest: looseString(object, 'accountingSnapshotDigest'),
+    runId: looseString(object, 'runId'),
+    runBaseSnapshot: looseString(object, 'runBaseSnapshot'),
+    candidateSnapshot: looseString(object, 'candidateSnapshot'),
+    sourcesDigest: looseString(object, 'sourcesDigest'),
+    changedFilesDigest: looseString(object, 'changedFilesDigest'),
+  };
+}
+
 function validateVerificationRecord(object: JsonObject, path: string): NativeVerificationRecord {
   checkResponseKeys(object, path, [
     'recordId',
@@ -1952,15 +2179,9 @@ function validateVerificationRecord(object: JsonObject, path: string): NativeVer
     workspaceId: fString(object, 'workspaceId', path),
     worktreeId: fString(object, 'worktreeId', path),
     treeHash: fNullableString(object, 'treeHash', path),
-    criteria: fObjectArray(object, 'criteria', path).map((entry, index) => {
-      const itemPath = `${path}.criteria[${index}]`;
-      checkResponseKeys(entry, itemPath, ['criterionKey', 'passed', 'evidence']);
-      return {
-        criterionKey: fString(entry, 'criterionKey', itemPath),
-        passed: fBool(entry, 'passed', itemPath),
-        evidence: fNullableString(entry, 'evidence', itemPath),
-      };
-    }),
+    criteria: fObjectArray(object, 'criteria', path).map((entry) =>
+      validateCriterionVerdict(entry),
+    ),
     checks: fObjectArray(object, 'checks', path).map((entry, index) => {
       const itemPath = `${path}.checks[${index}]`;
       checkResponseKeys(entry, itemPath, [
@@ -2002,6 +2223,11 @@ function validateVerificationRecord(object: JsonObject, path: string): NativeVer
     status: fString(object, 'status', path),
     startedMs: fInt(object, 'startedMs', path),
     completedMs: fNullableInt(object, 'completedMs', path),
+    candidateProof: parseCandidateProof(looseObject(object, 'candidateProof')),
+    verifiedSnapshot: looseString(object, 'verifiedSnapshot'),
+    basedOnSnapshot: looseString(object, 'basedOnSnapshot'),
+    sourceCount: looseInt(object, 'sourceCount'),
+    landedSnapshot: looseString(object, 'landedSnapshot'),
   };
 }
 

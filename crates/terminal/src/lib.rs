@@ -415,6 +415,36 @@ struct ChildState {
     owner: ProcessOwner,
     started_ms: i64,
     exited: Option<Option<i32>>,
+    /// The per-child containment of this row (Windows: its own
+    /// `KILL_ON_JOB_CLOSE` job; off Windows: the process group needs no
+    /// stored authority). Read on Windows only (terminate/reap/job close);
+    /// off Windows it is deliberately inert.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    containment: ChildContainment,
+}
+
+/// Per-child containment: on Windows its OWN `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+/// Job Object, created BEFORE the process exists. Assignment happens while the
+/// child is `CREATE_SUSPENDED`, so the child — and every descendant it will
+/// ever create — is a job member before it can execute. Terminating or
+/// closing this job is the OS-enumerated tree kill (no pid walk, no
+/// taskkill); off Windows the process group is the tree authority and this
+/// carries nothing.
+#[cfg(windows)]
+struct ChildContainment {
+    job: JobGuard,
+}
+
+#[cfg(not(windows))]
+struct ChildContainment;
+
+impl ChildContainment {
+    /// PRIMARY tree termination (Windows): the kernel iterates the job's
+    /// process list, so children of members are members — the whole tree.
+    #[cfg(windows)]
+    fn terminate(&self) {
+        self.job.terminate();
+    }
 }
 
 /// The bounded capture state; mutated only by the reader task.
@@ -508,8 +538,6 @@ pub struct SpawnTimeline {
 }
 
 pub struct ProcessSupervisor {
-    #[cfg(windows)]
-    job: JobGuard,
     registry: Arc<Mutex<HashMap<u64, ChildState>>>,
     cas: Arc<faktor_cas::Cas>,
     next_id: Arc<std::sync::atomic::AtomicU64>,
@@ -534,17 +562,20 @@ impl std::fmt::Debug for ProcessSupervisor {
 impl Drop for ProcessSupervisor {
     /// Daemon-shutdown scope (spec §22 / commandment 8): when the LAST
     /// reference to the supervisor drops, every still-live child is
-    /// killed. No child outlives its runtime owner.
+    /// killed. No child outlives its runtime owner. On Windows each child's
+    /// own kill-on-close job is the primary authority (terminated here, and
+    /// closed by dropping the registry right after — the OS takes every
+    /// still-running member even if the terminate call were skipped).
     fn drop(&mut self) {
-        let targets: Vec<u32> = {
+        let targets: Vec<(u64, u32)> = {
             let reg = self.registry.lock().unwrap();
-            reg.values()
-                .filter(|s| s.exited.is_none())
-                .map(|s| s.pid)
+            reg.iter()
+                .filter(|(_, s)| s.exited.is_none())
+                .map(|(id, s)| (*id, s.pid))
                 .collect()
         };
-        for pid in targets {
-            let _ = kill_group(pid, 300);
+        for (id, pid) in targets {
+            let _ = self.terminate_registered_sync(id, pid, 300);
         }
     }
 }
@@ -559,14 +590,6 @@ impl ProcessSupervisor {
     pub fn with_limit(cas: Arc<faktor_cas::Cas>, max_live: usize) -> Arc<Self> {
         let max_live = max_live.max(1);
         Arc::new(Self {
-            #[cfg(windows)]
-            job: JobGuard::create().unwrap_or_else(|| {
-                tracing::warn!(
-                    "CreateJobObject failed; children lose the OS kill-on-close guarantee"
-                );
-                // A zero handle keeps every assign a no-op.
-                JobGuard::null()
-            }),
             registry: Arc::new(Mutex::new(HashMap::new())),
             cas,
             next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -670,9 +693,13 @@ impl ProcessSupervisor {
         Ok(())
     }
 
-    fn register(&self, pid: u32, owner: ProcessOwner, started_ms: i64) -> u64 {
-        #[cfg(windows)]
-        self.job.assign(pid);
+    fn register(
+        &self,
+        pid: u32,
+        owner: ProcessOwner,
+        started_ms: i64,
+        containment: ChildContainment,
+    ) -> u64 {
         let id = self.alloc_id();
         self.registry.lock().unwrap().insert(
             id,
@@ -681,9 +708,56 @@ impl ProcessSupervisor {
                 owner: owner.clone(),
                 started_ms,
                 exited: None,
+                containment,
             },
         );
         id
+    }
+
+    /// PRIMARY tree termination of one registered child (async paths): on
+    /// Windows the child's kill-on-close job (the kernel enumerates
+    /// membership — children of members are members, so this is the whole
+    /// tree with no pid walk and no taskkill); on unix the owned process
+    /// group with SIGTERM→SIGKILL grace. Async so the unix grace wait never
+    /// blocks the runtime; the Windows job kill is immediate.
+    async fn terminate_registered(&self, id: u64, pid: u32, grace_ms: u64) {
+        #[cfg(windows)]
+        {
+            let _ = (pid, grace_ms);
+            self.terminate_containment(id);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = id;
+            let _ = kill_group_async(pid, grace_ms).await;
+        }
+    }
+
+    /// Sync twin of [`Self::terminate_registered`] for the sync, Drop and
+    /// public kill paths.
+    fn terminate_registered_sync(&self, id: u64, pid: u32, grace_ms: u64) -> Result<(), Error> {
+        #[cfg(windows)]
+        {
+            let _ = (pid, grace_ms);
+            self.terminate_containment(id);
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = id;
+            kill_group(pid, grace_ms)
+        }
+    }
+
+    /// Terminate the job of one registered child. The job handle stays in
+    /// the registry row: the row's own kill-on-close closes it when the row
+    /// is dropped (reap/Drop), the OS failsafe for anything still running.
+    #[cfg(windows)]
+    fn terminate_containment(&self, id: u64) {
+        let reg = self.registry.lock().unwrap();
+        if let Some(state) = reg.get(&id) {
+            state.containment.terminate();
+        }
     }
 
     /// Recent spawns, newest first (bounded; see [`SpawnTimeline`]).
@@ -723,12 +797,17 @@ impl ProcessSupervisor {
         use tokio::io::AsyncReadExt;
         use tokio::process::Command as TokioCommand;
 
-        let mut std_cmd = self.command(&cfg);
+        let mut std_cmd = contain_on_create(self.command(&cfg));
         if cfg.capture {
             std_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         } else {
             std_cmd.stdout(Stdio::null()).stderr(Stdio::null());
         }
+        // Windows containment (before any process exists): the per-child
+        // kill-on-close job. The process is spawned CREATE_SUSPENDED, is
+        // assigned strictly, has membership verified while it cannot run,
+        // and is resumed LAST — an uncontained child is never exposed.
+        let containment = prepare_containment()?;
         let started_ms = now_ms();
         let mut cmd = TokioCommand::from(std_cmd);
         // Audit round 11: a DROPPED run() future (outer timeout/unwind) must
@@ -736,10 +815,12 @@ impl ProcessSupervisor {
         // the RAII guard below SIGKILLs the whole group as a last resort.
         cmd.kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| spawn_failure(&cfg, e))?;
+        #[cfg(windows)]
+        win_spawn::assign_and_resume_tokio(&containment.job, &mut child).await?;
         #[cfg(target_os = "linux")]
         mark_deny_all_proven(&cfg);
         let pid = child.id().unwrap_or(0);
-        let id = self.register(pid, cfg.owner.clone(), started_ms);
+        let id = self.register(pid, cfg.owner.clone(), started_ms, containment);
         self.timeline_spawn(
             id,
             pid,
@@ -842,7 +923,7 @@ impl ProcessSupervisor {
         let outcome = tokio::select! {
             s = child.wait() => RunOutcome::Exited(s.ok()),
             _ = tokio::time::sleep_until(deadline_at) => {
-                let _ = kill_group_async(pid, 2000).await;
+                self.terminate_registered(id, pid, 2000).await;
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 // The child is gone WITH no exit code: mark it exited so
@@ -853,7 +934,7 @@ impl ProcessSupervisor {
                 RunOutcome::TimedOut
             }
             _ = token.cancelled() => {
-                let _ = kill_group_async(pid, 500).await;
+                self.terminate_registered(id, pid, 500).await;
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 self.mark_exited(id, Some(None));
@@ -879,7 +960,7 @@ impl ProcessSupervisor {
             .is_ok();
             if r.is_some() && !done {
                 // Descendant still owns the pipe: terminate the owned tree.
-                let _ = kill_group_async(pid, 1500).await;
+                self.terminate_registered(id, pid, 1500).await;
                 if let Some(r) = r {
                     r.abort();
                     let _ = r.await;
@@ -1000,7 +1081,7 @@ impl ProcessSupervisor {
             .chars()
             .take(300)
             .collect();
-        let mut cmd = self.command(&cfg);
+        let mut cmd = contain_on_create(self.command(&cfg));
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1008,11 +1089,17 @@ impl ProcessSupervisor {
         let (mut child, pid, id) = {
             let _serial = self.spawn_serial.lock().unwrap();
             self.admit()?;
-            let child = cmd.spawn().map_err(|e| spawn_failure(&cfg, e))?;
+            // Windows containment: job BEFORE process, spawn suspended,
+            // assign strictly, verify membership, resume LAST.
+            let containment = prepare_containment()?;
+            #[allow(unused_mut)]
+            let mut child = cmd.spawn().map_err(|e| spawn_failure(&cfg, e))?;
+            #[cfg(windows)]
+            win_spawn::assign_and_resume_std(&containment.job, &mut child)?;
             #[cfg(target_os = "linux")]
             mark_deny_all_proven(&cfg);
             let pid = child.id();
-            let id = self.register(pid, cfg.owner.clone(), started_ms);
+            let id = self.register(pid, cfg.owner.clone(), started_ms, containment);
             self.timeline_spawn(id, pid, argv, &cfg.owner);
             (child, pid, id)
         };
@@ -1056,7 +1143,7 @@ impl ProcessSupervisor {
                 // Deadline fired: kill the OWNED tree (only while the child
                 // is still ours), then give the reaper a bounded moment.
                 if !reaped.load(Ordering::SeqCst) {
-                    let _ = kill_group(pid, 500);
+                    let _ = self.terminate_registered_sync(id, pid, 500);
                 }
                 let code = exit_rx
                     .recv_timeout(Duration::from_millis(500))
@@ -1076,7 +1163,7 @@ impl ProcessSupervisor {
         let mut out_head = out_rx.recv_timeout(settle).ok();
         let mut err_head = err_rx.recv_timeout(settle).ok();
         if out_head.is_none() || err_head.is_none() {
-            let _ = kill_group(pid, SYNC_KILL_GRACE_MS);
+            let _ = self.terminate_registered_sync(id, pid, SYNC_KILL_GRACE_MS);
             let grace = Duration::from_millis(500);
             if out_head.is_none() {
                 out_head = out_rx.recv_timeout(grace).ok();
@@ -1108,12 +1195,15 @@ impl ProcessSupervisor {
             isolation_gate(&cfg)?;
         }
         cfg.capture = false;
-        let mut cmd = self.command(&cfg);
+        let mut cmd = contain_on_create(self.command(&cfg));
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        let containment = prepare_containment()?;
         let started_ms = now_ms();
         let mut child = cmd.spawn().map_err(|e| spawn_failure(&cfg, e))?;
+        #[cfg(windows)]
+        win_spawn::assign_and_resume_std(&containment.job, &mut child)?;
         #[cfg(target_os = "linux")]
         mark_deny_all_proven(&cfg);
         let pid = child.id();
@@ -1129,7 +1219,7 @@ impl ProcessSupervisor {
             .stderr
             .take()
             .ok_or_else(|| Error::internal("no stderr"))?;
-        let id = self.register(pid, cfg.owner.clone(), started_ms);
+        let id = self.register(pid, cfg.owner.clone(), started_ms, containment);
         self.timeline_spawn(
             id,
             pid,
@@ -1171,17 +1261,21 @@ impl ProcessSupervisor {
         if cfg.network_isolation == NetworkIsolation::DenyAll {
             isolation_gate(&cfg)?;
         }
-        let mut cmd = self.command(&cfg);
+        let mut cmd = contain_on_create(self.command(&cfg));
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
         let started_ms = now_ms();
         let (child, pid, id) = {
             let _serial = self.spawn_serial.lock().unwrap();
             self.admit()?;
-            let child = cmd.spawn().map_err(|e| spawn_failure(&cfg, e))?;
+            let containment = prepare_containment()?;
+            #[allow(unused_mut)]
+            let mut child = cmd.spawn().map_err(|e| spawn_failure(&cfg, e))?;
+            #[cfg(windows)]
+            win_spawn::assign_and_resume_std(&containment.job, &mut child)?;
             #[cfg(target_os = "linux")]
             mark_deny_all_proven(&cfg);
             let pid = child.id();
-            let id = self.register(pid, cfg.owner.clone(), started_ms);
+            let id = self.register(pid, cfg.owner.clone(), started_ms, containment);
             self.timeline_spawn(
                 id,
                 pid,
@@ -1224,16 +1318,42 @@ impl ProcessSupervisor {
             .get(&id)
             .map(|c| c.pid)
             .ok_or_else(|| Error::not_found(format!("child {id}")))?;
-        kill_group(pid, grace_ms)
+        self.terminate_registered_sync(id, pid, grace_ms)
     }
 
     /// Kill a process by raw pid (process-group aware); used by MCP/LSP
-    /// clients that own their own child lifecycle.
+    /// clients that own their own child lifecycle. A pid that matches a
+    /// registered child is terminated through the SAME primary authority as
+    /// [`ProcessSupervisor::kill`] (the containment job on Windows, the
+    /// process group on unix); an unregistered pid keeps the platform
+    /// fallback.
     pub fn kill_child_pid(&self, pid: u32, grace_ms: u64) -> Result<(), Error> {
         if pid == 0 {
             return Err(Error::not_found("pid 0"));
         }
-        kill_group(pid, grace_ms)
+        #[cfg(windows)]
+        {
+            let id = {
+                let reg = self.registry.lock().unwrap();
+                reg.iter()
+                    .find(|(_, s)| s.pid == pid && s.exited.is_none())
+                    .map(|(id, _)| *id)
+            };
+            match id {
+                Some(id) => {
+                    self.terminate_containment(id);
+                    Ok(())
+                }
+                // Never owned by this supervisor: the documented best-effort
+                // fallback (taskkill). The caller's own child lifecycle has
+                // no job of ours to close.
+                None => kill_group(pid, grace_ms),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            kill_group(pid, grace_ms)
+        }
     }
 
     /// Is a raw pid still alive (used by MCP/LSP clients)?
@@ -1288,18 +1408,28 @@ impl ProcessSupervisor {
 
     /// Session death ⇒ its children die (unless transferred first).
     pub fn kill_all_for(&self, owner: ProcessOwner) -> Vec<u64> {
-        let mut killed = Vec::new();
+        // Snapshot the targets, terminate outside the registry lock (the
+        // Windows terminate path re-locks the registry; the unix grace wait
+        // must never serialize other callers), then mark exactly the
+        // snapshotted rows exited.
+        let targets: Vec<(u64, u32)> = {
+            let reg = self.registry.lock().unwrap();
+            reg.iter()
+                .filter(|(_, s)| s.owner == owner && s.exited.is_none())
+                .map(|(id, s)| (*id, s.pid))
+                .collect()
+        };
+        let mut killed = Vec::with_capacity(targets.len());
+        for (id, pid) in &targets {
+            let _ = self.terminate_registered_sync(*id, *pid, 2000);
+            killed.push(*id);
+        }
         let mut reg = self.registry.lock().unwrap();
-        let targets: Vec<(u64, u32)> = reg
-            .iter()
-            .filter(|(_, s)| s.owner == owner && s.exited.is_none())
-            .map(|(id, s)| (*id, s.pid))
-            .collect();
-        for (id, pid) in targets {
-            let _ = kill_group(pid, 2000);
-            killed.push(id);
-            if let Some(s) = reg.get_mut(&id) {
-                s.exited = Some(None);
+        for (id, _) in &targets {
+            if let Some(s) = reg.get_mut(id) {
+                if s.exited.is_none() {
+                    s.exited = Some(None);
+                }
             }
         }
         killed
@@ -1386,6 +1516,204 @@ fn spawn_failure(cfg: &SpawnConfig, e: std::io::Error) -> Error {
 fn mark_deny_all_proven(cfg: &SpawnConfig) {
     if cfg.network_isolation == NetworkIsolation::DenyAll {
         DENY_ALL_PROVEN.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+// ------------------------------------------------------------------ windows
+// The Windows spawn containment protocol (spec §22, commandment 8): every
+// supervised child gets its OWN `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` job,
+// is created `CREATE_SUSPENDED`, assigned strictly while it cannot execute,
+// has its membership verified before it could fork, and is resumed LAST.
+// Tree death is OS-enumerated job termination (explicit kills) plus
+// kill-on-close (daemon death) — never a `taskkill` pid walk.
+
+/// Apply the platform's spawn-time containment preparation to a base
+/// command: on Windows the process is marked `CREATE_SUSPENDED` (it must
+/// not execute one instruction before the containment job owns it); unix
+/// needs nothing beyond the process group already applied by
+/// [`ProcessSupervisor::command_base`].
+#[cfg(windows)]
+fn contain_on_create(mut cmd: std::process::Command) -> std::process::Command {
+    win_spawn::suspend_on_create(&mut cmd);
+    cmd
+}
+
+#[cfg(not(windows))]
+fn contain_on_create(cmd: std::process::Command) -> std::process::Command {
+    cmd
+}
+
+/// Create the per-child containment for one spawn, BEFORE any process
+/// exists. Windows: its own kill-on-close job (a creation failure refuses
+/// the spawn — without the job there is no tree guarantee). Off Windows:
+/// nothing to carry (the process group is the authority).
+#[cfg(windows)]
+fn prepare_containment() -> Result<ChildContainment, Error> {
+    Ok(ChildContainment {
+        job: win_spawn::create_job()?,
+    })
+}
+
+#[cfg(not(windows))]
+fn prepare_containment() -> Result<ChildContainment, Error> {
+    Ok(ChildContainment)
+}
+
+/// Pure Windows containment policy (compiled on every host so the ordering
+/// invariants are adversarially testable where no Windows runtime exists —
+/// the same pattern as `faktor-pty::win_common`).
+#[cfg(any(windows, test))]
+mod win_containment_policy {
+    /// `CREATE_SUSPENDED` (winbase.h frozen ABI value): the process is
+    /// created with its primary thread suspended, so it can neither execute
+    /// nor fork a descendant before the job owns it.
+    pub(crate) const CREATE_SUSPENDED: u32 = 0x0000_0004;
+
+    /// The creation flags every supervised Windows child is created with:
+    /// suspended until the containment job owns it. Nothing else may be
+    /// added here without re-justifying the ordering.
+    pub(crate) fn creation_flags() -> u32 {
+        CREATE_SUSPENDED
+    }
+
+    /// The exposure gate: resume a child (and therefore expose it) ONLY
+    /// after the strict assignment succeeded AND job membership was
+    /// verified while the child was still suspended. Any other combination
+    /// refuses the spawn and terminates the still-suspended child.
+    pub(crate) fn may_resume(assigned: bool, verified_member: bool) -> bool {
+        assigned && verified_member
+    }
+}
+
+/// The Windows spawn path: create the job, create the process suspended,
+/// assign strictly, verify membership while it cannot run, resume LAST.
+/// Any failure terminates the still-suspended child and refuses the spawn.
+#[cfg(windows)]
+mod win_spawn {
+    use std::os::windows::process::CommandExt;
+
+    use faktor_winjob::JobGuard;
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SUSPEND_RESUME};
+
+    use super::*;
+
+    // `NtResumeProcess` (ntdll): resume every thread of a process. The
+    // kernel transition needed is `ResumeThread`, but
+    // `std::process::Command::spawn` closes the primary-thread handle that
+    // `CreateProcess` returned and exposes no resume seam; process-wide
+    // resume is the user-mode counterpart of the WDK-documented
+    // `ZwResumeProcess` and takes only a process handle (opened with
+    // `PROCESS_SUSPEND_RESUME`). A just-created suspended process has
+    // exactly one thread, so this is precisely "resume the primary thread".
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtResumeProcess(process_handle: HANDLE) -> i32;
+    }
+
+    /// Create the per-child containment job. Fail-closed: without the job
+    /// there is no tree guarantee, so the spawn is refused before any
+    /// process exists.
+    pub(super) fn create_job() -> Result<JobGuard, Error> {
+        JobGuard::create_strict().map_err(|code| {
+            Error::internal(format!(
+                "windows containment: CreateJobObject(KILL_ON_JOB_CLOSE) failed \
+                 (win32 error {code}); refusing the spawn"
+            ))
+        })
+    }
+
+    /// Mark the command `CREATE_SUSPENDED` (the pure policy owns the flag).
+    pub(super) fn suspend_on_create(cmd: &mut std::process::Command) {
+        cmd.creation_flags(win_containment_policy::creation_flags());
+    }
+
+    /// The assign → verify → resume core, executed while the child is STILL
+    /// suspended. Ordering is the containment guarantee:
+    /// 1. `assign_strict` — a failed assignment refuses the spawn;
+    /// 2. `contains` — membership is verified before any instruction runs,
+    ///    so it cannot race a descendant;
+    /// 3. resume — the ONLY exposure point, gated by the pure
+    ///    [`win_containment_policy::may_resume`] predicate.
+    fn assign_verify_resume(job: &JobGuard, pid: u32) -> Result<(), Error> {
+        if pid == 0 {
+            return Err(Error::internal(
+                "windows containment: spawned child has no pid; refusing the spawn",
+            ));
+        }
+        job.assign_strict(pid).map_err(|code| {
+            Error::internal(format!(
+                "windows containment: AssignProcessToJobObject(pid {pid}) failed \
+                 (win32 error {code}); the suspended child is terminated, never resumed \
+                 uncontained"
+            ))
+        })?;
+        // The child is still suspended: this check cannot race a descendant.
+        let verified_member = job.contains(pid);
+        if !win_containment_policy::may_resume(true, verified_member) {
+            return Err(Error::internal(format!(
+                "windows containment: pid {pid} is not a job member after assignment; \
+                 the suspended child is terminated, never resumed uncontained"
+            )));
+        }
+        resume(pid).map_err(|code| {
+            Error::internal(format!(
+                "windows containment: NtResumeProcess(pid {pid}) failed (status {code}); \
+                 the child is terminated"
+            ))
+        })
+    }
+
+    fn resume(pid: u32) -> Result<(), u32> {
+        // SAFETY: `pid` names the just-created, still-suspended child; the
+        // handle is closed on every path.
+        unsafe {
+            let process = OpenProcess(PROCESS_SUSPEND_RESUME, 0, pid);
+            if process.is_null() {
+                return Err(GetLastError());
+            }
+            let status = NtResumeProcess(process);
+            CloseHandle(process);
+            if status < 0 {
+                Err(status as u32)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Contain an already-created std child. On failure the child is killed
+    /// while still suspended (`TerminateProcess` works on a suspended
+    /// process; the primary thread never runs) and the error is returned.
+    pub(super) fn assign_and_resume_std(
+        job: &JobGuard,
+        child: &mut std::process::Child,
+    ) -> Result<(), Error> {
+        let pid = child.id();
+        match assign_verify_resume(job, pid) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(e)
+            }
+        }
+    }
+
+    /// tokio twin of [`assign_and_resume_std`].
+    pub(super) async fn assign_and_resume_tokio(
+        job: &JobGuard,
+        child: &mut tokio::process::Child,
+    ) -> Result<(), Error> {
+        let pid = child.id().unwrap_or(0);
+        match assign_verify_resume(job, pid) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                Err(e)
+            }
+        }
     }
 }
 
@@ -1489,10 +1817,29 @@ fn read_pipes(
     }
 }
 
-/// Kill the whole process group: SIGTERM, grace, SIGKILL. On Windows the
-/// process tree is killed via taskkill (Job Objects live behind cfg).
-/// The grace wait exits early: the moment the group leader is gone the
-/// function returns instead of sleeping the full grace.
+/// Best-effort process-tree kill for a pid this supervisor does NOT own (no
+/// containment row exists, so there is no job to close): `taskkill /T`.
+/// Deliberately an afterthought — it is never the primary guarantee and
+/// every supervised Windows child is terminated through its own
+/// kill-on-close Job Object instead (OS-enumerated membership, no pid walk,
+/// no window where a recycled pid could be hit).
+#[cfg(not(unix))]
+fn taskkill_best_effort(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Kill the whole process group on unix: SIGTERM, grace, SIGKILL. The
+/// grace wait exits early: the moment the group leader is gone the function
+/// returns instead of sleeping the full grace. On Windows the primary tree
+/// kill is the containment job ([`ChildContainment::terminate`]); this
+/// function only serves unowned pids and is a best-effort afterthought.
 fn kill_group(pid: u32, grace_ms: u64) -> Result<(), Error> {
     #[cfg(unix)]
     {
@@ -1512,19 +1859,17 @@ fn kill_group(pid: u32, grace_ms: u64) -> Result<(), Error> {
     }
     #[cfg(not(unix))]
     {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let _ = grace_ms;
+        taskkill_best_effort(pid);
     }
     Ok(())
 }
 
-/// Async kill of the whole process group: SIGTERM, then poll for exit every
-/// 25ms (no blocking sleep inside the runtime); the moment the group leader
-/// is gone the future returns. At the grace deadline SIGKILL is sent and the
-/// future returns.
+/// Async kill of the whole process group on unix: SIGTERM, then poll for
+/// exit every 25ms (no blocking sleep inside the runtime); at the grace
+/// deadline SIGKILL is sent. On Windows the primary tree kill is the
+/// containment job; this async form only serves unowned pids and delegates
+/// to the best-effort [`taskkill_best_effort`].
 pub async fn kill_group_async(pid: u32, grace_ms: u64) -> Result<(), Error> {
     #[cfg(unix)]
     {
@@ -1547,11 +1892,8 @@ pub async fn kill_group_async(pid: u32, grace_ms: u64) -> Result<(), Error> {
     }
     #[cfg(not(unix))]
     {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let _ = grace_ms;
+        taskkill_best_effort(pid);
     }
     Ok(())
 }
@@ -3346,18 +3688,23 @@ mod tests {
 }
 
 // ================================================================ windows
-/// On Windows every supervised child is assigned to a faktor-winjob
-/// JobGuard (kill-on-close): daemon death terminates the whole tree via OS
-/// ownership. macOS/Linux keep process groups + signals.
+/// On Windows every supervised child gets its OWN faktor-winjob JobGuard
+/// (`KILL_ON_JOB_CLOSE`), created before the process and assigned while the
+/// child is `CREATE_SUSPENDED` — so the OS owns the whole tree before the
+/// child can execute. Daemon death closes the jobs (kill-on-close); explicit
+/// kills terminate the job (OS-enumerated membership). macOS/Linux keep
+/// process groups + signals.
 #[cfg(windows)]
 pub use faktor_winjob::JobGuard;
 
 // ================================================================ windows tests
 // P0-59 process-tree certification through the REAL windows spawn path of
-// this crate: std::process children registered with the supervisor are
-// assigned to the JobGuard (kill-on-close) AND killed via taskkill /T on
-// cancel; dropping the supervisor exercises both. Runtime-certification
-// only on a windows host — on unix hosts this module does not exist.
+// this crate: every child is spawned CREATE_SUSPENDED into its own
+// KILL_ON_JOB_CLOSE job (assign_strict + membership verification before
+// resume); cancel/kill terminate the job and dropping the supervisor closes
+// it (kill-on-close). taskkill is only a best-effort fallback for pids the
+// supervisor never owned. Runtime-certification only on a windows host — on
+// unix hosts this module does not exist.
 #[cfg(all(test, windows))]
 mod windows_tests {
     use std::path::Path;
@@ -3398,10 +3745,11 @@ mod windows_tests {
     }
 
     /// powershell (direct child) sleeps 60 s; the ping grandchild is born
-    /// ~1.5 s in — after register() has assigned the parent to the job, so
-    /// the grandchild lands in the job by descent — writes its pid, and
-    /// sleeps ~60 s. `ping -n 60` is a deterministic ~60 s sleeper even on
-    /// a network-blocked runner (ICMP failure still paces the retries).
+    /// ~1.5 s in — after spawn/resume returned, and since the direct child
+    /// was assigned to its job WHILE SUSPENDED, the grandchild lands in the
+    /// job by descent — writes its pid, and sleeps ~60 s. `ping -n 60` is a
+    /// deterministic ~60 s sleeper even on a network-blocked runner (ICMP
+    /// failure still paces the retries).
     fn sleeper_tree_script(pid_file: &Path) -> String {
         // Proven-correct on CI (mirrors the pty lifecycle suite): absolute
         // system ping path (no PATH reliance under a hidden window) and an
@@ -3417,13 +3765,8 @@ mod windows_tests {
         )
     }
 
-    fn supervisor_with_tree(
-        dir: &tempfile::TempDir,
-        pid_file: &Path,
-    ) -> (Arc<ProcessSupervisor>, SpawnConfig) {
-        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
-        let sup = ProcessSupervisor::new(cas);
-        let cfg = SpawnConfig {
+    fn tree_cfg(pid_file: &Path) -> SpawnConfig {
+        SpawnConfig {
             cmd: "powershell.exe".into(),
             args: vec![
                 "-NoProfile".into(),
@@ -3437,8 +3780,16 @@ mod windows_tests {
             capture: false, // no pipe drama: the tree is killed, not drained
             artifact_max: 1024 * 1024,
             network_isolation: NetworkIsolation::Inherit,
-        };
-        (sup, cfg)
+        }
+    }
+
+    fn supervisor_with_tree(
+        dir: &tempfile::TempDir,
+        pid_file: &Path,
+    ) -> (Arc<ProcessSupervisor>, SpawnConfig) {
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = ProcessSupervisor::new(cas);
+        (sup, tree_cfg(pid_file))
     }
 
     fn wait_for_grandchild(pid_file: &Path) -> u32 {
@@ -3453,8 +3804,8 @@ mod windows_tests {
     }
 
     /// The task-cancellation path (run + CancellationToken) must kill the
-    /// whole supervised tree: direct powershell child AND ping grandchild
-    /// (taskkill /T over the registered pid, backed by job membership).
+    /// whole supervised tree: direct powershell child AND ping grandchild,
+    /// through the child's kill-on-close job (OS-enumerated membership).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn task_cancellation_kills_the_whole_supervised_tree() {
         let dir = tempfile::tempdir().unwrap();
@@ -3499,9 +3850,9 @@ mod windows_tests {
     }
 
     /// Daemon-crash semantics end-to-end: dropping the LAST supervisor
-    /// reference kills the live tree — the registry kill path (taskkill /T)
-    /// plus the JobGuard kill-on-close that fires as the supervisor's job
-    /// handle closes.
+    /// reference kills the live tree — the per-child job is terminated on
+    /// the drop path and its handle closes right after (kill-on-close), so
+    /// the OS takes every remaining member with no taskkill involved.
     #[test]
     fn dropping_the_supervisor_kills_the_tree() {
         let dir = tempfile::tempdir().unwrap();
@@ -3509,21 +3860,7 @@ mod windows_tests {
         let (direct, grandchild) = {
             let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
             let sup = ProcessSupervisor::new(cas);
-            let cfg = SpawnConfig {
-                cmd: "powershell.exe".into(),
-                args: vec![
-                    "-NoProfile".into(),
-                    "-NonInteractive".into(),
-                    "-Command".into(),
-                    sleeper_tree_script(&pid_file).into(),
-                ],
-                cwd: std::env::temp_dir(),
-                env: EnvSpec::default_baseline(),
-                owner: ProcessOwner::Daemon,
-                capture: false,
-                artifact_max: 1024 * 1024,
-                network_isolation: NetworkIsolation::Inherit,
-            };
+            let cfg = tree_cfg(&pid_file);
             let handle = sup.spawn(cfg).expect("supervised spawn");
             let grandchild = wait_for_grandchild(&pid_file);
             assert!(pid_alive(grandchild), "grandchild must be alive pre-drop");
@@ -3533,6 +3870,105 @@ mod windows_tests {
         wait_until("drop-killed tree death", Duration::from_secs(10), || {
             !pid_alive(direct) && !pid_alive(grandchild)
         });
+    }
+
+    /// Suspended-assign ordering + descendant membership before resume: the
+    /// script starts a `-WindowStyle Hidden` ping as its FIRST action (the
+    /// hidden window gives ping its OWN console, so ONLY job membership can
+    /// reach it) and writes the pid. `CREATE_SUSPENDED` → assign_strict →
+    /// membership check → resume makes the direct child a job member before
+    /// it executes one instruction, so the grandchild is contained by
+    /// descent; a spawn-then-assign race lets it escape. `sup.kill`
+    /// terminates that job and BOTH die (no taskkill pid walk).
+    #[test]
+    fn immediate_detached_grandchild_is_a_job_member_before_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("imm.pid");
+        let (sup, mut cfg) = supervisor_with_tree(&dir, &pid_file);
+        cfg.args[3] = format!(
+            "$ping = Join-Path $env:SystemRoot 'System32\\ping.exe'; \
+             $p = Start-Process -FilePath $ping -ArgumentList '-n','60','127.0.0.1' \
+                 -WindowStyle Hidden -PassThru; \
+             Set-Content -Path '{}' -Value ([string]$p.Id) -Encoding ascii; \
+             Start-Sleep -Seconds 60",
+            pid_file.display()
+        );
+        let handle = sup.spawn(cfg).expect("supervised spawn");
+        let grandchild = wait_for_grandchild(&pid_file);
+        assert!(
+            pid_alive(handle.pid) && pid_alive(grandchild),
+            "direct child + immediate detached grandchild must be alive before the kill"
+        );
+        sup.kill(handle.id, 500).expect("containment kill");
+        wait_until("job-terminated tree death", Duration::from_secs(10), || {
+            !pid_alive(handle.pid) && !pid_alive(grandchild)
+        });
+    }
+
+    /// One containment job per CHILD (never one shared job): killing one
+    /// supervised tree terminates exactly that child's job — the other
+    /// tree, detached grandchild included, keeps running until its own job
+    /// is terminated.
+    #[test]
+    fn kill_takes_only_the_target_childs_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_a = dir.path().join("a.pid");
+        let pid_b = dir.path().join("b.pid");
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = ProcessSupervisor::new(cas);
+        let a = sup.spawn(tree_cfg(&pid_a)).expect("tree a");
+        let b = sup.spawn(tree_cfg(&pid_b)).expect("tree b");
+        let ga = wait_for_grandchild(&pid_a);
+        let gb = wait_for_grandchild(&pid_b);
+        assert!(pid_alive(a.pid) && pid_alive(ga) && pid_alive(b.pid) && pid_alive(gb));
+
+        sup.kill(a.id, 500).expect("kill tree a");
+        wait_until("target tree death", Duration::from_secs(10), || {
+            !pid_alive(a.pid) && !pid_alive(ga)
+        });
+        assert!(
+            pid_alive(b.pid) && pid_alive(gb),
+            "killing one child's job must never touch another child's tree"
+        );
+        sup.kill(b.id, 500).expect("cleanup tree b");
+    }
+
+    /// Exited-leader containment: the direct child starts a detached
+    /// grandchild and exits immediately. `reap()` drops the leader's row —
+    /// and with it the job handle — so kill-on-close takes the descendant.
+    /// A taskkill/pid-walk kill cannot do this: the tree's root pid is
+    /// already gone when the descendant must die.
+    #[test]
+    fn reap_kills_the_descendants_of_an_exited_leader() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("orphan.pid");
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = ProcessSupervisor::new(cas);
+        let mut cfg = tree_cfg(&pid_file);
+        cfg.args[3] = format!(
+            "$ping = Join-Path $env:SystemRoot 'System32\\ping.exe'; \
+             $p = Start-Process -FilePath $ping -ArgumentList '-n','60','127.0.0.1' \
+                 -WindowStyle Hidden -PassThru; \
+             Set-Content -Path '{}' -Value ([string]$p.Id) -Encoding ascii",
+            pid_file.display()
+        );
+        let handle = sup.spawn(cfg).expect("supervised spawn");
+        let grandchild = wait_for_grandchild(&pid_file);
+        assert!(
+            pid_alive(grandchild),
+            "detached descendant alive before reap"
+        );
+        wait_until(
+            "exited leader is collectible",
+            Duration::from_secs(20),
+            || !sup.reap().is_empty(),
+        );
+        assert!(!pid_alive(handle.pid), "leader exited");
+        wait_until(
+            "kill-on-close descendant death after reap",
+            Duration::from_secs(10),
+            || !pid_alive(grandchild),
+        );
     }
 
     // --------------- platform-default shell through the supervisor -------
@@ -3793,5 +4229,152 @@ mod windows_tests {
             sup.alive().is_empty(),
             "no live child after the timeout kill"
         );
+    }
+}
+
+// ============================================== containment policy (portable)
+// The Windows containment ordering policy and the supervisor's kill-path
+// source contract, testable on EVERY host (the runtime rows above are
+// windows-only). Pure policy functions mirror the values the Windows spawn
+// path applies; the source scans lock the protocol order and the removal of
+// taskkill from the primary kill paths.
+#[cfg(test)]
+mod containment_policy_tests {
+    use super::*;
+
+    /// Extract one item's `{...}` body by brace matching. Format-string
+    /// braces are balanced, so the scan is exact for these items.
+    fn body<'a>(src: &'a str, header: &str) -> &'a str {
+        let start = src
+            .find(header)
+            .unwrap_or_else(|| panic!("source has no {header}"));
+        let open = start + src[start..].find('{').expect("item body");
+        let mut depth = 0usize;
+        for (i, b) in src.as_bytes()[open..].iter().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..open + i + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unclosed item {header}");
+    }
+
+    /// Windows creation is suspended until the job owns the child: the pure
+    /// flag function is the ONLY source of the creation flags, and it is
+    /// exactly CREATE_SUSPENDED (0x4, winbase.h).
+    #[test]
+    fn windows_creation_is_suspended_until_assigned() {
+        assert_eq!(
+            win_containment_policy::creation_flags(),
+            win_containment_policy::CREATE_SUSPENDED
+        );
+        assert_eq!(win_containment_policy::CREATE_SUSPENDED, 0x0000_0004);
+    }
+
+    /// Exposure is legal only with BOTH a successful strict assignment and a
+    /// verified membership; every other combination refuses the spawn.
+    #[test]
+    fn exposure_requires_assignment_and_verified_membership() {
+        assert!(win_containment_policy::may_resume(true, true));
+        assert!(!win_containment_policy::may_resume(false, true));
+        assert!(!win_containment_policy::may_resume(true, false));
+        assert!(!win_containment_policy::may_resume(false, false));
+    }
+
+    /// Source contract of the Windows spawn path: `assign_verify_resume`
+    /// executes the one legal order — assign_strict → membership check →
+    /// resume gate → resume — and every spawn path suspends on create and
+    /// prepares the job before spawning.
+    #[test]
+    fn windows_spawn_source_orders_assign_verify_resume() {
+        let src = include_str!("lib.rs");
+        let inner = body(src, "fn assign_verify_resume(");
+        let i_assign = inner.find("assign_strict(").expect("strict assignment");
+        let i_member = inner
+            .find("contains(pid)")
+            .expect("membership verification while suspended");
+        let i_gate = inner.find("may_resume(").expect("exposure gate");
+        let i_resume = inner.find("resume(pid)").expect("resume");
+        assert!(
+            i_assign < i_member,
+            "membership must be verified after assignment"
+        );
+        assert!(
+            i_member < i_gate,
+            "the resume gate must follow membership verification"
+        );
+        assert!(i_gate < i_resume, "resume must be the last step");
+        // The suspension hook is the job-preparation path's child, applied
+        // before spawn on every entry point. (Scan the production source
+        // only: this test's own literals must not count.)
+        let production = src
+            .split("mod containment_policy_tests")
+            .next()
+            .expect("test module split");
+        let contain = body(production, "fn contain_on_create(mut cmd:");
+        assert!(contain.contains("suspend_on_create"));
+        assert_eq!(
+            production
+                .matches("contain_on_create(self.command(&cfg))")
+                .count(),
+            4,
+            "every spawn entry point (run/run_sync/spawn/detached) must suspend on create"
+        );
+        assert_eq!(
+            production.matches("prepare_containment()?").count(),
+            4,
+            "every spawn entry point must prepare the containment job before spawning"
+        );
+    }
+
+    /// Kill-path contract: no supervisor kill path references taskkill. The
+    /// primary authority is the per-child containment job (Windows) or the
+    /// process group (unix); taskkill survives exactly once, as the
+    /// documented best-effort helper for pids the supervisor never owned.
+    #[test]
+    fn supervisor_kill_paths_do_not_depend_on_taskkill() {
+        let src = include_str!("lib.rs");
+        let production = src
+            .split("mod containment_policy_tests")
+            .next()
+            .expect("test module split");
+        for header in [
+            "async fn terminate_registered(",
+            "fn terminate_registered_sync(",
+            "pub fn kill(",
+            "pub fn kill_all_for(",
+            "impl Drop for ProcessSupervisor {",
+        ] {
+            let inner = body(production, header);
+            assert!(
+                !inner.contains("taskkill"),
+                "{header} must not fall back to taskkill"
+            );
+            assert!(
+                inner.contains("terminate_containment")
+                    || inner.contains("terminate_registered")
+                    || inner.contains("kill_group_async"),
+                "{header} must terminate through the containment authority"
+            );
+        }
+        assert_eq!(
+            production.matches("Command::new(\"taskkill\")").count(),
+            1,
+            "taskkill must survive only as the single best-effort helper"
+        );
+        assert!(body(production, "fn taskkill_best_effort(").contains("taskkill"));
+        // kill_child_pid routes a registered pid through the containment job;
+        // the unowned-pid fallback is `kill_group`, whose non-unix body is
+        // exactly the documented taskkill afterthought.
+        let kcp = body(production, "pub fn kill_child_pid(");
+        assert!(kcp.contains("terminate_containment"));
+        assert!(kcp.contains("kill_group"));
+        assert!(body(production, "fn kill_group(").contains("taskkill_best_effort"));
     }
 }

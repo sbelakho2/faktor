@@ -5,20 +5,20 @@ The JetBrains side of the Faktor split-mode design. The daemon is the
 process lifecycle, the auth channel, the protocol clients, and a real
 frontend panel. There is no placeholder code left in this tree.
 
-The upstream JetBrains 7.1.2 Kotlin UI sources are not vendored (that
-remains an external dependency), so the frontend here is a native Swing
-panel that speaks Faktor Native Protocol v1 directly. The real
-IntelliJ-platform tool-window adapter (`FaktorToolWindowFactory` +
-`META-INF/plugin.xml`) embeds the same `FaktorChatPanel` without touching
-the bridge.
+The upstream JetBrains 7.1.2 Kotlin sources are vendored at
+`compat/jetbrains-712/kilo-jetbrains` as the pinned, hash-verified
+reference corpus (MIT; per-file SHA-256 in `ui/upstream.json` under
+`jetbrains_712`; see `compat/jetbrains-712/NOTICE.md`). Upstream 7.1.2 is
+Kotlin/Swing, so the Faktor-owned Swing panels below remain the ONE
+rendering implementation; the vendored tree is not a second renderer.
 
 ## Modules
 
 | Module | Contents |
 | --- | --- |
-| `:shared` | `dev.faktor.shared` — plain Kotlin data classes with zero dependencies. `Protocol.kt` is the frozen v7.5.6 wire contract (legacy migration glue); `NativeProtocol.kt` is the native surface: a JSON value model, a recursive-descent reader/writer, typed DTO parsers, and the strict request bodies. |
-| `:backend` | `dev.faktor.backend` — `BackendProcessManager` (launch, startup line, bounded stdout drainer, SIGTERM-then-forcible stop), `NativeClient` (bearer-authenticated HTTP client of the native endpoints), `NativeEventStream` (SSE journal stream with cursor resume and bounded backoff). |
-| `:frontend` | `dev.faktor.frontend` — `FaktorFrontendService` (the UI-free bridge: start/stop, session, task-run/agent/usage/verification/evidence routing, stream lifecycle), `FaktorChatPanel` (native Swing tool-window panel: chat input, streaming transcript, task/verification/budget status, agent controls, evidence retrieval) and `FaktorToolWindowFactory` (the IntelliJ tool-window host). `FaktorFrontendApp` launches the panel standalone. `src/main/resources/META-INF/plugin.xml` is the real plugin descriptor (`dev.faktor.jetbrains`, name/vendor `Faktor`, version `0.1.0`, `since-build 241`). |
+| `:shared` | `dev.faktor.shared` — plain Kotlin data classes with zero dependencies. `Protocol.kt` is the frozen v7.5.6 wire contract (legacy migration glue); `NativeProtocol.kt` is the native surface: a JSON value model, a recursive-descent reader/writer, typed DTO parsers (incl. providers and terminals), and the strict request bodies. |
+| `:backend` | `dev.faktor.backend` — `BackendProcessManager` (launch, startup line, bounded stdout drainer, SIGTERM-then-forcible stop), `NativeClient` (bearer-authenticated HTTP client of the native endpoints incl. providers/terminals/output), `NativeEventStream` (SSE journal stream with cursor resume and bounded backoff). |
+| `:frontend` | `dev.faktor.frontend` — `FaktorFrontendService` (the UI-free bridge: start/stop/attach/restart, session, task-run/agent/usage/verification/evidence/provider/terminal routing, stream lifecycle and `reconnectStream` cursor resume), `FaktorChatPanel` (native Swing tool-window panel with Status, Task, Task Tree, Agents, Permissions, Tournament, Board, Evidence, Terminal, Settings and History tabs) plus the section panels (`TaskTreePanel`, `BlockersPanel`, `PermissionsPanel`, `TerminalPanel`, `SettingsPanel`, `HistoryPanel`, `TournamentPanel`, `BoardPanel`, `EvidenceNavigatorPanel`, `AttachmentsPanel`) and `FaktorToolWindowFactory` (the IntelliJ tool-window host). `FaktorFrontendApp` launches the panel standalone. `src/main/resources/META-INF/plugin.xml` is the real plugin descriptor (`dev.faktor.jetbrains`, name/vendor `Faktor`, version `0.1.0`, `since-build 241`). |
 
 ## Authentication and lifecycle
 
@@ -51,6 +51,10 @@ the bridge.
 | usage | `GET /native/usage`, `GET /native/session/{id}/usage` |
 | verification | `GET /native/session/{id}/verification`, `GET /native/session/{id}/tasks/{task_id}/verification` |
 | evidence | `GET /native/evidence/{id}`, `POST /native/evidence/{id}/retrieve` |
+| providers | `GET /native/providers` (registry view; `/models` catalog remains the fallback join) |
+| terminals | `GET /native/terminals?session={id}`, `GET /native/session/{id}/terminal/events`, `POST /native/session/{id}/terminal` (session-owned spawn), `GET /pty/{pty_id}/output` (snapshot) |
+| history / lifecycle | `GET /session/list`, start/stop/attach, `restart()` (session+cursor preserved), `reconnectStream()` (SSE cursor resume) |
+| permissions | `GET /permission/list?session_id={id}`, `POST /permission/reply` |
 
 SSE frames carry `event:`, `id:` (journal sequence = resume cursor) and one
 JSON `data:` line. Heartbeats are ignored but advance the cursor; oversized
@@ -126,7 +130,23 @@ This builds `faktor-cli` if missing and then:
    then the real native flow (start → bearer health → ready → create
    session → prompt → SSE frames + cursor → messages → journal page →
    task-runs → agents → usage → verification → task views → typed
-   evidence error → stop).
+   evidence error → stop);
+4. runs `FrontendSmoke <binary>` — canned native frames for every panel
+   section plus the real daemon (task-run attachments, permissions,
+   tournaments, board round-trip, typed refusals, evidence);
+5. runs `JetBrainsParitySmoke <binary>` — first the upstream pin
+   (`UPSTREAM PIN PASS`: every per-file SHA-256 of
+   `compat/jetbrains-712/kilo-jetbrains` from `ui/upstream.json`, the
+   license hash and the Faktor patch-set paths, all offline), then the
+   ten parity families over canned frames (`task mode`, `agent tree with
+   blockers/presentation/pixel identity`, `permissions`, `terminal`,
+   `review/tournament`, `evidence navigation`, `settings`, `provider
+   selection`, `history`, `restart/reconnect`), then a raw-socket fake
+   daemon driving the REAL `FaktorFrontendService` + `FaktorChatPanel`
+   end to end (permission reply, terminal spawn, task-run body,
+   session-from-selection, history open, SSE cursor resume), then the
+   real daemon (history, task-run with mutation mode, terminal
+   spawn/list/events/output, restart with the durable session, reconnect).
 
 Every step prints PASS/FAIL; the script exits nonzero on any failure. The
 script compiles only the non-IntelliJ sources, so it stays runnable

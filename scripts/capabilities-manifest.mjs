@@ -21,7 +21,7 @@
 //   CAPABILITIES_OUT_DIR  output directory (default target/certification)
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -32,7 +32,20 @@ const DOC_PATH = resolve(ROOT, 'docs/certification.md');
 const GENERATE_ONLY = process.argv.includes('--generate-only');
 
 const file = (rel) => existsSync(resolve(ROOT, rel));
-const dir = (rel) => existsSync(resolve(ROOT, rel)) && !file(rel);
+
+// A DIRECTORY probe must actually test isDirectory(): `exists && !exists`
+// is dead code and silently kept the vendored-JetBrains flip unreachable.
+const dir = (rel) => {
+  const path = resolve(ROOT, rel);
+  if (!existsSync(path)) {
+    return false;
+  }
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+};
 
 function readText(rel) {
   return readFileSync(resolve(ROOT, rel), 'utf8');
@@ -274,6 +287,58 @@ function buildManifest() {
   };
 }
 
+// ---------------------------------------------------------- self-check
+//
+// The derivations above are only as honest as their probes. This check
+// fails loudly when (a) the file()/dir() probes stop distinguishing
+// files from directories (the historical `exists && !exists` bug kept the
+// vendored-JetBrains flip unreachable), or (b) the pinned 7.1.2 corpus is
+// present but the two JetBrains-dependent surfaces do NOT carry the label
+// it earns — and vice versa when the corpus is absent.
+function selfCheck(manifest) {
+  const problems = [];
+  if (dir('scripts') !== true || dir('scripts/capabilities-manifest.mjs') !== false) {
+    problems.push(
+      'file()/dir() probes disagree with the tree (scripts/ is a directory, scripts/capabilities-manifest.mjs is a regular file)',
+    );
+  } else if (file('scripts/capabilities-manifest.mjs') !== true) {
+    problems.push('file() probe disagrees with the tree for scripts/capabilities-manifest.mjs');
+  }
+  const jetbrainsPin = dir('compat/jetbrains-712');
+  const jetbrainsLabel = manifest.surfaces.jetbrains_frontend.status;
+  const parityLabel = manifest.surfaces.ui_parity.status;
+  if (jetbrainsPin) {
+    if (jetbrainsLabel !== 'IMPLEMENTED') {
+      problems.push(
+        `jetbrains_frontend is ${jetbrainsLabel} although the pinned 7.1.2 corpus compat/jetbrains-712/ is present`,
+      );
+    }
+    if (vscodeWebviewStatus() === 'IMPLEMENTED' && parityLabel !== 'IMPLEMENTED') {
+      problems.push(
+        `ui_parity is ${parityLabel} although both pinned corpora (v7.5.6 webview + 7.1.2 JetBrains) are present`,
+      );
+    }
+  } else {
+    if (jetbrainsLabel === 'IMPLEMENTED') {
+      problems.push(
+        'jetbrains_frontend claims IMPLEMENTED but the pinned 7.1.2 corpus compat/jetbrains-712/ is absent',
+      );
+    }
+    if (parityLabel === 'IMPLEMENTED') {
+      problems.push(
+        'ui_parity claims IMPLEMENTED but the pinned 7.1.2 corpus compat/jetbrains-712/ is absent',
+      );
+    }
+  }
+  if (problems.length > 0) {
+    for (const problem of problems) {
+      console.error(`capabilities self-check: ${problem}`);
+    }
+    process.exit(1);
+  }
+  return jetbrainsPin;
+}
+
 // ---------------------------------------------------------- docs drift check
 
 // The doc's capability table rows carry a backticked key and an uppercase
@@ -365,6 +430,7 @@ function implementedClaimErrors() {
 // --------------------------------------------------------------------- main
 
 const manifest = buildManifest();
+const jetbrainsPin = selfCheck(manifest);
 mkdirSync(resolve(ROOT, OUT_DIR), { recursive: true });
 writeFileSync(MANIFEST_PATH, `${JSON.stringify(manifest, null, 2)}\n`);
 
@@ -377,6 +443,11 @@ const summary = Object.entries(manifest.surfaces)
   .join(' ');
 console.log(`capabilities manifest: ${MANIFEST_PATH}`);
 console.log(`surfaces: ${summary}`);
+console.log(
+  jetbrainsPin
+    ? 'capabilities self-check: probes ok; pinned JetBrains 7.1.2 corpus present and the JetBrains-dependent labels carry their earned status.'
+    : 'capabilities self-check: probes ok; no pinned JetBrains 7.1.2 corpus (labels stay honest without it).',
+);
 if (!GENERATE_ONLY) {
   console.log('docs/certification.md capability table in sync.');
 }
