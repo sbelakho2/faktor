@@ -47,15 +47,21 @@ LLM used only where reasoning is actually needed
   creates a kill-on-close Job Object per supervised child
   (`CreateJobObjectW` + `AssignProcessToJobObject` +
   `SetInformationJobObject` in `crates/winjob`, wired through
-  `faktor-terminal`) with `taskkill /T` as the escalation path.
+  `faktor-terminal`) with `taskkill /T` as the escalation path. The session
+  PTY authority (`crates/pty`, ACP-negotiated `faktor.terminal`) spawns
+  ConPTY children `CREATE_SUSPENDED`, assigns them to a
+  `KILL_ON_JOB_CLOSE` job, then resumes: no child runs outside the job.
 - **Provider normalization** — ~10 transport families + dynamic model registry.
-  No `if provider == "deepseek"` anywhere in the agent.
+  OpenAI Chat Completions and the native **Responses** API are both
+  first-class (`api=chat|responses`, Responses by default for the official
+  endpoint; strict parsing, streaming/deadline/retry/terminal tests). No
+  `if provider == "deepseek"` anywhere in the agent.
 
 ## Layout
 
 ```
 apps/        (real Faktor IDE panels: the VS Code extension host/chat/cockpit and the JetBrains split-mode frontend/backend — task tree, blockers, tournament, board, evidence; no upstream JetBrains sources)
-crates/      (the Rust engine workspace, incl. winjob/agent/verify/sandbox/index/cas/snapshot)
+crates/      (the Rust engine workspace, incl. winjob/pty/agent/verify/sandbox/index/cas/snapshot)
 compat/      (permanent protocol fixtures: kilo-v756/, jetbrains-712/)
 fixtures/    (protocol, providers, screenshots, repositories)
 tests/       (integration, soak, fault, visual, performance — adversarial only)
@@ -76,10 +82,12 @@ ui/          (vendored frozen upstream UI: kilo-v756-webview/ + kilo-ui/, pinned
   fallback. Later releases are never merged wholesale.
 - **JetBrains:** JetBrains 7.1.2 (Kotlin frontend stays; process manager is
   modified only to launch the Faktor binary).
-- **Protocol (TARGET):** the real v7.5.6 contract is the compatibility
-  destination; `compat/kilo-v756/` currently holds a hand-written wire
-  surface (subset) labelled as such. The Rust daemon must pass the real
-  contract before the old backend is removed.
+- **Protocol (glue; full parity TARGET):** the real v7.5.6 contract remains
+  the compatibility destination; `compat/kilo-v756/` golden fixtures are
+  frozen and exercised byte-for-byte by `tests/compat` for the wired subset
+  (startup line, auth, sessions, messages, SSE, provider list, errors). The
+  Rust daemon must pass the full contract before the old backend is removed;
+  the native protocol stays the daemon's own surface.
 
 ## Building
 
@@ -121,19 +129,30 @@ precedence over a root `.woodpecker.yml`, and this repository has none):
   the Woodpecker API.
 
 The `certificate` job is the aggregate gate in every workflow: every lane
-writes `target/certification/lanes/<lane>.json` into the shared workflow
-workspace, and the certificate (depending on all lanes, running on `success`
-or `failure`) fails when a marker is missing/failed/stale/unexpected or the
-workflow status is not success; darwin/windows carry per-platform
-certificates inside `trusted.yaml`. Woodpecker reports one commit status per
-workflow, so branch protection requires `ci/woodpecker/pr/pr`. No secrets are
-required; the named cache volumes need the repository to be marked trusted by
-a server admin (see `scripts/woodpecker/setup.md` for the PR-vs-trusted
-storage policy and its residual risks).
+emits a `faktor-woodpecker-lane/v2` marker with the exact commit and tree,
+runner identity, command-set digest, timestamps and artifact hashes into
+`target/certification/lanes/<lane>.json`, and the certificate (depending on
+all lanes, running on `success` or `failure`) runs
+`node scripts/certification/evidence.mjs verify-markers` — rejecting missing,
+unexpected, duplicate, unreadable, other-commit, tree-mismatch, stale-run,
+failed-lane, skipped-required, silent-skip, command-digest/drift,
+artifact-mismatch and non-success workflow status — then writes
+`ci-certification.json`. Passing campaigns also write
+`target/certification/evidence/<kind>.json` `faktor-cert-evidence/v1`
+objects (`real_provider`, `real_soak`, ...); release gates require those
+objects to be signed by an allowlisted ed25519 identity. darwin/windows
+carry per-platform certificates inside `trusted.yaml`. Woodpecker reports
+one commit status per workflow, so branch protection requires
+`ci/woodpecker/pr/pr`. No secrets are required; the named cache volumes need
+the repository to be marked trusted by a server admin (see
+`scripts/woodpecker/setup.md` for the PR-vs-trusted storage policy and its
+residual risks).
 
 The offline per-host certificate is unchanged: `bash scripts/certify-local.sh
-fast` (or `full`) emits `target/certification/manifest.json`; see
-`docs/certification.md`.
+fast` (or `full`) emits `target/certification/manifest.json` and consumes
+signed evidence objects for release gates (`docs/certification.md` §6); the
+`CERTIFY_*` booleans are inert self-test inputs and setting one without a
+verifying signed evidence file fails the run.
 
 ## Branding
 
@@ -169,5 +188,10 @@ authoritative surface and is scan-enforced.
 | Multi-candidate tournament | IMPLEMENTED | `crates/orchestrator/src/tournament.rs` + native start/state/list endpoints; integration stays an explicit approved merge |
 | Pixel agents | IMPLEMENTED | `apps/vscode/src/pixelAgents.ts` + JetBrains `PixelAgents.kt` (identical FNV-1a hashes) |
 | Canonical child blockers | IMPLEMENTED | `crates/session/src/child.rs` (`child_runtime` v23 row) + native agent projection |
-| Presentation continuity | IMPLEMENTED | durable `child_presentation_changed` fold + `POST /native/session/{id}/agents/{child}/presentation` (presentation only; same ChildId/lineage) |
+| Presentation continuity | IMPLEMENTED | durable `child_presentation_changed` fold + `POST /native/session/{id}/agents/{child}/presentation` (`crates/session/src/child.rs`, `crates/server/src/native/agents.rs`; presentation only, same ChildId/lineage) |
+| Materialize → verify → land | IMPLEMENTED | durable `IntegrationRecord` with real final-root verification (`crates/session/src/ledger.rs` `IntegrationRecordRow`, `crates/orchestrator/src/task_executor.rs`); owner edits invalidate |
+| Typed criterion proofs | IMPLEMENTED | `NoOpDisposition::RequiresCriterionProof` (`crates/core/src/state.rs`) + independent reviewer proof validated before completion steps run (`crates/orchestrator/src/task_executor.rs` `run_completion_steps_against_proof`) |
+| OpenAI Responses family | IMPLEMENTED | native `OpenAiFamily::Responses` dispatch + `responses_body`/`responses_stream` (`crates/openai/src/lib.rs`), CLI `api=chat\|responses` (`crates/cli/src/config.rs` `OpenAiApi`) |
+| Windows containment (Job Objects + ConPTY) | IMPLEMENTED | `crates/winjob/src/lib.rs`, `crates/terminal/src/lib.rs` (`JobGuard`), `crates/pty/src/windows.rs` (spawn suspended → assign → resume; no taskkill guarantee) |
+| Certification evidence chain | IMPLEMENTED | `scripts/certification/evidence.mjs` (`faktor-cert-evidence/v1`, `verify-markers`), `scripts/certification/evidence.schema.json`, `scripts/certify-local.sh` (`evidence_gate`), v2 lane markers in `.woodpecker/pr.yaml` |
 | Repo rename (faktor) | DONE (external) | `gh repo rename`; in-tree branding was already Faktor and is unchanged |

@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "faktor-cert-evidence/v1",
+  "title": "Faktor certification evidence object",
+  "description": "Exact-SHA evidence written by a certification lane into target/certification/evidence/<kind>.json. Booleans never certify: only a schema-valid object bound to the commit and tree, with digests matching the recorded commands/artifacts, certifies. Release-grade gates additionally require an ed25519 signature by an allowlisted CI identity (scripts/certification/evidence.mjs verify --require-signed).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "repository",
+    "commit_sha",
+    "tree_hash",
+    "kind",
+    "status",
+    "started_at",
+    "finished_at",
+    "commands_digest",
+    "artifact_digest",
+    "runner"
+  ],
+  "properties": {
+    "schema": {
+      "const": "faktor-cert-evidence/v1"
+    },
+    "repository": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Repository identity (git remote URL, or an explicit name when no remote is configured)."
+    },
+    "commit_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "git rev-parse HEAD at the moment the evidence was written."
+    },
+    "tree_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "git rev-parse 'HEAD^{tree}' at the same moment: the tree object of the commit (the documented tree-hash command; do not use git write-tree, which would hash the mutable index)."
+    },
+    "kind": {
+      "type": "string",
+      "pattern": "^[a-z0-9_]+$",
+      "description": "Evidence kind; must match the file name target/certification/evidence/<kind>.json."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["passed", "failed", "skipped"]
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "finished_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "commands_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "sha256 of the canonical command-set text (commands joined with newlines, no trailing newline)."
+    },
+    "artifact_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "sha256 of the canonical artifact list: for each artifact sorted by path, the line '<sha256>:<hex>\\t<path>\\n'; sha256 of the empty string when there are no artifacts."
+    },
+    "repository_tree_verified": {
+      "type": "boolean",
+      "description": "True when the writer confirmed tree_hash equals git rev-parse 'HEAD^{tree}' at write time."
+    },
+    "runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "arch", "ci", "run_id"],
+      "properties": {
+        "os": { "type": "string", "enum": ["darwin", "linux", "windows", "unknown"] },
+        "arch": { "type": "string", "minLength": 1 },
+        "ci": { "type": "string", "minLength": 1 },
+        "run_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "commands": {
+      "type": ["array", "null"],
+      "items": { "type": "string" },
+      "description": "Optional human-readable command list; the digest alone is normative."
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+        }
+      }
+    },
+    "signature": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["algorithm", "identity", "public_key", "value"],
+      "properties": {
+        "algorithm": { "const": "ed25519" },
+        "identity": { "type": "string", "minLength": 1 },
+        "public_key": {
+          "type": "string",
+          "minLength": 44,
+          "description": "Base64 raw 32-byte ed25519 public key; must match the allowlisted key for identity."
+        },
+        "value": {
+          "type": "string",
+          "minLength": 44,
+          "description": "Base64 ed25519 signature over the canonical JSON of this object without the signature field (keys sorted)."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,261 @@
+{
+  "schema": "faktor.compat.sdk-traces/v1",
+  "sdk": {
+    "commit": "fa02955bfa17b60e57e0d7406d200a73337472ee",
+    "package": "@kilocode/sdk",
+    "path": "packages/sdk/js",
+    "version": "7.5.6"
+  },
+  "steps": [
+    {
+      "args": {
+        "full": "true",
+        "sessionID": "$sessionID"
+      },
+      "call": "session.diff",
+      "id": "session.diff.empty",
+      "note": "No checkpoint rows exist in this harness, so the daemon's [] matches the SDK's array type trivially; with rows the entry shape diverges (daemon {path,status,diff?} vs SDK SnapshotFileDiff {file,patch,before,after,additions,deletions,status}). Locked as divergence until a checkpoint row is exercised.",
+      "request": {
+        "method": "GET",
+        "path": "/session/@string/diff",
+        "query": "full=true"
+      },
+      "response": {
+        "body": [],
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "#nonempty"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionDiffResponses.200 (Array<SnapshotFileDiff>)",
+      "status": "divergence"
+    },
+    {
+      "args": {
+        "full": "false",
+        "messageID": "999",
+        "sessionID": "$sessionID"
+      },
+      "call": "session.diff",
+      "id": "session.diff.missing-message",
+      "note": "The SDK spells the filter messageID (vs the daemon's old message=) and full as \"true\"/\"false\" (vs full=1). The compat layer now accepts both spellings and answers the unknown message with an honest 409 refusal instead of silently ignoring the filter.",
+      "request": {
+        "method": "GET",
+        "path": "/session/@string/diff",
+        "query": "full=false&messageID=999"
+      },
+      "response": {
+        "body": {
+          "message": "diff: unknown message id 999",
+          "ok": false
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 409
+      },
+      "sdk_requires": [],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionDiffResponses.200",
+      "status": "divergence"
+    },
+    {
+      "args": {
+        "sessionID": "$sessionID"
+      },
+      "call": "session.abort",
+      "id": "session.abort",
+      "note": "SDK 200: boolean; daemon 200: {aborted:[opId]}.",
+      "request": {
+        "method": "POST",
+        "path": "/session/@string/abort",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "aborted": [
+            "@string"
+          ]
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "#bool"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionAbortResponses.200 (boolean)",
+      "status": "divergence"
+    },
+    {
+      "args": {
+        "messageID": "$cursor",
+        "sessionID": "$sessionID"
+      },
+      "call": "session.revert",
+      "id": "session.revert",
+      "note": "Snapshots are not wired in this harness: the daemon refuses 409 {ok:false,message} instead of returning the SDK's Session8 revert projection.",
+      "request": {
+        "body": {
+          "messageID": "@string"
+        },
+        "content_type": "application/json",
+        "method": "POST",
+        "path": "/session/@string/revert",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "message": "revert unavailable: snapshots unavailable",
+          "ok": false
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 409
+      },
+      "sdk_requires": [],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionRevertResponses.200 (Session8)",
+      "status": "divergence"
+    },
+    {
+      "args": {
+        "sessionID": "$sessionID"
+      },
+      "call": "session.unrevert",
+      "id": "session.unrevert",
+      "note": "The SDK sends NO body; the compat handler now accepts the body-less form (the old protocol DTO required one) and refuses honestly 409 because the daemon has no durable revert target to redo.",
+      "request": {
+        "method": "POST",
+        "path": "/session/@string/unrevert",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "message": "unrevert unavailable: no revert target (the SDK sends no message id; the daemon keeps no durable revert state in this slice)",
+          "ok": false
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 409
+      },
+      "sdk_requires": [],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionUnrevertResponses.200 (Session9)",
+      "status": "divergence"
+    },
+    {
+      "args": {
+        "messageID": "$cursor",
+        "sessionID": "$sessionID"
+      },
+      "call": "session.deleteMessage",
+      "id": "session.deleteMessage",
+      "note": "SDK 200: boolean; daemon 200: {ok:true}.",
+      "request": {
+        "method": "DELETE",
+        "path": "/session/@string/message/@string",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "message": "deleteMessage refused: message 3 is the active turn's newest message (in flight); stop the turn before removing it",
+          "ok": false
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 409
+      },
+      "sdk_requires": [
+        "#bool"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionDeleteMessageResponses.200 (boolean)",
+      "status": "divergence"
+    },
+    {
+      "args": {
+        "messageID": "$cursor",
+        "sessionID": "$sessionID"
+      },
+      "call": "session.fork",
+      "id": "session.fork",
+      "note": "The SDK's optional {messageID} body is accepted (the daemon forks the whole history); the response is the daemon {sessionID,title,createdMs} instead of the SDK rich Session5.",
+      "request": {
+        "body": {
+          "messageID": "@string"
+        },
+        "content_type": "application/json",
+        "method": "POST",
+        "path": "/session/@string/fork",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "createdMs": "@int",
+          "sessionID": "@string",
+          "title": "wire trace (fork)"
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "id",
+        "time.created"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionForkResponses.200 (Session5)",
+      "status": "divergence"
+    },
+    {
+      "args": {
+        "sessionID": "$sessionID"
+      },
+      "call": "session.delete",
+      "id": "session.delete",
+      "note": "SDK 200: boolean; daemon 200: {ok:true} (the deleted session stays as a Closed tombstone row).",
+      "request": {
+        "method": "DELETE",
+        "path": "/session/@string",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "message": "session 1 is mid-turn (ReadyForNextTurn); refuse to delete",
+          "ok": false
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 409
+      },
+      "sdk_requires": [
+        "#bool"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionDeleteResponses.200 (boolean)",
+      "status": "divergence"
+    },
+    {
+      "args": {
+        "sessionID": "$sessionID2"
+      },
+      "call": "session.delete",
+      "id": "session.delete.clean",
+      "note": "Success branch on a never-driven session: the daemon durably ends the session and answers {ok:true} where the SDK declares boolean.",
+      "request": {
+        "method": "DELETE",
+        "path": "/session/@string",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "ok": true
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "#bool"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionDeleteResponses.200 (boolean)",
+      "status": "divergence"
+    }
+  ]
+}

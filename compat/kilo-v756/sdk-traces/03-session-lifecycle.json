@@ -1,0 +1,468 @@
+{
+  "schema": "faktor.compat.sdk-traces/v1",
+  "sdk": {
+    "commit": "fa02955bfa17b60e57e0d7406d200a73337472ee",
+    "package": "@kilocode/sdk",
+    "path": "packages/sdk/js",
+    "version": "7.5.6"
+  },
+  "steps": [
+    {
+      "args": {
+        "agent": "default",
+        "metadata": {
+          "origin": "compat-sdk-traces"
+        },
+        "model": {
+          "id": "m",
+          "providerID": "fake"
+        },
+        "title": "wire trace"
+      },
+      "call": "session.create",
+      "capture": {
+        "sessionID": [
+          "data.sessionID",
+          "data.id"
+        ]
+      },
+      "id": "session.create",
+      "note": "daemon 200: {sessionID,title,createdMs}; SDK Session3: {id,slug,projectID,workspaceID?,directory,path?,parentID?,title,agent?,model?,version,metadata?,time:{created,updated,compacting?,archived?},...}.",
+      "request": {
+        "body": "{\"agent\":\"default\",\"metadata\":{\"origin\":\"compat-sdk-traces\"},\"model\":{\"id\":\"m\",\"providerID\":\"fake\"},\"title\":\"wire trace\"}",
+        "content_type": "application/json",
+        "method": "POST",
+        "path": "/session",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "createdMs": "@int",
+          "sessionID": "@string",
+          "title": "wire trace"
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "id",
+        "slug",
+        "projectID",
+        "directory",
+        "version",
+        "time"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionCreateResponses.200 (Session3)",
+      "status": "divergence"
+    },
+    {
+      "args": {
+        "metadata": null,
+        "model": {
+          "id": "m",
+          "providerID": "fake"
+        },
+        "permission": null,
+        "platform": null,
+        "title": "wire trace nulls"
+      },
+      "call": "session.create",
+      "id": "session.create.null-optionals",
+      "note": "Null-vs-absent probe: the unmodified client serializes explicit nulls into the body (the daemon accepts them); the response divergence is the same rich-Session gap as session.create.",
+      "request": {
+        "body": "{\"metadata\":null,\"model\":{\"id\":\"m\",\"providerID\":\"fake\"},\"permission\":null,\"platform\":null,\"title\":\"wire trace nulls\"}",
+        "content_type": "application/json",
+        "method": "POST",
+        "path": "/session",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "createdMs": "@int",
+          "sessionID": "@string",
+          "title": "wire trace nulls"
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "id",
+        "time"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionCreateResponses.200 (Session3)",
+      "status": "divergence"
+    },
+    {
+      "args": {
+        "limit": 20,
+        "roots": true
+      },
+      "call": "session.list",
+      "id": "session.list",
+      "note": "daemon 200: {sessions:[SessionSummary]}; SDK 200: Array<Session1> (the bare rich-session array).",
+      "request": {
+        "method": "GET",
+        "path": "/session",
+        "query": "limit=20&roots=true"
+      },
+      "response": {
+        "body": {
+          "sessions": [
+            {
+              "createdMs": "@int",
+              "sessionID": "@string",
+              "state": "idle",
+              "title": "wire trace nulls",
+              "updatedMs": "@int"
+            },
+            {
+              "createdMs": "@int",
+              "sessionID": "@string",
+              "state": "idle",
+              "title": "wire trace",
+              "updatedMs": "@int"
+            }
+          ]
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "#array"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionListResponses.200 (Array<Session1>)",
+      "status": "divergence"
+    },
+    {
+      "args": {
+        "sessionID": "$sessionID"
+      },
+      "call": "session.get",
+      "id": "session.get",
+      "note": "daemon 200: {sessionID,title,state,createdMs,updatedMs}; SDK Session2 requires id/directory/version/time{}.",
+      "request": {
+        "method": "GET",
+        "path": "/session/@string",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "createdMs": "@int",
+          "sessionID": "@string",
+          "state": "idle",
+          "title": "wire trace",
+          "updatedMs": "@int"
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "id",
+        "time.created"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionGetResponses.200 (Session2)",
+      "status": "divergence"
+    },
+    {
+      "args": {
+        "sessionID": "$sessionID",
+        "title": "wire trace updated"
+      },
+      "call": "session.update",
+      "id": "session.update",
+      "note": "The SDK updates with PATCH /session/{sessionID}; the daemon registers POST for the frozen update op. Route/method and response shape both diverge.",
+      "request": {
+        "body": "{\"title\":\"wire trace updated\"}",
+        "content_type": "application/json",
+        "method": "PATCH",
+        "path": "/session/@string",
+        "query": ""
+      },
+      "response": {
+        "body": null,
+        "content_type": "",
+        "event_stream": false,
+        "status": 405
+      },
+      "sdk_requires": [
+        "id",
+        "time.updated"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionUpdateResponses.200 (Session4)",
+      "status": "divergence"
+    },
+    {
+      "args": {},
+      "call": "session.status",
+      "id": "session.status",
+      "note": "The SDK asks for the whole status MAP (directory/workspace query only); the daemon's /session/status alias requires ?session_id= and projects ONE session state.",
+      "request": {
+        "method": "GET",
+        "path": "/session/status",
+        "query": ""
+      },
+      "response": {
+        "body_text": "Failed to deserialize query string: missing field `session_id`",
+        "content_type": "text/plain",
+        "event_stream": false,
+        "status": 400
+      },
+      "sdk_requires": [],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionStatusResponses.200 ({ [key: string]: SessionStatus })",
+      "status": "divergence"
+    },
+    {
+      "args": {
+        "limit": 10,
+        "sessionID": "$sessionID"
+      },
+      "call": "session.messages",
+      "id": "session.messages.empty",
+      "note": "Empty projection: the daemon's bare [] (plus x-has-more:false) is byte-identical to the SDK's declared array; this is the one session surface that passes with no messages.",
+      "request": {
+        "method": "GET",
+        "path": "/session/@string/message",
+        "query": "limit=10"
+      },
+      "response": {
+        "body": [],
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionMessagesResponses.200 (Array<{info: Message, parts: Array<Part>}>)",
+      "status": "passing"
+    },
+    {
+      "args": {
+        "model": {
+          "modelID": "m",
+          "providerID": "fake"
+        },
+        "parts": [
+          {
+            "synthetic": false,
+            "text": "ping",
+            "time": {
+              "start": 0
+            },
+            "type": "text"
+          }
+        ],
+        "sessionID": "$sessionID",
+        "snapshotInitialization": "wait",
+        "tools": {
+          "read_file": true,
+          "write_file": false
+        }
+      },
+      "call": "session.prompt",
+      "id": "session.prompt",
+      "note": "Realistic SDK input union: `tools` is a name->bool map, `snapshotInitialization` is \"wait\", and the text part carries the SDK's extra synthetic/time fields; the compat layer accepts all of it (the scaffold DTO would have rejected the body). The RESPONSE still diverges: daemon {info:{sessionID,messageID,role,createdMs,providerID,modelID}, parts:[{type,text}]} vs SDK AssistantMessage id/time{}/parentID/mode/agent/path/cost/tokens and Part id/sessionID/messageID.",
+      "request": {
+        "body": "{\"model\":{\"modelID\":\"m\",\"providerID\":\"fake\"},\"parts\":[{\"synthetic\":false,\"text\":\"ping\",\"time\":{\"start\":0},\"type\":\"text\"}],\"snapshotInitialization\":\"wait\",\"tools\":{\"read_file\":true,\"write_file\":false}}",
+        "content_type": "application/json",
+        "method": "POST",
+        "path": "/session/@string/message",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "info": {
+            "createdMs": "@int",
+            "messageID": "@string",
+            "modelID": "m",
+            "providerID": "fake",
+            "role": "assistant",
+            "sessionID": "@string"
+          },
+          "parts": [
+            {
+              "text": "pong",
+              "type": "text"
+            }
+          ]
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "info.id",
+        "info.time.created"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionPromptResponses.200 ({info: AssistantMessage, parts: Array<Part>})",
+      "status": "divergence"
+    },
+    {
+      "args": {
+        "limit": 1,
+        "sessionID": "$sessionID"
+      },
+      "call": "session.messages",
+      "capture": {
+        "cursor": [
+          "data.0.info.messageID",
+          "data.0.info.id"
+        ]
+      },
+      "id": "session.messages.newest",
+      "note": "Newest-first single page (the daemon's paging cursor is the message sequence); the entry info/parts are the daemon's wire rows, not the SDK Message/Part rich objects.",
+      "request": {
+        "method": "GET",
+        "path": "/session/@string/message",
+        "query": "limit=@string"
+      },
+      "response": {
+        "body": [
+          {
+            "info": {
+              "createdMs": "@int",
+              "messageID": "@string",
+              "modelID": "m",
+              "providerID": "fake",
+              "role": "assistant",
+              "sessionID": "@string"
+            },
+            "parts": [
+              {
+                "text": "pong",
+                "type": "text"
+              }
+            ]
+          }
+        ],
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "0.info.id",
+        "0.parts.0.id"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionMessagesResponses.200",
+      "status": "divergence"
+    },
+    {
+      "args": {
+        "before": "$cursor",
+        "limit": 1,
+        "sessionID": "$sessionID"
+      },
+      "call": "session.messages",
+      "id": "session.messages.before",
+      "note": "before=<cursor> paging: the wire query encoding (before=<seq>&limit=1) is locked; the entry shape diverges exactly like session.messages.newest.",
+      "request": {
+        "method": "GET",
+        "path": "/session/@string/message",
+        "query": "before=@string&limit=@string"
+      },
+      "response": {
+        "body": [
+          {
+            "info": {
+              "createdMs": "@int",
+              "messageID": "@string",
+              "modelID": "m",
+              "providerID": "fake",
+              "role": "user",
+              "sessionID": "@string"
+            },
+            "parts": [
+              {
+                "text": "ping",
+                "type": "text"
+              }
+            ]
+          }
+        ],
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "0.info.id"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionMessagesResponses.200",
+      "status": "divergence"
+    },
+    {
+      "args": {
+        "modelID": "m",
+        "providerID": "fake",
+        "sessionID": "$sessionID"
+      },
+      "call": "session.summarize",
+      "id": "session.summarize",
+      "note": "SDK 200: boolean; daemon 200: {sessionID,title,summary} (a bounded local digest that ignores the required providerID/modelID body).",
+      "request": {
+        "body": "{\"modelID\":\"m\",\"providerID\":\"fake\"}",
+        "content_type": "application/json",
+        "method": "POST",
+        "path": "/session/@string/summarize",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "sessionID": "@string",
+          "summary": "assistant: pong\nuser: ping\n",
+          "title": "wire trace"
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "#bool"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionSummarizeResponses.200 (boolean)",
+      "status": "divergence"
+    },
+    {
+      "args": {
+        "model": {
+          "id": "m",
+          "providerID": "fake"
+        },
+        "title": "wire trace delete target"
+      },
+      "call": "session.create",
+      "capture": {
+        "sessionID2": [
+          "sessionID",
+          "id"
+        ]
+      },
+      "id": "session.create.second",
+      "note": "A never-driven session, so session.delete.clean exercises the SUCCESS branch of the delete wire (the first session is refused mid-turn).",
+      "request": {
+        "body": "{\"model\":{\"id\":\"m\",\"providerID\":\"fake\"},\"title\":\"wire trace delete target\"}",
+        "content_type": "application/json",
+        "method": "POST",
+        "path": "/session",
+        "query": ""
+      },
+      "response": {
+        "body": {
+          "createdMs": "@int",
+          "sessionID": "@string",
+          "title": "wire trace delete target"
+        },
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "id",
+        "time"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionCreateResponses.200 (Session3)",
+      "status": "divergence"
+    }
+  ]
+}

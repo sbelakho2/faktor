@@ -1448,6 +1448,8 @@ dependencies = [
 name = "faktor-tests-compat"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "blake3",
  "faktor-agent",
  "faktor-core",
  "faktor-fs",
