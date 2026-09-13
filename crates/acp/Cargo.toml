@@ -17,5 +17,6 @@ tracing.workspace = true
 [dev-dependencies]
 faktor-agent.workspace = true
 faktor-core.workspace = true
+faktor-pty.workspace = true
 faktor-server.workspace = true
 faktor-session.workspace = true

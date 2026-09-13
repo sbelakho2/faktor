@@ -7,7 +7,8 @@
 //! and hostile UTF-8/NUL round-trips. Assertions target the official ACP
 //! v1 wire shapes (`sessionId`, `stopReason`, official error format).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,7 +25,8 @@ use faktor_acp::protocol::{frame, notification_frame, parse_frame};
 use faktor_acp::{
     agent_thought_chunk_update, session_update_params, text_chunk_update, tool_call_from_native,
     tool_result_from_native, user_message_chunk_update, AcpBackend, AcpConfig, AcpServer,
-    AcpStreamBackend, PermissionOption, PromptCtx,
+    AcpStreamBackend, PermissionOption, PromptCtx, TerminalAuthority, TerminalError,
+    TerminalHandle, TerminalSpec,
 };
 use serde_json::{json, Value};
 use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
@@ -1804,7 +1806,10 @@ async fn mcp_authenticate_terminal_and_unknown_methods_never_silent() {
         .unwrap()
         .contains("methodId"));
 
-    // Terminal methods are not implemented and not advertised.
+    // Terminal methods are unreachable here: the client declared no
+    // `faktor.terminal` extension, so even the methods this crate
+    // implements keep the official method-not-found (the client-side
+    // `terminal/output`/`wait_for_exit`/`release` are never implemented).
     for method in [
         "terminal/create",
         "terminal/output",
@@ -1887,4 +1892,1179 @@ async fn non_text_prompt_blocks_refuse_typed_and_text_carries_structured_output(
         .await;
     assert_eq!(msg["result"]["stopReason"], "end_turn");
     assert_eq!(msg["result"]["_meta"]["echo"], structured);
+}
+
+// ---------------------------------------------------------------------------
+// Negotiated `faktor.terminal` extension
+// ---------------------------------------------------------------------------
+
+/// In-memory terminal authority: real ownership semantics (session-scoped
+/// rows, ownership ids, kill semantics) without spawning any OS process.
+/// Used for the negotiation matrix, hostile-param and output-bound tests;
+/// the real-PTY tests live behind `cfg(unix)` below.
+#[derive(Clone, Default)]
+struct FakeAuthority {
+    inner: Arc<FakeAuthorityInner>,
+}
+
+#[derive(Default)]
+struct FakeAuthorityInner {
+    next: AtomicU64,
+    creates: Mutex<Vec<TerminalSpec>>,
+    handles: Mutex<HashMap<String, Arc<FakeHandle>>>,
+}
+
+struct FakeHandle {
+    id: String,
+    ownership: String,
+    pid: u32,
+    alive: AtomicBool,
+    rows: AtomicU64,
+    cols: AtomicU64,
+    output: Mutex<Vec<u8>>,
+    input: Mutex<Vec<u8>>,
+    kills: AtomicU64,
+}
+
+impl FakeHandle {
+    fn feed(&self, bytes: &[u8]) {
+        self.output.lock().unwrap().extend_from_slice(bytes);
+    }
+
+    fn input(&self) -> Vec<u8> {
+        self.input.lock().unwrap().clone()
+    }
+
+    fn size(&self) -> (u16, u16) {
+        (
+            self.rows.load(Ordering::SeqCst) as u16,
+            self.cols.load(Ordering::SeqCst) as u16,
+        )
+    }
+
+    fn kills(&self) -> u64 {
+        self.kills.load(Ordering::SeqCst)
+    }
+}
+
+impl TerminalHandle for FakeHandle {
+    fn terminal_id(&self) -> &str {
+        &self.id
+    }
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+    fn ownership_id(&self) -> &str {
+        &self.ownership
+    }
+    fn write(&self, bytes: &[u8]) -> Result<(), TerminalError> {
+        self.input.lock().unwrap().extend_from_slice(bytes);
+        Ok(())
+    }
+    fn resize(&self, rows: u16, cols: u16) -> Result<(), TerminalError> {
+        if rows == 0 || cols == 0 {
+            return Err(TerminalError::Invalid("bad size".into()));
+        }
+        self.rows.store(rows as u64, Ordering::SeqCst);
+        self.cols.store(cols as u64, Ordering::SeqCst);
+        Ok(())
+    }
+    fn drain_output(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.output.lock().unwrap())
+    }
+    fn kill(&self) -> Result<(), TerminalError> {
+        self.kills.fetch_add(1, Ordering::SeqCst);
+        self.alive.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl FakeAuthority {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn handle(&self, terminal_id: &str) -> Arc<FakeHandle> {
+        self.inner
+            .handles
+            .lock()
+            .unwrap()
+            .get(terminal_id)
+            .expect("fake handle exists")
+            .clone()
+    }
+
+    fn create_count(&self) -> usize {
+        self.inner.creates.lock().unwrap().len()
+    }
+
+    fn last_spec(&self) -> TerminalSpec {
+        self.inner
+            .creates
+            .lock()
+            .unwrap()
+            .last()
+            .expect("at least one create")
+            .clone()
+    }
+}
+
+impl TerminalAuthority for FakeAuthority {
+    fn create(
+        &self,
+        _session_id: &str,
+        spec: &TerminalSpec,
+    ) -> Result<Arc<dyn TerminalHandle>, TerminalError> {
+        match spec.command.as_str() {
+            "refuse-spawn" => return Err(TerminalError::Refused("spawn refused".into())),
+            "invalid-spec" => return Err(TerminalError::Invalid("bad terminal spec".into())),
+            _ => {}
+        }
+        let n = self.inner.next.fetch_add(1, Ordering::SeqCst);
+        let handle = Arc::new(FakeHandle {
+            id: format!("t-{n}"),
+            ownership: format!("own-{n}"),
+            pid: 9000 + n as u32,
+            alive: AtomicBool::new(true),
+            rows: AtomicU64::new(spec.rows as u64),
+            cols: AtomicU64::new(spec.cols as u64),
+            output: Mutex::new(Vec::new()),
+            input: Mutex::new(Vec::new()),
+            kills: AtomicU64::new(0),
+        });
+        self.inner.creates.lock().unwrap().push(spec.clone());
+        self.inner
+            .handles
+            .lock()
+            .unwrap()
+            .insert(handle.id.clone(), handle.clone());
+        Ok(handle)
+    }
+}
+
+fn start_server_with_terminals<B: AcpBackend + 'static>(
+    backend: B,
+    authority: Arc<dyn TerminalAuthority>,
+) -> (WireClient, tokio::task::JoinHandle<Result<(), String>>) {
+    start_server_with_terminals_and_config(backend, authority, AcpConfig::default())
+}
+
+fn start_server_with_terminals_and_config<B: AcpBackend + 'static>(
+    backend: B,
+    authority: Arc<dyn TerminalAuthority>,
+    config: AcpConfig,
+) -> (WireClient, tokio::task::JoinHandle<Result<(), String>>) {
+    let (server_side, client_side) = duplex(4 * 1024 * 1024);
+    let (server_r, server_w) = tokio::io::split(server_side);
+    let (client_r, client_w) = tokio::io::split(client_side);
+    let server = AcpServer::new(backend)
+        .with_config(config)
+        .with_terminal_authority(authority);
+    let handle = tokio::spawn(async move { server.serve_connection(server_r, server_w).await });
+    let client = WireClient {
+        read: client_r,
+        write: client_w,
+        recv_buf: Vec::new(),
+        next_id: 1,
+    };
+    (client, handle)
+}
+
+async fn new_session(client: &mut WireClient) -> String {
+    let msg = client.request("session/new", json!({})).await;
+    msg["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string()
+}
+
+fn terminal_updates(frames: &[Value], terminal_id: &str) -> Vec<Value> {
+    frames
+        .iter()
+        .filter(|frame| {
+            frame.get("method").and_then(Value::as_str) == Some("session/update")
+                && frame["params"]["update"]["kind"] == "terminalOutput"
+                && frame["params"]["update"]["terminalId"] == terminal_id
+        })
+        .map(|frame| frame["params"]["update"].clone())
+        .collect()
+}
+
+/// Collect terminal output frames for `terminal_id` until `pred` matches
+/// one of their `data` strings (returns the matching update).
+async fn recv_terminal_output_until(
+    client: &mut WireClient,
+    terminal_id: &str,
+    what: &str,
+    mut pred: impl FnMut(&str) -> bool,
+) -> Value {
+    for _ in 0..20_000 {
+        let msg = client.expect_message().await;
+        if msg.get("method").and_then(Value::as_str) != Some("session/update") {
+            continue;
+        }
+        let update = &msg["params"]["update"];
+        if update["kind"] != "terminalOutput" || update["terminalId"] != terminal_id {
+            continue;
+        }
+        if pred(update["data"].as_str().unwrap_or_default()) {
+            return update.clone();
+        }
+    }
+    panic!("timed out waiting for terminal output {what}");
+}
+
+fn terminal_probes(session: &str) -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "terminal/create",
+            json!({ "sessionId": session, "command": "sh" }),
+        ),
+        (
+            "terminal/input",
+            json!({ "sessionId": session, "terminalId": "t-0", "data": "x" }),
+        ),
+        (
+            "terminal/resize",
+            json!({ "sessionId": session, "terminalId": "t-0", "rows": 1, "cols": 1 }),
+        ),
+        (
+            "terminal/kill",
+            json!({ "sessionId": session, "terminalId": "t-0" }),
+        ),
+        (
+            "terminal/close",
+            json!({ "sessionId": session, "terminalId": "t-0" }),
+        ),
+        ("terminal/list", json!({ "sessionId": session })),
+    ]
+}
+
+#[tokio::test]
+async fn terminal_negotiation_matrix_declared_vs_not() {
+    let authority = Arc::new(FakeAuthority::new());
+
+    // (a) Authority attached + client declares: granted, and every method is
+    // reachable.
+    let (mut client, _task) = start_server_with_terminals(
+        EchoBackend::new(),
+        authority.clone() as Arc<dyn TerminalAuthority>,
+    );
+    let init = client
+        .request(
+            "initialize",
+            json!({ "protocolVersion": 1, "extensions": ["faktor.terminal"] }),
+        )
+        .await;
+    assert_eq!(init["result"]["extensions"], json!(["faktor.terminal"]));
+    let sid = new_session(&mut client).await;
+    let created = client
+        .request(
+            "terminal/create",
+            json!({
+                "sessionId": sid,
+                "command": "sh",
+                "args": ["-c", "echo hi"],
+                "cwd": "/",
+                "env": ["PATH"],
+                "rows": 30,
+                "cols": 100,
+            }),
+        )
+        .await;
+    let tid = created["result"]["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    assert_eq!(created["result"]["sessionId"], sid);
+    assert!(created["result"]["pid"].as_u64().unwrap() > 0);
+    assert_eq!(created["result"]["ownershipId"], "own-0");
+    // The authority received the allowlist NAMES and the geometry; the wire
+    // never carried environment values.
+    let spec = authority.last_spec();
+    assert_eq!(spec.env, vec!["PATH".to_string()]);
+    assert_eq!((spec.rows, spec.cols), (30, 100));
+    assert_eq!(spec.cwd.as_deref(), Some("/"));
+    assert_eq!(authority.create_count(), 1);
+
+    // Resize and kill reach the authority; the row reflects both.
+    let msg = client
+        .request(
+            "terminal/resize",
+            json!({ "sessionId": sid, "terminalId": tid, "rows": 33, "cols": 121 }),
+        )
+        .await;
+    assert_eq!(msg["result"], json!({}));
+    assert_eq!(authority.handle(&tid).size(), (33, 121));
+    let msg = client
+        .request(
+            "terminal/kill",
+            json!({ "sessionId": sid, "terminalId": tid }),
+        )
+        .await;
+    assert_eq!(msg["result"], json!({}));
+    assert_eq!(authority.handle(&tid).kills(), 1);
+    let list = client
+        .request("terminal/list", json!({ "sessionId": sid }))
+        .await;
+    assert_eq!(list["result"]["terminals"][0]["alive"], false);
+
+    // Close releases the row; further operations are typed refusals.
+    let msg = client
+        .request(
+            "terminal/close",
+            json!({ "sessionId": sid, "terminalId": tid }),
+        )
+        .await;
+    assert_eq!(msg["result"], json!({}));
+    let list = client
+        .request("terminal/list", json!({ "sessionId": sid }))
+        .await;
+    assert_eq!(list["result"]["terminals"], json!([]));
+    let msg = client
+        .request(
+            "terminal/resize",
+            json!({ "sessionId": sid, "terminalId": tid, "rows": 1, "cols": 1 }),
+        )
+        .await;
+    assert_eq!(msg["error"]["code"], -32602);
+
+    // The official client-side terminal methods are NOT part of this
+    // extension's table: even a negotiated client gets -32601 for them.
+    for method in [
+        "terminal/output",
+        "terminal/wait_for_exit",
+        "terminal/release",
+    ] {
+        assert_eq!(
+            client
+                .error_code_of(method, json!({ "sessionId": sid, "terminalId": "t-0" }))
+                .await,
+            -32601,
+            "{method} is not implemented and must stay method-not-found"
+        );
+    }
+
+    // (b) Authority attached + client does not declare: every terminal
+    // method keeps the official -32601, and the extension is not echoed.
+    let (mut strict, _task2) = start_server_with_terminals(
+        EchoBackend::new(),
+        authority.clone() as Arc<dyn TerminalAuthority>,
+    );
+    let init = strict
+        .request("initialize", json!({ "protocolVersion": 1 }))
+        .await;
+    assert!(init["result"].get("extensions").is_none());
+    let sid = new_session(&mut strict).await;
+    for (method, params) in terminal_probes(&sid) {
+        assert_eq!(
+            strict.error_code_of(method, params).await,
+            -32601,
+            "{method} must be an official method-not-found for a non-declaring client"
+        );
+    }
+
+    // (c) No authority attached + client declares: declaring an unbacked
+    // capability is not a negotiation, and nothing is claimed.
+    let (mut unbacked, _task3) = start_server(EchoBackend::new());
+    let init = unbacked
+        .request(
+            "initialize",
+            json!({ "protocolVersion": 1, "extensions": ["faktor.terminal"] }),
+        )
+        .await;
+    assert!(
+        init["result"].get("extensions").is_none(),
+        "an unbacked terminal authority must never be negotiated: {init}"
+    );
+    let sid = new_session(&mut unbacked).await;
+    for (method, params) in terminal_probes(&sid) {
+        assert_eq!(
+            unbacked.error_code_of(method, params).await,
+            -32601,
+            "{method} must stay unavailable without a terminal authority"
+        );
+    }
+}
+
+#[tokio::test]
+async fn terminal_hostile_params_are_typed_and_connection_survives() {
+    let authority = Arc::new(FakeAuthority::new());
+    let (mut client, _task) = start_server_with_terminals(
+        EchoBackend::new(),
+        authority.clone() as Arc<dyn TerminalAuthority>,
+    );
+    client
+        .request(
+            "initialize",
+            json!({ "protocolVersion": 1, "extensions": ["faktor.terminal"] }),
+        )
+        .await;
+    let sid = new_session(&mut client).await;
+    let created = client
+        .request(
+            "terminal/create",
+            json!({ "sessionId": sid, "command": "sh" }),
+        )
+        .await;
+    let tid = created["result"]["terminalId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let hostile: Vec<(&str, Value)> = vec![
+        (
+            "terminal/input",
+            json!({
+                "sessionId": sid,
+                "terminalId": tid,
+                "data": "x".repeat(faktor_acp::MAX_TERMINAL_INPUT_BYTES + 1),
+            }),
+        ),
+        (
+            "terminal/input",
+            json!({ "sessionId": sid, "terminalId": tid, "data": "a\u{0}b" }),
+        ),
+        (
+            "terminal/input",
+            json!({ "sessionId": sid, "terminalId": tid, "data": 7 }),
+        ),
+        (
+            "terminal/input",
+            json!({ "sessionId": sid, "terminalId": tid }),
+        ),
+        (
+            "terminal/input",
+            json!({ "sessionId": sid, "terminalId": tid, "data": "x", "extra": true }),
+        ),
+        (
+            "terminal/resize",
+            json!({ "sessionId": sid, "terminalId": tid, "rows": 0, "cols": 80 }),
+        ),
+        (
+            "terminal/resize",
+            json!({ "sessionId": sid, "terminalId": tid, "rows": 65536, "cols": 80 }),
+        ),
+        (
+            "terminal/resize",
+            json!({ "sessionId": sid, "terminalId": tid, "rows": -1, "cols": 80 }),
+        ),
+        (
+            "terminal/resize",
+            json!({ "sessionId": sid, "terminalId": tid, "rows": 1.5, "cols": 80 }),
+        ),
+        (
+            "terminal/resize",
+            json!({ "sessionId": sid, "terminalId": tid, "rows": 24 }),
+        ),
+        (
+            "terminal/create",
+            json!({ "sessionId": sid, "command": "" }),
+        ),
+        (
+            "terminal/create",
+            json!({
+                "sessionId": sid,
+                "command": "x".repeat(faktor_acp::MAX_TERMINAL_COMMAND_BYTES + 1),
+            }),
+        ),
+        (
+            "terminal/create",
+            json!({ "sessionId": sid, "command": "sh\u{0}od" }),
+        ),
+        (
+            "terminal/create",
+            json!({
+                "sessionId": sid,
+                "command": "sh",
+                "args": (0..=faktor_acp::MAX_TERMINAL_ARGS).map(|_| "a").collect::<Vec<_>>(),
+            }),
+        ),
+        (
+            "terminal/create",
+            json!({ "sessionId": sid, "command": "sh", "cwd": "/\u{0}" }),
+        ),
+        (
+            "terminal/create",
+            json!({ "sessionId": sid, "command": "sh", "env": ["BAD-NAME"] }),
+        ),
+        (
+            "terminal/create",
+            json!({ "sessionId": sid, "command": "sh", "env": { "PATH": "/bin" } }),
+        ),
+        (
+            "terminal/create",
+            json!({ "sessionId": sid, "command": "sh", "rows": 0 }),
+        ),
+        (
+            "terminal/create",
+            json!({ "sessionId": sid, "command": "sh", "bogus": 1 }),
+        ),
+        (
+            "terminal/create",
+            json!({ "sessionId": "foreign-session", "command": "sh" }),
+        ),
+        (
+            "terminal/kill",
+            json!({ "sessionId": sid, "terminalId": "t-999" }),
+        ),
+        (
+            "terminal/kill",
+            json!({ "sessionId": "foreign-session", "terminalId": tid }),
+        ),
+        ("terminal/close", json!({ "sessionId": sid })),
+        ("terminal/list", json!({ "sessionId": "foreign-session" })),
+        ("terminal/list", json!({ "sessionId": sid, "extra": 1 })),
+    ];
+    for (method, params) in hostile {
+        let msg = client.request(method, params.clone()).await;
+        assert_eq!(
+            msg["error"]["code"], -32602,
+            "{method} with hostile params must be a typed invalid-params refusal: {msg}"
+        );
+    }
+
+    // A refusing authority maps to the internal error (with the message in
+    // data), never a silent success.
+    let msg = client
+        .request(
+            "terminal/create",
+            json!({ "sessionId": sid, "command": "refuse-spawn" }),
+        )
+        .await;
+    assert_eq!(msg["error"]["code"], -32603);
+    let msg = client
+        .request(
+            "terminal/create",
+            json!({ "sessionId": sid, "command": "invalid-spec" }),
+        )
+        .await;
+    assert_eq!(msg["error"]["code"], -32602);
+
+    // The connection still serves and the original terminal is intact.
+    let msg = client
+        .request(
+            "terminal/input",
+            json!({ "sessionId": sid, "terminalId": tid, "data": "ok\n" }),
+        )
+        .await;
+    assert_eq!(msg["result"], json!({}));
+    assert_eq!(authority.handle(&tid).input(), b"ok\n");
+    let info = client.request("agent_info", json!({})).await;
+    assert_eq!(info["result"]["name"], "faktor-test-agent");
+}
+
+#[tokio::test]
+async fn terminal_output_notifications_are_bounded_coalesced_and_ordered() {
+    let authority = Arc::new(FakeAuthority::new());
+    let config = AcpConfig {
+        terminal_output_frame_max: 1024,
+        terminal_output_window_max: 4096,
+        terminal_poll_interval: Duration::from_millis(10),
+        ..AcpConfig::default()
+    };
+    let (mut client, _task) = start_server_with_terminals_and_config(
+        EchoBackend::new(),
+        authority.clone() as Arc<dyn TerminalAuthority>,
+        config,
+    );
+    client
+        .request(
+            "initialize",
+            json!({ "protocolVersion": 1, "extensions": ["faktor.terminal"] }),
+        )
+        .await;
+    let sid = new_session(&mut client).await;
+    let created = client
+        .request(
+            "terminal/create",
+            json!({ "sessionId": sid, "command": "sh" }),
+        )
+        .await;
+    let tid = created["result"]["terminalId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 8 KiB in one window: 4 frames of <= 1 KiB are emitted, the remaining
+    // 4 KiB hit the per-window cap and are DROPPED — but recorded.
+    authority.handle(&tid).feed(&vec![b'a'; 8192]);
+    let mut frames = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while frames.len() < 4 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let msg = tokio::time::timeout(remaining, client.expect_message())
+            .await
+            .expect("bounded output arrives");
+        if msg.get("method").and_then(Value::as_str) == Some("session/update") {
+            frames.extend(terminal_updates(std::slice::from_ref(&msg), &tid));
+        }
+    }
+    let mut total = 0usize;
+    for (index, update) in frames.iter().enumerate() {
+        assert_eq!(update["seq"], json!(index as u64), "per-terminal order");
+        assert_eq!(update["kind"], "terminalOutput");
+        assert_eq!(update["terminalId"], tid);
+        let bytes = update["bytes"].as_u64().unwrap() as usize;
+        assert!(bytes <= 1024, "frame exceeds the configured cap: {update}");
+        assert_eq!(
+            update["data"].as_str().unwrap().len(),
+            bytes,
+            "lossy data length matches the raw byte count for ASCII"
+        );
+        total += bytes;
+    }
+    assert_eq!(total, 4096, "the per-window cap bounds one tick");
+
+    // The dropped bytes are recorded on the ownership row (never silent).
+    // Poll: the recording happens in the same pump tick that emitted the
+    // frames, so a concurrent list may observe it one beat later.
+    let row = wait_for_terminal_row(&mut client, &sid, &tid, "recorded backpressure", |row| {
+        row["droppedBytes"] == json!(4096)
+    })
+    .await;
+    assert_eq!(row["backpressureEvents"], json!(1));
+    assert_eq!(row["emittedFrames"], json!(4));
+
+    // The next frame carries the previous window's recorded loss, then a
+    // fresh seq continues the order.
+    authority.handle(&tid).feed(b"tail");
+    let update = recv_terminal_output_until(&mut client, &tid, "tail frame", |data| {
+        data.contains("tail")
+    })
+    .await;
+    assert_eq!(update["seq"], json!(4));
+    assert_eq!(update["bytes"], json!(4));
+    assert_eq!(update["droppedBytes"], json!(4096));
+    assert_eq!(update["backpressureEvents"], json!(1));
+}
+
+async fn wait_for_terminal_row(
+    client: &mut WireClient,
+    session: &str,
+    terminal_id: &str,
+    what: &str,
+    mut pred: impl FnMut(&Value) -> bool,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let list = client
+            .request("terminal/list", json!({ "sessionId": session }))
+            .await;
+        if let Some(row) = list["result"]["terminals"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["terminalId"] == terminal_id))
+        {
+            if pred(row) {
+                return row.clone();
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn terminal_list_is_scoped_to_the_requesting_session_only() {
+    let authority = Arc::new(FakeAuthority::new());
+    let (mut client, _task) = start_server_with_terminals(
+        EchoBackend::new(),
+        authority.clone() as Arc<dyn TerminalAuthority>,
+    );
+    client
+        .request(
+            "initialize",
+            json!({ "protocolVersion": 1, "extensions": ["faktor.terminal"] }),
+        )
+        .await;
+    let sid_a = new_session(&mut client).await;
+    let sid_b = new_session(&mut client).await;
+    assert_ne!(sid_a, sid_b);
+
+    let created_a = client
+        .request(
+            "terminal/create",
+            json!({ "sessionId": sid_a, "command": "sh" }),
+        )
+        .await;
+    let tid_a = created_a["result"]["terminalId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let created_b = client
+        .request(
+            "terminal/create",
+            json!({ "sessionId": sid_b, "command": "sh" }),
+        )
+        .await;
+    let tid_b = created_b["result"]["terminalId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(tid_a, tid_b);
+
+    // Each session's view holds exactly its own row.
+    let list_a = client
+        .request("terminal/list", json!({ "sessionId": sid_a }))
+        .await;
+    assert_eq!(list_a["result"]["sessionId"], sid_a);
+    let rows_a = list_a["result"]["terminals"].as_array().unwrap();
+    assert_eq!(rows_a.len(), 1);
+    assert_eq!(rows_a[0]["terminalId"], tid_a);
+    assert_eq!(rows_a[0]["sessionId"], sid_a);
+
+    let list_b = client
+        .request("terminal/list", json!({ "sessionId": sid_b }))
+        .await;
+    let rows_b = list_b["result"]["terminals"].as_array().unwrap();
+    assert_eq!(rows_b.len(), 1);
+    assert_eq!(rows_b[0]["terminalId"], tid_b);
+    assert!(
+        rows_b.iter().all(|row| row["terminalId"] != tid_a),
+        "session B must never see session A's terminal: {list_b}"
+    );
+
+    // Cross-session operations are typed denials, identical to unknown ids.
+    for (method, params) in [
+        (
+            "terminal/input",
+            json!({ "sessionId": sid_b, "terminalId": tid_a, "data": "x" }),
+        ),
+        (
+            "terminal/resize",
+            json!({ "sessionId": sid_b, "terminalId": tid_a, "rows": 10, "cols": 10 }),
+        ),
+        (
+            "terminal/kill",
+            json!({ "sessionId": sid_b, "terminalId": tid_a }),
+        ),
+        (
+            "terminal/close",
+            json!({ "sessionId": sid_b, "terminalId": tid_a }),
+        ),
+    ] {
+        let msg = client.request(method, params).await;
+        assert_eq!(
+            msg["error"]["code"], -32602,
+            "a foreign session must never operate another session's terminal: {msg}"
+        );
+    }
+
+    // Both terminals are still alive for their owners.
+    let msg = client
+        .request(
+            "terminal/input",
+            json!({ "sessionId": sid_a, "terminalId": tid_a, "data": "a\n" }),
+        )
+        .await;
+    assert_eq!(msg["result"], json!({}));
+    let msg = client
+        .request(
+            "terminal/input",
+            json!({ "sessionId": sid_b, "terminalId": tid_b, "data": "b\n" }),
+        )
+        .await;
+    assert_eq!(msg["result"], json!({}));
+}
+
+// ---------------------------------------------------------------------------
+// Real PTY lifecycle (the authority is a thin adapter over the existing
+// `faktor-pty` crate: no second PTY implementation lives in this crate).
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[derive(Default)]
+struct PtyAuthority {
+    next: AtomicU64,
+}
+
+#[cfg(unix)]
+struct PtyHandle {
+    id: String,
+    ownership: String,
+    pid: u32,
+    pty: Mutex<faktor_pty::Pty>,
+}
+
+#[cfg(unix)]
+impl TerminalAuthority for PtyAuthority {
+    fn create(
+        &self,
+        _session_id: &str,
+        spec: &TerminalSpec,
+    ) -> Result<Arc<dyn TerminalHandle>, TerminalError> {
+        let env = if spec.env.is_empty() {
+            faktor_pty::EnvSpec::default_baseline()
+        } else {
+            faktor_pty::EnvSpec::Allowlisted(spec.env.clone())
+        };
+        let config = faktor_pty::PtyConfig {
+            command: spec.command.clone(),
+            args: spec.args.clone(),
+            cwd: spec.cwd.clone(),
+            env,
+            rows: spec.rows,
+            cols: spec.cols,
+        };
+        let pty = faktor_pty::Pty::spawn(&config).map_err(|e| TerminalError::Refused(e.message))?;
+        let n = self.next.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(PtyHandle {
+            id: format!("pty-{n}"),
+            ownership: format!("own-pty-{n}"),
+            pid: pty.pid(),
+            pty: Mutex::new(pty),
+        }))
+    }
+}
+
+#[cfg(unix)]
+impl TerminalHandle for PtyHandle {
+    fn terminal_id(&self) -> &str {
+        &self.id
+    }
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+    fn is_alive(&self) -> bool {
+        self.pty.lock().unwrap().is_alive()
+    }
+    fn ownership_id(&self) -> &str {
+        &self.ownership
+    }
+    fn write(&self, bytes: &[u8]) -> Result<(), TerminalError> {
+        self.pty
+            .lock()
+            .unwrap()
+            .write_all(bytes)
+            .map_err(|e| TerminalError::Refused(e.message))
+    }
+    fn resize(&self, rows: u16, cols: u16) -> Result<(), TerminalError> {
+        self.pty
+            .lock()
+            .unwrap()
+            .resize(rows, cols)
+            .map_err(|e| TerminalError::Refused(e.message))
+    }
+    fn drain_output(&self) -> Vec<u8> {
+        self.pty.lock().unwrap().read_available()
+    }
+    fn kill(&self) -> Result<(), TerminalError> {
+        self.pty.lock().unwrap().kill();
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -0 {pid} 2>/dev/null"))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Send one request, then read until BOTH its response and a terminal
+/// update whose `data` contains `needle` have been seen (the two race, and
+/// neither may be dropped).
+#[cfg(unix)]
+async fn request_until_terminal_output(
+    client: &mut WireClient,
+    id: u64,
+    method: &str,
+    params: Value,
+    terminal_id: &str,
+    needle: &str,
+) -> (Value, Vec<Value>) {
+    let bytes = frame(method.to_string(), id, params);
+    client.write.write_all(&bytes).await.expect("client write");
+    client.write.flush().await.expect("client flush");
+    let mut updates: Vec<Value> = Vec::new();
+    let mut response: Option<Value> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for terminal output {needle:?}"
+        );
+        let msg = tokio::time::timeout(remaining, client.expect_message())
+            .await
+            .expect("pty output arrives");
+        if msg.get("method").and_then(Value::as_str) == Some("session/update") {
+            updates.extend(terminal_updates(std::slice::from_ref(&msg), terminal_id));
+        } else if msg["id"] == json!(id) {
+            response = Some(msg);
+        }
+        let got = updates
+            .iter()
+            .any(|update| update["data"].as_str().unwrap_or_default().contains(needle));
+        if got {
+            if let Some(response) = response {
+                return (response, updates);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_lifecycle_over_a_real_pty_create_input_resize_kill_close() {
+    let authority: Arc<dyn TerminalAuthority> = Arc::new(PtyAuthority::default());
+    let (mut client, _task) = start_server_with_terminals(EchoBackend::new(), authority);
+    client
+        .request(
+            "initialize",
+            json!({ "protocolVersion": 1, "extensions": ["faktor.terminal"] }),
+        )
+        .await;
+    let sid = new_session(&mut client).await;
+
+    let created = client
+        .request(
+            "terminal/create",
+            json!({
+                "sessionId": sid,
+                "command": "sh",
+                "args": ["-c", "stty -echo; read x; echo got:$x; read y; stty size; sleep 30"],
+                "env": ["PATH"],
+                "rows": 24,
+                "cols": 80,
+            }),
+        )
+        .await;
+    assert_eq!(created["error"], Value::Null, "create failed: {created}");
+    let result = &created["result"];
+    let tid = result["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let pid = result["pid"].as_u64().expect("pid") as u32;
+    assert!(pid > 0, "a real pty pid");
+    assert!(result["ownershipId"]
+        .as_str()
+        .unwrap()
+        .starts_with("own-pty-"));
+    assert_eq!(result["sessionId"], sid);
+    assert!(pid_alive(pid), "the pty child is alive after create");
+
+    // Input round trip through the real tty.
+    let (response, updates) = request_until_terminal_output(
+        &mut client,
+        100,
+        "terminal/input",
+        json!({ "sessionId": sid, "terminalId": tid, "data": "hello\n" }),
+        &tid,
+        "got:hello",
+    )
+    .await;
+    assert_eq!(response["result"], json!({}));
+    assert!(
+        !updates.is_empty(),
+        "the tty output must arrive as terminalOutput frames"
+    );
+
+    // Resize reaches the kernel; the child prints the new geometry.
+    let msg = client
+        .request(
+            "terminal/resize",
+            json!({ "sessionId": sid, "terminalId": tid, "rows": 33, "cols": 121 }),
+        )
+        .await;
+    assert_eq!(msg["result"], json!({}));
+    let (_response, resized_updates) = request_until_terminal_output(
+        &mut client,
+        101,
+        "terminal/input",
+        json!({ "sessionId": sid, "terminalId": tid, "data": "go\n" }),
+        &tid,
+        "33 121",
+    )
+    .await;
+    let mut updates = updates;
+    updates.extend(resized_updates);
+
+    // Every frame is bounded, ordered per terminal, and names the ownership.
+    let mut last_seq: Option<u64> = None;
+    for update in &updates {
+        assert_eq!(update["kind"], "terminalOutput");
+        assert_eq!(update["terminalId"], tid);
+        let seq = update["seq"].as_u64().unwrap();
+        if let Some(last) = last_seq {
+            assert!(seq > last, "terminal frames must be ordered by seq");
+        }
+        last_seq = Some(seq);
+        let bytes = update["bytes"].as_u64().unwrap() as usize;
+        assert!(
+            bytes <= faktor_acp::TERMINAL_OUTPUT_FRAME_MAX,
+            "frame exceeds the default per-frame bound: {update}"
+        );
+    }
+
+    // Session-owned row: alive with its ownership id while the child lives.
+    let row = wait_for_terminal_row(&mut client, &sid, &tid, "live row", |row| {
+        row["alive"] == json!(true)
+    })
+    .await;
+    assert_eq!(row["pid"], json!(pid));
+    assert_eq!(row["sessionId"], sid);
+
+    // Kill terminates the whole tree; the row reports the dead child.
+    let msg = client
+        .request(
+            "terminal/kill",
+            json!({ "sessionId": sid, "terminalId": tid }),
+        )
+        .await;
+    assert_eq!(msg["result"], json!({}));
+    wait_for_terminal_row(&mut client, &sid, &tid, "killed row", |row| {
+        row["alive"] == json!(false)
+    })
+    .await;
+    assert!(!pid_alive(pid), "kill must terminate the pty child");
+
+    // Close releases the row; the id is gone and typed refusals follow.
+    let msg = client
+        .request(
+            "terminal/close",
+            json!({ "sessionId": sid, "terminalId": tid }),
+        )
+        .await;
+    assert_eq!(msg["result"], json!({}));
+    let list = client
+        .request("terminal/list", json!({ "sessionId": sid }))
+        .await;
+    assert_eq!(list["result"]["terminals"], json!([]));
+    let msg = client
+        .request(
+            "terminal/input",
+            json!({ "sessionId": sid, "terminalId": tid, "data": "x" }),
+        )
+        .await;
+    assert_eq!(msg["error"]["code"], -32602);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_connection_close_kills_the_pty_tree() {
+    let authority: Arc<dyn TerminalAuthority> = Arc::new(PtyAuthority::default());
+    let (mut client, task) = start_server_with_terminals(EchoBackend::new(), authority);
+    client
+        .request(
+            "initialize",
+            json!({ "protocolVersion": 1, "extensions": ["faktor.terminal"] }),
+        )
+        .await;
+    let sid = new_session(&mut client).await;
+    let created = client
+        .request(
+            "terminal/create",
+            json!({
+                "sessionId": sid,
+                "command": "sh",
+                "args": ["-c", "sleep 300"],
+            }),
+        )
+        .await;
+    let pid = created["result"]["pid"].as_u64().unwrap() as u32;
+    assert!(pid > 0 && pid_alive(pid), "child alive before the close");
+
+    // Drop the connection: the serve loop winds down and kills every
+    // session-owned terminal before returning (no orphans).
+    drop(client);
+    let result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("serve loop winds down at EOF")
+        .expect("serve task joins");
+    assert!(result.is_ok(), "{result:?}");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while pid_alive(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pty child {pid} outlived its connection"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_env_allowlist_never_carries_daemon_secrets() {
+    let authority: Arc<dyn TerminalAuthority> = Arc::new(PtyAuthority::default());
+    let (mut client, _task) = start_server_with_terminals(EchoBackend::new(), authority);
+    client
+        .request(
+            "initialize",
+            json!({ "protocolVersion": 1, "extensions": ["faktor.terminal"] }),
+        )
+        .await;
+    let sid = new_session(&mut client).await;
+    let created = client
+        .request(
+            "terminal/create",
+            json!({
+                "sessionId": sid,
+                "command": "sh",
+                "args": ["-c", "stty -echo; env; echo ENV_DONE"],
+                "env": [
+                    "PATH",
+                    "FAKTOR_SERVER_PASSWORD",
+                    "OPENAI_API_KEY",
+                    "TEST_PRIVATE_SECRET",
+                    "GITHUB_TOKEN",
+                ],
+            }),
+        )
+        .await;
+    let tid = created["result"]["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+
+    // Concatenate every terminalOutput frame until the sentinel closes the
+    // environment dump (the dump may be split across coalesced frames).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut text = String::new();
+    while !text.contains("ENV_DONE") {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "env dump never completed: {text:?}");
+        let msg = tokio::time::timeout(remaining, client.expect_message())
+            .await
+            .expect("env output");
+        if msg.get("method").and_then(Value::as_str) == Some("session/update") {
+            for update in terminal_updates(std::slice::from_ref(&msg), &tid) {
+                text.push_str(update["data"].as_str().unwrap_or_default());
+            }
+        }
+    }
+    assert!(
+        text.lines().any(|line| line.starts_with("PATH=")),
+        "the allowlisted PATH must arrive: {text:?}"
+    );
+    for secret in [
+        "FAKTOR_SERVER_PASSWORD",
+        "OPENAI_API_KEY",
+        "TEST_PRIVATE_SECRET",
+        "GITHUB_TOKEN",
+    ] {
+        assert!(
+            !text.contains(secret),
+            "the daemon secret {secret} leaked through the ACP terminal: {text:?}"
+        );
+    }
+
+    let msg = client
+        .request(
+            "terminal/close",
+            json!({ "sessionId": sid, "terminalId": tid }),
+        )
+        .await;
+    assert_eq!(msg["result"], json!({}));
 }

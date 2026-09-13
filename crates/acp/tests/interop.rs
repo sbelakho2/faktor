@@ -38,7 +38,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 use faktor_acp::{
     plan_from_native_steps, tool_call_from_native, tool_result_from_native, AcpServer,
-    AcpStreamBackend, AgentStateStatus, PermissionOption, PromptCtx,
+    AcpStreamBackend, AgentStateStatus, PermissionOption, PromptCtx, TerminalAuthority,
+    TerminalError, TerminalHandle, TerminalSpec,
 };
 use faktor_protocol::v756::{Message as NativeMessage, MessagesPage, PageMeta, Part as NativePart};
 
@@ -581,6 +582,12 @@ enum Method {
     Load,
     Prompt,
     Cancel,
+    TerminalCreate,
+    TerminalInput,
+    TerminalResize,
+    TerminalKill,
+    TerminalClose,
+    TerminalList,
 }
 
 #[derive(Debug)]
@@ -630,6 +637,25 @@ enum Ev {
         method: String,
         params: J,
     },
+    /// `terminal/create` answered with the ownership row's identity.
+    TerminalCreated {
+        terminal: String,
+        pid: i64,
+    },
+    /// A terminal control request answered with the empty official result.
+    TerminalOk,
+    /// `terminal/list` answered; the row count is checked, never guessed.
+    TerminalList {
+        count: usize,
+    },
+    /// Negotiated `terminalOutput` extension update.
+    TerminalOutput {
+        session: String,
+        terminal: String,
+        seq: i64,
+        data: String,
+        bytes: i64,
+    },
     Unknown(String),
 }
 
@@ -673,6 +699,12 @@ struct IndieClient {
     tool_calls: Vec<(String, String)>,
     plans: Vec<usize>,
     extensions: Vec<String>,
+    /// The extension subset the server granted in `initialize`.
+    negotiated: Vec<String>,
+    /// `(terminalId, seq, data, bytes)` of every terminalOutput frame.
+    terminal_output: Vec<(String, i64, String, i64)>,
+    /// Row count of the last `terminal/list` result.
+    terminal_rows: usize,
     unknown: Vec<String>,
     closed: bool,
 }
@@ -698,6 +730,9 @@ impl IndieClient {
             tool_calls: Vec::new(),
             plans: Vec::new(),
             extensions: Vec::new(),
+            negotiated: Vec::new(),
+            terminal_output: Vec::new(),
+            terminal_rows: 0,
             unknown: Vec::new(),
             closed: false,
         })
@@ -737,6 +772,12 @@ impl IndieClient {
             Method::Load => "session/load",
             Method::Prompt => "session/prompt",
             Method::Cancel => "session/cancel",
+            Method::TerminalCreate => "terminal/create",
+            Method::TerminalInput => "terminal/input",
+            Method::TerminalResize => "terminal/resize",
+            Method::TerminalKill => "terminal/kill",
+            Method::TerminalClose => "terminal/close",
+            Method::TerminalList => "terminal/list",
         };
         self.send(wire, Some(id), params)?;
         Ok(id)
@@ -757,6 +798,21 @@ impl IndieClient {
                     | (Ev::LoadDone | Ev::Error { .. }, Method::Load)
                     | (Ev::Error { .. }, Method::Prompt)
                     | (Ev::CancelAck | Ev::Error { .. }, Method::Cancel)
+                    | (
+                        Ev::TerminalCreated { .. } | Ev::Error { .. },
+                        Method::TerminalCreate
+                    )
+                    | (
+                        Ev::TerminalOk | Ev::Error { .. },
+                        Method::TerminalInput
+                            | Method::TerminalResize
+                            | Method::TerminalKill
+                            | Method::TerminalClose
+                    )
+                    | (
+                        Ev::TerminalList { .. } | Ev::Error { .. },
+                        Method::TerminalList
+                    )
             );
             if done {
                 return Ok(ev);
@@ -868,30 +924,75 @@ impl IndieClient {
             // Extension frame: this client must have declared the matching
             // Faktor extension or the frame is an official-protocol
             // violation.
-            if kind != "agentStateChanged" {
-                return self.unknown_kind(&format!("unknown extension update kind {kind:?}"));
+            match kind {
+                "agentStateChanged" => {
+                    let Some(status) = update
+                        .get("agentState")
+                        .and_then(|state| state.get("status"))
+                        .and_then(J::as_str)
+                    else {
+                        return self.unknown_kind("agentStateChanged without a status string");
+                    };
+                    if !self
+                        .extensions
+                        .iter()
+                        .any(|e| e == "faktor.agentStateChanged")
+                    {
+                        return self.unknown_kind(
+                            "agentStateChanged arrived although the client declared no extensions",
+                        );
+                    }
+                    self.states.push(status.to_string());
+                    return Ev::State {
+                        session: sid.to_string(),
+                        status: status.to_string(),
+                    };
+                }
+                "terminalOutput" => {
+                    if !self.extensions.iter().any(|e| e == "faktor.terminal") {
+                        return self.unknown_kind(
+                            "terminalOutput arrived although the client declared no terminal extension",
+                        );
+                    }
+                    let Some(terminal) = update.get("terminalId").and_then(J::as_str) else {
+                        return self.unknown_kind("terminalOutput without a string terminalId");
+                    };
+                    let Some(seq) = update.get("seq").and_then(J::as_i64).filter(|s| *s >= 0)
+                    else {
+                        return self.unknown_kind("terminalOutput without a non-negative seq");
+                    };
+                    let Some(data) = update.get("data").and_then(J::as_str) else {
+                        return self.unknown_kind("terminalOutput without string data");
+                    };
+                    let Some(bytes) = update.get("bytes").and_then(J::as_i64).filter(|b| *b >= 0)
+                    else {
+                        return self.unknown_kind("terminalOutput without byte accounting");
+                    };
+                    if bytes > 256 * 1024 {
+                        return self.unknown_kind("terminalOutput frame exceeds the client bound");
+                    }
+                    for counter in ["droppedBytes", "backpressureEvents"] {
+                        if let Some(value) = update.get(counter) {
+                            let Some(value) = value.as_i64().filter(|v| *v >= 0) else {
+                                return self.unknown_kind("terminalOutput with a bad loss counter");
+                            };
+                            let _ = value;
+                        }
+                    }
+                    self.terminal_output
+                        .push((terminal.to_string(), seq, data.to_string(), bytes));
+                    return Ev::TerminalOutput {
+                        session: sid.to_string(),
+                        terminal: terminal.to_string(),
+                        seq,
+                        data: data.to_string(),
+                        bytes,
+                    };
+                }
+                other => {
+                    return self.unknown_kind(&format!("unknown extension update kind {other:?}"));
+                }
             }
-            let Some(status) = update
-                .get("agentState")
-                .and_then(|state| state.get("status"))
-                .and_then(J::as_str)
-            else {
-                return self.unknown_kind("agentStateChanged without a status string");
-            };
-            if !self
-                .extensions
-                .iter()
-                .any(|e| e == "faktor.agentStateChanged")
-            {
-                return self.unknown_kind(
-                    "agentStateChanged arrived although the client declared no extensions",
-                );
-            }
-            self.states.push(status.to_string());
-            return Ev::State {
-                session: sid.to_string(),
-                status: status.to_string(),
-            };
         }
         let kind = update.get("sessionUpdate").and_then(J::as_str);
         match kind {
@@ -1037,6 +1138,26 @@ impl IndieClient {
                 let Some(version) = result.get("protocolVersion").and_then(J::as_i64) else {
                     return self.unknown_kind("initialize result without numeric protocolVersion");
                 };
+                if let Some(extensions) = result.get("extensions") {
+                    match extensions {
+                        J::Arr(items) => {
+                            for item in items {
+                                match item.as_str() {
+                                    Some(name) => self.negotiated.push(name.to_string()),
+                                    None => {
+                                        return self.unknown_kind(
+                                            "initialize result carries a non-string extension",
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            return self
+                                .unknown_kind("initialize result extensions are not an array")
+                        }
+                    }
+                }
                 Ev::InitResult { version }
             }
             Method::New => {
@@ -1069,6 +1190,35 @@ impl IndieClient {
                     return self.unknown_kind("cancel answered with a stopReason");
                 }
                 Ev::CancelAck
+            }
+            Method::TerminalCreate => {
+                let Some(terminal) = result.get("terminalId").and_then(J::as_str) else {
+                    return self.unknown_kind("terminal/create without a string terminalId");
+                };
+                let Some(pid) = result.get("pid").and_then(J::as_i64).filter(|p| *p > 0) else {
+                    return self.unknown_kind("terminal/create without a positive pid");
+                };
+                if result.get("ownershipId").and_then(J::as_str).is_none() {
+                    return self.unknown_kind("terminal/create without an ownershipId");
+                }
+                Ev::TerminalCreated {
+                    terminal: terminal.to_string(),
+                    pid,
+                }
+            }
+            Method::TerminalInput
+            | Method::TerminalResize
+            | Method::TerminalKill
+            | Method::TerminalClose => match result {
+                J::Obj(fields) if fields.is_empty() => Ev::TerminalOk,
+                _ => self.unknown_kind("terminal control result is not the empty object"),
+            },
+            Method::TerminalList => {
+                let Some(J::Arr(rows)) = result.get("terminals") else {
+                    return self.unknown_kind("terminal/list without a terminals array");
+                };
+                self.terminal_rows = rows.len();
+                Ev::TerminalList { count: rows.len() }
             }
         }
     }
@@ -1357,9 +1507,20 @@ struct Harness {
 
 impl Harness {
     fn start(backend: FakeAgent) -> Self {
+        Self::start_with_server(AcpServer::new_streaming(backend))
+    }
+
+    /// Harness with a terminal authority attached: `faktor.terminal` can be
+    /// negotiated on this server.
+    fn start_with_terminals(backend: FakeAgent, authority: Arc<dyn TerminalAuthority>) -> Self {
+        Self::start_with_server(
+            AcpServer::new_streaming(backend).with_terminal_authority(authority),
+        )
+    }
+
+    fn start_with_server(server: AcpServer) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
         let addr = listener.local_addr().expect("local addr");
-        let server = AcpServer::new_streaming(backend);
         let kills = Arc::new(Mutex::new(Vec::new()));
         let conn_threads = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -2748,4 +2909,305 @@ fn interop_m_session_load_replays_official_history_in_order() {
     }
 
     client.assert_no_unknown("session/load interop");
+}
+
+// ---------------------------------------------------------------------------
+// Negotiated `faktor.terminal` extension over the real wire (legacy
+// Content-Length transport, independent parser on the client path).
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[derive(Default)]
+struct InteropPtyAuthority {
+    next: AtomicU64,
+}
+
+#[cfg(unix)]
+struct InteropPtyHandle {
+    id: String,
+    ownership: String,
+    pid: u32,
+    pty: Mutex<faktor_pty::Pty>,
+}
+
+#[cfg(unix)]
+impl TerminalAuthority for InteropPtyAuthority {
+    fn create(
+        &self,
+        _session_id: &str,
+        spec: &TerminalSpec,
+    ) -> Result<Arc<dyn TerminalHandle>, TerminalError> {
+        let env = if spec.env.is_empty() {
+            faktor_pty::EnvSpec::default_baseline()
+        } else {
+            faktor_pty::EnvSpec::Allowlisted(spec.env.clone())
+        };
+        let config = faktor_pty::PtyConfig {
+            command: spec.command.clone(),
+            args: spec.args.clone(),
+            cwd: spec.cwd.clone(),
+            env,
+            rows: spec.rows,
+            cols: spec.cols,
+        };
+        let pty = faktor_pty::Pty::spawn(&config).map_err(|e| TerminalError::Refused(e.message))?;
+        let n = self.next.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(InteropPtyHandle {
+            id: format!("wire-pty-{n}"),
+            ownership: format!("wire-own-{n}"),
+            pid: pty.pid(),
+            pty: Mutex::new(pty),
+        }))
+    }
+}
+
+#[cfg(unix)]
+impl TerminalHandle for InteropPtyHandle {
+    fn terminal_id(&self) -> &str {
+        &self.id
+    }
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+    fn is_alive(&self) -> bool {
+        self.pty.lock().unwrap().is_alive()
+    }
+    fn ownership_id(&self) -> &str {
+        &self.ownership
+    }
+    fn write(&self, bytes: &[u8]) -> Result<(), TerminalError> {
+        self.pty
+            .lock()
+            .unwrap()
+            .write_all(bytes)
+            .map_err(|e| TerminalError::Refused(e.message))
+    }
+    fn resize(&self, rows: u16, cols: u16) -> Result<(), TerminalError> {
+        self.pty
+            .lock()
+            .unwrap()
+            .resize(rows, cols)
+            .map_err(|e| TerminalError::Refused(e.message))
+    }
+    fn drain_output(&self) -> Vec<u8> {
+        self.pty.lock().unwrap().read_available()
+    }
+    fn kill(&self) -> Result<(), TerminalError> {
+        self.pty.lock().unwrap().kill();
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -0 {pid} 2>/dev/null"))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn wait_for_terminal_output(client: &mut IndieClient, terminal: &str, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !client
+        .terminal_output
+        .iter()
+        .any(|(t, _, data, _)| t == terminal && data.contains(needle))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for terminal output {needle:?}"
+        );
+        match client.next_event(Duration::from_millis(100)) {
+            Ok(Ev::TerminalOutput {
+                session,
+                terminal: frame_terminal,
+                seq,
+                data,
+                bytes,
+            }) => {
+                // The independent client validates every field and its own
+                // bounds before the payload is accepted.
+                assert!(!session.is_empty());
+                assert_eq!(frame_terminal, terminal);
+                assert!(seq >= 0);
+                assert!(bytes >= 0);
+                assert!(!data.is_empty() || bytes == 0);
+            }
+            Ok(_) => {}
+            Err(ClientErr::Timeout) => {}
+            Err(err) => panic!(
+                "connection failed while waiting for terminal output: {}",
+                err.describe()
+            ),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn interop_n_terminal_lifecycle_over_real_wire() {
+    let authority: Arc<dyn TerminalAuthority> = Arc::new(InteropPtyAuthority::default());
+    let harness = Harness::start_with_terminals(FakeAgent::new(), authority);
+    let mut client = connect_and_init_with(harness.addr, &["faktor.terminal"], false);
+    assert!(
+        client.negotiated.iter().any(|e| e == "faktor.terminal"),
+        "the declared terminal extension must be granted: {:?}",
+        client.negotiated
+    );
+    let session = rpc_new_session(&mut client);
+
+    let (created, pid) = match client.rpc(
+        Method::TerminalCreate,
+        &jobj(&[
+            ("sessionId", jstr(&session)),
+            ("command", jstr("sh")),
+            (
+                "args",
+                jarr(&[
+                    jstr("-c"),
+                    jstr("stty -echo; read x; echo out:$x; read y; stty size; sleep 30"),
+                ]),
+            ),
+            ("env", jarr(&[jstr("PATH")])),
+            ("rows", J::I(24)),
+            ("cols", J::I(80)),
+        ]),
+    ) {
+        Ok(Ev::TerminalCreated { terminal, pid }) => {
+            assert!(pid > 0);
+            (terminal, pid as u32)
+        }
+        other => panic!("terminal/create failed: {other:?}"),
+    };
+    assert!(pid_alive(pid), "the pty child must be alive after create");
+
+    match client.rpc(
+        Method::TerminalInput,
+        &jobj(&[
+            ("sessionId", jstr(&session)),
+            ("terminalId", jstr(&created)),
+            ("data", jstr("hello\n")),
+        ]),
+    ) {
+        Ok(Ev::TerminalOk) => {}
+        other => panic!("terminal/input failed: {other:?}"),
+    }
+    wait_for_terminal_output(&mut client, &created, "out:hello");
+
+    match client.rpc(
+        Method::TerminalResize,
+        &jobj(&[
+            ("sessionId", jstr(&session)),
+            ("terminalId", jstr(&created)),
+            ("rows", J::I(40)),
+            ("cols", J::I(132)),
+        ]),
+    ) {
+        Ok(Ev::TerminalOk) => {}
+        other => panic!("terminal/resize failed: {other:?}"),
+    }
+    match client.rpc(
+        Method::TerminalInput,
+        &jobj(&[
+            ("sessionId", jstr(&session)),
+            ("terminalId", jstr(&created)),
+            ("data", jstr("go\n")),
+        ]),
+    ) {
+        Ok(Ev::TerminalOk) => {}
+        other => panic!("terminal/input failed: {other:?}"),
+    }
+    wait_for_terminal_output(&mut client, &created, "40 132");
+
+    // Per-terminal frame order is monotonic (the client parses every
+    // terminalOutput itself, including its byte accounting and bounds).
+    let seqs: Vec<i64> = client
+        .terminal_output
+        .iter()
+        .filter(|(terminal, _, _, _)| terminal == &created)
+        .map(|(_, seq, _, _)| *seq)
+        .collect();
+    assert!(!seqs.is_empty(), "terminal output must arrive");
+    assert!(
+        seqs.windows(2).all(|pair| pair[0] < pair[1]),
+        "terminal frames must be ordered: {seqs:?}"
+    );
+
+    match client.rpc(
+        Method::TerminalList,
+        &jobj(&[("sessionId", jstr(&session))]),
+    ) {
+        Ok(Ev::TerminalList { count }) => assert_eq!(count, 1, "one owned terminal"),
+        other => panic!("terminal/list failed: {other:?}"),
+    }
+    assert_eq!(client.terminal_rows, 1);
+
+    match client.rpc(
+        Method::TerminalKill,
+        &jobj(&[
+            ("sessionId", jstr(&session)),
+            ("terminalId", jstr(&created)),
+        ]),
+    ) {
+        Ok(Ev::TerminalOk) => {}
+        other => panic!("terminal/kill failed: {other:?}"),
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pid_alive(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "terminal/kill must terminate the pty child"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    match client.rpc(
+        Method::TerminalList,
+        &jobj(&[("sessionId", jstr(&session))]),
+    ) {
+        Ok(Ev::TerminalList { count }) => assert_eq!(count, 1, "kill keeps the row"),
+        other => panic!("terminal/list failed: {other:?}"),
+    }
+
+    match client.rpc(
+        Method::TerminalClose,
+        &jobj(&[
+            ("sessionId", jstr(&session)),
+            ("terminalId", jstr(&created)),
+        ]),
+    ) {
+        Ok(Ev::TerminalOk) => {}
+        other => panic!("terminal/close failed: {other:?}"),
+    }
+    match client.rpc(
+        Method::TerminalList,
+        &jobj(&[("sessionId", jstr(&session))]),
+    ) {
+        Ok(Ev::TerminalList { count }) => assert_eq!(count, 0, "close releases the row"),
+        other => panic!("terminal/list failed: {other:?}"),
+    }
+    quiesce(&mut client);
+    client.assert_no_unknown("terminal lifecycle over the real wire");
+
+    // A non-declaring client keeps the official method-not-found for every
+    // terminal method, even though this server carries the authority.
+    let mut strict = connect_and_init(harness.addr);
+    assert!(strict.negotiated.is_empty(), "{:?}", strict.negotiated);
+    let sid = rpc_new_session(&mut strict);
+    match strict.rpc(
+        Method::TerminalCreate,
+        &jobj(&[("sessionId", jstr(&sid)), ("command", jstr("sh"))]),
+    ) {
+        Ok(Ev::Error { code, .. }) => {
+            assert_eq!(code, -32601, "unnegotiated terminal/create must be -32601")
+        }
+        other => panic!("unnegotiated terminal/create must be refused: {other:?}"),
+    }
+    match strict.rpc(Method::TerminalList, &jobj(&[("sessionId", jstr(&sid))])) {
+        Ok(Ev::Error { code, .. }) => assert_eq!(code, -32601),
+        other => panic!("unnegotiated terminal/list must be refused: {other:?}"),
+    }
+    strict.assert_no_unknown("terminal refusal over the real wire");
 }

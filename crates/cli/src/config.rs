@@ -628,6 +628,24 @@ impl Config {
     }
 }
 
+/// The wire family of an `open_ai` provider entry.
+///
+/// - `chat` (default for CUSTOM endpoints): `POST /chat/completions` — the
+///   classic shape every OpenAI-compatible server implements.
+/// - `responses` (default for the OFFICIAL `api.openai.com` endpoint): the
+///   native Responses API (`POST /responses`).
+///
+/// The default is chosen from the configured `base_url` when `api` is
+/// absent; an explicit `api` always wins (including `api = "chat"` on the
+/// official endpoint, for deployments/proxies that only speak Chat
+/// Completions). Any other value is a strict parse error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiApi {
+    Chat,
+    Responses,
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderCfg {
@@ -641,6 +659,13 @@ pub enum ProviderCfg {
         id: String,
         base_url: String,
         api_key_env: Option<String>,
+        /// Wire family override. Absent = the documented endpoint default:
+        /// the official OpenAI endpoint prefers the modern Responses API
+        /// while every custom `base_url` stays on Chat Completions (custom
+        /// compatible servers rarely implement `/responses`). Explicit
+        /// `chat`/`responses` always wins; any other value fails to parse.
+        #[serde(default)]
+        api: Option<OpenAiApi>,
         #[serde(default)]
         pricing: Option<ProviderPricingCfg>,
     },
@@ -887,6 +912,30 @@ impl ProviderCfg {
         }
     }
 
+    /// The OpenAI wire family this entry selects (`None` for non-`open_ai`
+    /// entries). An explicit `api` always wins; absent, the OFFICIAL OpenAI
+    /// endpoint defaults to the native Responses family (the modern default
+    /// for api.openai.com) while any custom `base_url` stays on Chat
+    /// Completions (compatible servers rarely implement `/responses`).
+    pub fn openai_family(&self) -> Option<faktor_openai::OpenAiFamily> {
+        match self {
+            ProviderCfg::OpenAi { base_url, api, .. } => Some(match api {
+                Some(OpenAiApi::Chat) => faktor_openai::OpenAiFamily::Chat,
+                Some(OpenAiApi::Responses) => faktor_openai::OpenAiFamily::Responses,
+                None => {
+                    if same_endpoint(base_url, OPENAI_OFFICIAL_BASE_URL)
+                        || same_endpoint(base_url, "https://api.openai.com")
+                    {
+                        faktor_openai::OpenAiFamily::Responses
+                    } else {
+                        faktor_openai::OpenAiFamily::Chat
+                    }
+                }
+            }),
+            _ => None,
+        }
+    }
+
     /// The configured endpoint's STRICT billing origin (billing-origin
     /// audit): official canonical endpoints resolve to their official
     /// origin, any other `base_url` is a [`BillingOrigin::CustomEndpoint`]
@@ -1005,7 +1054,10 @@ impl ProviderCfg {
                 faktor_ollama::OllamaProvider::new_with_transport(cfg, transport.clone())
             }
             ProviderCfg::OpenAi { base_url, .. } => {
-                let cfg = faktor_openai::OpenAiConfig::chat(base_url, self.key());
+                let mut cfg = faktor_openai::OpenAiConfig::chat(base_url, self.key());
+                cfg.family = self
+                    .openai_family()
+                    .expect("open_ai entries always select an OpenAI family");
                 faktor_openai::OpenAiProvider::build_with_transport(cfg, transport.clone())
             }
             ProviderCfg::Anthropic { .. } => {
@@ -1322,6 +1374,7 @@ mod tests {
                     id: "dup".into(),
                     base_url: "http://x".into(),
                     api_key_env: None,
+                    api: None,
                     pricing: None,
                 },
             ],
@@ -1339,6 +1392,7 @@ mod tests {
                     id: "distinct".into(),
                     base_url: "http://y".into(),
                     api_key_env: None,
+                    api: None,
                     pricing: None,
                 },
             ],
@@ -1390,6 +1444,145 @@ mod tests {
         let cfg = Config::load_strict(&path).unwrap();
         assert_eq!(cfg.model, "m");
         assert_eq!(cfg.providers.len(), 2);
+    }
+
+    #[test]
+    fn openai_api_setting_selects_family_with_documented_default() {
+        use faktor_openai::OpenAiFamily;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.json");
+        std::fs::write(
+            &path,
+            r#"{"config_version": 1, "model": "m", "providers": [
+                {"kind": "open_ai", "id": "official-default", "base_url": "https://api.openai.com/v1"},
+                {"kind": "open_ai", "id": "official-no-version", "base_url": "https://api.openai.com"},
+                {"kind": "open_ai", "id": "custom-default", "base_url": "https://corp.example.com/v1"},
+                {"kind": "open_ai", "id": "official-chat", "base_url": "https://api.openai.com/v1", "api": "chat"},
+                {"kind": "open_ai", "id": "custom-responses", "base_url": "https://corp.example.com/v1", "api": "responses"}
+            ]}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_strict(&path).unwrap();
+        // Documented default: the modern Responses family ONLY for the
+        // official endpoint; every custom base_url stays Chat.
+        assert_eq!(
+            cfg.providers[0].openai_family(),
+            Some(OpenAiFamily::Responses)
+        );
+        assert_eq!(
+            cfg.providers[1].openai_family(),
+            Some(OpenAiFamily::Responses)
+        );
+        assert_eq!(cfg.providers[2].openai_family(), Some(OpenAiFamily::Chat));
+        // Explicit `api` always wins, in both directions.
+        assert_eq!(cfg.providers[3].openai_family(), Some(OpenAiFamily::Chat));
+        assert_eq!(
+            cfg.providers[4].openai_family(),
+            Some(OpenAiFamily::Responses)
+        );
+        // Non-OpenAI entries select no OpenAI family.
+        assert_eq!(
+            ProviderCfg::Ollama {
+                id: "o".into(),
+                base_url: None,
+                pricing: None,
+            }
+            .openai_family(),
+            None
+        );
+        // The setting round-trips through save/load.
+        cfg.save(&path).unwrap();
+        let back = Config::load_strict(&path).unwrap();
+        assert_eq!(back.providers[3].openai_family(), Some(OpenAiFamily::Chat));
+        assert_eq!(
+            back.providers[4].openai_family(),
+            Some(OpenAiFamily::Responses)
+        );
+        // Hostile values and unknown sibling keys are strict parse errors.
+        for bad in [
+            r#"{"providers": [{"kind": "open_ai", "id": "x", "base_url": "https://x", "api": "auto"}]}"#,
+            r#"{"providers": [{"kind": "open_ai", "id": "x", "base_url": "https://x", "api": "completions"}]}"#,
+            r#"{"providers": [{"kind": "open_ai", "id": "x", "base_url": "https://x", "api": 3}]}"#,
+            r#"{"providers": [{"kind": "open_ai", "id": "x", "base_url": "https://x", "api_version": "v1"}]}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            Config::load(&path).expect_err("hostile api surface must fail");
+            assert!(Config::load_strict(&path).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn built_openai_provider_targets_the_selected_family_endpoint() {
+        // The BUILD path (not just the pure selector) must construct the
+        // family the config declares: the recorded request URL proves which
+        // endpoint the adapter will speak (responses default for the
+        // official endpoint, chat default for custom ones, explicit wins).
+        use faktor_core::cancellation::CancellationToken;
+        use faktor_core::id::{OpId, SessionId};
+        use faktor_provider::egress::MockHttpTransport;
+        use faktor_provider::{
+            ContentPart, GenericAgentRequest, RequestMessage, RequestMeta, Role,
+        };
+        use futures::StreamExt as _;
+
+        let make_cfg = |base_url: &str, api: Option<OpenAiApi>| ProviderCfg::OpenAi {
+            id: "probe".into(),
+            base_url: base_url.into(),
+            api_key_env: None,
+            api,
+            pricing: None,
+        };
+        let request = || GenericAgentRequest {
+            model: "m".into(),
+            system: String::new(),
+            messages: vec![RequestMessage {
+                role: Role::User,
+                content: vec![ContentPart::text("hi")],
+            }],
+            tools: vec![],
+            max_output: None,
+            reasoning: None,
+            stream: true,
+            meta: RequestMeta {
+                operation_id: OpId::new(1),
+                session_id: SessionId::new(1),
+                provider: "probe".into(),
+                attempt: 0,
+                deadline_ms: 0,
+                cancellation: CancellationToken::new(),
+            },
+        };
+        for (cfg, expected_path) in [
+            (
+                make_cfg("https://api.openai.com/v1", None),
+                "https://api.openai.com/v1/responses",
+            ),
+            (
+                make_cfg("https://corp.example.com/v1", None),
+                "https://corp.example.com/v1/chat/completions",
+            ),
+            (
+                make_cfg("https://api.openai.com/v1", Some(OpenAiApi::Chat)),
+                "https://api.openai.com/v1/chat/completions",
+            ),
+            (
+                make_cfg("https://corp.example.com/v1", Some(OpenAiApi::Responses)),
+                "https://corp.example.com/v1/responses",
+            ),
+        ] {
+            let mock = Arc::new(MockHttpTransport::new(200, "data: [DONE]\n\n"));
+            let transport: Arc<dyn HttpTransport> = mock.clone();
+            let provider = cfg
+                .build(transport)
+                .unwrap_or_else(|e| panic!("{cfg:?} build: {e}"));
+            let mut stream = provider.stream(request());
+            while stream.next().await.is_some() {}
+            assert_eq!(
+                mock.requests(),
+                vec![("POST".to_string(), expected_path.to_string())],
+                "{cfg:?}"
+            );
+        }
     }
 
     #[test]
@@ -1692,6 +1885,7 @@ mod tests {
             id: "t".into(),
             base_url: "http://x".into(),
             api_key_env: Some("KP_TEST_KEY".into()),
+            api: None,
             pricing: None,
         };
         assert_eq!(cfg.key().as_deref(), Some("secret-value"));
@@ -1725,6 +1919,7 @@ mod tests {
                 id: id.into(),
                 base_url: format!("https://{id}.example.com/v1"),
                 api_key_env: None,
+                api: None,
                 pricing: None,
             };
             registry
@@ -1793,18 +1988,21 @@ mod tests {
             id: "a".into(),
             base_url: OPENAI_OFFICIAL_BASE_URL.into(),
             api_key_env: None,
+            api: None,
             pricing: None,
         };
         let official_openai_slash = ProviderCfg::OpenAi {
             id: "a2".into(),
             base_url: format!("{OPENAI_OFFICIAL_BASE_URL}/"),
             api_key_env: None,
+            api: None,
             pricing: None,
         };
         let custom_openai = ProviderCfg::OpenAi {
             id: "corp-proxy".into(),
             base_url: "https://corp.example.com/v1".into(),
             api_key_env: None,
+            api: None,
             pricing: None,
         };
         assert_eq!(
@@ -1890,6 +2088,7 @@ mod tests {
             id: "b".into(),
             base_url: "https://corp.example.com/v1".into(),
             api_key_env: None,
+            api: None,
             pricing: None,
         };
         assert_ne!(custom_openai.id(), same_custom_other_id.id());
@@ -1912,6 +2111,7 @@ mod tests {
             id: "b".into(),
             base_url: OPENAI_OFFICIAL_BASE_URL.into(),
             api_key_env: None,
+            api: None,
             pricing: None,
         }
         .build(open_transport())

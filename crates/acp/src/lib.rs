@@ -173,16 +173,66 @@
 //! `clientCapabilities.fs` is negotiated per connection and gates every
 //! [`ClientHandle`] filesystem call.
 //!
+//! # Terminal extension (`faktor.terminal`, negotiated)
+//!
+//! Interactive terminals are a negotiated Faktor extension: `initialize`
+//! accepts `"extensions": ["faktor.terminal"]` exactly like
+//! `faktor.agentStateChanged`, and the accepted name is echoed back only
+//! when the server carries a [`TerminalAuthority`]. The daemon attaches its
+//! existing session-owned terminal authority through
+//! [`AcpServer::with_terminal_authority`]; without one the name is not
+//! negotiated and nothing is claimed. Clients that did not negotiate keep
+//! the official `-32601` for every `terminal/*` request.
+//!
+//! | method            | params                                                   | result |
+//! |-------------------|----------------------------------------------------------|--------|
+//! | `terminal/create` | `{sessionId, command, args?, cwd?, env?, rows?, cols?}`  | `{terminalId, pid, sessionId, ownershipId}` |
+//! | `terminal/input`  | `{sessionId, terminalId, data}`                          | `{}`   |
+//! | `terminal/resize` | `{sessionId, terminalId, rows, cols}`                    | `{}`   |
+//! | `terminal/kill`   | `{sessionId, terminalId}`                                | `{}`   |
+//! | `terminal/close`  | `{sessionId, terminalId}`                                | `{}`   |
+//! | `terminal/list`   | `{sessionId}`                                            | `{sessionId, terminals: [...]}` |
+//!
+//! Params are strict (unknown fields answer `-32602`) and bounded: command
+//! and args by the [`MAX_TERMINAL_COMMAND_BYTES`] family, `env` by
+//! [`MAX_TERMINAL_ENV_NAMES`]/[`MAX_TERMINAL_ENV_NAME_BYTES`], input by
+//! [`MAX_TERMINAL_INPUT_BYTES`], sizes to the `u16` geometry range
+//! (`0`/oversize/NUL are typed refusals). `env` is an ALLOWLIST OF NAMES:
+//! the attached authority resolves them against the daemon environment and
+//! applies its deny-set, so daemon secrets never cross; this crate never
+//! carries environment values.
+//!
+//! Every terminal is owned by the session that created it: the per-
+//! connection terminal registry keys rows by `(sessionId, terminalId)`,
+//! a foreign session or terminal id is a typed `-32602` denial (existence is
+//! never leaked), and `terminal/list` projects only the requesting session's
+//! rows with their ownership ids. Output arrives as bounded `session/update`
+//! extension frames (`kind: "terminalOutput"`, [`terminal_output_update`]):
+//! coalesced per pump window, capped per frame
+//! ([`AcpConfig::terminal_output_frame_max`]) and per window
+//! ([`AcpConfig::terminal_output_window_max`]), ordered by a per-terminal
+//! `seq`; when the writer queue is full or a window cap is hit, bytes are
+//! dropped and the loss is recorded (`droppedBytes`/`backpressureEvents` on
+//! the next frame and on the `terminal/list` row) — a pump never blocks the
+//! writer, the PTY drain, or a prompt turn.
+//!
+//! Lifetime: terminals are cancellable (per-terminal `kill`/`close`, and the
+//! connection's wind-down on EOF), bounded by [`AcpConfig::max_terminals`]
+//! and the [`AcpConfig::max_sessions`]-capped session index, session-scoped,
+//! and killed before the serve loop returns; dropping the authority handle is
+//! the final failsafe, so no child outlives its connection. This crate
+//! implements no PTY itself: everything goes through the injected
+//! [`TerminalAuthority`] seam, which the daemon maps onto `faktor-pty` and
+//! its existing session-owned terminal rows.
+//!
 //! # Out of official ACP v1 scope (honestly absent, never faked)
 //!
-//! Terminals: this crate's [`protocol`] module has no ACP terminal frame
-//! schema and no session-owned terminal projection is reachable from the
-//! seam, so `terminal/*` methods are not implemented, no terminal content
-//! is emitted, and requests for them answer the official `-32601`. Prompt
-//! content blocks other than text are refused with `-32602`; the text-only
-//! path is the documented structured-output path — a text block carries any
-//! structured payload (JSON/XML) verbatim and this crate never inspects or
-//! rewrites it.
+//! Prompt content blocks other than text are refused with `-32602`; the
+//! text-only path is the documented structured-output path — a text block
+//! carries any structured payload (JSON/XML) verbatim and this crate never
+//! inspects or rewrites it. The official client-side `terminal/*` methods
+//! (`terminal/output`, `terminal/wait_for_exit`, `terminal/release`) are not
+//! part of this extension's table and keep answering `-32601`.
 
 use futures::future::BoxFuture;
 use serde_json::{json, Map, Value};
@@ -190,8 +240,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::Duration;
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use faktor_protocol::v756::{MessagesPage, Part as NativePart};
@@ -227,8 +277,13 @@ pub const DEFAULT_MAX_CLIENT_REQUESTS: usize = 32;
 /// `agentStateChanged` status frame.
 pub const EXTENSION_AGENT_STATE_CHANGED: &str = "faktor.agentStateChanged";
 
+/// The negotiated terminal extension: session-owned PTY control
+/// (`terminal/create|input|resize|kill|close|list`) plus bounded
+/// `terminalOutput` update frames.
+pub const EXTENSION_TERMINAL: &str = "faktor.terminal";
+
 /// The extensions this server can accept, in canonical order.
-pub const ACCEPTED_EXTENSIONS: [&str; 1] = [EXTENSION_AGENT_STATE_CHANGED];
+pub const ACCEPTED_EXTENSIONS: [&str; 2] = [EXTENSION_AGENT_STATE_CHANGED, EXTENSION_TERMINAL];
 
 /// JSON-RPC well-known error codes (official ACP v1 messages).
 pub const PARSE_ERROR: i64 = -32700;
@@ -241,9 +296,45 @@ pub const INTERNAL_ERROR: i64 = -32603;
 /// turn is already running (or queued) for the session.
 pub const SESSION_BUSY: i64 = -32001;
 
-/// ACP-reserved-range error: the server's per-session capacity is
+/// ACP-reserved-range error: the server's per-session prompt capacity is
 /// exhausted (a bounded-resource refusal, never unbounded growth).
 pub const SESSION_LIMIT: i64 = -32003;
+
+/// ACP-reserved-range error: the per-connection terminal capacity is
+/// exhausted ([`AcpConfig::max_terminals`]); new terminals are refused,
+/// existing ones keep working.
+pub const TERMINAL_LIMIT: i64 = -32004;
+
+/// Cap on one terminal `command` (bytes).
+pub const MAX_TERMINAL_COMMAND_BYTES: usize = 4096;
+
+/// Cap on the `args` list of one `terminal/create`.
+pub const MAX_TERMINAL_ARGS: usize = 256;
+
+/// Cap on one `args` entry (bytes).
+pub const MAX_TERMINAL_ARG_BYTES: usize = 4096;
+
+/// Cap on a `terminal/create` `cwd` (bytes).
+pub const MAX_TERMINAL_CWD_BYTES: usize = 4096;
+
+/// Cap on the `env` allowlist of one `terminal/create` (names only).
+pub const MAX_TERMINAL_ENV_NAMES: usize = 64;
+
+/// Cap on one `env` allowlist entry (bytes).
+pub const MAX_TERMINAL_ENV_NAME_BYTES: usize = 256;
+
+/// Cap on one session/terminal id string in terminal params (bytes).
+pub const MAX_TERMINAL_ID_BYTES: usize = 256;
+
+/// Cap on one `terminal/input` payload (bytes).
+pub const MAX_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
+
+/// Default cap on the raw bytes of one `terminalOutput` frame.
+pub const TERMINAL_OUTPUT_FRAME_MAX: usize = 16 * 1024;
+
+/// Default cap on the raw bytes a terminal pump may emit per window (one
+/// pump tick); the excess is dropped and recorded as backpressure.
+pub const TERMINAL_OUTPUT_WINDOW_MAX: usize = 128 * 1024;
 
 const MAX_METHOD_LEN: usize = 128;
 const READ_CHUNK: usize = 64 * 1024;
@@ -261,6 +352,7 @@ const MSG_METHOD_NOT_FOUND: &str = "Method not found";
 const MSG_INTERNAL_ERROR: &str = "Internal error";
 const MSG_SESSION_BUSY: &str = "A prompt turn is already in progress for this session";
 const MSG_SESSION_LIMIT: &str = "session capacity exhausted";
+const MSG_TERMINAL_LIMIT: &str = "terminal capacity exhausted";
 const MSG_LOAD_MCP_UNSUPPORTED: &str = "this agent does not support MCP servers";
 const MSG_AUTH_UNAVAILABLE: &str = "no authentication methods are available";
 
@@ -357,6 +449,21 @@ pub struct AcpConfig {
     pub client_request_timeout: Duration,
     /// Cap on concurrent server→client requests per connection.
     pub max_client_requests: usize,
+    /// Cap on live terminals per connection (new creates are refused with
+    /// [`TERMINAL_LIMIT`] once reached; existing rows keep working).
+    pub max_terminals: usize,
+    /// Cap on the raw bytes of one `terminalOutput` frame.
+    pub terminal_output_frame_max: usize,
+    /// Cap on the raw bytes one terminal pump emits per window; the excess
+    /// is dropped and recorded as backpressure.
+    pub terminal_output_window_max: usize,
+    /// Terminal pump tick: how often available output is coalesced and
+    /// emitted. Bounded loss is only ever recorded, never silent.
+    pub terminal_poll_interval: Duration,
+    /// Bounded wait for one authority terminal spawn.
+    pub terminal_spawn_timeout: Duration,
+    /// Bounded wait for one terminal write/kill operation.
+    pub terminal_io_timeout: Duration,
 }
 
 impl Default for AcpConfig {
@@ -369,6 +476,12 @@ impl Default for AcpConfig {
             shutdown_timeout: Duration::from_secs(5),
             client_request_timeout: Duration::from_secs(300),
             max_client_requests: DEFAULT_MAX_CLIENT_REQUESTS,
+            max_terminals: 32,
+            terminal_output_frame_max: TERMINAL_OUTPUT_FRAME_MAX,
+            terminal_output_window_max: TERMINAL_OUTPUT_WINDOW_MAX,
+            terminal_poll_interval: Duration::from_millis(20),
+            terminal_spawn_timeout: Duration::from_secs(10),
+            terminal_io_timeout: Duration::from_secs(2),
         }
     }
 }
@@ -696,6 +809,37 @@ pub fn plan_from_native_steps(steps: &[(String, Option<u32>)]) -> Value {
 /// Official `session/update` notification params: `{sessionId, update}`.
 pub fn session_update_params(session_id: &str, update: Value) -> Value {
     json!({ "sessionId": session_id, "update": update })
+}
+
+/// `session/update` frame body: the negotiated `terminalOutput` extension
+/// frame (`{kind, terminalId, seq, data, bytes, droppedBytes?,
+/// backpressureEvents?}`). `data` is the lossy-UTF-8 view of the raw chunk
+/// (terminal streams are not guaranteed valid UTF-8), `bytes` is the exact
+/// raw byte count of the chunk, `seq` is the per-terminal monotonic frame
+/// index, and the optional counters report bytes/events dropped since the
+/// previous frame (omitted when zero — never silently lost, always
+/// recorded).
+pub fn terminal_output_update(
+    terminal_id: &str,
+    seq: u64,
+    data: &str,
+    bytes: usize,
+    dropped_bytes: u64,
+    backpressure_events: u64,
+) -> Value {
+    let mut update = Map::new();
+    update.insert("kind".into(), json!("terminalOutput"));
+    update.insert("terminalId".into(), json!(terminal_id));
+    update.insert("seq".into(), json!(seq));
+    update.insert("data".into(), json!(data));
+    update.insert("bytes".into(), json!(bytes));
+    if dropped_bytes > 0 {
+        update.insert("droppedBytes".into(), json!(dropped_bytes));
+    }
+    if backpressure_events > 0 {
+        update.insert("backpressureEvents".into(), json!(backpressure_events));
+    }
+    Value::Object(update)
 }
 
 /// Cooperative cancellation token shared by a running turn, its streaming
@@ -1439,6 +1583,459 @@ pub struct BackendCapabilities {
     pub mcp_sse: bool,
 }
 
+/// Spawn specification of one `terminal/create`: bounded command/args/cwd,
+/// an environment ALLOWLIST OF NAMES (never values, never the daemon
+/// environment), and the initial window geometry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalSpec {
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    /// Environment names the authority may copy from the daemon (after its
+    /// own deny-set); names, never values.
+    pub env: Vec<String>,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+/// Why one terminal authority operation failed. [`TerminalError::Invalid`]
+/// maps to the official `-32602`; the other variants map to `-32603` with
+/// the message in `data`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalError {
+    /// The request is invalid (bad geometry, NUL, unknown terminal, ...).
+    Invalid(String),
+    /// The authority refused the operation (spawn failed, process gone).
+    Refused(String),
+    /// The authority is unavailable for this operation.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for TerminalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TerminalError::Invalid(message) => write!(f, "{message}"),
+            TerminalError::Refused(message) => write!(f, "terminal refused: {message}"),
+            TerminalError::Unavailable(message) => write!(f, "terminal unavailable: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for TerminalError {}
+
+/// One live terminal handed back by a [`TerminalAuthority`]. Implementations
+/// must be fast and internally bounded: `drain_output` never blocks, `kill`
+/// is idempotent and terminates the whole process tree, and dropping the
+/// last handle kills the tree as the final failsafe.
+pub trait TerminalHandle: Send + Sync {
+    /// The authority-unique terminal id (the ownership row's key).
+    fn terminal_id(&self) -> &str;
+    /// The child pid at spawn.
+    fn pid(&self) -> u32;
+    /// Whether the child process tree is still alive.
+    fn is_alive(&self) -> bool;
+    /// The authority's ownership id for this row (daemon op/pty identity).
+    fn ownership_id(&self) -> &str;
+    /// Write raw bytes to the terminal.
+    fn write(&self, bytes: &[u8]) -> Result<(), TerminalError>;
+    /// Resize the terminal window.
+    fn resize(&self, rows: u16, cols: u16) -> Result<(), TerminalError>;
+    /// Drain all currently available output (bounded by the authority's
+    /// ring; never blocking).
+    fn drain_output(&self) -> Vec<u8>;
+    /// Kill the whole process tree (idempotent).
+    fn kill(&self) -> Result<(), TerminalError>;
+}
+
+/// The terminal seam: the daemon attaches its existing session-owned
+/// terminal authority (faktor-pty + ownership rows) here. This crate owns
+/// no PTY of its own; absent an authority, the `faktor.terminal` extension
+/// is not negotiated and every `terminal/*` request answers `-32601`.
+pub trait TerminalAuthority: Send + Sync {
+    /// Create a session-owned terminal. `session_id` is the session the
+    /// caller proved ownership of; the authority must enforce its own
+    /// environment deny-set regardless of `spec.env`.
+    fn create(
+        &self,
+        session_id: &str,
+        spec: &TerminalSpec,
+    ) -> Result<Arc<dyn TerminalHandle>, TerminalError>;
+}
+
+impl<T: TerminalAuthority + ?Sized> TerminalAuthority for Arc<T> {
+    fn create(
+        &self,
+        session_id: &str,
+        spec: &TerminalSpec,
+    ) -> Result<Arc<dyn TerminalHandle>, TerminalError> {
+        (**self).create(session_id, spec)
+    }
+}
+
+/// Per-connection terminal registry: session-scoped ownership rows, bounded
+/// by [`AcpConfig::max_terminals`], each with a coalescing output pump. Owned
+/// by `serve_connection`; [`TerminalRegistry::shutdown`] runs on every
+/// connection wind-down so no terminal outlives its connection.
+#[derive(Clone)]
+struct TerminalRegistry {
+    authority: Option<Arc<dyn TerminalAuthority>>,
+    sessions: Arc<Mutex<HashSet<String>>>,
+    table: Arc<Mutex<TerminalTable>>,
+    config: AcpConfig,
+}
+
+#[derive(Default)]
+struct TerminalTable {
+    entries: HashMap<String, LiveTerminal>,
+}
+
+struct LiveTerminal {
+    session_id: String,
+    handle: Arc<dyn TerminalHandle>,
+    stats: Arc<TerminalStats>,
+    kill_tx: Option<oneshot::Sender<()>>,
+    pump: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Bounded per-terminal output accounting (never unbounded).
+#[derive(Default)]
+struct TerminalStats {
+    emitted_frames: AtomicU64,
+    dropped_bytes: AtomicU64,
+    backpressure_events: AtomicU64,
+}
+
+impl TerminalRegistry {
+    fn new(authority: Option<Arc<dyn TerminalAuthority>>, config: AcpConfig) -> Self {
+        Self {
+            authority,
+            sessions: Arc::new(Mutex::new(HashSet::new())),
+            table: Arc::new(Mutex::new(TerminalTable::default())),
+            config,
+        }
+    }
+
+    fn has_authority(&self) -> bool {
+        self.authority.is_some()
+    }
+
+    /// Record a session created through this connection. The index is
+    /// capped like the session registry; beyond the cap new sessions stay
+    /// untracked and their terminal requests answer the typed unknown-
+    /// session denial (bounded, loud, never silent).
+    fn note_session(&self, session_id: &str) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if sessions.len() < self.config.max_sessions {
+            sessions.insert(session_id.to_string());
+        }
+    }
+
+    fn knows_session(&self, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(session_id)
+    }
+
+    /// Register a freshly created handle, spawn its output pump, and return
+    /// the `terminal/create` result. A hostile authority id (empty, NUL,
+    /// oversized, duplicate) is refused and the handle is killed — never
+    /// leaked.
+    fn register(
+        &self,
+        session_id: &str,
+        handle: Arc<dyn TerminalHandle>,
+        main_tx: mpsc::Sender<Vec<u8>>,
+        negotiation: Negotiation,
+    ) -> Result<Value, ServerError> {
+        let terminal_id = handle.terminal_id().to_string();
+        let invalid_id = terminal_id.is_empty()
+            || terminal_id.len() > MAX_TERMINAL_ID_BYTES
+            || terminal_id.contains('\0');
+        let mut table = self
+            .table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if invalid_id {
+            drop(table);
+            let _ = handle.kill();
+            return Err(ServerError::internal(
+                "terminal authority returned an invalid terminal id".to_string(),
+            ));
+        }
+        if table.entries.len() >= self.config.max_terminals {
+            drop(table);
+            let _ = handle.kill();
+            return Err(ServerError {
+                code: TERMINAL_LIMIT,
+                message: MSG_TERMINAL_LIMIT.to_string(),
+                data: None,
+            });
+        }
+        if table.entries.contains_key(&terminal_id) {
+            drop(table);
+            let _ = handle.kill();
+            return Err(ServerError::internal(format!(
+                "terminal authority returned duplicate terminal id {terminal_id:?}"
+            )));
+        }
+        let stats = Arc::new(TerminalStats::default());
+        let (kill_tx, kill_rx) = oneshot::channel();
+        let pump = spawn_terminal_pump(
+            Arc::clone(&handle),
+            Arc::clone(&stats),
+            kill_rx,
+            session_id.to_string(),
+            terminal_id.clone(),
+            main_tx,
+            negotiation,
+            self.config,
+        );
+        table.entries.insert(
+            terminal_id.clone(),
+            LiveTerminal {
+                session_id: session_id.to_string(),
+                handle: Arc::clone(&handle),
+                stats,
+                kill_tx: Some(kill_tx),
+                pump: Some(pump),
+            },
+        );
+        Ok(json!({
+            "terminalId": terminal_id,
+            "pid": handle.pid(),
+            "sessionId": session_id,
+            "ownershipId": handle.ownership_id(),
+        }))
+    }
+
+    /// Resolve `(sessionId, terminalId)` to its live handle. A terminal of
+    /// another session is reported exactly like an unknown terminal: typed
+    /// invalid params, never a silent success and never an existence leak.
+    fn handle_for(
+        &self,
+        session_id: &str,
+        terminal_id: &str,
+    ) -> Result<Arc<dyn TerminalHandle>, ServerError> {
+        if !self.knows_session(session_id) {
+            return Err(unknown_session(session_id));
+        }
+        let table = self
+            .table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match table.entries.get(terminal_id) {
+            Some(entry) if entry.session_id == session_id => Ok(Arc::clone(&entry.handle)),
+            _ => Err(unknown_terminal(session_id, terminal_id)),
+        }
+    }
+
+    /// Remove one terminal row, returning its handle, pump cancellation and
+    /// stats (the caller kills the handle). The row is gone even if the kill
+    /// is best-effort, so a foreign caller can never reach it again.
+    fn take(
+        &self,
+        session_id: &str,
+        terminal_id: &str,
+    ) -> Result<(Arc<dyn TerminalHandle>, Arc<TerminalStats>), ServerError> {
+        if !self.knows_session(session_id) {
+            return Err(unknown_session(session_id));
+        }
+        let mut table = self
+            .table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let owned = matches!(
+            table.entries.get(terminal_id),
+            Some(entry) if entry.session_id == session_id
+        );
+        if !owned {
+            return Err(unknown_terminal(session_id, terminal_id));
+        }
+        let mut entry = table
+            .entries
+            .remove(terminal_id)
+            .expect("entry was just observed");
+        if let Some(kill_tx) = entry.kill_tx.take() {
+            let _ = kill_tx.send(());
+        }
+        if let Some(pump) = entry.pump.take() {
+            pump.abort();
+        }
+        Ok((entry.handle, entry.stats))
+    }
+
+    /// The requesting session's OWN rows, sorted by terminal id for a stable
+    /// projection. Foreign rows are never included.
+    fn list(&self, session_id: &str) -> Result<Vec<Value>, ServerError> {
+        if !self.knows_session(session_id) {
+            return Err(unknown_session(session_id));
+        }
+        let table = self
+            .table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut ids: Vec<&String> = table
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.session_id == session_id)
+            .map(|(id, _)| id)
+            .collect();
+        ids.sort();
+        Ok(ids
+            .into_iter()
+            .map(|id| {
+                let entry = table.entries.get(id).expect("id came from the table");
+                json!({
+                    "terminalId": id,
+                    "pid": entry.handle.pid(),
+                    "alive": entry.handle.is_alive(),
+                    "sessionId": entry.session_id,
+                    "ownershipId": entry.handle.ownership_id(),
+                    "emittedFrames": entry.stats.emitted_frames.load(Ordering::Relaxed),
+                    "droppedBytes": entry.stats.dropped_bytes.load(Ordering::Relaxed),
+                    "backpressureEvents": entry.stats.backpressure_events.load(Ordering::Relaxed),
+                })
+            })
+            .collect())
+    }
+
+    /// Cancel every pump and kill every handle. Runs on every connection
+    /// wind-down (EOF/shutdown/writer death) before the serve loop returns,
+    /// so a PTY child never outlives its ACP connection; dropping the last
+    /// handle stays the emergency failsafe.
+    async fn shutdown(&self) {
+        let entries: Vec<LiveTerminal> = {
+            let mut table = self
+                .table
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            table.entries.drain().map(|(_, entry)| entry).collect()
+        };
+        let mut handles: Vec<Arc<dyn TerminalHandle>> = Vec::with_capacity(entries.len());
+        for mut entry in entries {
+            if let Some(kill_tx) = entry.kill_tx.take() {
+                let _ = kill_tx.send(());
+            }
+            if let Some(pump) = entry.pump.take() {
+                pump.abort();
+            }
+            handles.push(entry.handle);
+        }
+        if !handles.is_empty() {
+            let _ = tokio::task::spawn_blocking(move || {
+                for handle in &handles {
+                    let _ = handle.kill();
+                }
+            })
+            .await;
+        }
+    }
+}
+
+fn unknown_session(session_id: &str) -> ServerError {
+    ServerError::invalid_params(format!("unknown session {session_id:?}"))
+}
+
+fn unknown_terminal(session_id: &str, terminal_id: &str) -> ServerError {
+    ServerError::invalid_params(format!(
+        "unknown terminal {terminal_id:?} for session {session_id:?}"
+    ))
+}
+
+/// One terminal's coalescing output pump. Every tick it drains the
+/// authority's bounded ring, emits `terminalOutput` frames of at most
+/// `terminal_output_frame_max` raw bytes and at most
+/// `terminal_output_window_max` raw bytes per window, and records every
+/// dropped byte/event (frames are `try_send`-ed: the pump NEVER blocks the
+/// writer queue, so a slow client can only cost recorded terminal loss, not
+/// a deadlock). Per-terminal frame order is preserved by construction.
+#[allow(clippy::too_many_arguments)]
+fn spawn_terminal_pump(
+    handle: Arc<dyn TerminalHandle>,
+    stats: Arc<TerminalStats>,
+    mut kill_rx: oneshot::Receiver<()>,
+    session_id: String,
+    terminal_id: String,
+    main_tx: mpsc::Sender<Vec<u8>>,
+    negotiation: Negotiation,
+    config: AcpConfig,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let interval = config.terminal_poll_interval.max(Duration::from_millis(1));
+        let frame_max = config.terminal_output_frame_max.max(1);
+        let window_max = config.terminal_output_window_max.max(frame_max);
+        let mut seq: u64 = 0;
+        let mut pending_dropped: u64 = 0;
+        let mut pending_backpressure: u64 = 0;
+        loop {
+            tokio::select! {
+                _ = &mut kill_rx => break,
+                _ = tokio::time::sleep(interval) => {}
+            }
+            // A re-initialize can un-negotiate the extension; the pump then
+            // holds the bounded ring (never unbounded buffering) instead of
+            // emitting unnegotiated extension frames.
+            if !negotiation.has_extension(EXTENSION_TERMINAL) {
+                continue;
+            }
+            let raw = handle.drain_output();
+            if raw.is_empty() {
+                continue;
+            }
+            let mut offset = 0usize;
+            let mut window_used = 0usize;
+            while offset < raw.len() {
+                let window_left = window_max.saturating_sub(window_used);
+                if window_left == 0 {
+                    let dropped = (raw.len() - offset) as u64;
+                    stats.dropped_bytes.fetch_add(dropped, Ordering::Relaxed);
+                    stats.backpressure_events.fetch_add(1, Ordering::Relaxed);
+                    pending_dropped += dropped;
+                    pending_backpressure += 1;
+                    break;
+                }
+                let take = (raw.len() - offset).min(frame_max).min(window_left);
+                let chunk = &raw[offset..offset + take];
+                offset += take;
+                window_used += take;
+                let data = String::from_utf8_lossy(chunk);
+                let update = terminal_output_update(
+                    &terminal_id,
+                    seq,
+                    &data,
+                    take,
+                    pending_dropped,
+                    pending_backpressure,
+                );
+                let params = session_update_params(&session_id, update);
+                let frame = notification_body_bytes("session/update", &params);
+                match main_tx.try_send(frame) {
+                    Ok(()) => {
+                        seq += 1;
+                        stats.emitted_frames.fetch_add(1, Ordering::Relaxed);
+                        pending_dropped = 0;
+                        pending_backpressure = 0;
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        stats
+                            .dropped_bytes
+                            .fetch_add(take as u64, Ordering::Relaxed);
+                        stats.backpressure_events.fetch_add(1, Ordering::Relaxed);
+                        pending_dropped += take as u64;
+                        pending_backpressure += 1;
+                        break;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                }
+            }
+        }
+    })
+}
+
 /// Why `session/load` failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadSessionError {
@@ -1847,6 +2444,7 @@ fn classify(value: Value) -> Incoming {
 pub struct AcpServer {
     engine: Engine,
     config: AcpConfig,
+    terminal_authority: Option<Arc<dyn TerminalAuthority>>,
 }
 
 impl AcpServer {
@@ -1856,6 +2454,7 @@ impl AcpServer {
         Self {
             engine: Engine::Sync(Arc::new(backend)),
             config: AcpConfig::default(),
+            terminal_authority: None,
         }
     }
 
@@ -1864,7 +2463,19 @@ impl AcpServer {
         Self {
             engine: Engine::Stream(Arc::new(backend)),
             config: AcpConfig::default(),
+            terminal_authority: None,
         }
+    }
+
+    /// Attach the daemon's session-owned terminal authority. Only then can
+    /// `faktor.terminal` be negotiated: a client that declares the extension
+    /// gets it echoed and the `terminal/*` table; without an authority the
+    /// extension is not granted and every `terminal/*` request answers the
+    /// official `-32601`. The crate implements no PTY itself — the authority
+    /// is where `faktor-pty` and the daemon's ownership rows live.
+    pub fn with_terminal_authority(mut self, authority: Arc<dyn TerminalAuthority>) -> Self {
+        self.terminal_authority = Some(authority);
+        self
     }
 
     /// Override the sizing/behavior knobs.
@@ -1887,6 +2498,7 @@ impl AcpServer {
         let (lane_tx, lane_rx) = mpsc::channel(CANCEL_LANE_CAPACITY);
         let (request_tx, request_rx) = mpsc::channel(config.request_queue_capacity);
         let registry = Registry::new(config.max_sessions);
+        let terminals = TerminalRegistry::new(self.terminal_authority.clone(), config);
         let negotiation = Negotiation::default();
         let outstanding = Outstanding::new(config.max_client_requests);
 
@@ -1898,6 +2510,7 @@ impl AcpServer {
         let dispatcher_handle = tokio::spawn(dispatcher_task(
             self.engine.clone(),
             registry.clone(),
+            terminals.clone(),
             main_tx.clone(),
             negotiation.clone(),
             outstanding.clone(),
@@ -2050,11 +2663,14 @@ impl AcpServer {
             }
         }
 
-        // Wind-down: cancel every running turn, fail every outstanding
-        // server→client request with Closed, drop our queue handles, then
-        // join dispatcher and writer (bounded by shutdown_timeout).
+        // Wind-down: cancel every running turn, kill every session-owned
+        // terminal (pumps cancelled, process trees killed) before the writer
+        // queues close, fail every outstanding server→client request with
+        // Closed, drop our queue handles, then join dispatcher and writer
+        // (bounded by shutdown_timeout).
         registry.cancel_all();
         outstanding.drain();
+        terminals.shutdown().await;
         drop(request_tx);
         drop(main_tx);
         drop(lane_tx);
@@ -2352,9 +2968,11 @@ async fn write_frame<W: AsyncWrite + Unpin>(
 
 /// Dispatcher task: owns the per-session state machine; routes prompts to
 /// per-session operation tasks; answers everything else directly.
+#[allow(clippy::too_many_arguments)]
 async fn dispatcher_task(
     engine: Engine,
     registry: Registry,
+    terminals: TerminalRegistry,
     main_tx: mpsc::Sender<Vec<u8>>,
     negotiation: Negotiation,
     outstanding: Outstanding,
@@ -2365,6 +2983,7 @@ async fn dispatcher_task(
         dispatch_request(
             &engine,
             &registry,
+            &terminals,
             &main_tx,
             &negotiation,
             &outstanding,
@@ -2383,6 +3002,7 @@ async fn dispatcher_task(
 async fn dispatch_request(
     engine: &Engine,
     registry: &Registry,
+    terminals: &TerminalRegistry,
     main_tx: &mpsc::Sender<Vec<u8>>,
     negotiation: &Negotiation,
     outstanding: &Outstanding,
@@ -2393,7 +3013,13 @@ async fn dispatch_request(
 ) -> Result<(), String> {
     match method {
         "initialize" => {
-            let frame = initialize_response(id, params, engine.capabilities(), negotiation);
+            let frame = initialize_response(
+                id,
+                params,
+                engine.capabilities(),
+                negotiation,
+                terminals.has_authority(),
+            );
             send_checked(main_tx, frame).await
         }
         "agent_info" => {
@@ -2406,6 +3032,10 @@ async fn dispatch_request(
             }
             match engine.create_session(params) {
                 Ok(session_id) => {
+                    // Only sessions created through this connection may own
+                    // terminals here; the index is bounded like the session
+                    // registry.
+                    terminals.note_session(&session_id);
                     let frame = result_frame(id, &json!({ "sessionId": session_id }));
                     send_checked(main_tx, frame).await
                 }
@@ -2443,6 +3073,10 @@ async fn dispatch_request(
             // every authenticate call is an official typed refusal.
             let frame = authenticate_response(id, params);
             send_checked(main_tx, frame).await
+        }
+        "terminal/create" | "terminal/input" | "terminal/resize" | "terminal/kill"
+        | "terminal/close" | "terminal/list" => {
+            dispatch_terminal(terminals, main_tx, negotiation, id, method, params).await
         }
         other => {
             let frame = error_frame(id, METHOD_NOT_FOUND, MSG_METHOD_NOT_FOUND, None);
@@ -2518,6 +3152,391 @@ async fn dispatch_load(
             send_checked(main_tx, frame).await
         }
     }
+}
+
+/// Dispatcher entry for the six `faktor.terminal` methods. The gate is the
+/// negotiated extension AND an attached authority: clients that did not
+/// declare `faktor.terminal` (or a server without a terminal authority) keep
+/// the official `-32601`, exactly like any unknown method.
+async fn dispatch_terminal(
+    terminals: &TerminalRegistry,
+    main_tx: &mpsc::Sender<Vec<u8>>,
+    negotiation: &Negotiation,
+    id: RequestId,
+    method: &str,
+    params: &Value,
+) -> Result<(), String> {
+    if !terminals.has_authority() || !negotiation.has_extension(EXTENSION_TERMINAL) {
+        let frame = error_frame(id, METHOD_NOT_FOUND, MSG_METHOD_NOT_FOUND, None);
+        return send_checked(main_tx, frame).await;
+    }
+    let outcome = match method {
+        "terminal/create" => terminal_create(terminals, main_tx, negotiation, params).await,
+        "terminal/input" => terminal_input(terminals, params).await,
+        "terminal/resize" => terminal_resize(terminals, params).await,
+        "terminal/kill" => terminal_kill(terminals, params).await,
+        "terminal/close" => terminal_close(terminals, params).await,
+        "terminal/list" => terminal_list(terminals, params),
+        _ => Err(ServerError::internal("unrouted terminal method")),
+    };
+    match outcome {
+        Ok(value) => {
+            let frame = result_frame(id, &value);
+            send_checked(main_tx, frame).await
+        }
+        Err(e) => respond_error(main_tx, id, e).await,
+    }
+}
+
+/// Strict param object: every unknown member is a typed refusal (a typo can
+/// never silently degrade into a default).
+fn strict_terminal_params<'a>(
+    params: &'a Value,
+    allowed: &[&str],
+) -> Result<&'a Map<String, Value>, ServerError> {
+    let object = params
+        .as_object()
+        .ok_or_else(|| ServerError::invalid_params("params must be a JSON object"))?;
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(ServerError::invalid_params(format!(
+                "unknown terminal param {key:?}"
+            )));
+        }
+    }
+    Ok(object)
+}
+
+fn required_terminal_string(
+    object: &Map<String, Value>,
+    field: &str,
+    max: usize,
+) -> Result<String, ServerError> {
+    match object.get(field) {
+        Some(Value::String(text)) if text.is_empty() => Err(ServerError::invalid_params(format!(
+            "terminal param \"{field}\" must be non-empty"
+        ))),
+        Some(Value::String(text)) if text.len() > max => Err(ServerError::invalid_params(format!(
+            "terminal param \"{field}\" exceeds {max} bytes"
+        ))),
+        Some(Value::String(text)) if text.contains('\0') => Err(ServerError::invalid_params(
+            format!("terminal param \"{field}\" contains a NUL byte"),
+        )),
+        Some(Value::String(text)) => Ok(text.clone()),
+        Some(_) => Err(ServerError::invalid_params(format!(
+            "terminal param \"{field}\" must be a string"
+        ))),
+        None => Err(ServerError::invalid_params(format!(
+            "missing terminal param \"{field}\""
+        ))),
+    }
+}
+
+fn optional_terminal_string(
+    object: &Map<String, Value>,
+    field: &str,
+    max: usize,
+) -> Result<Option<String>, ServerError> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => {
+            if text.is_empty() {
+                return Err(ServerError::invalid_params(format!(
+                    "terminal param \"{field}\" must be non-empty"
+                )));
+            }
+            if text.len() > max {
+                return Err(ServerError::invalid_params(format!(
+                    "terminal param \"{field}\" exceeds {max} bytes"
+                )));
+            }
+            if text.contains('\0') {
+                return Err(ServerError::invalid_params(format!(
+                    "terminal param \"{field}\" contains a NUL byte"
+                )));
+            }
+            Ok(Some(text.clone()))
+        }
+        Some(_) => Err(ServerError::invalid_params(format!(
+            "terminal param \"{field}\" must be a string"
+        ))),
+    }
+}
+
+fn terminal_args(object: &Map<String, Value>) -> Result<Vec<String>, ServerError> {
+    match object.get("args") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => {
+            if items.len() > MAX_TERMINAL_ARGS {
+                return Err(ServerError::invalid_params(format!(
+                    "terminal args exceed the {MAX_TERMINAL_ARGS}-entry bound"
+                )));
+            }
+            let mut args = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::String(text)
+                        if text.len() <= MAX_TERMINAL_ARG_BYTES && !text.contains('\0') =>
+                    {
+                        args.push(text.clone());
+                    }
+                    Value::String(text) if text.len() > MAX_TERMINAL_ARG_BYTES => {
+                        return Err(ServerError::invalid_params(format!(
+                            "terminal arg exceeds {MAX_TERMINAL_ARG_BYTES} bytes"
+                        )));
+                    }
+                    Value::String(_) => {
+                        return Err(ServerError::invalid_params(
+                            "terminal arg contains a NUL byte",
+                        ));
+                    }
+                    _ => {
+                        return Err(ServerError::invalid_params("terminal args must be strings"));
+                    }
+                }
+            }
+            Ok(args)
+        }
+        Some(_) => Err(ServerError::invalid_params(
+            "terminal param \"args\" must be an array of strings",
+        )),
+    }
+}
+
+/// `env` is an allowlist of NAMES (never `KEY=VALUE` pairs): the attached
+/// authority resolves the names against the daemon environment and applies
+/// its own deny-set, so secrets can never cross the ACP wire from either
+/// direction.
+fn terminal_env(object: &Map<String, Value>) -> Result<Vec<String>, ServerError> {
+    match object.get("env") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => {
+            if items.len() > MAX_TERMINAL_ENV_NAMES {
+                return Err(ServerError::invalid_params(format!(
+                    "terminal env allowlist exceeds the {MAX_TERMINAL_ENV_NAMES}-name bound"
+                )));
+            }
+            let mut names = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(name) = item.as_str() else {
+                    return Err(ServerError::invalid_params(
+                        "terminal env entries must be strings",
+                    ));
+                };
+                if name.len() > MAX_TERMINAL_ENV_NAME_BYTES {
+                    return Err(ServerError::invalid_params(format!(
+                        "terminal env name exceeds {MAX_TERMINAL_ENV_NAME_BYTES} bytes"
+                    )));
+                }
+                let mut bytes = name.bytes().enumerate();
+                let valid = match bytes.next() {
+                    Some((_, b)) if b.is_ascii_alphabetic() || b == b'_' => {
+                        bytes.all(|(_, b)| b.is_ascii_alphanumeric() || b == b'_')
+                    }
+                    _ => false,
+                };
+                if !valid {
+                    return Err(ServerError::invalid_params(format!(
+                        "invalid terminal env name {name:?} (expected [A-Za-z_][A-Za-z0-9_]*)"
+                    )));
+                }
+                names.push(name.to_string());
+            }
+            Ok(names)
+        }
+        Some(_) => Err(ServerError::invalid_params(
+            "terminal param \"env\" must be an array of names",
+        )),
+    }
+}
+
+fn terminal_size_field(
+    object: &Map<String, Value>,
+    field: &str,
+    default: Option<u16>,
+) -> Result<u16, ServerError> {
+    match object.get(field) {
+        None | Some(Value::Null) => default.ok_or_else(|| {
+            ServerError::invalid_params(format!("missing terminal param \"{field}\""))
+        }),
+        Some(Value::Number(number)) => match number.as_u64() {
+            Some(value) if (1..=65535).contains(&value) => Ok(value as u16),
+            _ => Err(ServerError::invalid_params(format!(
+                "terminal param \"{field}\" must be an integer in 1..=65535"
+            ))),
+        },
+        Some(_) => Err(ServerError::invalid_params(format!(
+            "terminal param \"{field}\" must be an integer"
+        ))),
+    }
+}
+
+/// A session is terminal-writable only when it was created through THIS
+/// connection; anything else is the same typed denial, so foreign sessions
+/// and nonexistent ones are indistinguishable (no existence leak).
+fn require_terminal_session(
+    terminals: &TerminalRegistry,
+    object: &Map<String, Value>,
+) -> Result<String, ServerError> {
+    let session_id = required_terminal_string(object, "sessionId", MAX_TERMINAL_ID_BYTES)?;
+    if !terminals.knows_session(&session_id) {
+        return Err(unknown_session(&session_id));
+    }
+    Ok(session_id)
+}
+
+fn terminal_error_to_server(error: TerminalError) -> ServerError {
+    match error {
+        TerminalError::Invalid(message) => ServerError::invalid_params(message),
+        other => ServerError::internal(other.to_string()),
+    }
+}
+
+/// Run one bounded blocking authority operation off the dispatcher task.
+async fn run_terminal_op<F>(timeout: Duration, op: F) -> Result<(), ServerError>
+where
+    F: FnOnce() -> Result<(), TerminalError> + Send + 'static,
+{
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(op)).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(terminal_error_to_server(error)),
+        Ok(Err(_join)) => Err(ServerError::internal("terminal io task failed")),
+        Err(_elapsed) => Err(ServerError::internal("terminal io timed out")),
+    }
+}
+
+async fn terminal_create(
+    terminals: &TerminalRegistry,
+    main_tx: &mpsc::Sender<Vec<u8>>,
+    negotiation: &Negotiation,
+    params: &Value,
+) -> Result<Value, ServerError> {
+    let object = strict_terminal_params(
+        params,
+        &["sessionId", "command", "args", "cwd", "env", "rows", "cols"],
+    )?;
+    let session_id = require_terminal_session(terminals, object)?;
+    let command = required_terminal_string(object, "command", MAX_TERMINAL_COMMAND_BYTES)?;
+    let args = terminal_args(object)?;
+    let cwd = optional_terminal_string(object, "cwd", MAX_TERMINAL_CWD_BYTES)?;
+    let env = terminal_env(object)?;
+    let rows = terminal_size_field(object, "rows", Some(24))?;
+    let cols = terminal_size_field(object, "cols", Some(80))?;
+    let spec = TerminalSpec {
+        command,
+        args,
+        cwd,
+        env,
+        rows,
+        cols,
+    };
+    let authority = terminals
+        .authority
+        .clone()
+        .ok_or_else(|| ServerError::internal("no terminal authority attached"))?;
+    let session_for_authority = session_id.clone();
+    let created = tokio::time::timeout(
+        terminals.config.terminal_spawn_timeout,
+        tokio::task::spawn_blocking(move || authority.create(&session_for_authority, &spec)),
+    )
+    .await;
+    match created {
+        Ok(Ok(Ok(handle))) => {
+            terminals.register(&session_id, handle, main_tx.clone(), negotiation.clone())
+        }
+        Ok(Ok(Err(error))) => Err(terminal_error_to_server(error)),
+        Ok(Err(_join)) => Err(ServerError::internal("terminal spawn task failed")),
+        // The blocking spawn was abandoned at the bound; if it ever
+        // completes, the drawn handle is dropped, which kills the child.
+        Err(_elapsed) => Err(ServerError::internal("terminal spawn timed out")),
+    }
+}
+
+async fn terminal_input(
+    terminals: &TerminalRegistry,
+    params: &Value,
+) -> Result<Value, ServerError> {
+    let object = strict_terminal_params(params, &["sessionId", "terminalId", "data"])?;
+    let session_id = require_terminal_session(terminals, object)?;
+    let terminal_id = required_terminal_string(object, "terminalId", MAX_TERMINAL_ID_BYTES)?;
+    let data = match object.get("data") {
+        Some(Value::String(text)) => text.clone(),
+        Some(_) => {
+            return Err(ServerError::invalid_params(
+                "terminal param \"data\" must be a string",
+            ))
+        }
+        None => {
+            return Err(ServerError::invalid_params(
+                "missing terminal param \"data\"",
+            ))
+        }
+    };
+    if data.len() > MAX_TERMINAL_INPUT_BYTES {
+        return Err(ServerError::invalid_params(format!(
+            "terminal input of {} bytes exceeds the {MAX_TERMINAL_INPUT_BYTES}-byte bound",
+            data.len()
+        )));
+    }
+    if data.contains('\0') {
+        return Err(ServerError::invalid_params(
+            "terminal input contains a NUL byte",
+        ));
+    }
+    let handle = terminals.handle_for(&session_id, &terminal_id)?;
+    let bytes = data.into_bytes();
+    run_terminal_op(terminals.config.terminal_io_timeout, move || {
+        handle.write(&bytes)
+    })
+    .await?;
+    Ok(json!({}))
+}
+
+async fn terminal_resize(
+    terminals: &TerminalRegistry,
+    params: &Value,
+) -> Result<Value, ServerError> {
+    let object = strict_terminal_params(params, &["sessionId", "terminalId", "rows", "cols"])?;
+    let session_id = require_terminal_session(terminals, object)?;
+    let terminal_id = required_terminal_string(object, "terminalId", MAX_TERMINAL_ID_BYTES)?;
+    let rows = terminal_size_field(object, "rows", None)?;
+    let cols = terminal_size_field(object, "cols", None)?;
+    let handle = terminals.handle_for(&session_id, &terminal_id)?;
+    run_terminal_op(terminals.config.terminal_io_timeout, move || {
+        handle.resize(rows, cols)
+    })
+    .await?;
+    Ok(json!({}))
+}
+
+async fn terminal_kill(terminals: &TerminalRegistry, params: &Value) -> Result<Value, ServerError> {
+    let object = strict_terminal_params(params, &["sessionId", "terminalId"])?;
+    let session_id = require_terminal_session(terminals, object)?;
+    let terminal_id = required_terminal_string(object, "terminalId", MAX_TERMINAL_ID_BYTES)?;
+    let handle = terminals.handle_for(&session_id, &terminal_id)?;
+    run_terminal_op(terminals.config.terminal_io_timeout, move || handle.kill()).await?;
+    Ok(json!({}))
+}
+
+async fn terminal_close(
+    terminals: &TerminalRegistry,
+    params: &Value,
+) -> Result<Value, ServerError> {
+    let object = strict_terminal_params(params, &["sessionId", "terminalId"])?;
+    let session_id = require_terminal_session(terminals, object)?;
+    let terminal_id = required_terminal_string(object, "terminalId", MAX_TERMINAL_ID_BYTES)?;
+    // The row is removed (pump cancelled) before the kill; the row can never
+    // be reached again even if the best-effort kill fails.
+    let (handle, _stats) = terminals.take(&session_id, &terminal_id)?;
+    run_terminal_op(terminals.config.terminal_io_timeout, move || handle.kill()).await?;
+    Ok(json!({}))
+}
+
+fn terminal_list(terminals: &TerminalRegistry, params: &Value) -> Result<Value, ServerError> {
+    let object = strict_terminal_params(params, &["sessionId"])?;
+    let session_id = require_terminal_session(terminals, object)?;
+    let rows = terminals.list(&session_id)?;
+    Ok(json!({ "sessionId": session_id, "terminals": rows }))
 }
 
 /// Map the frozen native message page (newest-first) into chronological
@@ -2984,6 +4003,7 @@ fn initialize_response(
     params: &Value,
     capabilities: BackendCapabilities,
     negotiation: &Negotiation,
+    terminal_available: bool,
 ) -> Vec<u8> {
     let version = params.get("protocolVersion");
     let version_ok = match version {
@@ -3001,10 +4021,18 @@ fn initialize_response(
         );
         return error_frame(id, INVALID_PARAMS, &message, Some(Value::Object(data)));
     }
-    let negotiated = match parse_initialize(params) {
+    let mut negotiated = match parse_initialize(params) {
         Ok(negotiated) => negotiated,
         Err(e) => return error_frame(id, e.code, &e.message, e.data),
     };
+    // `faktor.terminal` is granted only when the server carries a terminal
+    // authority; declaring it without one is not negotiated (and every
+    // terminal method keeps the official -32601).
+    if !terminal_available {
+        negotiated
+            .extensions
+            .retain(|name| name != EXTENSION_TERMINAL);
+    }
     negotiation.replace(negotiated.clone());
     let mut agent_capabilities = Map::new();
     agent_capabilities.insert(

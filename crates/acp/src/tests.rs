@@ -607,6 +607,13 @@ fn a_update_frame_goldens_reference_exact_shapes() {
         g::ERROR_INTERNAL_BACKEND,
         g::ERROR_INVALID_PARAMS_SESSION,
         g::ERROR_SESSION_BUSY,
+        g::INITIALIZE_REQUEST_TERMINAL,
+        g::INITIALIZE_RESPONSE_TERMINAL,
+        g::TERMINAL_CREATE_REQUEST,
+        g::TERMINAL_CREATE_RESPONSE,
+        g::TERMINAL_LIST_RESPONSE,
+        g::UPDATE_FRAME_TERMINAL_OUTPUT,
+        g::UPDATE_FRAME_TERMINAL_OUTPUT_DROPPED,
     ] {
         let v: Value = serde_json::from_str(fixture).expect("golden fixture is valid JSON");
         assert!(v.is_object());
@@ -1962,4 +1969,299 @@ async fn ndjson_blank_lines_malformed_lines_and_invalid_requests_keep_serving() 
     .await;
     let info = peer.recv_until("agent_info", |f| f["id"] == "after").await;
     assert_eq!(info["result"]["name"], "test-agent");
+}
+
+// ---------------------------------------------------------------------------
+// Negotiated `faktor.terminal` extension: builders, strict params, ownership
+// ---------------------------------------------------------------------------
+
+#[test]
+fn terminal_output_update_builder_matches_golden_shapes() {
+    assert_eq!(
+        terminal_output_update("t-1", 0, "hello", 5, 0, 0),
+        golden_value(g::UPDATE_FRAME_TERMINAL_OUTPUT)
+    );
+    assert_eq!(
+        terminal_output_update("t-1", 7, "abc", 3, 4096, 2),
+        golden_value(g::UPDATE_FRAME_TERMINAL_OUTPUT_DROPPED)
+    );
+    // Zero counters are omitted entirely: a frame never claims loss that
+    // did not happen, and never hides loss that did.
+    let clean = terminal_output_update("t-1", 0, "hello", 5, 0, 0);
+    assert!(clean.get("droppedBytes").is_none());
+    assert!(clean.get("backpressureEvents").is_none());
+    let lossy = terminal_output_update("t-1", 0, "", 0, 1, 1);
+    assert_eq!(lossy["droppedBytes"], 1);
+    assert_eq!(lossy["backpressureEvents"], 1);
+}
+
+#[test]
+fn terminal_extension_negotiation_is_honest_about_authority() {
+    let negotiation = Negotiation::default();
+    let request = json!({
+        "protocolVersion": 1,
+        "extensions": ["faktor.terminal", "faktor.agentStateChanged"],
+    });
+
+    // No authority attached: the declared terminal name is NOT granted; the
+    // accepted status extension still is.
+    let frame = initialize_response(
+        RequestId::from(1u64),
+        &request,
+        BackendCapabilities::default(),
+        &negotiation,
+        false,
+    );
+    let value: Value = serde_json::from_slice(&frame).expect("initialize response body");
+    assert_eq!(
+        value["result"]["extensions"],
+        json!(["faktor.agentStateChanged"]),
+        "an unbacked capability must never be echoed"
+    );
+    assert!(
+        !negotiation.has_extension(EXTENSION_TERMINAL),
+        "an unbacked capability must never be negotiated"
+    );
+
+    // Authority attached: the declared terminal extension is granted.
+    let frame = initialize_response(
+        RequestId::from(2u64),
+        &request,
+        BackendCapabilities::default(),
+        &negotiation,
+        true,
+    );
+    let value: Value = serde_json::from_slice(&frame).expect("initialize response body");
+    assert_eq!(
+        value["result"]["extensions"],
+        json!(["faktor.terminal", "faktor.agentStateChanged"])
+    );
+    assert!(negotiation.has_extension(EXTENSION_TERMINAL));
+}
+
+#[test]
+fn terminal_strict_params_refuse_hostiles_typed() {
+    // Unknown fields are refused, never silently ignored.
+    let params = json!({ "sessionId": "s", "command": "sh", "bogus": 1 });
+    assert!(strict_terminal_params(&params, &["sessionId", "command"]).is_err());
+
+    let object = |value: &Value| value.as_object().unwrap().clone();
+
+    // Command/string bounds, emptiness and NUL.
+    let too_long = "x".repeat(MAX_TERMINAL_COMMAND_BYTES + 1);
+    for value in [
+        json!({ "command": "" }),
+        json!({ "command": too_long }),
+        json!({ "command": "sh\u{0}od" }),
+        json!({ "command": 7 }),
+    ] {
+        let o = object(&value);
+        assert!(
+            required_terminal_string(&o, "command", MAX_TERMINAL_COMMAND_BYTES).is_err(),
+            "hostile command accepted: {value}"
+        );
+    }
+
+    // Args: count, per-entry size, NUL, non-string.
+    let many: Vec<Value> = (0..=MAX_TERMINAL_ARGS).map(|_| json!("a")).collect();
+    for value in [
+        json!({ "args": many }),
+        json!({ "args": ["ok", "y".repeat(MAX_TERMINAL_ARG_BYTES + 1)] }),
+        json!({ "args": ["a\u{0}b"] }),
+        json!({ "args": ["ok", 3] }),
+        json!({ "args": "not-an-array" }),
+    ] {
+        assert!(
+            terminal_args(&object(&value)).is_err(),
+            "hostile args: {value}"
+        );
+    }
+
+    // Env: names only, strict grammar, bounds; values are never accepted.
+    let many: Vec<Value> = (0..=MAX_TERMINAL_ENV_NAMES)
+        .map(|i| json!(format!("VAR_{i}")))
+        .collect();
+    for value in [
+        json!({ "env": many }),
+        json!({ "env": ["PATH", "BAD-NAME"] }),
+        json!({ "env": ["1LEADING"] }),
+        json!({ "env": [""] }),
+        json!({ "env": ["K=V"] }),
+        json!({ "env": ["A\u{0}B"] }),
+        json!({ "env": [7] }),
+        json!({ "env": { "PATH": "/bin" } }),
+    ] {
+        assert!(
+            terminal_env(&object(&value)).is_err(),
+            "hostile env: {value}"
+        );
+    }
+    assert_eq!(
+        terminal_env(&object(&json!({ "env": ["PATH", "_OK2"] }))).unwrap(),
+        vec!["PATH".to_string(), "_OK2".to_string()]
+    );
+
+    // Sizes: zero, over-u16, negative, fractional and non-numeric refused.
+    for value in [
+        json!({ "rows": 0 }),
+        json!({ "rows": 65536 }),
+        json!({ "rows": -1 }),
+        json!({ "rows": 1.5 }),
+        json!({ "rows": "24" }),
+    ] {
+        assert!(
+            terminal_size_field(&object(&value), "rows", Some(24)).is_err(),
+            "hostile size: {value}"
+        );
+    }
+    assert_eq!(
+        terminal_size_field(&object(&json!({})), "rows", Some(24)).unwrap(),
+        24
+    );
+    assert!(terminal_size_field(&object(&json!({})), "rows", None).is_err());
+    assert_eq!(
+        terminal_size_field(&object(&json!({ "rows": 65535 })), "rows", None).unwrap(),
+        65535
+    );
+}
+
+struct UnitHandle {
+    id: String,
+    ownership: String,
+    pid: u32,
+    alive: AtomicBool,
+    output: Mutex<Vec<u8>>,
+}
+
+impl UnitHandle {
+    fn new(id: &str, ownership: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            ownership: ownership.to_string(),
+            pid: 4242,
+            alive: AtomicBool::new(true),
+            output: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl TerminalHandle for UnitHandle {
+    fn terminal_id(&self) -> &str {
+        &self.id
+    }
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+    fn ownership_id(&self) -> &str {
+        &self.ownership
+    }
+    fn write(&self, bytes: &[u8]) -> Result<(), TerminalError> {
+        self.output.lock().unwrap().extend_from_slice(bytes);
+        Ok(())
+    }
+    fn resize(&self, _rows: u16, _cols: u16) -> Result<(), TerminalError> {
+        Ok(())
+    }
+    fn drain_output(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.output.lock().unwrap())
+    }
+    fn kill(&self) -> Result<(), TerminalError> {
+        self.alive.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn terminal_registry_ownership_is_session_scoped_and_bounded() {
+    let config = AcpConfig {
+        max_terminals: 1,
+        ..AcpConfig::default()
+    };
+    let registry = TerminalRegistry::new(None, config);
+    registry.note_session("sess-a");
+    registry.note_session("sess-b");
+
+    let (main_tx, _main_rx) = tokio::sync::mpsc::channel(8);
+    let created = registry
+        .register(
+            "sess-a",
+            Arc::new(UnitHandle::new("t-1", "own-1")),
+            main_tx.clone(),
+            Negotiation::default(),
+        )
+        .unwrap();
+    assert_eq!(created["terminalId"], "t-1");
+    assert_eq!(created["ownershipId"], "own-1");
+    assert_eq!(created["pid"], 4242);
+
+    // Session-scoped projection: A sees its row, B never does.
+    let rows_a = registry.list("sess-a").unwrap();
+    assert_eq!(rows_a.len(), 1);
+    assert_eq!(rows_a[0]["ownershipId"], "own-1");
+    assert!(registry.list("sess-b").unwrap().is_empty());
+
+    // Foreign session: the same typed denial as an unknown session or an
+    // unknown terminal — existence is never leaked.
+    let foreign = registry
+        .handle_for("sess-b", "t-1")
+        .err()
+        .expect("foreign session denied");
+    assert_eq!(foreign.code, INVALID_PARAMS);
+    let unknown_session = registry
+        .handle_for("nope", "t-1")
+        .err()
+        .expect("unknown session denied");
+    assert_eq!(unknown_session.code, INVALID_PARAMS);
+    let unknown_terminal = registry
+        .handle_for("sess-a", "t-999")
+        .err()
+        .expect("unknown terminal denied");
+    assert_eq!(unknown_terminal.code, INVALID_PARAMS);
+    assert!(foreign.message.contains("unknown terminal"));
+    assert!(unknown_terminal.message.contains("unknown terminal"));
+
+    // The capacity bound is a typed resource refusal, and the refused
+    // handle is killed (no orphan).
+    let refused = Arc::new(UnitHandle::new("t-2", "own-2"));
+    let err = registry
+        .register(
+            "sess-a",
+            refused.clone(),
+            main_tx.clone(),
+            Negotiation::default(),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, TERMINAL_LIMIT);
+    assert!(!refused.is_alive(), "a refused terminal must be killed");
+
+    // Duplicate authority ids are refused and killed.
+    let registry = TerminalRegistry::new(None, AcpConfig::default());
+    registry.note_session("sess-a");
+    registry
+        .register(
+            "sess-a",
+            Arc::new(UnitHandle::new("t-1", "own-1")),
+            main_tx.clone(),
+            Negotiation::default(),
+        )
+        .unwrap();
+    let duplicate = Arc::new(UnitHandle::new("t-1", "own-9"));
+    let err = registry
+        .register("sess-a", duplicate.clone(), main_tx, Negotiation::default())
+        .unwrap_err();
+    assert_eq!(err.code, INTERNAL_ERROR);
+    assert!(!duplicate.is_alive());
+
+    // `take` removes the row (close semantics): the handle is no longer
+    // reachable through any session.
+    let (handle, _stats) = registry.take("sess-a", "t-1").unwrap();
+    assert_eq!(handle.terminal_id(), "t-1");
+    let gone = registry
+        .handle_for("sess-a", "t-1")
+        .err()
+        .expect("closed terminal is gone");
+    assert_eq!(gone.code, INVALID_PARAMS);
 }
