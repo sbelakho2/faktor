@@ -38,6 +38,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod criteria;
 pub mod derive;
 pub mod exec;
 pub mod review;

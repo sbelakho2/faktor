@@ -235,6 +235,33 @@ pub const MAX_INTEGRATION_ID_BYTES: usize = 128;
 /// The entry tag of one integration record (mirrors the enum tag).
 pub const INTEGRATION_RECORDED_TAG: &str = "integration_recorded";
 
+// Durable orchestrated run-base + landing-transaction rows (prepare ->
+// verify(candidate) -> land(owner)): one `run_base` row records the
+// IMMUTABLE run-base generation every isolated child is derived from, and
+// one `integration_txn` row per landing attempt journals every per-path
+// decision, its rollback blob and the transaction phase. Both fold nowhere
+// in the head and are PINNED across compaction: the run base is the CAS
+// anchor staging refuses against, and an unfinished landing transaction is
+// the durable recovery authority a restarted executor finishes or rolls
+// back from.
+pub const ENTRY_RUN_BASE: &str = "run_base";
+pub const ENTRY_INTEGRATION_TXN: &str = "integration_txn";
+
+// ---------------------------------------------------------------- run-base / txn bounds
+
+/// Hard bound on the stored run-base path.
+pub const MAX_RUN_BASE_ROOT_BYTES: usize = 1024;
+/// Hard bound on the stored manifest digest / snapshot hashes.
+pub const MAX_RUN_BASE_DIGEST_BYTES: usize = 64;
+/// Hard bound on the number of per-path rows of one landing transaction
+/// (mirrors the change-set file cap; the transaction never silently drops a
+/// decision).
+pub const MAX_INTEGRATION_TXN_PATHS: usize = 2000;
+/// Hard bound on the conflict summaries of one landing transaction.
+pub const MAX_INTEGRATION_TXN_CONFLICTS: usize = 32;
+/// Hard bound on one conflict summary line.
+pub const MAX_INTEGRATION_TXN_CONFLICT_BYTES: usize = 256;
+
 // ---------------------------------------------------------------- edit txn bounds
 
 /// Max files in ONE edit transaction (mirrors the engine's bound).
@@ -576,6 +603,14 @@ pub enum LedgerPayload {
     /// integration root and its snapshot digest, the integrated files and
     /// any conflicts. Record-first and pinned across compaction.
     IntegrationRecorded { record: IntegrationRecordRow },
+    /// The durable IMMUTABLE run base of one orchestrated run, recorded
+    /// BEFORE the first child spawn. Pinned across compaction.
+    RunBaseRecorded { record: RunBaseRecord },
+    /// One durable landing transaction of an orchestrated run: record-first
+    /// per-path decisions + rollback blobs, then the deterministic phase a
+    /// crashed executor finishes landing or rolls back from. Pinned across
+    /// compaction.
+    IntegrationTxnRecorded { row: IntegrationTxnRow },
 }
 
 /// One decoded ledger row.
@@ -787,6 +822,140 @@ pub struct IntegrationRecordRow {
     pub at_ms: i64,
 }
 
+/// The durable IMMUTABLE run base of one orchestrated run (prepare phase
+/// zero): the snapshot digest of the owner root taken BEFORE the first child
+/// spawn, the copied base root and the manifest digest of the copy. Every
+/// isolated child derives from this generation and
+/// [`crate::ledger`]-backed staging refuses a child whose recorded base does
+/// not name this record. Written once per run; a second record for the same
+/// run is a typed Conflict at the ledger read (the newest row wins and the
+/// executor refuses a digest drift).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunBaseRecord {
+    pub run_id: String,
+    pub workspace_id: u64,
+    pub worktree_id: u64,
+    /// Lowercase 64-hex BLAKE3 of the owner root at the moment the base was
+    /// accepted (before == after == copied by the stable-copy contract).
+    pub snapshot_hash: String,
+    /// Deterministic digest of the copied manifest (path|hash rows).
+    pub manifest_digest: String,
+    /// The daemon-owned base root every child/candidate derives from.
+    pub root: String,
+    pub created_ms: i64,
+}
+
+/// The durable phase of one transactional owner landing (record-first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationTxnPhase {
+    /// Decisions + rollback blobs recorded, verification not yet bound.
+    Prepared,
+    /// The verified candidate snapshot is bound; owner not touched.
+    Verified,
+    /// The owner-equality recheck passed; per-path applies in flight.
+    Landing,
+    /// Every path applied and the landed root equals the verified candidate.
+    Landed,
+    /// A late conflict forced a rollback of the paths we applied.
+    RollingBack,
+    /// Every path restored to base (or marked a rollback conflict).
+    RolledBack,
+    /// Landing refused deterministically (owner drift before the first
+    /// write); nothing was applied.
+    Blocked,
+}
+
+impl IntegrationTxnPhase {
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            IntegrationTxnPhase::Prepared => "prepared",
+            IntegrationTxnPhase::Verified => "verified",
+            IntegrationTxnPhase::Landing => "landing",
+            IntegrationTxnPhase::Landed => "landed",
+            IntegrationTxnPhase::RollingBack => "rolling_back",
+            IntegrationTxnPhase::RolledBack => "rolled_back",
+            IntegrationTxnPhase::Blocked => "blocked",
+        }
+    }
+
+    /// Whether the phase is finished (no recovery action may run).
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            IntegrationTxnPhase::Landed
+                | IntegrationTxnPhase::RolledBack
+                | IntegrationTxnPhase::Blocked
+        )
+    }
+}
+
+/// The durable per-path state of one landing transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationPathTxnState {
+    Pending,
+    Applied,
+    RolledBack,
+    Conflict,
+    RollbackConflict,
+}
+
+/// ONE per-path landing decision + outcome. `base_blob` is the CAS digest
+/// of the path's base content (the rollback authority); `candidate_hash` is
+/// `None` for a deletion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationPathTxn {
+    pub path: String,
+    /// Lowercase 64-hex base content digest; `None` = the path was absent at
+    /// the run base.
+    #[serde(default)]
+    pub base_hash: Option<String>,
+    /// Lowercase 64-hex candidate content digest; `None` = candidate deleted
+    /// the path.
+    #[serde(default)]
+    pub candidate_hash: Option<String>,
+    /// CAS digest of the base content blob (rollback), when one exists.
+    #[serde(default)]
+    pub base_blob: Option<String>,
+    pub state: IntegrationPathTxnState,
+}
+
+impl IntegrationPathTxn {
+    pub fn state_tag(&self) -> &'static str {
+        match self.state {
+            IntegrationPathTxnState::Pending => "pending",
+            IntegrationPathTxnState::Applied => "applied",
+            IntegrationPathTxnState::RolledBack => "rolled_back",
+            IntegrationPathTxnState::Conflict => "conflict",
+            IntegrationPathTxnState::RollbackConflict => "rollback_conflict",
+        }
+    }
+}
+
+/// The durable landing transaction of one orchestrated run: record-first
+/// decisions + rollback blobs before the first owner write, per-path
+/// outcomes, and the deterministic phase a crashed executor recovers from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationTxnRow {
+    pub run_id: String,
+    pub task_id: u64,
+    pub owner_root: String,
+    pub candidate_root: String,
+    pub run_base_snapshot: String,
+    /// The verified candidate snapshot landing must reproduce exactly.
+    pub verified_candidate_snapshot: String,
+    pub sources_digest: String,
+    pub phase: IntegrationTxnPhase,
+    pub paths: Vec<IntegrationPathTxn>,
+    /// Exact number of decision rows the transaction carries (the stored
+    /// list may be bounded; nothing is silently dropped).
+    pub path_count: u64,
+    pub applied_count: u64,
+    pub conflicts: Vec<String>,
+    pub at_ms: i64,
+}
+
 /// Report of one watermark compaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerCompactReport {
@@ -833,6 +1002,8 @@ fn entry_tag_of(payload: &LedgerPayload) -> &'static str {
         LedgerPayload::CompletionContractSet { .. } => ENTRY_COMPLETION_CONTRACT_SET,
         LedgerPayload::CompletionStepStatus { .. } => ENTRY_COMPLETION_STEP_STATUS,
         LedgerPayload::IntegrationRecorded { .. } => ENTRY_INTEGRATION_RECORD,
+        LedgerPayload::RunBaseRecorded { .. } => ENTRY_RUN_BASE,
+        LedgerPayload::IntegrationTxnRecorded { .. } => ENTRY_INTEGRATION_TXN,
     }
 }
 
@@ -1057,6 +1228,20 @@ fn decode_payload(
             let decoded = decode(entry_type)?;
             if let LedgerPayload::IntegrationRecorded { record } = &decoded {
                 validate_integration_record(record)?;
+            }
+            Ok(decoded)
+        }
+        ENTRY_RUN_BASE => {
+            let decoded = decode(entry_type)?;
+            if let LedgerPayload::RunBaseRecorded { record } = &decoded {
+                validate_run_base_record(record)?;
+            }
+            Ok(decoded)
+        }
+        ENTRY_INTEGRATION_TXN => {
+            let decoded = decode(entry_type)?;
+            if let LedgerPayload::IntegrationTxnRecorded { row } = &decoded {
+                validate_integration_txn(row)?;
             }
             Ok(decoded)
         }
@@ -1684,6 +1869,154 @@ pub(crate) fn validate_integration_record(
     Ok(())
 }
 
+/// Shape bounds of one `run_base` row, shared by the appender and the
+/// strict decoder.
+pub(crate) fn validate_run_base_record(record: &RunBaseRecord) -> Result<(), SessionError> {
+    let check_hex = |value: &str, what: &str| -> Result<(), SessionError> {
+        if value.len() != MAX_RUN_BASE_DIGEST_BYTES || !value.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(SessionError::Malformed(format!(
+                "ledger run_base {what} must be the 64-char hex BLAKE3"
+            )));
+        }
+        Ok(())
+    };
+    if record.run_id.is_empty() || record.run_id.len() > MAX_INTEGRATION_ID_BYTES {
+        return Err(SessionError::Malformed(
+            "ledger run_base run_id must be 1..=MAX_INTEGRATION_ID_BYTES".into(),
+        ));
+    }
+    if record.workspace_id == 0 || record.worktree_id == 0 {
+        return Err(SessionError::Malformed(
+            "ledger run_base workspace_id/worktree_id must be non-zero".into(),
+        ));
+    }
+    check_hex(&record.snapshot_hash, "snapshot_hash")?;
+    check_hex(&record.manifest_digest, "manifest_digest")?;
+    if record.root.is_empty() || record.root.len() > MAX_RUN_BASE_ROOT_BYTES {
+        return Err(SessionError::Malformed(
+            "ledger run_base root must be 1..=MAX_RUN_BASE_ROOT_BYTES".into(),
+        ));
+    }
+    if record.created_ms <= 0 {
+        return Err(SessionError::Malformed(
+            "ledger run_base created_ms must be positive".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Shape bounds of one `integration_txn` row, shared by the appender and
+/// the strict decoder.
+pub(crate) fn validate_integration_txn(row: &IntegrationTxnRow) -> Result<(), SessionError> {
+    let check_hex = |value: &str, what: &str| -> Result<(), SessionError> {
+        if value.len() != MAX_RUN_BASE_DIGEST_BYTES || !value.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(SessionError::Malformed(format!(
+                "ledger integration_txn {what} must be the 64-char hex BLAKE3"
+            )));
+        }
+        Ok(())
+    };
+    if row.run_id.is_empty() || row.run_id.len() > MAX_INTEGRATION_ID_BYTES {
+        return Err(SessionError::Malformed(
+            "ledger integration_txn run_id must be 1..=MAX_INTEGRATION_ID_BYTES".into(),
+        ));
+    }
+    if row.task_id == 0 {
+        return Err(SessionError::Malformed(
+            "ledger integration_txn task_id must be non-zero".into(),
+        ));
+    }
+    if row.owner_root.is_empty() || row.owner_root.len() > MAX_INTEGRATION_ROOT_BYTES {
+        return Err(SessionError::Malformed(
+            "ledger integration_txn owner_root must be 1..=MAX_INTEGRATION_ROOT_BYTES".into(),
+        ));
+    }
+    if row.candidate_root.is_empty() || row.candidate_root.len() > MAX_INTEGRATION_ROOT_BYTES {
+        return Err(SessionError::Malformed(
+            "ledger integration_txn candidate_root must be 1..=MAX_INTEGRATION_ROOT_BYTES".into(),
+        ));
+    }
+    check_hex(&row.run_base_snapshot, "run_base_snapshot")?;
+    check_hex(
+        &row.verified_candidate_snapshot,
+        "verified_candidate_snapshot",
+    )?;
+    if !row.sources_digest.is_empty() {
+        check_hex(&row.sources_digest, "sources_digest")?;
+    }
+    if row.paths.len() > MAX_INTEGRATION_TXN_PATHS {
+        return Err(SessionError::Oversized(format!(
+            "ledger integration_txn stores {} paths (cap {MAX_INTEGRATION_TXN_PATHS})",
+            row.paths.len()
+        )));
+    }
+    if row.path_count < row.paths.len() as u64 {
+        return Err(SessionError::Malformed(
+            "ledger integration_txn path count is smaller than its stored paths".into(),
+        ));
+    }
+    if row.path_count == 0 && !row.paths.is_empty() {
+        return Err(SessionError::Malformed(
+            "ledger integration_txn with zero paths must carry no path rows".into(),
+        ));
+    }
+    let mut previous: Option<&str> = None;
+    for path in &row.paths {
+        if path.path.is_empty() || path.path.len() > MAX_INTEGRATION_PATH_BYTES {
+            return Err(SessionError::Malformed(
+                "ledger integration_txn path must be 1..=MAX_INTEGRATION_PATH_BYTES".into(),
+            ));
+        }
+        if previous.is_some_and(|p| p >= path.path.as_str()) {
+            return Err(SessionError::Malformed(
+                "ledger integration_txn paths must be strictly ascending".into(),
+            ));
+        }
+        previous = Some(&path.path);
+        if let Some(hash) = &path.base_hash {
+            check_hex(hash, "path base_hash")?;
+        }
+        if let Some(hash) = &path.candidate_hash {
+            check_hex(hash, "path candidate_hash")?;
+        }
+        if let Some(blob) = &path.base_blob {
+            check_hex(blob, "path base_blob")?;
+        }
+        if path.base_hash.is_none() && path.base_blob.is_some() {
+            return Err(SessionError::Malformed(
+                "ledger integration_txn path without a base hash may not carry a base blob".into(),
+            ));
+        }
+    }
+    if row.applied_count > row.path_count {
+        return Err(SessionError::Malformed(
+            "ledger integration_txn applied count exceeds its path count".into(),
+        ));
+    }
+    if row.conflicts.len() > MAX_INTEGRATION_TXN_CONFLICTS {
+        return Err(SessionError::Oversized(format!(
+            "ledger integration_txn stores {} conflicts (cap {MAX_INTEGRATION_TXN_CONFLICTS})",
+            row.conflicts.len()
+        )));
+    }
+    for conflict in &row.conflicts {
+        if conflict.is_empty() || conflict.len() > MAX_INTEGRATION_TXN_CONFLICT_BYTES {
+            return Err(SessionError::Malformed(
+                "ledger integration_txn conflict must be 1..=MAX_INTEGRATION_TXN_CONFLICT_BYTES"
+                    .into(),
+            ));
+        }
+    }
+    if row.at_ms <= 0 {
+        return Err(SessionError::Malformed(
+            "ledger integration_txn at_ms must be positive".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn check_payload_bytes(payload: &LedgerPayload) -> Result<(), SessionError> {
     let bytes = json_bytes(&serde_json::to_value(payload).unwrap_or_default());
     if bytes > MAX_LEDGER_ENTRY_BYTES {
@@ -1944,6 +2277,10 @@ fn fold(head: &mut LedgerHead, payload: &LedgerPayload) -> Result<(), SessionErr
         // and are pinned across compaction (the completion gate re-reads
         // them), exactly like tournament and completion-contract rows.
         LedgerPayload::IntegrationRecorded { .. } => {}
+        // Run-base and landing-transaction rows are operational recovery
+        // authorities: they fold nowhere in the head and are pinned across
+        // compaction (staging and crash recovery re-read them).
+        LedgerPayload::RunBaseRecorded { .. } | LedgerPayload::IntegrationTxnRecorded { .. } => {}
     }
     Ok(())
 }
@@ -3125,6 +3462,63 @@ impl SessionHandle {
         Ok(out)
     }
 
+    /// Append the durable IMMUTABLE run base of one orchestrated run
+    /// (recorded before the first child spawn). The row is validated before
+    /// any byte is journaled.
+    pub fn ledger_run_base_set(&self, record: &RunBaseRecord) -> faktor_core::Result<i64> {
+        validate_run_base_record(record)?;
+        let _guard = self.command_guard();
+        self.append_entry(LedgerPayload::RunBaseRecorded {
+            record: record.clone(),
+        })?
+        .ok_or_else(|| {
+            SessionError::Internal("ledger run base append returned no seq".into()).into()
+        })
+    }
+
+    /// The NEWEST durable run base of one run, or `None` when the run never
+    /// recorded one (legacy/direct-runtime runs).
+    pub fn ledger_run_base_get(&self, run_id: &str) -> faktor_core::Result<Option<RunBaseRecord>> {
+        let mut latest: Option<RunBaseRecord> = None;
+        for entry in self.all_entries_decoded()? {
+            if let LedgerPayload::RunBaseRecorded { record } = entry.payload {
+                if record.run_id == run_id {
+                    latest = Some(record);
+                }
+            }
+        }
+        Ok(latest)
+    }
+
+    /// Append one durable landing-transaction row (record-first: decisions +
+    /// rollback blobs before the first owner write; later rows journal the
+    /// per-path outcomes and the phase).
+    pub fn ledger_integration_txn_set(&self, row: &IntegrationTxnRow) -> faktor_core::Result<i64> {
+        validate_integration_txn(row)?;
+        let _guard = self.command_guard();
+        self.append_entry(LedgerPayload::IntegrationTxnRecorded { row: row.clone() })?
+            .ok_or_else(|| {
+                SessionError::Internal("ledger integration txn append returned no seq".into())
+                    .into()
+            })
+    }
+
+    /// The NEWEST durable landing transaction of one run, or `None`.
+    pub fn ledger_integration_txn_for_run(
+        &self,
+        run_id: &str,
+    ) -> faktor_core::Result<Option<IntegrationTxnRow>> {
+        let mut latest: Option<IntegrationTxnRow> = None;
+        for entry in self.all_entries_decoded()? {
+            if let LedgerPayload::IntegrationTxnRecorded { row } = entry.payload {
+                if row.run_id == run_id {
+                    latest = Some(row);
+                }
+            }
+        }
+        Ok(latest)
+    }
+
     /// The shared typed append tail: bounds the payload, maps its entry
     /// type, and writes the single row (gapless, always above the head's
     /// checkpoint so the fold cursor never rewinds).
@@ -3226,6 +3620,11 @@ impl SessionHandle {
         // the completion gate re-read them, so a pruned record would
         // silently unbind a passing verification from the root it certified.
         let mut integration_seqs: Vec<i64> = Vec::new();
+        // Run-base records and landing-transaction rows are pinned: staging
+        // refuses against the recorded base and crash recovery finishes or
+        // rolls back from the transaction rows, so watermark compaction must
+        // never silently delete either authority.
+        let mut orchestrated_txn_seqs: Vec<i64> = Vec::new();
         for entry in &entries {
             match &entry.payload {
                 LedgerPayload::GoalSet { .. } => {
@@ -3254,6 +3653,10 @@ impl SessionHandle {
                 LedgerPayload::CompletionContractSet { .. }
                 | LedgerPayload::CompletionStepStatus { .. } => completion_seqs.push(entry.seq),
                 LedgerPayload::IntegrationRecorded { .. } => integration_seqs.push(entry.seq),
+                LedgerPayload::RunBaseRecorded { .. }
+                | LedgerPayload::IntegrationTxnRecorded { .. } => {
+                    orchestrated_txn_seqs.push(entry.seq)
+                }
                 _ => {}
             }
         }
@@ -3293,6 +3696,7 @@ impl SessionHandle {
         pinned.extend(board_seqs);
         pinned.extend(completion_seqs);
         pinned.extend(integration_seqs);
+        pinned.extend(orchestrated_txn_seqs);
         pinned.sort_unstable();
         pinned.dedup();
         let head_json = head_to_json(&head)?;

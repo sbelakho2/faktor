@@ -9011,6 +9011,7 @@ mod tests {
                     criterion_key: "tests pass".into(),
                     passed: true,
                     evidence: Some("ran".into()),
+                    binding: None,
                 }],
                 checks: vec![faktor_core::state::CheckExecution {
                     check: check.into(),
@@ -9645,6 +9646,7 @@ mod tests {
                 criterion_key,
                 passed: true,
                 evidence: None,
+                binding: None,
             })
             .collect::<Vec<_>>();
         for _ in 0..8 {

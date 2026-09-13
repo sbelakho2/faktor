@@ -1191,6 +1191,100 @@ pub fn merge_delete(
     }
 }
 
+/// Commit-time CAS write of RAW bytes at `dst_root/dst_rel` (the landing /
+/// rollback primitive beside [`merge_apply_content`] and [`merge_delete`]).
+/// `expected` is the destination's previous whole-content digest:
+///
+/// - `Some(base)`: the destination must still hold `base` (or already hold
+///   the new digest — an idempotent replay → [`CasMergeResult::AlreadyCurrent`]);
+///   anything else is a typed Conflict and the destination is untouched;
+/// - `None`: the destination must not exist (exclusive create); a
+///   concurrent creation is a typed Conflict.
+///
+/// The write goes through the shared atomic commit discipline, so a crash
+/// leaves either the old or the new whole file.
+pub fn cas_write_content(
+    dst_root: &Path,
+    dst_rel: &Path,
+    bytes: &[u8],
+    expected: Option<FileHash>,
+) -> Result<CasMergeResult, Error> {
+    let dst_root = dst_root.canonicalize().map_err(|e| {
+        Error::not_found(format!(
+            "cas-write destination root {}: {e}",
+            dst_root.display()
+        ))
+    })?;
+    let dst = if expected.is_none() {
+        resolve_or_create_within(&dst_root, dst_rel)?
+    } else {
+        resolve_within(&dst_root, dst_rel)?
+    };
+    let new_hash = FileHash::from(blake3::hash(bytes).into());
+    let state = atomic::FileState::now_with_digest(&dst).map_err(|e| {
+        Error::new(
+            e.kind,
+            format!("cas-write recheck {}: {}", dst.display(), e.message),
+        )
+    })?;
+    match (state.exists, expected, state.digest) {
+        (true, _, Some(cur)) if cur == new_hash => Ok(CasMergeResult::AlreadyCurrent),
+        (false, Some(_), _) => Err(Error::conflict(format!(
+            "{} vanished after the base snapshot; refusing to recreate it from a stale decision",
+            dst.display()
+        ))),
+        (true, None, _) => Err(Error::conflict(format!(
+            "{} exists although the base snapshot had no such file; refusing to overwrite it",
+            dst.display()
+        ))),
+        (true, Some(base), Some(cur)) if cur != base => Err(Error::conflict(format!(
+            "{} changed since the base snapshot (expected {}, found {}); not overwritten",
+            dst.display(),
+            base.to_hex(),
+            cur.to_hex()
+        ))),
+        (true, Some(_), None) => Err(Error::conflict(format!(
+            "{} is not a readable file; refusing to overwrite it",
+            dst.display()
+        ))),
+        (false, None, _) => {
+            atomic::atomic_create(&dst, bytes).map_err(|e| {
+                if e.kind == ErrorKind::Conflict {
+                    Error::conflict(format!(
+                        "{} appeared during the landing; refusing to overwrite it",
+                        dst.display()
+                    ))
+                } else {
+                    e
+                }
+            })?;
+            Ok(CasMergeResult::Applied)
+        }
+        (true, Some(base), Some(_)) => {
+            let expected = atomic::FileState {
+                exists: true,
+                size: None,
+                digest: Some(base),
+                modified_ms: None,
+            };
+            atomic::atomic_replace_cas(&dst, &expected, bytes).map_err(|e| {
+                if e.kind == ErrorKind::Conflict {
+                    Error::conflict(format!(
+                        "{}: {}",
+                        dst.display(),
+                        e.message
+                            .strip_prefix("cas mismatch; ")
+                            .unwrap_or(&e.message)
+                    ))
+                } else {
+                    e
+                }
+            })?;
+            Ok(CasMergeResult::Applied)
+        }
+    }
+}
+
 /// Bounded recursive walk over the canonical tree `root` (already
 /// canonicalized, non-symlink). Yields every FILE as (relative path,
 /// absolute path, open verified handle) to `visit`. Directory symlinks are

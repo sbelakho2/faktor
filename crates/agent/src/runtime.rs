@@ -42,9 +42,10 @@ use faktor_core::id::{OpId, SessionId, TaskId, WorkspaceId};
 use faktor_core::model::PricingSnapshot;
 use faktor_core::op::{EffectStatus, ModelCallAttempt, OpMeta, RecoveryStrategy};
 use faktor_core::state::{
-    AgentState, CandidateProofRef, CheckExecution, CriterionOrigin, CriterionRequirement,
-    CriterionVerification, EnvironmentFingerprint, FileStateEvidence, FingerprintFileHash,
-    OutcomeReason, ReasonCode, TaskState, TaskTransition, ToolVersion, VerificationStatus,
+    command_binding_digest, AgentState, CandidateProofRef, CheckExecution, CriterionBinding,
+    CriterionOrigin, CriterionRequirement, CriterionVerification, EnvironmentFingerprint,
+    FileStateEvidence, FingerprintFileHash, OutcomeReason, ReasonCode, TaskState, TaskTransition,
+    ToolVersion, VerificationStatus,
 };
 use faktor_core::time::Clock;
 use faktor_core::WorkspaceIdentity;
@@ -61,12 +62,21 @@ use faktor_semantic::{
     WorkspacePath, GENERIC_FALLBACK_ID, MAX_ENTITY_ID_BYTES, SEMANTIC_SCHEMA_VERSION,
 };
 use faktor_session::ops::PermissionRequest as SessionPermission;
-use faktor_session::task::{decode_criteria, encode_criteria, merge_derived_criteria, Criterion};
+use faktor_session::task::{
+    decode_criteria, encode_criteria, merge_derived_criteria, Criterion, ProofBasis,
+    ProofBasisCheck, ProofBasisCriterion,
+};
 use faktor_session::{
     BudgetError as SessionBudgetError, CompletionContractGate, RecoveredOp, RecoveryAction,
     RecoveryReport, SessionManager, Task, TaskError, TaskPatch,
 };
 use faktor_store::ToolRunRow;
+use faktor_verify::criteria::{
+    ChangeSetEntry, ChangeSetStatus, CheckOutcomeRow, CheckOutcomeStatus, CriterionEvaluation,
+    CriterionEvaluationContext, CriterionEvaluationRow, EvidenceRecord, EvidenceResolver,
+    FallbackEvaluator, IndependentReviewer, ReadOnlyRepo, ReviewRequest, ReviewVerdict,
+    StructuredReviewOutput,
+};
 use faktor_verify::exec::{BudgetDecision, CheckRunStatus};
 
 use crate::loop_detect::{Fingerprint, LoopDetector};
@@ -6592,14 +6602,23 @@ impl AgentRuntime {
             results.iter().filter(|(_, ok)| !ok).count(),
             root.display()
         );
-        let criteria_rows: Vec<CriterionVerification> = criteria
-            .iter()
-            .map(|c| CriterionVerification {
-                criterion_key: c.clone(),
-                passed: status == VerificationStatus::Passed,
-                evidence: Some(summary.clone()),
-            })
-            .collect();
+        // Typed criterion verdicts (P0): evaluated through each criterion's
+        // OWN binding. The blanket `passed = integrated checks passed`
+        // mapping is GONE; a criterion without a binding the evaluator can
+        // resolve is Unavailable, never Passed.
+        let candidate_snapshot = root_snapshot_best_effort(&ws);
+        let criteria_rows = criterion_verdicts_from_attempt(
+            criteria,
+            &checks,
+            &results,
+            &unavailable,
+            changed,
+            &ws,
+            None,
+            &candidate_snapshot,
+            "",
+        )
+        .await;
         Ok(IntegratedRootVerification {
             status,
             checks: executed,
@@ -6900,12 +6919,10 @@ impl AgentRuntime {
         // The once-only acceptance-criteria rows: goal + the derived
         // required checks, frozen at the first sighting. Memory facts are
         // durable rows compaction NEVER rewrites; the typed task row is
-        // seeded from the SAME canonical entries.
-        let criteria = if goal.is_empty() {
-            None
-        } else {
-            criteria_rows(goal, &checks)
-        };
+        // seeded from the SAME canonical entries. The goal is NOT an
+        // automatic criterion: acceptance criteria are the derived required
+        // checks with their typed bindings.
+        let criteria = criteria_rows(goal, &checks);
 
         // workspace root — the live shadow root of a shadowed drive, else
         // the durable workspace root (never the daemon cwd), the turn's
@@ -7241,16 +7258,19 @@ impl AgentRuntime {
         let proof = if executed.is_empty() {
             None
         } else {
-            Some(verification_proof_from_attempt(
-                criteria.as_deref(),
-                &checks,
-                &results,
-                &unavailable,
-                &executed,
-                changed,
-                &ws,
-                review.as_ref(),
-            ))
+            Some(
+                verification_proof_from_attempt(
+                    criteria.as_deref(),
+                    &checks,
+                    &results,
+                    &unavailable,
+                    &executed,
+                    changed,
+                    &ws,
+                    review.as_ref(),
+                )
+                .await,
+            )
         };
         self.persist_gate_facts(
             handle,
@@ -7514,11 +7534,7 @@ impl AgentRuntime {
                 );
             }
         }
-        let criteria = if goal.is_empty() {
-            None
-        } else {
-            criteria_rows(&goal, &mirrors)
-        };
+        let criteria = criteria_rows(&goal, &mirrors);
         let acceptance = faktor_verify::acceptance(&mirrors, &results);
         if acceptance == faktor_verify::Acceptance::Fail {
             for check in mirrors.iter().filter(|c| c.required) {
@@ -7568,16 +7584,19 @@ impl AgentRuntime {
         let proof = if executed.is_empty() {
             None
         } else {
-            Some(verification_proof_from_attempt(
-                criteria.as_deref(),
-                &mirrors,
-                &results,
-                &unavailable,
-                &executed,
-                &changed,
-                &ws,
-                None,
-            ))
+            Some(
+                verification_proof_from_attempt(
+                    criteria.as_deref(),
+                    &mirrors,
+                    &results,
+                    &unavailable,
+                    &executed,
+                    &changed,
+                    &ws,
+                    None,
+                )
+                .await,
+            )
         };
         self.persist_gate_facts(
             handle,
@@ -8359,6 +8378,7 @@ impl AgentRuntime {
             task_contract_hash: fingerprint_task_contract(handle, task_id),
             check_argv_cwd_env_hash: fingerprint_check_basis(check_basis),
             verification_impl_version: VERIFICATION_IMPL_VERSION.to_string(),
+            proof_basis_digest: None,
         };
         (environment, manifest_hashes, lockfile_hashes)
     }
@@ -8400,7 +8420,7 @@ impl AgentRuntime {
         review: Option<&serde_json::Value>,
         workspace: Option<&faktor_fs::WorkspaceHandle>,
     ) -> faktor_core::Result<(EnvironmentFingerprint, CandidateProofRef)> {
-        let (environment, manifest_hashes, lockfile_hashes) =
+        let (mut environment, manifest_hashes, lockfile_hashes) =
             self.observe_environment_fingerprint(handle, task_id, check_basis, workspace);
         // Candidate aggregates: `base` is the observed manifest/lockfile set
         // MINUS the paths this candidate changed (the build-input baseline);
@@ -8446,6 +8466,101 @@ impl AgentRuntime {
             source_diff_evidence,
             risk_report_evidence,
             accounting_snapshot_digest: handle.accounting_snapshot_digest(task_id)?,
+            run_id: None,
+            run_base_snapshot: None,
+            candidate_snapshot: None,
+            sources_digest: None,
+            changed_files_digest: None,
+        };
+        // P0 proof binding: one canonical proof-basis digest rides the
+        // environment fingerprint; a record may be reused only while every
+        // component below stays identical (task id+revision, task contract,
+        // candidate snapshot, integration sources, changed files, ordered
+        // checks, verifier/tool versions, env projection, instruction epoch,
+        // criteria ids+bindings, reviewer/evidence digests).
+        let integration = handle
+            .ledger_integration_record_for_task(task_id.raw())
+            .ok()
+            .flatten();
+        let candidate_snapshot = workspace
+            .map(root_snapshot_best_effort)
+            .unwrap_or_else(|| "snapshot-unavailable".into());
+        let changed_files_digest = changed_files_fold(changed_files);
+        let criteria: Vec<ProofBasisCriterion> = handle
+            .get_task(task_id)
+            .ok()
+            .flatten()
+            .map(|task| task.criteria())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|criterion| ProofBasisCriterion {
+                criterion_id: criterion.id.to_string(),
+                binding_digest: criterion.binding.as_ref().map(|b| b.content_digest()),
+            })
+            .collect();
+        let env_projection: Vec<(String, String)> = FINGERPRINT_ENV_KEYS
+            .iter()
+            .map(|key| {
+                let value = match std::env::var(key) {
+                    Ok(value) if !value.is_empty() => value,
+                    _ => "<absent>".to_string(),
+                };
+                ((*key).to_string(), value)
+            })
+            .collect();
+        let reviewer_digest = review.and_then(|value| {
+            serde_json::to_vec(value)
+                .ok()
+                .map(|bytes| format!("blake3:{}", blake3::hash(&bytes).to_hex()))
+        });
+        let basis = ProofBasis {
+            task_id: task_id.raw(),
+            task_revision: handle.task_revision(task_id)?.raw(),
+            task_contract_digest: environment.task_contract_hash.clone(),
+            candidate_snapshot: candidate_snapshot.clone(),
+            integration_sources_digest: integration
+                .as_ref()
+                .map(|r| r.sources_digest.clone())
+                .unwrap_or_default(),
+            changed_files_digest: changed_files_digest.clone(),
+            checks: check_basis
+                .iter()
+                .map(|(id, program, args)| ProofBasisCheck {
+                    check_id: id.clone(),
+                    program: program.clone(),
+                    args: args.clone(),
+                })
+                .collect(),
+            verification_impl_version: environment.verification_impl_version.clone(),
+            tool_versions: environment.toolchain_versions.clone(),
+            env_projection,
+            instruction_epoch: environment.instruction_epoch,
+            criteria,
+            reviewer_digest,
+            evidence_digests: {
+                let mut digests: Vec<String> = changed_files
+                    .iter()
+                    .map(|f| format!("{}:{}", f.path, f.digest_hex))
+                    .collect();
+                digests.sort();
+                digests
+            },
+        };
+        environment.proof_basis_digest = Some(basis.digest());
+        // Candidate provenance (P0): populated from the durable integration
+        // record of an orchestrated root, so both IDEs can show the verified
+        // snapshot, its run base, the source/change-set digests and the
+        // landed candidate snapshot.
+        let candidate_proof_ref = CandidateProofRef {
+            run_id: integration.as_ref().map(|r| r.run_id.clone()),
+            run_base_snapshot: integration.as_ref().and_then(|r| r.base_snapshot.clone()),
+            candidate_snapshot: Some(candidate_snapshot),
+            sources_digest: integration
+                .as_ref()
+                .map(|r| r.sources_digest.clone())
+                .filter(|digest| !digest.is_empty()),
+            changed_files_digest: Some(changed_files_digest),
+            ..candidate_proof_ref
         };
         Ok((environment, candidate_proof_ref))
     }
@@ -11858,43 +11973,47 @@ fn review_strings(v: Option<&serde_json::Value>) -> Vec<String> {
 }
 
 /// The once-only acceptance-criteria ENTRIES (audit 25; wave 8 seed; typed
-/// V2 audits 56/57/105): the goal plus one entry per REQUIRED derived check —
-/// the canonical form that seeds BOTH the typed `task` row's
-/// `acceptance_criteria` list and the `criteria`/`0` memory fact (via
-/// [`criteria_canonical_text`]). None when the derivation produced no
-/// required check — nothing to freeze. Every entry is bounded so the session
-/// layer's typed-criteria validation can never reject a runtime-derived
-/// value. The goal entry is a USER criterion (sticky: re-derivation never
-/// removes it); every check entry is a ProjectPolicy derivation tied to the
-/// derivation snapshot of its check set, so a changed check set re-derives
-/// the stale criteria.
-fn criteria_rows(goal: &str, checks: &[faktor_verify::Check]) -> Option<Vec<String>> {
+/// V2 audits 56/57/105; P0 criteria mandate): one entry per REQUIRED derived
+/// check, each carrying its OWN typed [`CriterionBinding::RequiredCheck`]
+/// (check id + command digest) — the canonical form that seeds BOTH the
+/// typed `task` row's `acceptance_criteria` list and the `criteria`/`0`
+/// memory fact (via [`criteria_canonical_text`]). The task GOAL is NOT
+/// inserted as a proof obligation anymore: `Task.goal` stays human, and the
+/// acceptance criteria are independently verifiable conditions. Legacy
+/// `goal: ...` rows already persisted migrate deterministically through
+/// `Criterion::effective_binding` (AggregateGoal, the independent final
+/// review). None when the derivation produced no required check — nothing to
+/// freeze. Every entry is bounded so the session layer's typed-criteria
+/// validation can never reject a runtime-derived value. Each check entry is
+/// a ProjectPolicy derivation tied to the derivation snapshot of its check
+/// set, so a changed check set re-derives the stale criteria.
+fn criteria_rows(_goal: &str, checks: &[faktor_verify::Check]) -> Option<Vec<String>> {
     let required: Vec<&faktor_verify::Check> = checks.iter().filter(|c| c.required).collect();
     if required.is_empty() {
         return None;
     }
     let snapshot = criteria_derivation_snapshot(&required);
-    let mut criteria = Vec::with_capacity(required.len() + 1);
-    criteria.push(Criterion::user(format!(
-        "goal: {}",
-        truncate(
-            goal,
-            faktor_session::task::MAX_TASK_CRITERION_TEXT_BYTES - "goal: ".len()
-        )
-    )));
+    let mut criteria = Vec::with_capacity(required.len());
     for check in required {
-        criteria.push(Criterion::derived(
-            format!(
-                "required check: {}",
-                truncate(
-                    &check.command,
-                    faktor_session::task::MAX_TASK_CRITERION_TEXT_BYTES - "required check: ".len()
-                )
-            ),
-            CriterionOrigin::ProjectPolicy,
-            CriterionRequirement::Required,
-            Some(snapshot.clone()),
-        ));
+        criteria.push(
+            Criterion::derived(
+                format!(
+                    "required check: {}",
+                    truncate(
+                        &check.command,
+                        faktor_session::task::MAX_TASK_CRITERION_TEXT_BYTES
+                            - "required check: ".len()
+                    )
+                ),
+                CriterionOrigin::ProjectPolicy,
+                CriterionRequirement::Required,
+                Some(snapshot.clone()),
+            )
+            .with_binding(CriterionBinding::RequiredCheck {
+                check_id: check.id.clone(),
+                command_digest: command_binding_digest(&check.command),
+            }),
+        );
     }
     Some(criteria.iter().map(Criterion::encode).collect())
 }
@@ -12201,6 +12320,24 @@ fn fingerprint_file_aggregate(entries: &[FingerprintFileHash]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+/// BLAKE3 (length-prefixed) digest of the ordered changed-file evidence
+/// (path + digest rows, sorted): the candidate's changed-files digest.
+fn changed_files_fold(files: &[FileStateEvidence]) -> String {
+    let mut rows: Vec<(&str, &str)> = files
+        .iter()
+        .map(|f| (f.path.as_str(), f.digest_hex.as_str()))
+        .collect();
+    rows.sort();
+    let mut hasher = blake3::Hasher::new();
+    for (path, digest) in rows {
+        for part in [path.as_bytes(), digest.as_bytes()] {
+            hasher.update(&(part.len() as u64).to_le_bytes());
+            hasher.update(part);
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 /// BLAKE3 (length-prefixed) digest of the ordered check basis: every
 /// `(id, program, argv)` in derivation order, the root-relative cwd (`"."` —
 /// every typed check runs under the verification root) and the fixed
@@ -12278,6 +12415,280 @@ fn fingerprint_task_contract(handle: &faktor_session::SessionHandle, task_id: Ta
     }
 }
 
+// ------------------------------------------- typed criterion evaluation (P0)
+//
+// The unsound `passed = suite passed` mapping is GONE: every acceptance
+// criterion is evaluated through its OWN typed binding. The evaluator
+// implementation lives in `faktor_verify::criteria`; the runtime supplies
+// the read-only ports (candidate repo, observed evidence, the recorded
+// independent review) and NEVER a mutation surface.
+
+/// Read-only candidate repo: whole-file streaming hashes through a cloned
+/// workspace handle (never a mutation).
+struct CandidateRepo(faktor_fs::WorkspaceHandle);
+
+impl ReadOnlyRepo for CandidateRepo {
+    fn hash_file(&self, path: &str) -> Option<String> {
+        self.0
+            .hash_file_streaming(std::path::Path::new(path), None)
+            .ok()
+            .map(|(_, hash)| hash.to_hex())
+    }
+}
+
+/// Best-effort candidate snapshot id of the verification root. An
+/// unreadable/oversized root yields the honest `snapshot-unavailable` id —
+/// never a guessed digest.
+fn root_snapshot_best_effort(ws: &faktor_fs::WorkspaceHandle) -> String {
+    faktor_session::root_snapshot_digest(ws.root(), faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES)
+        .map(|digest| format!("blake3:{digest}"))
+        .unwrap_or_else(|_| "snapshot-unavailable".into())
+}
+
+/// Evidence resolver over the attempt's OWN observed artifacts: check rows,
+/// changed-file digests and the review's cited evidence strings. A reference
+/// outside that universe does not resolve — never a guessed record.
+struct AttemptEvidenceResolver {
+    records: std::collections::BTreeMap<String, String>,
+    snapshot: String,
+}
+
+impl AttemptEvidenceResolver {
+    fn new(snapshot: &str) -> Self {
+        Self {
+            records: std::collections::BTreeMap::new(),
+            snapshot: snapshot.to_string(),
+        }
+    }
+
+    fn insert(&mut self, id: String, digest: String) {
+        if !id.is_empty() && self.records.len() < 1024 {
+            self.records.insert(id, digest);
+        }
+    }
+}
+
+impl EvidenceResolver for AttemptEvidenceResolver {
+    fn resolve(&self, evidence_id: &str) -> Option<EvidenceRecord> {
+        self.records.get(evidence_id).map(|digest| EvidenceRecord {
+            evidence_id: evidence_id.to_string(),
+            digest: digest.clone(),
+            snapshot: self.snapshot.clone(),
+        })
+    }
+}
+
+/// The independent-review port over the recorded review value of an attempt.
+/// The value was produced by the separate, context-isolated review phase;
+/// this adapter maps it into the structured criterion-review contract. It
+/// never synthesizes a verdict: an absent/unrecognized review is an error
+/// (the evaluator degrades to Unavailable, never to a pass).
+struct RecordedReviewPort {
+    review: Option<serde_json::Value>,
+}
+
+impl IndependentReviewer for RecordedReviewPort {
+    fn review<'a>(
+        &'a self,
+        request: &'a ReviewRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<StructuredReviewOutput, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let Some(review) = &self.review else {
+                return Err("no independent review ran for this attempt".into());
+            };
+            let verdict_text = review
+                .get("verdict")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let verdict = match verdict_text {
+                "pass" | "clean" => ReviewVerdict::Pass,
+                "fail" | "block" | "concern" => ReviewVerdict::Fail,
+                "unavailable" => ReviewVerdict::Unavailable,
+                other => {
+                    return Err(format!(
+                        "reviewer verdict {other:?} is not a recognized structured verdict"
+                    ))
+                }
+            };
+            let strings = |key: &str| -> Vec<String> {
+                review
+                    .get(key)
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|s| s.as_str())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let findings = strings("findings");
+            let evidence = strings("evidence");
+            let explanation = if findings.is_empty() {
+                format!("independent reviewer verdict {verdict_text:?}")
+            } else {
+                truncate(&findings.join("; "), 2000)
+            };
+            Ok(StructuredReviewOutput {
+                criterion_id: request.criterion_id.clone(),
+                snapshot: request.candidate_snapshot.clone(),
+                verdict,
+                evidence_refs: evidence.into_iter().take(16).collect(),
+                explanation,
+            })
+        })
+    }
+}
+
+/// Evaluate every acceptance criterion of one attempt through its OWN typed
+/// binding. Check-bound criteria resolve against the executed check rows,
+/// file-state bindings hash the VERIFIED CANDIDATE, evidence bindings resolve
+/// immutable evidence, and IndependentReview/AggregateGoal verdicts come from
+/// the recorded independent review — a reviewer pass with zero evidence is
+/// refused by the evaluator.
+#[allow(clippy::too_many_arguments)]
+async fn criterion_verdicts_from_attempt(
+    criteria: &[String],
+    checks: &[faktor_verify::Check],
+    results: &[(String, bool)],
+    unavailable: &[(String, String)],
+    changed: &[String],
+    ws: &faktor_fs::WorkspaceHandle,
+    review: Option<&serde_json::Value>,
+    candidate_snapshot: &str,
+    goal: &str,
+) -> Vec<CriterionVerification> {
+    if criteria.is_empty() {
+        return Vec::new();
+    }
+    let typed = decode_criteria(criteria);
+    let mut resolver = AttemptEvidenceResolver::new(candidate_snapshot);
+    let mut check_rows: Vec<CheckOutcomeRow> = Vec::new();
+    for check in checks {
+        let status = if let Some((_, ok)) = results.iter().find(|(id, _)| id == &check.id) {
+            if *ok {
+                CheckOutcomeStatus::Passed
+            } else {
+                CheckOutcomeStatus::Failed
+            }
+        } else if unavailable.iter().any(|(id, _)| id == &check.id) {
+            CheckOutcomeStatus::Unavailable
+        } else {
+            continue;
+        };
+        let digest = command_binding_digest(&check.command);
+        resolver.insert(check.id.clone(), digest.clone());
+        check_rows.push(CheckOutcomeRow {
+            check_id: check.id.clone(),
+            command_digest: digest,
+            status,
+            evidence: Some(truncate(
+                &check.command,
+                faktor_session::MAX_VERIFICATION_EVIDENCE_BYTES,
+            )),
+        });
+    }
+    let mut change_set: Vec<ChangeSetEntry> = Vec::new();
+    for path in changed.iter().take(64) {
+        let digest = ws
+            .hash_file_streaming(std::path::Path::new(path), None)
+            .ok()
+            .map(|(_, h)| h.to_hex())
+            .unwrap_or_default();
+        if !digest.is_empty() {
+            resolver.insert(format!("file:{path}"), digest.clone());
+            resolver.insert(path.clone(), digest.clone());
+        }
+        change_set.push(ChangeSetEntry {
+            path: path.clone(),
+            digest_hex: digest,
+            status: ChangeSetStatus::Modified,
+        });
+    }
+    if let Some(review) = review {
+        if let Some(evidence) = review.get("evidence").and_then(|v| v.as_array()) {
+            for cite in evidence.iter().filter_map(|s| s.as_str()).take(64) {
+                resolver.insert(cite.to_string(), command_binding_digest(cite));
+            }
+        }
+    }
+    let evidence: std::sync::Arc<dyn EvidenceResolver> = std::sync::Arc::new(resolver);
+    let reviewer: std::sync::Arc<dyn IndependentReviewer> =
+        std::sync::Arc::new(RecordedReviewPort {
+            review: review.cloned(),
+        });
+    let repo: std::sync::Arc<dyn ReadOnlyRepo> = std::sync::Arc::new(CandidateRepo(ws.clone()));
+    let evaluator = FallbackEvaluator;
+    let mut evaluations: Vec<(usize, CriterionEvaluation)> = Vec::new();
+    let context_of = |id: String, subordinate: Vec<CriterionEvaluationRow>| {
+        let mut ctx =
+            CriterionEvaluationContext::new(id, candidate_snapshot.to_string(), evidence.clone());
+        ctx.goal = goal.to_string();
+        ctx.change_set = change_set.clone();
+        ctx.checks = check_rows.clone();
+        ctx.repo = Some(repo.clone());
+        ctx.reviewer = Some(reviewer.clone());
+        ctx.subordinate = subordinate;
+        ctx
+    };
+    for (i, c) in typed.iter().enumerate() {
+        if matches!(c.effective_binding(), CriterionBinding::AggregateGoal) {
+            continue;
+        }
+        let criterion = faktor_verify::criteria::Criterion::new(
+            c.id.to_string(),
+            c.text.clone(),
+            Some(c.effective_binding()),
+        );
+        let mut ctx = context_of(c.id.to_string(), Vec::new());
+        evaluations.push((i, evaluator.evaluate(&mut ctx, &criterion).await));
+    }
+    for (i, c) in typed.iter().enumerate() {
+        if !matches!(c.effective_binding(), CriterionBinding::AggregateGoal) {
+            continue;
+        }
+        let criterion = faktor_verify::criteria::Criterion::new(
+            c.id.to_string(),
+            c.text.clone(),
+            Some(c.effective_binding()),
+        );
+        let subordinate: Vec<CriterionEvaluationRow> = evaluations
+            .iter()
+            .map(|(j, evaluation)| CriterionEvaluationRow {
+                criterion_id: typed[*j].id.to_string(),
+                binding: Some(typed[*j].effective_binding()),
+                evaluation: evaluation.clone(),
+            })
+            .collect();
+        let mut ctx = context_of(c.id.to_string(), subordinate);
+        evaluations.push((i, evaluator.evaluate(&mut ctx, &criterion).await));
+    }
+    evaluations.sort_by_key(|(i, _)| *i);
+    evaluations
+        .into_iter()
+        .map(|(i, evaluation)| CriterionVerification {
+            criterion_key: criteria[i].clone(),
+            passed: evaluation.is_passed(),
+            evidence: {
+                let refs = evaluation.evidence_refs();
+                if refs.is_empty() {
+                    evaluation.reason().map(|reason| {
+                        truncate(reason, faktor_session::MAX_VERIFICATION_EVIDENCE_BYTES)
+                    })
+                } else {
+                    Some(truncate(
+                        &refs.join("; "),
+                        faktor_session::MAX_VERIFICATION_EVIDENCE_BYTES,
+                    ))
+                }
+            },
+            binding: Some(typed[i].effective_binding()),
+        })
+        .collect()
+}
+
 /// Assemble the durable-proof payload of one verification attempt with a
 /// verdict (audit P0-8 + typed migration P0-9/10; see [`VerificationProof`]):
 /// - one [`CheckExecution`] per required check that RAN, built from the
@@ -12301,7 +12712,7 @@ fn fingerprint_task_contract(handle: &faktor_session::SessionHandle, task_id: Ta
 /// Attempts whose required checks produced NO verdict (only unavailable
 /// ones) never reach this builder — there is nothing a record could certify.
 #[allow(clippy::too_many_arguments)]
-fn verification_proof_from_attempt(
+async fn verification_proof_from_attempt(
     criteria: Option<&[String]>,
     checks: &[faktor_verify::Check],
     results: &[(String, bool)],
@@ -12340,48 +12751,20 @@ fn verification_proof_from_attempt(
             summary: run.summary.clone(),
         });
     }
-    let required: Vec<&faktor_verify::Check> = checks.iter().filter(|c| c.required).collect();
-    let mut verdicts = Vec::new();
-    if let Some(entries) = criteria {
-        // Entry 0 is the goal; entry i >= 1 maps to required[i-1] (identical
-        // order to criteria_rows, which built `entries`).
-        for (i, entry) in entries.iter().enumerate() {
-            let (passed, evidence) = if i == 0 {
-                let any_failed = results.iter().any(|(_, ok)| !ok);
-                (
-                    !any_failed,
-                    any_failed.then(|| "required checks failed".to_string()),
-                )
-            } else {
-                match required.get(i - 1) {
-                    Some(check) => {
-                        let outcome = results
-                            .iter()
-                            .find(|(id, _)| id == &check.id)
-                            .map(|(_, ok)| *ok);
-                        let no_verdict = unavailable.iter().any(|(id, _)| id == &check.id);
-                        match outcome {
-                            Some(true) => (true, None),
-                            Some(false) => {
-                                (false, Some(format!("required check '{}' failed", check.id)))
-                            }
-                            None if no_verdict => (
-                                false,
-                                Some("required check unavailable (no verdict)".into()),
-                            ),
-                            None => (false, Some("required check did not run".into())),
-                        }
-                    }
-                    None => (false, Some("criterion without a derived check".into())),
-                }
-            };
-            verdicts.push(CriterionVerification {
-                criterion_key: entry.clone(),
-                passed,
-                evidence,
-            });
-        }
-    }
+    let entries: &[String] = criteria.unwrap_or(&[]);
+    let candidate_snapshot = root_snapshot_best_effort(ws);
+    let verdicts = criterion_verdicts_from_attempt(
+        entries,
+        checks,
+        results,
+        unavailable,
+        changed,
+        ws,
+        review,
+        &candidate_snapshot,
+        "",
+    )
+    .await;
     let mut files = Vec::new();
     for path in changed.iter().take(16) {
         if let Ok((size, hash)) = ws.hash_file_streaming(std::path::Path::new(path), None) {
@@ -16759,13 +17142,16 @@ mod tests {
         let criteria = facts
             .iter()
             .find(|(k, key, _)| k == "criteria" && key == "0")
-            .expect("criteria row must seed with the goal + derived check")
+            .expect("criteria row must seed with the derived check")
             .2
             .clone();
-        assert!(criteria.contains("goal: verified"), "{criteria}");
         assert!(
             criteria.contains("required check: cargo check"),
             "{criteria}"
+        );
+        assert!(
+            !criteria.contains("goal: "),
+            "the goal is not an automatic proof obligation: {criteria}"
         );
     }
 
@@ -17422,8 +17808,11 @@ mod tests {
                 .find(|(k, key, _)| k == "criteria" && key == "0")
                 .unwrap_or_else(|| panic!("criteria row missing after turn {i}: {facts:?}"));
             let text = row.2.clone();
-            assert!(text.contains("goal: gating task"), "{text}");
-            assert!(text.contains("cargo check"), "{text}");
+            assert!(text.contains("required check: cargo check"), "{text}");
+            assert!(
+                !text.contains("goal: gating task"),
+                "the goal stays human: {text}"
+            );
             match &expected {
                 Some(e) => assert_eq!(&text, e, "compaction must never rewrite the criteria row"),
                 None => expected = Some(text),
@@ -17529,9 +17918,9 @@ mod tests {
         );
         let criteria_text = criteria_canonical_text(&t.acceptance_criteria);
         assert!(
-            criteria_text.contains("goal: gating task")
-                && criteria_text.contains("required check: cargo check"),
-            "the canonical typed criteria row carries the seeded entries: {criteria_text}"
+            criteria_text.contains("required check: cargo check")
+                && !criteria_text.contains("goal: gating task"),
+            "the canonical typed criteria row carries the derived check entries (never an automatic goal obligation): {criteria_text}"
         );
         assert_eq!(
             criteria_fact(&handle).as_deref(),
@@ -18004,10 +18393,7 @@ mod tests {
             task_id,
             session_id: session,
             goal: "gating task".into(),
-            acceptance_criteria: vec![
-                "goal: gating task".into(),
-                "required check: cargo check".into(),
-            ],
+            acceptance_criteria: vec![],
             plan: vec![],
             attachments: Vec::new(),
             budget: Default::default(),
@@ -19207,8 +19593,8 @@ mod tests {
         let row_criteria1 =
             criteria_canonical_text(&h.list_tasks().unwrap()[0].acceptance_criteria);
         assert!(
-            row_criteria1.contains("goal: gating task")
-                && row_criteria1.contains("required check: cargo check"),
+            row_criteria1.contains("required check: cargo check")
+                && !row_criteria1.contains("goal: gating task"),
             "{row_criteria1}"
         );
         assert_eq!(criteria_turn1, row_criteria1);
@@ -19461,8 +19847,9 @@ mod tests {
             }
             let fact = criteria_fact(&h).expect("criteria fact must exist after every compaction");
             assert!(
-                fact.contains("goal: gating task") && fact.contains("required check: cargo check"),
-                "the criteria fact carries the canonical typed entries: {fact:?}"
+                fact.contains("required check: cargo check")
+                    && !fact.contains("goal: gating task"),
+                "the criteria fact carries the canonical typed check entries (the goal stays human): {fact:?}"
             );
             match &expected_fact {
                 Some(e) => assert_eq!(
@@ -27010,10 +27397,13 @@ mod tests {
             "the line-900 change must appear in the diff package: {rendered:?}"
         );
         assert!(rendered.contains("src/unsafe_shim.rs"), "{rendered:?}");
-        assert!(rendered.contains("goal: gating task"), "{rendered:?}");
         assert!(
             rendered.contains("required check: cargo check"),
             "{rendered:?}"
+        );
+        assert!(
+            !rendered.contains("goal: gating task"),
+            "the review package carries the typed criteria, not an automatic goal obligation: {rendered:?}"
         );
         // ... and NO implementation context does (the marker rode the drive
         // transcript of THIS very turn).

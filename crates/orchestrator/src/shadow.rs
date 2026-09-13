@@ -379,6 +379,9 @@ impl ShadowRoots {
         let cs = ChangeSet {
             child_id: CHILD_ID.to_string(),
             base_id: base_id_of(&shadow.shadow_id),
+            run_base_snapshot: None,
+            child_start_snapshot: None,
+            final_child_snapshot: None,
             files,
             created_ms: self.manager.now_ms(),
         };

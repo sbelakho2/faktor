@@ -833,6 +833,7 @@ pub fn run_scripted_task(
                 criterion_key: criterion.clone(),
                 passed: task.verifies,
                 evidence: Some("efficiency harness deterministic verification".to_string()),
+                binding: None,
             })
             .collect(),
         checks: Vec::new(),

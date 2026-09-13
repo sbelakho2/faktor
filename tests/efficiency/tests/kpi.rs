@@ -88,6 +88,7 @@ fn complete_verified(f: &Fixture, now: i64) {
                 criterion_key: key.clone(),
                 passed: true,
                 evidence: Some("fixture".into()),
+                binding: None,
             })
             .collect(),
         checks: Vec::new(),

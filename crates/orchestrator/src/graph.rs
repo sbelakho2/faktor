@@ -580,6 +580,7 @@ mod tests {
             created_ms: 1,
             updated_ms: 1,
             base_snapshot_id: None,
+            run_base_snapshot: None,
             env_snapshot_id: None,
             execution_phase: ExecutionPhase::default(),
         }

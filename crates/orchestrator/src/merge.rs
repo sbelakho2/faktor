@@ -92,22 +92,96 @@ pub struct ChangeEntry {
 
 /// The staged merge candidate (audit 98) — the STRUCTURED result of a
 /// finished child (audit 69): files + digests, stored durably, replacing
-/// prose-only results.
+/// prose-only results. The identity of an orchestrated change set includes
+/// the RUN BASE it was derived from, the child and the child's start/final
+/// content snapshots — a re-staged candidate over a different run
+/// generation can never alias an older one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeSet {
     pub child_id: String,
     /// The durable base snapshot (id) the diff was computed against.
     pub base_id: String,
+    /// The RUN BASE snapshot hash every isolated child of the run derived
+    /// from (the generation this change set belongs to). `None` for legacy
+    /// (direct-runtime / shadow) change sets.
+    #[serde(default)]
+    pub run_base_snapshot: Option<String>,
+    /// Deterministic digest of the child's spawn-time START map.
+    #[serde(default)]
+    pub child_start_snapshot: Option<String>,
+    /// Deterministic digest of the child's CURRENT (final) content map.
+    #[serde(default)]
+    pub final_child_snapshot: Option<String>,
     pub files: Vec<ChangeEntry>,
     pub created_ms: i64,
 }
 
 impl ChangeSet {
-    /// Deterministic change-set id (one per child base — re-staging after a
-    /// crash re-upserts the SAME rows, so it is idempotent).
+    /// Deterministic content identity of one staged change set: the child,
+    /// its base anchors and every ordered change entry are digested
+    /// together (NOT just the base name). Re-staging an identical candidate
+    /// re-derives the SAME id; any content drift derives a different one.
     pub fn id(&self) -> String {
-        format!("{}-cs", self.base_id)
+        let mut parts: Vec<String> = vec![
+            format!("child={}", self.child_id),
+            format!("base={}", self.base_id),
+            format!(
+                "run_base={}",
+                self.run_base_snapshot.as_deref().unwrap_or("")
+            ),
+            format!(
+                "start={}",
+                self.child_start_snapshot.as_deref().unwrap_or("")
+            ),
+            format!(
+                "final={}",
+                self.final_child_snapshot.as_deref().unwrap_or("")
+            ),
+        ];
+        for entry in &self.files {
+            parts.push(format!(
+                "{}|{}|{}",
+                entry.path.to_string_lossy(),
+                entry.child_hash.map(|h| h.to_hex()).unwrap_or_default(),
+                entry.base_hash.map(|h| h.to_hex()).unwrap_or_default(),
+            ));
+        }
+        format!("cs-{}", stable_content_digest(&parts))
     }
+}
+
+/// Deterministic 64-hex content digest of a bounded string list (FNV-1a
+/// folded under four seeds; stable across processes and platforms — the
+/// session layer uses the same discipline for its list digests).
+pub(crate) fn stable_content_digest(items: &[String]) -> String {
+    let mut out = String::with_capacity(64);
+    for seed in [
+        0xcbf2_9ce4_8422_2325u64,
+        0x9e37_79b9_7f4a_7c15,
+        0x2545_f491_4f6c_dd1d,
+        0x94d0_49bb_1331_11ebu64,
+    ] {
+        let mut hash = seed;
+        for item in items {
+            for b in item.as_bytes() {
+                hash ^= u64::from(*b);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hash ^= 0xff;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        out.push_str(&format!("{hash:016x}"));
+    }
+    out
+}
+
+/// Deterministic digest of one recorded base map (sorted path|hash rows).
+pub(crate) fn base_map_digest(map: &[(PathBuf, FileHash)]) -> String {
+    let rows: Vec<String> = map
+        .iter()
+        .map(|(p, h)| format!("{}|{}", p.to_string_lossy(), h.to_hex()))
+        .collect();
+    stable_content_digest(&rows)
 }
 
 /// Durable merge record (audit 99): `merge_records(child_id, seq, status
@@ -410,6 +484,10 @@ pub(crate) fn put_change_set(
     let header = serde_json::json!({
         "child_id": cs.child_id,
         "base_id": cs.base_id,
+        "cs_id": cs.id(),
+        "run_base_snapshot": cs.run_base_snapshot,
+        "child_start_snapshot": cs.child_start_snapshot,
+        "final_child_snapshot": cs.final_child_snapshot,
         "files": cs.files.len(),
         "chunks": pack_chunks(&cs.files)?.len(),
         "created_ms": cs.created_ms,
@@ -420,7 +498,10 @@ pub(crate) fn put_change_set(
     put_chunks(&handle, KIND_CS, &key, &header, &chunks)
 }
 
-/// Read the stored change set of one child (by change-set id).
+/// Read the stored change set of one child (by change-set content id, or by
+/// a legacy `{base_id}-cs` id: the stored rows are scanned for a header whose
+/// content id or legacy id matches — a caller that only knows the base
+/// anchor still resolves the same candidate).
 pub(crate) fn read_change_set(
     manager: &Arc<faktor_session::SessionManager>,
     parent: SessionId,
@@ -430,10 +511,42 @@ pub(crate) fn read_change_set(
 ) -> Result<ChangeSet, ExecError> {
     let handle = parent_handle(manager, parent)?;
     let key = cs_key(run, child_id, cs_id);
-    let Some((header, chunks)) = read_chunks(&handle, KIND_CS, &key)? else {
-        return Err(ExecError::NotFound(format!(
-            "change set {cs_id} of child {child_id}"
-        )));
+    if let Some(cs) = read_change_set_at(&handle, child_id, &key)? {
+        return Ok(cs);
+    }
+    let prefix = format!("{run}/{child_id}/cs/");
+    for (kind, key, value) in scan_facts(&handle)? {
+        if kind != KIND_CS {
+            continue;
+        }
+        let Some(rest) = key.strip_prefix(&prefix) else {
+            continue;
+        };
+        if rest.contains('/') {
+            continue;
+        }
+        let header: serde_json::Value = serde_json::from_str(&value)
+            .map_err(|e| ExecError::Internal(format!("change-set header decode {key}: {e}")))?;
+        let stored_id = header.get("cs_id").and_then(|c| c.as_str()).unwrap_or("");
+        let base_id = header.get("base_id").and_then(|c| c.as_str()).unwrap_or("");
+        if stored_id == cs_id || format!("{base_id}-cs") == cs_id {
+            return read_change_set_at(&handle, child_id, &key)?.ok_or_else(|| {
+                ExecError::NotFound(format!("change set {cs_id} of child {child_id}"))
+            });
+        }
+    }
+    Err(ExecError::NotFound(format!(
+        "change set {cs_id} of child {child_id}"
+    )))
+}
+
+fn read_change_set_at(
+    handle: &faktor_session::SessionHandle,
+    child_id: &str,
+    key: &str,
+) -> Result<Option<ChangeSet>, ExecError> {
+    let Some((header, chunks)) = read_chunks(handle, KIND_CS, key)? else {
+        return Ok(None);
     };
     let files: Vec<ChangeEntry> = unpack_chunks(&chunks)?;
     for f in &files {
@@ -442,11 +555,11 @@ pub(crate) fn read_change_set(
     }
     if files.len() > MAX_CHANGES {
         return Err(ExecError::Internal(format!(
-            "stored change set {cs_id} holds {} files (cap {MAX_CHANGES})",
+            "stored change set {key} holds {} files (cap {MAX_CHANGES})",
             files.len()
         )));
     }
-    Ok(ChangeSet {
+    Ok(Some(ChangeSet {
         child_id: header
             .get("child_id")
             .and_then(|c| c.as_str())
@@ -457,12 +570,24 @@ pub(crate) fn read_change_set(
             .and_then(|c| c.as_str())
             .unwrap_or("")
             .to_string(),
+        run_base_snapshot: header
+            .get("run_base_snapshot")
+            .and_then(|c| c.as_str())
+            .map(str::to_string),
+        child_start_snapshot: header
+            .get("child_start_snapshot")
+            .and_then(|c| c.as_str())
+            .map(str::to_string),
+        final_child_snapshot: header
+            .get("final_child_snapshot")
+            .and_then(|c| c.as_str())
+            .map(str::to_string),
         files,
         created_ms: header
             .get("created_ms")
             .and_then(|c| c.as_i64())
             .unwrap_or(0),
-    })
+    }))
 }
 
 fn cs_id_of(base_id: &str) -> String {
@@ -840,6 +965,103 @@ pub(crate) fn compute_change_entries(
         }
     }
     Ok(entries)
+}
+
+// -------------------------------------------------- multi-child composition
+
+/// One child's change to one path, with the child provenance retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildChange {
+    pub child_id: String,
+    pub entry: ChangeEntry,
+}
+
+/// One resolved per-path decision of a multi-child candidate composition:
+/// the resulting content hash (`None` = deletion) and every child that
+/// converged on it (sorted — provenance, never a silent winner).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposedPathChange {
+    pub path: PathBuf,
+    pub child_hash: Option<FileHash>,
+    pub base_hash: Option<FileHash>,
+    pub sources: Vec<String>,
+}
+
+/// Precompose N children's staged change sets into ONE deterministic
+/// per-path candidate (point 4). Rules:
+///
+/// - every child that touches a path with the IDENTICAL resulting hash (or
+///   every child deleting it) is CONVERGENT: applied once, provenance kept;
+/// - different resulting hashes, or delete-vs-modify, are a TYPED conflict
+///   (never resolved by order);
+/// - differing base anchors for one path are a typed conflict (a drifted
+///   generation can never be composed).
+///
+/// The resolution is a pure function of the change-set CONTENT: the output
+/// order is the path order and every provenance list is sorted, so child
+/// input order and child-id lexical order are both irrelevant to the
+/// decision (a representative source is picked only among fully identical
+/// results).
+pub fn compose_child_changes(changes: &[ChangeSet]) -> Result<Vec<ComposedPathChange>, ExecError> {
+    let mut by_path: std::collections::BTreeMap<PathBuf, Vec<ChildChange>> =
+        std::collections::BTreeMap::new();
+    for cs in changes {
+        for entry in &cs.files {
+            by_path
+                .entry(entry.path.clone())
+                .or_default()
+                .push(ChildChange {
+                    child_id: cs.child_id.clone(),
+                    entry: entry.clone(),
+                });
+        }
+    }
+    let mut out: Vec<ComposedPathChange> = Vec::with_capacity(by_path.len());
+    for (path, mut group) in by_path {
+        group.sort_by(|a, b| a.child_id.cmp(&b.child_id));
+        let mut bases: Vec<Option<FileHash>> = group.iter().map(|c| c.entry.base_hash).collect();
+        bases.sort_by_key(|b| b.as_ref().map(|h| h.to_hex()));
+        bases.dedup();
+        if bases.len() > 1 {
+            return Err(ExecError::IntegrationConflict(format!(
+                "inter-child base drift at {}: the children name different base anchors",
+                path.display()
+            )));
+        }
+        let mut results: Vec<Option<FileHash>> = group.iter().map(|c| c.entry.child_hash).collect();
+        results.sort_by_key(|r| r.as_ref().map(|h| h.to_hex()));
+        results.dedup();
+        if results.len() > 1 {
+            let detail: Vec<String> = group
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{}:{}",
+                        c.child_id,
+                        c.entry
+                            .child_hash
+                            .map(|h| h.to_hex())
+                            .unwrap_or_else(|| "deleted".into())
+                    )
+                })
+                .collect();
+            return Err(ExecError::IntegrationConflict(format!(
+                "divergent inter-child changes at {}: {} (delete-vs-modify or different content); no order-based resolution exists",
+                path.display(),
+                detail.join(", ")
+            )));
+        }
+        let child_hash = results[0];
+        let base_hash = bases[0];
+        let sources: Vec<String> = group.iter().map(|c| c.child_id.clone()).collect();
+        out.push(ComposedPathChange {
+            path,
+            child_hash,
+            base_hash,
+            sources,
+        });
+    }
+    Ok(out)
 }
 
 // ------------------------------------------------- semantic merge preflight
@@ -1235,6 +1457,30 @@ impl OrchestratorRuntime {
                 child.ownership
             )));
         }
+        // Immutable run base (point 2): when the run recorded one, a child
+        // whose recorded base does not name that generation is STALE and
+        // never stages (a stale candidate can never be integrated).
+        let handle = parent_handle(&self.manager, parent)?;
+        let run_base = handle
+            .ledger_run_base_get(&run)
+            .map_err(|e| ExecError::Internal(format!("run base read: {e}")))?;
+        if let Some(rb) = &run_base {
+            match child.run_base_snapshot.as_deref() {
+                Some(recorded) if recorded == rb.snapshot_hash => {}
+                Some(recorded) => {
+                    return Err(ExecError::IntegrationConflict(format!(
+                        "child {child_id} was derived from run base {recorded} but run {run} carries run base {}; a stale change set is never staged",
+                        rb.snapshot_hash
+                    )));
+                }
+                None => {
+                    return Err(ExecError::IntegrationConflict(format!(
+                        "child {child_id} records no run base although run {run} carries one ({}); refusing to stage an unanchored change set",
+                        rb.snapshot_hash
+                    )));
+                }
+            }
+        }
         let parent_map = read_base_map(&self.manager, parent, &run, child_id, "parent")?;
         let parent_map = parent_map.unwrap_or_default();
         let start_map = read_base_map(&self.manager, parent, &run, child_id, "start")?;
@@ -1251,11 +1497,61 @@ impl OrchestratorRuntime {
                 .base_snapshot_id
                 .clone()
                 .unwrap_or_else(|| base_id_of(child_id)),
+            run_base_snapshot: child.run_base_snapshot.clone(),
+            child_start_snapshot: Some(base_map_digest(&start_map)),
+            final_child_snapshot: Some(base_map_digest(&now)),
             files,
             created_ms: self.manager.now_ms(),
         };
         put_change_set(&self.manager, parent, &run, &cs)?;
         Ok(cs)
+    }
+
+    /// Root-parameterized change-set apply (point 4): apply every entry of
+    /// `change_set` into `destination_root`, reading the child content from
+    /// `child_root`, through the shared commit-time CAS primitives
+    /// ([`faktor_fs::merge_apply_content`] / [`faktor_fs::merge_delete`]).
+    /// The destination's expected state is the entry's recorded base hash —
+    /// the SAME anchors the candidate composition and the owner landing use.
+    /// Nothing about the child's identity or ownership is consulted: this is
+    /// the pure apply primitive the composition and tests share.
+    pub fn apply_change_set_to_root(
+        &self,
+        destination_root: &Path,
+        child_root: &Path,
+        change_set: &ChangeSet,
+    ) -> Result<Vec<PathBuf>, ExecError> {
+        let mut applied: Vec<PathBuf> = Vec::new();
+        for entry in &change_set.files {
+            let outcome = match entry.child_hash {
+                Some(child_hash) => faktor_fs::merge_apply_content(
+                    destination_root,
+                    &entry.path,
+                    child_root,
+                    &entry.path,
+                    child_hash,
+                    entry.base_hash,
+                ),
+                None => match entry.base_hash {
+                    Some(base) => faktor_fs::merge_delete(destination_root, &entry.path, base),
+                    None => {
+                        return Err(ExecError::Internal(format!(
+                            "staged deletion {:?} has no base anchor",
+                            entry.path
+                        )))
+                    }
+                },
+            };
+            outcome.map_err(|e| {
+                ExecError::from_fs(
+                    &format!("change-set apply of {:?}", entry.path),
+                    destination_root,
+                    e,
+                )
+            })?;
+            applied.push(entry.path.clone());
+        }
+        Ok(applied)
     }
 
     /// Audit 99: approve and merge. Applies ONLY the approved paths of the
@@ -1388,6 +1684,21 @@ impl OrchestratorRuntime {
             return Err(ExecError::NotFound(format!(
                 "change set {change_set_id} does not belong to child {child_id}"
             )));
+        }
+        // Stale-generation refusal: a change set derived from an older run
+        // base is never merged into a run carrying a recorded base.
+        if let Some(rb) = parent_handle(&self.manager, parent)?
+            .ledger_run_base_get(&run)
+            .map_err(|e| ExecError::Internal(format!("run base read: {e}")))?
+        {
+            if cs.run_base_snapshot.as_deref() != Some(rb.snapshot_hash.as_str()) {
+                return Err(ExecError::IntegrationConflict(format!(
+                    "change set {} of child {child_id} names run base {:?} but run {run} carries {}; a stale change set is never merged",
+                    cs.id(),
+                    cs.run_base_snapshot,
+                    rb.snapshot_hash
+                )));
+            }
         }
         let (approved_v, rejected_v) = validate_decision(&cs, approved, rejected)?;
         let owner_root = self.plan_row(parent, &run)?.owner.root;
@@ -1754,6 +2065,7 @@ impl OrchestratorRuntime {
             created_ms: now,
             updated_ms: now,
             base_snapshot_id: None,
+            run_base_snapshot: None,
             env_snapshot_id: None,
             execution_phase: ExecutionPhase::Review,
         };
@@ -1876,6 +2188,9 @@ mod tests {
         ChangeSet {
             child_id: "child-0".into(),
             base_id: "base-child-0".into(),
+            run_base_snapshot: None,
+            child_start_snapshot: None,
+            final_child_snapshot: None,
             files,
             created_ms: 1,
         }
@@ -2381,6 +2696,7 @@ mod tests {
                 created_ms: 1,
                 updated_ms: 1,
                 base_snapshot_id: Some("base-child-0".into()),
+                run_base_snapshot: None,
                 env_snapshot_id: None,
                 execution_phase: ExecutionPhase::default(),
             };
