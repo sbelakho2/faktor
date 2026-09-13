@@ -11,17 +11,11 @@
 //!   base64 form plus the JSON envelope stays under the daemon's 10 MiB
 //!   request cap (`crate::api::MAX_BODY_BYTES`). The session/CAS ceiling
 //!   remains `MAX_ATTACHMENT_BYTES` for programmatic callers.
-//! - IMAGES ARE REFUSED LOUDLY (code `unsupported`, 400): provider
-//!   media/content parts are NOT wired. The provider layer has only a
-//!   URL-shaped `ContentKind::Image { url }` whose adapter encodings
-//!   disagree (OpenAI takes a data URL, Anthropic emits a `type:"url"`
-//!   source its API rejects, Google hardcodes `image/png` and expects raw
-//!   base64) and the agent has no path from a durable row to a request
-//!   part. The follow-up is precise: (1) add a binary part carrying
-//!   `{mime, bytes}`, (2) encode it per adapter wire, (3) gate on
-//!   `ModelCapabilities::vision`, (4) replace this refusal with delivery.
-//!   Until then the refusal keeps the client draft/images intact instead of
-//!   pretending the model saw them.
+//! - IMAGE ADMISSION IS MODEL-AWARE: images are admitted (stored) and then
+//!   validated at task admission against the CHOSEN model — `vision` must
+//!   be advertised, the mime must be a deliverable image type, and the size
+//!   must fit the provider's per-image bound. A refusal keeps the draft and
+//!   the durable bytes intact; nothing is cleared.
 //! - Hostile DTOs (unknown fields, non-string members, malformed base64,
 //!   traversal filenames, hostile mimes, oversized payloads) are typed
 //!   400/413s; an unknown digest resolves to a typed 404, never a phantom.
@@ -58,20 +52,6 @@ pub(crate) struct NativeAttachmentUpload {
     data_base64: String,
 }
 
-/// The typed wire refusal for image submission while provider
-/// media/content parts are not wired. Code `unsupported` so clients can
-/// distinguish it from a malformed body and restore the draft loudly.
-fn media_unsupported(mime: &str) -> ApiError {
-    ApiError {
-        code: "unsupported",
-        message: format!(
-            "image attachment ({mime}) cannot be submitted: provider media/content parts are not wired, so the bytes can never reach a model; the draft and attachments were kept — retry without the image or wait for the media-part follow-up"
-        ),
-        http_status: 400,
-        retryable: false,
-    }
-}
-
 /// Map one session-layer attachment refusal onto the wire: the DTO
 /// admission class is a client 400 (oversized keeps its distinct code),
 /// never a 5xx.
@@ -88,22 +68,104 @@ fn admission_error(e: &Error) -> ApiError {
     }
 }
 
+/// The typed wire refusal for an image the CHOSEN model cannot consume:
+/// `unsupported`, 400. The draft and the durable CAS bytes stay intact —
+/// admission clears nothing, so the client can retry with a vision model.
+fn media_model_unsupported(model: &str, reason: &str) -> ApiError {
+    ApiError {
+        code: "unsupported",
+        message: format!(
+            "image attachment cannot be delivered to model {model}: {reason}; the draft and attachment bytes were kept — select a vision model or remove the image"
+        ),
+        http_status: 400,
+        retryable: false,
+    }
+}
+
 /// The ONE wire admission rule for a task's binary attachment set: bounded
 /// count/structural validity/durable byte-identical resolution via the
-/// session layer, plus the loud image refusal. Runs BEFORE any run/task row
-/// so a refused start leaves no partial durable admission.
+/// session layer, plus MODEL-AWARE media validation of every image against
+/// the chosen model's capabilities. Runs BEFORE any run/task row so a
+/// refused start leaves no partial durable admission (and never touches
+/// the stored bytes or the composer draft).
 pub(crate) fn validate_wire_attachments(
+    state: &AppState,
     handle: &faktor_session::SessionHandle,
+    model_override: Option<&str>,
     ids: &[AttachmentId],
 ) -> Result<(), ApiError> {
-    for id in ids {
-        if id.is_image() {
-            return Err(media_unsupported(&id.mime));
-        }
-    }
     handle
         .resolve_attachments(ids)
-        .map_err(|e| admission_error(&e))
+        .map_err(|e| admission_error(&e))?;
+    let images: Vec<&AttachmentId> = ids.iter().filter(|id| id.is_image()).collect();
+    if images.is_empty() {
+        return Ok(());
+    }
+    let provider = handle.provider().map_err(|e| admission_error(&e))?;
+    let model = match model_override {
+        Some(m) if !m.is_empty() => m.to_string(),
+        _ => handle.model().map_err(|e| admission_error(&e))?,
+    };
+    // Fail closed when the provider is not registered: a fabricated
+    // assume-vision default would claim delivery that cannot happen.
+    let (caps, provider_max) = state
+        .deps
+        .agent
+        .provider_media_caps(&provider, &model)
+        .ok_or_else(|| ApiError {
+            code: "unsupported",
+            message: format!(
+                "provider {provider:?} of session {} is not registered; cannot validate image delivery to model {model}",
+                handle.id()
+            ),
+            http_status: 400,
+            retryable: false,
+        })?;
+    if !caps.vision {
+        return Err(media_model_unsupported(
+            &model,
+            "the model does not advertise vision capability",
+        ));
+    }
+    let per_image = provider_max.min(faktor_provider::MAX_MEDIA_BYTES_HARD);
+    let mut total: u64 = 0;
+    for id in images {
+        id.validate().map_err(|e| admission_error(&e))?;
+        if !faktor_provider::is_supported_image_mime(&id.mime) {
+            return Err(media_model_unsupported(
+                &model,
+                &format!(
+                    "mime {:?} is not a deliverable image type ({})",
+                    id.mime,
+                    faktor_provider::SUPPORTED_IMAGE_MIMES.join(", ")
+                ),
+            ));
+        }
+        if id.size > per_image as u64 {
+            return Err(ApiError {
+                code: "oversized",
+                message: format!(
+                    "image attachment {} is {} bytes, over the {per_image} byte bound of provider {provider:?}",
+                    id.digest, id.size
+                ),
+                http_status: 413,
+                retryable: false,
+            });
+        }
+        total = total.saturating_add(id.size);
+        if total > faktor_provider::MAX_REQUEST_IMAGE_BYTES as u64 {
+            return Err(ApiError {
+                code: "oversized",
+                message: format!(
+                    "image attachment set totals {total} bytes, over the {} byte request media bound",
+                    faktor_provider::MAX_REQUEST_IMAGE_BYTES
+                ),
+                http_status: 413,
+                retryable: false,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Parse one digest path segment strictly: 64 lowercase/uppercase hex chars.
@@ -136,14 +198,11 @@ pub(crate) async fn native_attachment_upload(
         Err(r) => return *r,
     };
     // Canonicalize exactly like the store write: a hostile or non-canonical
-    // mime is a typed 400 before any decode/CAS write; an image is the loud
-    // unsupported refusal.
+    // mime is a typed 400 before any decode/CAS write. Images are STORED
+    // here and validated against the chosen model at task admission.
     let mime = upload.mime.trim().to_ascii_lowercase();
     if let Err(e) = validate_mime(&mime) {
         return wire_status(admission_error(&e));
-    }
-    if mime.starts_with("image/") {
-        return wire_status(media_unsupported(&mime));
     }
     if let Some(name) = upload.filename.as_deref() {
         if let Err(e) = faktor_core::attachment::validate_filename(name) {
@@ -268,12 +327,6 @@ pub(crate) async fn native_attachment_bytes(
         }
         Err(e) => return api_err(&e),
     };
-    if stored.is_image() {
-        // Defensive symmetry with the upload refusal: an image row can only
-        // exist if written programmatically; delivering its bytes over the
-        // wire would imply the media path exists.
-        return wire_status(media_unsupported(&stored.mime));
-    }
     match handle.attachment_bytes(&stored, MAX_ATTACHMENT_UPLOAD_BYTES) {
         Ok(bytes) => (
             StatusCode::OK,
@@ -304,6 +357,15 @@ mod tests {
         registry
             .try_register(Arc::new(FakeProvider::new(
                 "fake",
+                ModelCapabilities {
+                    vision: true,
+                    ..Default::default()
+                },
+            )))
+            .unwrap();
+        registry
+            .try_register(Arc::new(FakeProvider::new(
+                "novision",
                 ModelCapabilities::default(),
             )))
             .unwrap();
@@ -471,7 +533,8 @@ mod tests {
                 .await
                 .unwrap()
         };
-        // An image is the LOUD unsupported refusal (media parts not wired).
+        // Uploads of IMAGES succeed: storage is model-agnostic and the
+        // vision/deliverability validation happens at task admission.
         let image = native_attachment_upload(
             State(state.clone()),
             headers.clone(),
@@ -479,16 +542,25 @@ mod tests {
             Ok(Json(upload("image/png", Some("shot.png"), b"\x89PNG"))),
         )
         .await;
-        let body = expect_status(image, StatusCode::BAD_REQUEST).await;
-        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(err["error"]["code"], "unsupported");
-        assert!(
-            err["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("provider media"),
-            "{err}"
-        );
+        assert_eq!(image.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(image.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let image_id: AttachmentId = serde_json::from_slice(&body).unwrap();
+        assert_eq!(image_id.mime, "image/png");
+        assert!(image_id.is_image());
+        // The stored image round-trips over the wire (bytes are reachable).
+        let bytes = native_attachment_bytes(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), image_id.digest.to_hex())),
+        )
+        .await;
+        assert_eq!(bytes.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(bytes.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"\x89PNG");
         // Hostile mime, traversal filename and malformed base64 are 400s.
         // (Uppercase is NOT hostile: it is canonicalized to lowercase before
         // validation, exactly like the session write path.)
@@ -537,8 +609,9 @@ mod tests {
         )
         .await;
         expect_status(response, StatusCode::PAYLOAD_TOO_LARGE).await;
-        // Nothing durable was left behind by any hostile attempt.
-        assert!(handle.list_attachments(16).unwrap().is_empty());
+        // The hostile attempts left exactly the (lawful) image row behind:
+        // nothing durable was created by any malformed payload.
+        assert_eq!(handle.list_attachments(16).unwrap(), vec![image_id]);
     }
 
     #[test]
@@ -575,30 +648,90 @@ mod tests {
     }
 
     #[test]
-    fn wire_admission_requires_durable_rows_and_refuses_images() {
+    fn wire_admission_is_model_aware_and_keeps_bytes_on_refusal() {
         let dir = tempfile::tempdir().unwrap();
-        let (_state, handle) = test_state(dir.path());
+        let (state, handle) = test_state(dir.path());
+        // A second session whose provider advertises NO vision.
+        let manager = state.deps.session.clone();
+        let ws = manager
+            .create_workspace(dir.path().to_str().unwrap())
+            .unwrap();
+        let created = manager
+            .create_session(ws, "novision-test", "novision", "m")
+            .unwrap();
+        let novision = manager.get_session(created.id()).unwrap().unwrap();
         let stored = handle
             .put_attachment("application/pdf", Some("spec.pdf"), b"%PDF")
             .unwrap();
         // A durable byte-identical id admits; an unknown digest is a 400
         // (client error) with the not-found cause preserved.
-        validate_wire_attachments(&handle, std::slice::from_ref(&stored))
+        validate_wire_attachments(&state, &handle, None, std::slice::from_ref(&stored))
             .expect("durable id admits");
         let unknown = AttachmentId {
             digest: FileHash::from([8; 32]),
             ..stored.clone()
         };
-        let err = validate_wire_attachments(&handle, &[unknown]).expect_err("unknown digest");
+        let err = validate_wire_attachments(&state, &handle, None, &[unknown])
+            .expect_err("unknown digest");
         assert_eq!(err.http_status, 400);
         assert!(err.message.contains("not stored"), "{err:?}");
-        // A programmatically stored image is refused at admission with the
-        // typed `unsupported` code (provider media parts are not wired).
+        // An image admits for the vision session, with a model override too.
         let image = handle
             .put_attachment("image/png", None, b"\x89PNG")
             .unwrap();
-        let err = validate_wire_attachments(&handle, &[image, stored]).expect_err("image");
+        validate_wire_attachments(&state, &handle, Some("m"), &[image.clone(), stored.clone()])
+            .expect("vision model admits the image");
+        // The VISION-LESS session refuses typedly and keeps the draft and
+        // the durable bytes: the row still resolves and the bytes are still
+        // served. Nothing is cleared by a refusal.
+        novision
+            .inherit_attachment(&image)
+            .expect("inherit for the second session");
+        let err = validate_wire_attachments(&state, &novision, None, std::slice::from_ref(&image))
+            .expect_err("vision-less model");
         assert_eq!(err.code, "unsupported");
-        assert!(err.message.contains("provider media"), "{err:?}");
+        assert_eq!(err.http_status, 400);
+        assert!(err.message.contains("vision"), "{err:?}");
+        assert_eq!(
+            novision.list_attachments(16).unwrap(),
+            vec![image.clone()],
+            "the refusal keeps the durable row"
+        );
+        assert_eq!(
+            novision.attachment_bytes(&image, 1 << 20).unwrap(),
+            b"\x89PNG",
+            "the refusal keeps the durable bytes"
+        );
+        // An image mime that no provider consumes is refused typedly.
+        let svg = handle
+            .put_attachment("image/svg+xml", None, b"<svg/>")
+            .unwrap();
+        let err = validate_wire_attachments(&state, &handle, None, std::slice::from_ref(&svg))
+            .expect_err("unsupported image mime");
+        assert_eq!(err.code, "unsupported");
+        assert!(err.message.contains("image/svg+xml"), "{err:?}");
+        // An image over the provider's per-image bound is a typed 413 and is
+        // kept durably (upload succeeded; only admission refused).
+        let oversized = handle
+            .put_attachment(
+                "image/png",
+                None,
+                &vec![0u8; faktor_provider::MAX_MODEL_IMAGE_BYTES + 1],
+            )
+            .unwrap();
+        let err =
+            validate_wire_attachments(&state, &handle, None, std::slice::from_ref(&oversized))
+                .expect_err("oversized image");
+        assert_eq!(err.code, "oversized");
+        assert_eq!(err.http_status, 413);
+        assert_eq!(
+            handle.attachment(oversized.digest).unwrap(),
+            Some(oversized.clone())
+        );
+        // A vision-less model is ALSO refused on the model-override path.
+        let err =
+            validate_wire_attachments(&state, &novision, Some("m"), std::slice::from_ref(&image))
+                .expect_err("override cannot rescue a vision-less provider");
+        assert_eq!(err.code, "unsupported");
     }
 }

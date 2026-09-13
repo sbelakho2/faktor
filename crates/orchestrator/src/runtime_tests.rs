@@ -214,6 +214,48 @@ fn caps_tools() -> ModelCapabilities {
     }
 }
 
+/// A write tool for the overlay-concurrency test: it writes `out.rs` under a
+/// directory named after the SESSION ROOT's basename (the child id), so two
+/// concurrent children can run the IDENTICAL script and still write
+/// distinct, ownership-declared paths inside their own overlays.
+fn owned_root_write_tool() -> Tool {
+    Tool {
+        name: "write_owned".into(),
+        description: "write out.rs under a dir named after the workspace root".into(),
+        input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+        capability: None,
+        recovery_hint: ToolRecovery::WorkspaceWrite,
+        path_args: vec![],
+        execute: Arc::new(|ctx: ToolRunCtx, _input: serde_json::Value| {
+            Box::pin(async move {
+                let ws = ctx
+                    .workspace
+                    .ok_or_else(|| faktor_core::error::Error::internal("no workspace wired"))?;
+                let leaf = ws
+                    .root()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| {
+                        faktor_core::error::Error::internal("workspace root has no name")
+                    })?
+                    .to_string();
+                let path = format!("{leaf}/out.rs");
+                std::fs::create_dir_all(ws.root().join(&leaf)).map_err(|e| {
+                    faktor_core::Error::internal(format!("mkdir {leaf} under {:?}: {e}", ws.root()))
+                })?;
+                ws.write_atomic(std::path::Path::new(&path), b"owned")
+                    .map_err(|e| faktor_core::Error::internal(format!("write {path}: {e}")))?;
+                Ok(ToolOutcome {
+                    text: format!("wrote {path}"),
+                    exit_code: Some(0),
+                    ..Default::default()
+                })
+            })
+        }),
+    }
+}
+
 /// A workspace-writing tool (the shape the daemon's write_file has): it
 /// writes through the session's resolved workspace, so it observes exactly
 /// where a child runs (owner checkout vs isolated candidate root).
@@ -282,6 +324,7 @@ fn open_env_with_routing(
     let mut tool_registry = ToolRegistry::new();
     tool_registry.register(echo_tool());
     tool_registry.register(write_tool());
+    tool_registry.register(owned_root_write_tool());
     let workspaces = faktor_fs::WorkspaceFileService::new();
     let deps = AgentDeps {
         session: manager.clone(),
@@ -487,7 +530,7 @@ async fn run_exec(
 use crate::test_support::heavy_guard;
 
 #[tokio::test]
-async fn end_to_end_disjoint_mutating_children_run_on_the_owner_worktree() {
+async fn end_to_end_disjoint_mutating_children_run_in_isolated_overlays() {
     let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 2));
@@ -516,10 +559,18 @@ async fn end_to_end_disjoint_mutating_children_run_on_the_owner_worktree() {
         assert_eq!(c.state, ChildState::Done);
         assert!(c.session_id != 0, "real session id");
         assert!(c.operation_id != 0, "maps to the child session's op id");
+        // ExclusivePaths is now exclusive write authority INSIDE a
+        // daemon-owned overlay — never the shared owner worktree.
         assert_eq!(c.ownership, ChildOwnership::ExclusivePaths);
-        assert_eq!(
+        assert_ne!(
             c.worktree_id, env.owner.worktree_id,
-            "shares the owner worktree"
+            "owns an overlay worktree, not the shared owner"
+        );
+        let overlay = env.isolated_root.join("run-1").join(&c.child_id);
+        assert!(overlay.is_dir(), "overlay dir must exist: {overlay:?}");
+        assert!(
+            !overlay.starts_with(&env.owner.root),
+            "the overlay is never the owner root"
         );
     }
     assert_registry_consistent(&env, "run-1");
@@ -530,6 +581,107 @@ async fn end_to_end_disjoint_mutating_children_run_on_the_owner_worktree() {
         "provider was driven {}",
         env.provider.count()
     );
+}
+
+#[tokio::test]
+async fn two_disjoint_paths_children_run_concurrently_in_their_own_overlays() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    // IDENTICAL scripts for both children: the write tool derives its target
+    // from the session root's basename (the child id), so script scheduling
+    // order cannot decide the outcome — each child writes only its own
+    // declared prefix inside its own overlay.
+    let script = vec![
+        ScriptedResponse::ToolCall {
+            id: "w".into(),
+            name: "write_owned".into(),
+            input: serde_json::json!({}),
+        },
+        ScriptedResponse::Text("wrote".into()),
+        ScriptedResponse::End,
+    ];
+    let env = Arc::new(open_env(dir.path(), vec![script.clone(), script], 40));
+    owner_write(&env, "keep.rs", b"owner-keep");
+    let before = owner_digest(&env);
+    let p = raw_plan(vec![
+        path_item("a", WorkKind::Implementation, &[], &["child-0"]),
+        path_item("b", WorkKind::Implementation, &[], &["child-1"]),
+    ]);
+    let run = env.orchestrator.clone();
+    let owner = env.owner.clone();
+    let config = base_config(&env, "run-overlay-par");
+    let handle = tokio::spawn(async move {
+        run.execute_task(p, owner, config, &[spec("a"), spec("b")])
+            .await
+    });
+    // BOTH children are live at once, each in its own overlay — the owner
+    // digest stays stable throughout.
+    wait_until(
+        || {
+            OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-overlay-par")
+                .map(|rows| {
+                    rows.len() == 2
+                        && rows
+                            .iter()
+                            .all(|r| r.state == ChildState::Running && r.session_id != 0)
+                })
+                .unwrap_or(false)
+        },
+        300,
+    )
+    .await;
+    let rows =
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-overlay-par")
+            .unwrap();
+    let mut worktrees: Vec<u64> = rows.iter().map(|r| r.worktree_id).collect();
+    worktrees.sort_unstable();
+    worktrees.dedup();
+    assert_eq!(
+        worktrees.len(),
+        2,
+        "each Paths child owns a distinct overlay"
+    );
+    assert!(rows.iter().all(|r| r.worktree_id != env.owner.worktree_id));
+    for r in &rows {
+        assert!(
+            child_dir(&env, "run-overlay-par", &r.child_id).is_dir(),
+            "overlay of {} exists while both children run",
+            r.child_id
+        );
+    }
+    assert_eq!(
+        owner_digest(&env),
+        before,
+        "owner byte-untouched while both Paths children run"
+    );
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(600), handle)
+        .await
+        .expect("bound")
+        .expect("no panic")
+        .expect("execution succeeds");
+    assert!(outcome.complete, "{outcome:?}");
+    for c in &outcome.children {
+        assert_eq!(c.ownership, ChildOwnership::ExclusivePaths);
+        let overlay = child_dir(&env, "run-overlay-par", &c.child_id);
+        assert!(
+            overlay.join(&c.child_id).join("out.rs").is_file(),
+            "child {} wrote only inside its declared prefix",
+            c.child_id
+        );
+        let other = if c.child_id == "child-0" {
+            "child-1"
+        } else {
+            "child-0"
+        };
+        assert!(
+            !overlay.join(other).join("out.rs").exists(),
+            "no cross-overlay write"
+        );
+    }
+    assert!(!env.owner.root.join("child-0").join("out.rs").exists());
+    assert!(!env.owner.root.join("child-1").join("out.rs").exists());
+    assert_eq!(owner_digest(&env), before, "owner still byte-untouched");
+    assert_registry_consistent(&env, "run-overlay-par");
 }
 
 #[tokio::test]
@@ -1091,10 +1243,13 @@ async fn overlapping_exclusive_ownership_is_refused_before_spawn() {
 #[tokio::test]
 async fn canonicalized_overlapping_spellings_are_refused_before_spawn() {
     let _heavy = heavy_guard();
-    // (audits 7/8/21/22) The compile ALSO resolves every mutating path set
-    // against the real owner root: spellings that only the filesystem
-    // equates (`src` vs `./src`) collide at compile — a typed
-    // OverlappingExclusiveOwnership before anything spawns.
+    // (audits 7/8/21/22 + hardening) The compile resolves every mutating
+    // path set through the ONE canonical vocabulary
+    // (`NormalizedWorkspacePath`): a `.`-alias spelling is no longer
+    // silently filesystem-canonicalized, it is a typed plan violation —
+    // and an fs-equivalent spelling like `./src` can therefore never widen
+    // or dodge the overlap analysis. The refusal is still BEFORE anything
+    // spawns.
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     let _ = std::fs::create_dir_all(env.owner.root.join("src"));
@@ -1109,9 +1264,9 @@ async fn canonicalized_overlapping_spellings_are_refused_before_spawn() {
         vec![spec("a"), spec("b")],
     )
     .await
-    .expect_err("fs-equivalent spellings must collide at compile");
+    .expect_err("non-canonical alias spellings must be refused at compile");
     assert!(
-        matches!(err, ExecError::OverlappingExclusiveOwnership(_)),
+        matches!(err, ExecError::InvalidPlan(_)) && err.to_string().contains("current_component"),
         "{err:?}"
     );
     assert!(
@@ -1175,7 +1330,8 @@ async fn mixed_analyze_implement_review_plan_runs_under_per_item_ownership() {
             .unwrap_or_else(|| panic!("no child for item {id}"))
     };
     // The read-only kinds shared the owner worktree read-only; the mutating
-    // item owned the disjoint path on the same worktree.
+    // item owns its declared path inside its OWN overlay (never the shared
+    // owner worktree directly).
     assert_eq!(row_of("analyze").ownership, ChildOwnership::ReadOnlyShared);
     assert_eq!(
         row_of("implement").ownership,
@@ -1185,7 +1341,16 @@ async fn mixed_analyze_implement_review_plan_runs_under_per_item_ownership() {
         row_of("implement").ownership_paths,
         vec!["src/a.rs".to_string()]
     );
-    assert_eq!(row_of("implement").worktree_id, env.owner.worktree_id);
+    assert_ne!(
+        row_of("implement").worktree_id,
+        env.owner.worktree_id,
+        "a Paths child owns an isolated overlay worktree"
+    );
+    assert!(env
+        .isolated_root
+        .join("run-mixed")
+        .join(&row_of("implement").child_id)
+        .is_dir());
     assert_eq!(row_of("review").ownership, ChildOwnership::ReadOnlyShared);
     // The durable wave-A3 rows persisted each item's EFFECTIVE ownership.
     let assignments =
@@ -1992,6 +2157,11 @@ fn owner_read(env: &Env, rel: &str) -> Vec<u8> {
     std::fs::read(env.owner.root.join(rel)).unwrap()
 }
 
+fn owner_digest(env: &Env) -> String {
+    faktor_session::root_snapshot_digest(&env.owner.root, faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES)
+        .unwrap()
+}
+
 fn child_dir(env: &Env, run_id: &str, child_id: &str) -> std::path::PathBuf {
     let dir = env.isolated_root.join(run_id).join(child_id);
     assert!(dir.is_dir(), "child dir must exist: {dir:?}");
@@ -2360,6 +2530,139 @@ async fn oversized_change_set_fails_loudly_and_leaves_the_parent_untouched() {
                     || !key.starts_with("run-oversize/child-0/")
             }),
         "no change-set rows may exist after the oversized refusal"
+    );
+}
+
+#[tokio::test]
+async fn exclusive_paths_staging_refuses_an_overlay_write_outside_the_declared_set() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    write_owner_file(&env, "keep.rs", b"parent-keep");
+    let p = raw_plan(vec![path_item(
+        "impl",
+        WorkKind::Implementation,
+        &[],
+        &["src"],
+    )]);
+    let outcome = run_exec(
+        &env,
+        p,
+        base_config(&env, "run-path-scope"),
+        vec![spec("impl")],
+    )
+    .await
+    .expect("execution succeeds");
+    assert!(outcome.complete, "{outcome:?}");
+    // A hostile/rogue writer (a tool that bypassed the edit-gate allowlist)
+    // leaves a path OUTSIDE the declared set inside the overlay: staging
+    // refuses the WHOLE change set typed — nothing composes or lands.
+    let overlay = child_dir(&env, "run-path-scope", "child-0");
+    std::fs::create_dir_all(overlay.join("src")).unwrap();
+    std::fs::write(overlay.join("src/in.rs"), b"inside").unwrap();
+    std::fs::write(overlay.join("evil.rs"), b"outside").unwrap();
+    let err = env
+        .orchestrator
+        .stage_child_changes("child-0")
+        .expect_err("an out-of-scope overlay write must refuse staging");
+    assert!(
+        matches!(err, ExecError::ExclusivePathViolation(_)),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("evil.rs"), "{err:?}");
+    let result = env
+        .orchestrator
+        .child_result("child-0")
+        .expect("child result readable");
+    assert!(
+        result.change_set.is_none(),
+        "nothing may be staged around the violation"
+    );
+    assert!(!env.owner.root.join("evil.rs").exists());
+    assert!(!env.owner.root.join("src/in.rs").exists());
+    // Removing the rogue write lets the declared path stage normally.
+    std::fs::remove_file(overlay.join("evil.rs")).unwrap();
+    let cs = env
+        .orchestrator
+        .stage_child_changes("child-0")
+        .expect("declared-path staging succeeds");
+    assert_eq!(cs.files.len(), 1);
+    assert_eq!(cs.files[0].path, std::path::PathBuf::from("src/in.rs"));
+}
+
+#[tokio::test]
+async fn legacy_shared_owner_paths_rows_are_refused_typed_at_staging() {
+    let _heavy = heavy_guard();
+    // A durable ExclusivePaths row from BEFORE isolation (no recorded spawn
+    // base, worktree == the shared owner) must never be reinterpreted as an
+    // overlay: staging refuses it typed instead of reading the owner as
+    // candidate content. Legacy runs are re-planned under isolation.
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    let p = raw_plan(vec![path_item(
+        "impl",
+        WorkKind::Implementation,
+        &[],
+        &["src"],
+    )]);
+    let outcome = run_exec(&env, p, base_config(&env, "run-legacy"), vec![spec("impl")])
+        .await
+        .expect("execution succeeds");
+    assert!(outcome.complete, "{outcome:?}");
+    // A LIVE mirror would shadow the tamper; the legacy shape exists only on
+    // a reopened daemon, so reopen the store and tamper the durable row.
+    let parent = env.parent;
+    drop(env);
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    let parent_handle = env.manager.get_session(parent).unwrap().unwrap();
+    let raw = parent_handle
+        .memory_facts()
+        .unwrap()
+        .into_iter()
+        .find(|(kind, key, _)| kind == REGISTRY_ROW_KIND && key == "run-legacy/child-0")
+        .map(|(_, _, value)| value)
+        .expect("registry row");
+    let mut row: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    row["base_snapshot_id"] = serde_json::Value::Null;
+    row["workspace_id"] = env.owner.workspace_id.into();
+    row["worktree_id"] = env.owner.worktree_id.into();
+    parent_handle
+        .upsert_memory_fact(REGISTRY_ROW_KIND, "run-legacy/child-0", &row.to_string())
+        .unwrap();
+    let tampered = OrchestratorRuntime::registry_rows(env.manager.clone(), parent, "run-legacy")
+        .unwrap()
+        .into_iter()
+        .find(|r| r.child_id == "child-0")
+        .expect("tampered row");
+    assert!(
+        tampered.base_snapshot_id.is_none(),
+        "tamper must clear the recorded base: {tampered:?}"
+    );
+    assert_eq!(
+        tampered.ownership,
+        ChildOwnership::ExclusivePaths,
+        "tamper must keep the ownership mode: {tampered:?}"
+    );
+    let err = env
+        .orchestrator
+        .stage_child_changes("child-0")
+        .expect_err("a legacy shared-owner row must be refused");
+    assert!(
+        matches!(err, ExecError::ExclusivePathViolation(_)),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("legacy shared-owner")
+            || err.to_string().contains("no spawn base snapshot"),
+        "{err:?}"
+    );
+    assert!(
+        env.orchestrator
+            .child_result("child-0")
+            .expect("child result readable")
+            .change_set
+            .is_none(),
+        "nothing may be staged from a legacy shared-owner row"
     );
 }
 
@@ -4551,9 +4854,9 @@ async fn child_projection_derives_budget_and_phase_across_reopen() {
 }
 
 /// P1 child specs: binary attachments are a typed field SEPARATE from the
-/// workspace-relative `files`, are validated with their own loud rule
-/// (images refused until provider media/content parts exist), and decode
-/// byte-identically on re-attach while old rows stay empty.
+/// workspace-relative `files`, are validated structurally (count/mime/
+/// filename/size; model-aware image delivery is validated at the server
+/// DTO), and decode byte-identically on re-attach while old rows stay empty.
 #[test]
 fn child_spec_attachments_are_separate_from_paths_and_decode_on_reattach() {
     let attachment = AttachmentId {
@@ -4589,16 +4892,16 @@ fn child_spec_attachments_are_separate_from_paths_and_decode_on_reattach() {
     }];
     assert!(validate_attachment_ids(&hostile.attachments).is_err());
 
-    // Images are refused loudly: no provider media/content part exists to
-    // carry their bytes.
+    // Images are valid structurally: delivery is gated on the chosen
+    // model's vision capability at the server DTO, and every adapter
+    // re-encodes the resolved bytes for its own wire.
     let image = AttachmentId {
         digest: faktor_core::hash::FileHash::from([4; 32]),
         mime: "image/png".into(),
         filename: None,
         size: 3,
     };
-    let err = validate_attachment_ids(&[image]).expect_err("images are refused");
-    assert!(err.to_string().contains("provider media"), "{err}");
+    validate_attachment_ids(&[image]).expect("image id is structurally valid");
     // The set bound is typed and inclusive.
     let many = vec![attachment; faktor_session::MAX_ATTACHMENTS_PER_TASK + 1];
     assert!(matches!(

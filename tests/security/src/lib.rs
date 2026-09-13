@@ -254,6 +254,13 @@ mod tests {
                             text.push_str(&format!("tool_call {name} {input}\n"));
                         }
                         faktor_provider::ContentKind::Image { .. } => {}
+                        faktor_provider::ContentKind::ImageData { mime, data } => {
+                            // The capture records labels only: never the
+                            // resolved bytes (a media leak into transcripts
+                            // would defeat the "no base64 in durable JSON"
+                            // invariant).
+                            text.push_str(&format!("image_data {mime} {} bytes\n", data.len()));
+                        }
                     }
                 }
             }

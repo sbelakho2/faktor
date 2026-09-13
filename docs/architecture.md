@@ -33,8 +33,10 @@ historical turns, and deterministic bookkeeping are local.
   built into the pinned closure (`ui/kilo-v756-webview/dist`), staged into
   the VSIX and render-gated (`vscode-visual`); the derived shell in
   `apps/vscode/` is IMPLEMENTED and CI-tested against the daemon. Client UI
-  parity is **PARTIAL** only because the JetBrains 7.1.2 sources are not
-  vendored; the blanket byte-for-byte claim is retired (§1).
+  parity is **PARTIAL**: the executable parity matrices (VS Code visual
+  render + frozen-upstream replay + JetBrains behavioral/visual matrices)
+  are the only evidence `ui_parity` accepts, and the JetBrains matrices do
+  not exist yet (§1).
 - **JetBrains shell:** native Kotlin bridge in `apps/jetbrains/`
   (`:shared` + `:backend` + `:frontend` compile and smoke-test against the
   real daemon). The frontend is a native Swing tool-window panel
@@ -42,16 +44,25 @@ historical turns, and deterministic bookkeeping are local.
   `NativeClient`/`NativeEventStream`: daemon lifecycle, bearer auth over
   the protected env channel, chat/task-run/agent/usage/verification/
   evidence routing and SSE journal streaming with cursor resume.
-  **Status: IMPLEMENTED (native bridge).** The upstream 7.1.2 UI sources
-  are NOT vendored, so byte-for-byte 7.1.2 UI parity remains
-  BLOCKED_EXTERNAL; the bridge is UI-framework independent and a future
-  IntelliJ tool-window adapter can embed the same panel.
+  **Status: IMPLEMENTED (native bridge + Faktor frontend).** The upstream
+  7.1.2 sources ARE vendored (`compat/jetbrains-712/`, per-file SHA-256
+  manifest in `ui/upstream.json` → `jetbrains_712`); the derived
+  `jetbrains_upstream_assets` label is **VENDORED**. Byte-for-byte 7.1.2
+  UI parity stays **PARTIAL** until executable JetBrains behavioral/visual
+  parity matrices exist — the kotlinc/daemon smokes are regression tests,
+  not parity results, and the upstream Gradle build is not run offline.
+  The bridge is UI-framework independent and the same panel is the single
+  rendering implementation.
 - **Protocol:** the v7.5.6 server contract subset (§16) is **compat glue
   only** — golden fixtures in `compat/kilo-v756/` keep the old UI shells
   testable against this daemon. Nothing in the runtime depends on it: the
   daemon's native surface is Faktor Native Protocol v1
   (`docs/native-protocol.md`), and the compat surface may be retired
-  whenever the old UI generation is.
+  whenever the old UI generation is. Wire-parity status is **PARTIAL** and
+  measured, never asserted: the required replay writes
+  `target/certification/kilo-compat.json` and currently records requests
+  36/36 exact, responses 10/36 exact with 26 locked divergences
+  (`docs/wire-compat.md`).
 
 **Non-goals:** reimplementing the old TypeScript/Bun engine or merging
 newer UI releases wholesale. Improving the v7.5.6 wire protocol is not a
@@ -136,12 +147,14 @@ Rules that shape the diagram (Commandments):
 
 ```
 apps/        frozen UI compatibility fixtures
-  vscode/       v7.5.6-derived client shell (webview vendored; UI parity: PARTIAL — JetBrains 7.1.2 absent)
-  jetbrains/    native Kotlin bridge + Swing panel (upstream 7.1.2 UI not vendored)
+  vscode/       v7.5.6-derived client shell (webview vendored; UI parity: PARTIAL — executable parity matrices incomplete)
+  jetbrains/    native Kotlin bridge + Swing panel (upstream 7.1.2 vendored/pinned; parity: PARTIAL — no executable matrix yet)
 compat/      optional v7.5.6 migration/test glue against the old UI
   kilo-v756/    frozen v7.5.6 wire contract fixtures (golden JSON); the
                 daemon never depends on them — old-UI shells do
-  jetbrains-712/ reserved JetBrains split-mode fixture corpus
+  jetbrains-712/ pinned upstream JetBrains 7.1.2 source (per-file SHA-256
+                manifest in ui/upstream.json); the reference, never a
+                second renderer
 fixtures/    protocol/, providers/, screenshots/, repositories/ test data
 tests/       integration/, soak/, performance/, fault/, visual/ (adversarial-only)
 crates/      the Rust engine workspace

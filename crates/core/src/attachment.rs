@@ -76,9 +76,9 @@ impl AttachmentId {
     }
 
     /// TRUE when the declared media type is an image (`image/*`). Image
-    /// bytes can only reach a provider through a provider media/content
-    /// part; until the adapters carry attachment bytes, admission refuses
-    /// these loudly (the composer draft is retained by the client).
+    /// bytes reach a provider as a resolved media part (`ContentKind::
+    /// ImageData`) that is gated on `ModelCapabilities::vision` at
+    /// admission and re-encoded per adapter wire.
     pub fn is_image(&self) -> bool {
         self.mime.starts_with("image/")
     }

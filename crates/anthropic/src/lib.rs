@@ -33,6 +33,11 @@ use faktor_provider::{
     ProviderErrorKind, ProviderStream, Role,
 };
 
+/// Documented Anthropic Messages per-image ceiling (raw bytes): the API
+/// accepts at most ~5 MiB per image before base64 inflation. Matches the
+/// daemon default; declared here so the adapter owns its bound.
+pub const ANTHROPIC_MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct AnthropicConfig {
     pub base_url: String,
@@ -118,6 +123,18 @@ impl AnthropicProvider {
                             "source": { "type": "url", "url": url }
                         }));
                     }
+                    ContentKind::ImageData { mime, data } => {
+                        // Resolved attachment bytes: Anthropic takes a
+                        // base64 source with an explicit media_type.
+                        content.push(serde_json::json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": mime,
+                                "data": data.to_base64(),
+                            }
+                        }));
+                    }
                     ContentKind::ToolCall { id, name, input } => {
                         content.push(serde_json::json!({
                             "type": "tool_use",
@@ -200,7 +217,19 @@ impl Provider for AnthropicProvider {
             .unwrap_or_else(|| self.config.default_caps.clone())
     }
 
+    fn max_image_bytes(&self) -> usize {
+        ANTHROPIC_MAX_IMAGE_BYTES
+    }
+
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
+        // Delivery gate BEFORE any wire decision: vision capability, image
+        // mime allowlist and the provider's per-image byte bound.
+        let caps = self.capabilities(&req.model);
+        if let Err(e) =
+            faktor_provider::validate_media_delivery(&req, &caps, self.max_image_bytes())
+        {
+            return faktor_provider::provider_error_stream(e);
+        }
         let body = self.wire_body(&req);
         let url = format!("{}/v1/messages", self.config.base_url);
         let transport = self.transport.clone();
@@ -563,6 +592,113 @@ mod tests {
                 break;
             }
         }
+    }
+
+    /// Resolved images lower BYTE-EXACTLY to an Anthropic base64 source
+    /// carrying the ACTUAL media type (never the old url/hardcoded shape).
+    #[tokio::test]
+    async fn image_data_lowers_to_byte_exact_base64_source() {
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 5, 6];
+        let expected_b64 = faktor_provider::MediaBytes::new(png.clone())
+            .unwrap()
+            .to_base64();
+        let server = MockServer::new();
+        let expected = expected_b64.clone();
+        server.route(
+            "POST",
+            "/v1/messages",
+            MockAction::AssertThenRespond {
+                status: 200,
+                body: "data: {\"type\":\"message_stop\"}\n\ndata: [DONE]\n\n".into(),
+                assert: Arc::new(move |body: &serde_json::Value| {
+                    assert_eq!(
+                        body["messages"][1]["content"],
+                        serde_json::json!([
+                            { "type": "text", "text": "look" },
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": expected
+                                }
+                            }
+                        ]),
+                        "Anthropic image lowering must be byte-exact"
+                    );
+                }),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        assert_eq!(provider.max_image_bytes(), ANTHROPIC_MAX_IMAGE_BYTES);
+        let mut r = req("claude-x");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::text("look"),
+                ContentPart::image_data("image/png", png).unwrap(),
+            ],
+        });
+        let mut stream = provider.stream(r);
+        while let Some(chunk) = stream.next().await {
+            if matches!(chunk, Ok(ProviderChunk::Done)) {
+                break;
+            }
+        }
+        assert_eq!(server.request_count(), 1);
+    }
+
+    /// Vision-less and over-bound media are refused typedly BEFORE any wire
+    /// byte (the Anthropic per-image bound is 5 MiB).
+    #[tokio::test]
+    async fn image_delivery_gate_is_typed_and_pre_wire() {
+        let server = MockServer::new();
+        let base = server.base_url().await;
+        let visionless = AnthropicConfig::new(None).with_base(&base).with_model(
+            "claude-x",
+            ModelCapabilities {
+                vision: false,
+                ..Default::default()
+            },
+        );
+        let provider = AnthropicProvider::build(visionless);
+        let mut r = req("claude-x");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::image_data("image/png", vec![0x89, b'P', b'N', b'G']).unwrap(),
+            ],
+        });
+        let err = provider.stream(r).next().await.unwrap().unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
+        assert!(err.message.contains("vision"), "{err}");
+        assert_eq!(server.request_count(), 0, "no wire byte on a gate refusal");
+
+        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let mut r = req("claude-x");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![ContentPart {
+                kind: ContentKind::ImageData {
+                    mime: "image/png".into(),
+                    data: faktor_provider::MediaBytes::new(vec![
+                        0u8;
+                        ANTHROPIC_MAX_IMAGE_BYTES + 1
+                    ])
+                    .unwrap(),
+                },
+                tool_call_id: None,
+            }],
+        });
+        let err = provider.stream(r).next().await.unwrap().unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
+        assert!(err.message.contains("exceeds"), "{err}");
+        assert_eq!(
+            server.request_count(),
+            0,
+            "no wire byte on an oversize refusal"
+        );
     }
 
     #[tokio::test]

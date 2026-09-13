@@ -57,8 +57,21 @@ pub enum ContentKind {
     Reasoning {
         text: String,
     },
+    /// A URL-shaped image reference (remote URL or `data:` URL). Kept for
+    /// callers that already hold a URL; attachment bytes ride
+    /// [`ContentKind::ImageData`] instead.
     Image {
         url: String,
+    },
+    /// Resolved attachment bytes (CAS → memory at request construction):
+    /// `mime` is the canonical lowercase media type from the durable
+    /// [`faktor_core::attachment::AttachmentId`] row and `data` is the
+    /// BOUNDED byte carrier. This part never survives a JSON roundtrip —
+    /// see [`MediaBytes`] — so durable task JSON keeps only attachment
+    /// ids and every request re-resolves from the CAS.
+    ImageData {
+        mime: String,
+        data: MediaBytes,
     },
     ToolCall {
         id: String,
@@ -77,6 +90,34 @@ impl ContentPart {
             kind: ContentKind::Text { text: text.into() },
             tool_call_id: None,
         }
+    }
+
+    /// One resolved image attachment part. `mime` must be a canonical
+    /// lowercase `image/*` type and the bytes are bounded by
+    /// [`MAX_MEDIA_BYTES_HARD`]; every violation (including zero bytes) is a
+    /// typed refusal at CONSTRUCTION (before any provider call).
+    pub fn image_data(mime: impl AsRef<str>, bytes: Vec<u8>) -> Result<Self, faktor_core::Error> {
+        let mime = mime.as_ref().to_string();
+        faktor_core::attachment::validate_mime(&mime)?;
+        if !mime.starts_with("image/") {
+            return Err(Error::new(
+                ErrorKind::Malformed,
+                format!("media part mime {mime:?} is not an image/* type"),
+            ));
+        }
+        if bytes.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Malformed,
+                "media part carries zero bytes; an empty image can never be valid",
+            ));
+        }
+        Ok(Self {
+            kind: ContentKind::ImageData {
+                mime,
+                data: MediaBytes::new(bytes)?,
+            },
+            tool_call_id: None,
+        })
     }
 
     pub fn reasoning(text: impl Into<String>) -> Self {
@@ -114,6 +155,180 @@ impl ContentPart {
             tool_call_id: Some(tool_call_id.into()),
         }
     }
+}
+
+/// Absolute structural ceiling of one [`MediaBytes`] carrier (raw bytes):
+/// mirrors the attachment/CAS ceiling, so any resolvable attachment can be
+/// carried. Per-provider DELIVERY bounds are tighter
+/// ([`Provider::max_image_bytes`], [`MAX_MODEL_IMAGE_BYTES`] default).
+pub const MAX_MEDIA_BYTES_HARD: usize = faktor_core::attachment::MAX_ATTACHMENT_BYTES as usize;
+
+/// Daemon-wide DEFAULT ceiling of ONE resolved image part (raw bytes)
+/// delivered to a provider. Providers may advertise a tighter or
+/// (documented API limits) slightly larger bound via
+/// [`Provider::max_image_bytes`]; admission validates the attachment
+/// against the CHOSEN provider's value.
+pub const MAX_MODEL_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
+/// Daemon-wide ceiling of ALL resolved image bytes in ONE provider request
+/// (the sum across image parts). Bounds the in-memory media of a request
+/// even when each individual image is under its provider bound.
+pub const MAX_REQUEST_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Conservative token estimate of ONE image part for the context budget.
+/// Real image tokenization is provider- and resolution-dependent (tiles /
+/// patches); the planner charges a fixed upper-bound estimate so an image
+/// can never be free in the budget and never scales with byte length.
+pub const IMAGE_PART_TOKEN_ESTIMATE: u64 = 4_096;
+
+/// Image media types the daemon will deliver to providers. Deliberately a
+/// closed allowlist: SVG (scriptable), BMP/TIFF (rarely accepted) and
+/// `image/*`-shaped junk are refused loudly at admission instead of being
+/// forwarded to a provider that will reject or mis-handle them.
+pub const SUPPORTED_IMAGE_MIMES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// True when `mime` is one of the [`SUPPORTED_IMAGE_MIMES`].
+pub fn is_supported_image_mime(mime: &str) -> bool {
+    SUPPORTED_IMAGE_MIMES.contains(&mime)
+}
+
+/// Resolved attachment bytes carried by [`ContentKind::ImageData`].
+///
+/// This is the media part's bounded byte carrier:
+///
+/// - construction enforces [`MAX_MEDIA_BYTES_HARD`];
+/// - [`serde::Serialize`] writes only `{"digest", "size"}` — expanded
+///   bytes NEVER travel through JSON, so durable task state keeps
+///   attachment ids and every request re-resolves from the CAS. The
+///   content digest keeps the JSON form content-sensitive for prompt
+///   accounting;
+/// - [`serde::Deserialize`] is a typed refusal: a JSON document can never
+///   smuggle expanded bytes back into a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaBytes(Vec<u8>);
+
+impl MediaBytes {
+    /// Wrap resolved bytes, enforcing [`MAX_MEDIA_BYTES_HARD`] (typed
+    /// `Oversized`, never a truncation). Per-provider delivery bounds are
+    /// enforced later by [`validate_media_delivery`].
+    pub fn new(bytes: Vec<u8>) -> Result<Self, Error> {
+        if bytes.len() > MAX_MEDIA_BYTES_HARD {
+            return Err(Error::new(
+                ErrorKind::Oversized,
+                format!(
+                    "resolved media of {} bytes exceeds MAX_MEDIA_BYTES_HARD ({MAX_MEDIA_BYTES_HARD})",
+                    bytes.len()
+                ),
+            ));
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// BLAKE3 address of the bytes (the attachment digest, as carried by
+    /// the durable row this part was resolved from).
+    pub fn digest(&self) -> faktor_core::hash::FileHash {
+        faktor_core::hash::FileHash::from(*blake3::hash(&self.0).as_bytes())
+    }
+
+    /// Standard-alphabet base64 of the raw bytes (adapter lowering).
+    pub fn to_base64(&self) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(&self.0)
+    }
+
+    /// `data:<mime>;base64,<b64>` URL (OpenAI-compatible wires).
+    pub fn to_data_url(&self, mime: &str) -> String {
+        format!("data:{mime};base64,{}", self.to_base64())
+    }
+}
+
+impl serde::Serialize for MediaBytes {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        let mut st = s.serialize_struct("MediaBytes", 2)?;
+        st.serialize_field("digest", &self.digest().to_hex())?;
+        st.serialize_field("size", &self.0.len())?;
+        st.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for MediaBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(_d: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom(
+            "resolved media bytes never travel through JSON: durable state stores attachment ids and requests re-resolve them from the CAS",
+        ))
+    }
+}
+
+/// Defense-in-depth delivery gate every adapter runs BEFORE lowering wire
+/// bytes: `caps.vision` must be advertised, the mime must be one of the
+/// [`SUPPORTED_IMAGE_MIMES`], and the raw bytes must fit the provider's own
+/// per-image bound ([`Provider::max_image_bytes`], itself capped by the
+/// structural [`MAX_MEDIA_BYTES_HARD`]). The agent's
+/// [`CapabilityValidator`] already refuses vision-less requests at request
+/// construction; adapters re-check so a directly-constructed or hostile
+/// request can never leak an image to a wire that would reject it — or,
+/// worse, silently drop it.
+pub fn validate_media_delivery(
+    req: &GenericAgentRequest,
+    caps: &ModelCapabilities,
+    max_image_bytes: usize,
+) -> Result<(), ProviderError> {
+    let bound = max_image_bytes.min(MAX_MEDIA_BYTES_HARD);
+    for m in &req.messages {
+        for part in &m.content {
+            let ContentKind::ImageData { mime, data } = &part.kind else {
+                continue;
+            };
+            if !caps.vision {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::BadRequest,
+                    format!(
+                        "model {} does not support vision; refusing to lower a resolved image part",
+                        req.model
+                    ),
+                ));
+            }
+            if !is_supported_image_mime(mime) {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::BadRequest,
+                    format!(
+                        "image mime {mime:?} is not deliverable (supported: {})",
+                        SUPPORTED_IMAGE_MIMES.join(", ")
+                    ),
+                ));
+            }
+            if data.len() > bound {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::BadRequest,
+                    format!(
+                        "resolved image of {} bytes exceeds the provider bound ({bound}); refusing to lower it",
+                        data.len()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A one-frame stream carrying a typed refusal produced BEFORE any wire
+/// byte was sent (adapter delivery gates). The error is terminal: nothing
+/// was attempted, so nothing may be retried on the same request.
+pub fn provider_error_stream(err: ProviderError) -> ProviderStream {
+    Box::pin(futures::stream::once(async move { Err(err) }))
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -558,6 +773,15 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// Maximum RAW bytes of ONE image part this provider accepts. The
+    /// daemon-wide default is [`MAX_MODEL_IMAGE_BYTES`]; adapters with
+    /// documented per-image API limits override it (Anthropic 5 MiB,
+    /// OpenAI/Google 20 MiB). Admission validates every image attachment
+    /// against the CHOSEN provider's value before any run/task row exists.
+    fn max_image_bytes(&self) -> usize {
+        MAX_MODEL_IMAGE_BYTES
+    }
+
     /// The models this provider can serve (configured + discovered +
     /// probed). Feeds the model-selector surface; never a fabricated list
     /// in the agent. Default: only the "default" entry.
@@ -661,6 +885,12 @@ impl Provider for InstanceProvider {
         self.inner.runtime_context_limit(model)
     }
 
+    fn max_image_bytes(&self) -> usize {
+        // Delegate: the wrapper must not mask a family's documented
+        // per-image API limit (admission reads this through the registry).
+        self.inner.max_image_bytes()
+    }
+
     fn catalog_entry(&self, model: &str) -> ModelCatalogEntry {
         // Delegate the row and rewrite its provider to THIS instance id:
         // catalog rows must name the registry key the daemon resolves
@@ -713,6 +943,25 @@ impl CapabilityValidator {
                     ),
                 ));
             }
+        }
+        // Resolved attachment media is only deliverable to a model that
+        // advertises vision; the refusal happens BEFORE any adapter
+        // lowering, so a vision-less model can never receive a silently
+        // dropped (or fabricated) image part.
+        let image_parts = req
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|p| matches!(p.kind, ContentKind::ImageData { .. }))
+            .count();
+        if image_parts > 0 && !caps.vision {
+            return Err(Error::new(
+                ErrorKind::Malformed,
+                format!(
+                    "model {} does not support vision, but {image_parts} image part(s) were resolved from attachments",
+                    req.model
+                ),
+            ));
         }
         Ok(())
     }
@@ -1770,6 +2019,115 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::Oversized);
         r.max_output = Some(1000);
         assert!(CapabilityValidator::validate(&r, &caps).is_ok());
+    }
+
+    /// Resolved media is vision-gated at capability validation (before any
+    /// adapter lowering) and is a typed refusal for a vision-less model.
+    #[test]
+    fn capability_validation_refuses_resolved_media_for_visionless_models() {
+        let mut r = req();
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::text("what is this?"),
+                ContentPart::image_data("image/png", vec![0x89, b'P', b'N', b'G']).unwrap(),
+            ],
+        });
+        let visionless = ModelCapabilities {
+            vision: false,
+            ..Default::default()
+        };
+        let err = CapabilityValidator::validate(&r, &visionless).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed);
+        assert!(err.message.contains("does not support vision"), "{err}");
+        let vision = ModelCapabilities {
+            vision: true,
+            ..Default::default()
+        };
+        CapabilityValidator::validate(&r, &vision).expect("vision model admits media");
+        // The legacy URL-shaped part is untouched by the media gate (it
+        // carries no bytes and predates the attachment path).
+        assert!(ContentPart::image_data("text/plain", vec![1]).is_err());
+        assert!(ContentPart::image_data("IMAGE/PNG", vec![1]).is_err());
+        assert!(ContentPart::image_data("image/png", Vec::new()).is_err());
+    }
+
+    #[test]
+    fn media_bytes_json_never_carries_expanded_bytes_and_refuses_decode() {
+        let bytes = vec![0x89, b'P', b'N', b'G', 1, 2, 3, 4];
+        let media = MediaBytes::new(bytes.clone()).unwrap();
+        let json = serde_json::to_value(&media).unwrap();
+        assert_eq!(json["size"], 8);
+        assert_eq!(
+            json["digest"],
+            serde_json::json!(media.digest().to_hex()),
+            "the JSON carrier is content-addressed"
+        );
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.len(), 2, "only digest+size may cross the JSON boundary");
+        assert!(
+            obj.values().all(|v| !v.is_array()),
+            "no expanded byte array may appear in JSON: {json}"
+        );
+        // Decoding bytes from JSON is impossible by construction: durable
+        // state stores attachment ids and requests re-resolve from the CAS.
+        assert!(serde_json::from_value::<MediaBytes>(json).is_err());
+        // A whole message containing media serializes to the digest carrier
+        // and can never be decoded back into expanded bytes.
+        let message = RequestMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::text("see"),
+                ContentPart::image_data("image/png", media.as_slice().to_vec()).unwrap(),
+            ],
+        };
+        let msg_json = serde_json::to_string(&message).unwrap();
+        assert!(!msg_json.contains("base64"), "{msg_json}");
+        assert!(serde_json::from_str::<RequestMessage>(&msg_json).is_err());
+        // The structural hard cap holds; per-provider bounds are separate.
+        assert!(MediaBytes::new(vec![0u8; MAX_MEDIA_BYTES_HARD + 1]).is_err());
+    }
+
+    /// The adapter delivery gate: vision, mime allowlist and the provider's
+    /// own per-image bound, checked BEFORE any wire byte.
+    #[test]
+    fn media_delivery_gate_checks_vision_mime_and_size() {
+        let mut r = req();
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::image_data("image/png", vec![0x89, b'P', b'N', b'G']).unwrap(),
+            ],
+        });
+        let vision = ModelCapabilities {
+            vision: true,
+            ..Default::default()
+        };
+        validate_media_delivery(&r, &vision, 8).expect("png of 4 bytes under an 8-byte bound");
+        // Too small a provider bound refuses typedly (no truncation).
+        let err = validate_media_delivery(&r, &vision, 3).unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
+        assert!(err.message.contains("provider bound"), "{err}");
+        // Vision-less refuses even when the size fits.
+        let err = validate_media_delivery(
+            &r,
+            &ModelCapabilities {
+                vision: false,
+                ..Default::default()
+            },
+            1 << 20,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
+        assert!(err.message.contains("vision"), "{err}");
+        // An image mime outside the closed allowlist refuses typedly.
+        let mut svg = req();
+        svg.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![ContentPart::image_data("image/svg+xml", b"<svg/>".to_vec()).unwrap()],
+        });
+        let err = validate_media_delivery(&svg, &vision, 1 << 20).unwrap_err();
+        assert!(err.message.contains("image/svg+xml"), "{err}");
     }
 
     #[test]

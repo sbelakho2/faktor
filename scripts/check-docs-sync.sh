@@ -10,8 +10,13 @@
 #       * crates/winjob uses AssignProcessToJobObject      => Job Objects may
 #         not be called a future/target mechanism;
 #       * ui/upstream.json exists (VS Code webview vendored) => the docs may
-#         not claim the upstream UI is not vendored, except where the claim
-#         is explicitly JetBrains-7.1.2-scoped.
+#         not claim the upstream UI is not vendored; once the JetBrains
+#         7.1.2 pin (compat/jetbrains-712 + ui/upstream.json jetbrains_712)
+#         exists the historical JetBrains-7.1.2-scoped exemption is retired
+#         and BLOCKED_EXTERNAL may no longer describe JetBrains/UI parity;
+#       * target/certification/kilo-compat.json records status=passed
+#         (responses N/N) => the docs may not claim required divergences
+#         remain.
 # Stale/contradicting docs are a review-rejected artifact: drift must be
 # loud, never silent.
 #
@@ -159,11 +164,17 @@ fi
 
 # 3. Vendored VS Code webview: ui/upstream.json means the upstream tree IS
 #    vendored, and the VSIX staging step (prepackage:vsix) ships it under
-#    media/. Generic "not vendored" claims contradict BOTH; only explicitly
-#    JetBrains-7.1.2-scoped statements are allowed.
+#    media/. Generic "not vendored" claims contradict BOTH; the
+#    JetBrains-7.1.2 scope exemption only applies while the 7.1.2 pin is
+#    ABSENT — once compat/jetbrains-712 + ui/upstream.json carry the pin, a
+#    JetBrains-scoped "not vendored" claim is equally stale.
 VSIX_STAGING=apps/vscode/scripts/prepare-vendored-webview.mjs
+JETBRAINS_PIN=0
+if [ -d compat/jetbrains-712 ] && grep -q '"jetbrains_712"' ui/upstream.json 2>/dev/null; then
+    JETBRAINS_PIN=1
+fi
 if [ -f ui/upstream.json ] && [ -f "$VSIX_STAGING" ]; then
-    for doc in "${TRUTH_DOCS[@]}"; do
+    for doc in "$DOC" "${TRUTH_DOCS[@]}"; do
         [ -f "$doc" ] || continue
         doc_fail=0
         raw_count=0
@@ -173,7 +184,11 @@ if [ -f ui/upstream.json ] && [ -f "$VSIX_STAGING" ]; then
             lineno="${entry%%:*}"
             line="${entry#*:}"
             case "$line" in
-                *JetBrains*|*jetbrains*|*7.1.2*|*712*) continue ;;
+                *JetBrains*|*jetbrains*|*7.1.2*|*712*)
+                    # The historical JetBrains scope exemption: only while
+                    # the pinned 7.1.2 corpus is genuinely absent.
+                    [ "$JETBRAINS_PIN" -eq 0 ] && continue
+                    ;;
             esac
             echo "CONTRADICTION: $doc:$lineno says the UI is not vendored without a JetBrains-7.1.2 scope, but ui/upstream.json exists and prepackage:vsix stages the pinned closure + overlay into media/" >&2
             echo "  exact line: $line" >&2
@@ -209,6 +224,35 @@ if [ -f apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/BoardPanel.k
         assert_no_contradiction "$doc" \
             '(scaffold|scaffolding|stub|placeholder)[^.]{0,100}apps?/' \
             "calls apps/ scaffolding/stubs, but the real Faktor panels exist (BoardPanel/TaskTreePanel/TournamentPanel)"
+    done
+fi
+
+# 5. Executable results invalidate stale prose labels. The 7.1.2 pin being
+#    vendored means BLOCKED_EXTERNAL can no longer describe the JetBrains/UI
+#    parity surface; a passed kilo-compat report (responses N/N) means no
+#    truth doc may still claim the required divergences remain. These are
+#    semantic assertions over the normalized text, so wrapped claims fail
+#    with their exact fragment.
+if [ "$JETBRAINS_PIN" -eq 1 ]; then
+    for doc in "$DOC" "${TRUTH_DOCS[@]}"; do
+        [ -f "$doc" ] || continue
+        assert_no_contradiction "$doc" \
+            '(jetbrains|712|client ui parity|ui parity)[^.]{0,80}blocked[_-]?external' \
+            "describes JetBrains/UI parity as BLOCKED_EXTERNAL although the pinned 7.1.2 corpus is vendored and executable parity results are the only remaining gate"
+        assert_no_contradiction "$doc" \
+            'blocked[_-]?external[^.]{0,80}(jetbrains|712|client ui parity|ui parity)' \
+            "describes JetBrains/UI parity as BLOCKED_EXTERNAL although the pinned 7.1.2 corpus is vendored and executable parity results are the only remaining gate"
+    done
+fi
+
+KILO_COMPAT_REPORT=target/certification/kilo-compat.json
+if [ -f "$KILO_COMPAT_REPORT" ] && \
+    grep -q '"status": "passed"' "$KILO_COMPAT_REPORT" 2>/dev/null; then
+    for doc in "$DOC" "${TRUTH_DOCS[@]}"; do
+        [ -f "$doc" ] || continue
+        assert_no_contradiction "$doc" \
+            'required divergences?[^.]{0,60}(remain|remaining|still)' \
+            "claims required kilo-compat divergences remain although target/certification/kilo-compat.json records status=passed (responses N/N)"
     done
 fi
 

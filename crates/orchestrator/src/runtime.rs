@@ -167,6 +167,12 @@ pub enum ExecError {
     },
     #[error("ownership overlap: {0} (normalized path sets of concurrent mutating children must be disjoint)")]
     OverlappingExclusiveOwnership(String),
+    /// A `Paths`-owned child's isolated overlay staged a change OUTSIDE its
+    /// declared exclusive write set: the change set is refused entirely and
+    /// nothing composes or lands (a tool that bypassed the edit-gate
+    /// allowlist can never widen an exclusive ownership by writing).
+    #[error("exclusive path violation: {0}")]
+    ExclusivePathViolation(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("conflict: {0}")]
@@ -361,11 +367,13 @@ pub struct ChildSpec {
     /// `AttachmentId` rows). SEPARATE from `files`: these are CAS bytes
     /// addressed by digest, never workspace paths. Durable with the spec, so
     /// a re-attach decodes the byte-identical set; every id is re-validated
-    /// ([`validate_attachment_ids`]) before any spawn. Old rows decode with
-    /// an empty list (field-level serde default). Provider delivery is not
-    /// wired yet, so image ids are refused loudly at admission.
+    /// ([`validate_attachment_ids`]) before any spawn, the child inherits
+    /// the verified rows when its drive is registered, and image delivery
+    /// is gated on the chosen model's `vision` capability. Old rows decode
+    /// with an empty list (field-level serde default).
     #[serde(default)]
     pub attachments: Vec<AttachmentId>,
+
     /// Task-level typed policy.
     pub task_caps: CapabilitySet,
     /// Child-level typed policy.
@@ -2728,7 +2736,44 @@ impl OrchestratorRuntime {
                 exec.owner.worktree_id,
                 ownership_paths,
             ),
-            ChildOwnership::IsolatedWorktree => {
+            // ExclusivePaths means exclusive write authority INSIDE an
+            // isolated overlay — never direct owner access. Both mutating
+            // ownership modes spawn a daemon-owned candidate workspace
+            // seeded from the common immutable run base (the SAME mechanism
+            // as IsolatedWorktree); ExclusivePaths only narrows what the
+            // child's write tools may touch inside that overlay (the
+            // declared path set is a tool-boundary allowlist, re-checked at
+            // staging), and its changes always enter the normal change-set
+            // pipeline (stage -> compose -> verify -> transactional land).
+            ChildOwnership::IsolatedWorktree | ChildOwnership::ExclusivePaths => {
+                if mode == ChildOwnership::ExclusivePaths {
+                    if ownership_paths.is_empty() {
+                        return Err(ExecError::InvalidState(format!(
+                            "exclusive child for item {} declares no ownership paths",
+                            item.id
+                        )));
+                    }
+                    // Audit 21 (retained as defense in depth): declared path
+                    // sets of live path mutators must stay disjoint. The
+                    // compile already refused overlaps; a tampered durable
+                    // row that slips through here is refused loudly.
+                    let mine = SchOwnershipSet::new(ownership_paths.clone())
+                        .canonicalized(&exec.owner.root);
+                    for other in exec.children.values() {
+                        if other.ownership != ChildOwnership::ExclusivePaths || other.is_terminal()
+                        {
+                            continue;
+                        }
+                        let theirs = SchOwnershipSet::new(other.ownership_paths.clone())
+                            .canonicalized(&exec.owner.root);
+                        if mine.overlaps(&theirs) {
+                            return Err(ExecError::OverlappingExclusiveOwnership(format!(
+                                "child {child_id} (item {}) writes overlap live child {} (item {})",
+                                item.id, other.child_id, other.item_id
+                            )));
+                        }
+                    }
+                }
                 let dir = exec
                     .config
                     .isolated_root
@@ -2736,7 +2781,7 @@ impl OrchestratorRuntime {
                     .join(&child_id);
                 std::fs::create_dir_all(&dir)
                     .map_err(|e| ExecError::Internal(format!("isolated child dir {dir:?}: {e}")))?;
-                // Point 2: every isolated child derives from the SAME
+                // Point 2: every overlay child derives from the SAME
                 // immutable run-base generation — its worktree is seeded
                 // with the run base (never the live owner). Bounded copy;
                 // an un-copyable or oversized tree fails the spawn loudly.
@@ -2763,38 +2808,15 @@ impl OrchestratorRuntime {
                     .map_err(|e| ExecError::Internal(format!("child worktree row: {e}")))?;
                 (ws.raw(), wt_raw as u64, ownership_paths)
             }
-            ChildOwnership::ExclusivePaths => {
-                if ownership_paths.is_empty() {
-                    return Err(ExecError::InvalidState(format!(
-                        "exclusive child for item {} declares no ownership paths",
-                        item.id
-                    )));
-                }
-                // Audit 21: a mutating child sharing the parent worktree is
-                // only acceptable with a PROVABLY DISJOINT normalized
-                // ownership set versus every other live mutating child.
-                let mine =
-                    SchOwnershipSet::new(ownership_paths.clone()).canonicalized(&exec.owner.root);
-                for other in exec.children.values() {
-                    if other.ownership != ChildOwnership::ExclusivePaths || other.is_terminal() {
-                        continue;
-                    }
-                    let theirs = SchOwnershipSet::new(other.ownership_paths.clone())
-                        .canonicalized(&exec.owner.root);
-                    if mine.overlaps(&theirs) {
-                        return Err(ExecError::OverlappingExclusiveOwnership(format!(
-                            "child {child_id} (item {}) writes overlap live child {} (item {})",
-                            item.id, other.child_id, other.item_id
-                        )));
-                    }
-                }
-                (
-                    exec.owner.workspace_id,
-                    exec.owner.worktree_id,
-                    ownership_paths,
-                )
-            }
         };
+        // The declared exclusive path set of a `Paths`-owned child: bound as
+        // the child session's durable change budget below (the tool-boundary
+        // write allowlist) and re-checked against the staged change set
+        // before anything composes into a candidate.
+        let declared_paths: Option<Vec<String>> = assignment
+            .ownership
+            .exclusive_paths()
+            .map(<[String]>::to_vec);
         // Effective capability set at spawn: parent ∩ task ∩ child. A child
         // can never exceed its parent, even when its policy claims more.
         let permissions = effective(&exec.config.parent_caps, &spec.task_caps, &spec.child_caps);
@@ -2865,7 +2887,10 @@ impl OrchestratorRuntime {
         // snapshot never silently truncates. Point 2: when the run carries
         // an immutable run base, the anchor map is the RUN BASE (never the
         // live owner) and the row records the generation it derived from.
-        if row.ownership == ChildOwnership::IsolatedWorktree {
+        if matches!(
+            row.ownership,
+            ChildOwnership::IsolatedWorktree | ChildOwnership::ExclusivePaths
+        ) {
             row.run_base_snapshot = exec.run_base_snapshot.clone();
             let anchor = exec
                 .run_base_root
@@ -2885,7 +2910,9 @@ impl OrchestratorRuntime {
         // leaving an orphan session — the binding is never silently
         // truncated or skipped.
         let env_root = match row.ownership {
-            ChildOwnership::IsolatedWorktree => self.child_worktree_dir(&row)?,
+            ChildOwnership::IsolatedWorktree | ChildOwnership::ExclusivePaths => {
+                self.child_worktree_dir(&row)?
+            }
             _ => exec.owner.root.clone(),
         };
         let env_id =
@@ -2905,6 +2932,23 @@ impl OrchestratorRuntime {
             )
             .map_err(|e| ExecError::Internal(format!("create_child_session: {e}")))?;
         row.session_id = session.id().raw();
+        // (audits 7/8/21/22 isolation) A `Paths`-owned child's declared path
+        // set is its write ALLOWLIST at the tool boundary: the durable
+        // change budget the agent's edit gate already enforces for DiskWrite
+        // tools. A write outside the declared paths is journaled
+        // PermissionDenied and never executes; staging re-checks the same
+        // boundary before any candidate composition. Bound BEFORE the child
+        // session is ever driven (no window in which an ungated tool batch
+        // could run).
+        if let Some(paths) = &declared_paths {
+            let budget = faktor_core::state::ChangeBudget {
+                allowed_paths: paths.clone(),
+                ..Default::default()
+            };
+            session.set_change_budget(Some(&budget)).map_err(|e| {
+                ExecError::Internal(format!("child change-budget binding failed: {e}"))
+            })?;
+        }
         // The registry row is the durable anchor of the child session: a
         // failed write is loud (never a silently unregistered child).
         self.persist_row(exec, &row)
@@ -2955,6 +2999,18 @@ impl OrchestratorRuntime {
                 .map(|spec| spec.files.clone())
                 .unwrap_or_default()
         };
+        // The run's durable BINARY attachment set rides the same durable
+        // spec; the child session inherits the verified rows when its drive
+        // op is registered (seed_task_attachments), so request construction
+        // can resolve the byte-identical bytes.
+        let attachments = {
+            let guard = self.exec.lock().expect("exec lock");
+            guard
+                .get(run_id)
+                .and_then(|exec| exec.specs.get(&child.item_id))
+                .map(|spec| spec.attachments.clone())
+                .unwrap_or_default()
+        };
         let outcomes = {
             let guard = self.exec.lock().expect("exec lock");
             guard
@@ -2984,6 +3040,7 @@ impl OrchestratorRuntime {
             let agent = agent.clone();
             let prompt = prompt.clone();
             let files = files.clone();
+            let attachments = attachments.clone();
             let model_override = model_override.clone();
             let run_id = run_id_owned.clone();
             let child_id = child_id.clone();
@@ -2994,6 +3051,7 @@ impl OrchestratorRuntime {
                 session_id,
                 prompt,
                 files,
+                attachments,
                 model_override,
                 max_tokens,
                 parent_session,
@@ -3265,13 +3323,12 @@ pub fn validate_attachment_files(files: &[String]) -> Result<(), ExecError> {
 
 /// The ONE durable binary-attachment validation rule of a run (shared by
 /// the request boundary, the durable spec decode and the server DTO): the
-/// set is bounded by [`faktor_session::MAX_ATTACHMENTS_PER_TASK`], every id
-/// is structurally validated (hostile mime/filename/size are typed
-/// refusals), and — until provider media/content parts carry bytes — an
-/// `is_image()` id is refused LOUDLY here as well as at the wire boundary:
-/// silently admitting an image the model can never see would lie about
-/// delivery. Durable-row existence is resolved by the session layer at
-/// admission ([`faktor_session::SessionHandle::resolve_attachments`]).
+/// set is bounded by [`faktor_session::MAX_ATTACHMENTS_PER_TASK`] and every
+/// id is structurally validated (hostile mime/filename/size are typed
+/// refusals). Durable-row existence is resolved by the session layer at
+/// admission ([`faktor_session::SessionHandle::resolve_attachments`]) and
+/// image delivery is validated against the chosen model's capabilities at
+/// the server DTO; a child inherits the verified rows at spawn.
 pub fn validate_attachment_ids(
     ids: &[faktor_core::attachment::AttachmentId],
 ) -> Result<(), ExecError> {
@@ -3285,12 +3342,6 @@ pub fn validate_attachment_ids(
     for id in ids {
         id.validate()
             .map_err(|e| ExecError::Malformed(format!("binary attachment {}: {e}", id.digest)))?;
-        if id.is_image() {
-            return Err(ExecError::Malformed(format!(
-                "image attachment {} ({}) cannot be delivered: provider media/content parts are not wired (the agent cannot send bytes to a provider); remove it or use a text/binary attachment",
-                id.digest, id.mime
-            )));
-        }
     }
     Ok(())
 }
@@ -3544,6 +3595,7 @@ fn drive_op_entry(
     session_id: SessionId,
     prompt: String,
     files: Vec<String>,
+    attachments: Vec<AttachmentId>,
     model_override: Option<String>,
     max_tokens: Option<u64>,
     parent_session: SessionId,
@@ -3553,6 +3605,10 @@ fn drive_op_entry(
     outcomes: Arc<Mutex<HashMap<OpId, DriveResult>>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), faktor_core::Error>> + Send>> {
     Box::pin(async move {
+        // The child inherits the run's verified binary attachment rows BEFORE
+        // its drive begins (a missing/tampered blob refuses the spawn typedly,
+        // never a child that believes it carries an image it cannot read).
+        agent.seed_task_attachments(session_id, &attachments)?;
         let (res, turn_op_id) = drive_child_turn(
             manager.clone(),
             agent,

@@ -11,10 +11,9 @@ use faktor_protocol::v756::*;
 use faktor_protocol::v756::{
     mapper as wire_mapper, wire::AbortBody, wire::DiffStatus, wire::MessageModel,
     wire::MessageSendRequest, wire::MessageSendResponse, wire::RevertBody,
-    wire::SessionCreateRequest, wire::SessionCreateResponse, wire::SessionListResponse,
-    wire::SessionSummarizeResponse, wire::SessionSummary, wire::SessionUpdateRequest,
-    wire::SessionUpdateResponse, wire::SnapshotFileDiff, wire::WireMessageEntry,
-    wire::WireMessageInfo, wire::WirePart,
+    wire::SessionCreateRequest, wire::SessionListResponse, wire::SessionSummarizeResponse,
+    wire::SessionSummary, wire::SessionUpdateRequest, wire::SessionUpdateResponse,
+    wire::SnapshotFileDiff, wire::WireMessageEntry, wire::WireMessageInfo, wire::WirePart,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +24,142 @@ use crate::native::{
     agent_state_tag, api_err, authed, exec_error_response, not_found, parse_session_id,
     wire_refused, wire_status,
 };
+
+/// The SDK Session1/2/3/4/5/8/9 session projection. The rich SDK field set
+/// is emitted ADDITIVELY next to the legacy `sessionID`/`createdMs`/
+/// `updatedMs`/`state` aliases the frozen Faktor fixtures and integration
+/// tests already read; no legacy field is removed. `directory` is the
+/// session's durable workspace root ("." for an unconfigured client),
+/// `projectID`/`workspaceID` the durable workspace identity and `version`
+/// the daemon version. Optional rich fields (summary/cost/tokens/share/
+/// permission/revert/parentID) are omitted, never fabricated.
+pub(crate) fn wire_rich_session(
+    state: &AppState,
+    row: &faktor_store::SessionRow,
+) -> serde_json::Value {
+    let sid = row.id.to_string();
+    let directory = state
+        .deps
+        .session
+        .resolve_workspace_root(row.id)
+        .ok()
+        .flatten()
+        .map(|root| root.to_string_lossy().to_string())
+        .unwrap_or_default();
+    serde_json::json!({
+        "id": sid.clone(),
+        "slug": sid.clone(),
+        "projectID": row.workspace_id.to_string(),
+        "workspaceID": row.workspace_id.to_string(),
+        "directory": directory,
+        "title": row.title.clone(),
+        "model": {"id": row.model.clone(), "providerID": row.provider.clone()},
+        "version": state.deps.version.clone(),
+        "time": {"created": row.created_ms, "updated": row.updated_ms},
+        // Legacy aliases (frozen Faktor fixtures + integration tests).
+        "sessionID": sid,
+        "createdMs": row.created_ms,
+        "updatedMs": row.updated_ms,
+        "state": agent_state_tag(row.state),
+    })
+}
+
+/// The SDK `SessionStatus.type` for a daemon state: every mid-turn state is
+/// `busy`, every parked/terminal state is `idle`. `retry`/`offline` require
+/// retry metadata the frozen surface does not project, so they are never
+/// fabricated.
+fn sdk_session_status_kind(state: faktor_core::state::AgentState) -> &'static str {
+    use faktor_core::state::AgentState::*;
+    match state {
+        Preparing | BuildingContext | WaitingForModel | Streaming | ToolRequested
+        | WaitingForPermission | ExecutingTool | Validating | UpdatingMemory => "busy",
+        Idle | ReadyForNextTurn | Completed | Cancelled | FailedRecoverable | FailedPermanent
+        | NeedsUserInput | Suspended => "idle",
+    }
+}
+
+/// One `info` half of the frozen message page/send shapes with the rich SDK
+/// Message fields added additively: the legacy wire names stay, `id` is the
+/// durable message SEQUENCE (the same identity `messageID` carries, so it is
+/// stable across a session fork), and rows carry the SDK's `agent` plus the
+/// assistant-only `parentID`/`mode`/`path`/`cost`/`tokens` fields and the
+/// user-only `model` field.
+///
+/// `include_time` controls the SDK `time` object. It is emitted for the
+/// single-session send response; the frozen PAGE omits it because a fork
+/// re-times the copied rows while the page contract guarantees the fork's
+/// projection is structurally equal to the source's (tested). `parent_id` is
+/// the durable user-message sequence that produced the assistant row. The
+/// daemon has one agent and one mode in this slice (the frozen "default");
+/// per-message usage accounting is not projected by the frozen surface, so
+/// cost/tokens are zeros (documented in docs/wire-compat.md) — never guessed
+/// numbers.
+#[allow(clippy::too_many_arguments)]
+fn wire_rich_message_info(
+    session_id: &str,
+    seq: i64,
+    role: &str,
+    created_ms: i64,
+    provider_id: Option<&str>,
+    model_id: Option<&str>,
+    parent_id: Option<&str>,
+    directory: &str,
+    include_time: bool,
+) -> serde_json::Value {
+    let mut info = serde_json::json!({
+        "sessionID": session_id,
+        "messageID": seq.to_string(),
+        "role": role,
+        "createdMs": created_ms,
+        "providerID": provider_id,
+        "modelID": model_id,
+        "id": seq.to_string(),
+        "agent": "default",
+    });
+    if include_time {
+        info["time"] = serde_json::json!({"created": created_ms});
+    }
+    if role == "assistant" {
+        if let Some(parent) = parent_id {
+            info["parentID"] = serde_json::json!(parent);
+        }
+        info["mode"] = serde_json::json!("default");
+        info["path"] = serde_json::json!({"cwd": directory, "root": directory});
+        info["cost"] = serde_json::json!(0.0);
+        info["tokens"] = serde_json::json!({
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "cache": {"read": 0, "write": 0},
+        });
+    } else {
+        info["model"] = serde_json::json!({"providerID": provider_id, "modelID": model_id});
+    }
+    info
+}
+
+/// Add the SDK Part identity fields to one serialized wire part. `id` is
+/// `{messageID}:{index}` — stable across a session fork (the durable part
+/// row id is per-session and must not ride the fork-equal page contract).
+/// `sessionID` is only emitted where the caller opted in (the single-session
+/// send response); the frozen page omits it for the same fork-equality
+/// reason. The discriminator and kind fields are untouched.
+fn wire_rich_part(
+    part: &WirePart,
+    message_id: &str,
+    part_id: &str,
+    session_id: Option<&str>,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(part).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(map) = &mut value {
+        map.insert("id".into(), serde_json::json!(part_id));
+        map.insert("messageID".into(), serde_json::json!(message_id));
+        if let Some(sid) = session_id {
+            map.insert("sessionID".into(), serde_json::json!(sid));
+        }
+    }
+    value
+}
 
 /// `POST /session` — create a session from the wire request. The workspace
 /// comes from the `x-faktor-directory` header, else `workspaceID`.
@@ -50,12 +185,7 @@ pub(crate) async fn wire_create_session(
         .create_session(ws, &args.title, &args.provider, &args.model)
     {
         Ok(handle) => match handle.row() {
-            Ok(row) => Json(SessionCreateResponse {
-                session_id: row.id.to_string(),
-                title: row.title,
-                created_ms: row.created_ms,
-            })
-            .into_response(),
+            Ok(row) => Json(wire_rich_session(&state, &row)).into_response(),
             Err(e) => api_err(&e),
         },
         Err(e) => api_err(&e),
@@ -110,14 +240,7 @@ pub(crate) async fn wire_session_summary(
         Err(e) => return api_err(&e),
     };
     match handle.row() {
-        Ok(row) => Json(SessionSummary {
-            session_id: row.id.to_string(),
-            title: row.title,
-            state: agent_state_tag(row.state),
-            created_ms: row.created_ms,
-            updated_ms: row.updated_ms,
-        })
-        .into_response(),
+        Ok(row) => Json(wire_rich_session(&state, &row)).into_response(),
         Err(e) => api_err(&e),
     }
 }
@@ -439,11 +562,47 @@ pub(crate) async fn wire_message_send(
         }
     }
     match found {
-        Some(entry) => Json(MessageSendResponse {
-            info: entry.info,
-            parts: entry.parts,
-        })
-        .into_response(),
+        Some(entry) => {
+            let session_label = sid.to_string();
+            let seq_label = entry.info.message_id.clone();
+            let directory = state
+                .deps
+                .session
+                .resolve_workspace_root(sid)
+                .ok()
+                .flatten()
+                .map(|root| root.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let parts_json: Vec<serde_json::Value> = entry
+                .parts
+                .iter()
+                .enumerate()
+                .map(|(index, part)| {
+                    wire_rich_part(
+                        part,
+                        &seq_label,
+                        &format!("{seq_label}:{index}"),
+                        Some(&session_label),
+                    )
+                })
+                .collect();
+            let parent = user_seq.to_string();
+            Json(serde_json::json!({
+                "info": wire_rich_message_info(
+                    &session_label,
+                    seq_label.parse::<i64>().unwrap_or(0),
+                    "assistant",
+                    entry.info.created_ms,
+                    entry.info.provider_id.as_deref(),
+                    entry.info.model_id.as_deref(),
+                    Some(&parent),
+                    &directory,
+                    true,
+                ),
+                "parts": parts_json,
+            }))
+            .into_response()
+        }
         // The turn ended without any assistant content (e.g. the provider
         // failed before the first chunk): honest failure, never a fake
         // assistant message.
@@ -543,6 +702,15 @@ pub(crate) async fn wire_messages_page(
         Ok(row) => (Some(row.provider), Some(row.model)),
         Err(_) => (None, None),
     };
+    let session_label = sid.to_string();
+    let directory = state
+        .deps
+        .session
+        .resolve_workspace_root(sid)
+        .ok()
+        .flatten()
+        .map(|root| root.to_string_lossy().to_string())
+        .unwrap_or_default();
     let store = state.deps.session.store();
     // One page + 1 probe row: paging never loads more than one page.
     let limit = q.limit.clamp(1, 100);
@@ -556,12 +724,18 @@ pub(crate) async fn wire_messages_page(
     }
     let mut entries = Vec::with_capacity(rows.len());
     for row in rows {
-        let mut parts = Vec::new();
+        let seq_label = row.seq.to_string();
+        let mut parts_json = Vec::new();
         match store.parts_of(row.id) {
             Ok(part_rows) => {
-                for p in &part_rows {
+                for (index, p) in part_rows.iter().enumerate() {
                     match wire_part_from_row(&p.kind, &p.data) {
-                        Ok(w) => parts.push(w),
+                        Ok(w) => parts_json.push(wire_rich_part(
+                            &w,
+                            &seq_label,
+                            &format!("{seq_label}:{index}"),
+                            None,
+                        )),
                         // A corrupt part row fails the page loudly (the
                         // legacy route has the same rule): never silently
                         // drop content.
@@ -574,26 +748,46 @@ pub(crate) async fn wire_messages_page(
         // Prompt messages themselves appear WITH their parts: user rows are
         // stored as {text, files} message data with no part rows, so the
         // text is projected as the wire text part here.
-        if parts.is_empty() && row.role == "user" {
+        if parts_json.is_empty() && row.role == "user" {
             if let Some(text) = row.data.get("text").and_then(|v| v.as_str()) {
                 if !text.is_empty() {
-                    parts.push(WirePart::Text {
-                        text: text.to_string(),
-                    });
+                    parts_json.push(wire_rich_part(
+                        &WirePart::Text {
+                            text: text.to_string(),
+                        },
+                        &seq_label,
+                        &format!("{seq_label}:0"),
+                        None,
+                    ));
                 }
             }
         }
-        entries.push(WireMessageEntry {
-            info: WireMessageInfo {
-                session_id: row.session_id.to_string(),
-                message_id: row.seq.to_string(),
-                role: row.role.clone(),
-                created_ms: row.created_ms,
-                provider_id: provider_id.clone(),
-                model_id: model_id.clone(),
-            },
-            parts,
-        });
+        // Assistant rows carry the durable user-message PARENT (the prompt
+        // that produced them) when the store can resolve it.
+        let parent_id = if row.role == "assistant" {
+            store
+                .messages_before(sid, Some(row.seq), 1)
+                .ok()
+                .and_then(|before| before.into_iter().next())
+                .filter(|m| m.role == "user")
+                .map(|m| m.seq.to_string())
+        } else {
+            None
+        };
+        entries.push(serde_json::json!({
+            "info": wire_rich_message_info(
+                &session_label,
+                row.seq,
+                &row.role,
+                row.created_ms,
+                provider_id.as_deref(),
+                model_id.as_deref(),
+                parent_id.as_deref(),
+                &directory,
+                false,
+            ),
+            "parts": parts_json,
+        }));
     }
     let mut resp = Json(entries).into_response();
     // Paging signal lives in a header (the frozen entry DTO is strict).
@@ -1058,17 +1252,38 @@ pub(crate) async fn wire_unrevert(
 // when the runtime cannot honor them (mid-turn, tool-result dependencies, or
 // durable-row removal the store does not expose in this workspace slice).
 
-/// `GET /session/status?session_id=` — the SDK-style state projection (the
-/// alias of `GET /session/state?session_id=` the frozen client also calls).
+/// `GET /session/status` — with `?session_id=` this is the SDK-style state
+/// projection (the alias of `GET /session/state?session_id=` the frozen
+/// client also calls). WITHOUT the query it answers the SDK's declared
+/// contract (`{ [sessionID]: SessionStatus }`, the whole status MAP over
+/// every durable session) instead of failing extraction.
 pub(crate) async fn wire_session_status_query(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<SdkStateQuery>,
+    Query(q): Query<SdkSessionQuery>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let sid = match parse_session_id(&q.session_id) {
+    let Some(raw) = q.session_id else {
+        let mut statuses = serde_json::Map::new();
+        match state.deps.session.list_sessions(None) {
+            Ok(handles) => {
+                for handle in handles {
+                    // A row that vanished mid-list is skipped, never fatal.
+                    if let Ok(row) = handle.row() {
+                        statuses.insert(
+                            row.id.to_string(),
+                            serde_json::json!({"type": sdk_session_status_kind(row.state)}),
+                        );
+                    }
+                }
+            }
+            Err(e) => return api_err(&e),
+        }
+        return Json(serde_json::Value::Object(statuses)).into_response();
+    };
+    let sid = match parse_session_id(&raw) {
         Ok(s) => s,
         Err(e) => return wire_status(e),
     };
@@ -1110,12 +1325,7 @@ pub(crate) async fn wire_session_fork(
     let title = format!("{} (fork)", row.title);
     match state.deps.session.fork_session(sid, &title) {
         Ok(fork) => match fork.row() {
-            Ok(fork_row) => Json(SessionCreateResponse {
-                session_id: fork_row.id.to_string(),
-                title: fork_row.title,
-                created_ms: fork_row.created_ms,
-            })
-            .into_response(),
+            Ok(fork_row) => Json(wire_rich_session(&state, &fork_row)).into_response(),
             Err(e) => api_err(&e),
         },
         Err(e) => api_err(&e),

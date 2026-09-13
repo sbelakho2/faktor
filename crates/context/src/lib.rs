@@ -512,16 +512,31 @@ mod token_cache_tests {
 
     #[test]
     fn unregistered_families_and_versions_fall_back_to_conservative_upper_bound() {
-        // Registered exact backends: only o200k@v1 and cl100k@v1. Every
-        // other named family (Anthropic/Gemini/Llama) and every unknown
-        // version falls back to the estimator, labeled UpperBound. The
-        // labels are part of the contract, so assert the exact kind too.
+        // Registered exact backends: only o200k@v1 and cl100k@v1. Families
+        // with NO local vocabulary (Anthropic/Gemini/Llama/GenericEstimator)
+        // and unknown GENERIC versions fall back to the estimator, labeled
+        // UpperBound. OpenAI version BUMPS (`o200k_base@v2`, unknown
+        // cl100k versions) are the hardening exception: the cache's
+        // infallible path still returns an explicitly labeled UpperBound
+        // (never v1's exact count), while the registry's selection path
+        // refuses them with a typed error.
         let cache = TokenCache::new();
         for id in [
             TokenizerId::ANTHROPIC,
             TokenizerId::GEMINI,
             TokenizerId::LLAMA,
             TokenizerId::GENERIC_ESTIMATOR,
+            TokenizerId {
+                family: TokenFamily::GenericEstimator,
+                version: 0,
+            },
+        ] {
+            let got = cache.count_tokenizer(id, "anything");
+            assert_eq!(got.kind, TokenEstimateKind::UpperBound, "{id}");
+            assert_eq!(got.count, est("anything"), "{id}");
+        }
+        let registry = TokenizerRegistry::with_builtin_backends();
+        for id in [
             TokenizerId {
                 family: TokenFamily::O200kBase,
                 version: 2,
@@ -530,11 +545,11 @@ mod token_cache_tests {
                 family: TokenFamily::Cl100kBase,
                 version: 0xDEAD_BEEF,
             },
-            TokenizerId {
-                family: TokenFamily::GenericEstimator,
-                version: 0,
-            },
         ] {
+            assert!(
+                registry.select(id).is_err(),
+                "{id} must be typed-refused at selection"
+            );
             let got = cache.count_tokenizer(id, "anything");
             assert_eq!(got.kind, TokenEstimateKind::UpperBound, "{id}");
             assert_eq!(got.count, est("anything"), "{id}");

@@ -32,6 +32,11 @@ use faktor_provider::{
     ProviderErrorKind, ProviderStream, Role,
 };
 
+/// Documented Gemini inline-data ceiling for one image part (raw bytes;
+/// base64 inflation stays inside the 20 MB request budget). Kept equal to
+/// OpenAI's documented per-image bound.
+pub const GOOGLE_MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct GoogleConfig {
     pub base_url: String,
@@ -97,6 +102,17 @@ impl GoogleProvider {
                     }
                     ContentKind::Image { url } => {
                         parts.push(serde_json::json!({ "inline_data": { "mime_type": "image/png", "data": url } }));
+                    }
+                    ContentKind::ImageData { mime, data } => {
+                        // Resolved attachment bytes: Gemini inline_data is
+                        // raw base64 + the ACTUAL media type (never the old
+                        // hardcoded image/png).
+                        parts.push(serde_json::json!({
+                            "inline_data": {
+                                "mime_type": mime,
+                                "data": data.to_base64(),
+                            }
+                        }));
                     }
                     ContentKind::ToolCall { id, name, input } => {
                         parts.push(serde_json::json!({
@@ -177,7 +193,19 @@ impl Provider for GoogleProvider {
         }
     }
 
+    fn max_image_bytes(&self) -> usize {
+        GOOGLE_MAX_IMAGE_BYTES
+    }
+
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
+        // Delivery gate BEFORE any wire decision: vision capability, image
+        // mime allowlist and the provider's per-image byte bound.
+        let caps = self.capabilities(&req.model);
+        if let Err(e) =
+            faktor_provider::validate_media_delivery(&req, &caps, self.max_image_bytes())
+        {
+            return faktor_provider::provider_error_stream(e);
+        }
         let body = self.wire_body(&req);
         let key = self.config.api_key.clone().unwrap_or_default();
         let url = format!(
@@ -469,6 +497,113 @@ mod tests {
         // with the query stripped; the adapter URL contains it).
         let (_, path, _) = server.last_request().unwrap();
         assert_eq!(path, "/v1beta/models/gemini-x:streamGenerateContent");
+    }
+
+    /// Resolved images lower BYTE-EXACTLY to Gemini `inline_data` with the
+    /// ACTUAL media type and standard base64 (never the old hardcoded
+    /// image/png + URL shape).
+    #[tokio::test]
+    async fn image_data_lowers_to_byte_exact_inline_data() {
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 3, 4];
+        let expected_b64 = faktor_provider::MediaBytes::new(png.clone())
+            .unwrap()
+            .to_base64();
+        let server = MockServer::new();
+        let expected = expected_b64.clone();
+        server.route(
+            "POST",
+            "/v1beta/models/gemini-x:streamGenerateContent",
+            MockAction::AssertThenRespond {
+                status: 200,
+                body: "data: {}\n\n".into(),
+                assert: Arc::new(move |body: &serde_json::Value| {
+                    assert_eq!(
+                        body["contents"][1]["parts"],
+                        serde_json::json!([
+                            { "text": "look" },
+                            {
+                                "inline_data": {
+                                    "mime_type": "image/png",
+                                    "data": expected
+                                }
+                            }
+                        ]),
+                        "Gemini image lowering must be byte-exact"
+                    );
+                }),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = GoogleProvider::build(GoogleConfig::new(Some("k".into())).with_base(&base));
+        assert_eq!(provider.max_image_bytes(), GOOGLE_MAX_IMAGE_BYTES);
+        let mut r = req("gemini-x");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::text("look"),
+                ContentPart::image_data("image/png", png).unwrap(),
+            ],
+        });
+        let mut stream = provider.stream(r);
+        while let Some(chunk) = stream.next().await {
+            if matches!(chunk, Ok(ProviderChunk::Done)) {
+                break;
+            }
+        }
+        assert_eq!(server.request_count(), 1);
+    }
+
+    /// Vision-less media for a model whose capabilities say no is refused
+    /// typedly BEFORE any wire byte.
+    #[tokio::test]
+    async fn image_delivery_gate_refuses_visionless_pre_wire() {
+        let server = MockServer::new();
+        let base = server.base_url().await;
+        let provider = GoogleProvider::build(
+            GoogleConfig::new(Some("k".into()))
+                .with_base(&base)
+                .with_model(
+                    "gemini-x",
+                    ModelCapabilities {
+                        vision: false,
+                        ..Default::default()
+                    },
+                ),
+        );
+        let mut r = req("gemini-x");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::image_data("image/png", vec![0x89, b'P', b'N', b'G']).unwrap(),
+            ],
+        });
+        let err = provider.stream(r).next().await.unwrap().unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
+        assert!(err.message.contains("vision"), "{err}");
+        assert_eq!(server.request_count(), 0, "no wire byte on a gate refusal");
+
+        // Over the provider's per-image bound: typed, pre-wire.
+        let provider = GoogleProvider::build(GoogleConfig::new(Some("k".into())).with_base(&base));
+        let mut r = req("gemini-x");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![ContentPart {
+                kind: ContentKind::ImageData {
+                    mime: "image/png".into(),
+                    data: faktor_provider::MediaBytes::new(vec![0u8; GOOGLE_MAX_IMAGE_BYTES + 1])
+                        .unwrap(),
+                },
+                tool_call_id: None,
+            }],
+        });
+        let err = provider.stream(r).next().await.unwrap().unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
+        assert!(err.message.contains("exceeds"), "{err}");
+        assert_eq!(
+            server.request_count(),
+            0,
+            "no wire byte on an oversize refusal"
+        );
     }
 
     #[test]

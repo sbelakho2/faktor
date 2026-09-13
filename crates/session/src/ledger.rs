@@ -783,13 +783,41 @@ pub struct IntegrationRecordRow {
     pub run_id: String,
     /// The root task row the integration serves.
     pub task_id: u64,
-    /// The base revision the integration started from (the first staged
-    /// change set's durable base id), when one exists.
-    #[serde(default)]
+    /// DEPRECATED (hardening): the old overloaded "base revision", derived
+    /// from `sources.first()`, mixed a change-set id with a revision. It is
+    /// never populated by the orchestrator anymore; the explicit snapshot
+    /// fields below carry the real run base / candidate / landed identity.
+    /// Decode stays lenient because pre-hardening rows and the (out-of-scope)
+    /// native server rows may still carry it; readers must prefer the
+    /// explicit fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_revision: Option<String>,
-    /// The base root snapshot digest before any child apply, when one exists.
-    #[serde(default)]
+    /// DEPRECATED alias of [`Self::run_base_snapshot`]: the base root digest
+    /// before any child apply. New rows populate both identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_snapshot: Option<String>,
+    /// The IMMUTABLE run base snapshot digest (the generation every staged
+    /// change set derived from). Explicit field; never derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_base_snapshot: Option<String>,
+    /// The COMPOSED candidate snapshot digest that verification bound and
+    /// landing reproduced exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_snapshot: Option<String>,
+    /// The FRESH whole-root digest taken after the landing equals
+    /// [`Self::final_snapshot_hash`]. Explicit field; never derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed_snapshot: Option<String>,
+    /// Digest of the proof basis the verification record was created under
+    /// (the same digest the record's environment fingerprint carries), so
+    /// the integration record names the exact reuse basis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_basis_digest: Option<String>,
+    /// Deterministic identity of the landing transaction that produced the
+    /// landed snapshot ([`IntegrationTxnRow::txn_id`]); `None` when no
+    /// landing transaction ran (blocked / pre-landing rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_txn_id: Option<String>,
     pub final_root: String,
     /// Lowercase 64-hex BLAKE3 digest of the final integration root; EMPTY
     /// while the record is in-flight (record-first, before any apply).
@@ -954,6 +982,33 @@ pub struct IntegrationTxnRow {
     pub applied_count: u64,
     pub conflicts: Vec<String>,
     pub at_ms: i64,
+}
+
+impl IntegrationTxnRow {
+    /// The deterministic CONTENT identity of this landing transaction: a
+    /// `blake3:`-prefixed digest over the immutable transaction legs (run,
+    /// task, owner/candidate roots, run base, verified candidate snapshot,
+    /// sources digest). It is stable across process restarts and recovery
+    /// replays — the mutable phase/path/at_ms fields are deliberately
+    /// excluded — so an integration record can name exactly which landing
+    /// transaction produced its landed snapshot.
+    pub fn txn_id(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"faktor-integration-txn:v1\0");
+        for part in [
+            self.run_id.as_bytes(),
+            &self.task_id.to_le_bytes(),
+            self.owner_root.as_bytes(),
+            self.candidate_root.as_bytes(),
+            self.run_base_snapshot.as_bytes(),
+            self.verified_candidate_snapshot.as_bytes(),
+            self.sources_digest.as_bytes(),
+        ] {
+            hasher.update(&(part.len() as u64).to_le_bytes());
+            hasher.update(part);
+        }
+        format!("blake3:{}", hasher.finalize().to_hex())
+    }
 }
 
 /// Report of one watermark compaction.
@@ -1775,6 +1830,46 @@ pub(crate) fn validate_integration_record(
     }
     if let Some(base) = &record.base_snapshot {
         check_hex(base, "base_snapshot")?;
+    }
+    // Explicit identity fields (hardening): each carries its own bound and
+    // shape; the deprecated alias must AGREE with the explicit field when
+    // both are present, so a tampered row can never name two base roots.
+    if let Some(base) = &record.run_base_snapshot {
+        check_hex(base, "run_base_snapshot")?;
+        if record
+            .base_snapshot
+            .as_deref()
+            .is_some_and(|alias| alias != base)
+        {
+            return Err(SessionError::Malformed(
+                "ledger integration_record base_snapshot and run_base_snapshot disagree".into(),
+            ));
+        }
+    }
+    if let Some(candidate) = &record.candidate_snapshot {
+        check_hex(candidate, "candidate_snapshot")?;
+    }
+    if let Some(landed) = &record.landed_snapshot {
+        check_hex(landed, "landed_snapshot")?;
+        if !record.final_snapshot_hash.is_empty() && record.final_snapshot_hash != *landed {
+            return Err(SessionError::Malformed(
+                "ledger integration_record landed_snapshot and final_snapshot_hash disagree".into(),
+            ));
+        }
+    }
+    if let Some(digest) = &record.proof_basis_digest {
+        if digest.is_empty() || digest.len() > MAX_INTEGRATION_ID_BYTES {
+            return Err(SessionError::Malformed(format!(
+                "ledger integration_record proof_basis_digest must be 1..={MAX_INTEGRATION_ID_BYTES} bytes"
+            )));
+        }
+    }
+    if let Some(txn) = &record.integration_txn_id {
+        if txn.is_empty() || txn.len() > MAX_INTEGRATION_ID_BYTES {
+            return Err(SessionError::Malformed(format!(
+                "ledger integration_record integration_txn_id must be 1..={MAX_INTEGRATION_ID_BYTES} bytes"
+            )));
+        }
     }
     if record.final_root.is_empty() || record.final_root.len() > MAX_INTEGRATION_ROOT_BYTES {
         return Err(SessionError::Malformed(format!(
@@ -5113,5 +5208,156 @@ mod tests {
         );
         let err = s.ledger_completion_step_statuses(1, 1).unwrap_err();
         assert_eq!(err.kind, faktor_core::ErrorKind::Oversized, "{err}");
+    }
+
+    /// Hardening: the explicit integration-identity fields
+    /// (`run_base_snapshot`/`candidate_snapshot`/`landed_snapshot`/
+    /// `proof_basis_digest`/`integration_txn_id`) round-trip a real reopen
+    /// byte-identically, and the txn id is the same before and after.
+    #[test]
+    fn integration_explicit_identity_fields_survive_reopen() {
+        use faktor_core::id::SessionId as Sid;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let cas = dir.path().join("cas");
+        let m = crate::SessionManager::open(store.clone(), cas.clone(), true).unwrap();
+        let s = session(&m);
+        let sid: Sid = s.id;
+        let hex = |c: char| c.to_string().repeat(64);
+        let txn = IntegrationTxnRow {
+            run_id: "run-identity".into(),
+            task_id: 9,
+            owner_root: "/owner".into(),
+            candidate_root: "/candidate".into(),
+            run_base_snapshot: hex('1'),
+            verified_candidate_snapshot: hex('2'),
+            sources_digest: hex('3'),
+            phase: IntegrationTxnPhase::Landed,
+            paths: Vec::new(),
+            path_count: 0,
+            applied_count: 0,
+            conflicts: Vec::new(),
+            at_ms: 5,
+        };
+        let txn_id = txn.txn_id();
+        assert!(txn_id.starts_with("blake3:"));
+        assert_eq!(txn_id, txn.txn_id(), "content identity is stable");
+        s.ledger_integration_txn_set(&txn).unwrap();
+        let record = IntegrationRecordRow {
+            run_id: "run-identity".into(),
+            task_id: 9,
+            base_revision: None,
+            base_snapshot: Some(hex('1')),
+            run_base_snapshot: Some(hex('1')),
+            candidate_snapshot: Some(hex('2')),
+            landed_snapshot: Some(hex('4')),
+            proof_basis_digest: Some(format!("blake3:{}", hex('5'))),
+            integration_txn_id: Some(txn_id.clone()),
+            final_root: "/owner".into(),
+            final_snapshot_hash: hex('4'),
+            integrated_files: vec!["src/lib.rs".into()],
+            integrated_file_count: 1,
+            integrated_files_digest: hex('6'),
+            conflicts: Vec::new(),
+            conflict_count: 0,
+            sources: Vec::new(),
+            source_count: 0,
+            sources_digest: String::new(),
+            at_ms: 6,
+        };
+        s.ledger_integration_record_set(&record).unwrap();
+        assert_eq!(
+            s.ledger_integration_record_for_task(9).unwrap().unwrap(),
+            record
+        );
+        drop(s);
+        drop(m);
+        let m2 = crate::SessionManager::open(store, cas, true).unwrap();
+        let s2 = m2.get_session(sid).unwrap().unwrap();
+        assert_eq!(
+            s2.ledger_integration_record_for_task(9).unwrap().unwrap(),
+            record,
+            "explicit identity fields must survive a real reopen"
+        );
+        let txn2 = s2.ledger_integration_txn_for_run("run-identity").unwrap();
+        assert_eq!(txn2.unwrap().txn_id(), txn_id, "txn id survives reopen");
+    }
+
+    /// Hardening: a tampered raw row that disagrees between the deprecated
+    /// alias and the explicit field (or binds a hostile digest) is a typed
+    /// read error — never a silently accepted identity.
+    #[test]
+    fn hostile_integration_identity_rows_fail_loudly() {
+        let (_d, m) = test_manager();
+        let raw = |s: &SessionHandle, record: serde_json::Value| {
+            m.store()
+                .append_ledger_entry(
+                    s.id(),
+                    ENTRY_INTEGRATION_RECORD,
+                    LEDGER_ENTRY_SCHEMA_V,
+                    serde_json::json!({ "kind": "integration_recorded", "record": record }),
+                )
+                .unwrap();
+        };
+        let base = |record: serde_json::Value| {
+            let mut v = serde_json::json!({
+                "run_id": "run-hostile",
+                "task_id": 1,
+                "final_root": "/owner",
+                "final_snapshot_hash": "44".repeat(32),
+                "integrated_files": [],
+                "integrated_file_count": 0,
+                "integrated_files_digest": "",
+                "conflicts": [],
+                "conflict_count": 0,
+                "sources": [],
+                "source_count": 0,
+                "sources_digest": "",
+                "at_ms": 1,
+            });
+            for (k, val) in record.as_object().unwrap() {
+                v[k.as_str()] = val.clone();
+            }
+            v
+        };
+        // Deprecated alias and explicit run-base field disagree.
+        let s = session(&m);
+        raw(
+            &s,
+            base(serde_json::json!({
+                "base_snapshot": "11".repeat(32),
+                "run_base_snapshot": "22".repeat(32),
+            })),
+        );
+        let err = s.ledger_integration_record_for_task(1).unwrap_err();
+        assert!(err.to_string().contains("disagree"), "{err}");
+        // Landed snapshot and final hash disagree.
+        let s = session(&m);
+        raw(
+            &s,
+            base(serde_json::json!({
+                "run_base_snapshot": "11".repeat(32),
+                "landed_snapshot": "22".repeat(32),
+            })),
+        );
+        let err = s.ledger_integration_record_for_task(1).unwrap_err();
+        assert!(err.to_string().contains("disagree"), "{err}");
+        // Hostile non-hex explicit digest.
+        let s = session(&m);
+        raw(
+            &s,
+            base(serde_json::json!({ "candidate_snapshot": "not-hex" })),
+        );
+        assert!(s.ledger_integration_record_for_task(1).is_err());
+        // Legacy row WITHOUT the new fields decodes additively (never a
+        // missing-field failure).
+        let s = session(&m);
+        raw(&s, base(serde_json::json!({})));
+        let legacy = s.ledger_integration_record_for_task(1).unwrap().unwrap();
+        assert!(legacy.run_base_snapshot.is_none());
+        assert!(legacy.candidate_snapshot.is_none());
+        assert!(legacy.landed_snapshot.is_none());
+        assert!(legacy.proof_basis_digest.is_none());
+        assert!(legacy.integration_txn_id.is_none());
     }
 }

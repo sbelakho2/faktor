@@ -15,21 +15,13 @@
 //!
 //! The attachment is deliberately SEPARATE from the workspace-relative
 //! `files` vocabulary: an attachment is bytes addressed by digest, never a
-//! path. Provider delivery of attachment bytes is NOT wired: the provider
-//! layer has only a URL-shaped `ContentKind::Image { url }` part whose
-//! adapter encodings are inconsistent (OpenAI accepts a data URL, Anthropic
-//! emits a `type:"url"` source the API rejects, Google hardcodes
-//! `image/png` and expects raw base64), and the agent has no path from a
-//! durable attachment row to a request part. The honest contract is
-//! therefore a LOUD typed refusal of `is_image()` submission at the wire
-//! boundary (`POST .../attachments` and task admission return code
-//! `unsupported`), with the composer draft/images restored by the client.
-//! The media-part follow-up is: (1) add a binary `ContentKind` that carries
-//! `{mime, bytes}` (not a URL), (2) teach every adapter to encode it for its
-//! own wire (base64 source for Anthropic/Google, data URL for
-//! OpenAI/Ollama), (3) gate it on `ModelCapabilities::vision`, and (4) turn
-//! the refusal into delivery once (1)-(3) exist. Until then no code path
-//! may claim images reached a provider.
+//! path. Model delivery resolves bytes HERE at request construction
+//! ([`SessionHandle::resolve_attachment_bytes`]) into
+//! `faktor_provider::ContentKind::ImageData` parts; the durable task JSON
+//! stores only the `AttachmentId`, and the provider adapters own their own
+//! wire encodings (base64 source for Anthropic/Google, data URL for
+//! OpenAI, raw base64 for Ollama). Admission validates the media mime/size
+//! against the chosen model's capabilities before any run/task row exists.
 
 use faktor_core::attachment::{
     validate_filename, validate_mime, AttachmentId, MAX_ATTACHMENTS_PER_TASK, MAX_ATTACHMENT_BYTES,
@@ -39,6 +31,17 @@ use faktor_core::hash::FileHash;
 
 use crate::handle::SessionHandle;
 use crate::SessionError;
+
+/// One durable attachment resolved to its verified bytes: the metadata row
+/// plus the CAS bytes it addresses. Returned ONLY by
+/// [`SessionHandle::resolve_attachment_bytes`] — the request-construction
+/// read path — so the agent never handles bytes detached from their
+/// identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAttachment {
+    pub id: AttachmentId,
+    pub bytes: Vec<u8>,
+}
 
 impl SessionHandle {
     /// Store a bounded attachment: validate bounds/shape, put the bytes into
@@ -82,6 +85,37 @@ impl SessionHandle {
                 computed.size
             ))
             .into());
+        }
+        Ok(stored)
+    }
+
+    /// Copy one already-admitted attachment into THIS session (the
+    /// orchestrated-child inheritance path): the id is structurally
+    /// validated, the CAS blob at its digest is verified to EXIST and hash
+    /// correctly (`Cas::verify_now`, streamed — no bytes materialize), and
+    /// the typed metadata row is written idempotently for this session. The
+    /// child's request construction then re-verifies the blob like any
+    /// other attachment. A missing/tampered blob is a typed refusal, never
+    /// an inherited phantom row.
+    pub fn inherit_attachment(&self, id: &AttachmentId) -> faktor_core::Result<AttachmentId> {
+        id.validate()?;
+        self.manager
+            .cas()
+            .verify_now(&id.digest.to_hex())
+            .map_err(SessionError::from)?;
+        let stored = self
+            .manager
+            .store()
+            .put_attachment(self.id, id)
+            .map_err(crate::map_store_err)?;
+        if stored != *id {
+            return Err(Error::new(
+                ErrorKind::Malformed,
+                format!(
+                    "inherited attachment {} conflicts with an existing row of session {}",
+                    id.digest, self.id
+                ),
+            ));
         }
         Ok(stored)
     }
@@ -142,10 +176,9 @@ impl SessionHandle {
     /// Admission never fabricates an attachment: an unknown digest is a
     /// typed `NotFound`, a mismatched durable row a typed `Malformed`.
     ///
-    /// Media policy lives ABOVE this layer: provider media/content parts are
-    /// not wired, so the server refuses `is_image()` ids loudly before this
-    /// call (see `crates/server/src/native/attachment.rs` for the precise
-    /// follow-up contract).
+    /// Media policy lives ABOVE this layer: provider admission validates the
+    /// image mime/size against the chosen model's capabilities, and request
+    /// construction resolves the bytes.
     pub fn resolve_attachments(&self, ids: &[AttachmentId]) -> faktor_core::Result<()> {
         if ids.len() > MAX_ATTACHMENTS_PER_TASK {
             return Err(Error::new(
@@ -181,6 +214,52 @@ impl SessionHandle {
             }
         }
         Ok(())
+    }
+
+    /// Resolve a bounded attachment SET to verified bytes (the
+    /// REQUEST-CONSTRUCTION read path). Order is the input order. Every id
+    /// is re-validated and must resolve byte-identically
+    /// ([`Self::resolve_attachments`]); each blob must fit `max_bytes_each`
+    /// and the running total must fit `max_total_bytes` — both checked from
+    /// the DURABLE size before any read, then re-verified against the
+    /// decoded blob (`attachment_bytes`). A missing or tampered CAS blob is
+    /// a typed error: no caller ever receives bytes that do not hash to
+    /// their attachment digest.
+    pub fn resolve_attachment_bytes(
+        &self,
+        ids: &[AttachmentId],
+        max_bytes_each: usize,
+        max_total_bytes: usize,
+    ) -> faktor_core::Result<Vec<ResolvedAttachment>> {
+        self.resolve_attachments(ids)?;
+        let mut total: u64 = 0;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if id.size > max_bytes_each as u64 {
+                return Err(Error::new(
+                    ErrorKind::Oversized,
+                    format!(
+                        "attachment {} is {} bytes, per-attachment limit {max_bytes_each}",
+                        id.digest, id.size
+                    ),
+                ));
+            }
+            total = total.saturating_add(id.size);
+            if total > max_total_bytes as u64 {
+                return Err(Error::new(
+                    ErrorKind::Oversized,
+                    format!(
+                        "attachment set totals {total} bytes, exceeding the {max_total_bytes} byte request bound"
+                    ),
+                ));
+            }
+            let bytes = self.attachment_bytes(id, max_bytes_each)?;
+            out.push(ResolvedAttachment {
+                id: id.clone(),
+                bytes,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -290,6 +369,116 @@ mod tests {
         };
         let err = s.attachment_bytes(&forged, 1 << 20).unwrap_err();
         assert_eq!(err.kind, faktor_core::ErrorKind::Malformed);
+    }
+
+    #[test]
+    fn child_inherits_attachment_rows_only_from_verified_blobs() {
+        let (_d, m) = test_manager();
+        let parent = session(&m);
+        let child = session(&m);
+        let id = parent
+            .put_attachment("image/png", Some("shot.png"), b"\x89PNG-data")
+            .unwrap();
+        // A phantom digest (no CAS blob) can never be inherited.
+        let phantom = AttachmentId {
+            digest: FileHash::from([42; 32]),
+            ..id.clone()
+        };
+        let err = child.inherit_attachment(&phantom).unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::NotFound);
+        assert_eq!(
+            child.attachment(phantom.digest).unwrap(),
+            None,
+            "no phantom row may land in the child session"
+        );
+        // Real inheritance writes the row; bytes resolve in the child only
+        // after the blob verified.
+        assert_eq!(child.inherit_attachment(&id).unwrap(), id);
+        assert_eq!(
+            child.attachment_bytes(&id, 1 << 20).unwrap(),
+            b"\x89PNG-data"
+        );
+        // Idempotent re-inheritance (crash re-attach path).
+        assert_eq!(child.inherit_attachment(&id).unwrap(), id);
+        assert_eq!(child.list_attachments(16).unwrap(), vec![id]);
+    }
+
+    #[test]
+    fn set_read_preserves_order_and_refuses_bounds_before_reading() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let first = s
+            .put_attachment("image/png", Some("a.png"), b"\x89PNG-a")
+            .unwrap();
+        let second = s
+            .put_attachment("image/jpeg", Some("b.jpg"), b"\xff\xd8-b")
+            .unwrap();
+        let resolved = s
+            .resolve_attachment_bytes(&[first.clone(), second.clone()], 1 << 20, 1 << 20)
+            .unwrap();
+        assert_eq!(
+            resolved.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            vec![first.clone(), second.clone()],
+            "input order is preserved exactly"
+        );
+        assert_eq!(resolved[0].bytes, b"\x89PNG-a");
+        assert_eq!(resolved[1].bytes, b"\xff\xd8-b");
+        // A per-attachment bound is typed BEFORE any blob is read.
+        let err = s
+            .resolve_attachment_bytes(&[first.clone(), second.clone()], 3, 1 << 20)
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized);
+        // A total bound is typed as well.
+        let err = s
+            .resolve_attachment_bytes(&[first.clone(), second.clone()], 1 << 20, 8)
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized);
+        // An unknown digest never materializes bytes.
+        let unknown = AttachmentId {
+            digest: FileHash::from([6; 32]),
+            ..first.clone()
+        };
+        let err = s
+            .resolve_attachment_bytes(&[unknown], 1 << 20, 1 << 20)
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn missing_or_tampered_cas_blob_is_a_typed_refusal() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let id = s
+            .put_attachment("image/png", Some("shot.png"), b"\x89PNG-real")
+            .unwrap();
+        let blob = m.cas().root().join(id.digest.cas_path());
+        // Missing blob: a typed absence, never fabricated bytes.
+        std::fs::remove_file(&blob).unwrap();
+        let err = s
+            .resolve_attachment_bytes(std::slice::from_ref(&id), 1 << 20, 1 << 20)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.kind,
+                faktor_core::ErrorKind::NotFound | faktor_core::ErrorKind::Store
+            ),
+            "missing blob => {:?}",
+            err.kind
+        );
+        // Tampered blob (same length, different bytes): the CAS re-hash is
+        // loud — the attachment is never served as its digest claims.
+        std::fs::write(&blob, b"\x89PNG-evil").unwrap();
+        let err = s
+            .resolve_attachment_bytes(std::slice::from_ref(&id), 1 << 20, 1 << 20)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.kind,
+                faktor_core::ErrorKind::Malformed | faktor_core::ErrorKind::Store
+            ),
+            "tampered blob => {:?}",
+            err.kind
+        );
     }
 
     #[test]
