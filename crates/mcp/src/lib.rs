@@ -547,7 +547,26 @@ sys.exit(0)
     fn production_paths_never_construct_a_command_or_supervisor() {
         const MARKERS: [&str; 3] = ["Command::new", "Command::spawn", "ProcessSupervisor::new"];
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
-        let source = std::fs::read_to_string(&path).unwrap();
+        // Stable-snapshot read (parallel sessions may edit this file while
+        // the full workspace suite runs; scanning a half-written file
+        // produced phantom offenders). Never scan an unstable file.
+        let mut source = std::fs::read_to_string(&path).unwrap();
+        let mut stable = false;
+        for _ in 0..8 {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            if let Ok(second) = std::fs::read_to_string(&path) {
+                if second == source {
+                    stable = true;
+                    break;
+                }
+                source = second;
+            }
+        }
+        assert!(
+            stable,
+            "src/lib.rs kept changing while the spawn-authority scan ran \
+             (concurrent writer); refusing to scan an unstable file"
+        );
         let production = source.split("#[cfg(test)]").next().unwrap();
         let mut offenders: Vec<String> = Vec::new();
         for (idx, line) in production.lines().enumerate() {

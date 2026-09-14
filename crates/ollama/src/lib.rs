@@ -471,14 +471,23 @@ impl OllamaProvider {
     /// (operation/session/deadline/cancellation stay off the wire like
     /// every other adapter call).
     fn embed_wire_body(&self, req: &EmbeddingRequest) -> serde_json::Value {
-        let mut body = serde_json::json!({
-            "model": req.model,
-            "input": req.inputs,
-        });
-        if let Some(keep) = &self.config.keep_alive {
-            body["keep_alive"] = serde_json::json!(keep);
+        // Typed struct (fixed field order): a serde_json::Map's key order
+        // depends on workspace feature unification (`preserve_order` flips
+        // it globally), so byte-exact wire assertions must not rely on Map
+        // ordering.
+        #[derive(serde::Serialize)]
+        struct EmbedBody<'a> {
+            model: &'a str,
+            input: &'a [String],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            keep_alive: Option<&'a str>,
         }
-        body
+        serde_json::to_value(EmbedBody {
+            model: &req.model,
+            input: &req.inputs,
+            keep_alive: self.config.keep_alive.as_deref(),
+        })
+        .unwrap_or(serde_json::Value::Null)
     }
 }
 
@@ -3098,12 +3107,29 @@ mod tests {
         assert_eq!(out.vectors, vec![vec![0.5, -0.25], vec![1.0, 0.0]]);
         let (method, path, raw) = server.last_request().unwrap();
         assert_eq!((method.as_str(), path.as_str()), ("POST", "/api/embed"));
-        // Byte-exact (serde_json's stable key order): model + batch input +
-        // the configured keep_alive, nothing else.
+        // Wire-exact contract, feature-unification-proof: the JSON VALUE
+        // equals {model, input, keep_alive} exactly and no other key is
+        // present. Raw byte ordering is NOT asserted because serde_json's
+        // Map ordering depends on the `preserve_order` feature being
+        // unified in by any workspace crate.
+        let sent: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(
-            raw,
-            r#"{"input":["alpha","beta"],"keep_alive":"30m","model":"all-minilm"}"#
+            sent,
+            serde_json::json!({
+                "model": "all-minilm",
+                "input": ["alpha", "beta"],
+                "keep_alive": "30m",
+            })
         );
+        let keys: Vec<&str> = sent
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec!["input", "keep_alive", "model"]);
     }
 
     /// Hostile `/api/embed` bodies are typed `Malformed` refusals — wrong

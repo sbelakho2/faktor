@@ -4,8 +4,46 @@
 
 use std::path::PathBuf;
 
+/// Fixture root resolution, robust against a stale test binary built in a
+/// different checkout that shares this workspace's target directory
+/// (fingerprints can match across checkouts; the embedded
+/// `CARGO_MANIFEST_DIR` then points at a deleted tree). Candidates, in
+/// order: the build-time manifest dir, the current working directory and
+/// its ancestors, then the executable's ancestors (target sits inside the
+/// real checkout). The FIRST candidate that exists wins; if none does we
+/// fail loudly with every path tried — never a silent skip.
 pub fn fixture_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../compat/kilo-v756")
+    let rel = "compat/kilo-v756";
+    let mut tried: Vec<PathBuf> = Vec::new();
+    let push_candidate = |base: &std::path::Path, tried: &mut Vec<PathBuf>| {
+        let candidate = base.join(rel);
+        tried.push(candidate.clone());
+        candidate.exists().then_some(candidate)
+    };
+    if let Some(found) = push_candidate(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(std::path::Path::new(".")),
+        &mut tried,
+    ) {
+        return found;
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        for base in cwd.ancestors() {
+            if let Some(found) = push_candidate(base, &mut tried) {
+                return found;
+            }
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for base in exe.ancestors() {
+            if let Some(found) = push_candidate(base, &mut tried) {
+                return found;
+            }
+        }
+    }
+    panic!("fixture root {rel} not found; tried: {tried:?}");
 }
 
 pub fn load(name: &str) -> serde_json::Value {

@@ -1099,10 +1099,32 @@ mod tests {
         let mut offenders: Vec<String> = Vec::new();
         for rel in files {
             let path = crates_root.join(rel);
-            let source = match std::fs::read_to_string(&path) {
+            // Stable-snapshot read: the workspace may be edited by another
+            // process while this scan runs (parallel sessions/agents), and
+            // scanning a half-written file produced phantom offenders in
+            // full-workspace runs. Read until two consecutive reads agree
+            // (bounded); never scan an unstable file silently.
+            let mut source = match std::fs::read_to_string(&path) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
+            let mut stable = false;
+            for _ in 0..8 {
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                match std::fs::read_to_string(&path) {
+                    Ok(second) if second == source => {
+                        stable = true;
+                        break;
+                    }
+                    Ok(second) => source = second,
+                    Err(_) => {}
+                }
+            }
+            assert!(
+                stable,
+                "{rel} kept changing while the spawn-authority scan ran \
+                 (concurrent writer); refusing to scan an unstable file"
+            );
             // Production section only: cut at the first #[cfg(test)].
             let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
             scanned += 1;

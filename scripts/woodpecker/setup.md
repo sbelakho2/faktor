@@ -326,7 +326,7 @@ are not possible; the aggregate gate therefore lives **inside** each workflow:
 
 - every lane ends by writing
   `target/certification/lanes/<lane>.json`
-  (`{"schema":"faktor-woodpecker-lane/v1","lane":...,"status":"passed","commit":...}`);
+  (`{"schema":"faktor-woodpecker-lane/v2","lane":...,"status":"passed","commit":...,"tree":...,"runner":{...},"commands_digest":...}`);
 - each `certificate`/`certificate-nightly`/`certificate-soak` step
   `depends_on` every lane of its workflow, runs with
   `when.status: [success, failure]` (a dependent is otherwise skipped when a

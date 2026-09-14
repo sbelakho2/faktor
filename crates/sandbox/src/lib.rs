@@ -1023,10 +1023,35 @@ mod tests {
         // isolation from the policy mapping. A literal `Inherit` there would
         // be a Required => Inherit path; the mapping function itself is
         // asserted to never send Required to Inherit.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("workspace root");
+        // Runtime-robust repo root: a stale test binary built in a deleted
+        // checkout (shared target dir, matching fingerprints) would embed
+        // that checkout's CARGO_MANIFEST_DIR; try the build-time root, then
+        // the cwd and the executable ancestors, and use the FIRST one that
+        // actually contains the scanned files. Fail loudly with every path
+        // tried — never a silent skip.
+        let candidates: Vec<std::path::PathBuf> = {
+            let mut v: Vec<std::path::PathBuf> = Vec::new();
+            if let Some(p) = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+            {
+                v.push(p.to_path_buf());
+            }
+            if let Ok(cwd) = std::env::current_dir() {
+                v.extend(cwd.ancestors().map(|a| a.to_path_buf()));
+            }
+            if let Ok(exe) = std::env::current_exe() {
+                v.extend(exe.ancestors().map(|a| a.to_path_buf()));
+            }
+            v
+        };
+        let root = candidates
+            .iter()
+            .find(|base| base.join("crates/cli/src/tools.rs").is_file())
+            .unwrap_or_else(|| {
+                panic!("repo root with crates/cli/src/tools.rs not found; tried: {candidates:?}")
+            })
+            .clone();
         for rel in ["crates/cli/src/tools.rs", "crates/verify/src/exec.rs"] {
             let path = root.join(rel);
             let text = std::fs::read_to_string(&path)
