@@ -35,8 +35,9 @@ historical turns, and deterministic bookkeeping are local.
   `apps/vscode/` is IMPLEMENTED and CI-tested against the daemon. Client UI
   parity is **PARTIAL**: the executable parity matrices (VS Code visual
   render + frozen-upstream replay + JetBrains behavioral/visual matrices)
-  are the only evidence `ui_parity` accepts, and the JetBrains matrices do
-  not exist yet (§1).
+  are the only evidence `ui_parity` accepts; the JetBrains behavioral and
+  visual matrices exist and pass, and `ui_parity` stays PARTIAL on the
+  remaining upstream-replay gap (§1).
 - **JetBrains shell:** native Kotlin bridge in `apps/jetbrains/`
   (`:shared` + `:backend` + `:frontend` compile and smoke-test against the
   real daemon). The frontend is a native Swing tool-window panel
@@ -47,10 +48,13 @@ historical turns, and deterministic bookkeeping are local.
   **Status: IMPLEMENTED (native bridge + Faktor frontend).** The upstream
   7.1.2 sources ARE vendored (`compat/jetbrains-712/`, per-file SHA-256
   manifest in `ui/upstream.json` → `jetbrains_712`); the derived
-  `jetbrains_upstream_assets` label is **VENDORED**. Byte-for-byte 7.1.2
-  UI parity stays **PARTIAL** until executable JetBrains behavioral/visual
-  parity matrices exist — the kotlinc/daemon smokes are regression tests,
-  not parity results, and the upstream Gradle build is not run offline.
+  `jetbrains_upstream_assets` label is **VENDORED**. The executable
+  JetBrains behavioral/visual parity matrices exist
+  (`target/certification/jetbrains-parity.json`, HEAD-bound: 11 behavioral
+  rows + 8 panels rendered against pinned baselines), so the derived
+  `jetbrains_behavioral_parity`/`jetbrains_visual_parity` labels are
+  **IMPLEMENTED**; the kotlinc/daemon smokes are regression tests, not
+  parity results, and the upstream Gradle build is not run offline.
   The bridge is UI-framework independent and the same panel is the single
   rendering implementation.
 - **Protocol:** the v7.5.6 server contract subset (§16) is **compat glue
@@ -148,7 +152,7 @@ Rules that shape the diagram (Commandments):
 ```
 apps/        frozen UI compatibility fixtures
   vscode/       v7.5.6-derived client shell (webview vendored; UI parity: PARTIAL — executable parity matrices incomplete)
-  jetbrains/    native Kotlin bridge + Swing panel (upstream 7.1.2 vendored/pinned; parity: PARTIAL — no executable matrix yet)
+  jetbrains/    native Kotlin bridge + Swing panel (upstream 7.1.2 vendored/pinned; behavioral+visual parity matrices IMPLEMENTED, HEAD-bound)
 compat/      optional v7.5.6 migration/test glue against the old UI
   kilo-v756/    frozen v7.5.6 wire contract fixtures (golden JSON); the
                 daemon never depends on them — old-UI shells do

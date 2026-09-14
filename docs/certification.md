@@ -19,7 +19,7 @@ an LLM: everything below is deterministic and offline.
 | `bash scripts/certify-local.sh fast` | fast (default) | The change-level gate for the host lane: formatting, check, derived capability manifest + docs drift, certification-evidence verifier selftest, clippy, workspace tests, static-authority scans, fault smoke, doctor `--deep`, branding scan, release CLI doctor. Minutes. |
 | `bash scripts/certify-local.sh full` | full | Everything in fast plus the long lanes: release `[perf]` distribution gates, `[fault]` campaigns at scale, coding-benchmark harness smoke, efficiency harness, ACP interop, artifact packaging and the installation matrix. Longer. The packaging section is the only one that may fetch npm packages (VSIX tooling); an unreachable registry is a recorded skip. |
 | `CERTIFY_SELFTEST=force_fail CERTIFY_OUT_DIR=/tmp/cert-selftest bash scripts/certify-local.sh fast` | selftest | Injects a synthetic failing section and proves the harness exits non-zero, records the failure, fail-fast marks the remainder skipped, and the manifest carries the certification schema with every flag false. Does not touch the real certificate. |
-| `CERTIFY_SELFTEST=release_gates bash scripts/certify-local.sh fast` | selftest | Proves the pure release rule: `release_certified` requires `local_offline_certified` AND all three external evidence gates (cross-platform lanes, real provider, real soak). Exits 0 only when every assertion holds. |
+| `CERTIFY_SELFTEST=release_gates bash scripts/certify-local.sh fast` | selftest | Proves the pure release rule: `release_certified` requires `local_offline_certified` AND every external evidence gate (cross-platform lanes, real provider). Exits 0 only when every assertion holds. |
 | `cargo test -p faktor-tests-fault --release -- --ignored` | long lane | The full `[fault]` campaigns (also part of `full`). |
 | `cargo test -p faktor-tests-performance --release -- --ignored` | long lane | The `[perf]` distribution gates (also part of `full`). |
 | `cargo test -p faktor-tests-fuzz-seeds` | long lane | Seeded pseudo-fuzz harnesses + bounded deterministic campaign; owned by the Woodpecker `static` job and manual runs. |
@@ -36,9 +36,9 @@ The manifest records exactly one `certification_level`:
 | --- | --- | --- |
 | `none` | anything else | No certificate; a failed run, a fast-profile run, or a dirty tree. |
 | `local_offline` | clean tree + `full` profile + `status=pass` + tests not skipped | This host certified the change offline: no network, no provider keys, no LLM. It is **not** a release certificate. |
-| `release` | `local_offline` **plus all three** external evidence gates at the same SHA | A shippable release certificate. |
+| `release` | `local_offline` **plus every** external evidence gate at the same SHA | A shippable release certificate. |
 
-The three external evidence gates are inputs the offline harness can never
+The external evidence gates are inputs the offline harness can never
 produce by itself and must never fabricate. Each gate is a
 `faktor-cert-evidence/v1` object at
 `target/certification/evidence/<kind>.json` (§6), verified against the exact
@@ -49,10 +49,9 @@ and an ed25519 signature from an allowlisted CI identity:
 | --- | --- |
 | `target/certification/evidence/cross_platform_lanes.json` | Every CI platform lane (§2.1) green at this exact SHA/tree. |
 | `target/certification/evidence/real_provider.json` | A recorded real-provider (keyed) run at this SHA/tree. |
-| `target/certification/evidence/real_soak.json` | A recorded wall-clock soak at this SHA/tree. |
 
 The old environment booleans (`CERTIFY_CROSS_PLATFORM_LANES`,
-`CERTIFY_REAL_PROVIDER`, `CERTIFY_REAL_SOAK`) are **inert**: they remain only
+`CERTIFY_REAL_PROVIDER`) are **inert**: they remain only
 as self-test inputs, never certify, and setting one without a verifying
 signed evidence file fails the run loudly. `release_certified` is `false`
 whenever any evidence file is missing, stale, unsigned, or bound to another
@@ -150,24 +149,21 @@ the named-volume caches and the release `[perf]` budgets). PRs run the reduced,
 `docs`, `vscode`, `vscode-visual`, `vscode-visual-with-skip`,
 `jetbrains-build`, `jetbrains-smoke`) plus its own certificate; branch
 protection requires the resulting `ci/woodpecker/pr/pr` workflow status. The
-cron workflows own the campaigns that are too long for push/PR:
-`nightly.yaml` runs the ignored `[fault]` campaign at scale, the longrun
+`nightly.yaml` cron workflow owns the campaigns that are too long for
+push/PR: the ignored `[fault]` campaign at scale, the longrun
 suite, efficiency, economy, the coding-benchmark smoke, the provider-key
 real-model run (an explicit recorded skip unless keys are supplied
-out-of-band) and supply-chain evidence; `soak.yaml` runs the `[soak]` 12h
-synthetic session and the 24h zero-drift wall-clock certification. Both write
-lane markers and their own certificate, and `soak` needs
-`WOODPECKER_MAX_PIPELINE_TIMEOUT` raised server-side because Woodpecker has no
-per-step timeout.
+out-of-band) and supply-chain evidence. It writes lane markers and its own
+certificate.
 
 100% requires the linux certificate green at the exact commit, plus the
 platform certificates when self-hosted darwin/windows agents exist. The
-release real-time soak (12–24h wall clock) is owned by the `soak` cron
-workflow and is deliberately **not** part of the PR/push lane set; `bash
+12–24h real-time soak is **out of scope by owner decision**: it is not a
+release criterion, no CI workflow or release gate consumes it, and the
+`[soak]`-ignored longrun tests remain in-tree and runnable manually. `bash
 scripts/certify-local.sh full` keeps the long release lanes ([perf], [fault]
 at scale, coding benchmark, efficiency, ACP interop, packaging, installation
-matrix) runnable offline, and the real soak must be run and recorded
-separately when required for a release.
+matrix) runnable offline.
 
 ### 2.2 UI builds and parity
 
@@ -423,7 +419,7 @@ commit.
 | `jetbrains_upstream_assets` | VENDORED | pinned upstream 7.1.2 source in `compat/jetbrains-712` with per-file SHA-256 manifest in `ui/upstream.json` (`jetbrains_712`) + `compat/jetbrains-712/NOTICE.md`; VENDORED is a provenance claim, never a parity claim |
 | `jetbrains_behavioral_parity` | IMPLEMENTED | executable parity matrix `target/certification/jetbrains-parity.json` (`faktor-jetbrains-parity/v1`, written by `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt`): 11 behavioral rows (task mode, agent tree, criterion proofs incl. all 7 binding kinds, permissions, terminal, review/tournament, evidence, settings, provider selection, history, restart/reconnect), each run against canned native frames AND the fake daemon, HEAD-bound |
 | `jetbrains_visual_parity` | IMPLEMENTED | the same artifact's visual axis: 8 panels rendered offscreen (`offscreen-swing-render+component-tree-state-digest-vs-pinned-baseline`), component-tree/state digest compared against pinned baselines in `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json`; a missing/mismatching baseline fails the run |
-| `compat_v756` | PARTIAL | measured replay report `target/certification/kilo-compat.json` (`faktor-kilo-compat/v1`): responses 33/37 exact, requests 37/37, 4 required divergences; corpus `compat/kilo-v756/sdk-traces` + `tests/compat`; IMPLEMENTED only at responses N/N bound to the exact HEAD |
+| `compat_v756` | PARTIAL | measured replay report `target/certification/kilo-compat.json` (`faktor-kilo-compat/v1`): responses 35/37 exact, requests 37/37, 2 required divergences (both auth locks, by design); corpus `compat/kilo-v756/sdk-traces` + `tests/compat`; IMPLEMENTED only at responses N/N bound to the exact HEAD |
 | `ui_parity` | PARTIAL | executable parity axes only: `ui/kilo-v756-webview/dist/visual-report.json` (VS Code visual), `target/certification/kilo-compat.json` (frozen-upstream behavioral), `target/certification/jetbrains-parity.json` (JetBrains behavioral + visual); vendored files or pinned corpora alone never flip it |
 | `acp_subset` | IMPLEMENTED | `crates/acp` (`AcpMethod::Initialize`) + `crates/acp/tests/interop.rs` + official `agent-client-protocol` client crate in `tests/acp-official` |
 | `openai_responses` | IMPLEMENTED | `crates/openai/src/lib.rs`: `OpenAiFamily::Responses` dispatch + `responses_body`/`responses_stream` codecs + the adversarial `responses_*` stream tests |
@@ -461,10 +457,10 @@ offline local profile).
 | JetBrains 7.1.2 upstream assets | pinned 7.1.2 source (`compat/jetbrains-712/`, per-file SHA-256 manifest) | `compat/jetbrains-712/NOTICE.md`, `ui/upstream.json` (`jetbrains_712`) | VENDORED |
 | JetBrains behavioral parity | executable parity matrix (`target/certification/jetbrains-parity.json`, behavioral axis) | `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt` + `JetBrainsParitySmoke.kt`; 11/11 rows against canned frames AND the fake daemon; emitted by `bash apps/jetbrains/compile-and-smoke.sh` | IMPLEMENTED (HEAD-bound artifact; the smoke alone is not the claim) |
 | JetBrains visual parity | executable parity matrix (`target/certification/jetbrains-parity.json`, visual axis) | offscreen Swing render + component-tree/state digest vs pinned `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json`; 8 panels; regenerated only with `bash apps/jetbrains/compile-and-smoke.sh --write-baselines` | IMPLEMENTED (offline component-tree/state comparison; a real-IDE screenshot comparison stays a host capability not claimed here) |
-| Compat fixtures v756 | golden suite + fixtures + required replay report | `tests/compat`, `target/certification/kilo-compat.json` (33/37 responses exact; 4 locked divergences) | CI-LANE / fast tests; derived `compat_v756`=PARTIAL until responses N/N |
+| Compat fixtures v756 | golden suite + fixtures + required replay report | `tests/compat`, `target/certification/kilo-compat.json` (35/37 responses exact; 2 locked auth divergences, by design) | CI-LANE / fast tests; derived `compat_v756`=PARTIAL until responses N/N |
 | Compat fixtures jetbrains-712 | pinned corpus (1043 files, MIT, sha256) | `compat/jetbrains-712/NOTICE.md`, `ui/upstream.json` (`jetbrains_712`), `JetBrainsParitySmoke` pin step | VENDORED |
 | Fuzz harnesses | seeded pseudo-fuzz | Woodpecker `static` job / manual | CI-LANE |
-| Real-time soak (12–24h) | wall-clock soak | self-hosted hook (disabled by default) | NOT RUN HERE |
+| Real-time soak (12–24h) | excluded by owner decision | no release gate and no CI workflow consumes a wall-clock soak; the `[soak]`-ignored longrun suites remain runnable manually | OUT OF SCOPE (by decision) |
 | PR/CI-fix completion contract | native DTO `completion_contract` + `CompletionContractSet`/`CompletionStepStatus` ledger rows + `VerifiedComplete` gate + ordered step executor | gate + durable rows + `crates/orchestrator/src/completion_steps.rs` runner (`crates/session/src/task.rs`, `crates/session/src/ledger.rs`, `crates/orchestrator/src/task_executor.rs`, `crates/agent/src/runtime.rs`); adversarial gate/step tests in-tree; Task-mode controls in both IDEs (§3.3) | IMPLEMENTED (gate + ordered/idempotent commit/push/PR execution) |
 | Coordination board | durable ledger rows (`board_post`/`board_read`/`board_receipt`/`board_reset`), CAS reset, scoped reads, board tools, native `GET/POST /native/session/{id}/board`, both IDE board panels | `crates/session/src/board.rs` + `crates/session/src/ledger.rs`; `crates/server/src/native/board.rs`; `apps/vscode/src/nativeClient.ts`; JetBrains `BoardPanel.kt` | IMPLEMENTED (fast tests green; native GET/POST round-trip in both IDE smokes; unavailable state recorded truthfully) |
 | Multi-candidate tournament | N = 2..=4 identical-criteria candidates, deterministic winner ordering, durable decide, loser cleanup, cross-IDE controls | `crates/orchestrator/src/tournament.rs` + `crates/orchestrator/src/task_executor.rs`; native start/state/list endpoints; VS Code cockpit + JetBrains `TournamentPanel.kt` (decide gated on every candidate settled) | IMPLEMENTED (fast tests green + both IDE smokes; integration stays the explicit approved-merge path) |
@@ -491,8 +487,8 @@ offline local profile).
 
 `bash scripts/certify-local.sh fast` on 2026-09-10 (darwin/arm64, rustc
 1.98.0) for commit `f6b1c2f7fabd92b45647fb240e362dfaff268d5b`:
-**PASS**, 9/9 sections, 463,589 ms, 8 recorded skips (fast-profile long
-lanes, the offline provider-key run, the Windows lane, the real soak). The
+**PASS**, 9/9 sections, 463,589 ms, 7 recorded skips (fast-profile long
+lanes, the offline provider-key run, the Windows lane). The
 worktree carried concurrent changes during that run (`dirty_count: 20`),
 so it is a work certificate, not a release certificate.
 `target/certification/manifest.json` is authoritative and is regenerated on
@@ -653,14 +649,12 @@ surfaces are adversarially tested in `apps/vscode/scripts/selftest.mjs` +
   "release_gates": {
     "cross_platform_lanes": false,
     "real_provider": false,
-    "real_soak": false,
     "evidence_required": true,
     "boolean_inputs_ignored": true
   },
   "evidence": {
     "cross_platform_lanes": {"file": "target/certification/evidence/cross_platform_lanes.json", "verified": false, "release_grade": false},
-    "real_provider": {"file": "target/certification/evidence/real_provider.json", "verified": false, "release_grade": false},
-    "real_soak": {"file": "target/certification/evidence/real_soak.json", "verified": false, "release_grade": false}
+    "real_provider": {"file": "target/certification/evidence/real_provider.json", "verified": false, "release_grade": false}
   },
   "commit": "<40-hex sha>",
   "dirty_count": 0,
@@ -686,7 +680,7 @@ surfaces are adversarially tested in `apps/vscode/scripts/selftest.mjs` +
     "compat_fixtures": {"v756": true, "jetbrains712": true},
     "surfaces": {"workspace_tests": true, "...": false},
     "offline": {"network_required": false, "provider_keys_required": false},
-    "release_rule": "a release is certified only for its exact commit with dirty=false AND local_offline_certified AND cross-platform lanes + real-provider + real-soak evidence"
+    "release_rule": "a release is certified only for its exact commit with dirty=false AND local_offline_certified AND cross-platform lanes + real-provider evidence"
   }
 }
 ```
@@ -700,9 +694,9 @@ Field semantics:
 | `status` | `pass` iff every attempted section passed and no release-gate boolean was asserted without verifying evidence; `fail` otherwise |
 | `certification_level` | `none`, `local_offline` or `release` (see §1) |
 | `local_offline_certified` | `true` only for `full` + `status=pass` + `dirty_count=0` + `fast_tests_skipped=false` |
-| `release_gates` | The three external evidence gates, each `true` only when `evidence/<kind>.json` verifies (`evidence_required: true`); `boolean_inputs_ignored: true` records that the `CERTIFY_*` booleans never certify |
+| `release_gates` | The external evidence gates, each `true` only when `evidence/<kind>.json` verifies (`evidence_required: true`); `boolean_inputs_ignored: true` records that the `CERTIFY_*` booleans never certify |
 | `evidence` | Per-gate evidence file path plus `verified`/`release_grade` (both true only for a schema-valid, commit+tree-bound, allowlisted-signature object; §6) |
-| `release_certified` | `true` only when `local_offline_certified` AND all three `release_gates` are true |
+| `release_certified` | `true` only when `local_offline_certified` AND every `release_gates` entry is true |
 | `sections[].status` | `pass` or `fail`; failed sections carry the first error line in `detail` |
 | `sections[].duration_ms` | wall time of that section |
 | `skipped[]` | sections not attempted, each with the exact reason (profile, fail-fast, offline contract, platform) |
@@ -727,9 +721,10 @@ configured).
 ## 5. Release certification rule
 
 > **A release is certified only for its exact commit with `dirty_count = 0`,
-> `local_offline_certified = true`, and all three external evidence objects
-> (`cross_platform_lanes`, `real_provider`, `real_soak`) verified at the same
-> commit and tree.** Booleans never certify.
+> `local_offline_certified = true`, and every external evidence object
+> (`cross_platform_lanes`, `real_provider`) verified at the same
+> commit and tree.** Booleans never certify. The 12–24h real-time soak is
+> out of scope by owner decision and is not a release gate.
 
 Concretely, to ship:
 
@@ -749,17 +744,15 @@ Concretely, to ship:
 4. A real-provider (keyed) benchmark/economics run is attached for the same
    SHA as `evidence/real_provider.json`; the offline certificate never
    implies it.
-5. A wall-clock soak is attached for the same SHA as
-   `evidence/real_soak.json`.
-6. Every evidence object is signed with an allowlisted ed25519 identity:
+5. Every evidence object is signed with an allowlisted ed25519 identity:
    `node scripts/certification/evidence.mjs sign --file
    target/certification/evidence/<kind>.json --key <private.pem> --key-id
    <identity>`. Unsigned evidence verifies as honest but **never
    release-grade**; `verify --require-signed` is what certify-local runs.
-7. The manifest now reports `"certification_level": "release"` and
+6. The manifest now reports `"certification_level": "release"` and
    `"release_certified": true`; any missing/invalid gate keeps both
    `release_certified=false` and the level at `local_offline` (or `none`).
-8. The manifest's `capabilities` labels are honest and derived from
+7. The manifest's `capabilities` labels are honest and derived from
    artifacts: `compat_v756` comes from the HEAD-bound
    `target/certification/kilo-compat.json` report (PARTIAL until responses
    are N/N), the JetBrains labels split provenance (`VENDORED`) from
@@ -786,7 +779,7 @@ signature verifier, marker verifier, self-tests) is
   "repository": "git remote URL or an explicit name",
   "commit_sha": "<40-hex sha>",
   "tree_hash": "<40-hex sha>",
-  "kind": "cross_platform_lanes | real_provider | real_soak | local_offline | ...",
+  "kind": "cross_platform_lanes | real_provider | local_offline | ...",
   "status": "passed | failed | skipped",
   "started_at": "2026-01-01T00:00:00Z",
   "finished_at": "2026-01-01T00:01:00Z",
@@ -846,8 +839,8 @@ node scripts/certification/evidence.mjs verify-markers --workflow pr \
   --pipeline-status "$CI_PIPELINE_STATUS" --run-id "$CI_PIPELINE_NUMBER"
 
 # add a signature with an offline key
-node scripts/certification/evidence.mjs sign --file target/certification/evidence/real_soak.json \
-  --key /secure/ci-ed25519.pem --key-id ci-soak
+node scripts/certification/evidence.mjs sign --file target/certification/evidence/real_provider.json \
+  --key /secure/ci-ed25519.pem --key-id ci-provider
 
 # prove the whole rejection matrix + signature allowlist + repo drift
 node scripts/certification/evidence.mjs selftest

@@ -53,12 +53,52 @@ mod tests {
     use faktor_core::capability::PermissionDecision;
     use faktor_core::model::ModelCapabilities;
     use faktor_core::time::SystemClock;
-    use faktor_provider::{FakeProvider, ProviderRegistry, ScriptedResponse};
+    use faktor_provider::{
+        FakeProvider, GenericAgentRequest, Provider, ProviderError, ProviderErrorKind,
+        ProviderRegistry, ProviderStream, ScriptedResponse,
+    };
     use faktor_server::permission::ChannelPermissionRequester;
     use faktor_server::{serve, ServerDeps, ServerHandle, ServerPassword};
     use faktor_session::SessionManager;
     use serde_json::{json, Map, Value};
     use tempfile::tempdir;
+
+    /// Catalog-only probe provider (family `openai`) for the SDK
+    /// `provider.list` replay: its REAL `known_models` carry one documented
+    /// Exact row (`gpt-4o`) and one model absent from the catalog
+    /// (`mystery-proxy-model`, Unknown pricing). The catalog rows come from
+    /// the provider trait's real builtin lookup; nothing ever streams.
+    struct CatalogProbe;
+
+    impl Provider for CatalogProbe {
+        fn id(&self) -> &str {
+            "openai"
+        }
+
+        fn capabilities(&self, _model: &str) -> ModelCapabilities {
+            ModelCapabilities {
+                context: 128_000,
+                max_output: 16_384,
+                tools: true,
+                thinking: true,
+                vision: true,
+                json_schema: true,
+                ..Default::default()
+            }
+        }
+
+        fn known_models(&self) -> Vec<String> {
+            vec!["gpt-4o".into(), "mystery-proxy-model".into()]
+        }
+
+        fn stream(&self, _req: GenericAgentRequest) -> ProviderStream {
+            faktor_provider::provider_error_stream(ProviderError::with_code(
+                ProviderErrorKind::BadRequest,
+                "catalog_only",
+                "the catalog probe never streams",
+            ))
+        }
+    }
 
     // ------------------------------------------------------------- harness
 
@@ -291,6 +331,9 @@ mod tests {
                 ],
             )))
             .unwrap();
+        // The SDK `provider.list` projection is exercised over a REAL
+        // catalog provider: one documented Exact row and one Unknown model.
+        registry.try_register(Arc::new(CatalogProbe)).unwrap();
         let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
         let fs = faktor_fs::WorkspaceFileService::new();
         let snapshots = Arc::new(faktor_snapshot::CheckpointStore::new(
@@ -430,6 +473,7 @@ mod tests {
         ("GET", "/permission", "compat"),
         ("GET", "/question", "compat"),
         ("GET", "/network", "compat"),
+        ("GET", "/provider", "compat"),
         // v7.5.6 wire-compat surface (subset the frozen extension calls).
         ("POST", "/session", "compat"),
         ("GET", "/session", "compat"),
@@ -797,6 +841,7 @@ mod tests {
             "messages_page.json",
             "password_auth.json",
             "provider_list.json",
+            "sdk-global-frames.json",
             "sse_frames.json",
             "startup_line.json",
             "upstream.json",
@@ -1069,6 +1114,67 @@ mod tests {
                         "MIT",
                         "fixture {file}: license provenance drifted"
                     );
+                }
+                "sdk-global-frames.json" => {
+                    // The SDK `global.event` union frame corpus: frames
+                    // captured from the daemon's real projector, pinned to
+                    // the vendored SDK's declared event-type literals.
+                    // Regenerated only by the projector test
+                    // (`FAKTOR_COMPAT_REGEN_GLOBAL_FRAMES=1`).
+                    let o = object(&raw, &file, "root");
+                    assert_eq!(
+                        str_key(o, &file, "schema"),
+                        "faktor.compat.sdk-global-frames/v1"
+                    );
+                    let sdk = object(key(o, &file, "sdk"), &file, "sdk");
+                    assert_eq!(str_key(sdk, &file, "version"), "7.5.6");
+                    let union = arr_key(o, &file, "union_types");
+                    assert!(union.len() > 100, "fixture {file}: thin union surface");
+                    let declared: Vec<&str> = union
+                        .iter()
+                        .map(|v| {
+                            let s = v.as_str().unwrap_or_else(|| {
+                                panic!("fixture {file}: union type must be a string")
+                            });
+                            assert!(
+                                s.contains('.'),
+                                "fixture {file}: union type {s:?} is not a dotted event literal"
+                            );
+                            s
+                        })
+                        .collect();
+                    let scenarios = arr_key(o, &file, "scenarios");
+                    assert!(!scenarios.is_empty(), "fixture {file}: no scenarios");
+                    for scenario in scenarios {
+                        let scenario = object(scenario, &file, "scenario");
+                        assert!(
+                            !str_key(scenario, &file, "id").is_empty(),
+                            "fixture {file}: scenario id"
+                        );
+                        let frames = arr_key(scenario, &file, "frames");
+                        assert!(!frames.is_empty(), "fixture {file}: no frames");
+                        for frame in frames {
+                            let frame = object(frame, &file, "frame");
+                            assert!(
+                                key(frame, &file, "directory").is_string(),
+                                "fixture {file}: frame directory must be a string"
+                            );
+                            let payload = object(key(frame, &file, "payload"), &file, "payload");
+                            assert!(
+                                str_key(payload, &file, "id").parse::<u64>().is_ok(),
+                                "fixture {file}: payload id is the ring sequence"
+                            );
+                            let kind = str_key(payload, &file, "type");
+                            assert!(
+                                declared.contains(&kind),
+                                "fixture {file}: frame type {kind:?} is not declared by the union list"
+                            );
+                            assert!(
+                                key(payload, &file, "properties").is_object(),
+                                "fixture {file}: frame properties must be an object"
+                            );
+                        }
+                    }
                 }
                 _unknown => {
                     let shape = match &raw {

@@ -430,6 +430,12 @@ fn normalize_json(value: &Value, vars: &BTreeMap<String, String>) -> Value {
                 || (!s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
             {
                 json!("@string")
+            } else if s.starts_with('@') {
+                // Golden escape: a LITERAL response string that starts with
+                // `@` (e.g. the real `@ai-sdk/openai` npm identity) is stored
+                // as `@@…` so the template language cannot confuse it with a
+                // wildcard; `template_matches` strips the escape back.
+                json!(format!("@{s}"))
             } else {
                 value.clone()
             }
@@ -505,6 +511,14 @@ fn substitute_vars_in_body(text: &str, vars: &BTreeMap<String, String>) -> Strin
 
 fn template_matches(expected: &Value, actual: &Value, at: &str) -> Result<(), String> {
     if let Value::String(template) = expected {
+        if let Some(literal) = template.strip_prefix("@@") {
+            // Escaped literal golden string (see `normalize_json`).
+            let wanted = format!("@{literal}");
+            return match actual.as_str() {
+                Some(s) if s == wanted => Ok(()),
+                _ => Err(format!("{at}: expected literal {wanted:?}, got {actual}")),
+            };
+        }
         if let Some(kind) = template.strip_prefix('@') {
             return match kind {
                 "string" => match actual.as_str() {
@@ -602,6 +616,93 @@ fn has_path(value: &Value, path: &str) -> bool {
             true
         }
     }
+}
+
+/// The event-type literals declared by the checked-in SDK global frame
+/// corpus (itself pinned to the vendored `types.gen.ts` by the projector
+/// test in `crates/server/src/compat/sdk.rs`).
+fn sdk_corpus_declared_types() -> BTreeSet<String> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../compat/kilo-v756/sdk-global-frames.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("SDK frame corpus {} unreadable: {e}", path.display()));
+    let corpus: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("SDK frame corpus {} invalid: {e}", path.display()));
+    corpus["union_types"]
+        .as_array()
+        .unwrap_or_else(|| panic!("SDK frame corpus {}: union_types missing", path.display()))
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect()
+}
+
+/// Validate one live SDK `GlobalEvent` frame against the checked-in corpus:
+/// the payload type must be declared by the vendored union and the declared
+/// property keys of the projected events must be present. Heartbeats (no
+/// payload) are skipped.
+fn validate_live_sdk_frame(id: &str, index: usize, frame: &Value) -> bool {
+    let Some(payload) = frame.get("payload") else {
+        return false; // keep-alive frame, not an SDK event
+    };
+    let at = format!("{id}.response.frames[{index}]");
+    let declared = sdk_corpus_declared_types();
+    assert!(
+        frame["directory"].is_string(),
+        "{at}: SDK envelope directory must be a string"
+    );
+    let payload = payload
+        .as_object()
+        .unwrap_or_else(|| panic!("{at}: payload must be an object, got {frame}"));
+    let type_name = payload
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("{at}: payload.type missing: {frame}"));
+    assert!(
+        declared.contains(type_name),
+        "{at}: payload type {type_name:?} is not declared by the vendored SDK union"
+    );
+    assert!(
+        payload
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.parse::<u64>().is_ok())
+            .unwrap_or(false),
+        "{at}: payload.id must be the ring sequence string"
+    );
+    let properties = payload
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .unwrap_or_else(|| panic!("{at}: payload.properties must be an object"));
+    let required: &[&str] = match type_name {
+        "session.created" | "session.deleted" | "session.updated" | "message.updated" => {
+            &["sessionID", "info"]
+        }
+        "message.part.updated" => &["sessionID", "part", "time"],
+        "session.turn.open" => &["sessionID"],
+        "session.turn.close" => &["sessionID", "reason"],
+        "session.next.text.delta" => &[
+            "timestamp",
+            "sessionID",
+            "assistantMessageID",
+            "textID",
+            "delta",
+        ],
+        "session.next.reasoning.delta" => &[
+            "timestamp",
+            "sessionID",
+            "assistantMessageID",
+            "reasoningID",
+            "delta",
+        ],
+        _ => &[],
+    };
+    for key in required {
+        assert!(
+            properties.contains_key(*key),
+            "{at}: {type_name} frame is missing declared property {key:?}: {frame}"
+        );
+    }
+    true
 }
 
 fn request_headers(trace_step: &Value) -> Map<String, Value> {
@@ -844,6 +945,26 @@ async fn unmodified_upstream_client_replays_against_the_real_daemon() {
                         .contains("text/event-stream"),
                     "{id}: expected an SSE stream"
                 );
+                // SDK global.event frame-corpus conformance: the live
+                // stream must emit at least one projected frame (sessions
+                // from earlier steps replay on connect), and every frame
+                // must be a declared member of the vendored SDK union with
+                // the declared property keys of the projected events.
+                if id == "global.event" {
+                    let frames = response["frames"].as_array().unwrap_or_else(|| {
+                        panic!("{id}: the driver recorded no SSE frames at all")
+                    });
+                    let mut sdk_frames = 0usize;
+                    for (i, frame) in frames.iter().enumerate() {
+                        if validate_live_sdk_frame(&id, i, frame) {
+                            sdk_frames += 1;
+                        }
+                    }
+                    assert!(
+                        sdk_frames > 0,
+                        "{id}: live stream produced no SDK GlobalEvent frames: {frames:?}"
+                    );
+                }
             } else {
                 let ct = response["content_type"].as_str().unwrap_or("");
                 assert!(

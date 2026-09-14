@@ -413,7 +413,7 @@ mod tests {
             .unwrap();
         let handle = session.get_session(created.id()).unwrap().unwrap();
         let state = AppState {
-            bus: Arc::new(crate::global::GlobalEventBus::new(session.clone(), None)),
+            projector: crate::api::AppState::test_projector(session.clone()),
             deps: Arc::new(deps),
             config: Arc::new(std::sync::RwLock::new(serde_json::Value::Object(
                 Default::default(),

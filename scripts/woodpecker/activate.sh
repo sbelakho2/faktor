@@ -8,7 +8,7 @@
 #      GET  /api/repos/lookup/<owner>/<repo>           resolve repo id/settings
 #   3. PATCH /api/repos/<repo_id>                       set the pipeline timeout (opt-in)
 #   4. POST|PATCH /api/repos/<repo_id>/secrets[/<name>] set secrets (none by default)
-#   5. GET/POST/PATCH /api/repos/<repo_id>/cron         register `nightly` + `soak`
+#   5. GET/POST/PATCH /api/repos/<repo_id>/cron         register `nightly`
 #   6. POST /api/repos/<repo_id>/cron/<cron_id>         optional --run-now
 #   7. prints the branch-protection setup for the commit-status contexts
 #
@@ -21,18 +21,17 @@
 #     bash scripts/woodpecker/activate.sh [owner/repo] [options]
 #
 # Options:
-#   --run-now                 trigger `nightly` and `soak` right after registration
+#   --run-now                 trigger `nightly` right after registration
 #   --timeout-minutes N       set the repo pipeline timeout (needs server
 #                             WOODPECKER_MAX_PIPELINE_TIMEOUT >= N; 0 = leave as is)
 #   --trusted                 request trusted.volumes (instance-admin token only;
-#                             needed by trusted.yaml/nightly.yaml/soak.yaml caches)
+#                             needed by trusted.yaml/nightly.yaml caches)
 #   --secret NAME=VALUE       create/update a repo secret (repeatable; none required)
 #   --dry-run                 print the API calls without sending them
 #   -h, --help                this text
 #
 # Defaults:
 #   cron `nightly`: 0 3 * * *   branch main, UTC, enabled
-#   cron `soak`:    0 4 * * 6   branch main, UTC, enabled
 #
 # The UI equivalents are in setup.md (§3 activation, §4 secrets, §6 cron);
 # if the API path differs on your instance, setup.md documents the exact UI
@@ -48,7 +47,7 @@ TIMEOUT_MINUTES=0
 REPO_FULL_NAME=""
 declare -a SECRETS=()
 
-usage() { sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; }
 
 die() { echo "activate: $*" >&2; exit 1; }
 note() { echo "activate: $*"; }
@@ -227,18 +226,18 @@ if [ "$TIMEOUT_MINUTES" -gt 0 ]; then
     request PATCH "/repos/${REPO_ID}" "{\"timeout\":${TIMEOUT_MINUTES}}"
     case "$RESPONSE_STATUS" in
     200) note "settings : timeout set" ;;
-    403) warn "timeout ${TIMEOUT_MINUTES} refused: server WOODPECKER_MAX_PIPELINE_TIMEOUT caps it (hosted instances are admin-fixed); soak/longrun cannot run at 24h until the cap is raised" ;;
+    403) warn "timeout ${TIMEOUT_MINUTES} refused: server WOODPECKER_MAX_PIPELINE_TIMEOUT caps it (hosted instances are admin-fixed); long campaigns cannot run past the cap until it is raised" ;;
     *) warn "timeout update returned ${RESPONSE_STATUS}: ${RESPONSE_BODY}" ;;
     esac
 else
-    note "settings : timeout left untouched (pass --timeout-minutes 1560 for the 24h soak)"
+    note "settings : timeout left untouched (pass --timeout-minutes 1560 for the nightly longrun campaign)"
 fi
 
 if [ "$TRUSTED" -eq 1 ]; then
     note "trusted  : requesting trusted.volumes (needs an instance-admin token)"
     request PATCH "/repos/${REPO_ID}" '{"trusted":{"volumes":true}}'
     case "$RESPONSE_STATUS" in
-    200) note "trusted  : granted (named-volume caches usable by trusted.yaml/nightly.yaml/soak.yaml)" ;;
+    200) note "trusted  : granted (named-volume caches usable by trusted.yaml/nightly.yaml)" ;;
     403) warn "trusted.volumes refused (not an instance admin); either strip volumes: from the trusted/cron workflows or ask a server admin (setup.md §5)" ;;
     *) warn "trusted update returned ${RESPONSE_STATUS}: ${RESPONSE_BODY}" ;;
     esac
@@ -280,7 +279,6 @@ fi
 # The cron job name must match the `when.cron` filter of the workflow file.
 CRON_SPECS=(
     "nightly|0 3 * * *|main|UTC"
-    "soak|0 4 * * 6|main|UTC"
 )
 CRON_IDS=()
 for spec in "${CRON_SPECS[@]}"; do
@@ -348,7 +346,7 @@ fi
 #   pull_request  -> ci/woodpecker/pr/pr          (the required PR gate)
 #   push main     -> ci/woodpecker/push/trusted   (post-merge evidence)
 #   tag           -> ci/woodpecker/tag/trusted
-#   cron          -> ci/woodpecker/cron/nightly | ci/woodpecker/cron/soak
+#   cron          -> ci/woodpecker/cron/nightly
 cat <<EOF
 
 Next steps (this script does not change branch protection):

@@ -43,14 +43,14 @@
 #                      scripts/certification/evidence.mjs defaults (which are
 #                      empty, so unsigned evidence never certifies).
 #
-# Release gates are EVIDENCE, not flags. CERTIFY_CROSS_PLATFORM_LANES,
-# CERTIFY_REAL_PROVIDER and CERTIFY_REAL_SOAK are INERT booleans kept only as
-# self-test inputs: setting one to 1 can never certify anything. A release
-# gate is true only when target/certification/evidence/<kind>.json exists,
-# verifies against the exact HEAD commit and HEAD tree hash
-# (`git rev-parse 'HEAD^{tree}'`), has matching command/artifact digests, and
-# carries an ed25519 signature from an allowlisted CI identity. A truthy
-# boolean with no verifying evidence file FAILS the run loudly.
+# Release gates are EVIDENCE, not flags. CERTIFY_CROSS_PLATFORM_LANES and
+# CERTIFY_REAL_PROVIDER are INERT booleans kept only as self-test inputs:
+# setting one to 1 can never certify anything. A release gate is true only
+# when target/certification/evidence/<kind>.json exists, verifies against the
+# exact HEAD commit and HEAD tree hash (`git rev-parse 'HEAD^{tree}'`), has
+# matching command/artifact digests, and carries an ed25519 signature from an
+# allowlisted CI identity. A truthy boolean with no verifying evidence file
+# FAILS the run loudly.
 #
 # Output:
 #   target/certification/manifest.json       certificate for this exact commit
@@ -61,7 +61,7 @@
 # The manifest schema (documented in docs/certification.md):
 #   {schema, profile, status, certification_level, local_offline_certified,
 #    release_certified, release_gates{cross_platform_lanes,real_provider,
-#    real_soak,evidence_required,boolean_inputs_ignored},
+#    evidence_required,boolean_inputs_ignored},
 #    evidence{cross_platform_lanes{file,verified,signed}, ...},
 #    commit, dirty_count, rustc, cargo, os, arch, timestamp,
 #    duration_ms, fast_tests_skipped, sections[{name,label,status,duration_ms,
@@ -81,17 +81,19 @@
 #   local_offline    a clean full-profile run passed: the change is certified
 #                    on THIS host, offline, with no provider keys or network.
 #                    It is NOT a release certificate.
-#   release          local_offline PLUS the three external evidence gates
-#                    (cross-platform lanes, real-provider run, real soak)
-#                    verified from signed evidence objects at the same commit
-#                    and tree. Without every gate, release_certified is false.
+#   release          local_offline PLUS the external evidence gates
+#                    (cross-platform lanes, real-provider run) verified from
+#                    signed evidence objects at the same commit and tree.
+#                    Without every gate, release_certified is false.
 # Exit code is non-zero if any required section fails (fail-fast: the
 # remaining sections are then recorded as skipped), or if a release-gate
 # boolean flag is set without a verifying signed evidence file.
 #
-# A release is certified only for its exact commit with dirty=false AND all
-# three evidence gates verified; see docs/certification.md for what 100%
-# means in this repository.
+# A release is certified only for its exact commit with dirty=false AND every
+# evidence gate verified; see docs/certification.md for what 100% means in
+# this repository. The 12-24h real-time soak is out of scope by owner
+# decision: it is not a release criterion, no CI workflow or release gate
+# consumes it, and the [soak]-ignored longrun suites stay runnable manually.
 #
 # Self-test:
 #   CERTIFY_SELFTEST=force_fail bash scripts/certify-local.sh fast
@@ -100,7 +102,7 @@
 #     carries the certification-level schema with all flags false.
 #   CERTIFY_SELFTEST=release_gates bash scripts/certify-local.sh fast
 #     proves the release rule end to end: (a) CERTIFY_* boolean flags are
-#     inert — with all three set to 1 and no evidence files the release
+#     inert — with both set to 1 and no evidence files the release
 #     gates stay false; (b) an unsigned evidence file never certifies; (c) a
 #     signed evidence file from an allowlisted ed25519 identity certifies
 #     (keypair generated in a temp dir; nothing touches the real
@@ -263,9 +265,9 @@ evidence_gate() {
     fi
 }
 
-# The three release-gate kinds, paired with their INERT boolean env names.
-RELEASE_GATE_KINDS=(cross_platform_lanes real_provider real_soak)
-RELEASE_GATE_ENVS=(CERTIFY_CROSS_PLATFORM_LANES CERTIFY_REAL_PROVIDER CERTIFY_REAL_SOAK)
+# The release-gate kinds, paired with their INERT boolean env names.
+RELEASE_GATE_KINDS=(cross_platform_lanes real_provider)
+RELEASE_GATE_ENVS=(CERTIFY_CROSS_PLATFORM_LANES CERTIFY_REAL_PROVIDER)
 
 # Fails closed when an operator asserts a gate with the inert boolean but no
 # verifying signed evidence exists: a boolean can never certify.
@@ -301,12 +303,13 @@ local_offline_certified_rule() {
     fi
 }
 
-# `release_certified`: the local offline certificate PLUS the three external
+# `release_certified`: the local offline certificate PLUS the external
 # evidence gates at the same SHA. The local harness can never fabricate a
-# cross-platform lane, a real-provider run or a wall-clock soak.
+# cross-platform lane or a real-provider run. The 12-24h real-time soak is
+# out of scope by owner decision and is deliberately NOT a gate.
 release_certified_rule() {
-    # local_offline cross_platform real_provider real_soak
-    if [ "$1" = "true" ] && [ "$2" = "true" ] && [ "$3" = "true" ] && [ "$4" = "true" ]; then
+    # local_offline cross_platform real_provider
+    if [ "$1" = "true" ] && [ "$2" = "true" ] && [ "$3" = "true" ]; then
         printf 'true'
     else
         printf 'false'
@@ -488,23 +491,21 @@ if [ "$SELFTEST" = "release_gates" ]; then
         "$(local_offline_certified_rule pass full 0 1)" false
     expect "failed run is not certified" \
         "$(local_offline_certified_rule fail full 0 0)" false
-    expect "all four gates release-certify" \
-        "$(release_certified_rule true true true true)" true
-    expect "missing real soak blocks release" \
-        "$(release_certified_rule true true true false)" false
+    expect "all release gates certify" \
+        "$(release_certified_rule true true true)" true
     expect "missing real provider blocks release" \
-        "$(release_certified_rule true true false true)" false
+        "$(release_certified_rule true true false)" false
     expect "missing cross-platform lanes block release" \
-        "$(release_certified_rule true false true true)" false
+        "$(release_certified_rule true false true)" false
     expect "no external evidence blocks release" \
-        "$(release_certified_rule true false false false)" false
+        "$(release_certified_rule true false false)" false
     expect "no local certificate blocks release" \
-        "$(release_certified_rule false true true true)" false
+        "$(release_certified_rule false true true)" false
 
     # ---- evidence is the only certifier: booleans are inert --------------
     # With every boolean asserted and no evidence files, every gate is false
     # and a locally-certified run still cannot release.
-    export CERTIFY_CROSS_PLATFORM_LANES=1 CERTIFY_REAL_PROVIDER=1 CERTIFY_REAL_SOAK=1
+    export CERTIFY_CROSS_PLATFORM_LANES=1 CERTIFY_REAL_PROVIDER=1
     selftest_tmp="$(mktemp -d "${TMPDIR:-/tmp}/faktor-cert-gates.XXXXXX")" || exit 1
     trap 'rm -rf "$selftest_tmp"' EXIT
     mkdir -p "$selftest_tmp/empty" "$selftest_tmp/signed" "$selftest_tmp/unsigned"
@@ -512,10 +513,8 @@ if [ "$SELFTEST" = "release_gates" ]; then
         "$(evidence_gate cross_platform_lanes "$selftest_tmp/empty")" false
     expect "boolean real-provider flag is inert without evidence" \
         "$(evidence_gate real_provider "$selftest_tmp/empty")" false
-    expect "boolean real-soak flag is inert without evidence" \
-        "$(evidence_gate real_soak "$selftest_tmp/empty")" false
     expect "asserted booleans cannot release-certify a local pass" \
-        "$(release_certified_rule true false false false)" false
+        "$(release_certified_rule true false false)" false
     saved_evidence_dir="$EVIDENCE_DIR"
     EVIDENCE_DIR="$selftest_tmp/empty"
     if assert_boolean_flags_inert; then
@@ -538,13 +537,13 @@ fs.writeFileSync(process.argv[2], JSON.stringify({
                 --sign-key "$selftest_tmp/key.pem" --key-id selftest --commands "release-gate selftest" \
                 --runner-os darwin --runner-arch arm64 --runner-ci selftest --runner-run-id 1 >/dev/null &&
             CERTIFY_EVIDENCE_KEYS="$selftest_tmp/keys.json" node "$EVIDENCE_SCRIPT" write \
-                --kind real_soak --status passed --out-dir "$selftest_tmp/unsigned" \
+                --kind real_provider --status passed --out-dir "$selftest_tmp/unsigned" \
                 --commands "release-gate selftest unsigned" \
                 --runner-os darwin --runner-arch arm64 --runner-ci selftest --runner-run-id 1 >/dev/null; then
             expect "signed allowlisted evidence certifies a gate" \
                 "$(CERTIFY_EVIDENCE_KEYS="$selftest_tmp/keys.json" evidence_gate cross_platform_lanes "$selftest_tmp/signed")" true
             expect "unsigned evidence never certifies a gate" \
-                "$(CERTIFY_EVIDENCE_KEYS="$selftest_tmp/keys.json" evidence_gate real_soak "$selftest_tmp/unsigned")" false
+                "$(CERTIFY_EVIDENCE_KEYS="$selftest_tmp/keys.json" evidence_gate real_provider "$selftest_tmp/unsigned")" false
             node -e '
 const fs = require("fs");
 const file = process.argv[1];
@@ -628,7 +627,6 @@ else
     fi
     add_skip coding-benchmark-real-model "provider-key run excluded: local certification is offline by contract (no keys, no network)"
     add_skip windows-lane "no Windows host here; the CI windows lane owns it"
-    add_skip real-soak "wall-clock 12-24h soak is a self-hosted/nightly hook, not run here"
 fi
 
 TOTAL_SECTIONS=${#SECTION_FN[@]}
@@ -692,8 +690,8 @@ ATTEMPTED="$i"
 # ---------------------------------------------------------------------------
 emit_manifest() {
     local commit dirty rustc_v cargo_v os arch now status local_offline release_certified level
-    local cross_platform real_provider real_soak platform_lane k
-    local cross_signed real_signed soak_signed
+    local cross_platform real_provider platform_lane k
+    local cross_signed real_signed
     commit="$(git rev-parse HEAD 2>/dev/null || printf unknown)"
     dirty="$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
     rustc_v="$(rustc --version 2>/dev/null || printf unknown)"
@@ -705,7 +703,6 @@ emit_manifest() {
     # truthy boolean without verifying signed evidence fails the run.
     cross_platform="$(evidence_gate cross_platform_lanes)"
     real_provider="$(evidence_gate real_provider)"
-    real_soak="$(evidence_gate real_soak)"
     if ! assert_boolean_flags_inert; then
         FAILED=1
         FAILED_SECTION="${FAILED_SECTION:-release-gates}"
@@ -716,9 +713,10 @@ emit_manifest() {
         status="fail"
     fi
     # Certification levels: local_offline is this host's clean full pass;
-    # release additionally requires ALL THREE verified external evidence
-    # gates for this exact commit and tree. The harness never fabricates a
-    # gate from a flag.
+    # release additionally requires EVERY verified external evidence gate
+    # for this exact commit and tree. The harness never fabricates a gate
+    # from a flag, and the 12-24h real-time soak is out of scope by owner
+    # decision (never a gate).
     local_offline="$(local_offline_certified_rule "$status" "$PROFILE" "$dirty" "$FAST_TESTS_SKIPPED")"
     # Write this host's own evidence object when it certifies (unsigned unless
     # CERTIFY_EVIDENCE_SIGN_KEY is configured; never a release gate).
@@ -730,7 +728,7 @@ emit_manifest() {
             --runner-run-id "$(date -u +%Y%m%dT%H%M%SZ)" \
             >>"$LOG_DIR/evidence-local_offline.log" 2>&1 || true
     fi
-    release_certified="$(release_certified_rule "$local_offline" "$cross_platform" "$real_provider" "$real_soak")"
+    release_certified="$(release_certified_rule "$local_offline" "$cross_platform" "$real_provider")"
     level="none"
     if [ "$release_certified" = "true" ]; then
         level="release"
@@ -739,7 +737,6 @@ emit_manifest() {
     fi
     cross_signed="$(if [ "$cross_platform" = "true" ]; then printf true; else printf false; fi)"
     real_signed="$(if [ "$real_provider" = "true" ]; then printf true; else printf false; fi)"
-    soak_signed="$(if [ "$real_soak" = "true" ]; then printf true; else printf false; fi)"
     case "$os" in
         darwin) platform_lane="macos" ;;
         linux) platform_lane="linux" ;;
@@ -758,17 +755,14 @@ emit_manifest() {
         printf '  "release_gates": {\n'
         printf '    "cross_platform_lanes": %s,\n' "$cross_platform"
         printf '    "real_provider": %s,\n' "$real_provider"
-        printf '    "real_soak": %s,\n' "$real_soak"
         printf '    "evidence_required": true,\n'
         printf '    "boolean_inputs_ignored": true\n'
         printf '  },\n'
         printf '  "evidence": {\n'
         printf '    "cross_platform_lanes": {"file": "%s", "verified": %s, "release_grade": %s},\n' \
             "$(json_escape "$EVIDENCE_DIR/cross_platform_lanes.json")" "$cross_platform" "$cross_signed"
-        printf '    "real_provider": {"file": "%s", "verified": %s, "release_grade": %s},\n' \
+        printf '    "real_provider": {"file": "%s", "verified": %s, "release_grade": %s}\n' \
             "$(json_escape "$EVIDENCE_DIR/real_provider.json")" "$real_provider" "$real_signed"
-        printf '    "real_soak": {"file": "%s", "verified": %s, "release_grade": %s}\n' \
-            "$(json_escape "$EVIDENCE_DIR/real_soak.json")" "$real_soak" "$soak_signed"
         printf '  },\n'
         printf '  "commit": "%s",\n' "$(json_escape "$commit")"
         printf '  "dirty_count": %s,\n' "$dirty"
@@ -844,7 +838,7 @@ emit_manifest() {
         printf '      "coding_benchmark_real_model": "skipped: provider-key run, offline local certification never spends"\n'
         printf '    },\n'
         printf '    "offline": {"network_required": false, "provider_keys_required": false},\n'
-        printf '    "release_rule": "a release is certified only for its exact commit with dirty=false AND local_offline_certified AND cross-platform lanes + real-provider + real-soak evidence"\n'
+        printf '    "release_rule": "a release is certified only for its exact commit with dirty=false AND local_offline_certified AND cross-platform lanes + real-provider evidence"\n'
         printf '  }\n'
         printf '}\n'
     } >"$MANIFEST.tmp"
@@ -862,8 +856,7 @@ if [ "$SELFTEST" = "force_fail" ]; then
         '"local_offline_certified": false' \
         '"release_certified": false' \
         '"cross_platform_lanes": false' \
-        '"real_provider": false' \
-        '"real_soak": false'; do
+        '"real_provider": false'; do
         if ! grep -q -- "$needle" "$MANIFEST"; then
             printf 'selftest: manifest schema missing %s\n' "$needle" >&2
             schema_ok=0
@@ -893,8 +886,8 @@ printf 'manifest: %s\n' "$MANIFEST"
 printf 'commit:   %s (dirty=%s)\n' \
     "$(git rev-parse HEAD 2>/dev/null || printf unknown)" \
     "$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
-printf 'evidence: cross-platform=%s real-provider=%s real-soak=%s (dir=%s)\n' \
-    "$(evidence_gate cross_platform_lanes)" "$(evidence_gate real_provider)" "$(evidence_gate real_soak)" "$EVIDENCE_DIR"
+printf 'evidence: cross-platform=%s real-provider=%s (dir=%s)\n' \
+    "$(evidence_gate cross_platform_lanes)" "$(evidence_gate real_provider)" "$EVIDENCE_DIR"
 printf 'gates:    CERTIFY_* booleans are inert self-test inputs; only verified signed evidence certifies\n'
 printf 'skipped:  %s section(s) recorded in the manifest\n' "${#SKIPPED_NAMES[@]}"
 printf 'offline:  no network, no provider keys, no LLM calls\n'

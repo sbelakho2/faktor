@@ -1,14 +1,14 @@
 # Faktor v7.5.6 wire compatibility manifest
 
-**Measured status (unmodified-client round): transport-exact, 33/37
-response surfaces exact, 4 documented divergences.** The pinned upstream
+**Measured status (unmodified-client round): transport-exact, 35/37
+response surfaces exact, 2 documented divergences.** The pinned upstream
 client — `@kilocode/sdk@7.5.6` from `Kilo-Org/kilocode@fa02955b`, vendored
 verbatim in `compat/kilo-v756/upstream-sdk/` — is replayed against this
 daemon by `cargo test -p faktor-tests-compat --lib
 unmodified_upstream_client`. The corpus has **37 recorded steps**
 (`compat/kilo-v756/sdk-traces/`): request bytes (method, path, query
 encoding, body, Basic auth header, content-type) match the recorded client
-bytes for **all 37**; **33 of 37** response surfaces match structurally
+bytes for **all 37**; **35 of 37** response surfaces match structurally
 (empty `session.messages` page, `session.create` ×3, `session.get`,
 `session.status`, `session.prompt`, `session.messages.newest/before`,
 `session.fork`, `session.diff.content`, `session.diff.missing-message`,
@@ -17,9 +17,11 @@ bytes for **all 37**; **33 of 37** response surfaces match structurally
 `session.deleteMessage`, `session.delete`, `session.delete.clean`,
 `config.get`, `config.warnings`, `config.overlay`, `pty.create`,
 `pty.remove`, `permission.list`,
-`question.list`, `network.list`, `global.dispose`, `instance.dispose`,
-`instance.reload`); **4 are locked
-divergence fixtures** (see "What the unmodified client still cannot drive").
+`question.list`, `network.list`, `provider.list`, `global.event`,
+`global.dispose`, `instance.dispose`,
+`instance.reload`); **2 are locked
+divergence fixtures** — both auth locks, by design (see "What the unmodified
+client still cannot drive").
 Every run writes
 `target/certification/kilo-compat.json` (`faktor-kilo-compat/v1`: commit,
 sdk_version, requests/responses passed-of-total, required_divergences,
@@ -184,55 +186,106 @@ store the sequence equals the row id).
      boolean (unknown id → SDK `404 PtyNotFoundError`). `env` VALUES never
      cross the daemon's ONE env authority: the map's NAMES become the spawn
      allowlist (documented, tested).
- 15. **Replay checkpoint corpus**: the replay harness wires the REAL
-     CAS-backed checkpoint store and a checkpoint-recording probe tool, so
-     the revert/unrevert/diff steps run against durable state rather than
-     refusing with "snapshots unavailable". The probe writes a per-process
-     gitignored scratch file (`target/compat-replay-<pid>/probe.txt`,
-     removed before every run) through the workspace handle and records the
-     real missing→existing transition — no fabricated state; the CAS blobs
-     are the bytes actually written. The scratch path is handed to the
-     driver as `probePath` and golden-normalized to `@string`, so
-     concurrent test processes in one checkout never share or race it.
+  15. **Replay checkpoint corpus**: the replay harness wires the REAL
+      CAS-backed checkpoint store and a checkpoint-recording probe tool, so
+      the revert/unrevert/diff steps run against durable state rather than
+      refusing with "snapshots unavailable". The probe writes a per-process
+      gitignored scratch file (`target/compat-replay-<pid>/probe.txt`,
+      removed before every run) through the workspace handle and records the
+      real missing→existing transition — no fabricated state; the CAS blobs
+      are the bytes actually written. The scratch path is handed to the
+      driver as `probePath` and golden-normalized to `@string`, so
+      concurrent test processes in one checkout never share or race it.
+  16. **`provider.list` (`GET /provider`)**: the daemon now answers the
+      SDK's `{all,default,connected,failed}` body, projecting `Model`
+      objects from the REAL catalog — `cost.input/output/cache` from the
+      frozen `PricingSnapshot` quote lines converted by the exact 1e6 ratio
+      into the SDK's published USD-per-million unit (no re-derivation),
+      `limit.context/output` from the real `ModelCapabilities`,
+      `capabilities` mapped from the same real flags (tools/thinking/vision;
+      `temperature`/`interleaved` are the documented conservative `false` —
+      the catalog carries no such capability), `api.{id,url,npm}` from the
+      configured provider FAMILY profile (published endpoint + AI-SDK
+      package identity; `api.id` is the real wire model id), and honest
+      empty `options`/`headers`. **Exclusion rule (asserted)**: a model
+      appears ONLY when its pricing is authoritative
+      (`Known|ConservativeCeiling|LocalZero`) AND the family profile
+      attests the endpoint — `openai`: builtin `Exact` rows only (a custom
+      OpenAI-compatible proxy shares the family id, so its user-override/
+      ceiling rows are excluded); `anthropic`/`google`: any authoritative
+      row (their endpoints are fixed by construction); `ollama`:
+      `LocalZero` only. `PricingState::Unknown` rows are **never flattened
+      to zero**; they are omitted (proved by `faktor-server`'s
+      `provider_list_excludes_unknown_priced_models_and_serves_exact_sibling_byte_exact`:
+      an Unknown-priced sibling is excluded while the Exact sibling is
+      served byte-exact). `default` is `{}` (no provider-qualified default
+      model exists in this runtime config) and `failed` is `[]` (the
+      registry exposes no failed-provider tracking). `connected` is the
+      registry's registered provider instance ids — the daemon keeps no
+      provider-credential store, so registration IS its usable set, never a
+      credential claim; a registered provider whose family has no attested
+      endpoint appears there but contributes no models. **Honest omission**:
+      `release_date` and `status` are OMITTED, not fabricated — the catalog
+      carries neither a vendor release date nor an alpha/beta/deprecated
+      lifecycle (the SDK declares both required; retired rows are excluded
+      by their pricing state). The replay freezes the emitted key set
+      exactly; the unit test pins its absence.
+  17. **`global.event` SDK-union projector**: `GET /global/event` now
+      streams the SDK `GlobalEvent` union, projected from the DURABLE
+      session journal plus the durable message/part rows and the live chunk
+      sink, in journal order, with the bounded ring's global sequence as
+      both the SSE `id` and the payload `id` (resume is exact and
+      idempotent). Projected members: `session.created` (SessionCreated +
+      durable row), `session.updated` (durable row metadata mutation: the
+      row is polled every cycle, and a change to its SDK-visible metadata —
+      title/provider/model — emits exactly one frame; the title-update path
+      journals no event, so the row itself is the trigger), `session.deleted`
+      (SessionEnded + durable row), `session.turn.open` (PromptReceived),
+      `session.turn.close`
+      (TurnCompleted on a park/terminal state; interior hops do not close),
+      `session.error` (Failed), `message.updated` (durable user/assistant
+      rows; system rows have no SDK Message variant), `message.part.updated`
+      (durable text/reasoning part rows plus the durable user prompt text,
+      matching the page's `messageID:index` part identity),
+      `session.next.text.delta` / `session.next.reasoning.delta` (live chunk
+      sink). The session fingerprint covers only SDK-visible metadata, so
+      internal `updated_ms` bumps from state transitions emit nothing (no
+      fabricated churn), the first observation of a row emits nothing
+      (`session.created` covers creation; pre-existing rows are read via
+      `session.list`), and a rename to the SAME title is not a metadata
+      change. **Locked union members, with the missing primitive named**:
+      SDK tool parts (the daemon persists bounded `excerpt` + artifact
+      REFERENCES, never the full inline `output`/`title`/`error` the SDK
+      `ToolState` declares, and stores `tool_call`/`tool_result` as SEPARATE
+      durable rows rather than one stateful `ToolPart`; projecting either
+      row alone would misstate the tool state), and every union member whose
+      subsystem this daemon does not implement (`pty.*`, `permission.*`,
+      `question.*`, `sandbox.*`, `indexing.*`, `installation.*`, MCP,
+      worktree, …). **Frame corpus**:
+      `compat/kilo-v756/sdk-global-frames.json` — frames captured from the
+      REAL projector in a deterministic journal/message/part/chunk scenario
+      (`crates/server/src/compat/sdk.rs`), with `union_types` pinned to the
+      vendored `types.gen.ts` literals and every frame type/property key
+      checked against them; regeneration is
+      `FAKTOR_COMPAT_REGEN_GLOBAL_FRAMES=1`. The live replay additionally
+      validates every observed frame against that corpus (declared type +
+      declared property keys) and requires at least one frame.
 
 ### What the unmodified client still cannot drive (honest)
 
-- **Auth gate + provider OAuth (locked by design).** The unauthenticated
-  `auth.missing` probe asserts the daemon's auth gate (401
+- **Auth gate + provider OAuth (locked by design; re-audited this round).**
+  The unauthenticated `auth.missing` probe asserts the daemon's auth gate (401
   `{error:{code,message,retryable}}` before any handler effect); the
   vendored types declare no 401 for `global.health`, so there is no
   SDK-declared shape it could match and the gate is deliberate. The SDK's
   `auth.set` is provider OAuth at `PUT /auth/{providerID}`; the daemon has
-  no provider-credential store, so the route is honestly 404 — an exact
-  pass would require OAuth persistence outside the allowed compat surface.
-- **`provider.list` metadata (re-audited, still locked).** The SDK's
-  `Provider.models[].Model` requires `api{id,url,npm}`, per-token cost,
-  limit, lifecycle `status` and `release_date`. The daemon catalog exposes
-  real capabilities and a pricing STATE
-  (`Known|ConservativeCeiling|Stale|LocalZero|Unknown`) but has no source
-  for `api.url`, `api.npm`, `release_date` or `status` (it cannot tell
-  alpha/beta/active apart), and the SDK type makes
-  `cost.input/output/cache` numeric REQUIRED — there is no null/optional
-  representation, and `PricingState::Unknown` rows must never be flattened
-  to `0`. Emitting partial Model objects would violate the declared type;
-  the honest 404 stays. Exact missing primitives: per-model API package id,
-  base URL and npm package; a model release date; a lifecycle status; and a
-  numeric cost representation for Unknown-pricing rows.
-- **`global.event` SSE multiplex (re-audited, still locked).** The
-  transport is exact (GET `/global/event`, auth, `200
-  text/event-stream`), but the daemon's `GlobalEvent` envelope is the
-  frozen Faktor journal projection (`type` names like `session_created` /
-  `session_next_text_delta`, payload fields like `session_id`) while the
-  SDK declares a different union (`session.created`, `properties`
-  objects, string `directory`/`project`/`workspace`). Exact missing
-  primitives: an SDK-union frame projector over the journal, plus a
-  replayable SSE frame corpus (the replay compares no frame bodies today).
-- **Streaming.** The SSE request (`GET /global/event`) is transport-locked
-  and opens `200 text/event-stream`, but the replay does not golden-compare
-  SSE frame bodies (an idle harness emits no event), and the daemon's
-  journal/global event payload union is not the SDK's multiplexed
-  `GlobalEvent` union (directory/project/workspace + payload). The
-  divergence is note-locked rather than body-compared.
+  no provider-credential store — its `/auth/set` rotates the SERVER
+  password — so the route is honestly 404. Both locks stand because the
+  daemon has no credential persistence primitive; an exact pass would
+  require implementing provider OAuth persistence (a credential store
+  outside the allowed compat surface), and fabricating a `200: boolean` for
+  a credential write that never happened is exactly what this lock
+  prevents. Nothing else is divergent.
 - **Rich message page omissions.** The page intentionally omits the SDK
   `time` object and part `sessionID` (fork-stable page contract, see fixed
   item 6); the send response carries both. `cost`/`tokens` are zeros
@@ -406,6 +459,8 @@ rows here do not imply v7.5.6-client shape compatibility.
 | network.list | `/network/list?session_id=`, `/network` | GET | legacy: `{networks:[...]}`; SDK alias: bare `SessionNetworkWait[]` — truthfully empty (no reconnect-wait subsystem; network-class asks ride `/permission`) | implemented, tested; **exact client pass** for the SDK alias |
 | network.reply | `/network/reply` | POST | `{ok:true}` | implemented, tested; SDK calls `/network/{requestID}/reply` (not registered) |
 | network.reject | `/network/reject` | POST | `{ok:true}` | implemented, tested; SDK calls `/network/{requestID}/reject` (not registered) |
+| provider.list | `/provider` | GET | SDK `{all,default,connected,failed}`; `Model` objects from the real catalog (quote-line cost in USD/M, real limits/capabilities, family-profile `api.{id,url,npm}`); authoritative-pricing exclusion rule; `release_date`/`status` omitted (no source) | implemented, tested; **exact client pass** (Unknown-priced sibling exclusion + byte-exact Exact sibling pinned by unit test) |
+| global.event | `/global/event` | GET | SDK `GlobalEvent` SSE union projected from the durable journal + message/part rows + live chunk sink, in journal order with ring-sequence ids; locked members named above | implemented, tested; **exact client pass** (live frames validated against `compat/kilo-v756/sdk-global-frames.json`) |
 | config.get | `/config/get`, `/config` | GET | legacy `/config/get`: `{config}` envelope; SDK `/config`: the BARE config object | implemented, tested; **exact client pass** for the SDK alias |
 | config.update | `/config/update` | POST | `{ok:true}` — only `model`/`compact_at_usage`/`instructions` are daemon-editable; any other key → 400 with the allowlist | implemented, tested; the SDK updates via PATCH `/config` (not registered) |
 | config.overlay | `/config/overlay` | GET, POST | GET (SDK read): one-layer projection — runtime object as the single source (`kind:"runtime"`), `effective == global`, `project:{}`, file targets `exists:false` with empty paths/revisions, real per-key `fields`; POST: `{ok:true}` bounded full replace | implemented, tested; **exact client pass** for the SDK GET |
@@ -429,22 +484,32 @@ rows here do not imply v7.5.6-client shape compatibility.
    (optional in the SDK type) rather than fabricate one; page `time`/part
    `sessionID` cannot ride the fork-equal page contract; per-message
    cost/tokens are not modeled by the frozen surface.
-2. **Missing client routes** — `GET /provider`, `GET /pty` (list),
-   `GET/PATCH /pty/{ptyID}` (terminal metadata the registry deliberately
-   does not keep), `/pty/{ptyID}/connect-token`, `PUT/DELETE
-   /auth/{providerID}`, `PATCH /config`, `PATCH /config/overlay`, and the
-   project/workspace lifecycle routes are not registered. `GET /config`,
-   `GET /config/overlay`, `GET /permission`, `GET /question`, `GET
+2. **Missing client routes** — `GET /pty` (list), `GET/PATCH /pty/{ptyID}`
+   (terminal metadata the registry deliberately does not keep),
+   `/pty/{ptyID}/connect-token`, `PUT/DELETE /auth/{providerID}`, `PATCH
+   /config`, `PATCH /config/overlay`, and the project/workspace lifecycle
+   routes are not registered. `GET /provider`, `GET /config`, `GET
+   /config/overlay`, `GET /permission`, `GET /question`, `GET
    /network`, `PATCH /session/{sessionID}` and `POST/DELETE /pty` now ARE.
-3. **SSE event union** — the daemon's journal/global frames are not the
-   SDK `GlobalEvent` union; an idle replay emits no frame, so the gap is
-   note-locked (no body golden). An SDK-union projector plus a frame corpus
-   are the exact missing primitives.
-4. **Provider Model metadata** — the SDK `Model` requires
-   `api{id,url,npm}`/numeric cost/limit/status/release_date; the daemon
-   cannot source `api.url`/`api.npm`/`release_date`/lifecycle `status`, and
-   `PricingState::Unknown` rows have no honest numeric cost representation
-   in the required type (unknown pricing is never faked as 0).
+3. **SSE union coverage** — the projector serves the lifecycle union members
+   the task round targeted (`session.created`, `session.updated` via the
+   durable row fingerprint, `session.deleted`, `message.updated`,
+   `message.part.updated`) plus turn/error/delta members (fixed item 17).
+   Locked members: SDK tool parts (the daemon persists bounded excerpts +
+   artifact references, not the full `ToolState` inline fields, and keeps
+   call/result as separate rows), and the union members whose subsystems do
+   not exist (`pty.*`, `permission.*`, …). The corpus records what is
+   served; nothing else is emitted.
+4. **Provider Model lifecycle metadata** — `release_date`/`status` are
+   omitted by design (the catalog carries neither a vendor release date nor
+   an alpha/beta/deprecated state; both are declared required by the SDK and
+   are never fabricated). `api.url`/`api.npm` come from the family profile,
+   a family-level published identity — a per-instance base URL is not
+   visible to the compat layer and is not claimed. `PricingState::Unknown`
+   rows have no honest numeric cost representation in the required type, so
+   they are excluded from the list (never faked as 0); user-override rows on
+   the openai wire family are likewise excluded because the endpoint cannot
+   be attested.
 5. **PTY metadata routes** — the real PTY registry keeps live processes,
    not command/args/cwd/title rows, so `GET /pty`, `GET /pty/{ptyID}` and
    `PATCH /pty/{ptyID}` (the SDK's list/get/update shape) stay

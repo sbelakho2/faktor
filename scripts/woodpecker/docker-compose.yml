@@ -27,8 +27,9 @@ services:
       WOODPECKER_GITHUB_CLIENT: ${WOODPECKER_GITHUB_CLIENT:-}
       WOODPECKER_GITHUB_SECRET: ${WOODPECKER_GITHUB_SECRET:-}
       # Cap for repo-level pipeline timeouts (minutes). 1560 = 26h so the
-      # weekly `soak` 24h lane can be admitted; see setup.md §6. Hosted
-      # instances fix this value, so soak needs a self-hosted server.
+      # nightly longrun campaign can be admitted; see setup.md §6. Hosted
+      # instances fix this value, so the cron campaign needs a self-hosted
+      # server.
       WOODPECKER_MAX_PIPELINE_TIMEOUT: ${WOODPECKER_MAX_PIPELINE_TIMEOUT:-1560}
     volumes:
       - woodpecker-data:/var/lib/woodpecker

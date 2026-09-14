@@ -390,10 +390,7 @@ mod tests {
         .unwrap();
         let deps = ServerDeps::new(session, agent, permissions);
         AppState {
-            bus: std::sync::Arc::new(crate::global::GlobalEventBus::new(
-                deps.session.clone(),
-                None,
-            )),
+            projector: crate::api::AppState::test_projector(deps.session.clone()),
             deps: std::sync::Arc::new(deps),
             config: std::sync::Arc::new(std::sync::RwLock::new(serde_json::Value::Object(
                 Default::default(),

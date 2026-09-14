@@ -556,6 +556,15 @@ impl Provider for OllamaProvider {
         OLLAMA_MAX_IMAGE_BYTES
     }
 
+    /// The native `/api/chat` message object has NO document field (only
+    /// `content`, `thinking`, `images` and `tool_calls`): Ollama is never
+    /// document-capable, so a resolved [`ContentKind::FileData`] part is a
+    /// typed refusal at the adapter boundary ([`Provider::stream`]) instead
+    /// of a silent drop.
+    fn document_capable(&self, _model: &str) -> bool {
+        false
+    }
+
     /// The probed `/api/show` capability drives the embedding gate (spec
     /// §10: discovery/probing drive behavior): an embedding-capable model
     /// (or an operator override) admits the CLI's strict `[embeddings]`
@@ -649,6 +658,18 @@ impl Provider for OllamaProvider {
         if let Err(e) =
             faktor_provider::validate_media_delivery(&req, &caps, self.max_image_bytes())
         {
+            return faktor_provider::provider_error_stream(e);
+        }
+        // The same gate for DOCUMENTS, mirroring the image gate: the native
+        // wire has no document field, so any resolved `FileData` part is a
+        // typed `BadRequest` BEFORE the body is built and before any wire
+        // byte — a directly-constructed hostile request can never have a
+        // document silently dropped by the lowering.
+        if let Err(e) = faktor_provider::validate_document_delivery(
+            &req,
+            self.document_capable(&req.model),
+            self.max_document_bytes(),
+        ) {
             return faktor_provider::provider_error_stream(e);
         }
         let body = self.wire_body(&req);
@@ -2024,6 +2045,69 @@ mod tests {
         // The legacy URL-shaped image part is not bytes-bearing and never
         // reaches this gate; only resolved ImageData is admitted/refused.
         assert_eq!(provider.max_image_bytes(), OLLAMA_MAX_IMAGE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn adapter_document_gate_refuses_documents_typed_before_the_wire() {
+        // Adapter-boundary DOCUMENT gate (parity with the image gate): the
+        // native /api/chat wire has no document field, so a resolved
+        // FileData part is a typed, single-frame BadRequest and NO wire byte
+        // is sent. The model is explicitly vision-capable so the refusal can
+        // only come from the document gate.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/api/chat",
+            MockAction::Respond {
+                status: 200,
+                body: r#"{"done":true}"#.into(),
+            },
+        );
+        let base = server.base_url().await;
+        let mut cfg = OllamaConfig::new(Some(base));
+        cfg.model_overrides.insert(
+            "qwen3.8".into(),
+            ModelCapabilities {
+                vision: true,
+                ..ModelCapabilities::default()
+            },
+        );
+        let provider = OllamaProvider::new(cfg);
+        assert!(
+            !provider.document_capable("qwen3.8"),
+            "the native wire has no document field"
+        );
+        let mut r = req("qwen3.8");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![ContentPart::file_data(
+                "application/pdf",
+                Some("spec.pdf"),
+                b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n%%EOF".to_vec(),
+            )
+            .unwrap()],
+        });
+        let mut stream = provider.stream(r);
+        let item = stream
+            .next()
+            .await
+            .expect("the refusal is a single terminal frame");
+        let err = item.expect_err("ollama must refuse a resolved document part");
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
+        assert!(!err.retryable, "nothing was attempted; retry cannot help");
+        assert!(
+            err.message.contains("does not support document input"),
+            "typed refusal names the capability: {err:?}"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "the refusal stream must terminate"
+        );
+        assert_eq!(
+            server.request_count(),
+            0,
+            "the document gate runs BEFORE any wire byte is sent"
+        );
     }
 
     #[tokio::test]

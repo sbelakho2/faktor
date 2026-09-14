@@ -481,9 +481,6 @@ const WORKFLOWS = {
       'supply-chain',
     ],
   },
-  soak: {
-    expected: ['soak-scale', 'longrun-24h'],
-  },
 };
 
 function expectedLanes(workflow) {
@@ -1255,12 +1252,12 @@ function runSelftest() {
     run('writeEvidence binds HEAD commit and tree', () => {
       const outDir = join(repo, 'target/certification/evidence');
       const path = writeEvidence({
-        kind: 'real_soak',
+        kind: 'real_provider',
         status: 'passed',
         outDir,
         cwd: repo,
         artifactsExplicit: [],
-        commandsText: 'selftest soak commands',
+        commandsText: 'selftest provider commands',
         runner: { os: 'linux', arch: 'amd64', ci: 'selftest', run_id: '1' },
       });
       const record = readJsonStrict(path);
@@ -1268,7 +1265,7 @@ function runSelftest() {
       assert(record.tree_hash === tree, 'evidence tree binding');
       assert(record.repository_tree_verified === true, 'tree verification flag');
       const verdict = verifyEvidenceObject(record, {
-        kind: 'real_soak',
+        kind: 'real_provider',
         expectedCommit: commit,
         expectedTree: tree,
         keys: {},
@@ -1281,7 +1278,7 @@ function runSelftest() {
     run('woodpecker marker heredocs match lane commands', () => {
       const yamlDir = resolve(ROOT, '.woodpecker');
       const problems = [];
-      const yamlFiles = { pr: 'pr.yaml', trusted: 'trusted.yaml', nightly: 'nightly.yaml', soak: 'soak.yaml' };
+      const yamlFiles = { pr: 'pr.yaml', trusted: 'trusted.yaml', nightly: 'nightly.yaml' };
       for (const [workflow, file] of Object.entries(yamlFiles)) {
         if (!existsSync(join(yamlDir, file))) {
           continue;
@@ -1331,7 +1328,7 @@ commands:
   verify         verify one evidence object (--kind K [--evidence-dir DIR]
                  [--require-signed] [--keys FILE] [--json]); exit 1 on problems
   verify-markers verify a workflow's lane markers and write the CI certificate
-                 --workflow pr|trusted|nightly|soak [--lanes-dir DIR] [--out FILE]
+                 --workflow pr|trusted|nightly [--lanes-dir DIR] [--out FILE]
                  [--yaml-dir DIR] [--pipeline-status STATUS] [--run-id ID]
   selftest       prove the rejection matrix + signature allowlist + repo drift`);
 }

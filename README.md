@@ -110,7 +110,7 @@ cargo run -p faktor-cli -- doctor
 
 ## CI
 
-CI runs on [Woodpecker](https://woodpecker-ci.org) from four event-scoped
+CI runs on [Woodpecker](https://woodpecker-ci.org) from three event-scoped
 workflows in `.woodpecker/` (targeted at Woodpecker 3.x; the folder takes
 precedence over a root `.woodpecker.yml`, and this repository has none):
 
@@ -124,13 +124,15 @@ precedence over a root `.woodpecker.yml`, and this repository has none):
 - **`trusted.yaml`** (`push`/`tag`, darwin/windows on `push` to `main`) — the
   full lane set including the release `[perf]` lane and the darwin/windows
   matrix combos, using the trusted named-volume caches (`faktor-trusted-*`).
-- **`nightly.yaml`** / **`soak.yaml`** (`cron` jobs `nightly`/`soak`) —
-  `[fault]` campaigns at scale, longrun, efficiency, economy, coding-benchmark
-  smoke (provider-key runs are recorded as explicit skips, never silent) and
-  supply-chain evidence; and the `[soak]` 12h synthetic + 24h zero-drift
-  wall-clock suites. Registration and the required timeout cap are in
-  `scripts/woodpecker/setup.md`; `scripts/woodpecker/activate.sh` does it via
-  the Woodpecker API.
+- **`nightly.yaml`** (`cron` job `nightly`) — `[fault]` campaigns at scale,
+  longrun, efficiency, economy, coding-benchmark smoke (provider-key runs are
+  recorded as explicit skips, never silent) and supply-chain evidence.
+  Registration is in `scripts/woodpecker/setup.md`;
+  `scripts/woodpecker/activate.sh` does it via the Woodpecker API.
+
+The 12–24h real-time soak is out of scope by owner decision: it is not a
+release criterion, no CI workflow or release gate consumes it, and the
+`[soak]`-ignored longrun suites remain runnable manually.
 
 The `certificate` job is the aggregate gate in every workflow: every lane
 emits a `faktor-woodpecker-lane/v2` marker with the exact commit and tree,
@@ -143,7 +145,7 @@ failed-lane, skipped-required, silent-skip, command-digest/drift,
 artifact-mismatch and non-success workflow status — then writes
 `ci-certification.json`. Passing campaigns also write
 `target/certification/evidence/<kind>.json` `faktor-cert-evidence/v1`
-objects (`real_provider`, `real_soak`, ...); release gates require those
+objects (`real_provider`, ...); release gates require those
 objects to be signed by an allowlisted ed25519 identity. darwin/windows
 carry per-platform certificates inside `trusted.yaml`. Woodpecker reports
 one commit status per workflow, so branch protection requires
@@ -198,4 +200,8 @@ authoritative surface and is scan-enforced.
 | OpenAI Responses family | IMPLEMENTED | native `OpenAiFamily::Responses` dispatch + `responses_body`/`responses_stream` (`crates/openai/src/lib.rs`), CLI `api=chat\|responses` (`crates/cli/src/config.rs` `OpenAiApi`) |
 | Windows containment (Job Objects + ConPTY) | IMPLEMENTED | `crates/winjob/src/lib.rs`, `crates/terminal/src/lib.rs` (`JobGuard`), `crates/pty/src/windows.rs` (spawn suspended → assign → resume; no taskkill guarantee) |
 | Certification evidence chain | IMPLEMENTED | `scripts/certification/evidence.mjs` (`faktor-cert-evidence/v1`, `verify-markers`), `scripts/certification/evidence.schema.json`, `scripts/certify-local.sh` (`evidence_gate`), v2 lane markers in `.woodpecker/pr.yaml` |
+| JetBrains 7.1.2 upstream assets | VENDORED (provenance only, never a parity claim) | pinned source `compat/jetbrains-712/` + per-file SHA-256 manifest `ui/upstream.json` (`jetbrains_712`) |
+| JetBrains behavioral parity | IMPLEMENTED (HEAD-bound executable matrix) | `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt` writes `target/certification/jetbrains-parity.json`: 11/11 rows against canned frames and the fake daemon |
+| JetBrains visual parity | IMPLEMENTED (offscreen render vs pinned baselines) | same matrix: 8 rendered panels against `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json` |
+| UI parity (`ui_parity`) | PARTIAL (derived in `target/certification/capabilities.json`) | JetBrains behavioral/visual, VS Code render and upstream replay axes; stays PARTIAL until the `target/certification/kilo-compat.json` responses are N/N |
 | Repo rename (faktor) | DONE (external) | `gh repo rename`; in-tree branding was already Faktor and is unchanged |
