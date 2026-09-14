@@ -51,6 +51,9 @@ object JetBrainsParitySmoke {
 
     private var failures = 0
 
+    /** Set when the executable parity matrix ran inside the fake-daemon session. */
+    private var matrixHit = false
+
     @JvmStatic
     fun main(args: Array<String>) {
         step("pin: upstream JetBrains 7.1.2 tree matches ui/upstream.json") {
@@ -103,6 +106,27 @@ object JetBrainsParitySmoke {
         }
         step("real daemon: history/task/permissions/terminal/restart/reconnect") {
             realDaemonSuite(args[0])
+        }
+
+        // The executable parity matrices: every row runs against the canned
+        // frames AND the fake daemon, the visual matrix renders each panel
+        // against the pinned baselines, and the artifact is written to
+        // target/certification/jetbrains-parity.json bound to this HEAD.
+        step("parity matrix: behavioral rows + visual render vs pinned baselines + artifact") {
+            assertTrue(
+                matrixHit,
+                "the parity matrix did not run inside the fake-daemon session"
+            )
+            assertEquals(
+                0, ParityMatrix.behavioralFailures(),
+                "parity matrix behavioral rows failed (see the artifact row evidence)"
+            )
+            for (result in ParityMatrix.visuals()) {
+                assertTrue(
+                    result.passed,
+                    "visual row ${result.panel}: ${result.detail}"
+                )
+            }
         }
 
         println(if (failures == 0) "JETBRAINS PARITY SMOKE PASS" else "JETBRAINS PARITY SMOKE FAIL ($failures)")
@@ -176,7 +200,7 @@ object JetBrainsParitySmoke {
             "${hashes.fields.size} files, $bytes bytes, sha256 verified")
     }
 
-    private fun resolveRepoRoot(): File {
+    internal fun resolveRepoRoot(): File {
         val prop = System.getProperty("faktor.repo.root")
         if (prop != null && prop.isNotEmpty()) {
             val root = File(prop).absoluteFile
@@ -267,7 +291,7 @@ object JetBrainsParitySmoke {
     // --------------------------------------------------------- 3. agent tree
 
     private fun agentTreeCanned() {
-        val agents = parseNativeAgents(AGENTS_JSON)
+        val agents = parseNativeAgents(PARITY_AGENTS_JSON)
         assertEquals(2, agents.size)
         val child = agents[1]
         assertEquals("Blocked", child.state)
@@ -304,7 +328,7 @@ object JetBrainsParitySmoke {
     // -------------------------------------------------------- 4. permissions
 
     private fun permissionsCanned() {
-        val permissions = parseNativePermissionList(PERMISSION_LIST_JSON)
+        val permissions = parseNativePermissionList(PARITY_PERMISSION_LIST_JSON)
         assertEquals(1, permissions.size)
         val panel = PermissionsPanel()
         var repliedId: String? = null
@@ -348,7 +372,7 @@ object JetBrainsParitySmoke {
     // ----------------------------------------------------------- 5. terminal
 
     private fun terminalCanned() {
-        val page = parseNativeTerminalPage(TERMINALS_JSON)
+        val page = parseNativeTerminalPage(PARITY_TERMINALS_JSON)
         assertEquals("7", page.sessionId)
         assertEquals(1, page.terminals.size)
         assertEquals("5", page.terminals[0].id)
@@ -356,12 +380,12 @@ object JetBrainsParitySmoke {
         assertEquals("3", page.terminals[0].taskId)
         assertEquals(null, page.terminals[0].agentId)
         assertEquals(1L, page.unowned)
-        val events = parseNativeTerminalEventPage(TERMINAL_EVENTS_JSON)
+        val events = parseNativeTerminalEventPage(PARITY_TERMINAL_EVENTS_JSON)
         assertEquals(1, events.events.size)
         assertEquals("created", events.events[0].type)
         assertEquals(false, events.hasMore)
-        assertEquals("6", parseNativeTerminalSpawned(TERMINAL_SPAWNED_JSON).ptyId)
-        val output = parseNativeTerminalOutput("6", TERMINAL_OUTPUT_JSON)
+        assertEquals("6", parseNativeTerminalSpawned(PARITY_TERMINAL_SPAWNED_JSON).ptyId)
+        val output = parseNativeTerminalOutput("6", PARITY_TERMINAL_OUTPUT_JSON)
         assertEquals("6", output.ptyId)
         assertEquals(true, output.alive)
         assertTrue(output.output.contains("parity-output"), output.output)
@@ -429,9 +453,9 @@ object JetBrainsParitySmoke {
     // -------------------------------------------------- 6. review/tournament
 
     private fun reviewCanned() {
-        val view = TaskTree.tournamentView(parseNativeTournament(TOURNAMENT_JSON))
+        val view = TaskTree.tournamentView(parseNativeTournament(PARITY_TOURNAMENT_JSON))
         val panel = TournamentPanel()
-        panel.setSummaries(dev.faktor.shared.parseNativeTournamentSummaries(TOURNAMENTS_LIST_JSON))
+        panel.setSummaries(dev.faktor.shared.parseNativeTournamentSummaries(PARITY_TOURNAMENTS_LIST_JSON))
         panel.setTournament(view)
         assertEquals(2, panel.candidateCount())
         assertEquals(false, panel.decideEnabled(), "a decided tournament exposes no decide")
@@ -505,7 +529,7 @@ object JetBrainsParitySmoke {
     // --------------------------------------------------------- 8. settings
 
     private fun settingsCanned() {
-        val providers = parseNativeProviders(PROVIDERS_JSON)
+        val providers = parseNativeProviders(PARITY_PROVIDERS_JSON)
         assertEquals(2, providers.size)
         assertEquals("alpha", providers[0].instanceId)
         assertEquals("openai", providers[0].family)
@@ -540,7 +564,7 @@ object JetBrainsParitySmoke {
     private fun providerSelectionCanned() {
         // Two providers expose the SAME model id with different capability
         // sets: the (provider, model) pair is the only safe join key.
-        val catalog = parseNativeModelCatalog(DUAL_MODELS_JSON)
+        val catalog = parseNativeModelCatalog(PARITY_DUAL_MODELS_JSON)
         val panel = SettingsPanel()
         panel.setCatalog(catalog)
         assertEquals(2, panel.providerCount())
@@ -555,7 +579,7 @@ object JetBrainsParitySmoke {
         panel.setCatalog(emptyList())
         assertEquals(0, panel.providerCount())
         assertEquals(null, panel.selectedProvider())
-        val child = parseNativeAgents(AGENTS_JSON)[1]
+        val child = parseNativeAgents(PARITY_AGENTS_JSON)[1]
         val model = TaskTree.build(
             agents = listOf(child.copy(provider = "alpha"), child.copy(agentId = "child-b", provider = "beta")),
             catalog = catalog
@@ -567,7 +591,7 @@ object JetBrainsParitySmoke {
     // ---------------------------------------------------------- 10. history
 
     private fun historyCanned() {
-        val sessions = parseNativeSessionList(SESSIONS_JSON)
+        val sessions = parseNativeSessionList(PARITY_SESSIONS_JSON)
         assertEquals(2, sessions.size)
         val panel = HistoryPanel()
         var openedId: String? = null
@@ -613,6 +637,12 @@ object JetBrainsParitySmoke {
     }
 
     // ------------------------------------------------------ fake daemon e2e
+    //
+    // The fake-daemon half of the parity matrix: one named observable per
+    // surface, driven in a single end-to-end session against the raw-socket
+    // fake daemon. The observables assert the EXACT request bodies and the
+    // rendered panel state; a failure is recorded against its surface row in
+    // `target/certification/jetbrains-parity.json`.
 
     private fun fakeDaemonSuite() {
         val daemon = ParityFakeDaemon()
@@ -627,6 +657,10 @@ object JetBrainsParitySmoke {
             Paths.get(System.getProperty("java.io.tmpdir"), "faktor-parity-fake")
         )
         var panel: FaktorChatPanel? = null
+        val registry = ParityMatrixRegistry
+        // The parity matrix owns `current` for this run; only the observable
+        // registry is ours to clear between suites.
+        registry.observables.clear()
         try {
             service.attachConnection(connection, stopAction = { process.destroyForcibly() })
             val created = service.createSession("alpha", "m", title = "parity")
@@ -634,96 +668,175 @@ object JetBrainsParitySmoke {
             service.watchSession("7", 0)
             panel = FaktorChatPanel(service)
             assertTrue(panel.refreshNowForTest(), "one refresh cycle must finish")
+            val chat = panel
 
-            // history: the durable session listing, current marked.
-            assertEquals(2, panel.historyView().count())
-            assertTrue(panel.historyView().label(0).contains("[ready]"), panel.historyView().label(0))
-            assertTrue(panel.historyView().streamText().contains("session=7"), panel.historyView().streamText())
-
-            // provider selection: the registry view drives the combos.
-            assertEquals(2, panel.settingsView().providerCount())
-            assertEquals("alpha", panel.settingsView().selectedProvider())
-            assertEquals("m", panel.settingsView().selectedModel())
-
-            // permissions: pending list rendered; reply posts the strict body.
-            assertEquals(1, panel.permissionsView().count())
-            assertTrue(
-                panel.permissionsView().unitLabel(0).contains("capability=shell"),
-                panel.permissionsView().unitLabel(0)
-            )
-            panel.permissionsView().submitReply("deny")
-            await("permission reply routed") {
-                daemon.lastRequest("POST", "/permission/reply") != null
+            registry.observables["history"] = {
+                // Durable session listing with the current session marked.
+                assertEquals(2, chat.historyView().count())
+                assertTrue(
+                    chat.historyView().label(0).contains("[ready]"),
+                    chat.historyView().label(0)
+                )
+                assertTrue(
+                    chat.historyView().streamText().contains("session=7"),
+                    chat.historyView().streamText()
+                )
             }
-            assertEquals(
-                "{\"permission_id\":\"7\",\"decision\":\"deny\"}",
-                daemon.lastRequest("POST", "/permission/reply")!!.body
-            )
-
-            // terminal: session-owned rows, spawn body, output snapshot.
-            assertEquals(1, panel.terminalView().terminalCount())
-            assertTrue(panel.terminalView().terminalLabel(0).contains("task=3"), panel.terminalView().terminalLabel(0))
-            panel.terminalView().setComposerFields("bash", "-lc echo-parity", "/tmp")
-            panel.terminalView().submitSpawn()
-            await("terminal spawn routed") {
-                daemon.lastRequest("POST", "/native/session/7/terminal") != null
+            registry.observables["provider_selection"] = {
+                // The registry view drives both combos and the join is
+                // (provider, model).
+                assertEquals(2, chat.settingsView().providerCount())
+                assertEquals("alpha", chat.settingsView().selectedProvider())
+                assertEquals("m", chat.settingsView().selectedModel())
             }
-            val spawnBody = daemon.lastRequest("POST", "/native/session/7/terminal")!!.body
-            assertTrue(spawnBody.contains("\"command\":\"bash\""), spawnBody)
-            assertTrue(spawnBody.contains("\"args\":[\"-lc\",\"echo-parity\"]"), spawnBody)
-            assertTrue(spawnBody.contains("\"cwd\":\"/tmp\""), spawnBody)
-            val output = service.terminalOutput("6")
-            assertEquals("6", output.ptyId)
-            assertTrue(output.output.contains("parity-output"), output.output)
-
-            // agent tree: children + blockers rendered from the fake frames.
-            val tree = panel.taskTreeView().model() ?: fail("the tree must be populated")
-            assertEquals(1, tree.children.size)
-            assertEquals("child-1", tree.children[0].childId)
-            assertEquals("permission", tree.children[0].blocker?.kind)
-            assertEquals(1, panel.blockersView().blockerCount())
-
-            // task mode: one request carries criteria + mutation default +
-            // completion contract + the attachment set.
-            panel.settingsView().selectMutationMode("direct_compat")
-            panel.completionCommit.isSelected = true
-            val attachment = Files.createTempFile("faktor-parity-attach-", ".txt")
-            panel.attachmentsView().addFiles(listOf(attachment.toString()))
-            panel.setTaskFieldsForTest("parity goal", "criterion A, criterion B")
-            panel.submitTaskForTest()
-            await("task run routed") {
-                daemon.lastRequest("POST", "/native/session/7/task-runs") != null
+            registry.observables["permissions"] = {
+                // Pending list rendered; the reply posts the strict body.
+                assertEquals(1, chat.permissionsView().count())
+                assertTrue(
+                    chat.permissionsView().unitLabel(0).contains("capability=shell"),
+                    chat.permissionsView().unitLabel(0)
+                )
+                chat.permissionsView().submitReply("deny")
+                await("permission reply routed") {
+                    daemon.lastRequest("POST", "/permission/reply") != null
+                }
+                assertEquals(
+                    "{\"permission_id\":\"7\",\"decision\":\"deny\"}",
+                    daemon.lastRequest("POST", "/permission/reply")!!.body
+                )
             }
-            val taskBody = daemon.lastRequest("POST", "/native/session/7/task-runs")!!.body
-            assertTrue(taskBody.contains("\"goal\":\"parity goal\""), taskBody)
-            assertTrue(taskBody.contains("\"criteria\":[\"criterion A\",\"criterion B\"]"), taskBody)
-            assertTrue(taskBody.contains("\"mutation_mode\":\"direct_compat\""), taskBody)
-            assertTrue(taskBody.contains("\"completion_contract\":{\"include_commit\":true"), taskBody)
-            assertTrue(taskBody.contains(attachment.toString()), taskBody)
-            await("task refresh after start") {
-                panel.taskTreeView().model()?.steps?.isNotEmpty() ?: false
+            registry.observables["terminal"] = {
+                // Session-owned rows, spawn body, output snapshot.
+                assertEquals(1, chat.terminalView().terminalCount())
+                assertTrue(
+                    chat.terminalView().terminalLabel(0).contains("task=3"),
+                    chat.terminalView().terminalLabel(0)
+                )
+                chat.terminalView().setComposerFields("bash", "-lc echo-parity", "/tmp")
+                chat.terminalView().submitSpawn()
+                await("terminal spawn routed") {
+                    daemon.lastRequest("POST", "/native/session/7/terminal") != null
+                }
+                val spawnBody = daemon.lastRequest("POST", "/native/session/7/terminal")!!.body
+                assertTrue(spawnBody.contains("\"command\":\"bash\""), spawnBody)
+                assertTrue(spawnBody.contains("\"args\":[\"-lc\",\"echo-parity\"]"), spawnBody)
+                assertTrue(spawnBody.contains("\"cwd\":\"/tmp\""), spawnBody)
+                val output = service.terminalOutput("6")
+                assertEquals("6", output.ptyId)
+                assertTrue(output.output.contains("parity-output"), output.output)
             }
-
-            // history open: selecting the other durable session switches the
-            // current session and reopens the SSE stream.
-            panel.historyView().select(1)
-            panel.historyView().submitOpen()
-            await("session 8 opened") { service.currentSessionId() == "8" }
-
-            // new session uses the Settings provider selection (alpha/m),
-            // never the stale composer defaults.
-            panel.newSessionForTest()
-            await("session created from selection") {
-                val request = daemon.lastRequest("POST", "/session/create")
-                request != null && daemon.requestCount("POST", "/session/create") >= 2
+            registry.observables["agents"] = {
+                // Children + blockers rendered from the fake frames.
+                val tree = chat.taskTreeView().model() ?: fail("the tree must be populated")
+                assertEquals(1, tree.children.size)
+                assertEquals("child-1", tree.children[0].childId)
+                assertEquals("permission", tree.children[0].blocker?.kind)
+                assertEquals(1, chat.blockersView().blockerCount())
             }
-            val createBody = daemon.lastRequest("POST", "/session/create")!!.body
-            assertTrue(createBody.contains("\"provider\":\"alpha\""), createBody)
-            assertTrue(createBody.contains("\"model\":\"m\""), createBody)
+            registry.observables["task_runs"] = {
+                // One request carries criteria + mutation mode + completion
+                // contract + the attachment set; the served task view then
+                // carries acceptance criteria.
+                chat.settingsView().selectMutationMode("direct_compat")
+                chat.completionCommit.isSelected = true
+                val attachment = Files.createTempFile("faktor-parity-attach-", ".txt")
+                chat.attachmentsView().addFiles(listOf(attachment.toString()))
+                chat.setTaskFieldsForTest("parity goal", "criterion A, criterion B")
+                chat.submitTaskForTest()
+                await("task run routed") {
+                    daemon.lastRequest("POST", "/native/session/7/task-runs") != null
+                }
+                val taskBody = daemon.lastRequest("POST", "/native/session/7/task-runs")!!.body
+                assertTrue(taskBody.contains("\"goal\":\"parity goal\""), taskBody)
+                assertTrue(
+                    taskBody.contains("\"criteria\":[\"criterion A\",\"criterion B\"]"), taskBody
+                )
+                assertTrue(taskBody.contains("\"mutation_mode\":\"direct_compat\""), taskBody)
+                assertTrue(taskBody.contains("\"completion_contract\":{\"include_commit\":true"), taskBody)
+                assertTrue(taskBody.contains(attachment.toString()), taskBody)
+                await("task refresh after start") {
+                    chat.taskTreeView().model()?.steps?.isNotEmpty() ?: false
+                }
+            }
+            registry.observables["criterion_proofs"] = {
+                // The verification route's records render every binding kind
+                // with its exact reference (daemon-served, never guessed).
+                // The served task view carries no explicit acceptance list, so
+                // rows are record-backed: seven typed kinds + the honest
+                // unavailable row; the canned half owns the exact count.
+                val model = chat.taskTreeView().model() ?: fail("the tree must be populated")
+                assertEquals(PARITY_BINDING_KINDS.size + 1, model.criteriaProof.size)
+                for ((criterion, kind, reference) in PARITY_BINDING_KINDS) {
+                    val row = model.criteriaProof.firstOrNull { it.criterionKey == criterion }
+                        ?: fail("missing proof row $criterion")
+                    assertEquals(kind, row.bindingKind, criterion)
+                    assertEquals("daemon", row.bindingSource, criterion)
+                    assertEquals(reference, row.bindingReference, criterion)
+                }
+            }
+            registry.observables["evidence"] = {
+                // Evidence refs from the served verification render on the
+                // navigator; retrieval routes through the real native route.
+                val model = chat.taskTreeView().model() ?: fail("the tree must be populated")
+                assertTrue(
+                    model.evidence.isNotEmpty(),
+                    "the served verification must carry evidence refs"
+                )
+                val retrieval = service.retrieveEvidence(41L, "{\"selector\":\"all\"}")
+                assertEquals(41L, retrieval.id)
+                val text = String(retrieval.bytes, Charsets.UTF_8)
+                assertTrue(
+                    text.contains("parity tool output"),
+                    "the retrieved text must carry the served payload: $text"
+                )
+                chat.evidenceView().setEvidence(model.evidence)
+                assertTrue(
+                    chat.evidenceView().evidenceCount() >= 1,
+                    "the navigator renders the served evidence refs"
+                )
+            }
+            registry.observables["tournament"] = {
+                // The tournament listing route loads into the panel's
+                // summaries (the daemon owns the candidates; decide gating is
+                // the panel row's canned half).
+                val summaries = service.tournaments()
+                assertEquals(2, summaries.size)
+                assertEquals("t-1", summaries[0].id)
+                chat.tournamentViewForTest().setSummaries(summaries)
+                assertTrue(
+                    chat.tournamentViewForTest().summariesText().contains("t-1"),
+                    chat.tournamentViewForTest().summariesText()
+                )
+            }
+            registry.observables["settings"] = {
+                // The mutation-mode default the Task composer reads.
+                assertTrue(
+                    chat.settingsView().mutationModes().contains("direct_compat"),
+                    chat.settingsView().mutationModes().toString()
+                )
+            }
+            registry.observables["restart_reconnect"] = {
+                // Opening the other durable session switches the current
+                // session and reopens the SSE stream at the new cursor.
+                chat.historyView().select(1)
+                chat.historyView().submitOpen()
+                await("session 8 opened") { service.currentSessionId() == "8" }
+                assertTrue(
+                    chat.historyView().reconnectEnabled(),
+                    "reconnect stays available on the durable session surface"
+                )
+            }
+            // The executable parity matrix runs NOW, inside the live
+            // fake-daemon session: its daemon rows drive the real clients
+            // against this daemon, its visual rows render the panels and the
+            // artifact lands on disk before the session is torn down.
+            ParityMatrix.run()
+            matrixHit = true
         } finally {
             if (panel != null) panel.shutdown()
             service.stop()
             daemon.stop()
+            registry.observables.clear()
         }
     }
 
@@ -845,9 +958,9 @@ object JetBrainsParitySmoke {
         daemon.on("GET", "/native/health") { _, response -> response.json(200, HEALTH_JSON) }
         daemon.on("GET", "/native/ready") { _, response -> response.json(200, READY_JSON) }
         daemon.on("POST", "/session/create") { _, response -> response.json(200, CREATED_JSON) }
-        daemon.on("GET", "/session/list") { _, response -> response.json(200, SESSIONS_JSON) }
-        daemon.on("GET", "/models") { _, response -> response.json(200, MODELS_JSON) }
-        daemon.on("GET", "/native/providers") { _, response -> response.json(200, PROVIDERS_JSON) }
+        daemon.on("GET", "/session/list") { _, response -> response.json(200, PARITY_SESSIONS_JSON) }
+        daemon.on("GET", "/models") { _, response -> response.json(200, PARITY_MODELS_JSON) }
+        daemon.on("GET", "/native/providers") { _, response -> response.json(200, PARITY_PROVIDERS_JSON) }
         daemon.on("GET", "/native/usage") { _, response -> response.json(200, USAGE_JSON) }
         daemon.on("GET", "/session/7/projection") { _, response -> response.json(200, PROJECTION_JSON) }
         daemon.on("GET", "/native/messages") { _, response -> response.json(200, MESSAGES_JSON) }
@@ -857,29 +970,32 @@ object JetBrainsParitySmoke {
             response.json(200, TASK_RUN_STARTED_JSON)
         }
         daemon.on("GET", "/native/session/7/tasks/3/verification") { _, response ->
-            response.json(200, TASK_VERIFICATION_JSON)
+            response.json(200, PARITY_CRITERION_PROOF_JSON)
         }
         daemon.on("GET", "/native/session/7/verification") { _, response ->
             response.json(200, VERIFICATION_JSON)
         }
+        daemon.on("POST", "/native/evidence/41/retrieve") { _, response ->
+            response.json(200, PARITY_EVIDENCE_RETRIEVAL_JSON)
+        }
         daemon.on("GET", "/native/session/7/usage") { _, response -> response.json(200, SESSION_USAGE_JSON) }
         daemon.on("GET", "/native/session/9/usage") { _, response -> response.json(200, SESSION_USAGE_JSON) }
         daemon.on("GET", "/native/session/7/tournaments") { _, response ->
-            response.json(200, TOURNAMENTS_LIST_JSON)
+            response.json(200, PARITY_TOURNAMENTS_LIST_JSON)
         }
-        daemon.on("GET", "/native/session/7/board") { _, response -> response.json(200, BOARD_PAGE_JSON) }
-        daemon.on("GET", "/permission/list") { _, response -> response.json(200, PERMISSION_LIST_JSON) }
+        daemon.on("GET", "/native/session/7/board") { _, response -> response.json(200, PARITY_BOARD_PAGE_JSON) }
+        daemon.on("GET", "/permission/list") { _, response -> response.json(200, PARITY_PERMISSION_LIST_JSON) }
         daemon.on("POST", "/permission/reply") { _, response -> response.json(200, PERMISSION_ACK_JSON) }
-        daemon.on("GET", "/native/agents") { _, response -> response.json(200, AGENTS_JSON) }
-        daemon.on("GET", "/native/terminals") { _, response -> response.json(200, TERMINALS_JSON) }
+        daemon.on("GET", "/native/agents") { _, response -> response.json(200, PARITY_AGENTS_JSON) }
+        daemon.on("GET", "/native/terminals") { _, response -> response.json(200, PARITY_TERMINALS_JSON) }
         daemon.on("GET", "/native/session/7/terminal/events") { _, response ->
-            response.json(200, TERMINAL_EVENTS_JSON)
+            response.json(200, PARITY_TERMINAL_EVENTS_JSON)
         }
         daemon.on("POST", "/native/session/7/terminal") { _, response ->
-            response.json(200, TERMINAL_SPAWNED_JSON)
+            response.json(200, PARITY_TERMINAL_SPAWNED_JSON)
         }
-        daemon.on("GET", "/pty/6/output") { _, response -> response.json(200, TERMINAL_OUTPUT_JSON) }
-        daemon.on("GET", "/pty/5/output") { _, response -> response.json(200, TERMINAL_OUTPUT_JSON) }
+        daemon.on("GET", "/pty/6/output") { _, response -> response.json(200, PARITY_TERMINAL_OUTPUT_JSON) }
+        daemon.on("GET", "/pty/5/output") { _, response -> response.json(200, PARITY_TERMINAL_OUTPUT_JSON) }
         for (session in listOf("7", "8")) {
             daemon.on("GET", "/api/session/$session/events") { request, response ->
                 val after = request.query["events_after"]?.toLongOrNull() ?: 0L
@@ -933,70 +1049,7 @@ object JetBrainsParitySmoke {
 
     private const val CREATED_JSON = "{\"id\":\"7\",\"title\":\"parity\",\"created_ms\":1750000000000}"
 
-    private const val SESSIONS_JSON = "{\"sessions\":[" +
-        "{\"id\":\"7\",\"title\":\"parity\",\"provider\":\"alpha\",\"model\":\"m\"," +
-        "\"state\":\"ready\"}," +
-        "{\"id\":\"8\",\"title\":\"older\",\"provider\":\"beta\",\"model\":\"n\"," +
-        "\"state\":\"ended\"}]}"
-
-    private const val MODELS_JSON = "[" +
-        "{\"provider\":\"alpha\",\"model\":\"m\",\"context\":1000,\"maxOutput\":100," +
-        "\"tools\":true,\"parallelTools\":false,\"reasoning\":true,\"thinking\":false," +
-        "\"vision\":false,\"structuredOutput\":false,\"embeddings\":false," +
-        "\"streaming\":true,\"source\":\"conservativeDefault\"}," +
-        "{\"provider\":\"beta\",\"model\":\"n\",\"context\":2000,\"maxOutput\":200," +
-        "\"tools\":false,\"parallelTools\":false,\"reasoning\":false,\"thinking\":true," +
-        "\"vision\":false,\"structuredOutput\":false,\"embeddings\":false," +
-        "\"streaming\":true,\"source\":\"conservativeDefault\"}]"
-
-    private const val PROVIDERS_JSON = "[" +
-        "{\"instanceId\":\"alpha\",\"family\":\"openai\",\"models\":[" +
-        "{\"model\":\"m\",\"context\":1000,\"maxOutput\":100,\"tools\":true," +
-        "\"parallelTools\":false,\"reasoning\":true,\"thinking\":false,\"vision\":false," +
-        "\"streaming\":true,\"source\":\"conservativeDefault\"}]," +
-        "\"runtimeContextLimitSupported\":true," +
-        "\"health\":{\"status\":\"registered\",\"note\":\"snapshot\"}}," +
-        "{\"instanceId\":\"beta\",\"family\":\"anthropic\",\"models\":[" +
-        "{\"model\":\"n\",\"context\":2000,\"maxOutput\":200,\"tools\":false," +
-        "\"parallelTools\":false,\"reasoning\":false,\"thinking\":true,\"vision\":false," +
-        "\"streaming\":true,\"source\":\"conservativeDefault\"}]," +
-        "\"runtimeContextLimitSupported\":false," +
-        "\"health\":{\"status\":\"registered\",\"note\":\"\"}}]"
-
-    private const val DUAL_MODELS_JSON = "[" +
-        "{\"provider\":\"alpha\",\"model\":\"m\",\"context\":1000,\"maxOutput\":100," +
-        "\"tools\":true,\"parallelTools\":false,\"reasoning\":true,\"thinking\":false," +
-        "\"vision\":false,\"structuredOutput\":false,\"embeddings\":false," +
-        "\"streaming\":true,\"source\":\"conservativeDefault\"}," +
-        "{\"provider\":\"beta\",\"model\":\"m\",\"context\":2000,\"maxOutput\":200," +
-        "\"tools\":false,\"parallelTools\":false,\"reasoning\":false,\"thinking\":true," +
-        "\"vision\":false,\"structuredOutput\":false,\"embeddings\":false," +
-        "\"streaming\":true,\"source\":\"conservativeDefault\"}]"
-
-    private const val PERMISSION_LIST_JSON = "{\"permissions\":[" +
-        "{\"id\":\"7\",\"session_id\":\"9\",\"capability\":\"shell\"," +
-        "\"detail\":{\"tool\":\"bash\"}}]}"
-
     private const val PERMISSION_ACK_JSON = "{\"ok\":true}"
-
-    private const val TERMINALS_JSON = "{" +
-        "\"sessionId\":\"7\",\"terminals\":[" +
-        "{\"id\":\"5\",\"pid\":123,\"alive\":true,\"sessionId\":\"7\",\"taskId\":\"3\"," +
-        "\"agentId\":null,\"operationId\":\"11\",\"spawnedMs\":1700}]," +
-        "\"unowned\":1,\"note\":\"1 daemon-level PTY row carries no session ownership\"}"
-
-    private const val TERMINAL_EVENTS_JSON = "{" +
-        "\"sessionId\":\"7\",\"events\":[" +
-        "{\"id\":1,\"type\":\"created\",\"ptyId\":\"5\",\"pid\":123,\"tsMs\":1700," +
-        "\"sessionId\":\"7\"}]," +
-        "\"hasMore\":false,\"nextCursor\":null}"
-
-    private const val TERMINAL_SPAWNED_JSON = "{" +
-        "\"ok\":true,\"ptyId\":\"6\",\"pid\":456,\"sessionId\":\"7\",\"taskId\":\"3\"," +
-        "\"agentId\":null,\"operationId\":\"12\"}"
-
-    private const val TERMINAL_OUTPUT_JSON =
-        "{\"ok\":true,\"output\":\"parity-output\\nsecond line\\n\",\"alive\":true}"
 
     private const val TASK_RUN_STARTED_JSON =
         "{\"task_id\":3,\"run_id\":\"run-9\",\"state\":\"Running\"}"
@@ -1052,43 +1105,6 @@ object JetBrainsParitySmoke {
         "\"messages\":[{\"seq\":1,\"id\":1,\"role\":\"user\",\"createdMs\":1," +
         "\"parts\":[{\"kind\":\"text\",\"data\":{\"text\":\"hello parity\"}}]}]," +
         "\"hasMore\":false,\"nextBefore\":null}"
-
-    private const val AGENTS_JSON = "[" +
-        "{\"agent_id\":\"self-1\",\"kind\":\"self\",\"run_id\":\"run-9\"," +
-        "\"session_id\":7,\"worktree_id\":1,\"goal\":\"ship it\",\"state\":\"Running\"," +
-        "\"model\":\"m\",\"budget\":null,\"ownership\":\"self\",\"item_ids\":[\"main\"]," +
-        "\"progress\":null,\"result\":null}," +
-        "{\"agent_id\":\"child-1\",\"kind\":\"child\",\"run_id\":\"run-9\"," +
-        "\"session_id\":9,\"worktree_id\":2,\"goal\":\"drive main step\",\"state\":\"Blocked\"," +
-        "\"model\":\"m\",\"provider\":\"alpha\",\"budget\":1000,\"ownership\":\"Mutating\"," +
-        "\"item_id\":\"main\",\"item_kind\":\"Implementation\"," +
-        "\"blocker\":{\"kind\":\"permission\",\"reason\":\"shell call needs approval\"," +
-        "\"dependency\":null,\"resolution\":\"allow the shell tool\"," +
-        "\"last_progress_ms\":42}," +
-        "\"capabilities\":[{\"cap\":\"ReadWorkspace\"}]," +
-        "\"progress\":{\"lastOutputAt\":1,\"lastProgressAt\":2,\"lastOpCompletedAt\":3," +
-        "\"inFlightOp\":null,\"silenceMs\":500,\"stallThresholdMs\":1000,\"stalled\":true}," +
-        "\"result\":{\"summary\":\"main step output\",\"merge\":null}," +
-        "\"presentation\":\"background\"}]"
-
-    private const val TOURNAMENTS_LIST_JSON = "[]"
-
-    private const val BOARD_PAGE_JSON = "{" +
-        "\"board_id\":7,\"revision\":0,\"posts\":[]," +
-        "\"next_before_revision\":null,\"has_more\":false}"
-
-    private const val TOURNAMENT_JSON = "{" +
-        "\"id\":\"t-1\",\"run_family\":\"run-7\",\"goal\":\"pick winner\"," +
-        "\"criteria\":[{\"id\":\"c-1\",\"spec\":\"tests pass\"}]," +
-        "\"candidates\":[" +
-        "{\"child_id\":\"child-0\",\"worktree\":\"/tmp/w0\",\"base_revision\":\"abc\"," +
-        "\"state\":\"done\",\"verification\":12,\"verification_pass\":true," +
-        "\"review\":{\"rank\":\"clean\",\"reviewer\":\"rev-1\"}," +
-        "\"cost_micro\":100,\"wall_ms\":1000}," +
-        "{\"child_id\":\"child-1\",\"worktree\":\"/tmp/w1\",\"base_revision\":\"abc\"," +
-        "\"state\":\"discarded\",\"verification\":null,\"verification_pass\":null," +
-        "\"review\":null,\"cost_micro\":50,\"wall_ms\":900}]," +
-        "\"winner\":\"child-0\",\"state\":\"decided\"}"
 }
 
 // ------------------------------------------------------------- fake daemon

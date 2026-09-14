@@ -540,6 +540,25 @@ impl Provider for PricingOverrideProvider {
         self.inner.runtime_context_limit(model)
     }
 
+    fn document_capable(&self, model: &str) -> bool {
+        self.inner.document_capable(model)
+    }
+
+    fn max_document_bytes(&self) -> usize {
+        self.inner.max_document_bytes()
+    }
+
+    fn supports_embeddings(&self, model: &str) -> bool {
+        self.inner.supports_embeddings(model)
+    }
+
+    fn embed(
+        &self,
+        req: crate::EmbeddingRequest,
+    ) -> Result<crate::EmbeddingResponse, crate::ProviderError> {
+        self.inner.embed(req)
+    }
+
     fn catalog_entry(&self, model: &str) -> ModelCatalogEntry {
         let mut entry = self.inner.catalog_entry(model);
         entry.provider = self.instance_id.clone();
@@ -647,6 +666,25 @@ impl Provider for BillingOriginProvider {
 
     fn runtime_context_limit(&self, model: &str) -> Option<usize> {
         self.inner.runtime_context_limit(model)
+    }
+
+    fn document_capable(&self, model: &str) -> bool {
+        self.inner.document_capable(model)
+    }
+
+    fn max_document_bytes(&self) -> usize {
+        self.inner.max_document_bytes()
+    }
+
+    fn supports_embeddings(&self, model: &str) -> bool {
+        self.inner.supports_embeddings(model)
+    }
+
+    fn embed(
+        &self,
+        req: crate::EmbeddingRequest,
+    ) -> Result<crate::EmbeddingResponse, crate::ProviderError> {
+        self.inner.embed(req)
     }
 
     fn catalog_entry(&self, model: &str) -> ModelCatalogEntry {

@@ -133,40 +133,68 @@
       },
       "call": "session.list",
       "id": "session.list",
-      "note": "daemon 200: {sessions:[SessionSummary]}; SDK 200: Array<Session1> (the bare rich-session array).",
+      "note": "Exact pass: GET /session now answers the SDK-declared BARE Session1[] of rich sessions (id, slug, projectID, workspaceID, directory, model, version, time) plus the frozen legacy aliases. The old {sessions:[...]} scaffold envelope is gone: the SDK type is the contract and the daemon's checked-in consumers were updated with it (limit is honored, bounded).",
       "request": {
         "method": "GET",
         "path": "/session",
         "query": "limit=20&roots=true"
       },
       "response": {
-        "body": {
-          "sessions": [
-            {
-              "createdMs": "@int",
-              "sessionID": "@string",
-              "state": "idle",
-              "title": "wire trace nulls",
-              "updatedMs": "@int"
+        "body": [
+          {
+            "createdMs": "@int",
+            "directory": ".",
+            "id": "@string",
+            "model": {
+              "id": "m",
+              "providerID": "fake"
             },
-            {
-              "createdMs": "@int",
-              "sessionID": "@string",
-              "state": "idle",
-              "title": "wire trace",
-              "updatedMs": "@int"
-            }
-          ]
-        },
+            "projectID": "@string",
+            "sessionID": "@string",
+            "slug": "@string",
+            "state": "idle",
+            "time": {
+              "created": "@int",
+              "updated": "@int"
+            },
+            "title": "wire trace nulls",
+            "updatedMs": "@int",
+            "version": "0.1.0",
+            "workspaceID": "@string"
+          },
+          {
+            "createdMs": "@int",
+            "directory": ".",
+            "id": "@string",
+            "model": {
+              "id": "m",
+              "providerID": "fake"
+            },
+            "projectID": "@string",
+            "sessionID": "@string",
+            "slug": "@string",
+            "state": "idle",
+            "time": {
+              "created": "@int",
+              "updated": "@int"
+            },
+            "title": "wire trace",
+            "updatedMs": "@int",
+            "version": "0.1.0",
+            "workspaceID": "@string"
+          }
+        ],
         "content_type": "application/json",
         "event_stream": false,
         "status": 200
       },
       "sdk_requires": [
-        "#array"
+        "#array",
+        "0.id",
+        "0.time.created"
       ],
       "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionListResponses.200 (Array<Session1>)",
-      "status": "divergence"
+      "status": "passing"
     },
     {
       "args": {
@@ -220,7 +248,7 @@
       },
       "call": "session.update",
       "id": "session.update",
-      "note": "The SDK updates with PATCH /session/{sessionID}; the daemon registers POST for the frozen update op. Route/method and response shape both diverge.",
+      "note": "Exact pass: PATCH /session/{sessionID} is registered and answers the rich SDK Session4 projection (id, slug, projectID, workspaceID, directory, model, version, time) additively next to the frozen aliases; the title is the durable field this slice owns, and metadata/permission/archive requests are refused 400 InvalidRequestError, never silently dropped.",
       "request": {
         "body": "{\"title\":\"wire trace updated\"}",
         "content_type": "application/json",
@@ -229,17 +257,37 @@
         "query": ""
       },
       "response": {
-        "body": null,
-        "content_type": "",
+        "body": {
+          "createdMs": "@int",
+          "directory": ".",
+          "id": "@string",
+          "model": {
+            "id": "m",
+            "providerID": "fake"
+          },
+          "projectID": "@string",
+          "sessionID": "@string",
+          "slug": "@string",
+          "state": "idle",
+          "time": {
+            "created": "@int",
+            "updated": "@int"
+          },
+          "title": "wire trace updated",
+          "updatedMs": "@int",
+          "version": "0.1.0",
+          "workspaceID": "@string"
+        },
+        "content_type": "application/json",
         "event_stream": false,
-        "status": 405
+        "status": 200
       },
       "sdk_requires": [
         "id",
         "time.updated"
       ],
       "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionUpdateResponses.200 (Session4)",
-      "status": "divergence"
+      "status": "passing"
     },
     {
       "args": {},
@@ -357,7 +405,7 @@
           },
           "parts": [
             {
-              "id": "@string",
+              "id": "3:0",
               "messageID": "@string",
               "sessionID": "@string",
               "text": "pong",
@@ -426,7 +474,7 @@
             },
             "parts": [
               {
-                "id": "@string",
+                "id": "3:0",
                 "messageID": "@string",
                 "text": "pong",
                 "type": "text"
@@ -452,6 +500,12 @@
         "sessionID": "$sessionID"
       },
       "call": "session.messages",
+      "capture": {
+        "cursorUser": [
+          "data.0.info.messageID",
+          "data.0.info.id"
+        ]
+      },
       "id": "session.messages.before",
       "note": "before=<cursor> paging: the wire query encoding (before=<seq>&limit=1) is locked. Exact pass: the user entry now carries the rich SDK UserMessage fields (id, agent, model) and the text Part its SDK id/messageID, additively next to the frozen aliases; the page intentionally omits the SDK `time` object and part `sessionID` (fork-stable page contract, see session.messages.newest).",
       "request": {
@@ -478,7 +532,7 @@
             },
             "parts": [
               {
-                "id": "@string",
+                "id": "2:0",
                 "messageID": "@string",
                 "text": "ping",
                 "type": "text"
@@ -504,7 +558,7 @@
       },
       "call": "session.summarize",
       "id": "session.summarize",
-      "note": "SDK 200: boolean; daemon 200: {sessionID,title,summary} (a bounded local digest that ignores the required providerID/modelID body).",
+      "note": "Exact pass: the SDK declares 200: boolean. The bounded digest over the newest messages is still computed server-side (the real bounded work; the SDK type has no text field for it), and the response is the bare boolean true.",
       "request": {
         "body": "{\"modelID\":\"m\",\"providerID\":\"fake\"}",
         "content_type": "application/json",
@@ -513,11 +567,7 @@
         "query": ""
       },
       "response": {
-        "body": {
-          "sessionID": "@string",
-          "summary": "assistant: pong\nuser: ping\n",
-          "title": "wire trace"
-        },
+        "body": true,
         "content_type": "application/json",
         "event_stream": false,
         "status": 200
@@ -526,7 +576,7 @@
         "#bool"
       ],
       "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionSummarizeResponses.200 (boolean)",
-      "status": "divergence"
+      "status": "passing"
     },
     {
       "args": {

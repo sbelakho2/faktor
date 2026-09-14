@@ -61,7 +61,7 @@ historical turns, and deterministic bookkeeping are local.
   whenever the old UI generation is. Wire-parity status is **PARTIAL** and
   measured, never asserted: the required replay writes
   `target/certification/kilo-compat.json` and currently records requests
-  36/36 exact, responses 10/36 exact with 26 locked divergences
+  36/36 exact, responses 28/36 exact with 8 locked divergences
   (`docs/wire-compat.md`).
 
 **Non-goals:** reimplementing the old TypeScript/Bun engine or merging

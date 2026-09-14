@@ -135,6 +135,29 @@ impl AnthropicProvider {
                             }
                         }));
                     }
+                    ContentKind::FileData {
+                        mime,
+                        filename: _,
+                        data,
+                    } => {
+                        // Resolved non-image DOCUMENT bytes: Anthropic takes
+                        // a `document` part. Plain text uses the documented
+                        // `text` source (construction already proved UTF-8);
+                        // PDF uses a byte-exact base64 source.
+                        let source = match std::str::from_utf8(data.as_slice()) {
+                            Ok(text) if mime == "text/plain" => serde_json::json!({
+                                "type": "text",
+                                "media_type": mime,
+                                "data": text,
+                            }),
+                            _ => serde_json::json!({
+                                "type": "base64",
+                                "media_type": mime,
+                                "data": data.to_base64(),
+                            }),
+                        };
+                        content.push(serde_json::json!({ "type": "document", "source": source }));
+                    }
                     ContentKind::ToolCall { id, name, input } => {
                         content.push(serde_json::json!({
                             "type": "tool_use",
@@ -221,6 +244,12 @@ impl Provider for AnthropicProvider {
         ANTHROPIC_MAX_IMAGE_BYTES
     }
 
+    fn document_capable(&self, _model: &str) -> bool {
+        // The Messages API carries `document` parts (PDF base64 / plain
+        // text) for every wired model.
+        true
+    }
+
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
         // Delivery gate BEFORE any wire decision: vision capability, image
         // mime allowlist and the provider's per-image byte bound.
@@ -228,6 +257,15 @@ impl Provider for AnthropicProvider {
         if let Err(e) =
             faktor_provider::validate_media_delivery(&req, &caps, self.max_image_bytes())
         {
+            return faktor_provider::provider_error_stream(e);
+        }
+        // The vision-like document gate: family capability, document mime
+        // allowlist, per-document and request-wide bounds.
+        if let Err(e) = faktor_provider::validate_document_delivery(
+            &req,
+            self.document_capable(&req.model),
+            self.max_document_bytes(),
+        ) {
             return faktor_provider::provider_error_stream(e);
         }
         let body = self.wire_body(&req);
@@ -638,6 +676,72 @@ mod tests {
             content: vec![
                 ContentPart::text("look"),
                 ContentPart::image_data("image/png", png).unwrap(),
+            ],
+        });
+        let mut stream = provider.stream(r);
+        while let Some(chunk) = stream.next().await {
+            if matches!(chunk, Ok(ProviderChunk::Done)) {
+                break;
+            }
+        }
+        assert_eq!(server.request_count(), 1);
+    }
+
+    /// Resolved DOCUMENT attachments lower BYTE-EXACTLY: PDF via a base64
+    /// `document` source, plain text via the documented `text` source —
+    /// never a fabricated extraction and never a lossy re-encode.
+    #[tokio::test]
+    async fn document_data_lowers_to_byte_exact_document_parts() {
+        let pdf: Vec<u8> = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n%%EOF".to_vec();
+        let expected_b64 = faktor_provider::MediaBytes::new(pdf.clone())
+            .unwrap()
+            .to_base64();
+        let server = MockServer::new();
+        let expected = expected_b64.clone();
+        server.route(
+            "POST",
+            "/v1/messages",
+            MockAction::AssertThenRespond {
+                status: 200,
+                body: "data: {\"type\":\"message_stop\"}\n\ndata: [DONE]\n\n".into(),
+                assert: Arc::new(move |body: &serde_json::Value| {
+                    assert_eq!(
+                        body["messages"][1]["content"],
+                        serde_json::json!([
+                            { "type": "text", "text": "read" },
+                            {
+                                "type": "document",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "application/pdf",
+                                    "data": expected
+                                }
+                            },
+                            {
+                                "type": "document",
+                                "source": {
+                                    "type": "text",
+                                    "media_type": "text/plain",
+                                    "data": "plain notes\n"
+                                }
+                            }
+                        ]),
+                        "Anthropic document lowering must be byte-exact"
+                    );
+                }),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        assert!(provider.document_capable("claude-x"));
+        let mut r = req("claude-x");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::text("read"),
+                ContentPart::file_data("application/pdf", Some("spec.pdf"), pdf).unwrap(),
+                ContentPart::file_data("text/plain", Some("notes.txt"), b"plain notes\n".to_vec())
+                    .unwrap(),
             ],
         });
         let mut stream = provider.stream(r);

@@ -36,9 +36,9 @@ pub use faktor_session::VerificationRecord;
 pub use faktor_verify::Acceptance;
 pub use loop_detect::LoopDetector;
 pub use runtime::{
-    AgentCard, AgentDeps, AgentRuntime, ChunkEvent, ChunkSink, CompletionGate, EvidenceProvider,
-    EvidenceQuery, IntegratedRootVerification, NoEvidence, PermissionRequester, ToolArtifactSink,
-    TurnOutcome, VerificationQuality,
+    review_model_identity_of, AgentCard, AgentDeps, AgentRuntime, ChunkEvent, ChunkSink,
+    CompletionGate, EvidenceProvider, EvidenceQuery, IntegratedRootVerification, NoEvidence,
+    PermissionRequester, ReviewModelIdentity, ToolArtifactSink, TurnOutcome, VerificationQuality,
 };
 pub use stall::{StallTracker, DEFAULT_STALL_SILENCE_MS};
 pub use tool::{

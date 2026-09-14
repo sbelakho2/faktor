@@ -14,7 +14,7 @@
       },
       "call": "session.diff",
       "id": "session.diff.empty",
-      "note": "No checkpoint rows exist in this harness, so the daemon's [] matches the SDK's array type trivially; with rows the entry shape diverges (daemon {path,status,diff?} vs SDK SnapshotFileDiff {file,patch,before,after,additions,deletions,status}). Locked as divergence until a checkpoint row is exercised.",
+      "note": "LOCKED (checkpoint-dependent content): with no checkpoint rows the bare [] trivially satisfies Array<SnapshotFileDiff>, but a non-empty entry must carry the SDK's required additions/deletions counts (plus file/patch), and this harness wires no snapshot store and the scripted provider performs no file edits, so no checkpoint row can be exercised. Promoting on an empty projection would overstate the diff surface; a non-empty golden needs real checkpoint content.",
       "request": {
         "method": "GET",
         "path": "/session/@string/diff",
@@ -40,7 +40,7 @@
       },
       "call": "session.diff",
       "id": "session.diff.missing-message",
-      "note": "The SDK spells the filter messageID (vs the daemon's old message=) and full as \"true\"/\"false\" (vs full=1). The compat layer now accepts both spellings and answers the unknown message with an honest 409 refusal instead of silently ignoring the filter.",
+      "note": "Exact pass (error surface): an unknown messageID answers the SDK-declared 400 BadRequestError {name:'BadRequest',data:{message,kind:'Query'}} — SessionDiffErrors declares exactly 400: BadRequestError and no other class, so the refusal IS the SDK contract (the old 409 was not an SDK status). This step covers the error branch only; the 200 content projection stays locked by session.diff.empty because the daemon's non-empty entries carry the frozen {path,status,diff?} shape where the SDK requires file/patch and additions/deletions, which only real checkpoint content could exercise.",
       "request": {
         "method": "GET",
         "path": "/session/@string/diff",
@@ -48,16 +48,22 @@
       },
       "response": {
         "body": {
-          "message": "diff: unknown message id 999",
-          "ok": false
+          "data": {
+            "kind": "Query",
+            "message": "diff: unknown message id 999"
+          },
+          "name": "BadRequest"
         },
         "content_type": "application/json",
         "event_stream": false,
-        "status": 409
+        "status": 400
       },
-      "sdk_requires": [],
-      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionDiffResponses.200",
-      "status": "divergence"
+      "sdk_requires": [
+        "name",
+        "data.message"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionDiffErrors.400 (BadRequestError)",
+      "status": "passing"
     },
     {
       "args": {
@@ -65,18 +71,14 @@
       },
       "call": "session.abort",
       "id": "session.abort",
-      "note": "SDK 200: boolean; daemon 200: {aborted:[opId]}.",
+      "note": "Exact pass: the SDK declares 200: boolean. The daemon reports whether the abort actually cancelled at least one tracked operation (this trace's just-finished turn still owns one, so true); a fully idle session honestly answers false, never a fabricated success.",
       "request": {
         "method": "POST",
         "path": "/session/@string/abort",
         "query": ""
       },
       "response": {
-        "body": {
-          "aborted": [
-            "@string"
-          ]
-        },
+        "body": true,
         "content_type": "application/json",
         "event_stream": false,
         "status": 200
@@ -85,7 +87,7 @@
         "#bool"
       ],
       "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionAbortResponses.200 (boolean)",
-      "status": "divergence"
+      "status": "passing"
     },
     {
       "args": {
@@ -94,7 +96,7 @@
       },
       "call": "session.revert",
       "id": "session.revert",
-      "note": "Snapshots are not wired in this harness: the daemon refuses 409 {ok:false,message} instead of returning the SDK's Session8 revert projection.",
+      "note": "LOCKED (no durable revert projection): the harness wires no snapshot/checkpoint store, so there is no recorded before-state to roll back to and the daemon refuses 409 {ok:false,message}. The SDK declares rich Session8 on success (and 409 SessionBusyError only for a genuinely BUSY session, which this is not); an exact pass requires a durable revert projection — backend work outside the allowed compat surface.",
       "request": {
         "body": {
           "messageID": "@string"
@@ -123,7 +125,7 @@
       },
       "call": "session.unrevert",
       "id": "session.unrevert",
-      "note": "The SDK sends NO body; the compat handler now accepts the body-less form (the old protocol DTO required one) and refuses honestly 409 because the daemon has no durable revert target to redo.",
+      "note": "LOCKED (no durable revert projection): the SDK sends NO body; the compat handler accepts the body-less form and refuses 409 because the daemon keeps no durable revert target to redo. The SDK declares rich Session9 on success; an exact pass requires durable revert state — backend work outside the allowed compat surface.",
       "request": {
         "method": "POST",
         "path": "/session/@string/unrevert",
@@ -144,31 +146,28 @@
     },
     {
       "args": {
-        "messageID": "$cursor",
+        "messageID": "$cursorUser",
         "sessionID": "$sessionID"
       },
       "call": "session.deleteMessage",
       "id": "session.deleteMessage",
-      "note": "SDK 200: boolean; daemon 200: {ok:true}.",
+      "note": "Exact pass: a dependency-free message is removed durably and the SDK-declared boolean true is answered. The driver targets the page's user message (captured from session.messages.before) because the daemon refuses deleting the ACTIVE turn's newest message with 409 — the case the SDK itself declares as SessionBusyError.",
       "request": {
         "method": "DELETE",
         "path": "/session/@string/message/@string",
         "query": ""
       },
       "response": {
-        "body": {
-          "message": "deleteMessage refused: message 3 is the active turn's newest message (in flight); stop the turn before removing it",
-          "ok": false
-        },
+        "body": true,
         "content_type": "application/json",
         "event_stream": false,
-        "status": 409
+        "status": 200
       },
       "sdk_requires": [
         "#bool"
       ],
       "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionDeleteMessageResponses.200 (boolean)",
-      "status": "divergence"
+      "status": "passing"
     },
     {
       "args": {
@@ -204,7 +203,7 @@
             "created": "@int",
             "updated": "@int"
           },
-          "title": "wire trace (fork)",
+          "title": "wire trace updated (fork)",
           "updatedMs": "@int",
           "version": "0.1.0",
           "workspaceID": "@string"
@@ -226,43 +225,14 @@
       },
       "call": "session.delete",
       "id": "session.delete",
-      "note": "SDK 200: boolean; daemon 200: {ok:true} (the deleted session stays as a Closed tombstone row).",
+      "note": "Exact pass: a session whose turn FINISHED (parked ReadyForNextTurn, no active turn record) is durably Closed and the SDK-declared boolean true is answered. The session layer's active-state predicate covers the parked machine, so the compat route completes the close through the daemon's own durable end path (the one /global/dispose uses); a genuinely mid-turn session still refuses 409. The SDK delete contract declares only 400/404, so a parked session must be deletable.",
       "request": {
         "method": "DELETE",
         "path": "/session/@string",
         "query": ""
       },
       "response": {
-        "body": {
-          "message": "session 1 is mid-turn (ReadyForNextTurn); refuse to delete",
-          "ok": false
-        },
-        "content_type": "application/json",
-        "event_stream": false,
-        "status": 409
-      },
-      "sdk_requires": [
-        "#bool"
-      ],
-      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionDeleteResponses.200 (boolean)",
-      "status": "divergence"
-    },
-    {
-      "args": {
-        "sessionID": "$sessionID2"
-      },
-      "call": "session.delete",
-      "id": "session.delete.clean",
-      "note": "Success branch on a never-driven session: the daemon durably ends the session and answers {ok:true} where the SDK declares boolean.",
-      "request": {
-        "method": "DELETE",
-        "path": "/session/@string",
-        "query": ""
-      },
-      "response": {
-        "body": {
-          "ok": true
-        },
+        "body": true,
         "content_type": "application/json",
         "event_stream": false,
         "status": 200
@@ -271,7 +241,31 @@
         "#bool"
       ],
       "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionDeleteResponses.200 (boolean)",
-      "status": "divergence"
+      "status": "passing"
+    },
+    {
+      "args": {
+        "sessionID": "$sessionID2"
+      },
+      "call": "session.delete",
+      "id": "session.delete.clean",
+      "note": "Exact pass: a never-driven session is durably ended (SessionEnded + lifecycle Closed) and the SDK-declared boolean true is answered; the row stays as a Closed tombstone (no store row-drop API in this slice).",
+      "request": {
+        "method": "DELETE",
+        "path": "/session/@string",
+        "query": ""
+      },
+      "response": {
+        "body": true,
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "#bool"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionDeleteResponses.200 (boolean)",
+      "status": "passing"
     }
   ]
 }

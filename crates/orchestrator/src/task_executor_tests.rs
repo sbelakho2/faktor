@@ -5252,6 +5252,7 @@ async fn root_record_reuse_consults_the_proof_basis() {
         criteria: vec![criterion_verdict.clone()],
         changed: Vec::new(),
         summary: "basis consult".into(),
+        review_model_identity: None,
     };
     let (first, first_basis) = env
         .executor
@@ -5399,6 +5400,7 @@ fn probe_run(program: &str) -> IntegratedRootVerification {
         criteria: vec![criterion],
         changed: Vec::new(),
         summary: "proof-basis probe".into(),
+        review_model_identity: None,
     }
 }
 
@@ -5573,6 +5575,112 @@ async fn production_basis_degrades_explicitly_and_is_reproducible() {
     );
 }
 
+/// PRODUCTION reviewer-identity wiring (not a synthetic helper call): with
+/// the parent session's configured pair FIXED, the proof basis is rebuilt
+/// through the real `find_or_create_root_verification_record` path and the
+/// review model recorded on the RUN changes the reviewer digest — a changed
+/// reviewer mints a FRESH record, the same reviewer reuses byte-identically.
+#[tokio::test]
+async fn production_reviewer_identity_changes_the_basis_digest() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_supervised(
+        dir.path(),
+        vec![],
+        faktor_agent::VerificationService::fake_ok(),
+        MutationMode::DirectCompat,
+    );
+    let (h, task_id, prepared, criteria) = probe_task_and_prepared(&env, "reviewer-run");
+    let snapshot = prepared.candidate_snapshot.clone();
+    // The parent session's configured pair is FIXED across every call below:
+    // only the RUN's recorded ACTUAL review call identity varies.
+    let parent_pair = {
+        let row = h.row().unwrap();
+        (row.provider, row.model)
+    };
+    let reviewed_run = |provider: &str, model: &str| IntegratedRootVerification {
+        status: VerificationStatus::Passed,
+        checks: Vec::new(),
+        criteria: vec![faktor_core::state::CriterionVerification {
+            criterion_key: "c1".into(),
+            passed: true,
+            evidence: Some("independent reviewer: clean".into()),
+            binding: Some(CriterionBinding::AggregateGoal),
+        }],
+        changed: Vec::new(),
+        summary: "reviewed".into(),
+        review_model_identity: Some(faktor_agent::ReviewModelIdentity {
+            provider: provider.into(),
+            model: model.into(),
+        }),
+    };
+    let (first, first_basis) = env
+        .executor
+        .find_or_create_root_verification_record(
+            &h,
+            task_id,
+            &criteria,
+            &snapshot,
+            &reviewed_run("review-provider-a", "review-model-a"),
+            &prepared,
+            VerificationStatus::Passed,
+        )
+        .await
+        .unwrap();
+    let (reused, reused_basis) = env
+        .executor
+        .find_or_create_root_verification_record(
+            &h,
+            task_id,
+            &criteria,
+            &snapshot,
+            &reviewed_run("review-provider-a", "review-model-a"),
+            &prepared,
+            VerificationStatus::Passed,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reused, first, "the same reviewer reuses the record");
+    assert_eq!(reused_basis, first_basis);
+    let (fresh, fresh_basis) = env
+        .executor
+        .find_or_create_root_verification_record(
+            &h,
+            task_id,
+            &criteria,
+            &snapshot,
+            &reviewed_run("review-provider-b", "review-model-b"),
+            &prepared,
+            VerificationStatus::Passed,
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        fresh, first,
+        "a changed ACTUAL review model must never reuse the old record"
+    );
+    assert_ne!(
+        fresh_basis, first_basis,
+        "the reviewer digest folds the real review provider/model"
+    );
+    // The parent session's configured pair never moved: the digest difference
+    // is the review call's identity, not the parent's.
+    let row = h.row().unwrap();
+    assert_eq!((row.provider, row.model), parent_pair);
+    // Both records durably carry their distinct basis digests.
+    for (record, basis) in [(first, &first_basis), (fresh, &fresh_basis)] {
+        assert_eq!(
+            h.get_verification_record(record)
+                .unwrap()
+                .unwrap()
+                .environment_fingerprint
+                .as_ref()
+                .and_then(|f| f.proof_basis_digest.as_deref()),
+            Some(basis.as_str())
+        );
+    }
+}
+
 /// The basis evidence/reviewer folds are pure, deterministic, bound to the
 /// exact evidence (a changed check program or reviewer identity changes the
 /// fold) and only count PASSED criteria — failed and unavailable verdicts
@@ -5649,15 +5757,24 @@ fn basis_evidence_and_reviewer_digests_are_exact_and_deterministic() {
         sources_digest: String::new(),
         staged: Vec::new(),
     };
-    let run_with =
-        |criteria: Vec<faktor_core::state::CriterionVerification>| IntegratedRootVerification {
+    let run_with = |criteria: Vec<faktor_core::state::CriterionVerification>,
+                    identity: Option<faktor_agent::ReviewModelIdentity>| {
+        IntegratedRootVerification {
             status: VerificationStatus::Passed,
             checks: vec![check.clone()],
             criteria,
             changed: Vec::new(),
             summary: "fold".into(),
-        };
-    let run = run_with(vec![passed_check.clone(), failed.clone()]);
+            review_model_identity: identity,
+        }
+    };
+    let reviewer_a = || {
+        Some(faktor_agent::ReviewModelIdentity {
+            provider: "review-provider-a".into(),
+            model: "review-model-a".into(),
+        })
+    };
+    let run = run_with(vec![passed_check.clone(), failed.clone()], None);
     let first = criterion_pass_evidence_digests(&prepared, &run);
     assert_eq!(
         first,
@@ -5681,22 +5798,41 @@ fn basis_evidence_and_reviewer_digests_are_exact_and_deterministic() {
         criteria: vec![passed_check.clone(), failed.clone()],
         changed: Vec::new(),
         summary: "fold".into(),
+        review_model_identity: None,
     };
     assert_ne!(
         first,
         criterion_pass_evidence_digests(&prepared, &other_run)
     );
     assert_eq!(
-        reviewer_proof_basis_digest(&h, &run_with(vec![passed_check.clone()])),
+        reviewer_proof_basis_digest(&run_with(vec![passed_check.clone()], reviewer_a())),
         None,
         "no reviewer-bearing pass means an honest None"
     );
-    let reviewer = reviewer_proof_basis_digest(&h, &run_with(vec![review.clone()])).unwrap();
+    assert_eq!(
+        reviewer_proof_basis_digest(&run_with(vec![review.clone()], None)),
+        None,
+        "a reviewer-bearing pass without an ACTUAL review-model call is an honest None — \
+         the parent session's configured pair is never substituted"
+    );
+    let reviewer =
+        reviewer_proof_basis_digest(&run_with(vec![review.clone()], reviewer_a())).unwrap();
     assert!(reviewer.starts_with("blake3:"));
     assert_eq!(
         reviewer,
-        reviewer_proof_basis_digest(&h, &run_with(vec![review.clone()])).unwrap(),
+        reviewer_proof_basis_digest(&run_with(vec![review.clone()], reviewer_a())).unwrap(),
         "reviewer folds are deterministic"
+    );
+    // The review model identity IS the digest: a different ACTUAL reviewer
+    // (same parent session row) changes the digest.
+    let reviewer_b = Some(faktor_agent::ReviewModelIdentity {
+        provider: "review-provider-b".into(),
+        model: "review-model-b".into(),
+    });
+    assert_ne!(
+        reviewer,
+        reviewer_proof_basis_digest(&run_with(vec![review.clone()], reviewer_b)).unwrap(),
+        "the actual review provider/model is part of the digest"
     );
     let mut changed_reviewer = review.clone();
     changed_reviewer.binding = Some(CriterionBinding::IndependentReview {
@@ -5704,8 +5840,8 @@ fn basis_evidence_and_reviewer_digests_are_exact_and_deterministic() {
     });
     assert_ne!(
         reviewer,
-        reviewer_proof_basis_digest(&h, &run_with(vec![changed_reviewer])).unwrap(),
-        "reviewer identity is part of the digest"
+        reviewer_proof_basis_digest(&run_with(vec![changed_reviewer], reviewer_a())).unwrap(),
+        "reviewer binding identity is part of the digest"
     );
 }
 

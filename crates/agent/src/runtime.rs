@@ -464,6 +464,17 @@ pub trait EvidenceProvider: Send + Sync {
     /// Forget one workspace's cached state (idle-unload, spec §21): the
     /// session ended, its index/scan state is dropped. Default: nothing.
     fn forget(&self, _workspace: WorkspaceId) {}
+
+    /// The CONFIGURED semantic embedder of this evidence provider, when the
+    /// daemon wired one (the `[embeddings]` config selection resolved
+    /// against the provider registry). The agent's index-backed evidence
+    /// assembly reads the embedder from THIS seam instead of hardcoding
+    /// `None`, so a configured embedder fuses semantically on both evidence
+    /// paths. Default `None`: lexical/symbol-only retrieval — an honest
+    /// degradation, never a fabricated vector.
+    fn embedder(&self) -> Option<Arc<dyn faktor_search::Embedder>> {
+        None
+    }
 }
 
 pub struct NoEvidence;
@@ -1265,6 +1276,42 @@ impl AgentDeps {
     }
 }
 
+/// The provider/model pair of the ACTUAL independent review call: the
+/// ROUTED reviewer that produced (or refused) the verdict, recorded from the
+/// live call's own outcome. Never the parent session's configured pair — the
+/// two differ whenever the review phase routes elsewhere, and the proof
+/// basis must name the real reviewer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReviewModelIdentity {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Extract the ACTUAL review-model identity recorded in one review value
+/// (`evidence.structured.review_model`, written by the review path from the
+/// live `IndependentReviewOutcome`). Honest `None` when no review-model call
+/// was attempted (`attempted != true`) or when the recorded pair is empty
+/// (an oversized package refused before routing) — never a fabricated
+/// reviewer.
+pub fn review_model_identity_of(review: &serde_json::Value) -> Option<ReviewModelIdentity> {
+    let model = review
+        .get("evidence")?
+        .get("structured")?
+        .get("review_model")?;
+    if model.get("attempted").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    let provider = model.get("provider").and_then(|v| v.as_str())?;
+    let model_name = model.get("model").and_then(|v| v.as_str())?;
+    if provider.is_empty() || model_name.is_empty() {
+        return None;
+    }
+    Some(ReviewModelIdentity {
+        provider: provider.to_string(),
+        model: model_name.to_string(),
+    })
+}
+
 /// The typed outcome of ONE integrated-root verification run: the checks the
 /// REAL shared [`crate::VerificationService`] executed over the final
 /// integration root, their proof rows, and one criterion verdict per
@@ -1277,6 +1324,11 @@ pub struct IntegratedRootVerification {
     /// The integrated change the checks were derived from.
     pub changed: Vec<String>,
     pub summary: String,
+    /// The ROUTED provider/model of the ACTUAL independent review call this
+    /// verdict rests on (`None` when no review-model call was attempted —
+    /// honest absence, never the parent's configured pair). The orchestrator
+    /// folds this pair into the proof basis's reviewer digest.
+    pub review_model_identity: Option<ReviewModelIdentity>,
 }
 
 /// The outcome of one ATTEMPT-BASED integrated-root verification (audit
@@ -4423,6 +4475,14 @@ impl AgentRuntime {
                 let request =
                     self.build_request(handle, &wire_plan, op_id, &model, &cancel, attempt)?;
                 CapabilityValidator::validate(&request, &caps)?;
+                // The vision-like DOCUMENT gate at the wire boundary: a
+                // provider that does not carry document parts can never
+                // receive a resolved FileData part (defense in depth
+                // behind the injection gate).
+                CapabilityValidator::validate_documents(
+                    &request,
+                    provider.document_capable(&model),
+                )?;
                 handle
                     .append_journal_event(
                         faktor_core::event::EventKind::ModelStarted,
@@ -6665,6 +6725,7 @@ impl AgentRuntime {
                 summary: format!(
                     "integrated-root verification unavailable: repository inventory incomplete ({reason})"
                 ),
+                review_model_identity: None,
             });
         }
         if repo_files.is_empty() {
@@ -6787,6 +6848,7 @@ impl AgentRuntime {
             criteria: criteria_rows,
             changed: changed.to_vec(),
             summary,
+            review_model_identity: review.as_ref().and_then(review_model_identity_of),
         })
     }
 
@@ -6891,6 +6953,7 @@ impl AgentRuntime {
                     summary: format!(
                         "integrated-root verification unavailable: repository inventory incomplete ({reason})"
                     ),
+                    review_model_identity: None,
                 }),
             });
         }
@@ -7169,6 +7232,7 @@ impl AgentRuntime {
                         ordered.len(),
                         root.display()
                     ),
+                    review_model_identity: review.as_ref().and_then(review_model_identity_of),
                 }),
             });
         }
@@ -7292,6 +7356,7 @@ impl AgentRuntime {
                 unavailable.len(),
                 root.display()
             ),
+            review_model_identity: review.and_then(review_model_identity_of),
         }
     }
 
@@ -7389,6 +7454,13 @@ impl AgentRuntime {
                 "no-op root certified by the independent reviewer ({} criterion proof(s), candidate {candidate_snapshot})",
                 criteria.len()
             ),
+            // The ACTUAL review call's routed pair (the no-op path always
+            // runs the reviewer): the orchestrator's reviewer digest must
+            // name the real reviewer, never the parent's configured pair.
+            review_model_identity: Some(ReviewModelIdentity {
+                provider: outcome.provider,
+                model: outcome.model,
+            }),
         })
     }
 
@@ -9466,7 +9538,12 @@ impl AgentRuntime {
         if concepts.is_empty() {
             return Some(Vec::new());
         }
-        let search = faktor_search::SearchService::new(view.index(), None);
+        // The CONFIGURED embedder (resolved from `[embeddings]` and exposed
+        // by the evidence provider) fuses the semantic leg; `None` keeps
+        // lexical/symbol-only retrieval. A configured-but-failing embedder
+        // degrades inside `fused` exactly like the cold path — the turn
+        // never breaks on embeddings.
+        let search = faktor_search::SearchService::new(view.index(), self.deps.evidence.embedder());
         let hits = search.evidence_package(ws, &concepts, INDEX_EVIDENCE_MAX_HITS);
         Some(
             hits.into_iter()
@@ -9895,20 +9972,25 @@ impl AgentRuntime {
         Ok(out)
     }
 
-    /// Resolve the durable task's IMAGE attachments into bounded in-memory
-    /// media parts at REQUEST CONSTRUCTION and append them (input order
-    /// preserved) to the newest user message carrying TEXT — the turn's own
-    /// prompt — synthesizing one only when the history has none (e.g. after
-    /// compaction dropped it). Non-image attachments are not model content
-    /// and stay CAS-only.
+    /// Resolve the durable task's IMAGE and non-image DOCUMENT attachments
+    /// into bounded in-memory media parts at REQUEST CONSTRUCTION and append
+    /// them (input order preserved) to the newest user message carrying
+    /// TEXT — the turn's own prompt — synthesizing one only when the history
+    /// has none (e.g. after compaction dropped it). Non-document
+    /// attachments (e.g. archives) are not model content and stay CAS-only.
     ///
     /// Every failure is typed and happens BEFORE any provider call:
     ///
-    /// - a model without [`ModelCapabilities::vision`] refuses loudly (never
-    ///   a silently dropped image);
-    /// - the mime must be one of the provider's supported image types;
-    /// - the provider's per-image bound and the request-wide media bound are
-    ///   checked from DURABLE sizes before any blob read;
+    /// - an image against a model without [`ModelCapabilities::vision`]
+    ///   refuses loudly (never a silently dropped image);
+    /// - a document against a provider whose
+    ///   [`faktor_provider::Provider::document_capable`] flag is false
+    ///   refuses loudly (the vision-like document gate — never a silently
+    ///   dropped document, never an invented text extraction);
+    /// - the mime must be one of the provider's supported image/document
+    ///   types;
+    /// - the provider's per-part bounds and the request-wide media/document
+    ///   bounds are checked from DURABLE sizes before any blob read;
     /// - a missing/tampered CAS blob is a typed error (the session layer
     ///   re-hashes every blob against its digest).
     ///
@@ -9930,15 +10012,30 @@ impl AgentRuntime {
             .filter(|a| a.is_image())
             .cloned()
             .collect();
-        if images.is_empty() {
+        let documents: Vec<faktor_core::attachment::AttachmentId> = task
+            .attachments
+            .iter()
+            .filter(|a| !a.is_image() && faktor_provider::is_supported_document_mime(&a.mime))
+            .cloned()
+            .collect();
+        if images.is_empty() && documents.is_empty() {
             return Ok(());
         }
-        if !caps.vision {
+        let model = handle.model().unwrap_or_default();
+        // Capability gates FIRST: nothing is read or resolved before every
+        // gate that can refuse the whole set has passed.
+        if !images.is_empty() && !caps.vision {
             return Err(Error::malformed(format!(
-                "model {} does not support vision, but task {} carries {} image attachment(s); remove them or select a vision model",
-                handle.model().unwrap_or_default(),
+                "model {model} does not support vision, but task {} carries {} image attachment(s); remove them or select a vision model",
                 task.task_id,
                 images.len()
+            )));
+        }
+        if !documents.is_empty() && !provider.document_capable(&model) {
+            return Err(Error::malformed(format!(
+                "the provider of model {model} does not support document input, but task {} carries {} document attachment(s); remove them or select a document-capable model",
+                task.task_id,
+                documents.len()
             )));
         }
         for id in &images {
@@ -9954,19 +10051,9 @@ impl AgentRuntime {
                 ));
             }
         }
-        // Defense in depth behind admission: the provider bound and the
-        // request-wide media bound are re-checked here, from durable sizes.
-        let per_image = provider
-            .max_image_bytes()
-            .min(faktor_provider::MAX_MEDIA_BYTES_HARD);
-        let resolved = handle.resolve_attachment_bytes(
-            &images,
-            per_image,
-            faktor_provider::MAX_REQUEST_IMAGE_BYTES,
-        )?;
         // The prompt message: the newest user message that carries text —
-        // never a tool-result-only user message. Deduped if this history
-        // was injected already in-process.
+        // never a tool-result-only user message. Deduped per KIND if this
+        // history was injected already in-process.
         let target = history
             .iter()
             .rposition(|m| {
@@ -9976,18 +10063,59 @@ impl AgentRuntime {
                     })
             })
             .or_else(|| history.iter().rposition(|m| m.role == Role::User));
-        let already = target.is_some_and(|i| {
+        let has_images = target.is_some_and(|i| {
             history[i]
                 .content
                 .iter()
                 .any(|p| matches!(p.kind, faktor_provider::ContentKind::ImageData { .. }))
         });
-        if already {
+        let has_documents = target.is_some_and(|i| {
+            history[i]
+                .content
+                .iter()
+                .any(|p| matches!(p.kind, faktor_provider::ContentKind::FileData { .. }))
+        });
+        let need_images = !images.is_empty() && !has_images;
+        let need_documents = !documents.is_empty() && !has_documents;
+        if !need_images && !need_documents {
             return Ok(());
         }
-        let mut parts = Vec::with_capacity(resolved.len());
-        for r in resolved {
+        // Defense in depth behind admission: the provider bounds and the
+        // request-wide bounds are re-checked here, from durable sizes.
+        let resolved_images = if need_images {
+            let per_image = provider
+                .max_image_bytes()
+                .min(faktor_provider::MAX_MEDIA_BYTES_HARD);
+            handle.resolve_attachment_bytes(
+                &images,
+                per_image,
+                faktor_provider::MAX_REQUEST_IMAGE_BYTES,
+            )?
+        } else {
+            Vec::new()
+        };
+        let resolved_documents = if need_documents {
+            let per_document = provider
+                .max_document_bytes()
+                .min(faktor_provider::MAX_MEDIA_BYTES_HARD);
+            handle.resolve_document_bytes(
+                &documents,
+                per_document,
+                faktor_provider::MAX_REQUEST_DOCUMENT_BYTES,
+            )?
+        } else {
+            Vec::new()
+        };
+        let mut parts = Vec::with_capacity(resolved_images.len() + resolved_documents.len());
+        for r in resolved_images {
             parts.push(ContentPart::image_data(&r.id.mime, r.bytes)?);
+        }
+        for r in resolved_documents {
+            parts.push(ContentPart::file_data(
+                &r.id.mime,
+                r.id.filename.as_deref(),
+                r.bytes,
+            )?);
         }
         match target {
             Some(i) => history[i].content.extend(parts),
@@ -13968,6 +14096,25 @@ mod tests {
             self.inner.capabilities(model)
         }
 
+        fn document_capable(&self, model: &str) -> bool {
+            self.inner.document_capable(model)
+        }
+
+        fn max_document_bytes(&self) -> usize {
+            self.inner.max_document_bytes()
+        }
+
+        fn supports_embeddings(&self, model: &str) -> bool {
+            self.inner.supports_embeddings(model)
+        }
+
+        fn embed(
+            &self,
+            req: faktor_provider::EmbeddingRequest,
+        ) -> Result<faktor_provider::EmbeddingResponse, faktor_provider::ProviderError> {
+            self.inner.embed(req)
+        }
+
         fn stream(&self, req: GenericAgentRequest) -> faktor_provider::ProviderStream {
             let n = self
                 .counter
@@ -15362,45 +15509,66 @@ mod tests {
     }
 
     /// Request construction (media): durable `AttachmentId`s resolve to
-    /// bounded in-memory `ImageData` parts at request time — order
-    /// preserved, non-images excluded — and NO expanded byte ever reaches
-    /// durable state (the task row keeps ids only).
+    /// bounded in-memory `ImageData`/`FileData` parts at request time —
+    /// order preserved, opaque non-documents excluded — and NO expanded byte
+    /// ever reaches durable state (the task row keeps ids only).
     #[tokio::test]
     async fn attachment_media_reaches_the_request_byte_exact_and_never_persists() {
         fn vision_caps() -> ModelCapabilities {
             ModelCapabilities {
                 vision: true,
+                // A realistic media-capable window: the resolved PDF part
+                // carries a fixed conservative token estimate, and document
+                // turns must never spuriously trigger compaction in this
+                // delivery test.
+                context: 131_072,
                 ..Default::default()
             }
         }
         let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
         let jpg: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0, 9, 8, 7];
+        let pdf: Vec<u8> = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n%%EOF".to_vec();
         let captured: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_hook = captured.clone();
         let expected_png = png.clone();
         let expected_jpg = jpg.clone();
+        let expected_pdf = pdf.clone();
         let wrapper = Arc::new(InspectingProvider::new(
-            Arc::new(FakeProvider::with_script(
-                "fake",
-                vision_caps(),
-                vec![ScriptedResponse::Text("seen".into()), ScriptedResponse::End],
-            )),
+            Arc::new(
+                FakeProvider::with_script(
+                    "fake",
+                    vision_caps(),
+                    vec![ScriptedResponse::Text("seen".into()), ScriptedResponse::End],
+                )
+                .with_documents(),
+            ),
             move |_n, req| {
                 let mut media = Vec::new();
+                let mut docs = Vec::new();
                 for m in &req.messages {
                     for p in &m.content {
-                        if let faktor_provider::ContentKind::ImageData { mime, data } = &p.kind {
-                            assert!(
-                                mime == "image/png" || mime == "image/jpeg",
-                                "unexpected mime {mime}"
-                            );
-                            media.push((mime.clone(), data.as_slice().to_vec()));
+                        match &p.kind {
+                            faktor_provider::ContentKind::ImageData { mime, data } => {
+                                assert!(
+                                    mime == "image/png" || mime == "image/jpeg",
+                                    "unexpected mime {mime}"
+                                );
+                                media.push((mime.clone(), data.as_slice().to_vec()));
+                            }
+                            faktor_provider::ContentKind::FileData { mime, data, .. } => {
+                                assert_eq!(mime, "application/pdf");
+                                docs.push(data.as_slice().to_vec());
+                            }
+                            _ => {}
                         }
                     }
                 }
                 if media.len() != 2 {
                     return Err(format!("expected 2 resolved images, got {}", media.len()));
+                }
+                if docs.len() != 1 || docs[0] != expected_pdf {
+                    return Err("the resolved PDF is not byte-exact".into());
                 }
                 if media[0].0 != "image/png" || media[0].1 != expected_png {
                     return Err("first image is not the byte-exact PNG".into());
@@ -15422,14 +15590,14 @@ mod tests {
         let img2 = handle
             .put_attachment("image/jpeg", Some("b.jpg"), &jpg)
             .unwrap();
-        let pdf = handle
-            .put_attachment("application/pdf", Some("spec.pdf"), b"%PDF-1.4")
+        let pdf_id = handle
+            .put_attachment("application/pdf", Some("spec.pdf"), &pdf)
             .unwrap();
         runtime
-            .seed_task_attachments(session, &[img1.clone(), img2.clone(), pdf.clone()])
+            .seed_task_attachments(session, &[img1.clone(), img2.clone(), pdf_id.clone()])
             .unwrap();
         let outcome = runtime
-            .run_turn(session, "describe both images", &[])
+            .run_turn(session, "describe both images and the spec", &[])
             .await
             .unwrap();
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
@@ -15441,7 +15609,7 @@ mod tests {
         // Durable state keeps the typed set ONLY: no expanded bytes and no
         // base64 anywhere in the task row or the message rows.
         let task = handle.get_task(handle.task_id().unwrap()).unwrap().unwrap();
-        assert_eq!(task.attachments, vec![img1, img2, pdf]);
+        assert_eq!(task.attachments, vec![img1, img2, pdf_id]);
         let page = handle.messages_page(None, 50).unwrap();
         let durable_json = serde_json::to_string(
             &page
@@ -15456,6 +15624,9 @@ mod tests {
                 .unwrap()
                 .to_base64(),
             faktor_provider::MediaBytes::new(jpg.clone())
+                .unwrap()
+                .to_base64(),
+            faktor_provider::MediaBytes::new(pdf.clone())
                 .unwrap()
                 .to_base64(),
         ] {
@@ -15506,6 +15677,128 @@ mod tests {
             b"\x89PNG"
         );
         assert_eq!(handle.list_attachments(16).unwrap(), vec![image]);
+    }
+
+    /// A document-capable provider receives non-image DOCUMENT attachments
+    /// as byte-exact `FileData` parts (PDF and plain text, input order
+    /// preserved), while opaque non-document attachments stay CAS-only.
+    #[tokio::test]
+    async fn attachment_documents_reach_the_request_byte_exact_for_document_capable_providers() {
+        let pdf: Vec<u8> = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n%%EOF".to_vec();
+        let text: Vec<u8> = b"plain notes\n".to_vec();
+        let fake = Arc::new(
+            FakeProvider::with_script(
+                "fake",
+                ModelCapabilities::default(),
+                vec![ScriptedResponse::End],
+            )
+            .with_documents(),
+        );
+        let (deps, _dir) = deps_with(fake, vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let pdf_id = handle
+            .put_attachment("application/pdf", Some("spec.pdf"), &pdf)
+            .unwrap();
+        let text_id = handle
+            .put_attachment("text/plain", Some("notes.txt"), &text)
+            .unwrap();
+        let opaque = handle
+            .put_attachment("application/zip", Some("bundle.zip"), b"PK\x03\x04")
+            .unwrap();
+        runtime
+            .seed_task_attachments(session, &[pdf_id.clone(), text_id.clone(), opaque.clone()])
+            .unwrap();
+        let provider = runtime.deps.providers.get("fake").unwrap();
+        let caps = provider.capabilities("m");
+        let mut history = vec![RequestMessage {
+            role: Role::User,
+            content: vec![ContentPart::text("read the spec and notes")],
+        }];
+        runtime
+            .inject_attachment_media(&handle, &mut history, &caps, provider.as_ref())
+            .unwrap();
+        let docs: Vec<(&str, Option<&str>, &[u8])> = history
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|p| match &p.kind {
+                faktor_provider::ContentKind::FileData {
+                    mime,
+                    filename,
+                    data,
+                } => Some((mime.as_str(), filename.as_deref(), data.as_slice())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(docs.len(), 2, "PDF + text, in input order: {docs:?}");
+        assert_eq!(
+            docs[0],
+            ("application/pdf", Some("spec.pdf"), pdf.as_slice())
+        );
+        assert_eq!(docs[1], ("text/plain", Some("notes.txt"), text.as_slice()));
+        // The opaque archive never became model content.
+        assert!(
+            !history.iter().flat_map(|m| &m.content).any(|p| matches!(
+                &p.kind,
+                faktor_provider::ContentKind::FileData { mime, .. } if mime == "application/zip"
+            )),
+            "non-document attachments must stay CAS-only"
+        );
+        // Durable bytes/rows are untouched by delivery.
+        assert_eq!(handle.attachment_bytes(&pdf_id, 1 << 20).unwrap(), pdf);
+        assert_eq!(handle.list_attachments(16).unwrap().len(), 3);
+    }
+
+    /// A document-less provider refuses the turn TYPEDLY before any provider
+    /// call and keeps the durable bytes and rows intact ("bytes/draft
+    /// remain") — never a silent drop and never an invented extraction.
+    #[tokio::test]
+    async fn attachment_documentless_model_is_a_typed_refusal_with_bytes_kept() {
+        let pdf: Vec<u8> = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n%%EOF".to_vec();
+        let (deps, _dir) = deps(
+            FakeProvider::with_script(
+                "fake",
+                ModelCapabilities::default(),
+                vec![ScriptedResponse::End],
+            ),
+            vec![],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let doc = handle
+            .put_attachment("application/pdf", Some("spec.pdf"), &pdf)
+            .unwrap();
+        runtime
+            .seed_task_attachments(session, std::slice::from_ref(&doc))
+            .unwrap();
+        let provider = runtime.deps.providers.get("fake").unwrap();
+        assert!(!provider.document_capable("m"));
+        let caps = provider.capabilities("m");
+        let mut history = vec![RequestMessage {
+            role: Role::User,
+            content: vec![ContentPart::text("read the spec")],
+        }];
+        let err = runtime
+            .inject_attachment_media(&handle, &mut history, &caps, provider.as_ref())
+            .expect_err("document-less provider must refuse");
+        assert_eq!(err.kind, ErrorKind::Malformed);
+        assert!(
+            err.message.contains("does not support document input"),
+            "{err:?}"
+        );
+        // Nothing was partially injected and the draft-equivalent durable
+        // bytes and row remain intact.
+        assert!(
+            !history
+                .iter()
+                .flat_map(|m| &m.content)
+                .any(|p| matches!(p.kind, faktor_provider::ContentKind::FileData { .. })),
+            "no partial document may survive a refused admission"
+        );
+        assert_eq!(handle.attachment_bytes(&doc, 1 << 20).unwrap(), pdf);
+        assert_eq!(handle.list_attachments(16).unwrap(), vec![doc]);
     }
 
     /// A missing or tampered CAS blob fails the request typedly — never a
@@ -27611,6 +27904,158 @@ mod tests {
         );
     }
 
+    /// Embedder for the semantic-evidence E2E: the prompt concepts
+    /// (`quantum`, `zebra`) are semantically near `ledger`/`reconcile` — none
+    /// of those words appear in the corpus, so lexical/symbol/exact search
+    /// can never find the file; only the semantic leg can.
+    struct ConceptAxisEmbedder;
+    impl faktor_search::Embedder for ConceptAxisEmbedder {
+        fn embed(&self, texts: &[String]) -> Vec<Vec<f32>> {
+            texts
+                .iter()
+                .map(|t| {
+                    let l = t.to_lowercase();
+                    vec![
+                        if l.contains("quantum") || l.contains("ledger") || l.contains("reconcile")
+                        {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                        if l.contains("zebra") || l.contains("parser") {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                    ]
+                })
+                .collect()
+        }
+    }
+
+    /// Evidence provider whose ONLY job is to expose a configured embedder
+    /// through the production seam (the legacy scan never runs on the
+    /// hosted-index path).
+    struct EmbedderEvidence {
+        embedder: Option<Arc<dyn faktor_search::Embedder>>,
+    }
+    impl EvidenceProvider for EmbedderEvidence {
+        fn evidence_for(
+            &self,
+            _s: SessionId,
+            _q: EvidenceQuery,
+        ) -> futures::future::BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn embedder(&self) -> Option<Arc<dyn faktor_search::Embedder>> {
+            self.embedder.clone()
+        }
+    }
+
+    /// One full turn over a two-file corpus with a Ready index generation,
+    /// producing the CAPTURED wire request's system prompt.
+    async fn captured_system_for_prompt(
+        embedder: Option<Arc<dyn faktor_search::Embedder>>,
+        prompt: &str,
+    ) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src").join("ledger.rs"),
+            "pub fn reconcile_accounts() -> u32 { 7 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src").join("parser.rs"),
+            "pub fn parse_expr() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        let provider = scripted_provider(vec![
+            ScriptedResponse::Text("ok".into()),
+            ScriptedResponse::End,
+        ]);
+        let fake = Arc::new(provider.clone());
+        let (mut adeps, _adir) = deps_with(
+            Arc::new(provider) as Arc<dyn faktor_provider::Provider>,
+            vec![],
+        );
+        adeps.evidence = Arc::new(EmbedderEvidence { embedder });
+        let ws = adeps
+            .session
+            .create_workspace(root.to_str().unwrap())
+            .unwrap();
+        let sid = adeps
+            .session
+            .create_session(ws, "idx", "fake", "m")
+            .unwrap()
+            .id();
+        let seen = Arc::new(std::sync::Mutex::new(None::<String>));
+        let hook = {
+            let seen = seen.clone();
+            move |_n: usize, req: &GenericAgentRequest| -> Result<(), String> {
+                *seen.lock().unwrap() = Some(req.system.clone());
+                Ok(())
+            }
+        };
+        let inspected = Arc::new(InspectingProvider::new(fake, hook));
+        let mut registry = ProviderRegistry::new();
+        registry.try_register(inspected).unwrap();
+        adeps.providers = Arc::new(registry);
+        let runtime = AgentRuntime::new(adeps).unwrap();
+        let svc = runtime.index_service().expect("index service hosted");
+        svc.attach(ws).unwrap();
+        svc.ensure_ready(ws, std::time::Instant::now() + Duration::from_secs(20))
+            .expect("generation 1 builds");
+        runtime.run_turn(sid, prompt, &[]).await.unwrap();
+        let captured = seen.lock().unwrap().clone().expect("request sent");
+        captured
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn configured_embedder_fuses_semantically_matched_evidence_into_the_request() {
+        // With the configured embedder exposed through
+        // `EvidenceProvider::embedder()`, the index-backed evidence assembly
+        // fuses the semantic leg and the CAPTURED wire request contains
+        // `src/ledger.rs` — a file that lexical/symbol/exact search on the
+        // same prompt misses (the corpus never contains quantum/zebra).
+        let system =
+            captured_system_for_prompt(Some(Arc::new(ConceptAxisEmbedder)), "quantum zebra").await;
+        let evidence = system
+            .split("## Retrieved evidence")
+            .nth(1)
+            .unwrap_or_default();
+        assert!(
+            evidence.contains("src/ledger.rs"),
+            "the semantically-matched item must reach the retrieved-evidence block: {system}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_embedder_degrades_honestly_and_never_invents_semantic_evidence() {
+        // The SAME prompt without an embedder: the turn completes (no
+        // crash, no broken evidence call) and the semantic-only file is
+        // absent from the retrieved-evidence block — proving the item above
+        // came from the semantic leg, and that absence degrades honestly to
+        // lexical/symbol-only retrieval.
+        let system = captured_system_for_prompt(None, "quantum zebra").await;
+        assert!(
+            !system.contains("## Retrieved evidence"),
+            "without an embedder no semantic evidence block may appear: {system}"
+        );
+        // A lexical query still finds its file on the same path (the
+        // degradation is semantic-only, never evidence-wide).
+        let lexical = captured_system_for_prompt(None, "reconcile_accounts").await;
+        let evidence = lexical
+            .split("## Retrieved evidence")
+            .nth(1)
+            .unwrap_or_default();
+        assert!(
+            evidence.contains("ledger.rs"),
+            "lexical/symbol evidence must survive the degraded mode: {lexical}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn first_prompt_never_blocks_on_index_build_and_uses_fallback() {
         // A fresh workspace (no Ready generation yet): the evidence call
@@ -28883,6 +29328,115 @@ mod tests {
             }
             other => panic!("review-model block must gate BlockedVerification, got {other:?}"),
         }
+    }
+
+    /// The ACTUAL review-model identity is extracted ONLY from a review value
+    /// whose recorded call was attempted with a non-empty routed pair; every
+    /// other shape is an honest `None` (the parent's configured pair is never
+    /// a substitute).
+    #[test]
+    fn review_model_identity_extraction_is_honest_about_absence() {
+        let attempted = serde_json::json!({
+            "verdict": "pass",
+            "evidence": {
+                "structured": {
+                    "review_model": {
+                        "attempted": true,
+                        "status": "called",
+                        "provider": "reviewmock",
+                        "model": "rev"
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            review_model_identity_of(&attempted),
+            Some(ReviewModelIdentity {
+                provider: "reviewmock".into(),
+                model: "rev".into(),
+            })
+        );
+        for absent in [
+            // No review-model call was attempted at all.
+            serde_json::json!({
+                "verdict": "pass",
+                "evidence": {"structured": {"review_model": {"attempted": false}}}
+            }),
+            // Attempted, but refused before routing (no pair recorded).
+            serde_json::json!({
+                "verdict": "pass",
+                "evidence": {"structured": {"review_model": {
+                    "attempted": true, "provider": "", "model": ""
+                }}}
+            }),
+            // A hostile/legacy shape without the structured record.
+            serde_json::json!({"verdict": "pass"}),
+        ] {
+            assert_eq!(review_model_identity_of(&absent), None, "{absent}");
+        }
+    }
+
+    /// PRODUCTION path: the integrated-root verification of a risky change
+    /// runs the review-model call through the router and exposes the ROUTED
+    /// provider/model on the verdict — while the parent session's configured
+    /// pair (fake/m) is demonstrably different.
+    #[tokio::test]
+    async fn integrated_root_exposes_the_actual_review_model_identity() {
+        let (manager, session, cas, snapshots, dir) = snapshot_review_env(&[(
+            "src/security.rs",
+            "pub fn authenticate(user: u32, secret: u32) -> u32 {\n    user.checked_add(secret).unwrap_or(0)\n}\n",
+        )]);
+        let (routing, review_calls) = PhasePinnedRouting::review_to("reviewmock", "rev");
+        let (deps, _d) = snapshot_review_deps(
+            &manager,
+            &snapshots,
+            &cas,
+            vec![mock_review_provider(r#"{"verdict":"clean","findings":[]}"#)],
+            vec![],
+            routing,
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let h = manager.get_session(session).unwrap().unwrap();
+        let parent_pair = {
+            let row = h.row().unwrap();
+            (row.provider, row.model)
+        };
+        assert_ne!(parent_pair, ("reviewmock".to_string(), "rev".to_string()));
+        let criterion = Criterion::derived(
+            "the security change is independently reviewed",
+            CriterionOrigin::ProjectPolicy,
+            CriterionRequirement::Required,
+            None,
+        )
+        .with_binding(CriterionBinding::IndependentReview {
+            reviewer_id: "final-reviewer".into(),
+        });
+        let criteria = vec![criterion.encode()];
+        let root = dir.path().join("ws");
+        let run = runtime
+            .verify_integrated_root(
+                &h,
+                &root,
+                &["src/security.rs".to_string()],
+                &criteria,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(review_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        assert_eq!(
+            run.review_model_identity,
+            Some(ReviewModelIdentity {
+                provider: "reviewmock".into(),
+                model: "rev".into(),
+            }),
+            "the verdict must name the ACTUAL routed reviewer, not the parent pair"
+        );
+        assert!(
+            run.criteria.iter().any(|c| c.passed),
+            "the aggregate-goal criterion passes through the recorded review: {:?}",
+            run.criteria
+        );
     }
 
     #[tokio::test]

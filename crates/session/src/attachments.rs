@@ -16,12 +16,14 @@
 //! The attachment is deliberately SEPARATE from the workspace-relative
 //! `files` vocabulary: an attachment is bytes addressed by digest, never a
 //! path. Model delivery resolves bytes HERE at request construction
-//! ([`SessionHandle::resolve_attachment_bytes`]) into
-//! `faktor_provider::ContentKind::ImageData` parts; the durable task JSON
-//! stores only the `AttachmentId`, and the provider adapters own their own
-//! wire encodings (base64 source for Anthropic/Google, data URL for
-//! OpenAI, raw base64 for Ollama). Admission validates the media mime/size
-//! against the chosen model's capabilities before any run/task row exists.
+//! ([`SessionHandle::resolve_attachment_bytes`] for images,
+//! [`SessionHandle::resolve_document_bytes`] for non-image documents) into
+//! `faktor_provider::ContentKind::ImageData` / `FileData` parts; the durable
+//! task JSON stores only the `AttachmentId`, and the provider adapters own
+//! their own wire encodings (base64 source for Anthropic/Google, data URL
+//! for OpenAI, raw base64 for Ollama). Admission validates the media
+//! mime/size against the chosen model's capabilities before any run/task row
+//! exists.
 
 use faktor_core::attachment::{
     validate_filename, validate_mime, AttachmentId, MAX_ATTACHMENTS_PER_TASK, MAX_ATTACHMENT_BYTES,
@@ -261,6 +263,43 @@ impl SessionHandle {
         }
         Ok(out)
     }
+
+    /// Resolve a bounded DOCUMENT attachment SET to verified bytes (the
+    /// request-construction read path for non-image documents). Identical
+    /// guarantees to [`Self::resolve_attachment_bytes`] — re-validated ids,
+    /// byte-identical durable rows, durable-size bounds before any read —
+    /// plus the document path's own structural rules: an IMAGE row passed to
+    /// the document path is a typed refusal (the two delivery paths never
+    /// cross), and a zero-byte row is refused (it can never be a valid
+    /// document part). An empty set resolves to an empty list.
+    pub fn resolve_document_bytes(
+        &self,
+        ids: &[AttachmentId],
+        max_bytes_each: usize,
+        max_total_bytes: usize,
+    ) -> faktor_core::Result<Vec<ResolvedAttachment>> {
+        for id in ids {
+            if id.is_image() {
+                return Err(Error::new(
+                    ErrorKind::Malformed,
+                    format!(
+                        "attachment {} has image mime {:?} and cannot ride the document delivery path",
+                        id.digest, id.mime
+                    ),
+                ));
+            }
+            if id.size == 0 {
+                return Err(Error::new(
+                    ErrorKind::Malformed,
+                    format!(
+                        "attachment {} is zero bytes and can never be a valid document part",
+                        id.digest
+                    ),
+                ));
+            }
+        }
+        self.resolve_attachment_bytes(ids, max_bytes_each, max_total_bytes)
+    }
 }
 
 #[cfg(test)]
@@ -308,6 +347,73 @@ mod tests {
         assert_eq!(h.attachment_bytes(&first, 1 << 20).unwrap(), bytes);
         // An unknown digest is an honest absence, never a phantom.
         assert_eq!(h.attachment(FileHash::from([9; 32])).unwrap(), None);
+    }
+
+    /// The document delivery path: byte-identical resolution of a small PDF
+    /// fixture, path crossing and zero-byte refusals, and the durable
+    /// bounds — while the image path is untouched.
+    #[test]
+    fn document_bytes_resolve_byte_exactly_and_crosses_are_refused() {
+        let (_dir, m) = test_manager();
+        let s = session(&m);
+        // A small byte-exact PDF fixture.
+        let pdf = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n%%EOF".to_vec();
+        let doc = s
+            .put_attachment("application/pdf", Some("spec.pdf"), &pdf)
+            .unwrap();
+        let text = s
+            .put_attachment("text/plain", Some("notes.txt"), b"plain text\n")
+            .unwrap();
+        let resolved = s
+            .resolve_document_bytes(&[doc.clone(), text.clone()], 1 << 20, 1 << 20)
+            .unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].id, doc);
+        assert_eq!(resolved[0].bytes, pdf, "the PDF bytes lower byte-exactly");
+        assert_eq!(resolved[1].bytes, b"plain text\n");
+        // An empty set is fine and reads nothing.
+        assert!(s
+            .resolve_document_bytes(&[], 1 << 20, 1 << 20)
+            .unwrap()
+            .is_empty());
+
+        // An IMAGE row can never ride the document path.
+        let img = s
+            .put_attachment("image/png", Some("shot.png"), b"\x89PNG")
+            .unwrap();
+        let err = s
+            .resolve_document_bytes(std::slice::from_ref(&img), 1 << 20, 1 << 20)
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Malformed);
+        assert!(err.message.contains("document delivery path"), "{err}");
+
+        // A zero-byte row is refused before any read.
+        let empty = s
+            .put_attachment("application/pdf", Some("empty.pdf"), b"")
+            .unwrap();
+        let err = s
+            .resolve_document_bytes(&[empty], 1 << 20, 1 << 20)
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Malformed);
+        assert!(err.message.contains("zero bytes"), "{err}");
+
+        // Durable bounds apply from the metadata BEFORE any blob read.
+        let err = s
+            .resolve_document_bytes(std::slice::from_ref(&doc), 4, 1 << 20)
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized);
+        let err = s
+            .resolve_document_bytes(&[doc, text], 1 << 20, 4)
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized);
+
+        // The image path still resolves the image byte-identically.
+        assert_eq!(
+            s.resolve_attachment_bytes(&[img], 1 << 20, 1 << 20)
+                .unwrap()[0]
+                .bytes,
+            b"\x89PNG"
+        );
     }
 
     #[test]

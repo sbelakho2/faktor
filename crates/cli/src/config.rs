@@ -42,6 +42,11 @@ pub struct Config {
     /// The additive `[efficiency]` section (audit 86 + the efficiency-variant
     /// production flags): five boolean feature switches, ALL default `false`.
     pub efficiency: EfficiencyCfg,
+    /// The additive `[embeddings]` section: the semantic embedding provider
+    /// selection (model + provider + policy) wired into the search seam.
+    /// Absent = no embedder: retrieval stays lexical/symbol-only and
+    /// degrades honestly, never a fabricated vector.
+    pub embeddings: Option<EmbeddingCfg>,
 }
 
 /// The additive `[completion]` section (P2 follow-up): how a contracted
@@ -391,6 +396,133 @@ impl<'de> serde::Deserialize<'de> for EfficiencyCfg {
     }
 }
 
+/// The additive `[embeddings]` section: ONE selected semantic embedding
+/// provider. Strict by construction (map-only parsing: unknown keys,
+/// duplicate keys, non-object shapes and wrong value types are parse
+/// errors) and strictly additive (an absent section keeps no embedder):
+///
+/// - `provider` names a REGISTERED provider instance id;
+/// - `model` names the embedding model that instance serves;
+/// - `policy` decides what an unresolvable selection means:
+///   `best_effort` (default) degrades to no embedder with a warning, while
+///   `required` refuses startup — the daemon never boots claiming semantic
+///   retrieval it cannot honor.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EmbeddingCfg {
+    pub provider: String,
+    pub model: String,
+    pub policy: EmbeddingPolicy,
+}
+
+/// Selection strictness of the `[embeddings]` section. See [`EmbeddingCfg`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingPolicy {
+    /// An unresolvable selection degrades to no embedder (honest lexical/
+    /// symbol-only retrieval) with a warning.
+    #[default]
+    BestEffort,
+    /// An unresolvable selection fails daemon startup.
+    Required,
+}
+
+impl<'de> serde::Deserialize<'de> for EmbeddingPolicy {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let value = String::deserialize(de)?;
+        match value.as_str() {
+            "best_effort" => Ok(Self::BestEffort),
+            "required" => Ok(Self::Required),
+            other => Err(D::Error::custom(format!(
+                "unknown embedding policy {other:?}; expected \"best_effort\" or \"required\""
+            ))),
+        }
+    }
+}
+
+/// The `[embeddings]` keys, in stable order (unknown-field errors list
+/// them).
+pub const EMBEDDING_FIELDS: &[&str] = &["provider", "model", "policy"];
+
+/// Strict bound of the configured embedding provider/model ids: long enough
+/// for real ids, short enough to stay journal-safe.
+pub const MAX_EMBEDDING_ID_BYTES: usize = 256;
+
+impl<'de> serde::Deserialize<'de> for EmbeddingCfg {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error as _, MapAccess, Visitor};
+
+        struct SectionVisitor;
+
+        impl<'de> Visitor<'de> for SectionVisitor {
+            type Value = EmbeddingCfg;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("the [embeddings] section as a JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<EmbeddingCfg, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut provider: Option<String> = None;
+                let mut model: Option<String> = None;
+                let mut policy: Option<EmbeddingPolicy> = None;
+                let mut seen: u8 = 0;
+                while let Some(key) = map.next_key::<String>()? {
+                    let (bit, name) = match key.as_str() {
+                        "provider" => (1u8, "provider"),
+                        "model" => (2, "model"),
+                        "policy" => (4, "policy"),
+                        other => return Err(A::Error::unknown_field(other, EMBEDDING_FIELDS)),
+                    };
+                    if seen & bit != 0 {
+                        return Err(A::Error::duplicate_field(name));
+                    }
+                    seen |= bit;
+                    match bit {
+                        1 => provider = Some(map.next_value()?),
+                        2 => model = Some(map.next_value()?),
+                        _ => policy = Some(map.next_value()?),
+                    }
+                }
+                Ok(EmbeddingCfg {
+                    provider: provider.ok_or_else(|| A::Error::missing_field("provider"))?,
+                    model: model.ok_or_else(|| A::Error::missing_field("model"))?,
+                    policy: policy.unwrap_or_default(),
+                })
+            }
+        }
+
+        de.deserialize_map(SectionVisitor)
+    }
+}
+
+impl EmbeddingCfg {
+    /// Semantic validation shared by both load paths: ids are non-empty and
+    /// bounded. A registry-resolvable check happens at daemon build, where
+    /// the provider registry exists.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [("provider", &self.provider), ("model", &self.model)] {
+            if value.trim().is_empty() {
+                return Err(format!("embeddings: {name} is empty"));
+            }
+            if value.len() > MAX_EMBEDDING_ID_BYTES {
+                return Err(format!(
+                    "embeddings: {name} exceeds {MAX_EMBEDDING_ID_BYTES} bytes"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The additive `[verification]` section (daemon verification policy).
 /// Strictly additive with `serde(default)`: an absent section (or absent
 /// keys inside it) keep the crate defaults (quick ≤ 60 s, unit ≤ 600 s
@@ -489,6 +621,8 @@ impl<'de> serde::Deserialize<'de> for Config {
             completion: CompletionCfg,
             #[serde(default = "production_efficiency")]
             efficiency: EfficiencyCfg,
+            #[serde(default)]
+            embeddings: Option<EmbeddingCfg>,
         }
         let file = File::deserialize(de)?;
         if file.config_version != 1 {
@@ -510,6 +644,7 @@ impl<'de> serde::Deserialize<'de> for Config {
             tasks: file.tasks,
             completion: file.completion,
             efficiency: file.efficiency,
+            embeddings: file.embeddings,
         })
     }
 }
@@ -544,6 +679,7 @@ impl Default for Config {
             tasks: TasksCfg::default(),
             completion: CompletionCfg::default(),
             efficiency: EfficiencyCfg::production_defaults(),
+            embeddings: None,
         }
     }
 }
@@ -1207,7 +1343,58 @@ impl Config {
             p.validate_pricing()
                 .map_err(|e| format!("provider {}: {e}", p.id()))?;
         }
+        if let Some(embeddings) = &self.embeddings {
+            embeddings.validate()?;
+        }
         Ok(())
+    }
+
+    /// Resolve the configured semantic embedder against the daemon's
+    /// provider registry (the runtime half of `[embeddings]`). `Ok(None)`
+    /// means "no semantic embedder": retrieval stays lexical/symbol-only —
+    /// an honest degradation, never a fabricated vector. A `required`
+    /// policy turns an unresolvable selection into an error (startup
+    /// refusal); `best_effort` degrades to `None` with a warning.
+    ///
+    /// The embedder calls the provider SYNCHRONOUSLY through
+    /// [`faktor_provider::Provider::embed`]; retries follow `retry` (the
+    /// daemon's configured policy) and input batching is internal.
+    pub fn semantic_embedder(
+        &self,
+        providers: &faktor_provider::ProviderRegistry,
+        retry: &faktor_core::retry::RetryPolicy,
+    ) -> Result<Option<Arc<dyn faktor_search::Embedder>>, String> {
+        let Some(cfg) = &self.embeddings else {
+            return Ok(None);
+        };
+        cfg.validate()?;
+        let missing = |reason: String| -> Result<Option<Arc<dyn faktor_search::Embedder>>, String> {
+            match cfg.policy {
+                EmbeddingPolicy::Required => Err(format!(
+                    "embeddings: provider {:?} model {:?} is required but {reason}",
+                    cfg.provider, cfg.model
+                )),
+                EmbeddingPolicy::BestEffort => {
+                    tracing::warn!(
+                        "semantic embeddings disabled: provider {:?} model {:?} {reason}; retrieval stays lexical/symbol-only",
+                        cfg.provider,
+                        cfg.model
+                    );
+                    Ok(None)
+                }
+            }
+        };
+        let Some(provider) = providers.get(cfg.provider.as_str()) else {
+            return missing("is not a registered provider".to_string());
+        };
+        if !provider.supports_embeddings(&cfg.model) {
+            return missing("does not advertise embedding support for the model".to_string());
+        }
+        Ok(Some(Arc::new(crate::embeddings::ProviderEmbedder::new(
+            provider,
+            cfg.model.clone(),
+            *retry,
+        ))))
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
@@ -1304,6 +1491,132 @@ mod tests {
         assert_eq!(loaded.model, cfg.model);
         assert_eq!(loaded.compact_at_usage, 0.65);
         assert!(loaded.providers.is_empty());
+    }
+
+    /// The additive `[embeddings]` section: strict map-only parsing, the
+    /// strict/lenient load paths, and the registry-backed selection policy
+    /// (`required` refuses, `best_effort` degrades to no embedder).
+    #[test]
+    fn embeddings_section_is_strict_and_policy_gated() {
+        use faktor_provider::{EmbeddingResponse, FakeProvider};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("emb.json");
+        assert!(
+            Config::default().embeddings.is_none(),
+            "an absent section keeps no embedder"
+        );
+        let cfg = Config {
+            embeddings: Some(EmbeddingCfg {
+                provider: "embed-me".into(),
+                model: "emb-1".into(),
+                policy: EmbeddingPolicy::Required,
+            }),
+            ..Config::default()
+        };
+        cfg.save(&path).unwrap();
+        let loaded = Config::load_strict(&path).unwrap();
+        assert_eq!(
+            loaded.embeddings, cfg.embeddings,
+            "the selection round-trips"
+        );
+
+        // Strict parsing: unknown/duplicate keys, wrong types, missing
+        // members and positional arrays are refused by BOTH load paths.
+        for bad in [
+            r#"{"embeddings": {"model": "m"}}"#,
+            r#"{"embeddings": {"provider": "p", "model": "m", "bogus": 1}}"#,
+            r#"{"embeddings": {"provider": "p", "model": "m", "policy": "sometimes"}}"#,
+            r#"{"embeddings": {"provider": "p", "model": "m", "policy": true}}"#,
+            r#"{"embeddings": {"provider": "p", "provider": "q", "model": "m"}}"#,
+            r#"{"embeddings": ["p", "m"]}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(
+                Config::load(&path).is_err(),
+                "hostile [embeddings] must fail: {bad}"
+            );
+            assert!(Config::load_strict(&path).is_err(), "{bad}");
+        }
+        // Empty ids parse but are refused by semantic validation.
+        std::fs::write(&path, r#"{"embeddings": {"provider": "", "model": "m"}}"#).unwrap();
+        assert!(Config::load(&path).is_ok());
+        assert!(Config::load_strict(&path).is_err());
+
+        // Registry resolution.
+        let retry = faktor_core::retry::RetryPolicy::default();
+        let mut registry = faktor_provider::ProviderRegistry::new();
+        let fake = Arc::new(
+            FakeProvider::new("embed-me", ModelCapabilities::default()).with_embeddings(
+                "emb-1",
+                vec![Ok(EmbeddingResponse::new(vec![vec![0.5, 0.25]]).unwrap())],
+            ),
+        );
+        registry.try_register(fake.clone()).unwrap();
+        let resolved = cfg
+            .semantic_embedder(&registry, &retry)
+            .unwrap()
+            .expect("a capable configured provider resolves");
+        let vectors = resolved.try_embed(&["hello".into()]).unwrap();
+        assert_eq!(vectors, vec![vec![0.5, 0.25]]);
+        assert_eq!(fake.embedding_requests()[0].model, "emb-1");
+        assert_eq!(
+            fake.embedding_requests()[0].inputs,
+            vec!["hello".to_string()]
+        );
+
+        // `required` refuses an unresolvable selection; `best_effort`
+        // degrades to no embedder (honest lexical/symbol-only retrieval).
+        for (provider, model) in [("nope", "emb-1"), ("embed-me", "other")] {
+            let required = Config {
+                embeddings: Some(EmbeddingCfg {
+                    provider: provider.into(),
+                    model: model.into(),
+                    policy: EmbeddingPolicy::Required,
+                }),
+                ..Config::default()
+            };
+            assert!(
+                required.semantic_embedder(&registry, &retry).is_err(),
+                "{provider}/{model} must refuse under required"
+            );
+            let best_effort = Config {
+                embeddings: Some(EmbeddingCfg {
+                    provider: provider.into(),
+                    model: model.into(),
+                    policy: EmbeddingPolicy::BestEffort,
+                }),
+                ..Config::default()
+            };
+            assert!(
+                best_effort
+                    .semantic_embedder(&registry, &retry)
+                    .unwrap()
+                    .is_none(),
+                "{provider}/{model} must degrade under best_effort"
+            );
+        }
+        // A registered provider with no embedding surface cannot be
+        // selected even though the id resolves.
+        let mut plain = faktor_provider::ProviderRegistry::new();
+        plain
+            .try_register(Arc::new(FakeProvider::new(
+                "plain",
+                ModelCapabilities::default(),
+            )))
+            .unwrap();
+        let cfg_plain = Config {
+            embeddings: Some(EmbeddingCfg {
+                provider: "plain".into(),
+                model: "m".into(),
+                policy: EmbeddingPolicy::BestEffort,
+            }),
+            ..Config::default()
+        };
+        assert!(cfg_plain
+            .semantic_embedder(&plain, &retry)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

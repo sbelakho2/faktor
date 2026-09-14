@@ -68,6 +68,13 @@ use faktor_provider::{
 
 const DEFAULT_BASE: &str = "http://127.0.0.1:11434";
 
+/// Per-image raw-byte ceiling the Ollama adapter delivers. Ollama's native
+/// `/api/chat` takes base64 `images` without documenting a per-image limit;
+/// the daemon-wide default ([`faktor_provider::MAX_MODEL_IMAGE_BYTES`]) is
+/// therefore the adapter's own bound, still capped structurally by
+/// [`faktor_provider::MAX_MEDIA_BYTES_HARD`] inside the delivery gate.
+pub const OLLAMA_MAX_IMAGE_BYTES: usize = faktor_provider::MAX_MODEL_IMAGE_BYTES;
+
 #[derive(Debug, Clone)]
 pub struct OllamaConfig {
     pub base_url: String,
@@ -514,7 +521,25 @@ impl Provider for OllamaProvider {
         self.runtime_limits.read().unwrap().get(model).copied()
     }
 
+    fn max_image_bytes(&self) -> usize {
+        OLLAMA_MAX_IMAGE_BYTES
+    }
+
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
+        // Adapter-boundary media gate (defense in depth alongside the
+        // agent-side `CapabilityValidator`): the adapter's OWN capability
+        // data decides, BEFORE any wire byte and before the body is built —
+        // a vision-less model refuses every resolved image part with a typed
+        // `BadRequest`, and a directly-constructed or hostile request can
+        // never smuggle an image onto the native `images` array (or have it
+        // silently dropped). The check also enforces the mime allowlist and
+        // this adapter's per-image byte bound.
+        let caps = self.capabilities(&req.model);
+        if let Err(e) =
+            faktor_provider::validate_media_delivery(&req, &caps, self.max_image_bytes())
+        {
+            return faktor_provider::provider_error_stream(e);
+        }
         let body = self.wire_body(&req);
         let url = format!("{}/api/chat", self.config.base_url);
         let transport = self.transport.clone();
@@ -1022,6 +1047,14 @@ fn lower_native_message(
                 switch_role(&mut acc, &mut out, role_name(&m.role));
                 let a = acc.as_mut().expect("switch_role guarantees an accumulator");
                 a.images.push(data.to_base64());
+            }
+            ContentKind::FileData { .. } => {
+                // Documents are NOT deliverable on the native ollama wire:
+                // `document_capable` stays false, the delivery gate refuses
+                // every resolved document part typedly BEFORE this lowering
+                // runs, and this arm can only be reached by a directly
+                // constructed hostile request — which must never smuggle a
+                // document into `images` or any other field.
             }
         }
     }
@@ -1563,7 +1596,9 @@ mod tests {
     #[tokio::test]
     async fn resolved_image_data_lowers_to_native_base64_array() {
         // Resolved `ImageData` parts lower to the SAME native `images`
-        // array as a data-URI URL: raw standard base64, no prefix.
+        // array as a data-URI URL: raw standard base64, no prefix. The model
+        // must advertise vision (the adapter-boundary gate refuses a
+        // resolved image for a vision-less profile before lowering).
         let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 1, 2, 3];
         let expected = faktor_provider::MediaBytes::new(png.clone())
             .unwrap()
@@ -1578,7 +1613,15 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::build(OllamaConfig::new(Some(base)));
+        let mut cfg = OllamaConfig::new(Some(base));
+        cfg.model_overrides.insert(
+            "qwen3.8".into(),
+            ModelCapabilities {
+                vision: true,
+                ..ModelCapabilities::default()
+            },
+        );
+        let provider = OllamaProvider::build(cfg);
         let mut r = req("qwen3.8");
         r.messages.push(RequestMessage {
             role: Role::User,
@@ -1597,6 +1640,169 @@ mod tests {
             msg["images"],
             serde_json::json!([expected]),
             "resolved bytes lower byte-exactly to raw base64"
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_media_gate_refuses_images_when_the_model_lacks_vision() {
+        // Adapter-boundary gate: the adapter's OWN capability data (the
+        // probed `vision` flag) decides, alongside the agent-side
+        // CapabilityValidator. A vision-less model + a resolved image part
+        // is a typed, single-frame BadRequest — and NO wire byte is sent
+        // (the mock server must record zero requests).
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/api/chat",
+            MockAction::Respond {
+                status: 200,
+                body: r#"{"done":true}"#.into(),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        // Capability data explicitly probed as vision-less.
+        assert!(!provider.capabilities("qwen3.8").vision);
+        let mut r = req("qwen3.8");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::image_data("image/png", vec![0x89, b'P', b'N', b'G', 1]).unwrap(),
+            ],
+        });
+        let mut stream = provider.stream(r);
+        let item = stream
+            .next()
+            .await
+            .expect("the refusal is a single terminal frame");
+        let err = item.expect_err("a vision-less model must refuse the image");
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
+        assert!(!err.retryable, "nothing was attempted; retry cannot help");
+        assert!(
+            err.message.contains("does not support vision"),
+            "typed refusal names the capability: {err:?}"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "the refusal stream must terminate"
+        );
+        assert_eq!(
+            server.request_count(),
+            0,
+            "the gate runs BEFORE any wire byte is sent"
+        );
+        // The legacy URL-shaped image part is not bytes-bearing and never
+        // reaches this gate; only resolved ImageData is admitted/refused.
+        assert_eq!(provider.max_image_bytes(), OLLAMA_MAX_IMAGE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn adapter_media_gate_lowers_images_for_vision_models() {
+        // A vision-capable model (the adapter's own probed data) admits the
+        // same request and the image lowers byte-exactly onto the native
+        // `images` array.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/api/chat",
+            MockAction::AssertThenRespond {
+                status: 200,
+                body: r#"{"done":true}"#.into(),
+                assert: Arc::new(|body: &serde_json::Value| {
+                    assert!(
+                        body["messages"][2]["images"]
+                            .as_array()
+                            .is_some_and(|a| !a.is_empty()),
+                        "a vision model must receive the lowered image: {body}"
+                    );
+                }),
+            },
+        );
+        let base = server.base_url().await;
+        let mut cfg = OllamaConfig::new(Some(base));
+        cfg.model_overrides.insert(
+            "qwen3.8".into(),
+            ModelCapabilities {
+                vision: true,
+                ..ModelCapabilities::default()
+            },
+        );
+        let provider = OllamaProvider::new(cfg);
+        assert!(
+            provider.capabilities("qwen3.8").vision,
+            "adapter capability data admits vision"
+        );
+        let mut r = req("qwen3.8");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::image_data("image/png", vec![0x89, b'P', b'N', b'G', 9, 9]).unwrap(),
+            ],
+        });
+        let chunks = stream_chunks(&*provider, r).await;
+        assert!(matches!(chunks.last(), Some(ProviderChunk::Done)));
+        assert!(
+            server.request_count() >= 1,
+            "the vision model request reached the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_media_gate_refuses_hostile_oversized_payload_typed() {
+        // Hostile, maximally-sized payload: a valid-PNG-magic image exactly
+        // one byte over the adapter's per-image bound. The refusal is typed
+        // (`BadRequest`, not a panic, not a truncated send, not an OOM) and
+        // happens before any wire byte.
+        let png = [0x89, b'P', b'N', b'G'];
+        let oversized: Vec<u8> = png
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(
+                0u8,
+                OLLAMA_MAX_IMAGE_BYTES + 1 - png.len(),
+            ))
+            .collect();
+        assert_eq!(oversized.len(), OLLAMA_MAX_IMAGE_BYTES + 1);
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/api/chat",
+            MockAction::Respond {
+                status: 200,
+                body: r#"{"done":true}"#.into(),
+            },
+        );
+        let base = server.base_url().await;
+        let mut cfg = OllamaConfig::new(Some(base));
+        cfg.model_overrides.insert(
+            "qwen3.8".into(),
+            ModelCapabilities {
+                vision: true,
+                ..ModelCapabilities::default()
+            },
+        );
+        let provider = OllamaProvider::new(cfg);
+        let mut r = req("qwen3.8");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![ContentPart::image_data("image/png", oversized).unwrap()],
+        });
+        let mut stream = provider.stream(r);
+        let item = stream.next().await.expect("one typed refusal frame");
+        let err = item.expect_err("the oversized payload must be refused");
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
+        assert!(
+            err.message.contains("exceeds the provider bound"),
+            "typed bound refusal: {err:?}"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "the refusal stream must terminate"
+        );
+        assert_eq!(
+            server.request_count(),
+            0,
+            "an oversized image never starts a request"
         );
     }
 

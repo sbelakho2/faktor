@@ -5,12 +5,33 @@
 #   3. run BackendSmoke (v7.5.6 wire), NativeBridgeSmoke (native protocol v1 +
 #      fake-server unit suite), FrontendSmoke (panels + canned frames) and
 #      JetBrainsParitySmoke (upstream 7.1.2 pin hashes + fake daemon + parity
-#      families + real daemon restart/reconnect) against the real daemon; exit 0/1
+#      families + the executable behavioral/visual parity matrix artifact +
+#      real daemon restart/reconnect) against the real daemon; exit 0/1
+#
+# Flags:
+#   --write-baselines  re-pin the visual matrix baselines from this render
+#                      (apps/jetbrains/frontend/src/test/resources/parity/
+#                      visual-baselines.json); normal runs compare against the
+#                      pinned file and fail on drift
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 JETBRAINS="$ROOT/apps/jetbrains"
+
+EXTRA_JVM_ARGS=""
+for arg in "$@"; do
+  case "$arg" in
+    --write-baselines)
+      EXTRA_JVM_ARGS="-Dfaktor.parity.writeBaselines=true"
+      echo "[compile-and-smoke] writing pinned visual baselines from this render"
+      ;;
+    *)
+      echo "FAIL: unknown flag: $arg" >&2
+      exit 1
+      ;;
+  esac
+done
 
 SHARED_SRC="$JETBRAINS/shared/src/main/kotlin/dev/faktor/shared/Protocol.kt
 $JETBRAINS/shared/src/main/kotlin/dev/faktor/shared/NativeProtocol.kt"
@@ -20,6 +41,7 @@ $JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/NativeEventStream.kt"
 TEST_SRC="$JETBRAINS/backend/src/test/kotlin/dev/faktor/backend/BackendProcessManagerTest.kt
 $JETBRAINS/backend/src/test/kotlin/dev/faktor/backend/NativeClientTest.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/FrontendTestSupport.kt
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/FrontendSmoke.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt"
 FRONTEND_SRC="$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorFrontendService.kt
@@ -200,7 +222,7 @@ compile_kotlin || {
 run_smoke() {
   local name="$1"
   local err="$WORK/${name}.stderr"
-  java -Dfaktor.repo.root="$ROOT" -cp "$SMOKE_JAR" "$2" "$BIN" 2>"$err"
+  java -Dfaktor.repo.root="$ROOT" $EXTRA_JVM_ARGS -cp "$SMOKE_JAR" "$2" "$BIN" 2>"$err"
   local rc=$?
   if [ $rc -ne 0 ]; then
     echo "[compile-and-smoke] $name FAILED (rc=$rc); daemon stderr tail ($err):" >&2

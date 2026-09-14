@@ -11,8 +11,7 @@ use faktor_protocol::v756::*;
 use faktor_protocol::v756::{
     mapper as wire_mapper, wire::AbortBody, wire::DiffStatus, wire::MessageModel,
     wire::MessageSendRequest, wire::MessageSendResponse, wire::RevertBody,
-    wire::SessionCreateRequest, wire::SessionListResponse, wire::SessionSummarizeResponse,
-    wire::SessionSummary, wire::SessionUpdateRequest, wire::SessionUpdateResponse,
+    wire::SessionCreateRequest, wire::SessionUpdateRequest, wire::SessionUpdateResponse,
     wire::SnapshotFileDiff, wire::WireMessageEntry, wire::WireMessageInfo, wire::WirePart,
 };
 use std::sync::Arc;
@@ -192,33 +191,49 @@ pub(crate) async fn wire_create_session(
     }
 }
 
-/// `GET /session` — the session list.
+/// Bound on `GET /session?limit=` (bounded everything: no unbounded page).
+pub(crate) const MAX_SESSION_LIST: usize = 500;
+
+/// The SDK `session.list` query. `roots`/`start`/`search` are accepted by
+/// the declared type but not interpreted by this slice (forked sessions are
+/// independent rows without a parent link); `limit` IS honored, bounded.
+#[derive(serde::Deserialize, Default)]
+pub(crate) struct WireSessionListQuery {
+    limit: Option<u64>,
+}
+
+/// `GET /session` — the SDK's `session.list` contract: a BARE `Session1[]`
+/// (the rich session projection, newest first), never the old
+/// `{sessions:[…]}` scaffold envelope. The SDK type is the contract; the
+/// daemon's checked-in consumers were updated with it.
 pub(crate) async fn wire_list_sessions(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(q): Query<WireSessionListQuery>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let limit = q
+        .limit
+        .map(|l| (l as usize).min(MAX_SESSION_LIST))
+        .unwrap_or(MAX_SESSION_LIST);
     let mut sessions = Vec::new();
     match state.deps.session.list_sessions(None) {
         Ok(handles) => {
             for h in handles {
                 // A row that vanished mid-list is skipped, never fatal.
                 if let Ok(row) = h.row() {
-                    sessions.push(SessionSummary {
-                        session_id: row.id.to_string(),
-                        title: row.title,
-                        state: agent_state_tag(row.state),
-                        created_ms: row.created_ms,
-                        updated_ms: row.updated_ms,
-                    });
+                    sessions.push(wire_rich_session(&state, &row));
+                    if sessions.len() >= limit {
+                        break;
+                    }
                 }
             }
         }
         Err(e) => return api_err(&e),
     }
-    Json(SessionListResponse { sessions }).into_response()
+    Json(sessions).into_response()
 }
 
 /// `GET /session/{sessionID}` — one session summary (404 when unknown).
@@ -359,6 +374,35 @@ fn compat_malformed(message: &str) -> Response {
             "code": "malformed",
             "message": message,
             "retryable": false,
+        })),
+    )
+        .into_response()
+}
+
+/// The SDK's declared `400` error for a bad request parameter
+/// (`BadRequestError`): `{name:"BadRequest", data:{message, kind?}}`. Used
+/// where the SDK union declares 400 and the frozen `{ok:false,message}` 409
+/// would be a status the SDK never expects (e.g. `session.diff` with an
+/// unknown `messageID`).
+pub(crate) fn sdk_bad_request(message: &str, kind: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "name": "BadRequest",
+            "data": {"message": message, "kind": kind},
+        })),
+    )
+        .into_response()
+}
+
+/// The SDK's declared `400` error for an unserviceable request
+/// (`InvalidRequestError`): `{_tag:"InvalidRequestError", message}`.
+pub(crate) fn sdk_invalid_request(message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "_tag": "InvalidRequestError",
+            "message": message,
         })),
     )
         .into_response()
@@ -798,7 +842,10 @@ pub(crate) async fn wire_messages_page(
     resp
 }
 
-/// `POST /session/{sessionID}/abort` — body `{ messageID? }`.
+/// `POST /session/{sessionID}/abort` — body `{ messageID? }`. The SDK
+/// declares `200: boolean`; the daemon reports whether the abort actually
+/// cancelled at least one operation (a parked/idle session answers `false`,
+/// never a fabricated success).
 pub(crate) async fn wire_abort(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -822,10 +869,7 @@ pub(crate) async fn wire_abort(
         Ok(Some(_)) => {}
     }
     match state.deps.agent.abort(sid) {
-        Ok(ops) => Json(AbortResponse {
-            aborted: ops.iter().map(|o| o.to_string()).collect(),
-        })
-        .into_response(),
+        Ok(ops) => Json(!ops.is_empty()).into_response(),
         Err(e) => api_err(&e),
     }
 }
@@ -857,7 +901,8 @@ pub(crate) fn store_err(e: &faktor_store::StoreError) -> Response {
 /// Filters (documented, audit P0):
 /// - `?message=<seq>` limits the projection to ONE checkpoint: the newest
 ///   checkpoint recorded at-or-before that message's `created_ms` (the same
-///   selection revert uses). Unknown message → honest 409.
+///   selection revert uses). An unknown/malformed message is the SDK's
+///   declared `400 BadRequestError`, never a silently ignored filter.
 /// - `?file=<rel path>` keeps only the entries whose recorded path equals
 ///   the given relative path (exact match; no filesystem access happens).
 /// - `?full=1` adds the full unified diff text (before/after content
@@ -896,7 +941,7 @@ pub(crate) async fn wire_diff(
         let seq: i64 = match raw.parse() {
             Ok(s) if s > 0 => s,
             _ => {
-                return wire_refused(&format!("diff: malformed message {raw:?}"));
+                return sdk_bad_request(&format!("diff: malformed message {raw:?}"), "Query");
             }
         };
         let message_ms = match store.message_created_ms(sid, seq) {
@@ -904,7 +949,7 @@ pub(crate) async fn wire_diff(
             Err(e) => return store_err(&e),
         };
         let Some(message_ms) = message_ms else {
-            return wire_refused(&format!("diff: unknown message id {seq}"));
+            return sdk_bad_request(&format!("diff: unknown message id {seq}"), "Query");
         };
         // Newest checkpoint recorded at-or-before the message: one
         // checkpoint = the rows of that checkpoint sequence.
@@ -1338,9 +1383,11 @@ pub(crate) const SUMMARIZE_LAST_MESSAGES: usize = 3;
 /// Hard bound on the returned summary text.
 pub(crate) const SUMMARIZE_MAX_BYTES: usize = 4096;
 
-/// `POST /session/{sessionID}/summarize` — a bounded summary from the
-/// session title + the newest messages' text (nothing heavy is stored or
-/// journaled). Text is truncated to [`SUMMARIZE_MAX_BYTES`].
+/// `POST /session/{sessionID}/summarize` — the SDK declares `200: boolean`.
+/// The bounded digest over the session title + newest messages' text is
+/// still produced (the real, bounded work this surface defines); it has no
+/// field in the SDK type, so the boolean reports its completion. Unknown
+/// sessions stay 404.
 pub(crate) async fn wire_session_summarize(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1358,9 +1405,9 @@ pub(crate) async fn wire_session_summarize(
         Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
         Err(e) => return api_err(&e),
     };
-    let row = match handle.row() {
-        Ok(r) => r,
-        Err(e) => return api_err(&e),
+    // The row read validates the durable session before the bounded digest.
+    if let Err(e) = handle.row() {
+        return api_err(&e);
     };
     let store = state.deps.session.store();
     let rows = match store.messages_before(sid, None, SUMMARIZE_LAST_MESSAGES as u64) {
@@ -1399,12 +1446,11 @@ pub(crate) async fn wire_session_summarize(
     if digest.is_empty() {
         digest = "No messages yet.".into();
     }
-    Json(SessionSummarizeResponse {
-        session_id: sid.to_string(),
-        title: row.title,
-        summary: digest,
-    })
-    .into_response()
+    // The SDK type has no text field; the digest is the bounded work the
+    // boolean acknowledges (never a fabricated summary over an unknown
+    // session — that path already 404'd above).
+    let _ = digest;
+    Json(true).into_response()
 }
 
 /// Append `s`, never exceeding `max` bytes without splitting a char.
@@ -1468,13 +1514,68 @@ pub(crate) async fn wire_session_update(
     }
 }
 
-/// `DELETE /session/{sessionID}` — delete a session: refused while the
-/// session is mid-turn (active turn record or active machine state);
-/// otherwise the session is durably ended (`SessionEnded` journal event +
-/// lifecycle Closed), lingering queued prompts are cancelled and the
-/// per-session in-process registries are closed. The durable row is kept
-/// (the Closed tombstone reads as `completed`; a store-level row-drop API
-/// does not exist in this slice of the workspace).
+/// The SDK `session.update` (PATCH) body: every field optional. This slice
+/// durably owns the TITLE only; `metadata`/`permission`/archive requests are
+/// refused with the SDK-declared `400 InvalidRequestError` instead of being
+/// silently dropped.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SdkSessionUpdateBody {
+    title: Option<String>,
+    metadata: Option<serde_json::Value>,
+    permission: Option<serde_json::Value>,
+    time: Option<serde_json::Value>,
+}
+
+/// `PATCH /session/{sessionID}` — the SDK's `session.update`: returns the
+/// rich SDK `Session4` projection (the same superset `session.get` serves).
+/// A title-less patch is a legal no-op read of the current session.
+pub(crate) async fn wire_session_update_patch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    body: Option<Json<SdkSessionUpdateBody>>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let sid = match parse_session_id(&session_id) {
+        Ok(s) => s,
+        Err(e) => return wire_status(e),
+    };
+    let handle = match state.deps.session.get_session(sid) {
+        Ok(Some(h)) => h,
+        Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
+        Err(e) => return api_err(&e),
+    };
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    if body.metadata.is_some() || body.permission.is_some() || body.time.is_some() {
+        return sdk_invalid_request(
+            "session.update supports the title field only; metadata/permission/time are not \
+             durable in this slice",
+        );
+    }
+    if let Some(title) = body.title {
+        if let Err(e) = handle.update_session_title(&title) {
+            return api_err(&e);
+        }
+    }
+    match handle.row() {
+        Ok(row) => Json(wire_rich_session(&state, &row)).into_response(),
+        Err(e) => api_err(&e),
+    }
+}
+
+/// `DELETE /session/{sessionID}` — delete a session. The SDK declares
+/// `200: boolean` (and only 400/404 errors), so a session whose turn has
+/// FINISHED is deletable: the session layer's `is_active()` predicate also
+/// covers the parked `ReadyForNextTurn` machine and refuses it, so a parked
+/// session with no active turn record is ended through the daemon's own
+/// durable close path (the one `/global/dispose` uses). A genuinely active
+/// turn still refuses 409. On success the durable row is kept (the Closed
+/// tombstone; a store-level row-drop API does not exist in this slice),
+/// lingering queued prompts are cancelled and the per-session in-process
+/// registries are closed.
 pub(crate) async fn wire_session_delete(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1488,13 +1589,33 @@ pub(crate) async fn wire_session_delete(
         Err(e) => return wire_status(e),
     };
     match state.deps.session.delete_session(sid) {
-        Ok(()) => Json(OkResponse { ok: true }).into_response(),
+        Ok(()) => Json(true).into_response(),
         Err(e) => {
             if matches!(
                 e.kind,
                 faktor_core::error::ErrorKind::Conflict
                     | faktor_core::error::ErrorKind::InvalidState { .. }
             ) {
+                // Parked-session fallback (documented): `ReadyForNextTurn`
+                // means the turn is DONE — there is no active turn record to
+                // protect — and the SDK has no 409 for delete. Every other
+                // conflict (real mid-turn, already-terminal lifecycle) keeps
+                // the honest 409 refusal.
+                let store = state.deps.session.store();
+                let parked = matches!(
+                    store.get_session(sid),
+                    Ok(Some(row))
+                        if row.state == faktor_core::state::AgentState::ReadyForNextTurn
+                );
+                let no_active_turn = matches!(store.active_turn_record(sid), Ok(None));
+                if parked && no_active_turn {
+                    // Queue hygiene first (same order as /global/dispose).
+                    let _ = state.deps.agent.abort(sid);
+                    return match state.deps.agent.end_session(sid) {
+                        Ok(()) => Json(true).into_response(),
+                        Err(close) => api_err(&close),
+                    };
+                }
                 wire_refused(&e.message)
             } else {
                 api_err(&e)
@@ -1542,7 +1663,7 @@ pub(crate) async fn wire_message_delete(
     // The session layer owns the checks (existence, in-flight turn,
     // tool-result dependencies) and the durable one-transaction removal.
     match handle.delete_message(seq) {
-        Ok(()) => Json(OkResponse { ok: true }).into_response(),
+        Ok(()) => Json(true).into_response(),
         Err(e) => match e.kind {
             faktor_core::error::ErrorKind::NotFound => {
                 wire_status(not_found(&format!("message {seq} of session {sid}")))

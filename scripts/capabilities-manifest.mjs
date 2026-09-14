@@ -75,8 +75,7 @@ function statusFromMarkers(present, complete) {
 const VENDORED_WEBVIEW_ROOT = 'ui/kilo-v756-webview';
 const JETBRAINS_712_ROOT = 'compat/jetbrains-712';
 const KILO_COMPAT_REPORT = 'target/certification/kilo-compat.json';
-const JETBRAINS_BEHAVIORAL_MATRIX = 'target/certification/jetbrains-behavioral-parity.json';
-const JETBRAINS_VISUAL_MATRIX = 'target/certification/jetbrains-visual-parity.json';
+const JETBRAINS_PARITY_MATRIX = 'target/certification/jetbrains-parity.json';
 const VSCODE_VISUAL_MATRIX = `${VENDORED_WEBVIEW_ROOT}/dist/visual-report.json`;
 
 function readJson(rel) {
@@ -117,12 +116,23 @@ function jetbrainsPin() {
 
 // ------------------------------------------------------------- derivations
 
-// An executable parity matrix is only evidence when it is a report object
-// bound to the exact HEAD and every row passed. Canned/fake-daemon smokes
-// are not parity results and are never consulted here.
-function matrixResult(rel, label) {
+// The executable JetBrains parity artifact (one report for both axes):
+// `{schema, commit, rows[], behavioral{passed,total}, visual{passed,total,
+//  method}}`. A label is only evidence when the report is a real object bound
+// to the exact HEAD and the axis it names is fully passed by its own checks.
+// The smoke suite's green output is never consulted.
+function jetbrainsMatrix(rel) {
   const matrix = readJson(rel);
-  if (!matrix || typeof matrix !== 'object') {
+  if (!matrix || typeof matrix !== 'object' || matrix.schema !== 'faktor-jetbrains-parity/v1') {
+    return null;
+  }
+  return matrix;
+}
+
+function behavioralMatrixResult(rel) {
+  const matrix = jetbrainsMatrix(rel);
+  const label = 'JetBrains behavioral parity';
+  if (matrix === null) {
     return {
       status: 'PARTIAL',
       detail: `${label}: no executable parity matrix at ${rel} (smoke suites are not parity results)`,
@@ -130,17 +140,61 @@ function matrixResult(rel, label) {
   }
   const bound = HEAD !== null && matrix.commit === HEAD;
   const rows = Array.isArray(matrix.rows) ? matrix.rows : [];
-  const allPassed = rows.length > 0 && rows.every((row) => row && row.status === 'passed');
+  const behavioral = matrix.behavioral || {};
+  const allPassed =
+    rows.length > 0 &&
+    rows.every((row) => row && row.status === 'passed') &&
+    behavioral.passed === rows.length &&
+    behavioral.total === rows.length;
   if (matrix.status === 'passed' && bound && allPassed) {
     return {
       status: 'IMPLEMENTED',
-      detail: `${label}: ${rows.length}/${rows.length} matrix rows passed at ${matrix.commit}`,
+      detail: `${label}: ${rows.length}/${rows.length} behavioral rows passed at ${matrix.commit}`,
     };
   }
   const reason = !bound
     ? `matrix commit ${matrix.commit} != HEAD ${HEAD || 'unknown'}`
-    : `${rows.filter((row) => row?.status === 'passed').length}/${rows.length} rows passed (status=${matrix.status})`;
+    : `${behavioral.passed ?? 0}/${behavioral.total ?? rows.length} behavioral rows passed (status=${matrix.status})`;
   return { status: 'PARTIAL', detail: `${label}: ${reason}` };
+}
+
+// Visual parity requires a REAL rendered comparison: the matrix must record a
+// render-based method, a pinned baseline and a per-panel digest pass count
+// that matches its total. A report without those fields stays PARTIAL.
+function visualMatrixResult(rel) {
+  const matrix = jetbrainsMatrix(rel);
+  const label = 'JetBrains visual parity';
+  if (matrix === null) {
+    return {
+      status: 'PARTIAL',
+      detail: `${label}: no executable parity matrix at ${rel} (smoke suites are not parity results)`,
+    };
+  }
+  const bound = HEAD !== null && matrix.commit === HEAD;
+  const visual = matrix.visual || {};
+  const method = typeof visual.method === 'string' ? visual.method : '';
+  const rendered = method.includes('render');
+  const panels = Array.isArray(visual.panels) ? visual.panels : [];
+  const allPanelsPassed =
+    panels.length > 0 && panels.every((panel) => panel && panel.status === 'passed');
+  const countsMatch =
+    Number.isInteger(visual.passed) &&
+    Number.isInteger(visual.total) &&
+    visual.total > 0 &&
+    visual.passed === visual.total &&
+    panels.length === visual.total;
+  const ok = bound && visual.status === 'passed' && rendered && allPanelsPassed && countsMatch;
+  const reason = !bound
+    ? `matrix commit ${matrix.commit} != HEAD ${HEAD || 'unknown'}`
+    : !rendered
+      ? `visual method is not a rendered comparison (method=${method || 'missing'})`
+      : `${visual.passed ?? 0}/${visual.total ?? panels.length} rendered panels passed (status=${visual.status})`;
+  return {
+    status: ok ? 'IMPLEMENTED' : 'PARTIAL',
+    detail: ok
+      ? `${label}: ${panels.length}/${panels.length} rendered panels match the pinned baselines (${method}) at ${matrix.commit}`
+      : `${label}: ${reason}`,
+  };
 }
 
 function vscodeVisualResult() {
@@ -285,12 +339,12 @@ const SURFACES = {
   // to the exact HEAD. The kotlinc/daemon smokes are regression tests, not
   // parity results, and never move these labels.
   jetbrains_behavioral_parity: () => ({
-    ...matrixResult(JETBRAINS_BEHAVIORAL_MATRIX, 'JetBrains behavioral parity'),
-    evidence: [JETBRAINS_BEHAVIORAL_MATRIX, JETBRAINS_712_ROOT, 'ui/upstream.json'],
+    ...behavioralMatrixResult(JETBRAINS_PARITY_MATRIX),
+    evidence: [JETBRAINS_PARITY_MATRIX, JETBRAINS_712_ROOT, 'ui/upstream.json'],
   }),
   jetbrains_visual_parity: () => ({
-    ...matrixResult(JETBRAINS_VISUAL_MATRIX, 'JetBrains visual parity'),
-    evidence: [JETBRAINS_VISUAL_MATRIX, JETBRAINS_712_ROOT, 'ui/upstream.json'],
+    ...visualMatrixResult(JETBRAINS_PARITY_MATRIX),
+    evidence: [JETBRAINS_PARITY_MATRIX, JETBRAINS_712_ROOT, 'ui/upstream.json'],
   }),
   // compat_v756 derives from the REQUIRED kilo-compat replay report, never
   // from fixture-file existence: IMPLEMENTED only when the report is bound
@@ -304,8 +358,8 @@ const SURFACES = {
     const axes = {
       vscode_visual: vscodeVisualResult(),
       upstream_behavioral: compatV756Result(),
-      jetbrains_behavioral: matrixResult(JETBRAINS_BEHAVIORAL_MATRIX, 'JetBrains behavioral parity'),
-      jetbrains_visual: matrixResult(JETBRAINS_VISUAL_MATRIX, 'JetBrains visual parity'),
+      jetbrains_behavioral: behavioralMatrixResult(JETBRAINS_PARITY_MATRIX),
+      jetbrains_visual: visualMatrixResult(JETBRAINS_PARITY_MATRIX),
     };
     const statuses = Object.values(axes).map((axis) => axis.status);
     let status = 'BLOCKED_EXTERNAL';
@@ -320,8 +374,7 @@ const SURFACES = {
       evidence: [
         VSCODE_VISUAL_MATRIX,
         KILO_COMPAT_REPORT,
-        JETBRAINS_BEHAVIORAL_MATRIX,
-        JETBRAINS_VISUAL_MATRIX,
+        JETBRAINS_PARITY_MATRIX,
         JETBRAINS_712_ROOT,
         'ui/upstream.json',
       ].filter((rel) => file(rel) || dir(rel)),
@@ -476,13 +529,15 @@ function selfCheck(manifest) {
       problems.push('ui_parity claims IMPLEMENTED but no pinned JetBrains corpus exists');
     }
   }
-  if (behavioral === 'IMPLEMENTED' && readJson(JETBRAINS_BEHAVIORAL_MATRIX) === null) {
+  if (behavioral === 'IMPLEMENTED' && jetbrainsMatrix(JETBRAINS_PARITY_MATRIX) === null) {
     problems.push(
       'jetbrains_behavioral_parity claims IMPLEMENTED without an executable parity matrix report',
     );
   }
-  if (visual === 'IMPLEMENTED' && readJson(JETBRAINS_VISUAL_MATRIX) === null) {
-    problems.push('jetbrains_visual_parity claims IMPLEMENTED without an executable parity matrix report');
+  if (visual === 'IMPLEMENTED' && visualMatrixResult(JETBRAINS_PARITY_MATRIX).status !== 'IMPLEMENTED') {
+    problems.push(
+      'jetbrains_visual_parity claims IMPLEMENTED without a rendered comparison against pinned baselines',
+    );
   }
   if (compat === 'IMPLEMENTED') {
     const report = readJson(KILO_COMPAT_REPORT);
@@ -503,8 +558,8 @@ function selfCheck(manifest) {
     const axes = [
       vscodeVisualResult().status,
       compatV756Result().status,
-      matrixResult(JETBRAINS_BEHAVIORAL_MATRIX, 'JetBrains behavioral parity').status,
-      matrixResult(JETBRAINS_VISUAL_MATRIX, 'JetBrains visual parity').status,
+      behavioralMatrixResult(JETBRAINS_PARITY_MATRIX).status,
+      visualMatrixResult(JETBRAINS_PARITY_MATRIX).status,
     ];
     if (axes.some((status) => status !== 'IMPLEMENTED')) {
       problems.push(

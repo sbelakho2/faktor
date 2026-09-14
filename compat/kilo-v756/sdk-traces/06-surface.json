@@ -11,7 +11,7 @@
       "args": {},
       "call": "provider.list",
       "id": "provider.list",
-      "note": "The SDK reads GET /provider; the daemon registers the legacy GET /provider/list (shape {providers:[...]}), so the real client gets 404. Provider/model metadata therefore never reaches an unmodified v7.5.6 client.",
+      "note": "LOCKED (unsourceable Model metadata): the SDK's Provider.models[].Model requires api{id,url,npm}, per-token cost, limit, status and release_date. The daemon's catalog exposes real capabilities and a pricing STATE (Known|Unknown) precisely so unknown prices are never faked as 0, and it knows no npm package/release date; emitting models with fabricated metadata (or omitting the real catalog) would be worse than the honest 404. Locked until a faithful metadata projection exists.",
       "request": {
         "method": "GET",
         "path": "/provider",
@@ -40,7 +40,7 @@
       },
       "call": "pty.create",
       "id": "pty.create",
-      "note": "The SDK creates terminals at POST /pty; the daemon's PTY ops live at /pty/create and REJECT explicitly 409 (no PTY abstraction in the supervisor). The unmodified client sees a 404, not the documented refusal.",
+      "note": "LOCKED (platform-dependent backend): the SDK posts POST /pty and expects the Pty object; the daemon's real PTY ops live at /pty/create, so the SDK path is honestly unregistered (404). The trace's command is POSIX `sh` while the real backend is platform-specific (ConPTY on Windows) and fails honestly there, so a 200 golden could not be an exact pass on every CI platform; the SDK's interactive connect route is also unregistered. Locked rather than half-implementing the PTY lifecycle.",
       "request": {
         "body": "{\"args\":[],\"command\":\"sh\",\"cwd\":\".\",\"size\":{\"cols\":80,\"rows\":24},\"title\":\"wire-trace\"}",
         "content_type": "application/json",
@@ -62,67 +62,73 @@
       "args": {},
       "call": "permission.list",
       "id": "permission.list",
-      "note": "The SDK reads GET /permission; the daemon registers GET /permission/list. 404.",
+      "note": "Exact pass: GET /permission answers the SDK-declared bare PermissionRequest[] over the daemon's REAL pending permission requests (every class): capability -> permission, the requested target strings -> patterns, the full capability payload -> metadata, always [] because this slice keeps no always-allow rules.",
       "request": {
         "method": "GET",
         "path": "/permission",
         "query": ""
       },
       "response": {
-        "body": null,
-        "content_type": "",
+        "body": [],
+        "content_type": "application/json",
         "event_stream": false,
-        "status": 404
+        "status": 200
       },
-      "sdk_requires": [],
+      "sdk_requires": [
+        "#array"
+      ],
       "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#PermissionListResponses.200 (Array<PermissionRequest>)",
-      "status": "divergence"
+      "status": "passing"
     },
     {
       "args": {},
       "call": "question.list",
       "id": "question.list",
-      "note": "The SDK reads GET /question; the daemon registers GET /question/list. 404.",
+      "note": "Exact pass: GET /question answers the SDK-declared bare QuestionRequest[]. This slice has no structured-question subsystem — its question-class asks ARE permission requests and ride GET /permission — so the truthful projection is the empty array, never a fabricated question/option object.",
       "request": {
         "method": "GET",
         "path": "/question",
         "query": ""
       },
       "response": {
-        "body": null,
-        "content_type": "",
+        "body": [],
+        "content_type": "application/json",
         "event_stream": false,
-        "status": 404
+        "status": 200
       },
-      "sdk_requires": [],
+      "sdk_requires": [
+        "#array"
+      ],
       "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#QuestionListResponses.200 (Array<QuestionRequest>)",
-      "status": "divergence"
+      "status": "passing"
     },
     {
       "args": {},
       "call": "network.list",
       "id": "network.list",
-      "note": "The SDK reads GET /network; the daemon registers GET /network/list. 404.",
+      "note": "Exact pass: GET /network answers the SDK-declared bare SessionNetworkWait[]. The SDK type is a network RECONNECT wait with a required creation time; the daemon has no reconnect-wait state (network-class asks ride GET /permission), so the truthful projection is the empty array, never a fabricated wait/timestamp.",
       "request": {
         "method": "GET",
         "path": "/network",
         "query": ""
       },
       "response": {
-        "body": null,
-        "content_type": "",
+        "body": [],
+        "content_type": "application/json",
         "event_stream": false,
-        "status": 404
+        "status": 200
       },
-      "sdk_requires": [],
+      "sdk_requires": [
+        "#array"
+      ],
       "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#NetworkListResponses.200 (Array<SessionNetworkWait>)",
-      "status": "divergence"
+      "status": "passing"
     },
     {
       "args": {},
       "call": "global.event",
       "id": "global.event",
-      "note": "Streaming: the request (GET /global/event, auth header) is locked byte-for-byte and the stream opens 200 text/event-stream; the daemon's journal/global event payload union differs from the SDK's GlobalEvent union, and no event is emitted on an idle session, so the frame bodies are recorded but not golden-compared.",
+      "note": "LOCKED (SSE multiplexing / no frame corpus): the request bytes (GET /global/event, auth) and the opened 200 text/event-stream are transport-locked, but the replay does not golden-compare SSE frame bodies (an idle harness emits no event), and the daemon's journal/global envelope is not the SDK's multiplexed GlobalEvent union (directory/project/workspace + payload union). Note-locked until an SDK-union frame corpus can be replayed.",
       "request": {
         "method": "GET",
         "path": "/global/event",
@@ -142,16 +148,14 @@
       "args": {},
       "call": "global.dispose",
       "id": "global.dispose",
-      "note": "Daemon answers {ok:true} (idempotent, ends every session); the SDK declares 200: boolean.",
+      "note": "Exact pass: the SDK-declared 200: boolean true after every live session is durably ended (idempotent; an incomplete dispose is an error response, never false).",
       "request": {
         "method": "POST",
         "path": "/global/dispose",
         "query": ""
       },
       "response": {
-        "body": {
-          "ok": true
-        },
+        "body": true,
         "content_type": "application/json",
         "event_stream": false,
         "status": 200
@@ -160,22 +164,20 @@
         "#bool"
       ],
       "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#GlobalDisposeResponses.200 (boolean)",
-      "status": "divergence"
+      "status": "passing"
     },
     {
       "args": {},
       "call": "instance.dispose",
       "id": "instance.dispose",
-      "note": "Alias of /global/dispose; same {ok:true} vs boolean divergence.",
+      "note": "Exact pass: alias of /global/dispose; the SDK-declared boolean true after every live session is durably ended (idempotent).",
       "request": {
         "method": "POST",
         "path": "/instance/dispose",
         "query": ""
       },
       "response": {
-        "body": {
-          "ok": true
-        },
+        "body": true,
         "content_type": "application/json",
         "event_stream": false,
         "status": 200
@@ -184,22 +186,20 @@
         "#bool"
       ],
       "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#InstanceDisposeResponses.200 (boolean)",
-      "status": "divergence"
+      "status": "passing"
     },
     {
       "args": {},
       "call": "instance.reload",
       "id": "instance.reload",
-      "note": "Daemon answers {ok:true} after re-running recover(); the SDK declares 200: boolean.",
+      "note": "Exact pass: the SDK-declared 200: boolean true after the idempotent crash-recovery sweep (recover()).",
       "request": {
         "method": "POST",
         "path": "/instance/reload",
         "query": ""
       },
       "response": {
-        "body": {
-          "ok": true
-        },
+        "body": true,
         "content_type": "application/json",
         "event_stream": false,
         "status": 200
@@ -208,7 +208,7 @@
         "#bool"
       ],
       "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#InstanceReloadResponses.200 (boolean)",
-      "status": "divergence"
+      "status": "passing"
     }
   ]
 }

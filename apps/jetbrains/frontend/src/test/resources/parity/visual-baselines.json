@@ -1,0 +1,14 @@
+{
+  "schema": "faktor-parity-visual-baselines/v1",
+  "method": "offscreen-swing-render+component-tree-state-digest-vs-pinned-baseline",
+  "panelDigests": {
+    "task-tree": "93b2a0049d4baeded30f54839a96e4b3ff2f5c2968a4004247a3e2aa0efdf70a",
+    "blockers": "0a6ba6d1e0fcee4361bec7f6a4f070903b5743f9aee7ca2257468634ac67ca7e",
+    "tournament": "821c50021cdcd169de64e3bc7b1b21d8d3d3827574376ec50cb4b4c31f31a6cf",
+    "permissions": "8f99988c6225bbf446a24856cd15b599095a59124a36dc6da4b766738cd28886",
+    "terminal": "4838a7fb9fe768f85a6c94842d1cca25d4954f7487a624bb37c7648bab54c15d",
+    "evidence": "00ae5b99832cbe0ab234c2eec966b845811315a7db9656061a33f8bc70ed7fc1",
+    "settings": "323cb292b67c13fb46639eff87cb02fe08bd9338aeb911cd534ab388c3a4d6ee",
+    "history": "875d2e25a94ad5fa09a0760d5551197d97c8029fd18d449dff0e08e051db738e"
+  }
+}

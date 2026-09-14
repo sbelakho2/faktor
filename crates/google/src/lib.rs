@@ -114,6 +114,21 @@ impl GoogleProvider {
                             }
                         }));
                     }
+                    ContentKind::FileData {
+                        mime,
+                        filename: _,
+                        data,
+                    } => {
+                        // Resolved non-image DOCUMENT bytes: Gemini reads
+                        // PDFs (and plain text) through the same byte-exact
+                        // inline_data envelope.
+                        parts.push(serde_json::json!({
+                            "inline_data": {
+                                "mime_type": mime,
+                                "data": data.to_base64(),
+                            }
+                        }));
+                    }
                     ContentKind::ToolCall { id, name, input } => {
                         parts.push(serde_json::json!({
                             "functionCall": { "name": name, "args": input, "id": id }
@@ -197,6 +212,11 @@ impl Provider for GoogleProvider {
         GOOGLE_MAX_IMAGE_BYTES
     }
 
+    fn document_capable(&self, _model: &str) -> bool {
+        // Gemini carries documents through byte-exact `inline_data` parts.
+        true
+    }
+
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
         // Delivery gate BEFORE any wire decision: vision capability, image
         // mime allowlist and the provider's per-image byte bound.
@@ -204,6 +224,15 @@ impl Provider for GoogleProvider {
         if let Err(e) =
             faktor_provider::validate_media_delivery(&req, &caps, self.max_image_bytes())
         {
+            return faktor_provider::provider_error_stream(e);
+        }
+        // The vision-like document gate: family capability, document mime
+        // allowlist, per-document and request-wide bounds.
+        if let Err(e) = faktor_provider::validate_document_delivery(
+            &req,
+            self.document_capable(&req.model),
+            self.max_document_bytes(),
+        ) {
             return faktor_provider::provider_error_stream(e);
         }
         let body = self.wire_body(&req);
@@ -497,6 +526,60 @@ mod tests {
         // with the query stripped; the adapter URL contains it).
         let (_, path, _) = server.last_request().unwrap();
         assert_eq!(path, "/v1beta/models/gemini-x:streamGenerateContent");
+    }
+
+    /// Resolved DOCUMENT attachments lower BYTE-EXACTLY to Gemini
+    /// `inline_data` with the ACTUAL document media type and standard
+    /// base64.
+    #[tokio::test]
+    async fn document_data_lowers_to_byte_exact_inline_data() {
+        let pdf: Vec<u8> = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n%%EOF".to_vec();
+        let expected_b64 = faktor_provider::MediaBytes::new(pdf.clone())
+            .unwrap()
+            .to_base64();
+        let server = MockServer::new();
+        let expected = expected_b64.clone();
+        server.route(
+            "POST",
+            "/v1beta/models/gemini-x:streamGenerateContent",
+            MockAction::AssertThenRespond {
+                status: 200,
+                body: "data: {}\n\n".into(),
+                assert: Arc::new(move |body: &serde_json::Value| {
+                    assert_eq!(
+                        body["contents"][1]["parts"],
+                        serde_json::json!([
+                            { "text": "read" },
+                            {
+                                "inline_data": {
+                                    "mime_type": "application/pdf",
+                                    "data": expected
+                                }
+                            }
+                        ]),
+                        "Gemini document lowering must be byte-exact"
+                    );
+                }),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = GoogleProvider::build(GoogleConfig::new(Some("k".into())).with_base(&base));
+        assert!(provider.document_capable("gemini-x"));
+        let mut r = req("gemini-x");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::text("read"),
+                ContentPart::file_data("application/pdf", Some("spec.pdf"), pdf).unwrap(),
+            ],
+        });
+        let mut stream = provider.stream(r);
+        while let Some(chunk) = stream.next().await {
+            if let Ok(ProviderChunk::Done) = chunk {
+                break;
+            }
+        }
+        assert_eq!(server.request_count(), 1);
     }
 
     /// Resolved images lower BYTE-EXACTLY to Gemini `inline_data` with the

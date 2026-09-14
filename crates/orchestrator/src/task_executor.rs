@@ -2496,6 +2496,10 @@ impl TaskExecutor {
                 summary:
                     "empty aggregate change set allowed without criterion proof by the run's no-op policy"
                         .into(),
+                // An `Allowed` no-op is an explicitly investigative task and
+                // dispatches NO review-model call: no reviewer identity may
+                // be claimed.
+                review_model_identity: None,
             }
         } else if self
             .orchestrator
@@ -3461,7 +3465,7 @@ impl TaskExecutor {
                 .ok()
                 .and_then(|loaded| loaded.epoch().map(|epoch| epoch.as_u64()))
         });
-        let reviewer_digest = reviewer_proof_basis_digest(handle, run);
+        let reviewer_digest = reviewer_proof_basis_digest(run);
         let evidence_digests = criterion_pass_evidence_digests(prepared, run);
         Ok(ProofBasis {
             task_id: task_id.raw(),
@@ -4821,15 +4825,14 @@ fn truncate_bytes(s: &str, max: usize) -> String {
 
 /// The production reviewer digest of one root verification run: the reviewer
 /// identity of every PASSED reviewer-bearing criterion (independent review /
-/// aggregate goal), the session's configured provider+model (the reviewer
-/// model identity), and a structured-payload digest per verdict — folded
-/// deterministically into one `blake3:` digest. `None` when no
-/// reviewer-bearing criterion passed: an honest absence, never a fabricated
-/// reviewer row.
-fn reviewer_proof_basis_digest(
-    handle: &faktor_session::SessionHandle,
-    run: &faktor_agent::IntegratedRootVerification,
-) -> Option<String> {
+/// aggregate goal), the ROUTED provider+model of the ACTUAL review call the
+/// run rests on ([`faktor_agent::IntegratedRootVerification::review_model_identity`]),
+/// and a structured-payload digest per verdict — folded deterministically
+/// into one `blake3:` digest. `None` when no reviewer-bearing criterion
+/// passed OR when the run records no actual review-model call: an honest
+/// absence, never a fabricated reviewer row (the parent session's configured
+/// pair is NEVER substituted for the real reviewer).
+fn reviewer_proof_basis_digest(run: &faktor_agent::IntegratedRootVerification) -> Option<String> {
     let mut rows: Vec<String> = Vec::new();
     for verdict in &run.criteria {
         if !verdict.passed {
@@ -4852,15 +4855,18 @@ fn reviewer_proof_basis_digest(
     if rows.is_empty() {
         return None;
     }
+    // The ACTUAL review call's routed pair — never the parent's configured
+    // pair. No recorded identity means no review-model call was attempted:
+    // there is no reviewer to name, so the digest is an honest absence.
+    let review_identity = run.review_model_identity.as_ref()?;
     rows.sort();
     rows.dedup();
-    let (provider, model) = handle
-        .row()
-        .map(|row| (row.provider, row.model))
-        .unwrap_or_default();
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"faktor-reviewer-basis:v1\0");
-    for part in [provider.as_bytes(), model.as_bytes()] {
+    hasher.update(b"faktor-reviewer-basis:v2\0");
+    for part in [
+        review_identity.provider.as_bytes(),
+        review_identity.model.as_bytes(),
+    ] {
         hasher.update(&(part.len() as u64).to_le_bytes());
         hasher.update(part);
     }

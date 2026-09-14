@@ -54,6 +54,10 @@ pub struct RepoEvidence {
     session: Arc<SessionManager>,
     index: Arc<Mutex<WorkspaceIndex>>,
     search: SearchService,
+    /// The CONFIGURED semantic embedder (`[embeddings]` resolution); `None`
+    /// keeps retrieval lexical/symbol-only — an honest degradation, never a
+    /// fabricated vector.
+    embedder: Option<Arc<dyn faktor_search::Embedder>>,
     scan: Mutex<ScanState>,
     scan_max_files: usize,
     scan_max_dirs: usize,
@@ -62,22 +66,18 @@ pub struct RepoEvidence {
 }
 
 impl RepoEvidence {
-    pub fn new(session: Arc<SessionManager>) -> Self {
-        let index = Arc::new(Mutex::new(WorkspaceIndex::new()));
-        let search = SearchService::new(index.clone(), None);
-        Self {
+    pub fn new(
+        session: Arc<SessionManager>,
+        embedder: Option<Arc<dyn faktor_search::Embedder>>,
+    ) -> Self {
+        Self::with_embedder_and_caps(
             session,
-            index,
-            search,
-            scan: Mutex::new(ScanState {
-                scanned: HashSet::new(),
-                failed: HashSet::new(),
-            }),
-            scan_max_files: SCAN_MAX_FILES,
-            scan_max_dirs: SCAN_MAX_DIRS,
-            scan_max_bytes: SCAN_MAX_BYTES,
-            scan_max_file_bytes: SCAN_MAX_FILE_BYTES,
-        }
+            embedder,
+            SCAN_MAX_FILES,
+            SCAN_MAX_DIRS,
+            SCAN_MAX_BYTES,
+            SCAN_MAX_FILE_BYTES,
+        )
     }
 
     #[cfg(test)]
@@ -87,13 +87,33 @@ impl RepoEvidence {
         scan_max_dirs: usize,
         scan_max_bytes: usize,
         scan_max_file_bytes: usize,
+        embedder: Option<Arc<dyn faktor_search::Embedder>>,
+    ) -> Self {
+        Self::with_embedder_and_caps(
+            session,
+            embedder,
+            scan_max_files,
+            scan_max_dirs,
+            scan_max_bytes,
+            scan_max_file_bytes,
+        )
+    }
+
+    fn with_embedder_and_caps(
+        session: Arc<SessionManager>,
+        embedder: Option<Arc<dyn faktor_search::Embedder>>,
+        scan_max_files: usize,
+        scan_max_dirs: usize,
+        scan_max_bytes: usize,
+        scan_max_file_bytes: usize,
     ) -> Self {
         let index = Arc::new(Mutex::new(WorkspaceIndex::new()));
-        let search = SearchService::new(index.clone(), None);
+        let search = SearchService::new(index.clone(), embedder.clone());
         Self {
             session,
             index,
             search,
+            embedder,
             scan: Mutex::new(ScanState {
                 scanned: HashSet::new(),
                 failed: HashSet::new(),
@@ -275,6 +295,13 @@ impl EvidenceProvider for RepoEvidence {
     fn forget(&self, workspace: WorkspaceId) {
         self.forget_workspace(workspace);
     }
+
+    /// The CONFIGURED embedder also reaches the agent's index-backed
+    /// evidence assembly through this seam (the agent asks its evidence
+    /// provider for the embedder instead of hardcoding `None`).
+    fn embedder(&self) -> Option<Arc<dyn faktor_search::Embedder>> {
+        self.embedder.clone()
+    }
 }
 
 impl RepoEvidence {
@@ -339,7 +366,7 @@ mod tests {
             b"pub fn balance_account() -> i64 { 42 }\n",
         );
         let m = manager();
-        let ev = RepoEvidence::new(m.clone());
+        let ev = RepoEvidence::new(m.clone(), None);
         let sid = registered_session(&m, root.path());
         let evidence = ev.evidence_sync(
             sid,
@@ -354,6 +381,91 @@ mod tests {
         );
     }
 
+    /// Embedder for the fusion E2E: the concept tokens (`quantum`, `zebra`)
+    /// are semantically near `reconcile`/`ledger` — none of them appear in
+    /// the corpus, so lexical/symbol/exact search can never match.
+    struct ConceptAxisEmbedder;
+    impl faktor_search::Embedder for ConceptAxisEmbedder {
+        fn embed(&self, texts: &[String]) -> Vec<Vec<f32>> {
+            texts
+                .iter()
+                .map(|t| {
+                    let l = t.to_lowercase();
+                    vec![
+                        if l.contains("quantum") || l.contains("ledger") || l.contains("reconcile")
+                        {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                        if l.contains("zebra") { 1.0 } else { 0.0 },
+                    ]
+                })
+                .collect()
+        }
+    }
+
+    /// The configured-embedder wiring of the production evidence provider:
+    /// semantic fusion finds the item lexical/symbol search misses; without
+    /// an embedder the same prompt yields NO evidence (honest degradation,
+    /// no crash, no invented item); a FAILING embedder still serves the
+    /// lexical/symbol legs.
+    #[test]
+    fn configured_embedder_fuses_semantically_and_absence_degrades_honestly() {
+        let root = TempDir::new().unwrap();
+        write(
+            root.path(),
+            "src/ledger.rs",
+            b"pub fn reconcile_accounts() -> u32 { 7 }\n",
+        );
+        let m = manager();
+        let sid = registered_session(&m, root.path());
+        let query = EvidenceQuery {
+            prompt: "quantum zebra".into(),
+            ..Default::default()
+        };
+
+        let with = RepoEvidence::new(m.clone(), Some(Arc::new(ConceptAxisEmbedder)))
+            .evidence_sync(sid, &query);
+        assert!(
+            with.iter().any(|e| e.path.ends_with("ledger.rs")),
+            "the configured embedder must fuse the semantic-only item: {with:?}"
+        );
+
+        let without = RepoEvidence::new(m.clone(), None).evidence_sync(sid, &query);
+        assert!(
+            without.is_empty(),
+            "without an embedder no semantic evidence may be invented: {without:?}"
+        );
+
+        struct FailingEmbedder;
+        impl faktor_search::Embedder for FailingEmbedder {
+            fn embed(&self, _texts: &[String]) -> Vec<Vec<f32>> {
+                vec![]
+            }
+            fn try_embed(
+                &self,
+                _texts: &[String],
+            ) -> Result<Vec<Vec<f32>>, faktor_core::error::Error> {
+                Err(faktor_core::error::Error::new(
+                    faktor_core::error::ErrorKind::Network,
+                    "embedding backend down",
+                ))
+            }
+        }
+        let failing = RepoEvidence::new(m.clone(), Some(Arc::new(FailingEmbedder))).evidence_sync(
+            sid,
+            &EvidenceQuery {
+                prompt: "reconcile_accounts".into(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            failing.iter().any(|e| e.path.ends_with("ledger.rs")),
+            "lexical evidence must survive an embedding failure: {failing:?}"
+        );
+    }
+
     #[test]
     fn scan_is_capped_and_never_hangs() {
         let root = TempDir::new().unwrap();
@@ -365,7 +477,7 @@ mod tests {
             );
         }
         let m = manager();
-        let ev = RepoEvidence::with_caps(m.clone(), 25, 10_000, 64 * 1024 * 1024, 1_000_000);
+        let ev = RepoEvidence::with_caps(m.clone(), 25, 10_000, 64 * 1024 * 1024, 1_000_000, None);
         // The scan cap must not panic, must terminate, and must bound work.
         let sid = registered_session(&m, root.path());
         let evidence = ev.evidence_sync(
@@ -392,7 +504,7 @@ mod tests {
             b"function payments() {}\n",
         );
         let m = manager();
-        let ev = RepoEvidence::new(m.clone());
+        let ev = RepoEvidence::new(m.clone(), None);
         let sid = registered_session(&m, root.path());
         let evidence = ev.evidence_sync(
             sid,
@@ -426,7 +538,7 @@ mod tests {
         let m = manager();
         let ws = m.create_workspace(user.path().to_str().unwrap()).unwrap();
         let sid = m.create_session(ws, "shadowed", "p", "m").unwrap().id();
-        let ev = RepoEvidence::new(m.clone());
+        let ev = RepoEvidence::new(m.clone(), None);
         // Plain session: the user checkout is the evidence root (a shadow
         // row exists for NO session; shadow-only files are never seen).
         let out = ev.evidence_sync(
@@ -459,7 +571,7 @@ mod tests {
         m.put_shadow_row(sid, &row).unwrap();
         // A fresh evidence provider: per-workspace scan caches are process
         // state, so the re-pointed scan needs a clean provider instance.
-        let ev = RepoEvidence::new(m.clone());
+        let ev = RepoEvidence::new(m.clone(), None);
         let out = ev.evidence_sync(
             sid,
             &EvidenceQuery {
@@ -479,7 +591,7 @@ mod tests {
         let mut retired = row;
         retired.state = ShadowRowState::Integrated;
         m.put_shadow_row(sid, &retired).unwrap();
-        let ev = RepoEvidence::new(m.clone());
+        let ev = RepoEvidence::new(m.clone(), None);
         let out = ev.evidence_sync(
             sid,
             &EvidenceQuery {
@@ -500,7 +612,7 @@ mod tests {
         bin.extend([1u8; 64]);
         write(root.path(), "bin.dat", &bin);
         let m = manager();
-        let ev = RepoEvidence::new(m.clone());
+        let ev = RepoEvidence::new(m.clone(), None);
         // Root that is a file, missing root, unknown session.
         let sid = registered_session(&m, root.path());
         let _ = ev.evidence_sync(
@@ -540,7 +652,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         write(root.path(), "src/app.rs", b"fn payments() {}\n");
         let m = manager();
-        let ev = RepoEvidence::new(m.clone());
+        let ev = RepoEvidence::new(m.clone(), None);
         let sid = registered_session(&m, root.path());
         // 1 MiB prompt: bounded token extraction, bounded output.
         let huge = "a".repeat(1024 * 1024);
@@ -562,7 +674,7 @@ mod tests {
         write(root.path(), "big.rs", &[b'x'; 2_000_000]);
         write(root.path(), "good.rs", b"fn target_fn() {}\n");
         let m = manager();
-        let ev = RepoEvidence::with_caps(m.clone(), 100, 10_000, 64 * 1024 * 1024, 1_000);
+        let ev = RepoEvidence::with_caps(m.clone(), 100, 10_000, 64 * 1024 * 1024, 1_000, None);
         let sid = registered_session(&m, root.path());
         let evidence = ev.evidence_sync(
             sid,
@@ -587,7 +699,7 @@ mod tests {
             b"pub fn settle_payments() -> i64 { 7 }\n",
         );
         let m = manager();
-        let ev = RepoEvidence::new(m.clone());
+        let ev = RepoEvidence::new(m.clone(), None);
         let sid = registered_session(&m, root.path());
         let evidence = ev.evidence_sync(
             sid,
@@ -613,7 +725,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         write(root.path(), "src/one.rs", b"pub fn alpha_fn() {}\n");
         let m = manager();
-        let ev = RepoEvidence::new(m.clone());
+        let ev = RepoEvidence::new(m.clone(), None);
         let sid = registered_session(&m, root.path());
         // First scan: alpha_fn found.
         let evidence = ev.evidence_sync(

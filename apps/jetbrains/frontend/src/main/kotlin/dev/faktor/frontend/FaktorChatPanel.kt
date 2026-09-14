@@ -1316,6 +1316,12 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
 
     internal fun historyView(): HistoryPanel = historyPanel
 
+    internal fun tournamentViewForTest(): TournamentPanel = tournamentPanel
+
+    internal fun boardView(): BoardPanel = boardPanel
+
+    internal fun evidenceView(): EvidenceNavigatorPanel = navigator
+
     internal fun tabTitles(): List<String> {
         val out = ArrayList<String>()
         for (i in 0 until tabs.tabCount) out.add(tabs.getTitleAt(i))

@@ -131,6 +131,10 @@ mod tests {
                 .post(format!("{base}{path}"))
                 .header("content-type", "application/json")
                 .json(&json!({})),
+            "PATCH" => client
+                .patch(format!("{base}{path}"))
+                .header("content-type", "application/json")
+                .json(&json!({})),
             "DELETE" => client.delete(format!("{base}{path}")),
             other => panic!("unsupported probe verb {other}"),
         };
@@ -203,11 +207,17 @@ mod tests {
         ("GET", "/network/list", "protected"),
         ("GET", "/config/get", "protected"),
         ("POST", "/config/set", "protected"),
+        // SDK-exact aliases (the unmodified `@kilocode/sdk@7.5.6` paths).
+        ("GET", "/config", "compat"),
+        ("GET", "/permission", "compat"),
+        ("GET", "/question", "compat"),
+        ("GET", "/network", "compat"),
         // v7.5.6 wire-compat surface (subset the frozen extension calls).
         ("POST", "/session", "compat"),
         ("GET", "/session", "compat"),
         ("GET", "/session/{sessionID}", "compat"),
         ("POST", "/session/{sessionID}", "compat"),
+        ("PATCH", "/session/{sessionID}", "compat"),
         ("DELETE", "/session/{sessionID}", "compat"),
         ("POST", "/session/{sessionID}/fork", "compat"),
         ("POST", "/session/{sessionID}/summarize", "compat"),
@@ -229,6 +239,7 @@ mod tests {
         ("POST", "/network/reject", "compat"),
         ("POST", "/config/update", "compat"),
         ("GET", "/config/warnings", "compat"),
+        ("GET", "/config/overlay", "compat"),
         ("POST", "/config/overlay", "compat"),
         ("POST", "/config/overlayUpdate", "compat"),
         ("POST", "/pty/create", "compat"),

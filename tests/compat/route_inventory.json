@@ -51,8 +51,18 @@
   },
   {
     "method": "GET",
+    "path": "/config",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
     "path": "/config/get",
     "status_class": "protected"
+  },
+  {
+    "method": "GET",
+    "path": "/config/overlay",
+    "status_class": "compat"
   },
   {
     "method": "GET",
@@ -76,8 +86,18 @@
   },
   {
     "method": "GET",
+    "path": "/network",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
     "path": "/network/list",
     "status_class": "protected"
+  },
+  {
+    "method": "GET",
+    "path": "/permission",
+    "status_class": "compat"
   },
   {
     "method": "GET",
@@ -92,6 +112,11 @@
   {
     "method": "GET",
     "path": "/pty/{pty_id}/output",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
+    "path": "/question",
     "status_class": "compat"
   },
   {
@@ -152,6 +177,11 @@
   {
     "method": "GET",
     "path": "/session/{sessionID}/status",
+    "status_class": "compat"
+  },
+  {
+    "method": "PATCH",
+    "path": "/session/{sessionID}",
     "status_class": "compat"
   },
   {

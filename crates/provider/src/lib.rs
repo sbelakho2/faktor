@@ -73,6 +73,19 @@ pub enum ContentKind {
         mime: String,
         data: MediaBytes,
     },
+    /// Resolved NON-IMAGE DOCUMENT attachment bytes (CAS → memory at request
+    /// construction): `mime` is one of [`SUPPORTED_DOCUMENT_MIMES`],
+    /// `filename` is the durable row's optional display label (the wire
+    /// part's filename), and `data` is the same BOUNDED [`MediaBytes`]
+    /// carrier as [`ContentKind::ImageData`] — durable state keeps the
+    /// attachment id and every request re-resolves from the CAS. Delivery
+    /// is gated on the provider's [`Provider::document_capable`] flag, the
+    /// vision-like capability gate for document parts.
+    FileData {
+        mime: String,
+        filename: Option<String>,
+        data: MediaBytes,
+    },
     ToolCall {
         id: String,
         name: String,
@@ -114,6 +127,58 @@ impl ContentPart {
         Ok(Self {
             kind: ContentKind::ImageData {
                 mime,
+                data: MediaBytes::new(bytes)?,
+            },
+            tool_call_id: None,
+        })
+    }
+
+    /// One resolved non-image DOCUMENT attachment part (PDF/plain text).
+    /// `mime` must be canonical lowercase and one of the
+    /// [`SUPPORTED_DOCUMENT_MIMES`]; the optional `filename` is a display
+    /// label (never a path) validated with the attachment rules; the bytes
+    /// are bounded by [`MAX_MEDIA_BYTES_HARD`]. Every violation (including
+    /// zero bytes, an unsupported type and non-UTF-8 `text/plain`) is a
+    /// typed refusal at CONSTRUCTION, before any provider call.
+    pub fn file_data(
+        mime: impl AsRef<str>,
+        filename: Option<&str>,
+        bytes: Vec<u8>,
+    ) -> Result<Self, faktor_core::Error> {
+        let mime = mime.as_ref().to_string();
+        faktor_core::attachment::validate_mime(&mime)?;
+        if !is_supported_document_mime(&mime) {
+            return Err(Error::new(
+                ErrorKind::Malformed,
+                format!(
+                    "document part mime {mime:?} is not deliverable (supported: {})",
+                    SUPPORTED_DOCUMENT_MIMES.join(", ")
+                ),
+            ));
+        }
+        if let Some(name) = filename {
+            faktor_core::attachment::validate_filename(name)?;
+        }
+        if bytes.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Malformed,
+                "document part carries zero bytes; an empty document can never be valid",
+            ));
+        }
+        // `text/plain` is defined as UTF-8 text: a non-UTF-8 payload can
+        // never be lowered byte-exactly as a text document by every family,
+        // so it is a typed refusal at CONSTRUCTION instead of a silent lossy
+        // re-encode inside an adapter.
+        if mime == "text/plain" && std::str::from_utf8(&bytes).is_err() {
+            return Err(Error::new(
+                ErrorKind::Malformed,
+                "text/plain document part is not valid UTF-8",
+            ));
+        }
+        Ok(Self {
+            kind: ContentKind::FileData {
+                mime,
+                filename: filename.map(str::to_string),
                 data: MediaBytes::new(bytes)?,
             },
             tool_call_id: None,
@@ -191,6 +256,36 @@ pub const SUPPORTED_IMAGE_MIMES: &[&str] = &["image/png", "image/jpeg", "image/g
 pub fn is_supported_image_mime(mime: &str) -> bool {
     SUPPORTED_IMAGE_MIMES.contains(&mime)
 }
+
+/// Non-image DOCUMENT media types the daemon will deliver to providers.
+/// Deliberately a closed allowlist mirroring the image one: PDF and plain
+/// text are the documented `input_file` / `document` / `inline_data`
+/// payloads every supporting family accepts; anything else stays CAS-only
+/// (never a silently dropped or renamed part).
+pub const SUPPORTED_DOCUMENT_MIMES: &[&str] = &["application/pdf", "text/plain"];
+
+/// True when `mime` is one of the [`SUPPORTED_DOCUMENT_MIMES`].
+pub fn is_supported_document_mime(mime: &str) -> bool {
+    SUPPORTED_DOCUMENT_MIMES.contains(&mime)
+}
+
+/// Daemon-wide DEFAULT ceiling of ONE resolved document part (raw bytes)
+/// delivered to a provider. Providers may advertise a tighter or
+/// (documented API limits) slightly larger bound via
+/// [`Provider::max_document_bytes`]; admission validates the attachment
+/// against the CHOSEN provider's value.
+pub const MAX_MODEL_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Daemon-wide ceiling of ALL resolved document bytes in ONE provider
+/// request (the sum across document parts). Bounds the in-memory document
+/// payload of a request even when each part is under its provider bound.
+pub const MAX_REQUEST_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Conservative token estimate of ONE document part for the context budget.
+/// Real document tokenization is provider- and format-dependent (PDF page
+/// extraction, text chunking); the planner charges a fixed upper-bound
+/// estimate so a document can never be free in the budget.
+pub const DOCUMENT_PART_TOKEN_ESTIMATE: u64 = 16_384;
 
 /// Resolved attachment bytes carried by [`ContentKind::ImageData`].
 ///
@@ -322,6 +417,218 @@ pub fn validate_media_delivery(
         }
     }
     Ok(())
+}
+
+/// Defense-in-depth delivery gate every adapter runs BEFORE lowering wire
+/// bytes: the provider's own [`Provider::document_capable`] flag must be
+/// advertised for the model, the mime must be one of the
+/// [`SUPPORTED_DOCUMENT_MIMES`], the raw bytes must fit the provider's own
+/// per-document bound ([`Provider::max_document_bytes`], itself capped by
+/// the structural [`MAX_MEDIA_BYTES_HARD`]), and the request-wide document
+/// total must fit [`MAX_REQUEST_DOCUMENT_BYTES`]. The agent's document gate
+/// already refuses document-less requests at request construction; adapters
+/// re-check so a directly-constructed or hostile request can never leak a
+/// document to a wire that would reject it — or silently drop it.
+pub fn validate_document_delivery(
+    req: &GenericAgentRequest,
+    document_capable: bool,
+    max_document_bytes: usize,
+) -> Result<(), ProviderError> {
+    let bound = max_document_bytes.min(MAX_MEDIA_BYTES_HARD);
+    let mut total: u64 = 0;
+    for m in &req.messages {
+        for part in &m.content {
+            let ContentKind::FileData { mime, data, .. } = &part.kind else {
+                continue;
+            };
+            if !document_capable {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::BadRequest,
+                    format!(
+                        "model {} does not support document input; refusing to lower a resolved document part",
+                        req.model
+                    ),
+                ));
+            }
+            if !is_supported_document_mime(mime) {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::BadRequest,
+                    format!(
+                        "document mime {mime:?} is not deliverable (supported: {})",
+                        SUPPORTED_DOCUMENT_MIMES.join(", ")
+                    ),
+                ));
+            }
+            if data.len() > bound {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::BadRequest,
+                    format!(
+                        "resolved document of {} bytes exceeds the provider bound ({bound}); refusing to lower it",
+                        data.len()
+                    ),
+                ));
+            }
+            total = total.saturating_add(data.len() as u64);
+            if total > MAX_REQUEST_DOCUMENT_BYTES as u64 {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::BadRequest,
+                    format!(
+                        "resolved document set totals {total} bytes, exceeding the request bound ({MAX_REQUEST_DOCUMENT_BYTES}); refusing to lower it"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------------ embeddings
+
+/// Hard bound on the number of inputs of ONE embedding request. The CLI's
+/// configured embedder batches larger corpora into several requests, so a
+/// provider never receives an unbounded batch.
+pub const MAX_EMBEDDING_INPUTS: usize = 64;
+/// Hard bound on ONE embedding input (bytes).
+pub const MAX_EMBEDDING_INPUT_BYTES: usize = 16 * 1024;
+/// Hard bound on the summed input bytes of ONE embedding request.
+pub const MAX_EMBEDDING_TOTAL_INPUT_BYTES: usize = 256 * 1024;
+/// Hard bound on one embedding vector's dimensions.
+pub const MAX_EMBEDDING_DIMENSIONS: usize = 8_192;
+
+/// One provider-agnostic embedding request: the embedding MODEL and the
+/// ordered inputs to embed. Construction validates every bound (empty
+/// inputs, empty/oversized members, oversized totals and an empty model are
+/// typed refusals BEFORE any provider call) — a hostile caller can never
+/// hand a provider an unbounded batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingRequest {
+    pub model: String,
+    pub inputs: Vec<String>,
+}
+
+impl EmbeddingRequest {
+    pub fn new(model: impl Into<String>, inputs: Vec<String>) -> Result<Self, faktor_core::Error> {
+        let model = model.into();
+        if model.is_empty() {
+            return Err(Error::new(ErrorKind::Malformed, "embedding model is empty"));
+        }
+        if inputs.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Malformed,
+                "embedding request carries no inputs",
+            ));
+        }
+        if inputs.len() > MAX_EMBEDDING_INPUTS {
+            return Err(Error::new(
+                ErrorKind::Oversized,
+                format!(
+                    "embedding request carries {} inputs, over the cap of {MAX_EMBEDDING_INPUTS}",
+                    inputs.len()
+                ),
+            ));
+        }
+        let mut total: usize = 0;
+        for input in &inputs {
+            if input.is_empty() {
+                return Err(Error::new(ErrorKind::Malformed, "embedding input is empty"));
+            }
+            if input.len() > MAX_EMBEDDING_INPUT_BYTES {
+                return Err(Error::new(
+                    ErrorKind::Oversized,
+                    format!(
+                        "embedding input of {} bytes exceeds MAX_EMBEDDING_INPUT_BYTES ({MAX_EMBEDDING_INPUT_BYTES})",
+                        input.len()
+                    ),
+                ));
+            }
+            total = total.saturating_add(input.len());
+        }
+        if total > MAX_EMBEDDING_TOTAL_INPUT_BYTES {
+            return Err(Error::new(
+                ErrorKind::Oversized,
+                format!(
+                    "embedding inputs total {total} bytes, over the cap of {MAX_EMBEDDING_TOTAL_INPUT_BYTES}"
+                ),
+            ));
+        }
+        Ok(Self { model, inputs })
+    }
+}
+
+/// One provider-agnostic embedding response: exactly one finite vector per
+/// request input, all of the same non-zero dimension.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingResponse {
+    pub vectors: Vec<Vec<f32>>,
+}
+
+impl EmbeddingResponse {
+    pub fn new(vectors: Vec<Vec<f32>>) -> Result<Self, ProviderError> {
+        let response = Self { vectors };
+        response.validate()?;
+        Ok(response)
+    }
+
+    /// The response's own structural invariants: non-empty, uniform,
+    /// bounded and finite vectors. A hostile/truncated response is a typed
+    /// `Malformed` error, never a silent zero vector downstream.
+    pub fn validate(&self) -> Result<(), ProviderError> {
+        let Some(first) = self.vectors.first() else {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Malformed,
+                "embedding response carries no vectors",
+            ));
+        };
+        let dim = first.len();
+        if dim == 0 {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Malformed,
+                "embedding response carries a zero-length vector",
+            ));
+        }
+        if dim > MAX_EMBEDDING_DIMENSIONS {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Malformed,
+                format!(
+                    "embedding vector of {dim} dimensions exceeds MAX_EMBEDDING_DIMENSIONS ({MAX_EMBEDDING_DIMENSIONS})"
+                ),
+            ));
+        }
+        for vector in &self.vectors {
+            if vector.len() != dim {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::Malformed,
+                    format!(
+                        "embedding response mixes dimensions ({} vs {dim})",
+                        vector.len()
+                    ),
+                ));
+            }
+            if vector.iter().any(|v| !v.is_finite()) {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::Malformed,
+                    "embedding response carries a non-finite component",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the response against the request's input count: the provider
+    /// must return exactly one vector per input, in input order.
+    pub fn validate_for(&self, inputs: usize) -> Result<(), ProviderError> {
+        self.validate()?;
+        if self.vectors.len() != inputs {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Malformed,
+                format!(
+                    "embedding response carries {} vectors for {inputs} inputs",
+                    self.vectors.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A one-frame stream carrying a typed refusal produced BEFORE any wire
@@ -782,6 +1089,50 @@ pub trait Provider: Send + Sync {
         MAX_MODEL_IMAGE_BYTES
     }
 
+    /// Vision-like DOCUMENT capability gate: true when this provider can
+    /// lower a resolved [`ContentKind::FileData`] part for `model` onto its
+    /// wire (`input_file` / `file` / `document` / `inline_data`). The
+    /// daemon-wide default is `false`: a family that has not implemented
+    /// document parts refuses typedly instead of silently dropping them.
+    /// Adapters whose wire supports documents override it.
+    fn document_capable(&self, _model: &str) -> bool {
+        false
+    }
+
+    /// Maximum RAW bytes of ONE document part this provider accepts. The
+    /// daemon-wide default is [`MAX_MODEL_DOCUMENT_BYTES`]; adapters with
+    /// documented API limits may override it. Admission validates every
+    /// document attachment against the CHOSEN provider's value.
+    fn max_document_bytes(&self) -> usize {
+        MAX_MODEL_DOCUMENT_BYTES
+    }
+
+    /// Embedding capability flag: true when this provider serves embeddings
+    /// for `model` through [`Provider::embed`]. Default `false` — a family
+    /// without an embedding surface admits the CLI's strict embedding
+    /// selection as an honest unsupported refusal rather than a fabricated
+    /// vector.
+    fn supports_embeddings(&self, _model: &str) -> bool {
+        false
+    }
+
+    /// ONE embedding call for `model`. Bounded by
+    /// [`EmbeddingRequest`]/[`EmbeddingResponse`] construction; the DEFAULT
+    /// is a typed `BadRequest` refusal, so a family that has not implemented
+    /// embeddings can never fabricate vectors. Implementations must be
+    /// synchronous, bounded and non-panicking; the configured embedder owns
+    /// retries and input batching.
+    fn embed(&self, req: EmbeddingRequest) -> Result<EmbeddingResponse, ProviderError> {
+        Err(ProviderError::new(
+            ProviderErrorKind::BadRequest,
+            format!(
+                "provider {:?} does not implement embeddings for model {:?}",
+                self.id(),
+                req.model
+            ),
+        ))
+    }
+
     /// The models this provider can serve (configured + discovered +
     /// probed). Feeds the model-selector surface; never a fabricated list
     /// in the agent. Default: only the "default" entry.
@@ -891,6 +1242,28 @@ impl Provider for InstanceProvider {
         self.inner.max_image_bytes()
     }
 
+    fn document_capable(&self, model: &str) -> bool {
+        // Delegate: an instance-wrapped document-capable family must keep
+        // its document gate (the trait default false would silently make
+        // every wrapped endpoint document-less).
+        self.inner.document_capable(model)
+    }
+
+    fn max_document_bytes(&self) -> usize {
+        // Delegate: never mask a family's documented per-document limit.
+        self.inner.max_document_bytes()
+    }
+
+    fn supports_embeddings(&self, model: &str) -> bool {
+        // Delegate: the configured embedder resolves embeddings through the
+        // SAME registry instance, so the wrapper must not mask the flag.
+        self.inner.supports_embeddings(model)
+    }
+
+    fn embed(&self, req: EmbeddingRequest) -> Result<EmbeddingResponse, ProviderError> {
+        self.inner.embed(req)
+    }
+
     fn catalog_entry(&self, model: &str) -> ModelCatalogEntry {
         // Delegate the row and rewrite its provider to THIS instance id:
         // catalog rows must name the registry key the daemon resolves
@@ -959,6 +1332,34 @@ impl CapabilityValidator {
                 ErrorKind::Malformed,
                 format!(
                     "model {} does not support vision, but {image_parts} image part(s) were resolved from attachments",
+                    req.model
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The vision-like DOCUMENT gate: a request carrying resolved
+    /// [`ContentKind::FileData`] parts is refused typedly for a model whose
+    /// provider does not advertise document support. Kept separate from
+    /// [`Self::validate`] because document capability lives on the provider
+    /// (per wire family), not on [`ModelCapabilities`].
+    pub fn validate_documents(
+        req: &GenericAgentRequest,
+        document_capable: bool,
+    ) -> Result<(), faktor_core::Error> {
+        use faktor_core::error::{Error, ErrorKind};
+        let document_parts = req
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|p| matches!(p.kind, ContentKind::FileData { .. }))
+            .count();
+        if document_parts > 0 && !document_capable {
+            return Err(Error::new(
+                ErrorKind::Malformed,
+                format!(
+                    "the provider of model {} does not support document input, but {document_parts} document part(s) were resolved from attachments",
                     req.model
                 ),
             ));
@@ -1657,6 +2058,11 @@ pub struct FakeProvider {
     pub caps: ModelCapabilities,
     pub script: std::sync::Mutex<Vec<ScriptedResponse>>,
     pub fail_after_chunks: Option<usize>,
+    /// Document gate the fake advertises (default `false`).
+    pub document_capable: bool,
+    /// Embedding model the fake serves; `None` = the capability flag is
+    /// false and `embed` falls back to the trait's typed refusal.
+    pub embedding_model: Option<String>,
     /// One-shot: the FIRST stream call errors before any chunk; later
     /// calls delegate to the script (state-aware-retry tests).
     fail_once_before: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -1666,6 +2072,14 @@ pub struct FakeProvider {
     /// The cancellation token of the most recent request (test hook:
     /// asserts the provider request shares the turn's cancellation lineage).
     last_cancellation: std::sync::Arc<std::sync::Mutex<Option<CancellationToken>>>,
+    /// Scripted embedding responses, consumed in call order (an exhausted
+    /// script is a typed `Malformed` refusal).
+    embed_script: std::sync::Arc<std::sync::Mutex<Vec<Result<EmbeddingResponse, ProviderError>>>>,
+    /// Every embedding request the fake received, in call order (test hook).
+    embed_requests: std::sync::Arc<std::sync::Mutex<Vec<EmbeddingRequest>>>,
+    /// Total embedding calls the fake observed (test hook for retry
+    /// policy assertions: a retried call is several calls).
+    embed_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Debug, Clone)]
@@ -1684,28 +2098,47 @@ pub enum ScriptedResponse {
 }
 
 impl FakeProvider {
-    pub fn new(id: &str, caps: ModelCapabilities) -> Self {
-        Self {
-            id: id.to_string(),
-            caps,
-            script: std::sync::Mutex::new(vec![ScriptedResponse::End]),
-            fail_after_chunks: None,
-            fail_once_before: None,
-            last_model: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            last_cancellation: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        }
-    }
-
-    pub fn with_script(id: &str, caps: ModelCapabilities, script: Vec<ScriptedResponse>) -> Self {
+    fn empty(id: &str, caps: ModelCapabilities, script: Vec<ScriptedResponse>) -> Self {
         Self {
             id: id.to_string(),
             caps,
             script: std::sync::Mutex::new(script),
             fail_after_chunks: None,
+            document_capable: false,
+            embedding_model: None,
             fail_once_before: None,
             last_model: std::sync::Arc::new(std::sync::Mutex::new(None)),
             last_cancellation: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            embed_script: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            embed_requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            embed_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    pub fn new(id: &str, caps: ModelCapabilities) -> Self {
+        Self::empty(id, caps, vec![ScriptedResponse::End])
+    }
+
+    pub fn with_script(id: &str, caps: ModelCapabilities, script: Vec<ScriptedResponse>) -> Self {
+        Self::empty(id, caps, script)
+    }
+
+    /// A fake that advertises document capability for every model.
+    pub fn with_documents(mut self) -> Self {
+        self.document_capable = true;
+        self
+    }
+
+    /// A fake that serves embeddings for `model` from a scripted response
+    /// list, consumed one per call.
+    pub fn with_embeddings(
+        mut self,
+        model: &str,
+        script: Vec<Result<EmbeddingResponse, ProviderError>>,
+    ) -> Self {
+        self.embedding_model = Some(model.to_string());
+        *self.embed_script.lock().unwrap() = script;
+        self
     }
 
     /// Fail the FIRST stream call with a retryable network error BEFORE
@@ -1716,29 +2149,21 @@ impl FakeProvider {
         caps: ModelCapabilities,
         script: Vec<ScriptedResponse>,
     ) -> Self {
-        Self {
-            id: id.to_string(),
-            caps,
-            script: std::sync::Mutex::new(script),
-            fail_after_chunks: None,
-            fail_once_before: Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                false,
-            ))),
-            last_model: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            last_cancellation: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        }
+        let mut fake = Self::empty(id, caps, script);
+        fake.fail_once_before = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        fake
     }
 
     pub fn die_mid_stream(id: &str, caps: ModelCapabilities) -> Self {
-        Self {
-            id: id.to_string(),
+        let mut fake = Self::empty(
+            id,
             caps,
-            script: std::sync::Mutex::new(vec![ScriptedResponse::Text("partial reply…".into())]),
-            fail_after_chunks: Some(1),
-            fail_once_before: None,
-            last_model: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            last_cancellation: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        }
+            vec![ScriptedResponse::Text("partial reply…".into())],
+        );
+        fake.fail_after_chunks = Some(1);
+        fake
     }
 
     /// The model of the last request this provider was asked to stream
@@ -1751,6 +2176,17 @@ impl FakeProvider {
     /// stream (`None` when nothing was streamed yet).
     pub fn last_request_cancellation(&self) -> Option<CancellationToken> {
         self.last_cancellation.lock().unwrap().clone()
+    }
+
+    /// Every embedding request this fake received, in call order.
+    pub fn embedding_requests(&self) -> Vec<EmbeddingRequest> {
+        self.embed_requests.lock().unwrap().clone()
+    }
+
+    /// Total embedding calls the fake observed (including failed/refused
+    /// ones) — the retry-policy assertion hook.
+    pub fn embedding_call_count(&self) -> usize {
+        self.embed_calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// If true, the next call fails with RateLimited (and the script is
@@ -1773,9 +2209,14 @@ impl Clone for FakeProvider {
             caps: self.caps.clone(),
             script: std::sync::Mutex::new(self.script.lock().unwrap().clone()),
             fail_after_chunks: self.fail_after_chunks,
+            document_capable: self.document_capable,
+            embedding_model: self.embedding_model.clone(),
             fail_once_before: self.fail_once_before.clone(),
             last_model: self.last_model.clone(),
             last_cancellation: self.last_cancellation.clone(),
+            embed_script: self.embed_script.clone(),
+            embed_requests: self.embed_requests.clone(),
+            embed_calls: self.embed_calls.clone(),
         }
     }
 }
@@ -1787,6 +2228,43 @@ impl Provider for FakeProvider {
 
     fn capabilities(&self, _model: &str) -> ModelCapabilities {
         self.caps.clone()
+    }
+
+    fn document_capable(&self, _model: &str) -> bool {
+        self.document_capable
+    }
+
+    fn supports_embeddings(&self, model: &str) -> bool {
+        self.embedding_model
+            .as_deref()
+            .is_some_and(|m| m == model || m == "*")
+    }
+
+    fn embed(&self, req: EmbeddingRequest) -> Result<EmbeddingResponse, ProviderError> {
+        self.embed_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.embed_requests.lock().unwrap().push(req.clone());
+        if !self.supports_embeddings(&req.model) {
+            return Err(ProviderError::new(
+                ProviderErrorKind::BadRequest,
+                format!(
+                    "fake provider does not serve embeddings for {:?}",
+                    req.model
+                ),
+            ));
+        }
+        let next = if self.embed_script.lock().unwrap().is_empty() {
+            None
+        } else {
+            Some(self.embed_script.lock().unwrap().remove(0))
+        };
+        match next {
+            Some(result) => result,
+            None => Err(ProviderError::new(
+                ProviderErrorKind::Malformed,
+                "fake embedding script exhausted",
+            )),
+        }
     }
 
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
@@ -2128,6 +2606,155 @@ mod tests {
         });
         let err = validate_media_delivery(&svg, &vision, 1 << 20).unwrap_err();
         assert!(err.message.contains("image/svg+xml"), "{err}");
+    }
+
+    /// Document parts: construction is a closed-allowlist typed gate, and
+    /// the adapter delivery gate refuses document-less models, junk mimes,
+    /// per-document overruns and request-wide overruns BEFORE any wire byte.
+    #[test]
+    fn document_parts_are_typed_and_delivery_gated() {
+        let pdf = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n%%EOF".to_vec();
+        // Construction refuses non-documents, zero bytes and hostile names.
+        assert!(ContentPart::file_data("application/zip", Some("a.zip"), pdf.clone()).is_err());
+        assert!(ContentPart::file_data("application/pdf", Some("a.pdf"), Vec::new()).is_err());
+        assert!(ContentPart::file_data("application/pdf", Some("../x.pdf"), pdf.clone()).is_err());
+        assert!(ContentPart::file_data("APPLICATION/PDF", None, pdf.clone()).is_err());
+        // `text/plain` must be UTF-8 to lower byte-exactly everywhere.
+        assert!(ContentPart::file_data("text/plain", None, vec![0xff, 0xfe]).is_err());
+        ContentPart::file_data("text/plain", None, b"plain text".to_vec()).unwrap();
+        let part =
+            ContentPart::file_data("application/pdf", Some("spec.pdf"), pdf.clone()).unwrap();
+        match &part.kind {
+            ContentKind::FileData {
+                mime,
+                filename,
+                data,
+            } => {
+                assert_eq!(mime, "application/pdf");
+                assert_eq!(filename.as_deref(), Some("spec.pdf"));
+                assert_eq!(data.as_slice(), pdf.as_slice());
+            }
+            other => panic!("expected a FileData part, got {other:?}"),
+        }
+        // The JSON carrier keeps only digest+size and never decodes back.
+        let json = serde_json::to_string(&part).unwrap();
+        assert!(!json.contains("base64"), "{json}");
+        assert!(!json.contains("PDF"), "bytes must never ride JSON: {json}");
+        assert!(serde_json::from_str::<ContentPart>(&json).is_err());
+
+        let req_with_doc = || {
+            let mut r = req();
+            r.messages.push(RequestMessage {
+                role: Role::User,
+                content: vec![ContentPart::file_data(
+                    "application/pdf",
+                    Some("spec.pdf"),
+                    pdf.clone(),
+                )
+                .unwrap()],
+            });
+            r
+        };
+        let r = req_with_doc();
+        validate_document_delivery(&r, true, 1 << 20).expect("a capable model admits the PDF");
+        let err = validate_document_delivery(&r, false, 1 << 20).unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
+        assert!(err.message.contains("document input"), "{err}");
+        let err = validate_document_delivery(&r, true, 4).unwrap_err();
+        assert!(err.message.contains("provider bound"), "{err}");
+        // A directly-built hostile mime (bypassing `file_data`) is refused
+        // by the delivery gate's allowlist.
+        let mut hostile = req_with_doc();
+        hostile.messages[0].content[0].kind = ContentKind::FileData {
+            mime: "application/zip".into(),
+            filename: None,
+            data: MediaBytes::new(b"PK".to_vec()).unwrap(),
+        };
+        let err = validate_document_delivery(&hostile, true, 1 << 20).unwrap_err();
+        assert!(err.message.contains("not deliverable"), "{err}");
+        // The request-wide bound refuses a set whose parts each fit.
+        let mut two = req_with_doc();
+        two.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![ContentPart::file_data(
+                "application/pdf",
+                None,
+                vec![b'x'; MAX_REQUEST_DOCUMENT_BYTES + 1],
+            )
+            .unwrap()],
+        });
+        let err = validate_document_delivery(&two, true, MAX_MEDIA_BYTES_HARD).unwrap_err();
+        assert!(
+            err.message.contains("request bound"),
+            "the request-wide document bound must apply: {err}"
+        );
+        // Capability validation: a document-less provider refuses the part
+        // at request construction, a capable one admits it.
+        let err = CapabilityValidator::validate_documents(&r, false).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed);
+        assert!(
+            err.message.contains("does not support document input"),
+            "{err}"
+        );
+        CapabilityValidator::validate_documents(&r, true).expect("capable provider admits");
+        CapabilityValidator::validate_documents(&req(), false).expect("no documents, no gate");
+    }
+
+    /// Embedding request/response construction enforces every bound with
+    /// typed errors and the response can never be silently truncated.
+    #[test]
+    fn embedding_request_and_response_bounds_are_typed() {
+        assert!(EmbeddingRequest::new("m", vec![]).is_err());
+        assert!(EmbeddingRequest::new("", vec!["a".into()]).is_err());
+        assert!(EmbeddingRequest::new("m", vec![String::new()]).is_err());
+        assert!(EmbeddingRequest::new("m", vec!["a".into(); MAX_EMBEDDING_INPUTS + 1]).is_err());
+        assert!(
+            EmbeddingRequest::new("m", vec!["x".repeat(MAX_EMBEDDING_INPUT_BYTES + 1)]).is_err()
+        );
+        let big = "x".repeat(MAX_EMBEDDING_TOTAL_INPUT_BYTES / MAX_EMBEDDING_INPUTS + 1);
+        assert!(EmbeddingRequest::new("m", vec![big; MAX_EMBEDDING_INPUTS]).is_err());
+        let ok = EmbeddingRequest::new("embed-1", vec!["alpha".into(), "beta".into()]).unwrap();
+        assert_eq!(ok.inputs.len(), 2);
+
+        assert!(EmbeddingResponse::new(vec![]).is_err());
+        assert!(EmbeddingResponse::new(vec![vec![]]).is_err());
+        assert!(EmbeddingResponse::new(vec![vec![0.0, 0.0], vec![0.0]]).is_err());
+        assert!(EmbeddingResponse::new(vec![vec![f32::NAN]]).is_err());
+        assert!(EmbeddingResponse::new(vec![vec![0.0; MAX_EMBEDDING_DIMENSIONS + 1]]).is_err());
+        let response = EmbeddingResponse::new(vec![vec![0.25, -0.5], vec![1.0, 0.0]]).unwrap();
+        response.validate_for(2).unwrap();
+        assert!(response.validate_for(3).is_err());
+    }
+
+    /// The fake provider's embedding surface: capability flag + scripted
+    /// responses consumed in order with captured requests.
+    #[test]
+    fn fake_provider_embeddings_are_capability_gated_scripted_and_captured() {
+        let unsupported = FakeProvider::new("f", ModelCapabilities::default());
+        assert!(!unsupported.supports_embeddings("e"));
+        let err = unsupported
+            .embed(EmbeddingRequest::new("e", vec!["a".into()]).unwrap())
+            .unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
+
+        let fake = FakeProvider::new("f", ModelCapabilities::default()).with_embeddings(
+            "e",
+            vec![Ok(EmbeddingResponse::new(vec![vec![1.0, 2.0]]).unwrap())],
+        );
+        assert!(fake.supports_embeddings("e"));
+        assert!(!fake.supports_embeddings("other"));
+        let out = fake
+            .embed(EmbeddingRequest::new("e", vec!["a".into()]).unwrap())
+            .unwrap();
+        assert_eq!(out.vectors, vec![vec![1.0, 2.0]]);
+        assert_eq!(fake.embedding_call_count(), 1);
+        assert_eq!(fake.embedding_requests()[0].inputs, vec!["a".to_string()]);
+        // The script is consumed exactly once: an exhausted fake refuses.
+        let err = fake
+            .embed(EmbeddingRequest::new("e", vec!["b".into()]).unwrap())
+            .unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::Malformed);
+        assert_eq!(fake.embedding_call_count(), 2);
     }
 
     #[test]

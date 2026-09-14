@@ -206,12 +206,15 @@ separately when required for a release.
   permissions, terminal over the native PTY routes, review/tournament,
   evidence navigation, settings, provider selection, history,
   restart/reconnect) are covered by `JetBrainsParitySmoke` against canned
-  frames, a fake daemon and the real daemon. That suite is a regression
-  suite, **not** a parity result: the derived capability labels carry
-  `jetbrains_frontend` **IMPLEMENTED** (the Faktor-owned frontend operates),
-  `jetbrains_upstream_assets` **VENDORED** (the pin is present) and
-  `jetbrains_behavioral_parity`/`jetbrains_visual_parity` **PARTIAL** until
-  real executable parity matrices exist (§2.10, §3). Only the 2024.1.7
+  frames, a fake daemon and the real daemon, and driven as an executable
+  parity matrix (`apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt`)
+  that writes `target/certification/jetbrains-parity.json`: 11 behavioral
+  rows (each run against canned frames AND the fake daemon) and 8 rendered
+  Swing panels compared against pinned baselines. The derived capability
+  labels carry `jetbrains_frontend` **IMPLEMENTED** (the Faktor-owned
+  frontend operates), `jetbrains_upstream_assets` **VENDORED** (the pin is
+  present) and `jetbrains_behavioral_parity`/`jetbrains_visual_parity`
+  derived from that HEAD-bound artifact only (§2.10, §3). Only the 2024.1.7
   distribution was verified; `until-build` stays unbounded, so
   newer-platform compatibility is not claimed.
 
@@ -418,10 +421,10 @@ commit.
 | `jetbrains_native_bridge` | IMPLEMENTED | `apps/jetbrains/backend/src/main/kotlin/dev/faktor/backend/NativeClient.kt` (`class NativeClient`), `apps/jetbrains/backend/src/main/kotlin/dev/faktor/backend/NativeEventStream.kt` (`class NativeEventStream`), `apps/jetbrains/backend/src/test/kotlin/dev/faktor/backend/NativeClientTest.kt` (`NATIVE SMOKE PASS`) |
 | `jetbrains_frontend` | IMPLEMENTED | Faktor-owned Swing frontend operates: `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt`, `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/FrontendSmoke.kt` (`FRONTEND SMOKE PASS`), `plugin.xml`, `build.gradle.kts`. Upstream provenance is the separate `jetbrains_upstream_assets` row |
 | `jetbrains_upstream_assets` | VENDORED | pinned upstream 7.1.2 source in `compat/jetbrains-712` with per-file SHA-256 manifest in `ui/upstream.json` (`jetbrains_712`) + `compat/jetbrains-712/NOTICE.md`; VENDORED is a provenance claim, never a parity claim |
-| `jetbrains_behavioral_parity` | PARTIAL | executable parity matrix `target/certification/jetbrains-behavioral-parity.json` is absent; the kotlinc/daemon smokes are regression tests, not parity results |
-| `jetbrains_visual_parity` | PARTIAL | executable parity matrix `target/certification/jetbrains-visual-parity.json` is absent; the `JetBrainsParitySmoke` fixture suite is canned and not a visual matrix |
-| `compat_v756` | PARTIAL | measured replay report `target/certification/kilo-compat.json` (`faktor-kilo-compat/v1`): responses 10/36 exact, requests 36/36, 26 required divergences; corpus `compat/kilo-v756/sdk-traces` + `tests/compat`; IMPLEMENTED only at responses N/N bound to the exact HEAD |
-| `ui_parity` | PARTIAL | executable parity axes only: `ui/kilo-v756-webview/dist/visual-report.json` (VS Code visual), `target/certification/kilo-compat.json` (frozen-upstream behavioral), `target/certification/jetbrains-behavioral-parity.json`, `target/certification/jetbrains-visual-parity.json`; vendored files or pinned corpora alone never flip it |
+| `jetbrains_behavioral_parity` | IMPLEMENTED | executable parity matrix `target/certification/jetbrains-parity.json` (`faktor-jetbrains-parity/v1`, written by `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt`): 11 behavioral rows (task mode, agent tree, criterion proofs incl. all 7 binding kinds, permissions, terminal, review/tournament, evidence, settings, provider selection, history, restart/reconnect), each run against canned native frames AND the fake daemon, HEAD-bound |
+| `jetbrains_visual_parity` | IMPLEMENTED | the same artifact's visual axis: 8 panels rendered offscreen (`offscreen-swing-render+component-tree-state-digest-vs-pinned-baseline`), component-tree/state digest compared against pinned baselines in `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json`; a missing/mismatching baseline fails the run |
+| `compat_v756` | PARTIAL | measured replay report `target/certification/kilo-compat.json` (`faktor-kilo-compat/v1`): responses 28/36 exact, requests 36/36, 8 required divergences; corpus `compat/kilo-v756/sdk-traces` + `tests/compat`; IMPLEMENTED only at responses N/N bound to the exact HEAD |
+| `ui_parity` | PARTIAL | executable parity axes only: `ui/kilo-v756-webview/dist/visual-report.json` (VS Code visual), `target/certification/kilo-compat.json` (frozen-upstream behavioral), `target/certification/jetbrains-parity.json` (JetBrains behavioral + visual); vendored files or pinned corpora alone never flip it |
 | `acp_subset` | IMPLEMENTED | `crates/acp` (`AcpMethod::Initialize`) + `crates/acp/tests/interop.rs` + official `agent-client-protocol` client crate in `tests/acp-official` |
 | `openai_responses` | IMPLEMENTED | `crates/openai/src/lib.rs`: `OpenAiFamily::Responses` dispatch + `responses_body`/`responses_stream` codecs + the adversarial `responses_*` stream tests |
 | `windows_job_containment` | IMPLEMENTED | `crates/winjob/src/lib.rs` (`CreateJobObjectW`, `SetInformationJobObject`, `AssignProcessToJobObject`, `KILL_ON_JOB_CLOSE`) + `crates/pty/src/windows.rs` (`CREATE_SUSPENDED`, `assign_strict`, kill-on-close spawn test) |
@@ -456,9 +459,9 @@ offline local profile).
 | VS Code vendored webview | pinned v7.5.6 tree `ui/kilo-v756-webview` + `ui/upstream.json` hashes + built dist + visual baseline | `node scripts/webview-visual-check.mjs` + required Woodpecker `vscode-visual` job (chromium render must pass); §2.10 | PARTIAL (vendored, hashed and render-gated; real-IDE screenshot parity stays a host/CI capability not claimed offline) |
 | JetBrains bridge | kotlinc `apps/jetbrains/compile-and-smoke.sh` (wire + native + parity smokes); Gradle plugin build + verifier vs IC-2024.1.7 | Woodpecker `jetbrains-*` jobs / local script; §3.2 | CI-LANE (native bridge IMPLEMENTED; plugin verifier + parity smokes PASS locally 2026-09-13) |
 | JetBrains 7.1.2 upstream assets | pinned 7.1.2 source (`compat/jetbrains-712/`, per-file SHA-256 manifest) | `compat/jetbrains-712/NOTICE.md`, `ui/upstream.json` (`jetbrains_712`) | VENDORED |
-| JetBrains behavioral parity | executable parity matrix (`target/certification/jetbrains-behavioral-parity.json`) | absent; kotlinc/daemon smokes are regression tests, not parity results | PARTIAL |
-| JetBrains visual parity | executable parity matrix (`target/certification/jetbrains-visual-parity.json`) | absent; `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt` (`UPSTREAM PIN PASS`) is a canned fixture/interaction suite, not a visual matrix; upstream Gradle build not run offline | PARTIAL |
-| Compat fixtures v756 | golden suite + fixtures + required replay report | `tests/compat`, `target/certification/kilo-compat.json` (10/36 responses exact; 26 locked divergences) | CI-LANE / fast tests; derived `compat_v756`=PARTIAL until responses N/N |
+| JetBrains behavioral parity | executable parity matrix (`target/certification/jetbrains-parity.json`, behavioral axis) | `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt` + `JetBrainsParitySmoke.kt`; 11/11 rows against canned frames AND the fake daemon; emitted by `bash apps/jetbrains/compile-and-smoke.sh` | IMPLEMENTED (HEAD-bound artifact; the smoke alone is not the claim) |
+| JetBrains visual parity | executable parity matrix (`target/certification/jetbrains-parity.json`, visual axis) | offscreen Swing render + component-tree/state digest vs pinned `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json`; 8 panels; regenerated only with `bash apps/jetbrains/compile-and-smoke.sh --write-baselines` | IMPLEMENTED (offline component-tree/state comparison; a real-IDE screenshot comparison stays a host capability not claimed here) |
+| Compat fixtures v756 | golden suite + fixtures + required replay report | `tests/compat`, `target/certification/kilo-compat.json` (28/36 responses exact; 8 locked divergences) | CI-LANE / fast tests; derived `compat_v756`=PARTIAL until responses N/N |
 | Compat fixtures jetbrains-712 | pinned corpus (1043 files, MIT, sha256) | `compat/jetbrains-712/NOTICE.md`, `ui/upstream.json` (`jetbrains_712`), `JetBrainsParitySmoke` pin step | VENDORED |
 | Fuzz harnesses | seeded pseudo-fuzz | Woodpecker `static` job / manual | CI-LANE |
 | Real-time soak (12–24h) | wall-clock soak | self-hosted hook (disabled by default) | NOT RUN HERE |

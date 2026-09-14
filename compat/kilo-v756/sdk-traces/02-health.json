@@ -11,7 +11,7 @@
       "args": {},
       "call": "global.health",
       "id": "global.health",
-      "note": "daemon 200: {ok,version,protocol}; SDK 200: {healthy: true, version: string}.",
+      "note": "Exact pass: the daemon now answers the SDK-declared {healthy: true, version} ADDITIVELY next to the frozen {ok, protocol} aliases the legacy fixtures/consumers read.",
       "request": {
         "method": "GET",
         "path": "/global/health",
@@ -19,6 +19,7 @@
       },
       "response": {
         "body": {
+          "healthy": true,
           "ok": true,
           "protocol": "v756",
           "version": "0.1.0"
@@ -28,10 +29,11 @@
         "status": 200
       },
       "sdk_requires": [
-        "healthy"
+        "healthy",
+        "version"
       ],
       "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#GlobalHealthResponses.200",
-      "status": "divergence"
+      "status": "passing"
     }
   ]
 }
