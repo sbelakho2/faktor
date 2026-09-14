@@ -25,7 +25,6 @@ commit status.
 | `.woodpecker/pr.yaml` (`pr`) | `pull_request` | **no volumes at all** | reduced lane set: `storage-policy`, `linux`, `static`, `docs`, `vscode`, `vscode-visual`, `vscode-visual-with-skip`, `jetbrains-build`, `jetbrains-smoke`, then the aggregate `certificate` |
 | `.woodpecker/trusted.yaml` (`trusted`) | `push` (any branch) + `tag` (linux); `push` to `main` for darwin/windows | trusted named volumes `faktor-trusted-*` | full linux lane set incl. release `[perf]` + `certificate`; darwin/windows matrix combos + per-platform certificates |
 | `.woodpecker/nightly.yaml` (`nightly`) | `cron` job `nightly` | own `faktor-nightly-*` volumes | `[fault]` at scale, longrun, efficiency, economy, coding-benchmark smoke, provider-key real-model run (recorded skip by default), supply-chain, then `certificate-nightly` |
-| `.woodpecker/soak.yaml` (`soak`) | `cron` job `soak` | own `faktor-soak-*` volumes | `[soak]` 12h synthetic session + 24h zero-drift wall-clock run, then `certificate-soak` |
 
 `labels: platform: ${platform}` (trusted) or `labels: platform: linux/amd64`
 (pr/cron) routes workflows to agents. The deprecated `runs_on` key is **not**
@@ -50,9 +49,10 @@ docker compose up -d
 The compose file starts `woodpecker-server` (port 8000 for UI/API, port 9000
 for the agent gRPC channel, data in the `woodpecker-data` volume) and one
 linux docker agent. It also raises `WOODPECKER_MAX_PIPELINE_TIMEOUT` (default
-1560 minutes / 26h) so the `soak` job can be admitted; see §6. Port 9000 must
-be reachable from the macOS/Windows agent hosts and should be firewalled
-otherwise (only the shared agent secret crosses it). Server state survives
+1560 minutes / 26h) so the nightly longrun campaign can be admitted; see §6.
+Port 9000 must be reachable from the macOS/Windows agent hosts and should be
+firewalled otherwise (only the shared agent secret crosses it). Server state
+survives
 `docker compose down`; use `down -v` only to reset it.
 
 Create a GitHub OAuth application for the forge connection (Settings →
@@ -77,7 +77,7 @@ commit status; with the default server settings (`WOODPECKER_STATUS_CONTEXT`
 | pull request | `ci/woodpecker/pr/pr` |
 | push to main (any branch) | `ci/woodpecker/push/trusted` |
 | tag | `ci/woodpecker/tag/trusted` |
-| cron | `ci/woodpecker/cron/nightly`, `ci/woodpecker/cron/soak` |
+| cron | `ci/woodpecker/cron/nightly` |
 
 A workflow excluded by its `when` filter posts nothing. Server overrides of
 `WOODPECKER_STATUS_CONTEXT(_FORMAT)` rename every context; use the resulting
@@ -113,14 +113,14 @@ against v3.18.0):
   already known, otherwise from `gh api repos/<owner>/<repo> --jq .id` or the
   `FORGE_REMOTE_ID` environment variable;
 - `PATCH /api/repos/<repo_id> {"timeout":<minutes>}` — the pipeline timeout
-  (needed by `soak`; see §6);
+  (needed by the nightly longrun campaign; see §6);
 - `PATCH /api/repos/<repo_id> {"trusted":{"volumes":true}}` — trusted volumes
   (instance-admin token only, `--trusted`);
 - `POST|PATCH /api/repos/<repo_id>/secrets[/<name>]` — secrets (`--secret
   NAME=VALUE`, repeatable; **none are required by default**);
 - `GET|POST|PATCH /api/repos/<repo_id>/cron` — register/patch the `nightly`
-  and `soak` cron jobs (§6);
-- `--run-now` triggers both jobs once after registration;
+  cron job (§6);
+- `--run-now` triggers the job once after registration;
 - the script prints the branch-protection setup for `ci/woodpecker/pr/pr`
   (§7). Use `--dry-run` to print every call without sending it.
 
@@ -176,17 +176,17 @@ built around that constraint:
   `volumes:` key appears in that file.
 - `.woodpecker/trusted.yaml` is the only workflow that mounts the
   `faktor-trusted-*` caches, and it only matches `push`/`tag` (collaborator
-  events). `.woodpecker/nightly.yaml` and `.woodpecker/soak.yaml` mount their
-  own `faktor-nightly-*` / `faktor-soak-*` volumes, so a heavy campaign can
-  never corrupt the caches a trusted build reuses.
+  events). `.woodpecker/nightly.yaml` mounts its own `faktor-nightly-*`
+  volumes, so a heavy campaign can never corrupt the caches a trusted build
+  reuses.
 - Each lane gets its own target volume; the registry/git volumes are shared
   only inside one workflow. Named volumes are agent-host scoped and cannot be
   made branch-specific (Woodpecker does not substitute environment variables
   in `volumes:`), which is exactly why the event-class separation above is the
   isolation boundary.
 - If the instance cannot grant trusted status, delete every `volumes:` block
-  and `CARGO_TARGET_DIR` entry from `trusted.yaml`, `nightly.yaml` and
-  `soak.yaml` (everything still runs, just without warm caches). **Never add
+  and `CARGO_TARGET_DIR` entry from `trusted.yaml` and `nightly.yaml`
+  (everything still runs, just without warm caches). **Never add
   volumes to `pr.yaml`.**
 
 **Residual risk (must stay documented):** because trust is repository-wide,
@@ -197,28 +197,26 @@ and review `.woodpecker/` changes in PRs. Instances that cannot accept that
 should either skip trusted status entirely or also require approval for all
 pull requests (Project settings → Require approval for → `pull_requests`).
 
-## 6. Cron jobs (`nightly` and `soak`)
+## 6. Cron job (`nightly`)
 
-`nightly.yaml`/`soak.yaml` only run for a **cron event whose job name matches
-`when.cron`**. Register the jobs in the repository:
+`nightly.yaml` only runs for a **cron event whose job name matches
+`when.cron`**. Register the job in the repository:
 
-- UI: Project settings → **Cron Jobs** → *Add*, with
-  - `nightly`: schedule `0 3 * * *`, branch `main`, timezone `UTC`;
-  - `soak`: schedule `0 4 * * 6`, branch `main`, timezone `UTC`.
+- UI: Project settings → **Cron Jobs** → *Add*, with `nightly`: schedule
+  `0 3 * * *`, branch `main`, timezone `UTC`.
 - API/script: `bash scripts/woodpecker/activate.sh <owner/repo> --run-now`
-  (idempotent; it creates or patches both jobs and can trigger them once),
+  (idempotent; it creates or patches the job and can trigger it once),
   equivalent to
   `POST /api/repos/{repo_id}/cron` with
-  `{"name":"nightly","schedule":"0 3 * * *","branch":"main","timezone":"UTC","enabled":true}`
-  and the `soak` body with `{"name":"soak","schedule":"0 4 * * 6",...}`.
+  `{"name":"nightly","schedule":"0 3 * * *","branch":"main","timezone":"UTC","enabled":true}`.
 
 Supported schedule syntax: standard 5-field cron plus `@daily`, `@weekly`,
 `@every 5m`, ... (see the Woodpecker Cron doc).
 
 **Timeout:** Woodpecker has no per-step timeout; pipelines are capped by the
 repository timeout (default 60 min; the settable maximum defaults to
-`WOODPECKER_MAX_PIPELINE_TIMEOUT` = 120 min). The 24h `soak` lane therefore
-needs:
+`WOODPECKER_MAX_PIPELINE_TIMEOUT` = 120 min). The nightly longrun campaign
+therefore needs:
 
 ```sh
 # server/agent environment (docker-compose.yml sets this by default)
@@ -228,8 +226,8 @@ bash scripts/woodpecker/activate.sh <owner/repo> --timeout-minutes 1560
 ```
 
 On hosted `woodpecker-ci.org` the server cap is fixed and cannot be raised by
-a user; run `soak` on a self-hosted instance (or accept that the `longrun-24h`
-lane is a recorded non-run) until that changes.
+a user; run the nightly cron on a self-hosted instance (or accept that long
+campaign lanes are cut off at the cap) until that changes.
 
 ## 7. Branch protection / required status checks
 
@@ -327,7 +325,7 @@ are not possible; the aggregate gate therefore lives **inside** each workflow:
 - every lane ends by writing
   `target/certification/lanes/<lane>.json`
   (`{"schema":"faktor-woodpecker-lane/v2","lane":...,"status":"passed","commit":...,"tree":...,"runner":{...},"commands_digest":...}`);
-- each `certificate`/`certificate-nightly`/`certificate-soak` step
+- each `certificate`/`certificate-nightly` step
   `depends_on` every lane of its workflow, runs with
   `when.status: [success, failure]` (a dependent is otherwise skipped when a
   dependency fails), and fails when any marker is missing, marked failed,
@@ -352,8 +350,8 @@ open-source repositories; it provides **linux runners only**, and its
 `WOODPECKER_MAX_PIPELINE_TIMEOUT` is fixed. The `pr` workflow (including the
 required render gate and the aggregate `certificate`) and the `trusted`
 linux lanes run there without any agent setup; the darwin/windows combos need
-your own agents as in §9 (or removal of those matrix entries), and `soak`
-needs a self-hosted instance because of the timeout cap (§6).
+your own agents as in §9 (or removal of those matrix entries), and the nightly
+cron needs a self-hosted instance because of the timeout cap (§6).
 
 ## 12. Local/offline certificate
 

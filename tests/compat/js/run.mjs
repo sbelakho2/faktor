@@ -177,6 +177,11 @@ async function runStep(client, step, vars, used) {
       events.push(next.value);
     }
     controller.abort();
+    // Record the parsed SDK GlobalEvent frames on the response trace so the
+    // Rust harness can validate them against the checked-in frame corpus
+    // (compat/kilo-v756/sdk-global-frames.json).
+    const record = current.responses[0];
+    if (record) record.frames = events;
     return { data: events, error: null };
   }
   const result = await call(client, args);

@@ -111,6 +111,11 @@
   },
   {
     "method": "GET",
+    "path": "/provider",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
     "path": "/provider/list",
     "status_class": "protected"
   },

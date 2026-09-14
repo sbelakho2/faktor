@@ -43,7 +43,6 @@ use faktor_protocol::v756::{startup_line, Handshake};
 use faktor_session::SessionManager;
 
 use crate::auth::{AuthToken, ServerPassword};
-use crate::global::GlobalEventBus;
 use crate::permission::ChannelPermissionRequester;
 
 pub(crate) use crate::compat::*;
@@ -257,9 +256,13 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
     // false forever: /native/ready answers 503 {ready:false}.
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let set_ready = !deps.simulate_not_ready;
-    let bus = Arc::new(GlobalEventBus::new(
+    // The SDK `global.event` union projector (`GET /global/event`): the
+    // durable journal + message/part rows + the live chunk sink, projected
+    // into the SDK `GlobalEvent` frames the unmodified v7.5.6 client parses.
+    let projector = Arc::new(crate::compat::SdkGlobalProjector::new(
         deps.session.clone(),
         deps.directory.clone(),
+        deps.version.clone(),
     ));
     // Live chunk fan-out (audit round 11): low-latency session.next.*.delta
     // frames from the agent's bounded, coalescing stream (audit 41),
@@ -267,10 +270,10 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
     // sender half is dropped; push_chunk only appends to the bounded global
     // ring, so a slow SSE subscriber can never back up this drainer.
     if let Some(mut rx) = deps.chunk_rx.take() {
-        let bus2 = bus.clone();
+        let projector2 = projector.clone();
         tokio::spawn(async move {
             while let Some(chunk) = rx.recv().await {
-                bus2.push_chunk(chunk);
+                projector2.push_chunk(chunk);
             }
         });
     }
@@ -313,6 +316,7 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
         .route("/permission", get(permission_list_sdk))
         .route("/question", get(question_list_sdk))
         .route("/network", get(network_list_sdk))
+        .route("/provider", get(provider_list_sdk))
         // v7.5.6 wire compatibility surface (subset): the routes the frozen
         // extension actually calls.
         .route(
@@ -531,7 +535,7 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .with_state(AppState {
             deps: Arc::new(deps),
-            bus,
+            projector,
             config: Arc::new(std::sync::RwLock::new(serde_json::Value::Object(
                 Default::default(),
             ))),
@@ -568,7 +572,10 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) deps: Arc<ServerDeps>,
-    pub(crate) bus: Arc<GlobalEventBus>,
+    /// SDK `GlobalEvent` union projector behind `GET /global/event`
+    /// (crate::compat::sdk): the durable journal + message/part rows + the
+    /// live chunk sink, mapped to the vendored v7.5.6 union frames.
+    pub(crate) projector: Arc<crate::compat::SdkGlobalProjector>,
     pub(crate) config: Arc<std::sync::RwLock<serde_json::Value>>,
     /// Runtime server-password override (`auth.set`); `None` = the startup
     /// env password (`ServerDeps.server_password`) applies (`auth.remove`).
@@ -603,6 +610,22 @@ pub(crate) struct AppState {
     pub(crate) ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
+impl AppState {
+    /// Build the SDK global-event projector for a manually assembled
+    /// `AppState` (native test harnesses). Lives here, not in the native
+    /// modules, so the native layer keeps its no-compat-dependency rule.
+    #[cfg(test)]
+    pub(crate) fn test_projector(
+        session: Arc<faktor_session::SessionManager>,
+    ) -> Arc<crate::compat::SdkGlobalProjector> {
+        Arc::new(crate::compat::SdkGlobalProjector::new(
+            session,
+            None,
+            "test".into(),
+        ))
+    }
+}
+
 // ------------------------------------------------------------------ handlers
 
 #[cfg(test)]
@@ -612,7 +635,6 @@ mod tests {
     use faktor_core::id::{SessionId, WorkspaceId};
     use faktor_core::model::ModelCapabilities;
     use faktor_evidence::store::EvidenceStore as _;
-    use faktor_protocol::v756::*;
     use faktor_provider::FakeProvider;
     use faktor_session::BudgetAuthority;
     use std::time::Duration;
@@ -2817,7 +2839,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn global_event_stream_delivers_envelopes_and_resumes() {
+    async fn global_event_stream_delivers_sdk_frames_and_resumes() {
         use futures_util::StreamExt;
         let dir = tempfile::tempdir().unwrap();
         let mut deps = test_deps(dir.path());
@@ -2845,14 +2867,15 @@ mod tests {
         let created: serde_json::Value = resp.json().await.unwrap();
         let sid = created["id"].as_str().unwrap().to_string();
 
-        // Read frames until session_created arrives; record its SSE id.
+        // Read frames until the SDK `session.created` frame arrives; record
+        // its SSE id.
         let mut buf = String::new();
         let mut created_id = None;
         for _ in 0..300 {
             match tokio::time::timeout(Duration::from_millis(200), sse.next()).await {
                 Ok(Some(Ok(chunk))) => {
                     buf.push_str(&String::from_utf8_lossy(&chunk));
-                    if let Some(id) = frame_id_containing(&buf, "session_created") {
+                    if let Some(id) = frame_id_containing(&buf, "\"type\":\"session.created\"") {
                         created_id = Some(id);
                         break;
                     }
@@ -2860,14 +2883,26 @@ mod tests {
                 Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
             }
         }
-        let created_id = created_id.expect("session_created frame must arrive");
-        // The envelope carries the directory on every frame.
+        let created_id = created_id.expect("session.created frame must arrive");
+        // The SDK envelope carries the session's durable workspace root.
         assert!(
-            buf.contains("\"directory\":\"/w\""),
-            "envelope directory missing"
+            buf.contains("\"directory\":\".\""),
+            "SDK envelope directory missing: {buf}"
         );
+        // The projected frame must satisfy the declared SDK shape.
+        let frames = parse_sdk_frames(&buf);
+        let created_frame = frames
+            .iter()
+            .find(|(_, v)| v["payload"]["type"] == "session.created")
+            .map(|(_, v)| v.clone())
+            .expect("projected session.created frame");
+        assert!(created_frame["payload"]["id"].as_str().is_some());
+        assert_eq!(created_frame["payload"]["properties"]["sessionID"], sid);
+        assert_eq!(created_frame["payload"]["properties"]["info"]["id"], sid);
 
-        // Prompt and read the turn_open frame.
+        // Prompt: the SDK projector answers session.turn.open (journal
+        // PromptReceived) and message.updated / message.part.updated from
+        // the durable rows.
         client
             .post(format!("{base}/session/prompt"))
             .header("x-faktor-server-password", pw.as_str())
@@ -2880,7 +2915,7 @@ mod tests {
             match tokio::time::timeout(Duration::from_millis(200), sse.next()).await {
                 Ok(Some(Ok(chunk))) => {
                     buf.push_str(&String::from_utf8_lossy(&chunk));
-                    if buf.contains("session_turn_open") {
+                    if buf.contains("\"type\":\"session.turn.open\"") {
                         saw_turn_open = true;
                         break;
                     }
@@ -2888,11 +2923,14 @@ mod tests {
                 Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
             }
         }
-        assert!(saw_turn_open, "stream must deliver turn_open; got: {buf}");
+        assert!(
+            saw_turn_open,
+            "stream must deliver session.turn.open; got: {buf}"
+        );
         drop(sse);
 
-        // Resume after the created frame: no replay of session_created, but
-        // the subsequent events are delivered with strictly larger ids.
+        // Resume after the created frame: no replay of session.created, but
+        // the subsequent frames are delivered with strictly larger ids.
         let mut sse2 = client
             .get(format!("{base}/global/event?after={created_id}"))
             .header("x-faktor-server-password", pw.as_str())
@@ -2913,7 +2951,7 @@ mod tests {
             match tokio::time::timeout(Duration::from_millis(200), sse2.next()).await {
                 Ok(Some(Ok(chunk))) => {
                     buf2.push_str(&String::from_utf8_lossy(&chunk));
-                    if buf2.contains("session_turn_open") {
+                    if buf2.contains("\"type\":\"session.turn.open\"") {
                         resumed = true;
                         break;
                     }
@@ -2926,16 +2964,16 @@ mod tests {
             "resumed stream must deliver new frames; got: {buf2}"
         );
         assert!(
-            !buf2.contains("session_created"),
-            "resume after {created_id} must not replay session_created"
+            !buf2.contains("session.created"),
+            "resume after {created_id} must not replay session.created"
         );
         // Every resumed frame's id is strictly greater than the cursor.
-        for (id, ge) in parse_global_frames(&buf2) {
+        for (id, frame) in parse_sdk_frames(&buf2) {
             assert!(
                 id > created_id,
                 "resume cursor violated: {id} <= {created_id}"
             );
-            assert!(ge.payload.type_name() != "session_created");
+            assert!(frame["payload"]["type"] != "session.created");
         }
         let _ = handle.shutdown.send(());
     }
@@ -3365,10 +3403,27 @@ mod tests {
         None
     }
 
-    fn parse_global_frames(buf: &str) -> Vec<(u64, GlobalEvent)> {
-        buf.split("\n\n")
-            .filter_map(GlobalEvent::from_frame)
-            .collect()
+    fn parse_sdk_frames(buf: &str) -> Vec<(u64, serde_json::Value)> {
+        let mut out = Vec::new();
+        for frame in buf.split("\n\n") {
+            let mut id: Option<u64> = None;
+            let mut data: Option<serde_json::Value> = None;
+            for line in frame.lines() {
+                if let Some(v) = line.strip_prefix("id: ") {
+                    id = v.trim().parse().ok();
+                } else if let Some(v) = line.strip_prefix("data: ") {
+                    data = serde_json::from_str(v).ok();
+                }
+            }
+            let (Some(id), Some(data)) = (id, data) else {
+                continue;
+            };
+            if data.get("payload").is_none() {
+                continue; // keep-alive heartbeat, not an SDK frame
+            }
+            out.push((id, data));
+        }
+        out
     }
 
     fn test_deps(root: &std::path::Path) -> ServerDeps {

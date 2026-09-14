@@ -3,10 +3,9 @@
 # This is the ONLY workflow file that declares named volumes. The untrusted
 # pull_request event runs `.woodpecker/pr.yaml`, which declares none, so a PR
 # pipeline can never mount (or write into) the `faktor-trusted-*` caches.
-# The cron workflows (`nightly.yaml`, `soak.yaml`) use their own
-# `faktor-nightly-*` / `faktor-soak-*` volumes so heavy campaigns cannot
-# poison these caches either. See scripts/woodpecker/setup.md §5 for the
-# trust model and the residual risks.
+# The cron workflow (`nightly.yaml`) uses its own `faktor-nightly-*` volumes
+# so heavy campaigns cannot poison these caches either. See
+# scripts/woodpecker/setup.md §5 for the trust model and the residual risks.
 #
 # Job graph (one workflow per matrix platform; all mandatory linux lanes run
 # as parallel steps of a single workflow so they share one workspace):

@@ -1223,13 +1223,14 @@ async fn deterministic_provider_full_wire_conversation_flow() {
         .collect();
     assert_eq!(assistants.len(), 1, "{page}");
     // Live chunk fan-out (audit round 11): the sink pushes text deltas
-    // onto the GLOBAL event ring; the global stream delivers GlobalEvent
-    // envelopes (a different shape than the per-session SseEvent frames),
-    // so assert on the raw SSE payload.
+    // onto the GLOBAL event ring; the global stream projects the SDK
+    // `GlobalEvent` union (`session.next.text.delta`), a different shape
+    // than the per-session SseEvent frames, so assert on the raw SSE
+    // payload.
     wait_for(
         || {
             let raw = buf_global.lock().unwrap().clone();
-            raw.contains("session_next_text_delta")
+            raw.contains("session.next.text.delta")
         },
         "live session.next.text.delta frame from the chunk sink",
     )

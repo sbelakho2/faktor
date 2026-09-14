@@ -5,8 +5,8 @@
 # must never set CARGO_TARGET_DIR to a named-volume path. Everything a PR
 # job writes stays inside the per-pipeline workspace and is discarded when
 # the pipeline ends. The trusted caches (`faktor-trusted-*`, mounted only by
-# `trusted.yaml`) and the cron caches (`faktor-nightly-*` / `faktor-soak-*`)
-# are therefore out of reach of PR code by construction.
+# `trusted.yaml`) and the cron caches (`faktor-nightly-*`) are therefore out
+# of reach of PR code by construction.
 #
 # Why a separate workflow file instead of an event filter on `trusted.yaml`:
 # Woodpecker's trusted/volumes flag is per repository, not per event, so the
@@ -49,7 +49,7 @@ steps:
           echo "POLICY VIOLATION: .woodpecker/pr.yaml must not declare volumes (untrusted event)" >&2
           exit 1
         fi
-        if grep -vE '^[[:space:]]*#' .woodpecker/pr.yaml | grep -nE 'faktor-(trusted|nightly|soak)-'; then
+        if grep -vE '^[[:space:]]*#' .woodpecker/pr.yaml | grep -nE 'faktor-(trusted|nightly)-'; then
           echo "POLICY VIOLATION: .woodpecker/pr.yaml must not reference trusted/cron cache volumes" >&2
           exit 1
         fi
