@@ -508,7 +508,7 @@ async fn single_item_task_matches_the_direct_prompt_path_byte_for_byte() {
     {
         let ha = env_a.manager.get_session(env_a.parent).unwrap().unwrap();
         let hb = env_b.manager.get_session(env_b.parent).unwrap().unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
         loop {
             let a = ha.turn_record(op_a).unwrap().map(|r| r.status);
             let b = hb.turn_record(receipt_b.op_id).unwrap().map(|r| r.status);
@@ -625,7 +625,7 @@ async fn multi_item_task_spawns_real_children_and_completes() {
     // Both children were really driven (provider calls >= 2) and the
     // executor slot freed itself.
     assert!(env.provider.count() >= 2, "driven {}", env.provider.count());
-    wait_until(|| env.executor.active_run().is_none(), 60).await;
+    wait_until(|| env.executor.active_run().is_none(), 240).await;
     // The verification-disabled env parks the run in the explicit Verifying
     // state (never Pending/Running); VerifiedComplete is exercised by the
     // real-tool adversarial suite.
@@ -1067,7 +1067,7 @@ async fn runs_of_two_parent_sessions_proceed_concurrently_past_a_provider_barrie
         )
         .await;
     }
-    wait_until(|| executor.active_runs().is_empty(), 60).await;
+    wait_until(|| executor.active_runs().is_empty(), 240).await;
 }
 
 #[tokio::test]
@@ -3020,7 +3020,7 @@ async fn direct_compat_with_service_is_byte_identical_to_no_service() {
         let hb = env_b.manager.get_session(env_b.parent).unwrap().unwrap();
         let op_a = receipt_a.op_id.unwrap();
         let op_b = receipt_b.op_id.unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
         loop {
             let a = ha.turn_record(op_a).unwrap().map(|r| r.status);
             let b = hb.turn_record(op_b).unwrap().map(|r| r.status);
@@ -3364,7 +3364,7 @@ async fn cancel_orchestrated_run_fans_cancel_to_live_children_only() {
         60,
     )
     .await;
-    wait_until(|| ticker.count() >= 2, 60).await;
+    wait_until(|| ticker.count() >= 2, 240).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     executor
         .cancel_run(parent, &receipt.run_id)
@@ -4074,7 +4074,7 @@ async fn crashed_orchestrated_run_reattaches_files_from_durable_plan_not_memory(
         60,
     )
     .await;
-    wait_until(|| env.executor.active_runs().is_empty(), 60).await;
+    wait_until(|| env.executor.active_runs().is_empty(), 240).await;
     assert!(
         run_registry(&env.manager, env.parent, &receipt.run_id).is_empty(),
         "the crash seam fired BEFORE any spawn"

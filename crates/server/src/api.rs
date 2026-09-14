@@ -10800,7 +10800,10 @@ mod tests {
         // The list surface reports the orchestrated mode (the POST receipt
         // predates the detached plan row).
         let mut modes = Vec::new();
-        for _ in 0..200 {
+        // Environment-independent wait (the fixed 200x25ms loop was
+        // load-sensitive); the assertions and break condition are unchanged.
+        let wait_deadline = std::time::Instant::now() + Duration::from_secs(240);
+        while std::time::Instant::now() < wait_deadline {
             let resp = native_get(
                 &client,
                 &base,

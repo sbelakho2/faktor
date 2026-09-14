@@ -456,17 +456,31 @@ mod scans {
     }
 
     fn repo_root() -> std::path::PathBuf {
+        // Runtime-robust: a stale test binary from a deleted checkout
+        // (shared target dir, matching fingerprints) embeds that checkout's
+        // CARGO_MANIFEST_DIR. Try the build-time root, then cwd and exe
+        // ancestors; use the FIRST that really contains crates/. Fail
+        // loudly with every path tried — never a silent skip.
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let root = manifest
-            .parent()
-            .expect("tests/static-authority sits under tests/")
-            .parent()
-            .expect("tests/ sits under the repository root");
-        assert!(
-            root.join("crates").is_dir(),
-            "repository root not found from {}",
-            manifest.display()
-        );
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(root) = manifest.parent().and_then(|p| p.parent()) {
+            candidates.push(root.to_path_buf());
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            candidates.extend(cwd.ancestors().map(|a| a.to_path_buf()));
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            candidates.extend(exe.ancestors().map(|a| a.to_path_buf()));
+        }
+        let root = candidates
+            .iter()
+            .find(|base| base.join("crates").is_dir())
+            .unwrap_or_else(|| {
+                panic!(
+                    "repository root not found from {}; tried: {candidates:?}",
+                    manifest.display()
+                )
+            });
         root.to_path_buf()
     }
 

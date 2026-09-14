@@ -74,7 +74,6 @@ impl RepoEvidence {
         session: Arc<SessionManager>,
         embedder: Option<Arc<dyn faktor_search::Embedder>>,
     ) -> Self {
-        let index_embedding = embedder.clone().and_then(index_source_for_embedder);
         Self::with_embedder_and_caps(
             session,
             embedder,
@@ -339,6 +338,35 @@ impl RepoEvidence {
                 score: 1.0 / (1.0 + i as f64),
             })
             .collect()
+    }
+}
+
+/// When the configured embedder is also an index `EmbeddingSource` (the
+/// CLI's `ProviderEmbedder`), reuse it for build-time vector persistence
+/// with a stable `(model, revision)` identity. A pure query-time embedder
+/// yields `None` (honest: builds stay lexical/symbol-only).
+fn index_source_for_embedder(
+    embedder: Arc<dyn faktor_search::Embedder>,
+) -> Option<(
+    Arc<dyn faktor_index::EmbeddingSource>,
+    faktor_index::EmbeddingModel,
+)> {
+    let (id, rev) = embedder.identity()?;
+    let source: Arc<dyn faktor_index::EmbeddingSource> =
+        std::sync::Arc::new(SearchEmbedderIndexSource { embedder });
+    Some((source, faktor_index::EmbeddingModel::new(&id, &rev)))
+}
+
+/// Thin adapter: the `EmbeddingSource` impl forwards to the search
+/// embedder (the CLI type implements both; this keeps the seam object-safe
+/// in the agent crate without depending on the CLI).
+struct SearchEmbedderIndexSource {
+    embedder: Arc<dyn faktor_search::Embedder>,
+}
+
+impl faktor_index::EmbeddingSource for SearchEmbedderIndexSource {
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, faktor_core::Error> {
+        Ok(self.embedder.embed(texts))
     }
 }
 
@@ -767,34 +795,5 @@ mod tests {
             evidence.iter().any(|e| e.path.ends_with("two.rs")),
             "the rescanned index must see the new file: {evidence:?}"
         );
-    }
-}
-
-/// When the configured embedder is also an index `EmbeddingSource` (the
-/// CLI's `ProviderEmbedder`), reuse it for build-time vector persistence
-/// with a stable `(model, revision)` identity. A pure query-time embedder
-/// yields `None` (honest: builds stay lexical/symbol-only).
-fn index_source_for_embedder(
-    embedder: Arc<dyn faktor_search::Embedder>,
-) -> Option<(
-    Arc<dyn faktor_index::EmbeddingSource>,
-    faktor_index::EmbeddingModel,
-)> {
-    let (id, rev) = embedder.identity()?;
-    let source: Arc<dyn faktor_index::EmbeddingSource> =
-        std::sync::Arc::new(SearchEmbedderIndexSource { embedder });
-    Some((source, faktor_index::EmbeddingModel::new(&id, &rev)))
-}
-
-/// Thin adapter: the `EmbeddingSource` impl forwards to the search
-/// embedder (the CLI type implements both; this keeps the seam object-safe
-/// in the agent crate without depending on the CLI).
-struct SearchEmbedderIndexSource {
-    embedder: Arc<dyn faktor_search::Embedder>,
-}
-
-impl faktor_index::EmbeddingSource for SearchEmbedderIndexSource {
-    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, faktor_core::Error> {
-        Ok(self.embedder.embed(texts))
     }
 }
