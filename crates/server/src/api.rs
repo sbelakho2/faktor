@@ -305,6 +305,14 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
         .route("/network/list", get(network_list))
         .route("/config/get", get(config_get))
         .route("/config/set", post(config_set))
+        // SDK-exact aliases: the exact paths/methods the unmodified
+        // `@kilocode/sdk@7.5.6` client calls (see compat/kilo-v756/sdk-traces).
+        // They answer the SDK-declared shapes; the legacy daemon aliases
+        // above/below keep their own contracts.
+        .route("/config", get(config_get_bare))
+        .route("/permission", get(permission_list_sdk))
+        .route("/question", get(question_list_sdk))
+        .route("/network", get(network_list_sdk))
         // v7.5.6 wire compatibility surface (subset): the routes the frozen
         // extension actually calls.
         .route(
@@ -315,6 +323,7 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
             "/session/{sessionID}",
             get(wire_session_summary)
                 .post(wire_session_update)
+                .patch(wire_session_update_patch)
                 .delete(wire_session_delete),
         )
         .route("/session/{sessionID}/fork", post(wire_session_fork))
@@ -341,7 +350,10 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
         .route("/network/reject", post(network_reject))
         .route("/config/update", post(config_update))
         .route("/config/warnings", get(config_warnings))
-        .route("/config/overlay", post(config_overlay))
+        .route(
+            "/config/overlay",
+            get(config_overlay_get).post(config_overlay),
+        )
         .route("/config/overlayUpdate", post(config_overlay_update))
         .route("/pty/create", post(pty_create))
         .route("/pty/update", post(pty_update))
@@ -1208,6 +1220,10 @@ mod tests {
             ("get", "/network/list", serde_json::json!({})),
             ("get", "/config/get", serde_json::json!({})),
             ("post", "/config/set", serde_json::json!({"config": {}})),
+            ("get", "/config", serde_json::json!({})),
+            ("get", "/permission", serde_json::json!({})),
+            ("get", "/question", serde_json::json!({})),
+            ("get", "/network", serde_json::json!({})),
             ("get", "/session/status?session_id=1", serde_json::json!({})),
             ("get", "/session/1/status", serde_json::json!({})),
             ("post", "/session/1/fork", serde_json::json!({})),
@@ -1230,12 +1246,14 @@ mod tests {
                 serde_json::json!({"config": {"model": "m"}}),
             ),
             ("get", "/config/warnings", serde_json::json!({})),
+            ("get", "/config/overlay", serde_json::json!({})),
             ("post", "/config/overlay", serde_json::json!({"config": {}})),
             (
                 "post",
                 "/config/overlayUpdate",
                 serde_json::json!({"config": {}}),
             ),
+            ("patch", "/session/1", serde_json::json!({"title": "t"})),
             ("post", "/pty/create", serde_json::json!({})),
             ("post", "/pty/update", serde_json::json!({})),
             ("post", "/pty/remove", serde_json::json!({})),
@@ -1250,6 +1268,13 @@ mod tests {
                 client.get(format!("{base}{path}")).send().await.unwrap()
             } else if *method == "delete" {
                 client.delete(format!("{base}{path}")).send().await.unwrap()
+            } else if *method == "patch" {
+                client
+                    .patch(format!("{base}{path}"))
+                    .json(body)
+                    .send()
+                    .await
+                    .unwrap()
             } else {
                 client
                     .post(format!("{base}{path}"))
@@ -1382,29 +1407,37 @@ mod tests {
         assert_eq!(row.provider, "fake");
         assert_eq!(row.model, "m");
 
-        // GET /session lists it.
+        // GET /session lists it — the SDK `session.list` contract: a BARE
+        // `Session1[]` of rich sessions (the old `{sessions:[…]}` envelope
+        // was the scaffold alias; the SDK shape is the contract).
         let resp = basic(client.get(format!("{base}/session")))
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
         let list: serde_json::Value = resp.json().await.unwrap();
-        let ids: Vec<&str> = list["sessions"]
+        let sessions = list
             .as_array()
-            .unwrap()
+            .unwrap_or_else(|| panic!("session.list must be a bare array: {list}"));
+        let ids: Vec<&str> = sessions
             .iter()
             .filter_map(|s| s["sessionID"].as_str())
             .collect();
         assert!(ids.contains(&sid.as_str()));
-        let summary = &list["sessions"]
-            .as_array()
-            .unwrap()
+        let summary = sessions
             .iter()
             .find(|s| s["sessionID"].as_str() == Some(sid.as_str()))
             .unwrap();
         assert!(summary["createdMs"].as_i64().unwrap() > 0);
         assert!(summary["updatedMs"].as_i64().unwrap() > 0);
         assert!(summary["state"].is_string());
+        // Rich `Session1` fields ride the same entry.
+        assert!(summary["id"].is_string());
+        assert!(summary["slug"].is_string());
+        assert!(summary["projectID"].is_string());
+        assert!(summary["directory"].is_string());
+        assert!(summary["version"].is_string());
+        assert!(summary["time"]["created"].is_i64());
 
         // GET /session/{sessionID} summary.
         let resp = basic(client.get(format!("{base}/session/{sid}")))
@@ -1415,6 +1448,44 @@ mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["sessionID"], sid);
         assert_eq!(body["title"], "wire t1");
+
+        // PATCH /session/{sessionID} — the SDK `session.update` method:
+        // the rich Session4 projection, additively next to the frozen
+        // aliases. The durable title is the field this slice owns.
+        let resp = basic(
+            client
+                .patch(format!("{base}/session/{sid}"))
+                .json(&serde_json::json!({"title": "wire t1 patched"})),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["title"], "wire t1 patched");
+        assert_eq!(body["id"], sid);
+        assert_eq!(body["sessionID"], sid);
+        assert!(body["time"]["updated"].is_i64());
+        // Metadata/permission/archive are NOT durable here: the SDK-declared
+        // 400 InvalidRequestError, never a silent drop.
+        let resp = basic(
+            client
+                .patch(format!("{base}/session/{sid}"))
+                .json(&serde_json::json!({"metadata": {"x": 1}})),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["_tag"], "InvalidRequestError");
+        // The refused patch changed nothing.
+        let resp = basic(client.get(format!("{base}/session/{sid}")))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["title"], "wire t1 patched");
 
         // POST /session/{sessionID}/message with a full parts[] payload.
         let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
@@ -1535,7 +1606,10 @@ mod tests {
             serde_json::json!([])
         );
 
-        // POST abort with the frozen body shape.
+        // POST abort with the frozen body shape. The SDK declares
+        // `200: boolean`: the daemon reports whether at least one operation
+        // was actually cancelled (a just-finished turn may still own a
+        // tracked op; a fully idle session answers `false`).
         let resp = basic(
             client
                 .post(format!("{base}/session/{sid}/abort"))
@@ -1546,7 +1620,7 @@ mod tests {
         .unwrap();
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert!(body["aborted"].is_array());
+        assert!(body.is_boolean(), "the SDK shape is a boolean: {body}");
 
         // Adversarial: empty parts → 400; unknown body fields → 422; empty
         // body message → 400; unknown session → 404; non-numeric id → 400.
@@ -1988,17 +2062,19 @@ mod tests {
             serde_json::json!([]),
             "no checkpoints → the frozen array projection is empty"
         );
-        // Same for the filter forms: unknown message → honest 409.
+        // Same for the filter forms: an unknown message is the SDK's
+        // declared `400 BadRequestError` (SessionDiffErrors declares 400 and
+        // no other error class), never a silently ignored filter.
         let resp = client
             .get(format!("{base}/session/{sid}/diff?message=99"))
             .basic_auth("kilo", Some(pw.as_str()))
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 409);
+        assert_eq!(resp.status(), 400);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], false);
-        assert!(body["message"]
+        assert_eq!(body["name"], "BadRequest");
+        assert!(body["data"]["message"]
             .as_str()
             .unwrap()
             .contains("unknown message id"));
@@ -2461,15 +2537,21 @@ mod tests {
         assert_eq!(arr.len(), 1, "{body}");
         assert_eq!(arr[0]["path"], "f.txt");
         assert_eq!(arr[0]["status"], "modified");
-        // An unknown message is an honest 409, never an empty success.
+        // An unknown message is the SDK's declared 400 BadRequestError,
+        // never an empty success.
         let resp = client
             .get(format!("{base}/session/{sid}/diff?message=99"))
             .basic_auth("kilo", Some(pw.as_str()))
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 409);
-        assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["ok"], false);
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["name"], "BadRequest");
+        assert!(body["data"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown message id"));
 
         // ?full=1 adds the unified content to every entry (resolution via
         // the CAS), newest first.
@@ -3045,6 +3127,47 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let pid = pid.expect("permission must surface in /permission/list");
+
+        // SDK-exact routes: `GET /permission` is the declared BARE
+        // `PermissionRequest[]` over the same real pending state.
+        let resp = client
+            .get(format!("{base}/permission"))
+            .header("x-faktor-server-password", pw.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let sdk_list: serde_json::Value = resp.json().await.unwrap();
+        let sdk_perm = sdk_list
+            .as_array()
+            .unwrap_or_else(|| panic!("/permission must be a bare array: {sdk_list}"))
+            .iter()
+            .find(|p| p["id"].as_str() == Some(pid.as_str()))
+            .unwrap_or_else(|| panic!("pending permission missing from /permission: {sdk_list}"));
+        assert_eq!(sdk_perm["sessionID"], sid);
+        assert_eq!(sdk_perm["permission"], "execute_shell");
+        assert!(sdk_perm["patterns"].is_array());
+        assert!(sdk_perm["metadata"]["detail"].is_object());
+        assert!(sdk_perm["always"].as_array().unwrap().is_empty());
+        // `/question` and `/network` are the SDK's other two list surfaces:
+        // no structured question / reconnect-wait state exists in this
+        // slice, so they are truthfully empty while the ask rides
+        // `/permission`.
+        for path in ["question", "network"] {
+            let resp = client
+                .get(format!("{base}/{path}"))
+                .header("x-faktor-server-password", pw.as_str())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{path}");
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!([]),
+                "{path} must be a bare empty array"
+            );
+        }
 
         // Resolve through /permission/reply.
         let resp = client
@@ -3632,7 +3755,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn summarize_returns_a_bounded_digest() {
+    async fn summarize_returns_the_sdk_boolean_with_a_bounded_digest_computed() {
         let dir = tempfile::tempdir().unwrap();
         let deps = test_deps(dir.path());
         let pw = deps.server_password.clone();
@@ -3653,7 +3776,9 @@ mod tests {
         let created: serde_json::Value = resp.json().await.unwrap();
         let sid = created["sessionID"].as_str().unwrap().to_string();
 
-        // Empty session: bounded digest still answers.
+        // The SDK declares `200: boolean`. The bounded digest over the
+        // newest messages is still computed server-side (the real work);
+        // the type has no text field for it.
         let resp = client
             .post(format!("{base}/session/{sid}/summarize"))
             .basic_auth("kilo", Some(pw.as_str()))
@@ -3662,11 +3787,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["sessionID"], sid);
-        assert_eq!(body["title"], "digest me");
-        assert!(body["summary"].is_string());
+        assert_eq!(body, serde_json::json!(true));
 
-        // After a turn the summary digests the newest messages' text.
+        // After a turn the same SDK boolean answers over a non-empty
+        // session (the digest is bounded by construction).
         let resp = client
             .post(format!("{base}/session/{sid}/message"))
             .basic_auth("kilo", Some(pw.as_str()))
@@ -3684,12 +3808,19 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let body: serde_json::Value = resp.json().await.unwrap();
-        let summary = body["summary"].as_str().unwrap();
-        assert!(summary.contains("summarize this"), "{summary}");
-        assert!(summary.contains("pong"), "{summary}");
-        // Bounded: never a huge blob.
-        assert!(summary.len() < 16 * 1024);
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!(true)
+        );
+        // Unknown sessions stay 404 (never a fabricated success).
+        let resp = client
+            .post(format!("{base}/session/999999/summarize"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
         let _ = handle.shutdown.send(());
     }
 
@@ -3740,7 +3871,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], true);
+        // SDK-declared `200: boolean`.
+        assert_eq!(body, serde_json::json!(true));
         let row = manager
             .get_session(faktor_core::id::SessionId::new(sid))
             .unwrap()
@@ -3780,6 +3912,63 @@ mod tests {
             .row()
             .unwrap();
         assert!(row.lifecycle.is_terminal(), "Closed survives reopen");
+        // A PARKED session (turn finished → ReadyForNextTurn, no active
+        // turn record) is deletable: the session layer's active-state
+        // predicate covers the parked machine, so the compat route
+        // completes the durable close through the daemon's own end path;
+        // the SDK delete contract (boolean; only 400/404 declared) has no
+        // 409 for this state.
+        let resp = client
+            .post(format!("{base}/session"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
+            .send()
+            .await
+            .unwrap();
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let parked: u64 = created["sessionID"].as_str().unwrap().parse().unwrap();
+        let resp = client
+            .post(format!("{base}/session/{parked}/message"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .json(&serde_json::json!({
+                "model": {"providerID": "fake", "modelID": "m"},
+                "parts": [{"type": "text", "text": "finish the turn"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let parked_row = reopened
+            .get_session(faktor_core::id::SessionId::new(parked))
+            .unwrap()
+            .unwrap()
+            .row()
+            .unwrap();
+        assert_eq!(
+            parked_row.state,
+            faktor_core::state::AgentState::ReadyForNextTurn
+        );
+        let resp = client
+            .delete(format!("{base}/session/{parked}"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "parked delete must succeed");
+        assert_eq!(
+            resp.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!(true)
+        );
+        let parked_row = reopened
+            .get_session(faktor_core::id::SessionId::new(parked))
+            .unwrap()
+            .unwrap()
+            .row()
+            .unwrap();
+        assert!(
+            parked_row.lifecycle.is_terminal(),
+            "parked delete must be durably Closed"
+        );
         // Unknown session delete → 404.
         let resp = client
             .delete(format!("{base}/session/999999"))
@@ -3884,8 +4073,9 @@ mod tests {
         assert_eq!(resp.status(), 409);
         assert_eq!(store.message_count(s.id()).unwrap(), 4);
 
-        // A dependency-free message is removed DURABLY: {ok:true}, the row
-        // and its parts are gone, and the surviving sequences are stable.
+        // A dependency-free message is removed DURABLY: the SDK-declared
+        // boolean `true`, the row and its parts are gone, and the surviving
+        // sequences are stable.
         let resp = client
             .delete(format!("{base}/session/{sid}/message/1"))
             .basic_auth("kilo", Some(pw.as_str()))
@@ -3894,7 +4084,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], true);
+        assert_eq!(body, serde_json::json!(true));
         assert_eq!(store.message_count(s.id()).unwrap(), 3);
         assert_eq!(store.message_created_ms(s.id(), 1).unwrap(), None);
         // Surviving rows keep their sequences (2, 3, 4); a second delete of
@@ -4446,8 +4636,11 @@ mod tests {
                 .contains("not daemon-editable"),
             "{body}"
         );
-        // Warnings: a full-replace config/set can smuggle anything in; the
-        // warning surface reports it instead of silently accepting.
+        // Warnings: the SDK-declared bare `Array<{path,message}>`; a
+        // full-replace config/set can smuggle anything in and the warning
+        // surface reports it instead of silently accepting. `path` is the
+        // documented literal runtime label (this daemon's config has no
+        // file layer).
         let resp = client
             .post(format!("{base}/config/set"))
             .header("x-faktor-server-password", pw.as_str())
@@ -4468,18 +4661,24 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
-        let warnings = body["warnings"].as_array().unwrap();
+        let warnings = body
+            .as_array()
+            .unwrap_or_else(|| panic!("config.warnings must be a bare array: {body}"));
         assert!(
             warnings
                 .iter()
-                .any(|w| w.as_str().unwrap().contains("compact_at_usage")),
+                .any(|w| w["message"].as_str().unwrap().contains("compact_at_usage")),
             "{warnings:?}"
         );
         assert!(
             warnings
                 .iter()
-                .any(|w| w.as_str().unwrap().contains("smuggled_key")),
+                .any(|w| w["message"].as_str().unwrap().contains("smuggled_key")),
             "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().all(|w| w["path"] == "runtime"),
+            "the runtime source label is documented: {warnings:?}"
         );
         // A valid config warns about nothing (overlay = full replace, so no
         // smuggled key survives from the previous config/set).
@@ -4500,7 +4699,42 @@ mod tests {
             .await
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["warnings"], serde_json::json!([]));
+        assert_eq!(body, serde_json::json!([]));
+
+        // The SDK's `GET /config` serves the BARE config object (no
+        // envelope); the legacy `/config/get` keeps `{config}`.
+        let resp = client
+            .get(format!("{base}/config"))
+            .header("x-faktor-server-password", pw.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["compact_at_usage"], 0.5);
+        assert_eq!(body["instructions"], "i");
+
+        // The SDK's `GET /config/overlay` is a one-layer projection: the
+        // runtime object is the single source (no fabricated file targets).
+        let resp = client
+            .get(format!("{base}/config/overlay"))
+            .header("x-faktor-server-password", pw.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["scope"], "global");
+        assert_eq!(body["effective"]["model"], "m");
+        assert_eq!(body["global"]["model"], "m");
+        assert_eq!(body["project"], serde_json::json!({}));
+        assert_eq!(body["sources"][0]["kind"], "runtime");
+        assert_eq!(body["targets"]["global"]["exists"], false);
+        assert_eq!(body["fields"]["model"]["value"], "m");
+        assert_eq!(body["fields"]["model"]["editable"], true);
+        assert_eq!(body["fields"]["instructions"]["source"], "system");
+        assert_eq!(body["collections"], serde_json::json!({}));
 
         // overlay replaces the whole view; overlayUpdate merges into it.
         let resp = client
@@ -4678,7 +4912,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
 
-        // instance.reload re-runs daemon recovery (idempotent) → ok.
+        // instance.reload re-runs daemon recovery (idempotent) → the
+        // SDK-declared boolean `true`.
         let resp = client
             .post(format!("{base}/instance/reload"))
             .basic_auth("kilo", Some(pw.as_str()))
@@ -4687,7 +4922,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], true);
+        assert_eq!(body, serde_json::json!(true));
 
         // global.dispose ends every session durably.
         let resp = client
@@ -4698,7 +4933,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], true);
+        assert_eq!(body, serde_json::json!(true));
         let row = session
             .get_session(faktor_core::id::SessionId::new(sid))
             .unwrap()

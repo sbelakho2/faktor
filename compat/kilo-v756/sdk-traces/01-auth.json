@@ -11,7 +11,7 @@
       "args": {},
       "call": "global.health",
       "id": "auth.missing",
-      "note": "The unmodified client without the Basic header is refused 401 {error:{code,message,retryable}}; the frozen contract is the header FORM (Basic base64(\"kilo:\"+password)), which the authenticated steps lock byte-for-byte. The vendored types declare no 401 body for global.health, so the error body cannot be golden-compared against them.",
+      "note": "LOCKED (deliberate auth extension): the unauthenticated probe asserts the daemon's auth gate — 401 {error:{code,message,retryable}} BEFORE any handler effect. The vendored types declare no 401 for global.health (only 400 BadRequestError) and the SDK client always authenticates, so there is no SDK-declared success/error shape this refusal could match; removing the gate is not an option.",
       "request": {
         "method": "GET",
         "path": "/global/health",
@@ -44,7 +44,7 @@
       },
       "call": "auth.set",
       "id": "auth.provider-set",
-      "note": "The upstream SDK auth surface is PROVIDER OAuth at PUT /auth/{providerID}. The daemon's POST /auth/set rotates the SERVER PASSWORD and /auth/{providerID} is not registered (404): a different operation that happens to share a name.",
+      "note": "LOCKED (no provider-credential backend): the upstream SDK auth surface is provider OAuth at PUT /auth/{providerID}; the daemon has no provider credential store (its /auth/set rotates the SERVER password) and /auth/{providerID} is not registered -> 404. An exact pass would require implementing provider OAuth persistence outside the allowed compat surface; answering the declared 200: boolean would be a fabricated credential write.",
       "request": {
         "body": "{\"key\":\"wire-trace\",\"type\":\"api\"}",
         "content_type": "application/json",

@@ -259,6 +259,22 @@ fn lower_role_message(
                             "image_url": { "url": data.to_data_url(mime) }
                         }));
                     }
+                    ContentKind::FileData {
+                        mime,
+                        filename,
+                        data,
+                    } => {
+                        // Resolved non-image DOCUMENT bytes: the documented
+                        // Chat Completions file part takes the display
+                        // filename plus a base64 data URL (`file_data`).
+                        content.push(serde_json::json!({
+                            "type": "file",
+                            "file": {
+                                "filename": filename.as_deref().unwrap_or("document"),
+                                "file_data": data.to_data_url(mime),
+                            }
+                        }));
+                    }
                     _ => {} // reasoning/tool parts are not user wire content
                 }
             }
@@ -421,6 +437,20 @@ pub fn responses_body(req: &GenericAgentRequest) -> serde_json::Value {
                             content.push(serde_json::json!({
                                 "type": "input_image",
                                 "image_url": data.to_data_url(mime),
+                            }));
+                        }
+                        ContentKind::FileData {
+                            mime,
+                            filename,
+                            data,
+                        } => {
+                            // Resolved non-image DOCUMENT bytes: the native
+                            // Responses `input_file` part takes the display
+                            // filename plus a base64 data URL (`file_data`).
+                            content.push(serde_json::json!({
+                                "type": "input_file",
+                                "filename": filename.as_deref().unwrap_or("document"),
+                                "file_data": data.to_data_url(mime),
                             }));
                         }
                         _ => {}
@@ -1047,6 +1077,12 @@ impl Provider for OpenAiProvider {
         OPENAI_MAX_IMAGE_BYTES
     }
 
+    fn document_capable(&self, _model: &str) -> bool {
+        // Both wired families carry document parts: Chat Completions lowers
+        // `{type: "file"}`, the native Responses API lowers `input_file`.
+        true
+    }
+
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
         let deadlines = stream_deadlines(&req);
         let cancel = req.meta.cancellation.clone();
@@ -1059,6 +1095,16 @@ impl Provider for OpenAiProvider {
         if let Err(e) =
             faktor_provider::validate_media_delivery(&req, &caps, self.max_image_bytes())
         {
+            return faktor_provider::provider_error_stream(e);
+        }
+        // The vision-like document gate: the family-level capability flag,
+        // the document mime allowlist, the per-document and request-wide
+        // bounds — also BEFORE any wire byte.
+        if let Err(e) = faktor_provider::validate_document_delivery(
+            &req,
+            self.document_capable(&req.model),
+            self.max_document_bytes(),
+        ) {
             return faktor_provider::provider_error_stream(e);
         }
         // The family decides the wire body AND the endpoint + parser pair.
@@ -1626,6 +1672,109 @@ mod tests {
             content: vec![
                 ContentPart::text("look"),
                 ContentPart::image_data("image/png", png).unwrap(),
+            ],
+        });
+        let mut stream = provider.stream(r);
+        while let Some(chunk) = stream.next().await {
+            if matches!(chunk.unwrap(), ProviderChunk::Done) {
+                break;
+            }
+        }
+        assert_eq!(server.request_count(), 1);
+    }
+
+    /// Resolved DOCUMENT attachments lower BYTE-EXACTLY on both wire
+    /// families: Chat gets `{type: "file"}` with the display filename and a
+    /// base64 data URL, Responses gets `input_file` with the same fields.
+    #[tokio::test]
+    async fn document_data_lowers_byte_exact_on_chat_and_responses() {
+        let pdf: Vec<u8> = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n%%EOF".to_vec();
+        let media = faktor_provider::MediaBytes::new(pdf.clone()).unwrap();
+        let expected_url = media.to_data_url("application/pdf");
+        // Chat family.
+        let server = MockServer::new();
+        let expected_chat = expected_url.clone();
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::AssertThenRespond {
+                status: 200,
+                body: sse_body(&[
+                    serde_json::json!({"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}),
+                ]),
+                assert: Arc::new(move |body: &serde_json::Value| {
+                    assert_eq!(
+                        body["messages"][1]["content"],
+                        serde_json::json!([
+                            { "type": "text", "text": "read" },
+                            {
+                                "type": "file",
+                                "file": {
+                                    "filename": "spec.pdf",
+                                    "file_data": expected_chat
+                                }
+                            }
+                        ]),
+                        "Chat document lowering must be byte-exact"
+                    );
+                }),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        assert!(provider.document_capable("m1"));
+        let mut r = req("m1");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::text("read"),
+                ContentPart::file_data("application/pdf", Some("spec.pdf"), pdf.clone()).unwrap(),
+            ],
+        });
+        let mut stream = provider.stream(r);
+        while let Some(chunk) = stream.next().await {
+            if matches!(chunk.unwrap(), ProviderChunk::Done) {
+                break;
+            }
+        }
+        assert_eq!(server.request_count(), 1);
+
+        // Responses family.
+        let server = MockServer::new();
+        let expected_responses = expected_url.clone();
+        server.route(
+            "POST",
+            "/responses",
+            MockAction::AssertThenRespond {
+                status: 200,
+                body: sse_body(&[
+                    serde_json::json!({"type":"response.output_text.delta","delta":"ok"}),
+                    serde_json::json!({"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}),
+                ]),
+                assert: Arc::new(move |body: &serde_json::Value| {
+                    assert_eq!(
+                        body["input"][1]["content"],
+                        serde_json::json!([
+                            { "type": "input_text", "text": "read" },
+                            {
+                                "type": "input_file",
+                                "filename": "spec.pdf",
+                                "file_data": expected_responses
+                            }
+                        ]),
+                        "Responses document lowering must be byte-exact"
+                    );
+                }),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OpenAiProvider::build(OpenAiConfig::responses(base, None));
+        let mut r = req("m1");
+        r.messages.push(RequestMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::text("read"),
+                ContentPart::file_data("application/pdf", Some("spec.pdf"), pdf).unwrap(),
             ],
         });
         let mut stream = provider.stream(r);

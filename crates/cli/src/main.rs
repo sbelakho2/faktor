@@ -27,6 +27,7 @@ use faktor_terminal::{ProcessOwner, ProcessSupervisor};
 use serde_json::{json, Value};
 
 mod config;
+mod embeddings;
 mod evidence;
 mod graph;
 mod mcp_bridge;
@@ -762,7 +763,7 @@ fn build_daemon_core(
     // constructions and the registry's catalog rows.
     let mut providers = ProviderRegistry::new();
     let mut ollama_warmers: Vec<Arc<faktor_ollama::OllamaProvider>> = Vec::new();
-    for p in config.providers {
+    for p in &config.providers {
         if let Some(ollama) = p.build_ollama(transport.clone()) {
             let dyn_arc: Arc<dyn Provider> = ollama.clone();
             providers
@@ -834,8 +835,16 @@ fn build_daemon_core(
     };
     // Step 10 — evidence/cold: the daemon's evidence provider (spec §20):
     // the bounded per-workspace scan + search every session's context
-    // engine consults while the index has no Ready generation.
-    let repo_evidence = Arc::new(RepoEvidence::new(session.clone()));
+    // engine consults while the index has no Ready generation. The
+    // configured `[embeddings]` selection (model + provider + policy) is
+    // resolved HERE against the registry built above and rides the provider
+    // into BOTH evidence paths (the cold scan and the agent's index-backed
+    // assembly): an absent/unresolvable selection under `best_effort`
+    // degrades to lexical/symbol-only retrieval, never a fabricated vector.
+    let embedder = config
+        .semantic_embedder(&providers, &faktor_core::retry::RetryPolicy::default())
+        .map_err(|e| format!("embeddings config: {e}"))?;
+    let repo_evidence = Arc::new(RepoEvidence::new(session.clone(), embedder));
     // Step 11 — per-workspace repository instructions (P0-32): the
     // resolver is built over the daemon's SessionManager workspace table
     // ONCE — every later resolution reads a session's DURABLE workspace

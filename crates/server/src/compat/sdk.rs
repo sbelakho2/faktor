@@ -45,16 +45,19 @@ pub(crate) async fn hello(State(state): State<AppState>) -> Response {
 }
 
 /// `GET /global/health` — auth-required (the frozen v7.5.6 client
-/// authenticates every request, this one included).
+/// authenticates every request, this one included). Serves the SDK's
+/// declared `{healthy: true, version}` fields ADDITIVELY next to the frozen
+/// `{ok, protocol}` aliases (the legacy fixtures/consumers read those).
 pub(crate) async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    Json(HealthResponse {
-        ok: true,
-        version: state.deps.version.clone(),
-        protocol: faktor_core::PROTOCOL_V756.to_string(),
-    })
+    Json(serde_json::json!({
+        "ok": true,
+        "healthy": true,
+        "version": state.deps.version.clone(),
+        "protocol": faktor_core::PROTOCOL_V756.to_string(),
+    }))
     .into_response()
 }
 
@@ -774,8 +777,9 @@ pub(crate) async fn pty_output(
 /// `POST /global/dispose` and `POST /instance/dispose` — stop everything:
 /// every supervised process owned by a session is killed via the agent
 /// (which owns the supervisor), then each session is durably ended
-/// (SessionEnded journal event + lifecycle Closed). Honest refusal with the
-/// first failing session when any cannot end.
+/// (SessionEnded journal event + lifecycle Closed). The SDK declares
+/// `200: boolean`; the boolean is the honest overall outcome (an incomplete
+/// dispose is an error response, never `false`).
 pub(crate) async fn dispose_all_sessions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -790,7 +794,7 @@ pub(crate) async fn dispose_all_sessions(
     for handle in handles {
         let id = handle.id();
         // Idempotent: sessions that are already durably ended are skipped
-        // (a second dispose must still answer ok:true).
+        // (a second dispose must still answer true).
         let row = match handle.row() {
             Ok(r) => r,
             Err(e) => return api_err(&e),
@@ -808,17 +812,18 @@ pub(crate) async fn dispose_all_sessions(
             return wire_refused(&format!("dispose incomplete: session {id}: {}", e.message));
         }
     }
-    Json(OkResponse { ok: true }).into_response()
+    Json(true).into_response()
 }
 
 /// `POST /instance/reload` — re-run the daemon's crash recovery sweep over
-/// every session (idempotent) and acknowledge.
+/// every session (idempotent) and acknowledge with the SDK's declared
+/// boolean.
 pub(crate) async fn instance_reload(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
     match state.deps.agent.recover() {
-        Ok(_reports) => Json(OkResponse { ok: true }).into_response(),
+        Ok(_reports) => Json(true).into_response(),
         Err(e) => api_err(&e),
     }
 }
@@ -1124,12 +1129,101 @@ pub(crate) async fn network_list(
     Json(NetworkListResponse { networks }).into_response()
 }
 
+/// One pending request as the SDK's declared `PermissionRequest`:
+/// `{id, sessionID, permission, patterns, metadata, always, tool?}`.
+/// `permission` is the daemon's real capability tag; `patterns` the
+/// concrete requested target string(s) inside the capability detail (empty
+/// when the detail carries none); the full capability payload rides
+/// `metadata`; `always` is empty because this slice has no always-allow
+/// rule store (never a fabricated rule).
+fn sdk_permission_request(p: &PendingPermission) -> serde_json::Value {
+    let mut patterns: Vec<String> = Vec::new();
+    if let Some(obj) = p.detail.get("detail").and_then(|d| d.as_object()) {
+        for value in obj.values() {
+            if let Some(s) = value.as_str() {
+                patterns.push(s.to_string());
+            }
+        }
+    }
+    serde_json::json!({
+        "id": p.id.to_string(),
+        "sessionID": p.session_id.to_string(),
+        "permission": p.capability,
+        "patterns": patterns,
+        "metadata": {"detail": p.detail},
+        "always": [],
+    })
+}
+
+/// `GET /permission` — the SDK's declared BARE `PermissionRequest[]` over
+/// the daemon's REAL pending permission requests (every class: the
+/// capability detail carries the class; the network-class asks surface here
+/// too, never hidden).
+pub(crate) async fn permission_list_sdk(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let permissions: Vec<serde_json::Value> = state
+        .deps
+        .permissions
+        .pending_views()
+        .into_iter()
+        .map(|v| sdk_permission_request(&v))
+        .collect();
+    Json(permissions).into_response()
+}
+
+/// `GET /question` — the SDK's declared BARE `QuestionRequest[]`. This
+/// slice has NO structured-question subsystem: its question-class asks ARE
+/// permission requests and surface (with every other class) under
+/// `GET /permission`, so the truthful projection is the empty array —
+/// never a fabricated question/option object.
+pub(crate) async fn question_list_sdk(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    Json(Vec::<serde_json::Value>::new()).into_response()
+}
+
+/// `GET /network` — the SDK's declared BARE `SessionNetworkWait[]`. The
+/// SDK type is a network RECONNECT wait with a required creation time; the
+/// daemon has no reconnect-wait state (its network-class asks are
+/// permission requests on `GET /permission`), so the truthful projection is
+/// the empty array — never a fabricated wait or timestamp.
+pub(crate) async fn network_list_sdk(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    Json(Vec::<serde_json::Value>::new()).into_response()
+}
+
 pub(crate) async fn config_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
     let config = state.config.read().unwrap().clone();
     Json(ConfigGetResponse { config }).into_response()
+}
+
+/// `GET /config` — the SDK's `config.get` route: the BARE daemon config
+/// object (Config has no required fields; the daemon exposes exactly the
+/// runtime keys it owns). The legacy `/config/get` envelope stays for the
+/// frozen consumers.
+pub(crate) async fn config_get_bare(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let config = state.config.read().unwrap().clone();
+    Json(config).into_response()
 }
 
 /// The daemon-editable top-level config keys (`config.update` allowlist):
@@ -1223,42 +1317,122 @@ pub(crate) async fn config_update(
     Json(ConfigSetResponse { ok: true }).into_response()
 }
 
-/// `GET /config/warnings` — real validation warnings over the stored config
-/// (empty when everything validates).
+/// `GET /config/warnings` — the SDK's declared BARE
+/// `Array<{path,message,detail?}>`, produced by real validation over the
+/// stored config (empty when everything validates). `path` is the literal
+/// source label `runtime`: the daemon's config is an in-memory runtime
+/// object with no file layer in this slice, and a fabricated filename would
+/// be worse than the honest label. The legacy `{warnings:[…]}` envelope is
+/// gone (the SDK type is the contract; checked-in consumers were updated).
 pub(crate) async fn config_warnings(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
     let config = state.config.read().unwrap().clone();
-    let mut warnings = Vec::new();
+    let mut warnings: Vec<serde_json::Value> = Vec::new();
+    let mut push = |message: String| {
+        warnings.push(serde_json::json!({"path": "runtime", "message": message}));
+    };
     if let Some(obj) = config.as_object() {
         for (key, value) in obj {
             match key.as_str() {
                 "model" => {
                     if !value.is_string() {
-                        warnings.push("config \"model\" must be a string".into());
+                        push("config \"model\" must be a string".into());
                     }
                 }
                 "compact_at_usage" => {
                     let ok = value.as_f64().is_some_and(|v| (0.0..=1.0).contains(&v));
                     if !ok {
-                        warnings
-                            .push("config \"compact_at_usage\" must be a number in [0, 1]".into());
+                        push("config \"compact_at_usage\" must be a number in [0, 1]".into());
                     }
                 }
                 "instructions" => {
                     if !value.is_string() {
-                        warnings.push("config \"instructions\" must be a string".into());
+                        push("config \"instructions\" must be a string".into());
                     }
                 }
-                other => warnings.push(format!(
+                other => push(format!(
                     "unknown config key {other:?} (daemon-editable keys: {})",
                     CONFIG_EDITABLE_KEYS.join(", ")
                 )),
             }
         }
     }
-    Json(ConfigWarningsResponse { warnings }).into_response()
+    Json(warnings).into_response()
+}
+
+/// `GET /config/overlay` — the SDK's `config.overlay` read. This daemon has
+/// exactly ONE configuration layer (the in-memory runtime object; the CLI
+/// resolves providers before serve and this slice exposes no config FILE),
+/// so the projection is honest about that: the runtime layer is the single
+/// `source` (kind `runtime`, editable `false`), it applies as the global
+/// layer (`effective == global == runtime config`), no project layer is
+/// loaded (`project: {}`), and the SDK's file `targets` all report
+/// `exists:false` with empty paths/revisions (there are no config files to
+/// point at). `fields` carries the real per-key values with
+/// `source:"system"` and the daemon's honest `editable` allowlist; a file
+/// path/revision/inheritance chain is never fabricated.
+pub(crate) async fn config_overlay_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let config = state.config.read().unwrap().clone();
+    let mut fields = serde_json::Map::new();
+    if let Some(obj) = config.as_object() {
+        for (key, value) in obj {
+            fields.insert(
+                key.clone(),
+                serde_json::json!({
+                    "key": key,
+                    "path": [key],
+                    "value": value,
+                    "source": "system",
+                    "inherited": false,
+                    "overridden": false,
+                    "editable": CONFIG_EDITABLE_KEYS.contains(&key.as_str()),
+                    "reason": "daemon runtime config (no file layer in this slice)",
+                }),
+            );
+        }
+    }
+    let empty_target = |scope: &str| {
+        serde_json::json!({
+            "scope": scope,
+            "path": "",
+            "revision": "",
+            "exists": false,
+            "writable": false,
+            "raw": {},
+        })
+    };
+    Json(serde_json::json!({
+        "scope": "global",
+        "effective": config.clone(),
+        "global": config,
+        "project": {},
+        "sources": [{
+            "order": 0,
+            "kind": "runtime",
+            "scope": "global",
+            "label": "daemon runtime config",
+            "source": "runtime",
+            "exists": true,
+            "editable": false,
+            "reason": "in-memory runtime configuration (no file backing); applies as the global layer",
+        }],
+        "targets": {
+            "global": empty_target("global"),
+            "project": empty_target("project"),
+            "active": empty_target("global"),
+        },
+        "fields": fields,
+        "collections": {},
+    }))
+    .into_response()
 }
 
 /// `POST /config/overlay` — store a bounded overlay, replacing the whole

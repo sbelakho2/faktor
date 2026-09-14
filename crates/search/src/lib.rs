@@ -32,6 +32,15 @@ pub struct EvidenceHit {
 /// Semantic embedding provider (optional; search works without it).
 pub trait Embedder: Send + Sync {
     fn embed(&self, texts: &[String]) -> Vec<Vec<f32>>;
+
+    /// Fallible variant: a configured provider can fail typedly (transport,
+    /// rate limit, malformed response) and the error must surface to the
+    /// caller instead of being flattened into a vector list. The default
+    /// bridges to the infallible [`Embedder::embed`], so legacy embedders
+    /// keep working unchanged.
+    fn try_embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, Error> {
+        Ok(self.embed(texts))
+    }
 }
 
 pub struct SearchService {
@@ -183,9 +192,36 @@ impl SearchService {
         if candidates.is_empty() {
             return Ok(vec![]);
         }
-        let query_emb = embedder.embed(&[query.to_string()]);
-        let doc_embs = embedder.embed(&candidates);
-        let q = &query_emb[0];
+        let query_emb = embedder.try_embed(&[query.to_string()])?;
+        let doc_embs = embedder.try_embed(&candidates)?;
+        // A configured embedder is untrusted INPUT: an empty or ragged
+        // response is a typed refusal, never an index panic or a silent
+        // truncation that would score the wrong files.
+        let Some(q) = query_emb.first() else {
+            return Err(Error::malformed(
+                "embedding provider returned no vector for the query",
+            ));
+        };
+        if q.is_empty() || q.iter().any(|v| !v.is_finite()) {
+            return Err(Error::malformed(
+                "embedding provider returned a malformed query vector",
+            ));
+        }
+        if doc_embs.len() != paths.len() {
+            return Err(Error::malformed(format!(
+                "embedding provider returned {} vectors for {} documents",
+                doc_embs.len(),
+                paths.len()
+            )));
+        }
+        if doc_embs
+            .iter()
+            .any(|d| d.len() != q.len() || d.iter().any(|v| !v.is_finite()))
+        {
+            return Err(Error::malformed(
+                "embedding provider returned a document vector with a different dimension or non-finite component",
+            ));
+        }
         let mut scored: Vec<(String, f64)> = paths
             .iter()
             .zip(doc_embs.iter())
@@ -473,6 +509,89 @@ mod tests {
         assert!(hits.iter().any(|h| h.path.contains("parser.rs")));
         let hits = svc.exact(ws, "src/lexer", 10);
         assert!(hits.iter().any(|h| h.path.contains("lexer.rs")));
+    }
+
+    /// A configured embedder is untrusted input: malformed responses are
+    /// typed refusals (never a panic, never a silent truncation) and a
+    /// provider error propagates through `semantic` while `fused` degrades
+    /// honestly to the lexical/symbol legs.
+    #[test]
+    fn malformed_embedder_responses_are_typed_and_fusion_degrades() {
+        struct Bad(EmbedderResponses);
+        enum EmbedderResponses {
+            Empty,
+            Short,
+            Ragged,
+            NonFinite,
+            Failed,
+        }
+        impl Embedder for Bad {
+            fn embed(&self, texts: &[String]) -> Vec<Vec<f32>> {
+                let n = texts.len();
+                match self.0 {
+                    EmbedderResponses::Empty => vec![],
+                    EmbedderResponses::Short => vec![vec![1.0]; n.saturating_sub(1)],
+                    EmbedderResponses::Ragged => {
+                        let mut v = vec![vec![1.0, 0.0]; n];
+                        if let Some(f) = v.first_mut() {
+                            f.push(0.0);
+                        }
+                        v
+                    }
+                    EmbedderResponses::NonFinite => vec![vec![f32::NAN]; n],
+                    EmbedderResponses::Failed => {
+                        vec![vec![1.0]; n]
+                    }
+                }
+            }
+            fn try_embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, Error> {
+                if matches!(self.0, EmbedderResponses::Failed) {
+                    return Err(Error::new(
+                        ErrorKind::Provider {
+                            code: "embeddings_unavailable".into(),
+                            retryable: true,
+                        },
+                        "embedding provider refused the request",
+                    ));
+                }
+                Ok(self.embed(texts))
+            }
+        }
+        let (idx, ws) = corpus();
+        for (name, case) in [
+            ("empty", EmbedderResponses::Empty),
+            ("short", EmbedderResponses::Short),
+            ("ragged", EmbedderResponses::Ragged),
+            ("non-finite", EmbedderResponses::NonFinite),
+            ("failed", EmbedderResponses::Failed),
+        ] {
+            let svc = SearchService::new(idx.clone(), Some(Arc::new(Bad(case))));
+            let err = svc
+                .semantic(ws, "parse", 5)
+                .expect_err(&format!("{name} must be a typed refusal"));
+            if name != "failed" {
+                assert_eq!(err.kind, ErrorKind::Malformed, "{name}: {err}");
+            }
+            // Fusion never crashes and never loses the lexical/symbol legs.
+            let fused = svc.fused(ws, "parse", 5);
+            assert!(
+                fused.iter().any(|h| h.path == "src/parser.rs"),
+                "{name}: lexical/symbol evidence must survive: {fused:?}"
+            );
+        }
+        // A provider error carries its typed retryable code through.
+        let svc = SearchService::new(idx, Some(Arc::new(Bad(EmbedderResponses::Failed))));
+        let err = svc.semantic(ws, "parse", 5).unwrap_err();
+        assert!(
+            matches!(
+                err.kind,
+                ErrorKind::Provider {
+                    retryable: true,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]

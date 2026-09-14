@@ -972,6 +972,20 @@ pub fn measure_message(counter: &dyn TokenCounter, m: &RequestMessage) -> TokenE
                     kind: TokenEstimateKind::UpperBound,
                 }
             }
+            ContentKind::FileData { mime, data, .. } => {
+                // Resolved document media: the same accounting discipline as
+                // images — a fixed conservative upper-bound per document plus
+                // the mime label, never free and never a whole-bytes token
+                // count (extraction is provider/format dependent).
+                let estimate = counter.count_text(mime);
+                TokenEstimate {
+                    count: estimate
+                        .count
+                        .saturating_add(faktor_provider::DOCUMENT_PART_TOKEN_ESTIMATE)
+                        .max(data.len() as u64 / (64 * 1024)),
+                    kind: TokenEstimateKind::UpperBound,
+                }
+            }
             ContentKind::ToolCall { id, name, input } => {
                 let mut t = add_estimate(counter.count_text(id), counter.count_text(name));
                 t = add_estimate(t, counter.count_json(input));
