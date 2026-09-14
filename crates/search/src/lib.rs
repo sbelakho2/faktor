@@ -13,6 +13,11 @@ use faktor_index::{Symbol, SymbolKind, WorkspaceIndex};
 
 const MAX_QUERY_BYTES: usize = 4096;
 const MAX_SNIPPET_CHARS: usize = 400;
+/// Exact-cosine retrieval over PERSISTED index vectors is bounded to this
+/// many chunk vectors per query (deterministic prefix: sorted paths, chunk
+/// order). The persisted store is itself bounded per workspace; this is the
+/// per-query work bound.
+const MAX_PERSISTED_VECTORS_PER_QUERY: usize = 8_192;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
@@ -31,6 +36,14 @@ pub struct EvidenceHit {
 
 /// Semantic embedding provider (optional; search works without it).
 pub trait Embedder: Send + Sync {
+    /// Stable identity `(model_id, revision)` of this embedder when known.
+    /// The index persists vectors keyed by this identity so unchanged
+    /// chunks are never re-embedded; `None` keeps vector persistence off
+    /// (honest, never a fabricated identity).
+    fn identity(&self) -> Option<(String, String)> {
+        None
+    }
+
     fn embed(&self, texts: &[String]) -> Vec<Vec<f32>>;
 
     /// Fallible variant: a configured provider can fail typedly (transport,
@@ -172,9 +185,17 @@ impl SearchService {
                 "no embedding provider configured",
             ));
         };
+        let index = self.index.lock().unwrap();
+        // Persisted-vector retrieval (index builds with a configured
+        // embedding source persist chunk vectors keyed by content hash): the
+        // QUERY is embedded, the corpus is served from the durable vectors —
+        // no document is re-embedded per search, and chunk embeddings
+        // survive generation swaps/reopens.
+        if index.has_embedding_index(ws) {
+            return semantic_from_persisted(&index, ws, query, limit, embedder.as_ref());
+        }
         // Embed the query and candidate chunks (paths + symbols); cosine
         // similarity ranks the corpus.
-        let index = self.index.lock().unwrap();
         let mut candidates: Vec<String> = Vec::new();
         let mut paths: Vec<String> = Vec::new();
         if let Some(files) = index_files(&index, ws) {
@@ -325,6 +346,67 @@ fn snippet_for(path: &str) -> String {
     truncate(path, MAX_SNIPPET_CHARS)
 }
 
+/// Semantic retrieval over the PERSISTED chunk vectors of one workspace
+/// generation: embed the query, exact-cosine score every stored vector
+/// (bounded, deterministic order), keep each path's best chunk, rank by
+/// (score desc, path asc). A query vector whose dimension does not match
+/// the active model dimension is a typed `Malformed` refusal — never a
+/// silent zero-score ranking.
+fn semantic_from_persisted(
+    index: &WorkspaceIndex,
+    ws: WorkspaceId,
+    query: &str,
+    limit: usize,
+    embedder: &dyn Embedder,
+) -> Result<Vec<Hit>, Error> {
+    let query_emb = embedder.try_embed(&[query.to_string()])?;
+    let Some(q) = query_emb.first() else {
+        return Err(Error::malformed(
+            "embedding provider returned no vector for the query",
+        ));
+    };
+    if q.is_empty() || q.iter().any(|v| !v.is_finite()) {
+        return Err(Error::malformed(
+            "embedding provider returned a malformed query vector",
+        ));
+    }
+    let active_dimension = index.embedding_dimension(ws) as usize;
+    if q.len() != active_dimension {
+        return Err(Error::malformed(format!(
+            "query embedding dimension {} does not match the indexed model dimension {active_dimension}",
+            q.len()
+        )));
+    }
+    let mut best: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for (path, vector) in index.chunk_vectors(ws, MAX_PERSISTED_VECTORS_PER_QUERY) {
+        let score = cosine(q, vector);
+        best.entry(path)
+            .and_modify(|current| {
+                if score > *current {
+                    *current = score;
+                }
+            })
+            .or_insert(score);
+    }
+    let mut out: Vec<Hit> = best
+        .into_iter()
+        .map(|(path, score)| Hit {
+            snippet: snippet_for(&path),
+            path,
+            score,
+            symbol: None,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.path.cmp(&b.path))
+    });
+    out.truncate(limit);
+    Ok(out)
+}
+
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -412,6 +494,7 @@ fn kind_label(kind: SymbolKind) -> &'static str {
 mod tests {
     use super::*;
     use faktor_index::WorkspaceIndex as WI;
+    use faktor_index::{content_hash, EmbeddingModel};
 
     fn corpus() -> (Arc<Mutex<WI>>, WorkspaceId) {
         let mut idx = WI::new();
@@ -686,6 +769,140 @@ mod tests {
             .as_ref()
             .map(|s| s.name.starts_with("parse"))
             .unwrap_or(false)));
+    }
+
+    // ------------------------------------------------- persisted vectors
+
+    /// Query-side embedder for the persisted-vector path: keyword axes, and
+    /// it RECORDS every text it is asked to embed (proving the corpus is
+    /// served from the persisted store, not re-embedded).
+    struct SpyAxisEmbedder {
+        dimension: usize,
+        texts: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SpyAxisEmbedder {
+        fn new(dimension: usize) -> Self {
+            Self {
+                dimension,
+                texts: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn texts(&self) -> Vec<String> {
+            self.texts.lock().unwrap().clone()
+        }
+    }
+
+    impl Embedder for SpyAxisEmbedder {
+        fn embed(&self, texts: &[String]) -> Vec<Vec<f32>> {
+            self.texts.lock().unwrap().extend(texts.iter().cloned());
+            texts
+                .iter()
+                .map(|text| {
+                    let l = text.to_lowercase();
+                    let mut v = vec![0.1f32; self.dimension];
+                    let axis =
+                        if l.contains("quantum") || l.contains("ledger") || l.contains("reconcile")
+                        {
+                            0
+                        } else if l.contains("zebra") || l.contains("parser") {
+                            1
+                        } else {
+                            usize::MAX
+                        };
+                    if axis < self.dimension {
+                        for (i, component) in v.iter_mut().enumerate() {
+                            *component = if i == axis { 1.0 } else { 0.0 };
+                        }
+                    }
+                    v
+                })
+                .collect()
+        }
+    }
+
+    const LEDGER: &str = "pub fn reconcile_accounts() -> u32 { 7 }\n";
+    const PARSER: &str = "pub fn parse_expr() -> u32 { 1 }\n";
+
+    /// One corpus whose PERSISTED vectors (not query-time candidates) decide
+    /// the ranking: semantic search must return the exact nearest neighbor
+    /// by cosine and be deterministic across calls.
+    fn persisted_corpus(dimension: usize) -> (Arc<Mutex<WI>>, WorkspaceId) {
+        let mut idx = WI::new();
+        let ws = WorkspaceId::new(3);
+        idx.index_file(
+            ws,
+            std::path::Path::new("src/ledger.rs"),
+            LEDGER.as_bytes(),
+            1,
+        )
+        .unwrap();
+        idx.index_file(
+            ws,
+            std::path::Path::new("src/parser.rs"),
+            PARSER.as_bytes(),
+            2,
+        )
+        .unwrap();
+        idx.set_embedding_model(ws, &EmbeddingModel::new("m", "r1"));
+        let mut ledger = vec![0.0f32; dimension];
+        ledger[0] = 1.0;
+        let mut parser = vec![0.0f32; dimension];
+        parser[1] = 1.0;
+        idx.put_embedding(ws, &content_hash(LEDGER), ledger)
+            .unwrap();
+        idx.put_embedding(ws, &content_hash(PARSER), parser)
+            .unwrap();
+        (Arc::new(Mutex::new(idx)), ws)
+    }
+
+    #[test]
+    fn persisted_vectors_return_the_exact_nearest_neighbor_deterministically() {
+        let (idx, ws) = persisted_corpus(2);
+        let spy = Arc::new(SpyAxisEmbedder::new(2));
+        let svc = SearchService::new(idx, Some(spy.clone()));
+        let a = svc.semantic(ws, "quantum", 5).unwrap();
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0].path, "src/ledger.rs", "exact nearest neighbor wins");
+        assert!((a[0].score - 1.0).abs() < 1e-6, "{:?}", a[0]);
+        assert_eq!(a[1].path, "src/parser.rs");
+        assert!((a[1].score - 0.0).abs() < 1e-6);
+        // Deterministic across calls.
+        let b = svc.semantic(ws, "quantum", 5).unwrap();
+        assert_eq!(a, b, "persisted retrieval must be deterministic");
+        // Only QUERY texts ever reach the embedder (two calls for two
+        // queries); the corpus came from the store.
+        assert_eq!(
+            spy.texts(),
+            vec!["quantum".to_string(), "quantum".to_string()]
+        );
+        // Fusion still carries the persisted semantic leg.
+        let fused = svc.fused(ws, "quantum", 5);
+        assert!(
+            fused.iter().any(|h| h.path == "src/ledger.rs"),
+            "persisted vectors must fuse: {fused:?}"
+        );
+    }
+
+    #[test]
+    fn persisted_query_dimension_and_shape_mismatches_are_typed() {
+        // Index model dimension 2, embedder answers 3.
+        let (idx, ws) = persisted_corpus(2);
+        let svc = SearchService::new(idx.clone(), Some(Arc::new(SpyAxisEmbedder::new(3))));
+        let err = svc.semantic(ws, "quantum", 5).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed, "{err}");
+        assert!(err.message.contains("dimension"), "{err}");
+        // A non-finite query vector is a typed refusal.
+        struct NonFinite;
+        impl Embedder for NonFinite {
+            fn embed(&self, _texts: &[String]) -> Vec<Vec<f32>> {
+                vec![vec![f32::NAN, 0.0]]
+            }
+        }
+        let svc = SearchService::new(idx, Some(Arc::new(NonFinite)));
+        let err = svc.semantic(ws, "quantum", 5).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed, "{err}");
     }
 
     #[test]

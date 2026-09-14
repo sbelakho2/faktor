@@ -1,6 +1,11 @@
 [
   {
     "method": "DELETE",
+    "path": "/pty/{ptyID}",
+    "status_class": "compat"
+  },
+  {
+    "method": "DELETE",
     "path": "/session/{sessionID}",
     "status_class": "compat"
   },
@@ -263,6 +268,11 @@
     "method": "POST",
     "path": "/permission/reply",
     "status_class": "protected"
+  },
+  {
+    "method": "POST",
+    "path": "/pty",
+    "status_class": "compat"
   },
   {
     "method": "POST",

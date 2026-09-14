@@ -15,10 +15,15 @@ use std::path::Path;
 use faktor_core::id::WorkspaceId;
 
 pub mod cold;
+pub mod embedding;
 pub mod generation;
 pub mod service;
 pub mod state;
 
+pub use embedding::{
+    apply_embeddings, chunk_text, content_hash, EmbeddingIndex, EmbeddingModel, EmbeddingRecord,
+    EmbeddingSource, EmbeddingStats,
+};
 pub use service::{IndexError, IndexService, IndexView, ServiceConfig};
 pub use state::WorkspaceIndexState;
 
@@ -90,6 +95,11 @@ struct FileEntry {
     modified_ms: i64,
     #[allow(dead_code)]
     size: u64,
+    /// Content hashes of this file's embedded chunks, in chunk order
+    /// ([`embedding::chunk_text`] windows). Path/generation independent:
+    /// the vector itself lives in the workspace embedding index keyed by
+    /// the hash.
+    chunks: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -100,6 +110,9 @@ pub struct WorkspaceIndex {
     postings: HashMap<WorkspaceId, HashMap<String, HashMap<String, u32>>>,
     /// workspace → symbol name (lowercase) → (path, Symbol)
     symbols: HashMap<WorkspaceId, HashMap<String, Vec<(String, Symbol)>>>,
+    /// workspace → persisted chunk embeddings keyed by
+    /// (content_hash, model_id, model_revision, dimension).
+    embeddings: HashMap<WorkspaceId, EmbeddingIndex>,
     token_count: usize,
 }
 
@@ -133,6 +146,10 @@ impl WorkspaceIndex {
         let text = String::from_utf8_lossy(bytes);
         let tokens = tokenize(&text);
         let symbols = extract_symbols(rel, &text);
+        // Chunk content hashes (bounded by the embedding chunk caps): the
+        // key half of the persisted (content_hash, model, revision,
+        // dimension) vector store. A rename or rebuild reuses them.
+        let chunks: Vec<String> = chunk_text(&text).into_iter().map(content_hash).collect();
 
         // Remove old postings for this path.
         self.remove_file(workspace, rel);
@@ -143,6 +160,7 @@ impl WorkspaceIndex {
             symbols: symbols.clone(),
             modified_ms,
             size: bytes.len() as u64,
+            chunks,
         };
         files.insert(rel_str.clone(), entry);
 
@@ -273,6 +291,120 @@ impl WorkspaceIndex {
         self.postings.remove(&workspace);
         self.symbols.remove(&workspace);
         self.files.remove(&workspace);
+        self.embeddings.remove(&workspace);
+    }
+
+    // -------------------------------------------------------- embeddings
+
+    /// The workspace's persisted embedding index (identity + records).
+    pub fn embedding_index(&self, workspace: WorkspaceId) -> Option<&EmbeddingIndex> {
+        self.embeddings.get(&workspace)
+    }
+
+    /// True when the workspace carries usable persisted vectors for its
+    /// active identity — the condition under which semantic search retrieves
+    /// through the store instead of embedding the corpus per query.
+    pub fn has_embedding_index(&self, workspace: WorkspaceId) -> bool {
+        self.embeddings.get(&workspace).is_some_and(|e| {
+            e.dimension > 0
+                && e.records.values().any(|record| {
+                    record.model_id == e.model_id
+                        && record.model_revision == e.model_revision
+                        && record.dimension == e.dimension
+                })
+        })
+    }
+
+    /// Active dimension of the workspace's embedding index (`0` = none).
+    pub fn embedding_dimension(&self, workspace: WorkspaceId) -> u32 {
+        self.embeddings
+            .get(&workspace)
+            .map(|e| e.dimension)
+            .unwrap_or(0)
+    }
+
+    /// Activate an embedding identity, invalidating records of a different
+    /// model/revision (never a silent reuse across revisions).
+    pub fn set_embedding_model(&mut self, workspace: WorkspaceId, model: &EmbeddingModel) {
+        self.embeddings
+            .entry(workspace)
+            .or_default()
+            .set_identity(&model.model_id, &model.revision);
+    }
+
+    /// Replace the workspace's embedding index wholesale (the build pass
+    /// installs a fresh bounded set so stale records can never linger).
+    pub fn replace_embeddings(&mut self, workspace: WorkspaceId, embeddings: EmbeddingIndex) {
+        self.embeddings.insert(workspace, embeddings);
+    }
+
+    /// Insert one vector for `content_hash` under the active identity.
+    pub fn put_embedding(
+        &mut self,
+        workspace: WorkspaceId,
+        content_hash: &str,
+        vector: Vec<f32>,
+    ) -> Result<(), faktor_core::Error> {
+        self.embeddings
+            .entry(workspace)
+            .or_default()
+            .put(content_hash, vector)
+    }
+
+    /// The active-identity vector for one chunk hash, when persisted.
+    pub fn embedding_vector(&self, workspace: WorkspaceId, content_hash: &str) -> Option<&[f32]> {
+        self.embeddings
+            .get(&workspace)
+            .and_then(|e| e.active_vector(content_hash))
+    }
+
+    /// Drop every vector of the active identity (dimension drift).
+    pub fn purge_embeddings(&mut self, workspace: WorkspaceId) {
+        if let Some(embeddings) = self.embeddings.get_mut(&workspace) {
+            embeddings.purge_active_identity();
+        }
+    }
+
+    /// Content hashes of one indexed file's chunks, in chunk order.
+    pub fn chunk_hashes(&self, workspace: WorkspaceId, rel: &str) -> Vec<String> {
+        self.files
+            .get(&workspace)
+            .and_then(|files| files.get(rel))
+            .map(|entry| entry.chunks.clone())
+            .unwrap_or_default()
+    }
+
+    /// The persisted vectors of every indexed chunk, deterministically
+    /// ordered (sorted path, then chunk order) and bounded by `limit`.
+    /// Borrowed from the index snapshot: callers (search) hold the snapshot
+    /// lock and score in place — no vector is cloned.
+    pub fn chunk_vectors(&self, workspace: WorkspaceId, limit: usize) -> Vec<(String, &[f32])> {
+        let Some(embeddings) = self.embeddings.get(&workspace) else {
+            return Vec::new();
+        };
+        if embeddings.dimension == 0 {
+            return Vec::new();
+        }
+        let Some(files) = self.files.get(&workspace) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<&String> = files.keys().collect();
+        paths.sort();
+        let mut out: Vec<(String, &[f32])> = Vec::new();
+        for path in paths {
+            if out.len() >= limit {
+                break;
+            }
+            for hash in &files[path].chunks {
+                if out.len() >= limit {
+                    break;
+                }
+                if let Some(vector) = embeddings.active_vector(hash) {
+                    out.push((path.clone(), vector));
+                }
+            }
+        }
+        out
     }
 
     pub fn file_paths(&self, workspace: WorkspaceId) -> Vec<String> {

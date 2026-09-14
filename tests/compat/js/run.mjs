@@ -110,6 +110,7 @@ const CALLS = {
   "permission.list": (c, a) => c.permission.list(a),
   "provider.list": (c, a) => c.provider.list(a),
   "pty.create": (c, a) => c.pty.create(a),
+  "pty.remove": (c, a) => c.pty.remove(a),
   "question.list": (c, a) => c.question.list(a),
   "session.abort": (c, a) => c.session.abort(a),
   "session.create": (c, a) => c.session.create(a),
@@ -185,7 +186,12 @@ async function runStep(client, step, vars, used) {
 const groups = readdirSync(TRACES)
   .filter((name) => name.endsWith(".json"))
   .sort();
-const vars = {};
+// The replay harness's per-process checkpoint-probe scratch path (a test
+// fixture, never a wire input): registering it as a var lets golden
+// normalization record `@string` instead of a run-specific path.
+const vars = process.env.FAKTOR_COMPAT_PROBE_PATH
+  ? { probePath: process.env.FAKTOR_COMPAT_PROBE_PATH }
+  : {};
 const traces = [];
 for (const group of groups) {
   const parsed = JSON.parse(readFileSync(join(TRACES, group), "utf8"));

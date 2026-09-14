@@ -446,7 +446,16 @@ fn normalize_json(value: &Value, vars: &BTreeMap<String, String>) -> Value {
         }
         Value::Object(map) => Value::Object(
             map.iter()
-                .map(|(k, v)| (k.clone(), normalize_json(v, vars)))
+                .map(|(k, v)| {
+                    // `pid` is a real OS process id: platform-normalized to
+                    // an `@int` template (the golden must replay on any
+                    // host/run), never a recorded literal.
+                    if k == "pid" && v.is_number() {
+                        (k.clone(), json!("@int"))
+                    } else {
+                        (k.clone(), normalize_json(v, vars))
+                    }
+                })
                 .collect(),
         ),
         other => other.clone(),
@@ -737,7 +746,7 @@ async fn unmodified_upstream_client_replays_against_the_real_daemon() {
     // in the replay still leaves failed evidence for the required CI lane.
     let mut report = new_report();
     let dir = tempfile::tempdir().unwrap();
-    let (deps, password) = super::tests::server_deps(dir.path());
+    let (deps, password, probe_path) = super::tests::replay_server_deps(dir.path());
     let (handle, base) = super::tests::spawn_server(deps).await;
 
     if !node_available() {
@@ -765,6 +774,10 @@ async fn unmodified_upstream_client_replays_against_the_real_daemon() {
     let node_base = base.clone();
     let node_password = password.as_str().to_string();
     let node_out = out.clone();
+    // The probe scratch path is per-process; the driver carries it as a var
+    // so golden normalization maps it to @string (concurrent test processes
+    // never share the path).
+    let node_probe = probe_path.clone();
     let status = tokio::task::spawn_blocking(move || {
         Command::new("node")
             .arg("--import")
@@ -774,6 +787,7 @@ async fn unmodified_upstream_client_replays_against_the_real_daemon() {
             .env("KILO_PASSWORD", node_password)
             .env("KILO_TRACES", traces_root())
             .env("KILO_OUT", &node_out)
+            .env("FAKTOR_COMPAT_PROBE_PATH", &node_probe)
             .status()
     })
     .await
@@ -914,6 +928,15 @@ async fn unmodified_upstream_client_replays_against_the_real_daemon() {
         report.status,
     );
     let _ = handle.shutdown.send(());
+    cleanup_probe_dir(&probe_path);
+}
+
+/// Best-effort removal of this run's per-process probe scratch directory
+/// (each run owns its own; failures are ignored).
+fn cleanup_probe_dir(probe_path: &str) {
+    if let Some(dir) = std::path::Path::new(probe_path).parent() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// Freeze one recorded request into the golden template form.

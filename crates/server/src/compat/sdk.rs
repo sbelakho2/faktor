@@ -15,6 +15,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::v756::sdk_invalid_request;
 use super::{submit_and_run, COMPAT_MUTATION_MODE};
 use crate::api::{AppState, ServerDeps};
 use crate::native::{
@@ -678,6 +679,228 @@ pub(crate) async fn pty_create(
     let pid = pty.pid();
     state.ptys.lock().unwrap().insert(id, pty);
     Json(serde_json::json!({ "ok": true, "pty_id": id.to_string(), "pid": pid })).into_response()
+}
+
+// --------------------------------------------------- SDK-exact PTY routes
+// The unmodified `@kilocode/sdk@7.5.6` client calls `POST /pty` (create,
+// returns the `Pty` object), `DELETE /pty/{ptyID}` (remove, returns
+// boolean), `GET /pty` (list), `GET/PATCH /pty/{ptyID}` and
+// `POST /pty/{ptyID}/connect-token`. This slice registers the create/remove
+// pair over the daemon's REAL PTY registry (`AppState.ptys` — the same
+// process authority the native session-owned terminal surface drives); the
+// remaining routes would need terminal metadata the registry deliberately
+// does not keep (command/args/cwd/title are not durable), so they stay
+// unregistered rather than projecting fabricated rows. The SDK's create
+// body carries no session id, so an SDK-created terminal has no durable
+// session ownership row (the native session-scoped route mints those when a
+// session is known); `sessionID` is therefore omitted from the projection,
+// never invented.
+
+/// Bound of one SDK PTY create field (mirrors the native terminal spawn).
+pub(crate) const MAX_SDK_PTY_FIELD_BYTES: usize = 4096;
+/// Bound of one SDK PTY create arg list.
+pub(crate) const MAX_SDK_PTY_ARGS: usize = 256;
+/// Bound of one SDK PTY env name allowlist.
+pub(crate) const MAX_SDK_PTY_ENV_NAMES: usize = 64;
+
+/// The default command of an SDK `pty.create` without one: the platform's
+/// documented interactive shell. Never a fabricated path.
+fn default_pty_command() -> String {
+    if cfg!(windows) {
+        "cmd.exe".to_string()
+    } else {
+        std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string())
+    }
+}
+
+/// `POST /pty` — the SDK `pty.create` route over the daemon's real PTY
+/// registry. Body (all optional, exactly the SDK's declared set):
+/// `{command?, args?, cwd?, title?, env?, size?{rows,cols}}`. The response
+/// is the SDK `Pty` object built from the values the spawn actually used:
+/// `status` is the live child state at response time, `exitCode` is omitted
+/// (the PTY backend exposes no exit-code authority — never fabricated), and
+/// `sessionID` is omitted because the SDK body carries no session id and no
+/// ownership row is minted. `env` VALUES never cross the daemon's ONE env
+/// authority: the map's NAMES become the spawn allowlist and the values are
+/// ignored (documented in docs/wire-compat.md).
+pub(crate) async fn sdk_pty_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<serde_json::Value>>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let body = body
+        .map(|Json(v)| v)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(obj) = body.as_object() else {
+        return sdk_invalid_request("pty create body must be a JSON object");
+    };
+    let command = match obj.get("command").and_then(|v| v.as_str()) {
+        Some(c) if !c.is_empty() && c.len() <= MAX_SDK_PTY_FIELD_BYTES && !c.contains('\0') => {
+            c.to_string()
+        }
+        Some(_) => {
+            return sdk_invalid_request(
+                "pty command must be non-empty and at most 4096 bytes without NUL",
+            )
+        }
+        None => default_pty_command(),
+    };
+    let args: Vec<String> = match obj.get("args") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(text) = item.as_str() else {
+                    return sdk_invalid_request("pty args must be an array of strings");
+                };
+                out.push(text.to_string());
+            }
+            out
+        }
+        Some(_) => return sdk_invalid_request("pty args must be an array of strings"),
+    };
+    if args.len() > MAX_SDK_PTY_ARGS
+        || args
+            .iter()
+            .any(|a| a.len() > MAX_SDK_PTY_FIELD_BYTES || a.contains('\0'))
+    {
+        return sdk_invalid_request("pty args are oversized");
+    }
+    let cwd: Option<String> = match obj.get("cwd") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s))
+            if !s.is_empty() && s.len() <= MAX_SDK_PTY_FIELD_BYTES && !s.contains('\0') =>
+        {
+            Some(s.clone())
+        }
+        Some(_) => return sdk_invalid_request("pty cwd is invalid or oversized"),
+    };
+    let title = match obj.get("title").and_then(|v| v.as_str()) {
+        Some(t) if t.len() <= MAX_SDK_PTY_FIELD_BYTES && !t.contains('\0') => t.to_string(),
+        Some(_) => return sdk_invalid_request("pty title is oversized"),
+        None => command.clone(),
+    };
+    // env: {name: value}; only the NAMES feed the env authority.
+    let env_names: Vec<String> = match obj.get("env") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Object(map)) => {
+            let mut names = Vec::with_capacity(map.len());
+            for (name, value) in map {
+                if !value.is_string() {
+                    return sdk_invalid_request("pty env values must be strings");
+                }
+                if name.is_empty() || name.len() > 256 || name.contains('\0') || name.contains('=')
+                {
+                    return sdk_invalid_request("pty env name is invalid or oversized");
+                }
+                names.push(name.clone());
+            }
+            names
+        }
+        Some(_) => return sdk_invalid_request("pty env must be an object of string values"),
+    };
+    if env_names.len() > MAX_SDK_PTY_ENV_NAMES {
+        return sdk_invalid_request("pty env allowlist exceeds 64 names");
+    }
+    let (rows, cols) = match obj.get("size") {
+        None | Some(serde_json::Value::Null) => (24u16, 80u16),
+        Some(serde_json::Value::Object(size)) => {
+            let rows = size
+                .get("rows")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u16::try_from(v).ok())
+                .unwrap_or(24)
+                .max(1);
+            let cols = size
+                .get("cols")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u16::try_from(v).ok())
+                .unwrap_or(80)
+                .max(1);
+            (rows, cols)
+        }
+        Some(_) => return sdk_invalid_request("pty size must be an object"),
+    };
+    let env = if env_names.is_empty() {
+        faktor_pty::EnvSpec::default_baseline()
+    } else {
+        // The name allowlist rides the ONE env authority: values never
+        // cross, the secret deny-set applies inside `resolve()`.
+        faktor_pty::EnvSpec::Allowlisted(env_names)
+    };
+    let cfg = faktor_pty::PtyConfig {
+        command: command.clone(),
+        args: args.clone(),
+        cwd: cwd.clone(),
+        env,
+        rows,
+        cols,
+    };
+    let pty = match tokio::task::spawn_blocking(move || faktor_pty::Pty::spawn(&cfg)).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => return (StatusCode::BAD_REQUEST, Json(api_error_json(&e))).into_response(),
+        Err(_) => return wire_refused("pty spawn task failed"),
+    };
+    let id = state
+        .next_pty_id
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let pid = pty.pid();
+    let status = if pty.is_alive() { "running" } else { "exited" };
+    let effective_cwd = cwd.unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    });
+    state.ptys.lock().unwrap().insert(id, pty);
+    Json(serde_json::json!({
+        "id": id.to_string(),
+        "title": title,
+        "command": command,
+        "args": args,
+        "cwd": effective_cwd,
+        "status": status,
+        "pid": pid,
+    }))
+    .into_response()
+}
+
+/// `DELETE /pty/{ptyID}` — the SDK `pty.remove` route: terminate the real
+/// child process tree, drop the registry row and answer the SDK-declared
+/// boolean. An unknown (or already removed) id is the SDK-declared
+/// `404 PtyNotFoundError`; the kill is bounded by the PTY backend's own
+/// shutdown (SIGTERM → grace → SIGKILL → reader join on unix, job close on
+/// Windows).
+pub(crate) async fn sdk_pty_remove(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(pty_id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let id: u64 = match pty_id.parse() {
+        Ok(id) if id > 0 => id,
+        _ => return sdk_invalid_request("invalid pty id"),
+    };
+    state.terminal_owners.lock().unwrap().remove(&id);
+    match state.ptys.lock().unwrap().remove(&id) {
+        Some(mut pty) => {
+            pty.kill();
+            Json(true).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "_tag": "PtyNotFoundError",
+                "ptyID": id.to_string(),
+                "message": format!("pty {id} unknown"),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// `POST /pty/update` — write input and/or resize. Body: {pty_id,

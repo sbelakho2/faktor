@@ -358,6 +358,8 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
         .route("/pty/create", post(pty_create))
         .route("/pty/update", post(pty_update))
         .route("/pty/remove", post(pty_remove))
+        .route("/pty", post(sdk_pty_create))
+        .route("/pty/{ptyID}", delete(sdk_pty_remove))
         .route("/pty/{pty_id}/output", get(pty_output))
         .route("/global/dispose", post(dispose_all_sessions))
         .route("/instance/dispose", post(dispose_all_sessions))
@@ -1257,6 +1259,8 @@ mod tests {
             ("post", "/pty/create", serde_json::json!({})),
             ("post", "/pty/update", serde_json::json!({})),
             ("post", "/pty/remove", serde_json::json!({})),
+            ("post", "/pty", serde_json::json!({})),
+            ("delete", "/pty/1", serde_json::json!({})),
             ("post", "/global/dispose", serde_json::json!({})),
             ("post", "/instance/dispose", serde_json::json!({})),
             ("post", "/instance/reload", serde_json::json!({})),
@@ -2201,7 +2205,8 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(&file).unwrap(), b"edited by agent\n");
 
-        // POST revert: the file must be restored to the pre-edit state.
+        // POST revert: the file must be restored to the pre-edit state and
+        // the SDK Session8 projection must carry the durable revert marker.
         let resp = client
             .post(format!("{base}/session/{sid}/revert"))
             .basic_auth("kilo", Some(pw.as_str()))
@@ -2211,10 +2216,9 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], true);
-        let restored = body["restored"][0].clone();
-        assert_eq!(restored["path"], "notes.txt");
-        assert_eq!(restored["hash"], before.to_hex());
+        assert_eq!(body["id"], sid.to_string());
+        assert_eq!(body["revert"]["messageID"], "1");
+        assert_eq!(body["revert"]["workspace"], "restored");
         assert_eq!(std::fs::read(&file).unwrap(), b"original\n");
         let _ = handle.shutdown.send(());
     }
@@ -2328,6 +2332,8 @@ mod tests {
             .unwrap();
 
         // revert → pre-edit state; unrevert → the after state comes back.
+        // The unrevert target is the DURABLE restored marker, not the body:
+        // the SDK sends no body at all.
         let resp = client
             .post(format!("{base}/session/{sid}/revert"))
             .basic_auth("kilo", Some(pw.as_str()))
@@ -2346,8 +2352,11 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], true);
-        assert_eq!(body["restored"][0]["hash"], after.to_hex());
+        assert_eq!(body["id"], sid.to_string());
+        assert!(
+            body.get("revert").is_none(),
+            "a redone revert state must not project a stale marker: {body}"
+        );
         assert_eq!(std::fs::read(&file).unwrap(), b"edited by agent\n");
         let _ = handle.shutdown.send(());
     }
@@ -4878,6 +4887,81 @@ mod tests {
                 "ConPTY is a real implementation: creation must succeed"
             );
         }
+        let _ = handle.shutdown.send(());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sdk_pty_create_and_remove_through_the_wire() {
+        // The SDK's own create/remove route pair over the REAL PTY registry:
+        // POST /pty answers the SDK `Pty` object from the values the spawn
+        // actually used (no fabricated exitCode/sessionID), and DELETE
+        // /pty/{ptyID} kills the real child tree and answers the declared
+        // boolean; unknown/malformed ids are the SDK-declared errors.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let pw = deps.server_password.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let auth = |r: reqwest::RequestBuilder| r.header("x-faktor-server-password", pw.as_str());
+        let resp = auth(client.post(format!("{base}/pty")).json(&serde_json::json!({
+            "command": "sh",
+            "args": [],
+            "cwd": ".",
+            "title": "sdk-pty",
+            "size": {"rows": 24, "cols": 80},
+        })))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200, "SDK pty create must succeed on unix");
+        let pty: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(pty["command"], "sh");
+        assert_eq!(pty["args"], serde_json::json!([]));
+        assert_eq!(pty["cwd"], ".");
+        assert_eq!(pty["title"], "sdk-pty");
+        assert_eq!(pty["status"], "running");
+        assert!(pty["pid"].as_u64().unwrap() > 0);
+        assert!(
+            pty.get("exitCode").is_none(),
+            "the PTY backend exposes no exit code: it must be omitted, never fabricated"
+        );
+        assert!(
+            pty.get("sessionID").is_none(),
+            "the SDK create body carries no session id: ownership must not be invented"
+        );
+        let pty_id = pty["id"].as_str().unwrap().to_string();
+        assert!(pty_id.parse::<u64>().unwrap() > 0);
+        // Note: the sandboxed file execution of this test suite may keep `sh`
+        // alive; remove is the deterministic teardown and answers the SDK's
+        // bare boolean.
+        let resp = auth(client.delete(format!("{base}/pty/{pty_id}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!(true)
+        );
+        // Already removed → the SDK-declared 404 PtyNotFoundError.
+        let resp = auth(client.delete(format!("{base}/pty/{pty_id}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["_tag"], "PtyNotFoundError");
+        // Malformed id → 400 InvalidRequestError (SDK create/remove declare
+        // no 422; a non-numeric path is a request error).
+        let resp = auth(client.delete(format!("{base}/pty/not-a-number")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["_tag"], "InvalidRequestError");
         let _ = handle.shutdown.send(());
     }
     #[tokio::test]

@@ -46,7 +46,11 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use faktor_agent::{AgentDeps, AgentRuntime, NoEvidence, ToolRegistry};
+    use faktor_agent::{
+        AgentDeps, AgentRuntime, NoEvidence, PermissionRequester, RecoveryHint, Tool, ToolOutcome,
+        ToolRegistry,
+    };
+    use faktor_core::capability::PermissionDecision;
     use faktor_core::model::ModelCapabilities;
     use faktor_core::time::SystemClock;
     use faktor_provider::{FakeProvider, ProviderRegistry, ScriptedResponse};
@@ -117,6 +121,220 @@ mod tests {
         let handle = serve(deps, 0).await.unwrap();
         let base = format!("http://{}", handle.addr);
         (handle, base)
+    }
+
+    // ------------------------------------------------ replay harness (snapshots)
+
+    /// Deterministic scratch path of the checkpoint probe (relative to the
+    /// wire-created session's workspace root "." — inside the crate's
+    /// gitignored `target/`), namespaced by PROCESS so two concurrent test
+    /// processes in the same checkout can never race the same file. The
+    /// golden normalizes this path to `@string` via the driver's
+    /// `probePath` var (env `FAKTOR_COMPAT_PROBE_PATH`). Removed before
+    /// every replay so the probe's checkpoint is always a REAL
+    /// missing→existing file transition.
+    pub(crate) fn probe_path() -> String {
+        format!("target/compat-replay-{}/probe.txt", std::process::id())
+    }
+    /// The probe's deterministic content (the recorded diff goldens derive
+    /// their additions/deletions counts from it).
+    pub(crate) const PROBE_CONTENT: &str = "compat probe\n";
+
+    /// Permission requester of the replay harness ONLY: the checkpoint probe
+    /// is a test fixture, so its permission hop is deterministically
+    /// Allowed (mirrors `tests/integration`'s `AlwaysAllow`). Every other
+    /// surface keeps the real HTTP requester (`ServerDeps.permissions`), so
+    /// the permission endpoints still answer real pending views.
+    #[derive(Clone)]
+    struct AllowAllRequester;
+
+    impl PermissionRequester for AllowAllRequester {
+        fn request(
+            &self,
+            _session: faktor_core::id::SessionId,
+            _permission: &faktor_session::ops::PermissionRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = faktor_core::Result<PermissionDecision>> + Send>,
+        > {
+            Box::pin(async { Ok(PermissionDecision::Allow) })
+        }
+    }
+
+    /// A checkpoint-recording write tool (the harness fixture that makes the
+    /// real revert/unrevert/diff state exist): it writes the file through
+    /// the workspace handle and records the before/after pair in the ONE
+    /// CAS-backed checkpoint store — exactly the shape the daemon's
+    /// `write_file` records (missing file -> an existence-bearing Added row
+    /// via `record_change`). No fabricated state: the CAS blobs are the
+    /// bytes actually written.
+    fn checkpoint_probe_tool() -> Tool {
+        Tool {
+            name: "checkpoint_probe".into(),
+            description: "compat replay checkpoint probe".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            }),
+            resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+            capability: None,
+            recovery_hint: RecoveryHint::WorkspaceWrite,
+            path_args: vec!["path".into()],
+            execute: Arc::new(|ctx, args| {
+                Box::pin(async move {
+                    let Some(ws) = &ctx.workspace else {
+                        return Err(faktor_core::error::Error::internal("no workspace wired"));
+                    };
+                    let Some(snaps) = &ctx.snapshots else {
+                        return Err(faktor_core::error::Error::internal(
+                            "no checkpoint store wired",
+                        ));
+                    };
+                    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    let content = args
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or_default();
+                    let rel = std::path::Path::new(path);
+                    if let Some(parent) = rel.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            if let Ok(resolved) = ws.resolve(parent) {
+                                let _ = std::fs::create_dir_all(&resolved);
+                            }
+                        }
+                    }
+                    let current = ws.read(rel, 16 * 1024 * 1024).ok();
+                    match current {
+                        Some(data) => {
+                            if data.bytes == content.as_bytes() {
+                                return Ok(ToolOutcome {
+                                    text: format!("{path} unchanged"),
+                                    exit_code: Some(0),
+                                    ..Default::default()
+                                });
+                            }
+                            let before = snaps.before_write(ctx.session_id, path, &data.bytes)?;
+                            let after = ws.write_atomic(rel, content.as_bytes()).map_err(|e| {
+                                faktor_core::error::Error::internal(format!("write {path}: {e}"))
+                            })?;
+                            snaps.after_write(
+                                ctx.session_id,
+                                path,
+                                before,
+                                after,
+                                0,
+                                content.as_bytes(),
+                            )?;
+                        }
+                        None => {
+                            let after = ws.write_atomic(rel, content.as_bytes()).map_err(|e| {
+                                faktor_core::error::Error::internal(format!("write {path}: {e}"))
+                            })?;
+                            if let Err(e) = snaps.record_change(
+                                ctx.session_id,
+                                path,
+                                faktor_snapshot::FileState::missing(),
+                                None,
+                                faktor_snapshot::FileState::existing(after),
+                                Some(content.as_bytes()),
+                            ) {
+                                return Err(faktor_core::error::Error::internal(format!(
+                                    "checkpoint {path}: {e}"
+                                )));
+                            }
+                        }
+                    }
+                    Ok(ToolOutcome {
+                        text: "checkpoint probe recorded".to_string(),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    })
+                })
+            }),
+        }
+    }
+
+    /// The replay's daemon deps: the SAME store/agent/server graph as
+    /// [`server_deps`], plus the REAL CAS-backed checkpoint store and the
+    /// checkpoint probe tool, so the replay exercises the wire revert /
+    /// unrevert / diff routes against durable state instead of refusing
+    /// with "snapshots unavailable". The probe scratch file is removed
+    /// before the run (test scratch, never durable state). Returns the
+    /// per-process probe path too, so the caller can hand it to the driver
+    /// as `FAKTOR_COMPAT_PROBE_PATH` (golden-normalized to `@string`).
+    pub(crate) fn replay_server_deps(root: &Path) -> (ServerDeps, ServerPassword, String) {
+        let probe_path = probe_path();
+        let scratch = std::path::Path::new(&probe_path);
+        if let Some(parent) = scratch.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(&probe_path);
+        let mut registry = ProviderRegistry::new();
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    ..Default::default()
+                },
+                vec![
+                    ScriptedResponse::ToolCall {
+                        id: "compat-probe-1".into(),
+                        name: "checkpoint_probe".into(),
+                        input: json!({"path": probe_path, "content": PROBE_CONTENT}),
+                    },
+                    ScriptedResponse::Text("pong".into()),
+                    ScriptedResponse::End,
+                ],
+            )))
+            .unwrap();
+        let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
+        let fs = faktor_fs::WorkspaceFileService::new();
+        let snapshots = Arc::new(faktor_snapshot::CheckpointStore::new(
+            session.cas(),
+            session.store(),
+        ));
+        let mut tools = ToolRegistry::new();
+        tools.register(checkpoint_probe_tool());
+        let agent = AgentRuntime::new(AgentDeps {
+            session: session.clone(),
+            providers: Arc::new(registry),
+            chunk_sink: None,
+            permission_requester: Arc::new(AllowAllRequester),
+            evidence: Arc::new(NoEvidence),
+            tools: Arc::new(tools),
+            cas: Some(session.cas()),
+            workspaces: fs.clone(),
+            edit: None,
+            snapshots: Some(snapshots.clone()),
+            sandbox: None,
+            supervisor: None,
+            verification: faktor_agent::VerificationService::disabled(),
+            model: "m".into(),
+            compaction_model: None,
+            compact_at_usage: 0.65,
+            instructions: "You are a test server agent.".into(),
+            hooks: None,
+            instructions_resolver: faktor_instructions::no_roots_resolver(),
+            routing: faktor_agent::FixedRoutingPolicy::passthrough(),
+            budgets: Arc::new(faktor_session::NoopBudget),
+            clock: Arc::new(SystemClock),
+            tool_call_mode: faktor_agent::ToolCallMode::Native,
+            tool_deadline_ms: 2000,
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
+            semantic: faktor_agent::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
+        })
+        .unwrap();
+        let permissions = ChannelPermissionRequester::new(Duration::from_secs(30));
+        let mut deps = ServerDeps::new(session, agent, permissions).with_snapshots(fs, snapshots);
+        let password = ServerPassword::generate();
+        deps.server_password = password.clone();
+        (deps, password, probe_path)
     }
 
     /// One HTTP probe. POSTs carry an empty JSON object (enough to pass
@@ -245,6 +463,8 @@ mod tests {
         ("POST", "/pty/create", "compat"),
         ("POST", "/pty/update", "compat"),
         ("POST", "/pty/remove", "compat"),
+        ("POST", "/pty", "compat"),
+        ("DELETE", "/pty/{ptyID}", "compat"),
         ("GET", "/pty/{pty_id}/output", "compat"),
         ("POST", "/global/dispose", "compat"),
         ("POST", "/instance/dispose", "compat"),

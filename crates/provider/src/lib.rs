@@ -496,17 +496,45 @@ pub const MAX_EMBEDDING_TOTAL_INPUT_BYTES: usize = 256 * 1024;
 pub const MAX_EMBEDDING_DIMENSIONS: usize = 8_192;
 
 /// One provider-agnostic embedding request: the embedding MODEL and the
-/// ordered inputs to embed. Construction validates every bound (empty
-/// inputs, empty/oversized members, oversized totals and an empty model are
-/// typed refusals BEFORE any provider call) — a hostile caller can never
-/// hand a provider an unbounded batch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// ordered inputs to embed, plus the OPTIONAL operation [`RequestMeta`] that
+/// lineage (operation id, session id, deadline) flows through — exactly like
+/// a chat request. Construction validates every bound (empty inputs,
+/// empty/oversized members, oversized totals and an empty model are typed
+/// refusals BEFORE any provider call) — a hostile caller can never hand a
+/// provider an unbounded batch. `meta` is caller context, not part of the
+/// request's identity: equality compares model + inputs only (so retry
+/// scripts written before deadlines existed keep matching).
+#[derive(Debug, Clone)]
 pub struct EmbeddingRequest {
     pub model: String,
     pub inputs: Vec<String>,
+    /// Operation lineage (deadline in ms, op/session ids) when the caller
+    /// has one. `None` = legacy caller: adapters fall back to their own
+    /// transport bounds.
+    pub meta: Option<RequestMeta>,
 }
 
+impl PartialEq for EmbeddingRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.model == other.model && self.inputs == other.inputs
+    }
+}
+
+impl Eq for EmbeddingRequest {}
+
 impl EmbeddingRequest {
+    /// The operation deadline in ms remaining when this request was built;
+    /// `0` = no operation-level bound (adapter defaults apply).
+    pub fn deadline_ms(&self) -> u64 {
+        self.meta.as_ref().map(|m| m.deadline_ms).unwrap_or(0)
+    }
+
+    /// Attach operation lineage (deadline/op/session ids) additively.
+    pub fn with_meta(mut self, meta: RequestMeta) -> Self {
+        self.meta = Some(meta);
+        self
+    }
+
     pub fn new(model: impl Into<String>, inputs: Vec<String>) -> Result<Self, faktor_core::Error> {
         let model = model.into();
         if model.is_empty() {
@@ -551,7 +579,11 @@ impl EmbeddingRequest {
                 ),
             ));
         }
-        Ok(Self { model, inputs })
+        Ok(Self {
+            model,
+            inputs,
+            meta: None,
+        })
     }
 }
 
@@ -2351,7 +2383,9 @@ impl Provider for FakeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faktor_core::cancellation::CancellationToken;
     use faktor_core::error::ErrorKind;
+    use faktor_core::id::{OpId, SessionId};
 
     fn req() -> GenericAgentRequest {
         GenericAgentRequest {
@@ -2715,6 +2749,24 @@ mod tests {
         assert!(EmbeddingRequest::new("m", vec![big; MAX_EMBEDDING_INPUTS]).is_err());
         let ok = EmbeddingRequest::new("embed-1", vec!["alpha".into(), "beta".into()]).unwrap();
         assert_eq!(ok.inputs.len(), 2);
+        // Lineage is additive: a request without meta reports no deadline
+        // and equality ignores meta (retry scripts keep matching).
+        assert_eq!(ok.deadline_ms(), 0);
+        assert!(ok.meta.is_none());
+        let meta = RequestMeta {
+            operation_id: OpId::new(7),
+            session_id: SessionId::new(3),
+            provider: "p".into(),
+            attempt: 0,
+            deadline_ms: 1234,
+            cancellation: CancellationToken::new(),
+        };
+        let with_meta = EmbeddingRequest::new("embed-1", vec!["alpha".into(), "beta".into()])
+            .unwrap()
+            .with_meta(meta);
+        assert_eq!(with_meta.deadline_ms(), 1234);
+        assert_eq!(with_meta.meta.as_ref().unwrap().operation_id, OpId::new(7));
+        assert_eq!(with_meta, ok, "meta is lineage, never request identity");
 
         assert!(EmbeddingResponse::new(vec![]).is_err());
         assert!(EmbeddingResponse::new(vec![vec![]]).is_err());

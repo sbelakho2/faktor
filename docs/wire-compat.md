@@ -1,22 +1,24 @@
 # Faktor v7.5.6 wire compatibility manifest
 
-**Measured status (unmodified-client round): transport-exact, 28/36
-response surfaces exact, 8 documented divergences.** The pinned upstream
+**Measured status (unmodified-client round): transport-exact, 33/37
+response surfaces exact, 4 documented divergences.** The pinned upstream
 client — `@kilocode/sdk@7.5.6` from `Kilo-Org/kilocode@fa02955b`, vendored
 verbatim in `compat/kilo-v756/upstream-sdk/` — is replayed against this
 daemon by `cargo test -p faktor-tests-compat --lib
-unmodified_upstream_client`. The corpus has **36 recorded steps**
+unmodified_upstream_client`. The corpus has **37 recorded steps**
 (`compat/kilo-v756/sdk-traces/`): request bytes (method, path, query
 encoding, body, Basic auth header, content-type) match the recorded client
-bytes for **all 36**; **28 of 36** response surfaces match structurally
+bytes for **all 37**; **33 of 37** response surfaces match structurally
 (empty `session.messages` page, `session.create` ×3, `session.get`,
 `session.status`, `session.prompt`, `session.messages.newest/before`,
-`session.fork`, `session.diff.missing-message`, `global.health`,
+`session.fork`, `session.diff.content`, `session.diff.missing-message`,
+`session.revert`, `session.unrevert`, `global.health`,
 `session.list`, `session.update`, `session.summarize`, `session.abort`,
 `session.deleteMessage`, `session.delete`, `session.delete.clean`,
-`config.get`, `config.warnings`, `config.overlay`, `permission.list`,
+`config.get`, `config.warnings`, `config.overlay`, `pty.create`,
+`pty.remove`, `permission.list`,
 `question.list`, `network.list`, `global.dispose`, `instance.dispose`,
-`instance.reload`); **8 are locked
+`instance.reload`); **4 are locked
 divergence fixtures** (see "What the unmodified client still cannot drive").
 Every run writes
 `target/certification/kilo-compat.json` (`faktor-kilo-compat/v1`: commit,
@@ -69,9 +71,11 @@ store the sequence equals the row id).
      "wait"`, `text` parts with `synthetic`/`time`, `file` parts by
      `filename`/`url`, `agent`/`subtask` inputs) while still accepting the
      scaffold body; unknown TOP-LEVEL fields stay 422.
-  2. `POST /session/{sessionID}/unrevert` accepts the SDK's body-less form
-     and refuses honestly 409 (no durable revert target) instead of failing
-     extraction 415.
+  2. `POST /session/{sessionID}/unrevert` honours the SDK's body-less form:
+     the target IS the durable revert state (the newest checkpoint carrying
+     the `restored_ms` marker written by rollback, cleared by redo), and
+     the 200 answer is the SDK `Session9` rich session projection with no
+     `revert` object (the revert state is gone — never a stale marker).
   3. `GET /session/{sessionID}/diff` accepts the SDK's `messageID=` and
      `full=true|false` spellings (the scaffold `message=`/`full=1` stay
      accepted); an unknown/malformed `messageID` is now the SDK-declared
@@ -149,53 +153,80 @@ store the sequence equals the row id).
  11. **`global.health`** carries the SDK's `{healthy: true, version}`
      ADDITIVELY next to the frozen `{ok, protocol}` aliases the legacy
      fixtures/consumers read.
- 12. **SDK diff error class**: `GET /session/{sessionID}/diff` with an
-     unknown or malformed `messageID` answers the SDK-declared `400
+ 12. **SDK diff error class + content**: `GET /session/{sessionID}/diff`
+     with an unknown or malformed `messageID` answers the SDK-declared `400
      BadRequestError` (`SessionDiffErrors` declares 400 and no other
-     class), so the error branch is an exact corpus pass
-     (`session.diff.missing-message`); the 200 content projection remains
-     locked (see below).
+     class); with `full=true` a recorded checkpoint projects the real
+     unified diff AND the SDK-required `additions`/`deletions` counts,
+     counted from that same diff (the frozen `{path,status,diff?}` keys stay
+     additively; the counts ride only the `?full` projection — without it
+     no CAS reads happen and the frozen path+status-only contract stays
+     byte-identical). Both branches are exact corpus passes.
+ 13. **Revert/unrevert**: `POST /session/{sessionID}/revert` rolls the
+     recorded checkpoint back through the CAS-verified rollback path and
+     answers the SDK `Session8` rich session projection plus the durable
+     revert marker `revert: {messageID (the request's own target, echoed
+     byte-identically), workspace: "restored"}`; the rollback stamps
+     `checkpoint.restored_ms`, which is the durable state unrevert reads.
+     The conflict refusal (an independently edited file) keeps the frozen
+     honest `409 {ok:false,message,conflict:{path}}` shape rather than
+     claiming the SDK's `SessionBusyError` with a false "busy" reason.
+ 14. **SDK PTY create/remove**: `POST /pty` runs over the daemon's REAL PTY
+     registry (`AppState.ptys`, the same `faktor-pty` authority+registry the
+     native session-owned terminal surface drives) and answers the SDK `Pty`
+     object from the values the spawn actually used (real `id`/`pid`,
+     requested `command`/`args`/`cwd`/`title` echoed, `status` from the live
+     child state); `exitCode` is omitted because the PTY backend exposes no
+     exit-code authority, `sessionID` because the SDK create body carries no
+     session id (no ownership row is minted — the native session-scoped
+     route mints those). `DELETE /pty/{ptyID}` terminates the real child
+     tree through the backend's bounded shutdown and answers the declared
+     boolean (unknown id → SDK `404 PtyNotFoundError`). `env` VALUES never
+     cross the daemon's ONE env authority: the map's NAMES become the spawn
+     allowlist (documented, tested).
+ 15. **Replay checkpoint corpus**: the replay harness wires the REAL
+     CAS-backed checkpoint store and a checkpoint-recording probe tool, so
+     the revert/unrevert/diff steps run against durable state rather than
+     refusing with "snapshots unavailable". The probe writes a per-process
+     gitignored scratch file (`target/compat-replay-<pid>/probe.txt`,
+     removed before every run) through the workspace handle and records the
+     real missing→existing transition — no fabricated state; the CAS blobs
+     are the bytes actually written. The scratch path is handed to the
+     driver as `probePath` and golden-normalized to `@string`, so
+     concurrent test processes in one checkout never share or race it.
 
 ### What the unmodified client still cannot drive (honest)
 
-- **Auth gate + provider OAuth.** The unauthenticated `auth.missing` probe
-  asserts the daemon's auth gate (401
+- **Auth gate + provider OAuth (locked by design).** The unauthenticated
+  `auth.missing` probe asserts the daemon's auth gate (401
   `{error:{code,message,retryable}}` before any handler effect); the
   vendored types declare no 401 for `global.health`, so there is no
   SDK-declared shape it could match and the gate is deliberate. The SDK's
   `auth.set` is provider OAuth at `PUT /auth/{providerID}`; the daemon has
   no provider-credential store, so the route is honestly 404 — an exact
   pass would require OAuth persistence outside the allowed compat surface.
-- **Revert/unrevert need a durable projection.** The replay harness wires
-  no snapshot/checkpoint store and the scripted provider performs no file
-  edits, so `session.revert`/`unrevert` have no recorded before-state to
-  roll back/redo and refuse 409 `{ok:false,message}`. The SDK declares rich
-  `Session8/9` on success (and 409 `SessionBusyError` only for a genuinely
-  busy session, which this is not). The body-less `unrevert` form the SDK
-  sends IS accepted.
-- **Non-empty diff content.** `session.diff` with no checkpoint rows
-  answers the declared bare `Array<SnapshotFileDiff>` trivially (`[]`), but
-  a NON-EMPTY entry still carries the frozen `{path,status,diff?}` shape
-  where the SDK requires `file`/`patch` and the counts
-  `additions`/`deletions`, which only real checkpoint content could
-  exercise — the empty projection stays locked until a checkpoint corpus
-  exists. (The unknown-`messageID` refusal IS the SDK-declared `400
-  BadRequestError` and passes; it is the error branch, not the content
-  projection.)
-- **`provider.list` metadata.** The SDK's `Provider.models[].Model`
-  requires `api{id,url,npm}`, per-token cost, limit, status and
-  release_date. The daemon's catalog exposes real capabilities and a
-  pricing STATE (`Known|Unknown`) precisely so unknown prices are never
-  faked as `0`, and it knows no npm package/release date; emitting models
-  with fabricated metadata (or omitting the real catalog) would be worse
-  than the honest 404. `GET /provider` stays unregistered.
-- **PTY lifecycle.** The SDK posts `POST /pty` and expects the `Pty`
-  object; the daemon's real PTY ops live at `/pty/create`. The replay's
-  command is POSIX `sh` while the backend is platform-specific (ConPTY on
-  Windows) and fails honestly there, so a 200 golden could not be an exact
-  pass on every CI platform; the SDK's interactive connect route is also
-  unregistered. The SDK path stays 404 rather than half-implementing the
-  lifecycle.
+- **`provider.list` metadata (re-audited, still locked).** The SDK's
+  `Provider.models[].Model` requires `api{id,url,npm}`, per-token cost,
+  limit, lifecycle `status` and `release_date`. The daemon catalog exposes
+  real capabilities and a pricing STATE
+  (`Known|ConservativeCeiling|Stale|LocalZero|Unknown`) but has no source
+  for `api.url`, `api.npm`, `release_date` or `status` (it cannot tell
+  alpha/beta/active apart), and the SDK type makes
+  `cost.input/output/cache` numeric REQUIRED — there is no null/optional
+  representation, and `PricingState::Unknown` rows must never be flattened
+  to `0`. Emitting partial Model objects would violate the declared type;
+  the honest 404 stays. Exact missing primitives: per-model API package id,
+  base URL and npm package; a model release date; a lifecycle status; and a
+  numeric cost representation for Unknown-pricing rows.
+- **`global.event` SSE multiplex (re-audited, still locked).** The
+  transport is exact (GET `/global/event`, auth, `200
+  text/event-stream`), but the daemon's `GlobalEvent` envelope is the
+  frozen Faktor journal projection (`type` names like `session_created` /
+  `session_next_text_delta`, payload fields like `session_id`) while the
+  SDK declares a different union (`session.created`, `properties`
+  objects, string `directory`/`project`/`workspace`). Exact missing
+  primitives: an SDK-union frame projector over the journal, plus a
+  replayable SSE frame corpus (the replay compares no frame bodies today).
 - **Streaming.** The SSE request (`GET /global/event`) is transport-locked
   and opens `200 text/event-stream`, but the replay does not golden-compare
   SSE frame bodies (an idle harness emits no event), and the daemon's
@@ -317,15 +348,24 @@ newest first. Status is the recorded before→after transition (`added` |
 ```
 
 With `?full=1` (or the SDK's `?full=true`) each entry also carries the
-unified diff text (`diff`), resolved through the CAS (pre-after-blob rows
-are refused honestly with 409, exactly like the snapshot `diff_latest`):
+unified diff text (`diff`) plus the SDK-required `additions`/`deletions`
+counts, all resolved through the CAS and counted from the same diff
+(pre-after-blob rows are refused honestly with 409, exactly like the
+snapshot `diff_latest`):
 
 ```json
 [
   { "path": "f.txt", "status": "modified",
-    "diff": " line1\n line2\n-old\n+new\n line6" }
+    "diff": " line1\n line2\n-old\n+new\n line6",
+    "additions": 1, "deletions": 1 }
 ]
 ```
+
+Without `?full` no CAS reads happen and the frozen `{path,status}` shape
+stays byte-identical. This is an **exact client pass**: `path`/`diff` ride
+additively while the declared `SnapshotFileDiff` fields (`additions`,
+`deletions`, `status`, optional `file`/`patch`) are satisfied (the trace
+freezes the exact key set).
 
 Filters: `?message=<seq>` / the SDK's `?messageID=<seq>` limits the
 projection to ONE checkpoint — the newest checkpoint recorded at-or-before
@@ -333,11 +373,7 @@ that message's `created_ms`. An unknown or malformed message is the
 SDK-declared `400 BadRequestError` (`{name:"BadRequest",data:{message,kind:"Query"}}`)
 — `SessionDiffErrors` declares 400 and no other class. `?file=<rel
 path>` keeps only the entries whose recorded path equals the relative path
-(exact match; no filesystem access). No checkpoints → `[]`. **Divergence:**
-the real SDK entry type is `SnapshotFileDiff`
-(`file`/`patch`/`additions`/`deletions`); the empty projection passes
-trivially but a non-empty entry — which requires real checkpoint rows to
-exercise — still carries the frozen `{path,status,diff?}` shape.
+(exact match; no filesystem access). No checkpoints → `[]`.
 
 ## Operation manifest
 
@@ -359,8 +395,8 @@ rows here do not imply v7.5.6-client shape compatibility.
 | session.message (page) | `/session/{sessionID}/message` | GET | rich entry `{info,parts}` (above; no `time`, no part `sessionID`) | implemented, tested; **exact client pass** for the fork-stable projection |
 | session.message (send) | `/session/{sessionID}/message` | POST | rich `{info: AssistantMessage, parts: Part[]}` (above) | implemented, tested (200 done, 202 queued, 502 no-reply); **exact client pass** |
 | session.abort | `/session/{sessionID}/abort` | POST | SDK-declared bare `boolean`: `true` iff at least one operation was actually cancelled (a fully idle session answers `false`) | implemented, tested; **exact client pass** |
-| session.diff | `/session/{sessionID}/diff` | GET | `{path,status,diff?}[]` (above); unknown/malformed `messageID` → SDK-declared 400 `BadRequestError` | implemented, tested; accepts SDK `messageID`/`full`; **exact client pass** for the unknown-`messageID` error branch; the 200 content projection stays locked (empty is trivial, non-empty entries carry the frozen shape where `SnapshotFileDiff` requires `file`/`patch`/counts) |
-| session.revert / unrevert | `/session/{sessionID}/revert`, `/unrevert` | POST | `{ok,restored?,conflict?}` / `{ok:false,message}` | implemented, tested; unrevert accepts the SDK's body-less form; SDK expects rich Session projections; locked divergence without a snapshot backend |
+| session.diff | `/session/{sessionID}/diff` | GET | `{path,status,diff?,additions?,deletions?}[]` (above); unknown/malformed `messageID` → SDK-declared 400 `BadRequestError` | implemented, tested; accepts SDK `messageID`/`full`; **exact client pass** for both the unknown-`messageID` error branch and the `?full` content projection (real checkpoint, real counts) |
+| session.revert / unrevert | `/session/{sessionID}/revert`, `/unrevert` | POST | SDK `Session8`/`Session9` rich session; revert carries `revert: {messageID, workspace:"restored"}`; unrevert reads the durable `restored_ms` marker and answers with no `revert` object | implemented, tested; **exact client pass** against a real checkpoint |
 | session.state | `/session/{sessionID}/state` | GET | `SessionState` | implemented, tested; not an SDK method |
 | permission.list | `/permission/list?session_id=`, `/permission` | GET | legacy: `{permissions:[{id,session_id,capability,detail}]}`; SDK alias: bare `PermissionRequest[]` (capability → permission, target → patterns, payload → metadata, `always:[]`) | implemented, tested (real pending requests); **exact client pass** for the SDK alias (empty and non-empty projections tested) |
 | permission.reply | `/permission/reply`, `/api/perm/{id}/resolve` | POST | `{ok:true}` | implemented, tested; SDK calls `/permission/{requestID}/reply` (not registered) |
@@ -376,7 +412,7 @@ rows here do not imply v7.5.6-client shape compatibility.
 | config.overlayUpdate | `/config/overlayUpdate` | POST | `{ok:true}` (bounded shallow merge) | implemented, tested; the SDK PATCHes `/config/overlay` (not registered) |
 | config.warnings | `/config/warnings` | GET | SDK-declared bare `Array<{path,message,detail?}>`; `path` is the documented literal `runtime` source label (no file layer exists) | implemented, tested; **exact client pass** |
 | config.set | `/config/set` | POST | `{ok:true}` (legacy full replace, kept) | implemented, tested |
-| pty.create/update/remove | `/pty/create`, `/pty/update`, `/pty/remove` | POST | real spawn `{ok:true,pty_id,pid}` through `faktor-pty` (Unix PTY / Windows ConPTY), plus `{ok:true}` update/remove; oversized/hostile input refused | implemented, tested; the SDK calls POST `/pty` (404) and is divergence-locked (platform-dependent `sh` in the replay + its interactive connect route is unregistered) |
+| pty.create/remove | `/pty/create`, `/pty`, `/pty/remove`, `/pty/{ptyID}` | POST, DELETE | legacy `/pty/create` spawn `{ok:true,pty_id,pid}`; SDK `/pty` answers the `Pty` object (real id/pid/status, requested command/args/cwd/title echoed, `exitCode`/`sessionID` omitted — no source); SDK `DELETE /pty/{ptyID}` kills the real child tree and answers the declared boolean (unknown id → `404 PtyNotFoundError`) | implemented, tested; **exact client pass** for SDK create+remove; legacy update/remove keep `{ok:true}` |
 | global.dispose | `/global/dispose` | POST | SDK-declared bare `boolean` `true` after every live session is durably ended (idempotent) | implemented, tested; **exact client pass** |
 | instance.dispose | `/instance/dispose` | POST | same handler, bare `boolean` `true` | implemented, tested; **exact client pass** |
 | instance.reload | `/instance/reload` | POST | bare `boolean` `true` after re-running the idempotent `recover()` sweep | implemented, tested; **exact client pass** |
@@ -385,37 +421,50 @@ rows here do not imply v7.5.6-client shape compatibility.
 
 ## Residual gaps (need backend subsystems outside this round's allowed files)
 
-1. **Revert/unrevert projection** — `session.revert`/`unrevert` need a
-   durable revert state + snapshot target (this slice has neither in the
-   replay harness), so they stay honest 409 refusals; page `time`/part
+1. **Revert projection completeness** — revert/unrevert now run against the
+   real checkpoint store and answer the SDK `Session8`/`Session9` shapes
+   (above). Residual: the durable marker records WHICH checkpoint is
+   reverted, not the client's target message id, so read projections
+   (`session.get`/`list`) cannot name `revert.messageID` and omit `revert`
+   (optional in the SDK type) rather than fabricate one; page `time`/part
    `sessionID` cannot ride the fork-equal page contract; per-message
    cost/tokens are not modeled by the frozen surface.
-2. **Missing client routes** — `GET /provider`, `POST /pty` (plus
-   `/pty/{ptyID}`, `/pty/{ptyID}/connect`), `PUT/DELETE
+2. **Missing client routes** — `GET /provider`, `GET /pty` (list),
+   `GET/PATCH /pty/{ptyID}` (terminal metadata the registry deliberately
+   does not keep), `/pty/{ptyID}/connect-token`, `PUT/DELETE
    /auth/{providerID}`, `PATCH /config`, `PATCH /config/overlay`, and the
    project/workspace lifecycle routes are not registered. `GET /config`,
    `GET /config/overlay`, `GET /permission`, `GET /question`, `GET
-   /network` and `PATCH /session/{sessionID}` now ARE.
+   /network`, `PATCH /session/{sessionID}` and `POST/DELETE /pty` now ARE.
 3. **SSE event union** — the daemon's journal/global frames are not the
    SDK `GlobalEvent` union; an idle replay emits no frame, so the gap is
-   note-locked (no body golden).
-4. **Diff content entries** — the harness has no checkpoint rows; the
-   unknown-`messageID` error branch is exact, but the `SnapshotFileDiff`
-   field naming (`file`/`patch`/`additions`/`deletions`) is untested (and
-   the daemon's non-empty projection is still the frozen `{path,status,
-   diff?}` shape) against a real non-empty projection.
-5. **Provider Model metadata** — the SDK `Model` requires
-   `api{id,url,npm}`/cost/limit/status/release_date the daemon cannot
-   source without fabrication (unknown pricing is never faked as 0).
-6. **PTY lifecycle** — the daemon's real PTY backend is platform-specific
-   (POSIX pty vs ConPTY) and the SDK's interactive connect is unregistered;
-   a cross-platform 200 golden is impossible for the POSIX-`sh` trace.
-7. **Node-gated replay** — the unmodified-client replay needs Node >= 22.15
+   note-locked (no body golden). An SDK-union projector plus a frame corpus
+   are the exact missing primitives.
+4. **Provider Model metadata** — the SDK `Model` requires
+   `api{id,url,npm}`/numeric cost/limit/status/release_date; the daemon
+   cannot source `api.url`/`api.npm`/`release_date`/lifecycle `status`, and
+   `PricingState::Unknown` rows have no honest numeric cost representation
+   in the required type (unknown pricing is never faked as 0).
+5. **PTY metadata routes** — the real PTY registry keeps live processes,
+   not command/args/cwd/title rows, so `GET /pty`, `GET /pty/{ptyID}` and
+   `PATCH /pty/{ptyID}` (the SDK's list/get/update shape) stay
+   unregistered; create/remove are exact passes. On Windows the POSIX-`sh`
+   trace command fails honestly at spawn (the backend is ConPTY); the
+   compat replay lane is Linux, and the golden is platform-normalized
+   (`pid` is an `@int` template; the rest of the shape is POSIX-stable).
+6. **Node-gated replay** — the unmodified-client replay needs Node >= 22.15
    (the upstream client is TypeScript). The required PR/trusted
    `kilo-compat` lane runs it with `FAKTOR_COMPAT_REQUIRE_NODE=1`, so a
    missing Node fails the lane AND records `status: failed` in the report;
    the offline manifest + corpus checks always run.
-8. **session.delete row removal** — delete durably ends the session
+7. **session.delete row removal** — delete durably ends the session
    (journaled `SessionEnded` + lifecycle Closed, queued prompts cancelled,
    registries closed) but retains the row: a store-level `remove_session`
    SQL does not exist in this slice.
+8. **Per-request `tools` map** — the SDK body's `tools` name→bool map is
+   accepted (the v2 input union) but NOT enforced: tool availability is the
+   daemon's session bundle + `CapabilitySet`, so the map is currently a
+   no-op. The replay's checkpoint probe is a harness fixture scripted
+   through the provider; it does not claim per-request enablement.
+   Enforcing the map needs a per-turn tool filter in the runtime, outside
+   the compat surface.

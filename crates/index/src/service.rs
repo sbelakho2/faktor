@@ -50,6 +50,10 @@ use faktor_fs::{FsEventKind, WorkspaceFileService, WorkspaceHandle};
 use faktor_store::Store;
 
 use crate::cold::ColdEvidenceProvider;
+use crate::embedding::{
+    apply_embeddings, EmbeddingIndex, EmbeddingModel, EmbeddingSource,
+    MAX_EMBEDDING_SCAN_TEXT_BYTES,
+};
 use crate::generation::{FingerprintEntry, GenerationFile};
 use crate::state::{
     PersistedIndexState, StateError, WorkspaceIndexState, JOURNAL_BUILDING, JOURNAL_CORRUPT,
@@ -246,6 +250,10 @@ struct Inner {
     fs: Arc<WorkspaceFileService>,
     cfg: Mutex<ServiceConfig>,
     live: Mutex<HashMap<WorkspaceId, LiveWs>>,
+    /// OPTIONAL build-time embedding source plus the operator-pinned model
+    /// identity. `None` = the build carries persisted vectors forward but
+    /// never calls out; search can still use them.
+    embedding: Mutex<Option<(Arc<dyn EmbeddingSource>, EmbeddingModel)>>,
     notify: tokio::sync::Notify,
     worker_started: AtomicBool,
 }
@@ -263,6 +271,10 @@ struct ScanOutcome {
     /// True when the filesystem changed while the content was read (the
     /// build publishes anyway; a follow-up rebuild is scheduled).
     churned: bool,
+    /// Per-path chunk texts collected for build-time embedding (only when a
+    /// source is configured), bounded by
+    /// [`MAX_EMBEDDING_SCAN_TEXT_BYTES`].
+    chunks: Vec<(String, Vec<String>)>,
 }
 
 /// Build/crash seam hook for adversarial tests, fired at named points of
@@ -328,6 +340,7 @@ impl IndexService {
                 fs,
                 cfg: Mutex::new(ServiceConfig::default()),
                 live: Mutex::new(HashMap::new()),
+                embedding: Mutex::new(None),
                 notify: tokio::sync::Notify::new(),
                 worker_started: AtomicBool::new(false),
             }),
@@ -341,6 +354,55 @@ impl IndexService {
 
     fn cfg_of(inner: &Inner) -> ServiceConfig {
         *inner.cfg.lock().expect("cfg poisoned")
+    }
+
+    /// Configure (or clear) the build-time embedding source and the
+    /// operator-pinned model identity. Idempotent and cheap; it takes effect
+    /// on the NEXT build (an in-flight build keeps the source it started
+    /// with). `None` keeps the durable vectors and never calls out.
+    ///
+    /// A configured source makes every build carry matching persisted
+    /// vectors forward (keyed by content hash + model + revision +
+    /// dimension), embedding only chunks that changed, are new, or belong to
+    /// a new model/revision — an unchanged corpus is never re-embedded.
+    pub fn set_embedding_source(
+        &self,
+        source: Option<Arc<dyn EmbeddingSource>>,
+        model: EmbeddingModel,
+    ) {
+        *self.inner.embedding.lock().expect("embedding poisoned") =
+            source.map(|source| (source, model));
+    }
+
+    /// The source + identity a build must use, snapshotted under the lock.
+    fn embedding_config(&self) -> Option<(Arc<dyn EmbeddingSource>, EmbeddingModel)> {
+        self.inner
+            .embedding
+            .lock()
+            .expect("embedding poisoned")
+            .clone()
+    }
+
+    /// The previously published embedding index for `workspace`: the
+    /// in-memory published generation when it is loaded, else the newest
+    /// generation file on disk (a Dirty-at-restart build resumes before the
+    /// Ready content is materialized). Hostile/missing files degrade to
+    /// `None` (a full re-embed, never a wrong reuse).
+    fn prior_embeddings(&self, workspace: WorkspaceId) -> Option<EmbeddingIndex> {
+        {
+            let live = self.inner.live.lock().expect("live poisoned");
+            if let Some(l) = live.get(&workspace) {
+                if let Some(content) = &l.content {
+                    if let Ok(index) = content.lock() {
+                        if let Some(embeddings) = index.embedding_index(workspace) {
+                            return Some(embeddings.clone().sanitize());
+                        }
+                    }
+                    return Some(EmbeddingIndex::default());
+                }
+            }
+        }
+        newest_generation_embeddings(&self.inner.data_root, workspace)
     }
 
     /// Start the single background reconciliation worker of this service
@@ -1102,13 +1164,55 @@ impl IndexService {
                 "no workspace root".into(),
             );
         };
-        let scan = match scan_workspace(workspace, &root) {
+        // Build-time embedding is configured per service (additive API); the
+        // source snapshot is read once so an in-flight build is stable.
+        let source_config = self.embedding_config();
+        let mut scan = match scan_workspace(workspace, &root, source_config.is_some()) {
             Ok(outcome) => outcome,
             Err(e) => {
                 eprintln!("[run_build] scan error: {e}");
                 return self.fail_build(workspace, target, &expected_json, e);
             }
         };
+        // Persisted vectors survive a generation swap regardless of whether
+        // a source is configured: with one, matching vectors are carried and
+        // only missing chunks embed; without one, the prior store rides
+        // along verbatim for search.
+        match source_config.as_ref() {
+            Some((source, model)) => {
+                let prior = self.prior_embeddings(workspace);
+                let stats = apply_embeddings(
+                    &mut scan.index,
+                    workspace,
+                    prior.as_ref(),
+                    model,
+                    &scan.chunks,
+                    Some(source.as_ref()),
+                );
+                if stats.degraded {
+                    tracing::warn!(
+                        workspace = ws_raw,
+                        generation = target,
+                        carried = stats.carried,
+                        "index embeddings degraded for this build (lexical/symbol retrieval is unaffected)"
+                    );
+                } else if stats.carried > 0 || stats.embedded > 0 {
+                    tracing::info!(
+                        workspace = ws_raw,
+                        generation = target,
+                        carried = stats.carried,
+                        embedded = stats.embedded,
+                        calls = stats.calls,
+                        "index embeddings settled"
+                    );
+                }
+            }
+            None => {
+                if let Some(prior) = self.prior_embeddings(workspace) {
+                    scan.index.replace_embeddings(workspace, prior);
+                }
+            }
+        }
         let envelope = GenerationFile::capture(ws_raw, target, &scan.index, scan.fingerprint);
         let bytes = envelope.to_bytes().map_err(|e| IndexError::BuildFailed {
             workspace: ws_raw,
@@ -1638,9 +1742,11 @@ fn log_sweep_summary(origin: &'static str, workspace: u64, summary: SweepSummary
 /// Reads at most `SCAN_MAX_FILES` files and `SCAN_MAX_BYTES` in total, so
 /// a hostile repo is PARTIALLY indexed — never an unbounded build. Mirrors
 /// the bounded evidence scan's budget so both evidence paths agree.
-fn scan_workspace(ws: WorkspaceId, root: &Path) -> Result<ScanOutcome, String> {
+fn scan_workspace(ws: WorkspaceId, root: &Path, want_chunks: bool) -> Result<ScanOutcome, String> {
     let before = fingerprint(root)?;
     let mut index = WorkspaceIndex::new();
+    let mut chunks: Vec<(String, Vec<String>)> = Vec::new();
+    let mut chunk_text_bytes = 0usize;
     let mut files_scanned = 0usize;
     let mut dirs_visited = 0usize;
     let mut bytes_indexed = 0usize;
@@ -1699,6 +1805,24 @@ fn scan_workspace(ws: WorkspaceId, root: &Path) -> Result<ScanOutcome, String> {
                     index
                         .index_file(ws, Path::new(&rel_str), &bytes, modified_ms)
                         .map_err(|e| format!("index {rel_str}: {e}"))?;
+                    if want_chunks {
+                        // Chunk texts for build-time embedding: bounded per
+                        // file (chunk caps) and in total, so a hostile repo
+                        // cannot inflate the build's memory.
+                        let texts: Vec<String> =
+                            crate::embedding::chunk_text(&String::from_utf8_lossy(&bytes))
+                                .into_iter()
+                                .map(str::to_string)
+                                .collect();
+                        let bytes_here: usize = texts.iter().map(|t| t.len()).sum();
+                        if !texts.is_empty()
+                            && chunk_text_bytes.saturating_add(bytes_here)
+                                <= MAX_EMBEDDING_SCAN_TEXT_BYTES
+                        {
+                            chunk_text_bytes += bytes_here;
+                            chunks.push((rel_str.clone(), texts));
+                        }
+                    }
                     files_scanned += 1;
                     bytes_indexed = bytes_indexed.saturating_add(bytes.len());
                 }
@@ -1713,7 +1837,40 @@ fn scan_workspace(ws: WorkspaceId, root: &Path) -> Result<ScanOutcome, String> {
         index,
         fingerprint: after,
         churned,
+        chunks,
     })
+}
+
+/// Embeddings of the NEWEST on-disk generation file of `workspace` (a
+/// Dirty/Building-at-restart build resumes before the published content is
+/// materialized, so the carry-over reads the durable file directly).
+/// Bounded: at most [`SWEEP_MAX_ENTRIES`] directory entries examined, the
+/// generation read itself capped by [`read_generation_file`]. A missing or
+/// corrupt file degrades to `None` (a full re-embed, never a wrong reuse).
+fn newest_generation_embeddings(data_root: &Path, ws: WorkspaceId) -> Option<EmbeddingIndex> {
+    let mut budget = SWEEP_MAX_ENTRIES;
+    let mut newest = 0u64;
+    for entry in fs::read_dir(generation_dir(data_root, ws)).ok()?.flatten() {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        let Some(name) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        let generation = name
+            .strip_prefix("gen-")
+            .and_then(|rest| rest.strip_suffix(".json"))
+            .and_then(|n| n.parse::<u64>().ok());
+        if let Some(generation) = generation {
+            newest = newest.max(generation);
+        }
+    }
+    if newest == 0 {
+        return None;
+    }
+    let file = read_generation_file(&generation_file_path(data_root, ws, newest)).ok()?;
+    Some(file.data.embeddings.sanitize())
 }
 
 /// Stat-only fingerprint of every regular file under `root` (sorted,
@@ -3090,5 +3247,154 @@ mod tests {
             "retired shadows never keep re-pointing: {:?}",
             cold.hits
         );
+    }
+
+    // ------------------------------------------------------------ embeddings
+
+    /// Spy embedding source: counts provider calls (one per `embed` batch)
+    /// and records every text it was asked for.
+    #[derive(Default)]
+    struct CountingSource {
+        calls: std::sync::atomic::AtomicUsize,
+        texts: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CountingSource {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn texts(&self) -> Vec<String> {
+            self.texts.lock().unwrap().clone()
+        }
+    }
+
+    impl EmbeddingSource for CountingSource {
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, faktor_core::Error> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.texts.lock().unwrap().extend(texts.iter().cloned());
+            Ok(texts
+                .iter()
+                .map(|text| vec![if text.contains("alpha") { 1.0 } else { 0.0 }, 1.0])
+                .collect())
+        }
+    }
+
+    /// Persistence keyed by content hash: an unchanged chunk survives BUILD
+    /// generation swaps AND a daemon reopen without a second embed call; a
+    /// changed chunk is the only text re-embedded.
+    #[test]
+    fn embeddings_survive_generation_swaps_and_reopen_without_reembedding() {
+        let _serial = serial();
+        let env = env();
+        write(&env.repo, "src/a.rs", "pub fn alpha() {}\n");
+        write(&env.repo, "src/b.rs", "pub fn beta() {}\n");
+        let fs = faktor_fs::WorkspaceFileService::new();
+        let (_store, svc, ws) = restart(&env, fs.clone(), Some(fast_cfg()));
+        let source = Arc::new(CountingSource::default());
+        svc.set_embedding_source(Some(source.clone()), EmbeddingModel::new("m", "r1"));
+        let view = svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        assert_eq!(view.generation(), 1);
+        assert_eq!(source.calls(), 1, "one bounded embed call for the build");
+        assert_eq!(source.texts().len(), 2);
+        {
+            let arc = view.index();
+            let idx = arc.lock().unwrap();
+            assert!(idx.has_embedding_index(ws));
+            assert_eq!(idx.embedding_dimension(ws), 2);
+            assert_eq!(idx.chunk_vectors(ws, 10).len(), 2);
+        }
+
+        // Change ONE file: only its chunk re-embeds; the other is carried
+        // across the generation swap.
+        write(&env.repo, "src/a.rs", "pub fn alpha_changed() {}\n");
+        std::thread::sleep(Duration::from_millis(60)); // mtime resolution
+        svc.request_build(ws).unwrap();
+        let view = svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        assert_eq!(view.generation(), 2);
+        assert_eq!(source.calls(), 2);
+        let second_batch: Vec<String> = source.texts()[2..].to_vec();
+        assert_eq!(
+            second_batch,
+            vec!["pub fn alpha_changed() {}\n".to_string()],
+            "only the changed chunk is re-embedded"
+        );
+        drop(view);
+
+        // Reopen: a fresh daemon over the same store/data_root. The Ready
+        // generation reloads WITH its vectors and embeds nothing.
+        drop(svc);
+        let source2 = Arc::new(CountingSource::default());
+        let (_store2, svc2, ws2) = restart(&env, fs, Some(fast_cfg()));
+        assert_eq!(ws2, ws);
+        svc2.set_embedding_source(Some(source2.clone()), EmbeddingModel::new("m", "r1"));
+        let view = svc2.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        assert_eq!(view.generation(), 2, "ready generation reloads as-is");
+        {
+            let arc = view.index();
+            let idx = arc.lock().unwrap();
+            assert!(
+                idx.has_embedding_index(ws),
+                "persisted vectors survive a reopen"
+            );
+            let beta_hash = crate::embedding::content_hash("pub fn beta() {}\n");
+            assert_eq!(
+                idx.embedding_vector(ws, &beta_hash),
+                Some(&[0.0f32, 1.0][..]),
+                "the unchanged chunk's exact vector survived"
+            );
+        }
+        assert_eq!(
+            source2.calls(),
+            0,
+            "a reopen with no changes re-embeds nothing"
+        );
+        drop(view);
+
+        // Change the OTHER file after the reopen: exactly one re-embed.
+        write(&env.repo, "src/b.rs", "pub fn beta_changed() {}\n");
+        std::thread::sleep(Duration::from_millis(60));
+        svc2.request_build(ws).unwrap();
+        let view = svc2.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        assert_eq!(view.generation(), 3);
+        assert_eq!(source2.calls(), 1);
+        assert_eq!(
+            source2.texts(),
+            vec!["pub fn beta_changed() {}\n".to_string()]
+        );
+    }
+
+    /// A model REVISION change invalidates every persisted vector: the next
+    /// build re-embeds the whole referenced corpus (even though only one
+    /// file changed) under the new identity.
+    #[test]
+    fn model_revision_change_invalidates_and_reembeds_the_corpus() {
+        let _serial = serial();
+        let env = env();
+        write(&env.repo, "src/a.rs", "pub fn alpha() {}\n");
+        write(&env.repo, "src/b.rs", "pub fn beta() {}\n");
+        let fs = faktor_fs::WorkspaceFileService::new();
+        let (_store, svc, ws) = restart(&env, fs, Some(fast_cfg()));
+        let first = Arc::new(CountingSource::default());
+        svc.set_embedding_source(Some(first.clone()), EmbeddingModel::new("m", "r1"));
+        svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        assert_eq!(first.calls(), 1);
+
+        let second = Arc::new(CountingSource::default());
+        svc.set_embedding_source(Some(second.clone()), EmbeddingModel::new("m", "r2"));
+        write(&env.repo, "src/a.rs", "pub fn alpha() -> u8 { 1 }\n");
+        std::thread::sleep(Duration::from_millis(60));
+        svc.request_build(ws).unwrap();
+        let view = svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        assert_eq!(view.generation(), 2);
+        assert_eq!(second.calls(), 1, "one batch for the new revision");
+        assert_eq!(
+            second.texts().len(),
+            2,
+            "the new revision re-embeds every chunk, old vectors are never reused"
+        );
+        let arc = view.index();
+        let idx = arc.lock().unwrap();
+        assert!(idx.has_embedding_index(ws));
     }
 }
