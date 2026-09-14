@@ -2144,10 +2144,12 @@ async fn failed_drive_keeps_shadow_for_recovery_cancel_discards() {
 }
 
 #[test]
-fn oversize_shadow_refuses_the_task_before_any_mutation() {
-    // (g) at the executor: an un-copyable base refuses the task start with
-    // a typed Oversized BEFORE the submit — no provider call, no durable
-    // shadow row, no task row, no user bytes touched.
+fn oversize_shadow_admits_a_recoverable_failure_before_any_mutation() {
+    // (g) at the executor: an un-copyable base can never hang the start. The
+    // BOUNDED preflight refuses the isolation candidate promptly; the turn is
+    // admitted and lands FailedRecoverable with the durable user prompt and
+    // the durable run row — no provider call, no durable shadow row, no task
+    // row, and no user bytes touched.
     let dir = tempfile::tempdir().unwrap();
     let env = open_env_with_shadows(
         dir.path(),
@@ -2160,12 +2162,17 @@ fn oversize_shadow_refuses_the_task_before_any_mutation() {
     );
     seed_owner(&env.owner_root);
     std::fs::write(env.owner_root.join("extra.txt"), b"third file").unwrap();
-    let err = env
+    let receipt = env
         .executor
         .start_task(env.parent, mutating_request(&env, "oversized shadow"))
-        .expect_err("the copy cap refuses the run");
-    assert!(matches!(err, ExecError::Oversized(_)), "{err}");
-    assert_eq!(env.provider.count(), 0, "no drive ever started");
+        .expect("the run is admitted as a recoverable failure");
+    assert_eq!(receipt.mode, TaskRunMode::InSession);
+    assert!(!receipt.queued);
+    assert_eq!(
+        env.provider.count(),
+        0,
+        "no drive ever started (no model call)"
+    );
     assert!(env.manager.shadow_row(env.parent).unwrap().is_none());
     assert!(env
         .manager
@@ -2178,6 +2185,28 @@ fn oversize_shadow_refuses_the_task_before_any_mutation() {
     assert_eq!(
         std::fs::read(env.owner_root.join("a.txt")).unwrap(),
         b"base-alpha"
+    );
+    // The turn is settled and promptable again; its user prompt and run row
+    // are durable.
+    let handle = env.manager.get_session(env.parent).unwrap().unwrap();
+    assert_eq!(
+        handle.state().unwrap(),
+        faktor_core::state::AgentState::FailedRecoverable
+    );
+    let messages = handle.messages_before(None, 10).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[0].data["text"], "oversized shadow");
+    assert!(
+        handle
+            .memory_facts()
+            .unwrap()
+            .iter()
+            .any(
+                |(kind, key, _)| kind == crate::runtime::task_executor::TASK_RUN_ROW_KIND
+                    && key == &receipt.run_id
+            ),
+        "the admitted run row is durable"
     );
 }
 

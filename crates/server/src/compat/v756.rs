@@ -24,6 +24,11 @@ use crate::native::{
     wire_refused, wire_status,
 };
 
+/// Settlement grace the frozen `POST /session/{id}/message` wait adds on top
+/// of the session's own turn budget before it cancels a wedged turn and
+/// answers the frozen failure shape (the wait is always bounded).
+const WIRE_TURN_SETTLE_GRACE: Duration = Duration::from_secs(60);
+
 /// The SDK Session1/2/3/4/5/8/9 session projection. The rich SDK field set
 /// is emitted ADDITIVELY next to the legacy `sessionID`/`createdMs`/
 /// `updatedMs`/`state` aliases the frozen Faktor fixtures and integration
@@ -580,11 +585,41 @@ pub(crate) async fn wire_message_send(
     // ReadyForNextTurn (or Completed/Cancelled/Failed*/NeedsUserInput — an
     // error journals FailedRecoverable, never a stuck machine), then this
     // handler projects the NEWEST durable assistant row of this turn.
+    //
+    // BOUNDED (compat invariant): the wait can never exceed the session's own
+    // turn budget (the runtime's wall-clock bound of ONE logical turn) plus a
+    // settlement grace. On expiry the wedged turn is cancelled honestly
+    // (ReadyForNextTurn) and the frozen failure shape is answered — never an
+    // unbounded await.
+    let budget_ms = state.deps.session.turn_budget_ms();
+    let budget = if budget_ms == 0 {
+        faktor_session::DEFAULT_TURN_BUDGET_MS
+    } else {
+        budget_ms
+    };
+    let settle_deadline =
+        tokio::time::Instant::now() + Duration::from_millis(budget) + WIRE_TURN_SETTLE_GRACE;
     loop {
         match handle.state() {
             Ok(s) if !turn_machine_busy(s) => break,
             Ok(_) => {}
             Err(e) => return api_err(&e),
+        }
+        if tokio::time::Instant::now() >= settle_deadline {
+            let _ = state.deps.agent.abort_op(sid, Some(receipt.op_id));
+            tracing::warn!(
+                target: "faktor::compat",
+                session = %sid,
+                "frozen wire turn did not settle within its budget; cancelled"
+            );
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "message": "turn did not settle within its budget; the turn was cancelled",
+                })),
+            )
+                .into_response();
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }

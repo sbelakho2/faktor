@@ -245,6 +245,13 @@ impl ShadowRoots {
                 shadows_root.display()
             )));
         }
+        // Bounded preflight (settle phase 1): the copy caps are enforced on
+        // METADATA alone, before any manifest walk hashes file contents. A
+        // checkout beyond the caps (the smoke's repo root: tens of GiB of
+        // build artifacts) refuses typed here in bounded time instead of
+        // hashing the whole tree — the historic unbounded phase that stalled
+        // the frozen prompt.
+        bounded_base_preflight(&base, &self.limits)?;
         let shadow_id = format!("sh-{:016x}", self.manager.next_op_id().raw());
         let dir = shadows_root
             .join(session.raw().to_string())
@@ -735,6 +742,109 @@ fn shadow_copy_error(what: &str, e: faktor_fs::tree_manifest::TreeManifestError)
         E::RootUnavailable(message) => ExecError::NotFound(format!("{what}: {message}")),
         other => ExecError::WorkspaceDrift(format!("{what}: {other}")),
     }
+}
+
+/// Bounded metadata-only preflight of a shadow base (settle phase 1).
+///
+/// Mirrors the traversal rules and caps of the manifest copy
+/// ([`SHADOW_SKIP_DIRS`], entry count, summed regular-file/symlink bytes,
+/// manifest depth) but reads NO file contents, so a checkout beyond the
+/// caps refuses [`ExecError::Oversized`] in bounded time — before the
+/// stable-copy digests ([`tree_manifest`](faktor_fs::tree_manifest::tree_manifest))
+/// could hash a possibly huge tree. Every wait in `begin_shadow` after this
+/// point is bounded by the caps it admitted.
+fn bounded_base_preflight(base: &Path, limits: &ShadowCopyLimits) -> Result<(), ExecError> {
+    use faktor_fs::tree_manifest::MAX_TREE_MANIFEST_DEPTH;
+    let oversized = |what: &str| {
+        ExecError::Oversized(format!(
+            "shadow base {} {what}; the checkout is not isolatable within the shadow copy caps",
+            base.display()
+        ))
+    };
+    let io = |what: &str, e: std::io::Error| {
+        ExecError::WorkspaceDrift(format!("shadow base preflight {what}: {e}"))
+    };
+    let mut stack: Vec<(PathBuf, usize)> = vec![(base.to_path_buf(), 0)];
+    let mut entries: usize = 0;
+    let mut bytes: u64 = 0;
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > MAX_TREE_MANIFEST_DEPTH {
+            return Err(oversized("exceeds the manifest depth bound"));
+        }
+        let read =
+            std::fs::read_dir(&dir).map_err(|e| io(&format!("read_dir {}", dir.display()), e))?;
+        for entry in read {
+            let entry = entry.map_err(|e| io(&format!("read_dir {}", dir.display()), e))?;
+            entries += 1;
+            if entries > limits.max_entries {
+                return Err(oversized(&format!(
+                    "exceeds the {} entry copy cap",
+                    limits.max_entries
+                )));
+            }
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path)
+                .map_err(|e| io(&format!("metadata {}", path.display()), e))?;
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                let target = std::fs::read_link(&path)
+                    .map_err(|e| io(&format!("read_link {}", path.display()), e))?;
+                bytes = bytes.saturating_add(link_target_bytes(&target));
+                if bytes > limits.max_total_bytes {
+                    return Err(oversized(&format!(
+                        "exceeds the {} byte copy cap",
+                        limits.max_total_bytes
+                    )));
+                }
+            } else if file_type.is_dir() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| SHADOW_SKIP_DIRS.contains(&name))
+                {
+                    continue;
+                }
+                stack.push((path, depth + 1));
+            } else if file_type.is_file() {
+                // Internal atomic temporaries are skipped by the copy and
+                // never counted toward its byte total (parity).
+                let is_temp = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(faktor_fs::atomic::is_internal_temp_name);
+                if !is_temp {
+                    bytes = bytes.saturating_add(meta.len());
+                    if bytes > limits.max_total_bytes {
+                        return Err(oversized(&format!(
+                            "exceeds the {} byte copy cap",
+                            limits.max_total_bytes
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    tracing::debug!(
+        target: "faktor::shadow",
+        base = %base.display(),
+        entries,
+        bytes,
+        "shadow phase preflight admitted"
+    );
+    Ok(())
+}
+
+/// The literal byte length of one symlink target (the manifest's own
+/// accounting: unix raw bytes, lossy on platforms without raw OsStr bytes).
+#[cfg(unix)]
+fn link_target_bytes(target: &Path) -> u64 {
+    use std::os::unix::ffi::OsStrExt;
+    target.as_os_str().as_bytes().len() as u64
+}
+
+#[cfg(not(unix))]
+fn link_target_bytes(target: &Path) -> u64 {
+    target.to_string_lossy().len() as u64
 }
 
 /// Refuse a checkout carrying a symlink that a LITERAL manifest-faithful
