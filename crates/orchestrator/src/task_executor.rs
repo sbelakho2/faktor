@@ -1626,9 +1626,19 @@ impl TaskExecutor {
         // and before any byte of the user checkout could be touched.
         if let Some(base) = &base_root {
             let shadows = self.shadows.as_ref().expect("shadowed implies service");
-            shadows
-                .begin_shadow(parent, base)
-                .map_err(|e| ExecError::from_shadow("shadow begin for session", e))?;
+            if let Err(e) = shadows.begin_shadow(parent, base) {
+                let refusal = ExecError::from_shadow("shadow begin for session", e);
+                if matches!(refusal, ExecError::Oversized(_)) {
+                    // The BOUNDED caps refused an un-isolatable checkout
+                    // (shadow settle phase 1). The turn can never run
+                    // isolated, so it is admitted honestly and landed as a
+                    // recoverable failure — never a hang, and never a
+                    // promptable-but-idle machine. Protocol adapters project
+                    // the typed state (the frozen wire answers its 502).
+                    return self.admit_refused_isolation(parent, &handle, &req, refusal);
+                }
+                return Err(refusal);
+            }
         }
         // Durable task row (wave 9/16): one row per session task. A fresh
         // session seeds with the run's goal; a non-terminal existing row is
@@ -1785,6 +1795,80 @@ impl TaskExecutor {
             mode: TaskRunMode::InSession,
             op_id: Some(receipt.op_id),
             queued: receipt.queued,
+        })
+    }
+
+    /// Admit a single-item run whose isolation candidate the BOUNDED copy
+    /// caps refused ([`ExecError::Oversized`] from `begin_shadow`): the
+    /// durable user prompt is recorded, the turn lands
+    /// [`faktor_core::state::AgentState::FailedRecoverable`] (its record
+    /// closed), and the receipt is returned so every protocol adapter
+    /// projects the typed failure promptly. No task, run or shadow row is
+    /// written — the run never existed.
+    fn admit_refused_isolation(
+        self: &Arc<Self>,
+        parent: SessionId,
+        handle: &faktor_session::SessionHandle,
+        req: &TaskRunRequest,
+        refusal: ExecError,
+    ) -> Result<TaskRunReceipt, ExecError> {
+        let receipt = self
+            .agent
+            .submit(parent, &req.goal, &req.files)
+            .map_err(|e| ExecError::Internal(format!("submit: {}", e.message)))?;
+        if receipt.queued {
+            // A queued prompt never ran under this attempt; never strand a
+            // queue row whose isolation candidate does not exist. The row is
+            // cancelled and the refusal stays typed.
+            let _ = handle.abort(Some(receipt.op_id));
+            return Err(refusal);
+        }
+        let message = format!("isolation candidate refused: {refusal}");
+        if handle
+            .append_event(
+                faktor_core::event::EventKind::Failed,
+                faktor_core::state::AgentState::FailedRecoverable,
+                Some(receipt.op_id),
+                Some(serde_json::json!({ "message": message })),
+            )
+            .is_err()
+        {
+            // The machine could not record the failure: settle it through the
+            // abort transition (a turn outcome, always legal from a mid-turn
+            // state) and keep the typed refusal.
+            let _ = handle.abort(Some(receipt.op_id));
+            return Err(refusal);
+        }
+        let _ = handle.finish_turn_record(receipt.op_id, "failed");
+        // The durable run row makes the admitted-but-undriven run readable
+        // through the exact projection every other run uses (state derives
+        // from the settled session/task rows) — a client that holds the
+        // receipt never faces a phantom 404.
+        let run_id = format!("tx-{:016x}", receipt.op_id.raw());
+        let row = TaskRunRow {
+            run_id: run_id.clone(),
+            session_id: parent.raw(),
+            mode: TaskRunMode::InSession,
+            goal: truncate(&req.goal, MAX_GOAL_CHARS),
+            item_ids: req.work_items.iter().map(|w| w.id.clone()).collect(),
+            files: req.files.clone(),
+            attachments: req.effective_attachments_patch().unwrap_or_default(),
+            op_id: Some(receipt.op_id.raw()),
+            model: req.model.clone(),
+            budget_max_tokens: req.max_tokens,
+            created_ms: handle.now_ms(),
+        };
+        put_run_row(handle, &run_id, &row)?;
+        tracing::info!(
+            target: "faktor::task_executor",
+            session = %parent,
+            "shadow phase refused (bounded caps); turn admitted and landed failed_recoverable: {message}"
+        );
+        Ok(TaskRunReceipt {
+            run_id,
+            mode: TaskRunMode::InSession,
+            op_id: Some(receipt.op_id),
+            queued: false,
         })
     }
 

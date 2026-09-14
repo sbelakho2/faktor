@@ -11384,6 +11384,107 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frozen_wire_unshadowable_checkout_answers_promptly_and_settles() {
+        // REGRESSION (live daemon): a checkout beyond the shadow copy caps
+        // (the smoke's cwd is the repo root: tens of GiB of build artifacts)
+        // must never send the frozen handler into the unbounded manifest
+        // walk — the historic phase that hung `POST /session/{id}/message`
+        // and starved every other request. The bounded preflight refuses the
+        // candidate, the turn is admitted and lands FailedRecoverable, and
+        // the handler projects the frozen 502 with the user row durable.
+        let dir = tempfile::tempdir().unwrap();
+        let rig =
+            native_task_rig_with_provider(dir.path(), Arc::new(AlwaysFailsProvider), false, true);
+        seed_native_owner(&rig.owner_root);
+        // A sparse file far beyond the byte cap: metadata-cheap to create,
+        // and (without the bounded preflight) ~128 GiB of content hashing to
+        // walk twice — the historic unbounded phase, caught by the timeout
+        // below on any host.
+        let oversize = rig.owner_root.join("oversize-build-artifact.bin");
+        let file = std::fs::File::create(&oversize).unwrap();
+        file.set_len(64 * 1024 * 1024 * 1024).unwrap();
+        drop(file);
+        let NativeTaskRig {
+            deps,
+            manager,
+            parent: sid,
+            ..
+        } = rig;
+        let pw = deps.server_password.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let basic = |r: reqwest::RequestBuilder| r.basic_auth("kilo", Some(pw.as_str()));
+
+        // Bounded, not host-speed-bound: a handler wedged in the manifest
+        // walk fails this test within seconds.
+        let resp =
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                basic(client.post(format!("{base}/session/{sid}/message")).json(
+                    &serde_json::json!({
+                        "messageID": null,
+                        "model": {"providerID": "fake", "modelID": "m"},
+                        "parts": [{"type": "text", "text": "ping an unshadowable checkout"}],
+                    }),
+                ))
+                .send(),
+            )
+            .await
+            .expect("the frozen message handler must answer promptly on an unshadowable checkout")
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            502,
+            "an un-isolatable turn is an honest frozen-wire 502"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false, "frozen failure shape: {body}");
+        assert!(body["message"].is_string(), "{body}");
+        // The turn settled recoverably; no isolation candidate was created.
+        assert_eq!(
+            manager.get_session(sid).unwrap().unwrap().state().unwrap(),
+            faktor_core::state::AgentState::FailedRecoverable
+        );
+        assert!(
+            manager.shadow_row(sid).unwrap().is_none(),
+            "the refused candidate must not leave a shadow row"
+        );
+        // The user prompt is durable, so the frozen page still serves it.
+        let page: serde_json::Value =
+            basic(client.get(format!("{base}/session/{sid}/message?limit=5")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        let messages = page.as_array().expect("frozen page is a bare array");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m["parts"][0]["text"] == "ping an unshadowable checkout"),
+            "the durable user row must survive the refused isolation: {page}"
+        );
+        // The admitted run projects through the native run listing as the
+        // failed run it is — no phantom, no 404.
+        let runs: serde_json::Value =
+            basic(client.get(format!("{base}/native/session/{sid}/task-runs")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert!(
+            runs.as_array()
+                .is_some_and(|rows| rows.iter().any(|r| r["state"] == "Failed")),
+            "the admitted run must project as Failed: {runs}"
+        );
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn legacy_plan_global_ownership_converts_once_at_the_native_dto_boundary() {
         // A legacy client posts ONE plan-global ownership with two mutating
         // items that carry none of their own: the DTO boundary converts it
