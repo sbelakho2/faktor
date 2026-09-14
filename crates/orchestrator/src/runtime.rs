@@ -3739,9 +3739,11 @@ pub(crate) mod graph;
 #[path = "task_executor.rs"]
 pub mod task_executor;
 
-/// Shadow mutation roots (P0-48): config-gated shadow copies of the user
-/// checkout that mutating single-agent tasks work against; integration
-/// back into the user checkout is a conflict-aware CAS commit.
+/// Shadow mutation roots (P0-48): daemon-owned isolated candidates of the
+/// user checkout that mutating single-agent tasks work against;
+/// integration back into the user checkout is a conflict-aware CAS commit.
+/// Isolation is unconditional for mutating runs (no mode/config can disable
+/// it; see [`task_executor::TaskExecutor::new`]).
 #[path = "shadow.rs"]
 pub mod shadow;
 

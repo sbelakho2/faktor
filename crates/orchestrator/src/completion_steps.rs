@@ -2107,8 +2107,11 @@ mod tests {
     // ------------------- verified-root race injection (P0 completion gates)
 
     fn repo_tree(repo: &Path) -> String {
-        faktor_session::root_snapshot_digest(repo, faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES)
-            .unwrap()
+        faktor_fs::tree_manifest::tree_manifest_digest(
+            repo,
+            faktor_fs::tree_manifest::MAX_TREE_MANIFEST_ENTRIES,
+        )
+        .unwrap()
     }
 
     /// A session whose workspace root IS `root`, with a durable integration

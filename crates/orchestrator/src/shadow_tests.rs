@@ -1,24 +1,27 @@
-//! Adversarial tests of the shadow mutation-root service (P0-48).
+//! Adversarial tests of the shadow mutation-root service (P0-48/49).
 //!
-//! The tests break the invariants the feature exists for: user-checkout
-//! isolation until a clean commit, conflict-aware integration (external
-//! drift during the drive), crash replay of a partially applied commit,
-//! daemon-shutdown removal, symlink escapes, oversize refusals, `.git`
-//! plumbing never copied, and deterministic reopen recovery. The "shadowed
-//! drive writes" of the end-to-end semantics are staged as DIRECT writes
-//! into the shadow root — the exact operation a shadow-aware tool context
-//! performs once the next wave re-points the session file consumers (the
-//! wiring tests in `task_executor_tests.rs` drive the real executor).
+//! The tests break the invariants the feature exists for: a STABLE begin
+//! copy (owner_before == owner_after == copied) with bounded retries and a
+//! typed refusal for a permanently drifting checkout, a durable immutable
+//! run base + generation-anchored change sets, user-checkout isolation for
+//! the whole shadow lifetime, staging/deletion semantics, daemon-shutdown
+//! removal, symlink escapes, oversize refusals, `.git` plumbing never
+//! copied, and deterministic reopen recovery. Landing is deliberately NOT
+//! part of this service any more: the ONE commitment engine is the
+//! executor's transactional integration pipeline, covered end-to-end in
+//! `task_executor_tests.rs` (rollback, crash recovery, completion binding).
+//! The "shadowed drive writes" below are staged as DIRECT writes into the
+//! shadow root — the exact operation a shadow-aware tool context performs.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use faktor_core::id::SessionId;
-use faktor_session::{SessionManager, ShadowRowState};
+use faktor_session::{SessionManager, ShadowRow, ShadowRowState};
 
 use super::*;
 use crate::runtime::shadow::{
-    ShadowCopyLimits, ShadowRoots, SHADOW_MAX_BASE_ENTRIES, SHADOW_MAX_COPY_BYTES,
+    ShadowCopyDrift, ShadowCopyLimits, ShadowRoots, SHADOW_MAX_BASE_ENTRIES, SHADOW_MAX_COPY_BYTES,
 };
 
 struct Fix {
@@ -76,9 +79,20 @@ fn shadow_row_of(fix: &Fix) -> ShadowRow {
         .expect("a shadow row exists")
 }
 
+fn run_base_of(fix: &Fix) -> faktor_session::ledger::RunBaseRecord {
+    let handle = fix.manager.get_session(fix.session).unwrap().unwrap();
+    handle
+        .ledger_run_base_get(&shadow_row_of(fix).shadow_id)
+        .unwrap()
+        .expect("a durable run base exists")
+}
+
+fn owner_digest(fix: &Fix) -> String {
+    crate::runtime::task_executor::root_manifest_digest(&fix.user).unwrap()
+}
+
 /// The "shadowed drive" write: stage `bytes` at `rel` inside the shadow
-/// root (the next-wave consumers resolve this root via
-/// `SessionManager::active_root`).
+/// root (the consumers resolve this root via `SessionManager::active_root`).
 fn drive_write(fix: &Fix, rel: &str, bytes: &[u8]) {
     let row = shadow_row_of(fix);
     let dst = PathBuf::from(&row.root).join(rel);
@@ -92,187 +106,246 @@ fn assert_no_shadow(fix: &Fix) {
     assert!(fix.manager.shadow_row(fix.session).unwrap().is_none());
 }
 
-fn arm_seam(fix: &Fix, after: usize) {
-    fix.shadows.arm_apply_seam(after);
-}
-
-// ---------------------------------------------------------------- isolation
+// ---------------------------------------------------------------- begin
 
 #[test]
-fn user_checkout_untouched_until_commit_then_integrated() {
-    // (a)+(b) at service level: while the shadow is live, staged writes
-    // never leak into the user checkout; a clean auto-approve commit lands
-    // the content, removes the shadow and retires the durable row.
+fn begin_is_a_stable_copy_and_records_the_run_base() {
+    // The begin contract: owner_before == owner_after == copied, the user
+    // checkout is byte-identical, the shadow holds the base content, and the
+    // immutable run base + base manifest + active row are durable.
     let fix = open_fix(default_limits());
-    fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
+    let before = owner_digest(&fix);
+    let shadow = fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
+    let after = owner_digest(&fix);
+    let copied = faktor_fs::tree_manifest::tree_manifest_digest(
+        &shadow.root,
+        faktor_fs::tree_manifest::MAX_TREE_MANIFEST_ENTRIES,
+    )
+    .unwrap();
+    assert_eq!(before, after, "owner stable through the copy");
+    assert_eq!(copied, before, "the copy is byte-identical to the owner");
     let row = shadow_row_of(&fix);
     assert_eq!(row.state, ShadowRowState::Active);
-    let dir = PathBuf::from(&row.root);
-    assert!(dir.is_dir());
-    // Mid-drive: the shadow holds the new world, the user checkout still
-    // holds the base bytes.
-    drive_write(&fix, "a.txt", b"agent alpha v2");
-    drive_write(&fix, "new.txt", b"agent new file");
+    assert_eq!(row.base_root, shadow.base_root.to_string_lossy());
+    assert_eq!(row.root, shadow.root.to_string_lossy());
+    assert!(PathBuf::from(&row.root).is_dir());
+    // Isolation: the user checkout is untouched by the copy.
     assert_eq!(user_bytes(&fix, "a.txt"), b"alpha");
-    assert!(!fix.user.join("new.txt").exists());
-    // The staged candidate presents exactly the two changed files.
+    assert_eq!(user_bytes(&fix, "sub/b.txt"), b"beta");
+    // The run base is durable, immutable and keyed by the shadow id with the
+    // exact copied digest.
+    let rb = run_base_of(&fix);
+    assert_eq!(rb.run_id, shadow.shadow_id);
+    assert_eq!(rb.snapshot_hash, copied);
+    assert_eq!(rb.root, shadow.root.to_string_lossy());
+    assert!(rb.manifest_digest.len() == 64, "{}", rb.manifest_digest);
+    // The base manifest is durable and readable.
+    assert_eq!(
+        fix.shadows.base_manifest(&shadow).unwrap().len(),
+        3,
+        "three base files anchored"
+    );
+}
+
+#[test]
+fn stable_copy_retries_once_then_accepts() {
+    // The owner drifts between the before-digest and the copy on the FIRST
+    // attempt; the bounded retry re-copies the stabilized tree and accepts
+    // exactly that generation (drift included).
+    let fix = open_fix(default_limits());
+    fix.shadows.arm_copy_drift(ShadowCopyDrift::Once);
+    let shadow = fix
+        .shadows
+        .begin_shadow(fix.session, &fix.user)
+        .expect("a once-drifting owner stabilizes on retry");
+    // The drift happened in the OWNER (the seam mutates it) and the accepted
+    // copy is the stable post-drift tree.
+    let copied = crate::runtime::task_executor::root_manifest_digest(&shadow.root).unwrap();
+    assert_eq!(copied, owner_digest(&fix));
+    assert_eq!(
+        fs::read(shadow.root.join("shadow-copy-drift.txt")).unwrap(),
+        b"drift on attempt 1"
+    );
+    assert_eq!(run_base_of(&fix).snapshot_hash, copied);
+}
+
+#[test]
+fn stable_copy_refuses_a_permanently_drifting_owner_typed() {
+    // Every attempt drifts: the copy can never stabilize, so begin refuses
+    // with the typed WorkspaceDrift and leaves NO directory, NO manifest and
+    // NO row behind.
+    let fix = open_fix(default_limits());
+    fix.shadows.arm_copy_drift(ShadowCopyDrift::Every);
+    let err = fix
+        .shadows
+        .begin_shadow(fix.session, &fix.user)
+        .expect_err("a permanently drifting owner can never be shadowed");
+    assert!(
+        matches!(err, crate::runtime::ExecError::WorkspaceDrift(_)),
+        "{err}"
+    );
+    assert!(err.to_string().contains("did not stabilize"), "{err}");
+    assert_no_shadow(&fix);
+    let session_dir = fix
+        ._dir
+        .path()
+        .join("shadows")
+        .join(fix.session.raw().to_string());
+    if session_dir.exists() {
+        assert_eq!(
+            fs::read_dir(&session_dir).unwrap().count(),
+            0,
+            "no partial shadow directory survives a refused begin"
+        );
+    }
+}
+
+// ---------------------------------------------------------------- staging
+
+#[test]
+fn change_set_carries_the_generation_snapshots() {
+    // (P1) Every staged set binds the immutable run base, the child start
+    // map and the current child map; re-staging an unchanged tree is
+    // idempotent, a later write moves only the final snapshot.
+    let fix = open_fix(default_limits());
+    fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
+    let rb = run_base_of(&fix);
+    drive_write(&fix, "a.txt", b"agent alpha v2");
+    let cs1 = fix.shadows.present_change_set(fix.session).unwrap();
+    assert_eq!(
+        cs1.run_base_snapshot.as_deref(),
+        Some(rb.snapshot_hash.as_str())
+    );
+    let start = cs1
+        .child_start_snapshot
+        .clone()
+        .expect("child start snapshot populated");
+    let final1 = cs1
+        .final_child_snapshot
+        .clone()
+        .expect("final child snapshot populated");
+    assert_eq!(start.len(), 64);
+    assert_eq!(final1.len(), 64);
+    assert_ne!(start, final1, "the drive changed the child map");
+    assert_eq!(cs1.files.len(), 1);
+    // Idempotent for an unchanged shadow: same id, same anchors.
+    let cs2 = fix.shadows.present_change_set(fix.session).unwrap();
+    assert_eq!(cs1.id(), cs2.id());
+    assert_eq!(cs2.final_child_snapshot, Some(final1.clone()));
+    // A further write moves the final snapshot (and the id) but never the
+    // run base.
+    drive_write(&fix, "b.txt", b"agent beta v2");
+    let cs3 = fix.shadows.stage_change_set(fix.session).unwrap();
+    assert_eq!(
+        cs3.run_base_snapshot.as_deref(),
+        Some(rb.snapshot_hash.as_str()),
+        "the run base is immutable across stagings"
+    );
+    assert_eq!(cs3.child_start_snapshot, Some(start));
+    assert_ne!(cs3.final_child_snapshot, Some(final1));
+    assert_ne!(cs3.id(), cs1.id());
+    // The user checkout never moved.
+    assert_eq!(user_bytes(&fix, "a.txt"), b"alpha");
+    assert!(!fix.user.join("b.txt").exists());
+}
+
+#[test]
+fn stale_change_set_is_never_presented() {
+    // A stored change set whose run-base binding no longer matches the
+    // shadow's durable run base is STALE: presentation re-stages against the
+    // current generation instead of serving the stale set.
+    let fix = open_fix(default_limits());
+    fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
+    drive_write(&fix, "a.txt", b"agent alpha v2");
+    let cs1 = fix.shadows.present_change_set(fix.session).unwrap();
+    // Move the durable run base (a different generation's digest).
+    let handle = fix.manager.get_session(fix.session).unwrap().unwrap();
+    let mut rb = run_base_of(&fix);
+    rb.snapshot_hash = "f".repeat(64);
+    handle.ledger_run_base_set(&rb).unwrap();
+    let cs2 = fix.shadows.present_change_set(fix.session).unwrap();
+    assert_ne!(cs1.id(), cs2.id(), "the stale set is not served");
+    assert_eq!(
+        cs2.run_base_snapshot.as_deref(),
+        Some("f".repeat(64).as_str())
+    );
+}
+
+#[test]
+fn legacy_shadow_without_run_base_refuses_staging() {
+    // A manually planted legacy row (or a crashed begin that never recorded
+    // the run base) can never stage an unanchored change set: the refusal is
+    // typed and names the recovery (discard + begin again).
+    let fix = open_fix(default_limits());
+    let dir = fix
+        ._dir
+        .path()
+        .join("shadows")
+        .join(fix.session.raw().to_string())
+        .join("sh-legacy");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"legacy").unwrap();
+    fix.manager
+        .put_shadow_row(
+            fix.session,
+            &ShadowRow {
+                session_id: fix.session.raw(),
+                shadow_id: "sh-legacy".into(),
+                base_root: fix.user.to_string_lossy().into_owned(),
+                root: dir.to_string_lossy().into_owned(),
+                state: ShadowRowState::Active,
+                base_entries: 1,
+                base_bytes: 6,
+                created_ms: 1,
+            },
+        )
+        .unwrap();
+    let err = fix.shadows.stage_change_set(fix.session).unwrap_err();
+    assert!(err.to_string().contains("no durable run base"), "{err}");
+    let err = fix.shadows.present_change_set(fix.session).unwrap_err();
+    assert!(err.to_string().contains("no durable run base"), "{err}");
+    // The checkout is untouched by the refusal.
+    assert_eq!(user_bytes(&fix, "a.txt"), b"alpha");
+}
+
+#[test]
+fn deletions_and_untouched_drift_stage_deterministically() {
+    // A shadowed deletion stages as a base-anchored removal; an untouched
+    // user drift never enters the change set (the integration decides it at
+    // land time, never the staging).
+    let fix = open_fix(default_limits());
+    fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
+    let dir = PathBuf::from(&shadow_row_of(&fix).root);
+    fs::remove_file(dir.join("sub/b.txt")).unwrap();
+    // External drift on a file the shadow never touched.
+    fs::write(fix.user.join("c.txt"), b"user drift on c").unwrap();
     let cs = fix.shadows.present_change_set(fix.session).unwrap();
     let paths: Vec<String> = cs
         .files
         .iter()
         .map(|f| f.path.to_string_lossy().into_owned())
         .collect();
-    assert_eq!(paths, vec!["a.txt".to_string(), "new.txt".to_string()]);
-    let (approved, rejected) = super::auto_approve(&cs);
-    assert_eq!(approved.len(), 2);
-    assert!(rejected.is_empty());
-    // Clean commit: content lands, shadow removed, row retired.
-    let out = fix
-        .shadows
-        .commit_back(fix.session, &approved, &rejected)
-        .unwrap();
-    assert!(out.clean());
-    assert_eq!(out.merged.len(), 2);
-    assert_eq!(user_bytes(&fix, "a.txt"), b"agent alpha v2");
-    assert_eq!(user_bytes(&fix, "new.txt"), b"agent new file");
-    assert!(
-        !dir.exists(),
-        "shadow dir removed after a clean integration"
-    );
-    let row = shadow_row_of(&fix);
-    assert_eq!(row.state, ShadowRowState::Integrated);
-    // A later run on the same session begins a FRESH shadow (retired rows
-    // never block).
-    fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
-    let row2 = shadow_row_of(&fix);
-    assert_eq!(row2.state, ShadowRowState::Active);
-    assert_ne!(row2.shadow_id, row.shadow_id, "generations are distinct");
+    assert_eq!(paths, vec!["sub/b.txt".to_string()]);
+    let entry = &cs.files[0];
+    assert!(entry.child_hash.is_none(), "the deletion has no child hash");
+    assert!(entry.base_hash.is_some(), "the deletion is base-anchored");
+    // No staging ever writes the checkout.
+    assert_eq!(user_bytes(&fix, "c.txt"), b"user drift on c");
 }
 
 #[test]
-fn no_op_drive_integrates_nothing_and_discards() {
-    // An empty diff (the drive changed nothing) is a clean no-op: the user
-    // checkout is byte-identical and the shadow is retired.
+fn no_op_staging_is_empty_and_bounded() {
     let fix = open_fix(default_limits());
     fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
-    let dir = PathBuf::from(&shadow_row_of(&fix).root);
     let cs = fix.shadows.present_change_set(fix.session).unwrap();
     assert!(cs.files.is_empty(), "no writes -> no change set");
-    let out = fix.shadows.commit_all(fix.session).unwrap();
-    assert!(out.clean());
-    assert!(out.merged.is_empty());
-    assert_eq!(user_bytes(&fix, "a.txt"), b"alpha");
-    assert!(!dir.exists());
-    assert_eq!(shadow_row_of(&fix).state, ShadowRowState::Integrated);
-}
-
-#[test]
-fn deletions_commit_cas_and_retain_user_drift() {
-    // A shadow that deleted a base file commits the deletion through the
-    // CAS anchor; a user file that moved on meanwhile is a conflict and is
-    // never removed.
-    let fix = open_fix(default_limits());
-    fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
-    // Shadowed drive deletes sub/b.txt and adds d.txt.
-    let dir = PathBuf::from(&shadow_row_of(&fix).root);
-    fs::remove_file(dir.join("sub/b.txt")).unwrap();
-    drive_write(&fix, "d.txt", b"deleted b, added d");
-    // External drift on c.txt (untouched by the shadow) must NOT surface:
-    // only changed files are decided.
-    let out = fix.shadows.commit_all(fix.session).unwrap();
-    assert!(out.clean());
-    assert!(!fix.user.join("sub/b.txt").exists(), "deletion landed");
-    assert_eq!(user_bytes(&fix, "d.txt"), b"deleted b, added d");
-    assert_eq!(user_bytes(&fix, "a.txt"), b"alpha", "untouched file intact");
-    // Second run: the drive deletes a.txt again, but the user changed it
-    // meanwhile -> per-file conflict, deletion refused.
-    fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
-    let dir = PathBuf::from(&shadow_row_of(&fix).root);
-    fs::remove_file(dir.join("a.txt")).unwrap();
-    fs::write(fix.user.join("a.txt"), b"user drift on a").unwrap();
-    let out = fix.shadows.commit_all(fix.session).unwrap();
-    assert!(!out.clean(), "{out:?}");
-    assert_eq!(out.conflicts.len(), 1);
-    assert!(
-        out.conflicts[0].1.contains("changed since the base"),
-        "{out:?}"
-    );
     assert_eq!(
-        user_bytes(&fix, "a.txt"),
-        b"user drift on a",
-        "a drifted user file is never removed"
-    );
-    assert_eq!(
-        shadow_row_of(&fix).state,
-        ShadowRowState::IntegrationBlocked
+        cs.run_base_snapshot.as_deref(),
+        Some(run_base_of(&fix).snapshot_hash.as_str())
     );
 }
 
-#[test]
-fn external_user_drift_conflicts_then_resolves() {
-    // (c): the user edits a file while the drive is staged; the integration
-    // conflicts, the user checkout is untouched, the shadow is RETAINED
-    // with the conflict list durably recorded, and a second attempt after
-    // the user reverts integrates cleanly.
-    let fix = open_fix(default_limits());
-    fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
-    let shadow_dir = PathBuf::from(&shadow_row_of(&fix).root);
-    drive_write(&fix, "a.txt", b"agent new alpha");
-    fs::write(fix.user.join("a.txt"), b"user edit while drive").unwrap();
-    let out = fix.shadows.commit_all(fix.session).unwrap();
-    assert!(!out.clean());
-    assert_eq!(out.conflicts.len(), 1);
-    assert!(out.conflicts[0]
-        .1
-        .contains("changed since the base snapshot"));
-    assert_eq!(
-        user_bytes(&fix, "a.txt"),
-        b"user edit while drive",
-        "a conflicted user file is never overwritten"
-    );
-    assert!(shadow_dir.is_dir(), "shadow retained on conflict");
-    let row = shadow_row_of(&fix);
-    assert_eq!(row.state, ShadowRowState::IntegrationBlocked);
-    // A second commit while the drift persists surfaces the SAME conflict.
-    let again = fix.shadows.commit_all(fix.session).unwrap();
-    assert_eq!(again.conflicts.len(), 1);
-    assert_eq!(
-        user_bytes(&fix, "a.txt"),
-        b"user edit while drive",
-        "still untouched"
-    );
-    // The user resolves the drift (reverts to the base content); the same
-    // auto decision now integrates.
-    fs::write(fix.user.join("a.txt"), b"alpha").unwrap();
-    let out = fix.shadows.commit_all(fix.session).unwrap();
-    assert!(out.clean(), "{out:?}");
-    assert_eq!(user_bytes(&fix, "a.txt"), b"agent new alpha");
-    assert!(!shadow_dir.exists());
-    assert_eq!(shadow_row_of(&fix).state, ShadowRowState::Integrated);
-}
-
-#[test]
-fn exclusive_create_conflicts_with_user_creation() {
-    // A file the shadow created can never overwrite a user file created
-    // during the drive (exclusive-create semantics).
-    let fix = open_fix(default_limits());
-    fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
-    drive_write(&fix, "e.txt", b"shadow-owned");
-    fs::write(fix.user.join("e.txt"), b"user-owned, created during drive").unwrap();
-    let out = fix.shadows.commit_all(fix.session).unwrap();
-    assert!(!out.clean());
-    assert_eq!(out.conflicts.len(), 1);
-    assert!(
-        out.conflicts[0]
-            .1
-            .contains("exists although the base snapshot had no such file"),
-        "{out:?}"
-    );
-    assert_eq!(
-        user_bytes(&fix, "e.txt"),
-        b"user-owned, created during drive"
-    );
-}
+// ---------------------------------------------------------- hostile inputs
 
 #[test]
 fn hostile_shadow_paths_and_reuse_refused() {
@@ -303,14 +376,11 @@ fn hostile_shadow_paths_and_reuse_refused() {
         matches!(err, crate::runtime::ExecError::NotFound(_)),
         "{err}"
     );
-    // stage/commit/discard on a shadow-less session are typed refusals.
     assert!(fix
         .shadows
         .stage_change_set(SessionId::new(424_242))
         .is_err());
 }
-
-// ---------------------------------------------------------- hostile inputs
 
 /// Create a directory link `link -> target` with the strongest artifact the
 /// OS allows and return its kind (`"symlink"` or `"junction"`).
@@ -536,24 +606,40 @@ fn symlink_escape_from_shadow_copy_rejected() {
             assert!(leftovers.is_empty(), "{:?}", leftovers);
         }
     }
-    // Companion: the SAME link kind (symlink or junction) pointing INSIDE
-    // the base root is ACCEPTED — the refusal above is about the escaping
-    // target, never a blanket link ban — and the bounded copy follows it to
-    // the in-root content.
+    // Companion: a RELATIVE in-root link is copied LITERALLY (manifest
+    // semantics: the copy is the SAME tree; the walk never follows links)
+    // and still resolves inside the shadow to the real sub directory. An
+    // ABSOLUTE in-root link is refused: a literal copy would point it back
+    // at the user checkout, so a daemon-owned shadow can never hold it.
     remove_dir_link(&user.join("leak"));
-    let kind = create_dir_link(&user.join("alias"), &user.join("sub"));
-    let shadow = shadows
-        .begin_shadow(session, &user)
-        .expect("an in-root directory link is followed, not refused");
-    assert_eq!(
-        fs::read(shadow.root.join("alias/b.txt")).unwrap(),
-        b"beta",
-        "the copy follows the in-root {kind} to the real sub directory"
-    );
-    assert_eq!(
-        manager.shadow_row(session).unwrap().unwrap().state,
-        ShadowRowState::Active
-    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("sub", user.join("alias")).unwrap();
+        let shadow = shadows
+            .begin_shadow(session, &user)
+            .expect("a relative in-root directory link is accepted");
+        assert_eq!(
+            fs::read(shadow.root.join("alias/b.txt")).unwrap(),
+            b"beta",
+            "the literal in-root link resolves inside the shadow copy"
+        );
+        assert_eq!(
+            manager.shadow_row(session).unwrap().unwrap().state,
+            ShadowRowState::Active
+        );
+    }
+    #[cfg(windows)]
+    {
+        let kind = create_dir_link(&user.join("alias"), &user.join("sub"));
+        let err = shadows
+            .begin_shadow(session, &user)
+            .expect_err("an absolute in-root link is refused");
+        assert!(
+            err.to_string().contains("symlink") || err.to_string().contains("escape"),
+            "{kind} absolute link was not refused: {err}"
+        );
+        assert!(manager.shadow_row(session).unwrap().is_none());
+    }
 }
 
 #[test]
@@ -626,7 +712,6 @@ fn git_plumbing_never_copied_git_or_plain_root() {
         !shadow.root.join(".git").exists(),
         "no plumbing in the shadow"
     );
-    // The copied content is intact and committable.
     assert!(fix.user.join(".git/HEAD").exists(), "user .git untouched");
     drive_write(&fix, "a.txt", b"alpha via git-root shadow");
     // Staging after the write yields only content entries (never .git).
@@ -636,9 +721,7 @@ fn git_plumbing_never_copied_git_or_plain_root() {
         "no .git entry can ever be staged: {:?}",
         manifest.files
     );
-    let out = fix.shadows.commit_all(fix.session).unwrap();
-    assert!(out.clean());
-    assert_eq!(user_bytes(&fix, "a.txt"), b"alpha via git-root shadow");
+    assert_eq!(manifest.files.len(), 1);
     assert!(fix.user.join(".git/HEAD").exists());
     // A non-git root (no .git at all) uses the same fs-copy path.
     let fix2 = open_fix(default_limits());
@@ -646,37 +729,7 @@ fn git_plumbing_never_copied_git_or_plain_root() {
     assert!(PathBuf::from(&shadow_row_of(&fix2).root).is_dir());
 }
 
-// ------------------------------------------------------- crash and teardown
-
-#[test]
-fn crash_mid_apply_replays_identically() {
-    // A crash inside the apply loop (after 1 of 2 files) leaves the
-    // in-flight durable envelope; the identical auto decision replays each
-    // apply CAS-idempotently (AlreadyCurrent) and finalizes Applied.
-    let fix = open_fix(default_limits());
-    fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
-    drive_write(&fix, "a.txt", b"first change");
-    drive_write(&fix, "b.txt", b"second change"); // b.txt under sub/? no —
-    arm_seam(&fix, 1);
-    let err = fix
-        .shadows
-        .commit_all(fix.session)
-        .expect_err("seam fires after one apply");
-    assert!(matches!(
-        err,
-        crate::runtime::ExecError::InjectedCrashSeam(_)
-    ));
-    // Deterministic residue: a.txt already applied (its CAS merge is
-    // idempotent on replay), b.txt pending; the row is still live.
-    assert_eq!(user_bytes(&fix, "a.txt"), b"first change");
-    let row = shadow_row_of(&fix);
-    assert_eq!(row.state, ShadowRowState::Active);
-    let out = fix.shadows.commit_all(fix.session).unwrap();
-    assert!(out.clean(), "{out:?}");
-    assert_eq!(out.merged.len(), 2, "replay merges both files");
-    assert_eq!(user_bytes(&fix, "b.txt"), b"second change");
-    assert_eq!(shadow_row_of(&fix).state, ShadowRowState::Integrated);
-}
+// ------------------------------------------------------- discard/teardown
 
 #[test]
 fn discard_removes_dir_marks_row_and_retires_cleanly() {
@@ -687,8 +740,8 @@ fn discard_removes_dir_marks_row_and_retires_cleanly() {
     assert!(!dir.exists());
     assert_eq!(shadow_row_of(&fix).state, ShadowRowState::Discarded);
     assert_eq!(user_bytes(&fix, "a.txt"), b"alpha", "discard never writes");
-    // stage/commit after discard are typed refusals (the tombstone row
-    // exists; only live shadows may stage).
+    // stage after discard is a typed refusal (the tombstone row exists;
+    // only live shadows may stage).
     let err = fix.shadows.stage_change_set(fix.session).unwrap_err();
     assert!(
         err.to_string().contains("only Active/IntegrationBlocked"),
@@ -706,6 +759,29 @@ fn discard_removes_dir_marks_row_and_retires_cleanly() {
         matches!(err, crate::runtime::ExecError::NotFound(_)),
         "{err}"
     );
+}
+
+#[test]
+fn integration_blocked_retains_the_shadow_and_resumes_staging() {
+    // The integration-blocked state is LIVE: the directory stays, staging
+    // stays available, and the row can be retired by the executor's landing
+    // pipeline whenever the drift resolves.
+    let fix = open_fix(default_limits());
+    fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
+    let dir = PathBuf::from(&shadow_row_of(&fix).root);
+    drive_write(&fix, "a.txt", b"agent alpha v2");
+    fix.shadows.mark_integration_blocked(fix.session).unwrap();
+    assert!(dir.is_dir());
+    assert_eq!(
+        shadow_row_of(&fix).state,
+        ShadowRowState::IntegrationBlocked
+    );
+    let cs = fix.shadows.present_change_set(fix.session).unwrap();
+    assert_eq!(cs.files.len(), 1, "staging resumes while blocked");
+    assert_eq!(user_bytes(&fix, "a.txt"), b"alpha");
+    fix.shadows.mark_integrated(fix.session).unwrap();
+    assert!(!dir.exists());
+    assert_eq!(shadow_row_of(&fix).state, ShadowRowState::Integrated);
 }
 
 #[test]
@@ -786,15 +862,16 @@ fn reconcile_deterministically_settles_crash_residue() {
 }
 
 #[test]
-fn shadow_survives_reopen_and_commits_from_durable_rows() {
-    // (d): a crashed daemon's shadow (row + dir + base manifest + staged
-    // change set are all durable) is fully resolvable after a manager
-    // reopen, and commit_back works from the durable rows alone.
+fn shadow_survives_reopen_with_its_run_base() {
+    // (d): a crashed daemon's shadow (row + dir + base manifest + run base +
+    // staged change set are all durable) is fully readable after a manager
+    // reopen; the staged generation still binds the ORIGINAL run base, so a
+    // reopened executor can land it through the transactional pipeline.
     let dir = tempfile::tempdir().unwrap();
     let user = dir.path().join("user");
     fs::create_dir_all(&user).unwrap();
     fs::write(user.join("a.txt"), b"alpha").unwrap();
-    let (session, shadow_id, shadow_dir) = {
+    let (session, shadow_id, shadow_dir, run_base_hash) = {
         let manager =
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let ws = manager.create_workspace(user.to_str().unwrap()).unwrap();
@@ -806,11 +883,20 @@ fn shadow_survives_reopen_and_commits_from_durable_rows() {
         let shadow = shadows.begin_shadow(session, &user).unwrap();
         // The shadowed drive wrote before the crash...
         fs::write(shadow.root.join("a.txt"), b"agent post-crash state").unwrap();
+        let run_base_hash = shadows
+            .manager()
+            .get_session(session)
+            .unwrap()
+            .unwrap()
+            .ledger_run_base_get(&shadow.shadow_id)
+            .unwrap()
+            .unwrap()
+            .snapshot_hash;
         let shadow_dir = shadow.root.clone();
         // Simulate a CRASH (no Drop): the service is leaked, exactly like a
         // killed daemon — the durable row + dir survive for reopen.
         std::mem::forget(shadows);
-        (session, shadow.shadow_id.clone(), shadow_dir)
+        (session, shadow.shadow_id.clone(), shadow_dir, run_base_hash)
     };
     // The daemon restarts: reopen reads the durable shadow row + dir.
     let manager2 =
@@ -824,24 +910,22 @@ fn shadow_survives_reopen_and_commits_from_durable_rows() {
         fs::read(shadow_dir.join("a.txt")).unwrap(),
         b"agent post-crash state"
     );
-    // Deterministic continuation: the staged change set + commit work off
-    // the durable base manifest and the surviving shadow tree.
+    // Deterministic continuation: the run base + staged change set are read
+    // back byte-identically from durable rows.
+    let rb = shadows2
+        .manager()
+        .get_session(session)
+        .unwrap()
+        .unwrap()
+        .ledger_run_base_get(&shadow_id)
+        .unwrap()
+        .expect("run base survives");
+    assert_eq!(rb.snapshot_hash, run_base_hash);
     let cs = shadows2.present_change_set(session).unwrap();
     assert_eq!(cs.files.len(), 1);
-    assert_eq!(user_bytes_reopen(&user), b"alpha");
-    let out = shadows2.commit_all(session).unwrap();
-    assert!(out.clean());
     assert_eq!(
-        fs::read(user.join("a.txt")).unwrap(),
-        b"agent post-crash state"
+        cs.run_base_snapshot.as_deref(),
+        Some(run_base_hash.as_str())
     );
-    assert!(!shadow_dir.exists());
-    assert_eq!(
-        manager2.shadow_row(session).unwrap().unwrap().state,
-        ShadowRowState::Integrated
-    );
-}
-
-fn user_bytes_reopen(user: &Path) -> Vec<u8> {
-    fs::read(user.join("a.txt")).unwrap()
+    assert_eq!(fs::read(user.join("a.txt")).unwrap(), b"alpha");
 }

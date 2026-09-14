@@ -188,22 +188,21 @@ impl CompletionCfg {
     }
 }
 
-/// The additive `[tasks]` section (P0-48 shadow mutation roots, wave-24
-/// mutation policy).
+/// The additive `[tasks]` section (P0 mutation isolation; wave-24 policy).
 ///
 /// The section is strictly additive with `serde(default)` and an absent
-/// section keeping the crate default `mutation_mode: Shadow` — shadow
-/// mutation is the PRODUCTION DEFAULT: single-agent MUTATING tasks work in
-/// daemon-owned shadow worktrees and are integrated back into the user
-/// checkout with a conflict-aware CAS commit. `mutation_mode:
-/// "direct_compat"` opts one daemon back into today's direct behavior
-/// (byte-identical to every wave before shadow mutation was the default).
+/// section keeping the crate default `mutation_mode: Shadow` — every
+/// MUTATING task works in a daemon-owned isolated candidate and is
+/// integrated back into the user checkout with a conflict-aware CAS commit.
+/// There is NO direct-owner mode any more: `mutation_mode:
+/// "direct_compat"` is a strict parse error naming the removal, and so is
+/// the legacy `shadow_mutation = false` value.
 ///
 /// The pre-wave-24 boolean key `shadow_mutation` is still accepted as a
-/// LEGACY alias (old config files keep their meaning: `true` = shadow
-/// mutation on, `false` = direct), but it is an error to specify BOTH keys
-/// — the file never says two different things. Unknown keys inside the
-/// section are parse errors (strict on both load paths).
+/// LEGACY alias for its historical `true` meaning only (shadow mutation on),
+/// but it is an error to specify BOTH keys — the file never says two
+/// different things. Unknown keys inside the section are parse errors
+/// (strict on both load paths).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default)]
 pub struct TasksCfg {
     #[serde(default)]
@@ -222,8 +221,8 @@ impl<'de> serde::Deserialize<'de> for TasksCfg {
             #[serde(default)]
             mutation_mode: Option<MutationMode>,
             /// Legacy pre-wave-24 alias (config_version 1 files written
-            /// before the mode existed). `true` = shadow mutation on;
-            /// `false` = the direct behavior of that era.
+            /// before the mode existed). `true` = shadow mutation on; the
+            /// `false` value (direct) was REMOVED and is a strict error.
             #[serde(default)]
             shadow_mutation: Option<bool>,
         }
@@ -236,9 +235,9 @@ impl<'de> serde::Deserialize<'de> for TasksCfg {
             (None, Some(true)) => Ok(Self {
                 mutation_mode: MutationMode::Shadow,
             }),
-            (None, Some(false)) => Ok(Self {
-                mutation_mode: MutationMode::DirectCompat,
-            }),
+            (None, Some(false)) => Err(D::Error::custom(
+                "the legacy [tasks] shadow_mutation = false was removed: every mutating run executes in an isolated candidate (shadow mutation); there is no direct-owner mode",
+            )),
             (None, None) => Ok(Self {
                 mutation_mode: MutationMode::Shadow,
             }),
@@ -1408,12 +1407,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tasks_section_defaults_shadow_parses_modes_and_rejects_hostile() {
-        // Wave-24: absent [tasks] keeps the PRODUCT default — shadow
-        // mutation ON (`MutationMode::Shadow`); `direct_compat` opts the
-        // daemon back into the byte-identical direct behavior; the legacy
-        // boolean key still parses with its historical meaning on both load
-        // paths; specifying BOTH keys (or unknown keys / bad values) is a
+    fn tasks_section_defaults_shadow_and_rejects_the_removed_direct_mode() {
+        // P0 mutation isolation: absent [tasks] keeps the PRODUCT default —
+        // shadow mutation ON (`MutationMode::Shadow`); the removed
+        // `direct_compat` value and the legacy `shadow_mutation = false`
+        // value are STRICT parse errors naming the removal on both load
+        // paths; the legacy boolean key keeps its historical `true` meaning
+        // only; specifying BOTH keys (or unknown keys / bad values) is a
         // parse error.
         let cfg = Config::default();
         assert_eq!(
@@ -1432,18 +1432,11 @@ mod tests {
                 r#"{"tasks": {"mutation_mode": "shadow"}}"#,
                 MutationMode::Shadow,
             ),
-            (
-                r#"{"tasks": {"mutation_mode": "direct_compat"}}"#,
-                MutationMode::DirectCompat,
-            ),
-            // Legacy alias: the pre-wave-24 boolean key keeps its meaning.
+            // Legacy alias: the pre-wave-24 boolean key keeps its historical
+            // `true` meaning.
             (
                 r#"{"tasks": {"shadow_mutation": true}}"#,
                 MutationMode::Shadow,
-            ),
-            (
-                r#"{"tasks": {"shadow_mutation": false}}"#,
-                MutationMode::DirectCompat,
             ),
         ] {
             std::fs::write(&path, body).unwrap();
@@ -1458,6 +1451,18 @@ mod tests {
             Config::load(&path).unwrap().tasks.mutation_mode,
             MutationMode::Shadow
         );
+        // The removed direct-owner request is a strict parse error whose
+        // message NAMES the removal, on BOTH load paths.
+        for body in [
+            r#"{"tasks": {"mutation_mode": "direct_compat"}}"#,
+            r#"{"tasks": {"shadow_mutation": false}}"#,
+        ] {
+            std::fs::write(&path, body).unwrap();
+            let e = Config::load(&path).expect_err("the removed direct mode must fail");
+            assert!(e.contains("removed"), "{body}: {e}");
+            let e = Config::load_strict(&path).expect_err("strict load must fail");
+            assert!(e.contains("removed"), "{body}: {e}");
+        }
         for bad in [
             // A file never says two different things at once.
             r#"{"tasks": {"mutation_mode": "shadow", "shadow_mutation": true}}"#,
@@ -1474,7 +1479,8 @@ mod tests {
                 e.contains("unknown field")
                     || e.contains("invalid type")
                     || e.contains("unknown variant")
-                    || e.contains("cannot both be present"),
+                    || e.contains("cannot both be present")
+                    || e.contains("removed"),
                 "{e}"
             );
             assert!(Config::load_strict(&path).is_err());

@@ -202,13 +202,13 @@ pub struct DaemonGraph {
     ///     AUTHORITATIVE executor of multi-agent tasks and the durable control
     ///     surface the native `/agents/{child}/...` endpoints drive.
     pub orchestrator: Arc<OrchestratorRuntime>,
-    /// 19. The shadow-mutation roots (P0-48 + wave-24): the executor's
+    /// 19. The shadow-mutation roots (P0-48 + P0 isolation): the executor's
     ///     shadow service; its Drop removes every shadow on graceful daemon
     ///     teardown, reconcile() at boot is the deterministic crash recovery.
     pub shadows: Arc<ShadowRoots>,
     /// 20. The TaskExecutor over [`DaemonGraph::orchestrator`]: the ONE
-    ///     native task-start authority of the daemon. Non-optional; the
-    ///     configured MutationMode decides usage only.
+    ///     native task-start authority of the daemon. Non-optional; it always
+    ///     carries the shadow service, so every mutating run isolates.
     pub tasks: Arc<TaskExecutor>,
 }
 
@@ -1761,7 +1761,6 @@ mod tests {
     fn graph_build_over_test_data_dir_constructs_every_authority_and_each_responds() {
         use faktor_agent::EvidenceProvider;
         use faktor_core::id::TaskId;
-        use faktor_orchestrator::runtime::task_executor::MutationMode;
 
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
@@ -1893,12 +1892,9 @@ mod tests {
             .shadows
             .reconcile()
             .expect("shadow reconcile is idempotent");
-        // Orchestration authorities answer.
-        assert_eq!(
-            graph.tasks.mode(),
-            MutationMode::Shadow,
-            "production default is shadow mutation"
-        );
+        // Orchestration authorities answer: the executor always carries the
+        // graph's shadow service, so mutating runs always isolate.
+        assert!(graph.tasks.shadows().is_some());
         assert_eq!(graph.tasks.active_run(), None);
         assert_eq!(
             graph
@@ -2193,7 +2189,7 @@ mod tests {
         ("agent", "AgentRuntime::new"),
         ("orchestrator", "OrchestratorRuntime::new"),
         ("shadows", "ShadowRoots::new"),
-        ("tasks", "TaskExecutor::new_with_mode"),
+        ("tasks", "TaskExecutor::new("),
     ];
 
     /// Steps 1-3 + 17 are not inline in the core body: they live in the daemon
@@ -2347,7 +2343,7 @@ mod tests {
             "ProcessSupervisor::new",
             "OrchestratorRuntime::new",
             "ShadowRoots::new",
-            "TaskExecutor::new_with_mode",
+            "TaskExecutor::new_owner_direct_for_test_harness",
             "TaskExecutor::new(",
             "DurableBudgetLedger::new",
             "SemanticProviderRegistry::new",

@@ -1,38 +1,35 @@
 //! Shadow mutation roots (P0-48): the strongest remaining filesystem
 //! guarantee for single-agent MUTATING tasks.
 //!
-//! When the config gate `[tasks] shadow_mutation` is ON, a single-item
-//! mutating task does NOT work in the user checkout: the executor begins a
-//! daemon-owned SHADOW — a bounded copy of the checkout under
+//! When a mutating single-item task starts, it does NOT work in the user
+//! checkout: the executor begins a
+//! daemon-owned SHADOW — a bounded, STABLE copy of the checkout under
 //! `<data dir>/shadows/<session>/<shadow id>` (never inside the checkout) —
-//! and only a conflict-aware commit copies the shadow's changed files back
-//! into the user checkout through the wave-10/13 commit-time CAS primitives.
+//! and the run's candidate is verified and landed through the SAME
+//! run-base/candidate/integration architecture every orchestrated run uses:
+//! a one-child instance of it. The shadow root IS the child's candidate
+//! workspace; the immutable run base is recorded durably at begin
+//! (`RunBaseRecord`, keyed by the shadow id) and every staged [`ChangeSet`]
+//! carries the run-base/child-start/final-child snapshots exactly like an
+//! orchestrated child's.
 //!
 //! Semantics (decided and documented here):
 //! - The user checkout is the INTEGRATION TARGET, never the worktree of a
-//!   shadowed drive. Every applied file is CAS-guarded against the digest it
-//!   had at `begin_shadow` (the durable base manifest); a user file that
-//!   changed meanwhile is a per-file CONFLICT and is never overwritten.
-//! - Integration is automatic on a verified-complete run (every changed file
-//!   approved) — wave-13's direct-integration semantics for children,
-//!   re-expressed here for the single-agent case. The wave-13
-//!   `approve_and_merge` API itself does not fit this case (it resolves the
-//!   owner root and child worktree through durable child/plan rows, which an
-//!   in-session run has none of), so the same record-first envelope +
-//!   CAS-apply discipline is implemented against the shadow's own durable
-//!   rows; the durable base/change-set rows reuse the wave-13 chunked row
-//!   helpers under the shadow's own run namespace.
+//!   shadowed drive. Landing goes through the executor's transactional
+//!   `IntegrationTxnRow`/`IntegrationPathTxn` engine (record-first per-path
+//!   decisions + rollback blobs, per-path CAS applies, whole-root equality).
+//!   A conflict rolls every applied path back: the owner stays BYTE-IDENTICAL
+//!   to its pre-landing state, never partially landed.
+//! - `VerifiedComplete` is the CONSEQUENCE of a successful owner landing: the
+//!   shadow-world verification the drive runs is never the permission to
+//!   complete. While a MANAGED live shadow (one with a recorded run base)
+//!   exists, the session completion gate refuses a proof that is not bound
+//!   to a finalized integration.
 //! - On integration CONFLICTS the shadow is NOT discarded: the durable
-//!   shadow row moves to `IntegrationBlocked`, the envelope records status
-//!   Conflicted with the conflict list durably, and re-running the commit
-//!   with the same (auto) decision after the user resolves the drift resumes
-//!   the apply phase — each file apply is CAS-idempotent
-//!   ([`faktor_fs::CasMergeResult::AlreadyCurrent`] on replay). The task
-//!   row itself is agent-owned: a task whose verification certified the
-//!   SHADOW state keeps its certified state while the durable shadow rows
-//!   carry the integration_conflict reason — exactly the wave-13 model where
-//!   a Done child can still have a Failed merge envelope.
-//! - On failure/cancel (or an empty diff) the shadow is discarded.
+//!   shadow row moves to `IntegrationBlocked`, the integration transaction
+//!   records the conflict list durably, and re-running the settlement after
+//!   the user resolves the drift resumes the integration.
+//! - On failure/cancel (or a discarded run) the shadow is discarded.
 //! - Zero orphans: the active-shadow row is a DURABLE session fact
 //!   ([`faktor_session::ShadowRow`]), so a crashed daemon's shadows are
 //!   recoverable/cleanable after reopen ([`ShadowRoots::reconcile`]); a
@@ -50,23 +47,21 @@
 //! a git root (a tree with a `.git` entry) is detected and its `.git` is
 //! skipped so no plumbing is ever materialized into a shadow.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
 
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use faktor_core::hash::FileHash;
 use faktor_core::id::SessionId;
-use faktor_fs::CasMergeResult;
 use faktor_session::{SessionManager, ShadowRow, ShadowRowState};
 
 use crate::runtime::merge::{
-    self, base_id_of, compute_change_entries, parent_handle, put_base_map, put_change_set,
-    read_base_map, read_change_set, scan_facts, validate_decision, ChangeEntry, ChangeSet,
-    MAX_BASE_ENTRIES,
+    base_id_of, base_map_digest, compute_change_entries, parent_handle, put_base_map,
+    put_change_set, read_base_map, read_change_set, ChangeSet, MAX_BASE_ENTRIES,
 };
-use crate::runtime::{ExecError, MAX_RUN_ID_CHARS};
+use crate::runtime::ExecError;
 
 /// Default entry cap of one shadow base copy (matches the wave-13 base-map
 /// cap; trees beyond it are typed Oversized refusals).
@@ -80,77 +75,22 @@ pub const SHADOWS_DIR_NAME: &str = "shadows";
 /// which is itself derived from the durable op-id sequence — generations
 /// never collide).
 const CHILD_ID: &str = "shadow";
+/// Bounded retries of the stable shadow copy before a typed
+/// [`ExecError::WorkspaceDrift`] (the SAME stable-copy contract
+/// [`crate::runtime::task_executor::TaskExecutor`] applies to run bases:
+/// `owner_before == owner_after == shadow_copied`).
+pub const SHADOW_COPY_ATTEMPTS: usize = 3;
+/// Directories the shadow copy never materializes (VCS bookkeeping is not
+/// content; the root snapshot digest skips exactly these).
+const SHADOW_SKIP_DIRS: &[&str] = &[".git", ".hg", ".svn"];
 
-/// The durable envelope of ONE shadow integration attempt (P0-48, modeled
-/// on the wave-13 merge record): written (in-flight) BEFORE any file apply,
-/// finalized after every apply. Kind [`SHADOW_MERGE_KIND`] under
-/// `"<shadow id>/merge/<seq>"`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ShadowMergeStatus {
-    /// Every approved file applied with no conflicts.
-    Applied,
-    /// Conflicts surfaced (or the in-flight pre-apply marker); the shadow is
-    /// retained and the conflict list is recorded durably. The machine
-    /// reason of the blocked outcome is `integration_conflict` (the turn
-    /// itself was verified against the shadow world — the conflict is an
-    /// integration-time event, never a turn outcome).
-    Conflicted,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ShadowMergeEnvelope {
-    pub seq: u64,
-    pub shadow_id: String,
-    pub cs_id: String,
-    pub status: ShadowMergeStatus,
-    pub approved_count: usize,
-    pub rejected_count: usize,
-    pub merged_count: usize,
-    pub conflict_count: usize,
-    pub created_ms: i64,
-    /// Set only once the apply phase fully finished; `None` = in-flight
-    /// (crash-safe replay resumes from the durable decision rows).
-    pub finished_ms: Option<i64>,
-    /// Bounded detail (first conflicts / integration_conflict reason).
-    pub details: String,
-}
-
-impl ShadowMergeEnvelope {
-    pub fn in_flight(&self) -> bool {
-        self.finished_ms.is_none()
-    }
-}
-
-/// The durable part rows of one shadow integration (approved/rejected
-/// decisions written BEFORE the first apply; merged/conflicts after).
-pub(crate) const SHADOW_MERGE_KIND: &str = "shadow_merge";
-pub(crate) const SHADOW_MERGE_PART_KIND: &str = "shadow_merge_part";
-const ENVELOPE_BUDGET: usize = 3900;
-
-/// Outcome of one shadow integration attempt.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShadowIntegration {
-    pub merged: Vec<PathBuf>,
-    pub rejected: Vec<PathBuf>,
-    pub conflicts: Vec<(PathBuf, String)>,
-}
-
-impl ShadowIntegration {
-    pub fn clean(&self) -> bool {
-        self.conflicts.is_empty()
-    }
-}
-
-/// A stored approved/rejected decision pair of one integration attempt.
-type StoredDecision = (Vec<PathBuf>, Vec<PathBuf>);
-
-/// One begun shadow: the daemon-owned work root of a shadowed drive.
+/// A stored shadow base copy: the daemon-owned work root of a shadowed
+/// drive plus the generation anchors recorded at begin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shadow {
     pub session_id: SessionId,
     pub shadow_id: String,
-    /// The user checkout (integration target of `commit_back`).
+    /// The user checkout (integration target of the executor's landing).
     pub base_root: PathBuf,
     /// The shadow's own root (daemon data dir; never inside the checkout).
     pub root: PathBuf,
@@ -173,7 +113,19 @@ impl Default for ShadowCopyLimits {
     }
 }
 
-/// The shadow service: one per daemon data dir. Begins/commits/discards
+/// Deterministic test seam of the stable copy (adversarial tests): mutates
+/// the owner between the `before` digest and the copy so the stability
+/// contract is exercised deterministically.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowCopyDrift {
+    /// Drift exactly once (the first attempt); later attempts are stable.
+    Once,
+    /// Drift on every attempt: the copy can never stabilize.
+    Every,
+}
+
+/// The shadow service: one per daemon data dir. Begins/stages/discards
 /// shadows and keeps their durable registry rows consistent. A graceful
 /// shutdown (Drop or [`ShadowRoots::shutdown`]) removes every shadow dir;
 /// a crash leaves rows that a reopen reconciles deterministically.
@@ -182,7 +134,7 @@ pub struct ShadowRoots {
     shadows_root: PathBuf,
     limits: ShadowCopyLimits,
     #[cfg(test)]
-    apply_seam: Arc<Mutex<Option<usize>>>,
+    copy_seam: Arc<Mutex<Option<ShadowCopyDrift>>>,
 }
 
 impl std::fmt::Debug for ShadowRoots {
@@ -216,7 +168,7 @@ impl ShadowRoots {
             shadows_root,
             limits,
             #[cfg(test)]
-            apply_seam: Arc::new(Mutex::new(None)),
+            copy_seam: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -238,21 +190,29 @@ impl ShadowRoots {
     // ------------------------------------------------------------ begin
 
     /// Begin a shadow of the session's workspace: a fresh daemon-owned
-    /// bounded copy of `base_root` (the user checkout) plus the durable
-    /// active-shadow row and the base manifest (the CAS anchors of every
-    /// later apply). Refuses while the session already carries a LIVE
+    /// bounded STABLE copy of `base_root` (the user checkout) plus the
+    /// durable active-shadow row, the base manifest (the CAS anchors of
+    /// every staged change) and the immutable `RunBaseRecord` (the exact
+    /// generation every staged change set binds). The stable-copy contract
+    /// matches the executor's run bases: `owner_before == owner_after ==
+    /// copied` for the shadow tree, with [`SHADOW_COPY_ATTEMPTS`] bounded
+    /// retries and a typed [`ExecError::WorkspaceDrift`] when the owner
+    /// keeps moving. Refuses while the session already carries a LIVE
     /// shadow (crash residue or a drive in flight — resume/discard first).
     ///
-    /// Copy order is deterministic and zero-orphan-safe: directory, bounded
-    /// copy (`.git` plumbing skipped; symlink escapes, unreadable files and
-    /// trees beyond the caps fail LOUDLY with typed errors), durable base
-    /// manifest, durable active row. A failure at any point removes the
-    /// partial directory; a crash between steps leaves a row-less directory
-    /// (removed by [`ShadowRoots::reconcile`]) or a manifest without a row
-    /// (harmless chunk rows, same crash semantics as the wave-13 base
-    /// records).
+    /// Copy order is deterministic and zero-orphan-safe: directory, stable
+    /// bounded copy (`.git` plumbing skipped; symlink escapes, unreadable
+    /// files and trees beyond the caps fail LOUDLY with typed errors),
+    /// durable base manifest, durable run base, durable active row. A
+    /// failure at any point removes the partial directory; a crash between
+    /// steps leaves a row-less directory (removed by
+    /// [`ShadowRoots::reconcile`]) or orphan manifest/run-base rows
+    /// (harmless: the shadow id is never reused).
     pub fn begin_shadow(&self, session: SessionId, base_root: &Path) -> Result<Shadow, ExecError> {
-        parent_handle(&self.manager, session)?;
+        let handle = parent_handle(&self.manager, session)?;
+        let session_row = handle
+            .row()
+            .map_err(|e| ExecError::Internal(format!("session row read: {e}")))?;
         let shadows_root = self.ensure_shadows_root()?;
         if let Some(existing) = self
             .manager
@@ -289,51 +249,103 @@ impl ShadowRoots {
         let dir = shadows_root
             .join(session.raw().to_string())
             .join(&shadow_id);
-        if dir.exists() {
-            // Crash residue of an earlier generation: the daemon-owned dir
-            // is removed wholesale (never inside the user checkout).
-            std::fs::remove_dir_all(&dir).map_err(|e| {
-                ExecError::Internal(format!("shadow residue removal {}: {e}", dir.display()))
-            })?;
-        }
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| ExecError::Internal(format!("shadow dir {}: {e}", dir.display())))?;
-        let copied = match faktor_fs::copy_tree_skip(
-            &base,
-            &dir,
-            self.limits.max_entries,
-            self.limits.max_total_bytes,
-            &[".git"],
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                return Err(ExecError::from_fs("shadow base copy", &base, e));
-            }
+        let digest = |root: &Path| -> Result<String, ExecError> {
+            super::task_executor::root_manifest_digest(root)
         };
-        let manifest: Vec<(PathBuf, FileHash)> =
-            copied.iter().map(|e| (e.path.clone(), e.hash)).collect();
-        // Durable base manifest FIRST (crash before the row leaves a
-        // row-less dir removed by reconcile), then the durable active row.
+        // Stable copy (bounded retries): the copy is accepted only when the
+        // owner digest was identical before and after the copy AND the
+        // copied tree digests to the same value; otherwise the whole
+        // directory is rebuilt and the owner re-read.
+        let mut detail = String::new();
+        let mut accepted: Option<(String, Vec<faktor_fs::SnapshotEntry>)> = None;
+        for attempt in 1..=SHADOW_COPY_ATTEMPTS {
+            if dir.exists() {
+                // Crash residue/previous attempt: the daemon-owned dir is
+                // removed wholesale (never inside the user checkout).
+                std::fs::remove_dir_all(&dir).map_err(|e| {
+                    ExecError::Internal(format!("shadow residue removal {}: {e}", dir.display()))
+                })?;
+            }
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| ExecError::Internal(format!("shadow dir {}: {e}", dir.display())))?;
+            let before = digest(&base)?;
+            self.check_copy_seam(&base, attempt);
+            // The copy is CANONICAL-manifest faithful (literal symlinks,
+            // executable bits preserved): the stable-copy equality below is
+            // an equality of the ONE tree identity, not of a re-shaped
+            // materialization. Shadow policy stays stricter than the general
+            // manifest: a link whose resolved target leaves the checkout is
+            // still refused loudly before anything is copied.
+            reject_escaping_links(&base, self.limits.max_entries).inspect_err(|_| {
+                let _ = std::fs::remove_dir_all(&dir);
+            })?;
+            if let Err(e) = faktor_fs::tree_manifest::copy_tree_manifest(
+                &base,
+                &dir,
+                self.limits.max_entries,
+                self.limits.max_total_bytes,
+                SHADOW_SKIP_DIRS,
+            ) {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(shadow_copy_error(
+                    &format!("shadow base copy of {}", base.display()),
+                    e,
+                ));
+            }
+            let after = digest(&base)?;
+            let copied = digest(&dir)?;
+            if before == after && after == copied {
+                let snapshot = faktor_fs::snapshot_tree(&dir, MAX_BASE_ENTRIES)
+                    .map_err(|e| ExecError::from_fs("shadow tree snapshot", &dir, e))?;
+                accepted = Some((copied, snapshot));
+                break;
+            }
+            detail = format!("attempt {attempt}: before={before} after={after} copied={copied}");
+        }
+        let Some((copied, manifest)) = accepted else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(ExecError::WorkspaceDrift(format!(
+                "shadow base {} did not stabilize during the stable copy after {SHADOW_COPY_ATTEMPTS} attempts ({detail}); refusing to shadow a drifting checkout",
+                base.display()
+            )));
+        };
+        let manifest_rows: Vec<(PathBuf, FileHash)> =
+            manifest.iter().map(|e| (e.path.clone(), e.hash)).collect();
+        // Durable base manifest FIRST (crash before later rows leaves a
+        // row-less dir removed by reconcile), then the immutable run base,
+        // then the durable active row.
         if let Err(e) = put_base_map(
             &self.manager,
             session,
             &shadow_id,
             CHILD_ID,
             "base",
-            &manifest,
+            &manifest_rows,
         ) {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(e);
         }
-        let total: u64 = copied.iter().map(|e| e.size).sum();
+        let record = faktor_session::ledger::RunBaseRecord {
+            run_id: shadow_id.clone(),
+            workspace_id: session_row.workspace_id.raw(),
+            worktree_id: session_row.worktree_id.raw(),
+            snapshot_hash: copied,
+            manifest_digest: base_map_digest(&manifest_rows),
+            root: dir.to_string_lossy().into_owned(),
+            created_ms: handle.now_ms(),
+        };
+        if let Err(e) = handle.ledger_run_base_set(&record).map(|_| ()) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(ExecError::Internal(format!("shadow run base write: {e}")));
+        }
+        let total: u64 = manifest.iter().map(|e| e.size).sum();
         let row = ShadowRow {
             session_id: session.raw(),
             shadow_id: shadow_id.clone(),
             base_root: base.to_string_lossy().into_owned(),
             root: dir.to_string_lossy().into_owned(),
             state: ShadowRowState::Active,
-            base_entries: copied.len() as u64,
+            base_entries: manifest.len() as u64,
             base_bytes: total,
             created_ms: self.manager.now_ms(),
         };
@@ -358,10 +370,14 @@ impl ShadowRoots {
     /// Compute and durably store the change set of the session's shadow:
     /// every file whose current shadow content differs from the base
     /// manifest (with the base digest as the CAS anchor of the user path),
-    /// plus recorded deletions. Entry count beyond [`MAX_CHANGES`] is a
-    /// typed Oversized error and NOTHING is stored (the merge never
-    /// silently truncates). Deterministic and idempotent for an unchanged
-    /// shadow.
+    /// plus recorded deletions. The set carries the SAME generation anchors
+    /// as an orchestrated child's: `run_base_snapshot` (the immutable run
+    /// base recorded at begin — a shadow without one refuses to stage),
+    /// `child_start_snapshot` (digest of the begin map) and
+    /// `final_child_snapshot` (digest of the shadow tree now). Entry count
+    /// beyond [`crate::runtime::merge::MAX_CHANGES`] is a typed Oversized
+    /// error and NOTHING is stored (the integration never silently
+    /// truncates). Deterministic and idempotent for an unchanged shadow.
     pub fn stage_change_set(&self, session: SessionId) -> Result<ChangeSet, ExecError> {
         let row = self.live_row(session)?;
         let shadow = Shadow {
@@ -369,6 +385,16 @@ impl ShadowRoots {
             shadow_id: row.shadow_id.clone(),
             base_root: PathBuf::from(&row.base_root),
             root: PathBuf::from(&row.root),
+        };
+        let handle = parent_handle(&self.manager, session)?;
+        let Some(run_base) = handle
+            .ledger_run_base_get(&shadow.shadow_id)
+            .map_err(|e| ExecError::Internal(format!("shadow run base read: {e}")))?
+        else {
+            return Err(ExecError::InvalidState(format!(
+                "shadow {} has no durable run base (a legacy or crashed begin); discard() it and begin_shadow() again",
+                shadow.shadow_id
+            )));
         };
         let base_map = self.base_manifest(&shadow)?;
         let now_snap = faktor_fs::snapshot_tree(&shadow.root, MAX_BASE_ENTRIES)
@@ -379,9 +405,9 @@ impl ShadowRoots {
         let cs = ChangeSet {
             child_id: CHILD_ID.to_string(),
             base_id: base_id_of(&shadow.shadow_id),
-            run_base_snapshot: None,
-            child_start_snapshot: None,
-            final_child_snapshot: None,
+            run_base_snapshot: Some(run_base.snapshot_hash),
+            child_start_snapshot: Some(base_map_digest(&base_map)),
+            final_child_snapshot: Some(base_map_digest(&now)),
             files,
             created_ms: self.manager.now_ms(),
         };
@@ -389,221 +415,64 @@ impl ShadowRoots {
         Ok(cs)
     }
 
-    // -------------------------------------------------------- integration
-
     /// Present the session's staged change set (staging it first when
-    /// absent). The structured candidate a drive's verified-complete end
-    /// presents for approval-merge: [`commit_back`] consumes it.
+    /// absent). A stored set bound to a DIFFERENT run base than the shadow's
+    /// durable record is stale and is re-staged — a stale generation can
+    /// never be presented as the current candidate.
     pub fn present_change_set(&self, session: SessionId) -> Result<ChangeSet, ExecError> {
         let row = self.live_row(session)?;
+        let handle = parent_handle(&self.manager, session)?;
+        let run_base = handle
+            .ledger_run_base_get(&row.shadow_id)
+            .map_err(|e| ExecError::Internal(format!("shadow run base read: {e}")))?
+            .ok_or_else(|| {
+                ExecError::InvalidState(format!(
+                    "shadow {} has no durable run base; discard() it and begin_shadow() again",
+                    row.shadow_id
+                ))
+            })?;
         let cs_id = format!("{}-cs", base_id_of(&row.shadow_id));
         match read_change_set(&self.manager, session, &row.shadow_id, CHILD_ID, &cs_id) {
-            Ok(cs) => Ok(cs),
+            Ok(cs) if cs.run_base_snapshot.as_deref() == Some(run_base.snapshot_hash.as_str()) => {
+                Ok(cs)
+            }
+            Ok(_) => self.stage_change_set(session),
             Err(ExecError::NotFound(_)) => self.stage_change_set(session),
             Err(e) => Err(e),
         }
     }
 
-    /// Commit the shadow's changes back into the USER checkout. `approved`
-    /// and `rejected` must decide every changed file ([`validate_decision`];
-    /// [`ShadowRoots::commit_all`] auto-approves everything). Each apply is
-    /// a commit-time CAS write against the base manifest digest of the user
-    /// path (expected = the digest at begin): a user file that changed
-    /// meanwhile is a CONFLICT and is never overwritten; a path absent at
-    /// begin is an exclusive create.
-    ///
-    /// Record-first durability (wave-13 discipline): the in-flight envelope
-    /// and the durable decision rows are written BEFORE any apply, the
-    /// merged/conflict parts and the finalized envelope after. A crash at
-    /// any point is resumed by calling this again with the SAME decision:
-    /// every apply is CAS-idempotent ([`faktor_fs::CasMergeResult::AlreadyCurrent`]).
-    ///
-    /// Outcome semantics:
-    /// - no conflicts → the user checkout holds the new content; the shadow
-    ///   directory is removed and the durable row is marked `Integrated`;
-    /// - conflicts → the shadow is RETAINED, the row moves to
-    ///   `IntegrationBlocked` and the envelope carries the durable conflict
-    ///   list (reason `integration_conflict`). Re-run after the user
-    ///   resolves the drift with the same decision to resume.
-    pub fn commit_back(
-        &self,
-        session: SessionId,
-        approved: &[PathBuf],
-        rejected: &[PathBuf],
-    ) -> Result<ShadowIntegration, ExecError> {
-        let row = self.live_row(session)?;
-        let shadow = Shadow {
-            session_id: session,
-            shadow_id: row.shadow_id.clone(),
-            base_root: PathBuf::from(&row.base_root),
-            root: PathBuf::from(&row.root),
-        };
-        let base_root = shadow.base_root.canonicalize().map_err(|e| {
-            ExecError::NotFound(format!(
-                "integration target {} vanished since begin_shadow: {e}",
-                shadow.base_root.display()
-            ))
-        })?;
-        if !shadow.root.is_dir() {
+    // -------------------------------------------------------- integration
+
+    /// Mark the shadow INTEGRATED (record-first: the durable row reaches
+    /// `Integrated` BEFORE the directory is removed, so a reader or a crash
+    /// can never see filesystem cleanup with the row still live). The
+    /// caller has already landed the verified candidate into the owner
+    /// through the transactional integration engine; this only retires the
+    /// shadow's own envelope.
+    pub fn mark_integrated(&self, session: SessionId) -> Result<(), ExecError> {
+        let Some(row) = self
+            .manager
+            .shadow_row(session)
+            .map_err(|e| ExecError::Internal(format!("shadow row read: {e}")))?
+        else {
             return Err(ExecError::NotFound(format!(
-                "shadow root {} is gone; discard() and begin_shadow() again",
-                shadow.root.display()
+                "session {session} has no shadow row to integrate"
             )));
-        }
-        let cs = self.present_change_set(session)?;
-        let (approved_v, rejected_v) = validate_decision(&cs, approved, rejected)?;
-        let base_map = self.base_manifest(&shadow)?;
-        let base_idx: BTreeMap<PathBuf, FileHash> = base_map.iter().cloned().collect();
-
-        // ---- durable record FIRST (crash between record and applies is
-        // replay-safe because every apply is CAS-idempotent).
-        let seq = self.existing_seq(session, &shadow.shadow_id, &cs.id())?;
-        let decision_stored = self
-            .decision_rows(session, &shadow.shadow_id, &cs.id(), seq)?
-            .is_some();
-        if decision_stored {
-            let stored = self
-                .decision_rows(session, &shadow.shadow_id, &cs.id(), seq)?
-                .expect("checked above");
-            if stored.0 != approved_v || stored.1 != rejected_v {
-                return Err(ExecError::Conflict(format!(
-                    "the durable integration record of shadow {} records a different decision; replay must carry the identical approved/rejected sets",
-                    shadow.shadow_id
-                )));
-            }
-        } else {
-            // In-flight envelope + durable decision rows BEFORE any apply.
-            if self.envelope(session, &shadow.shadow_id, seq)?.is_none() {
-                self.write_envelope(
-                    session,
-                    &ShadowMergeEnvelope {
-                        seq,
-                        shadow_id: shadow.shadow_id.clone(),
-                        cs_id: cs.id(),
-                        status: ShadowMergeStatus::Conflicted,
-                        approved_count: approved_v.len(),
-                        rejected_count: rejected_v.len(),
-                        merged_count: 0,
-                        conflict_count: 0,
-                        created_ms: self.manager.now_ms(),
-                        finished_ms: None,
-                        details:
-                            "in-flight: durable integration record written before any file apply"
-                                .into(),
-                    },
-                )?;
-            }
-            self.write_part(
-                session,
-                &shadow.shadow_id,
-                seq,
-                "approved",
-                &approved_v,
-                &[],
-            )?;
-            self.write_part(
-                session,
-                &shadow.shadow_id,
-                seq,
-                "rejected",
-                &rejected_v,
-                &[],
-            )?;
-        }
-
-        // ---- apply phase (deterministic order = staged path order).
-        let mut merged: Vec<PathBuf> = Vec::new();
-        let mut conflicts: Vec<(PathBuf, String)> = Vec::new();
-        let mut processed = 0usize;
-        for entry in &cs.files {
-            if rejected_v.contains(&entry.path) {
-                processed += 1;
-                continue;
-            }
-            match self.apply_one(&base_root, &shadow, entry, &base_idx) {
-                Ok(()) => merged.push(entry.path.clone()),
-                Err(ApplyFailure::Conflict(detail)) => conflicts.push((entry.path.clone(), detail)),
-                Err(ApplyFailure::Hard(e)) => {
-                    // Prior applies stay (each individually CAS-committed);
-                    // the in-flight durable record lets the caller resume.
-                    return Err(e);
-                }
-            }
-            processed += 1;
-            self.check_apply_seam(processed)?;
-        }
-        merged.sort();
-        // ---- durable outcome rows, then the FINAL envelope.
-        self.write_part(session, &shadow.shadow_id, seq, "merged", &merged, &[])?;
-        self.write_part(
-            session,
-            &shadow.shadow_id,
-            seq,
-            "conflicts",
-            &[],
-            &conflicts,
-        )?;
-        let conflicted = !conflicts.is_empty();
-        let detail = if conflicts.is_empty() {
-            format!("all {} approved file(s) integrated", merged.len())
-        } else {
-            let (first_path, first_detail) = &conflicts[0];
-            format!(
-                "integration_conflict: {} conflict(s); first: {} — {}",
-                conflicts.len(),
-                first_path.display(),
-                first_detail.chars().take(160).collect::<String>()
-            )
         };
-        self.write_envelope(
-            session,
-            &ShadowMergeEnvelope {
-                seq,
-                shadow_id: shadow.shadow_id.clone(),
-                cs_id: cs.id(),
-                status: if conflicted {
-                    ShadowMergeStatus::Conflicted
-                } else {
-                    ShadowMergeStatus::Applied
-                },
-                approved_count: approved_v.len(),
-                rejected_count: rejected_v.len(),
-                merged_count: merged.len(),
-                conflict_count: conflicts.len(),
-                created_ms: self.manager.now_ms(),
-                finished_ms: Some(self.manager.now_ms()),
-                details: detail.chars().take(300).collect(),
-            },
-        )?;
-        let outcome = ShadowIntegration {
-            merged,
-            rejected: rejected_v,
-            conflicts,
-        };
-        if outcome.clean() {
-            // Clean integration: the user checkout holds the new content.
-            // Record-first: the durable row reaches Integrated BEFORE the
-            // directory is removed, so a reader (or a crash) can never see
-            // filesystem cleanup with the row still Active. Windows CI
-            // exposed the inverse ordering as an integration race.
-            self.mark_state(session, ShadowRowState::Integrated)?;
-            let _ = std::fs::remove_dir_all(&shadow.root);
-        } else {
-            // Conflicts: retain the shadow; the durable conflict list is the
-            // integration_conflict record. The row's IntegrationBlocked
-            // state keeps the run from completing on the user side.
-            self.mark_state(session, ShadowRowState::IntegrationBlocked)?;
+        self.mark_state(session, ShadowRowState::Integrated)?;
+        let dir = PathBuf::from(&row.root);
+        if dir.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
         }
-        Ok(outcome)
+        Ok(())
     }
 
-    /// Auto-approve every changed file and commit (wave-13 direct
-    /// integration semantics). Conflicts surface in the returned outcome;
-    /// the shadow is retained on conflict ([`commit_back`] docs).
-    pub fn commit_all(&self, session: SessionId) -> Result<ShadowIntegration, ExecError> {
-        let cs = self.present_change_set(session)?;
-        let all: Vec<PathBuf> = cs.files.iter().map(|f| f.path.clone()).collect();
-        self.commit_back(session, &all, &[])
+    /// Mark the shadow `IntegrationBlocked`: the landing transaction refused
+    /// (conflict or drift); the shadow directory is RETAINED so a later
+    /// settlement can resume after the user resolves the drift.
+    pub fn mark_integration_blocked(&self, session: SessionId) -> Result<(), ExecError> {
+        self.mark_state(session, ShadowRowState::IntegrationBlocked)
     }
 
     // ------------------------------------------------------------ discard
@@ -780,7 +649,7 @@ impl ShadowRoots {
         };
         if !row.state.is_live() {
             return Err(ExecError::InvalidState(format!(
-                "shadow {} of session {session} is {:?}; only Active/IntegrationBlocked shadows integrate or stage",
+                "shadow {} of session {session} is {:?}; only Active/IntegrationBlocked shadows stage",
                 row.shadow_id, row.state
             )));
         }
@@ -819,258 +688,120 @@ impl ShadowRoots {
         }
     }
 
-    fn envelope_key(shadow_id: &str, seq: u64) -> String {
-        format!("{shadow_id}/merge/{seq}")
-    }
-
-    fn part_key(shadow_id: &str, seq: u64, part: &str) -> String {
-        format!("{shadow_id}/merge/{seq}/part/{part}")
-    }
-
-    fn envelope(
-        &self,
-        session: SessionId,
-        shadow_id: &str,
-        seq: u64,
-    ) -> Result<Option<ShadowMergeEnvelope>, ExecError> {
-        let handle = parent_handle(&self.manager, session)?;
-        let key = Self::envelope_key(shadow_id, seq);
-        for (kind, k, value) in scan_facts(&handle)? {
-            if kind == SHADOW_MERGE_KIND && k == key {
-                let env: ShadowMergeEnvelope = serde_json::from_str(&value).map_err(|e| {
-                    ExecError::Internal(format!("integration envelope decode {key}: {e}"))
-                })?;
-                return Ok(Some(env));
-            }
-        }
-        Ok(None)
-    }
-
-    fn existing_seq(
-        &self,
-        session: SessionId,
-        shadow_id: &str,
-        cs_id: &str,
-    ) -> Result<u64, ExecError> {
-        let handle = parent_handle(&self.manager, session)?;
-        let prefix = format!("{shadow_id}/merge/");
-        let mut envs: Vec<(u64, ShadowMergeEnvelope)> = Vec::new();
-        for (kind, key, value) in scan_facts(&handle)? {
-            if kind != SHADOW_MERGE_KIND {
-                continue;
-            }
-            let Some(rest) = key.strip_prefix(&prefix) else {
-                continue;
-            };
-            let seq: u64 = rest
-                .parse()
-                .map_err(|_| ExecError::Internal(format!("hostile envelope key {key:?}")))?;
-            let env: ShadowMergeEnvelope = serde_json::from_str(&value).map_err(|e| {
-                ExecError::Internal(format!("integration envelope decode {key}: {e}"))
-            })?;
-            envs.push((seq, env));
-        }
-        envs.sort_by_key(|(seq, _)| *seq);
-        let existing = envs.into_iter().find(|(_, e)| e.cs_id == cs_id);
-        match existing {
-            Some((seq, _)) => Ok(seq),
-            None => {
-                // A fresh attempt: seq 1. A hostile leftover at seq 1 with a
-                // different cs id (never produced by this service) is
-                // refused loudly.
-                Ok(1)
-            }
-        }
-    }
-
-    fn decision_rows(
-        &self,
-        session: SessionId,
-        shadow_id: &str,
-        _cs_id: &str,
-        seq: u64,
-    ) -> Result<Option<StoredDecision>, ExecError> {
-        let handle = parent_handle(&self.manager, session)?;
-        let approved = self.read_part(&handle, shadow_id, seq, "approved")?;
-        let rejected = self.read_part(&handle, shadow_id, seq, "rejected")?;
-        match (approved, rejected) {
-            (Some(a), Some(r)) => Ok(Some((a, r))),
-            _ => Ok(None),
-        }
-    }
-
-    fn write_envelope(
-        &self,
-        session: SessionId,
-        env: &ShadowMergeEnvelope,
-    ) -> Result<(), ExecError> {
-        let handle = parent_handle(&self.manager, session)?;
-        if !env.shadow_id.is_ascii()
-            || env.shadow_id.is_empty()
-            || env.shadow_id.len() > MAX_RUN_ID_CHARS
-            || env.shadow_id.contains('/')
-        {
-            return Err(ExecError::Oversized(format!(
-                "shadow id must be 1..={MAX_RUN_ID_CHARS} ASCII characters without '/'"
-            )));
-        }
-        let value = serde_json::to_string(env)
-            .map_err(|e| ExecError::Internal(format!("envelope serialization: {e}")))?;
-        if value.len() > ENVELOPE_BUDGET {
-            return Err(ExecError::Oversized(format!(
-                "integration envelope of {} bytes exceeds the durable row budget",
-                value.len()
-            )));
-        }
-        handle
-            .upsert_memory_fact(
-                SHADOW_MERGE_KIND,
-                &Self::envelope_key(&env.shadow_id, env.seq),
-                &value,
-            )
-            .map_err(|e| ExecError::Internal(format!("integration record write: {}", e.message)))
-    }
-
-    fn write_part(
-        &self,
-        session: SessionId,
-        shadow_id: &str,
-        seq: u64,
-        part: &str,
-        paths: &[PathBuf],
-        conflicts: &[(PathBuf, String)],
-    ) -> Result<(), ExecError> {
-        let handle = parent_handle(&self.manager, session)?;
-        let items: Vec<serde_json::Value> = match part {
-            "conflicts" => conflicts
-                .iter()
-                .map(|(p, d)| {
-                    serde_json::json!([
-                        p.to_string_lossy(),
-                        d.chars().take(400).collect::<String>()
-                    ])
-                })
-                .collect(),
-            _ => paths
-                .iter()
-                .map(|p| serde_json::json!(p.to_string_lossy()))
-                .collect(),
-        };
-        let chunks = merge::pack_chunks(&items)?;
-        let header = serde_json::json!({ "part": part, "chunks": chunks.len(), "created_ms": self.manager.now_ms() });
-        let header = serde_json::to_string(&header)
-            .map_err(|e| ExecError::Internal(format!("part header: {e}")))?;
-        merge::put_chunks(
-            &handle,
-            SHADOW_MERGE_PART_KIND,
-            &Self::part_key(shadow_id, seq, part),
-            &header,
-            &chunks,
-        )
-    }
-
-    fn read_part(
-        &self,
-        handle: &faktor_session::SessionHandle,
-        shadow_id: &str,
-        seq: u64,
-        part: &str,
-    ) -> Result<Option<Vec<PathBuf>>, ExecError> {
-        let key = Self::part_key(shadow_id, seq, part);
-        let Some((_h, chunks)) = merge::read_chunks(handle, SHADOW_MERGE_PART_KIND, &key)? else {
-            return Ok(None);
-        };
-        let rows: Vec<String> = merge::unpack_chunks(&chunks)?;
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            out.push(merge::validate_rel_path_str(&r)?);
-        }
-        Ok(Some(out))
-    }
-
-    /// Apply ONE approved entry with the wave-10/13 commit-time CAS
-    /// primitives; per-file drift of the user file is a Conflict (the file
-    /// is not merged; the rest of the decision still applies), anything
-    /// else fails the whole commit loudly.
-    fn apply_one(
-        &self,
-        base_root: &Path,
-        shadow: &Shadow,
-        entry: &ChangeEntry,
-        base_idx: &BTreeMap<PathBuf, FileHash>,
-    ) -> Result<(), ApplyFailure> {
-        // The base anchor of the user path: the digest at begin. A path
-        // absent from the base manifest (the user checkout had no such file)
-        // is an exclusive create.
-        let base_hash = entry
-            .base_hash
-            .or_else(|| base_idx.get(&entry.path).copied());
-        let res = match entry.child_hash {
-            Some(child_hash) => faktor_fs::merge_apply_content(
-                base_root,
-                &entry.path,
-                &shadow.root,
-                &entry.path,
-                child_hash,
-                base_hash,
-            ),
-            None => match base_hash {
-                Some(base) => faktor_fs::merge_delete(base_root, &entry.path, base),
-                None => {
-                    return Err(ApplyFailure::Hard(ExecError::Internal(format!(
-                        "staged deletion {:?} has no base anchor",
-                        entry.path.display()
-                    ))))
-                }
-            },
-        };
-        match res {
-            Ok(CasMergeResult::Applied | CasMergeResult::AlreadyCurrent) => Ok(()),
-            Err(e)
-                if matches!(
-                    e.kind,
-                    faktor_core::ErrorKind::Conflict
-                        | faktor_core::ErrorKind::Permission
-                        | faktor_core::ErrorKind::NotFound
-                ) =>
-            {
-                Err(ApplyFailure::Conflict(e.message))
-            }
-            Err(e) => Err(ApplyFailure::Hard(ExecError::from_fs(
-                "shadow integration apply",
-                base_root,
-                e,
-            ))),
-        }
-    }
-
+    /// Test-only stable-copy drift seam: mutates the owner between the
+    /// `before` digest and the copy. Production compiles to a no-op.
     #[cfg(test)]
-    fn check_apply_seam(&self, processed: usize) -> Result<(), ExecError> {
-        let mut guard = self.apply_seam.lock().expect("seam poisoned");
-        if let Some(after) = *guard {
-            if processed > after {
-                // Fire-and-clear: the seam trips ONE apply run of THIS
-                // service instance (other instances in parallel tests are
-                // never affected).
+    fn check_copy_seam(&self, owner: &Path, attempt: usize) {
+        let mut guard = self.copy_seam.lock().expect("copy seam poisoned");
+        let mode = *guard;
+        match mode {
+            Some(ShadowCopyDrift::Once) if attempt == 1 => {
                 *guard = None;
-                return Err(ExecError::InjectedCrashSeam(format!(
-                    "shadow integration apply seam after {after} files"
-                )));
+                let _ = std::fs::write(
+                    owner.join("shadow-copy-drift.txt"),
+                    format!("drift on attempt {attempt}"),
+                );
             }
+            Some(ShadowCopyDrift::Every) => {
+                let _ = std::fs::write(
+                    owner.join("shadow-copy-drift.txt"),
+                    format!("drift on attempt {attempt}"),
+                );
+            }
+            _ => {}
         }
-        Ok(())
     }
 
-    /// Test-only: arm the deterministic apply crash seam of THIS instance.
+    /// Test-only: arm the deterministic stable-copy drift seam of THIS
+    /// service instance.
     #[cfg(test)]
-    pub fn arm_apply_seam(&self, after: usize) {
-        *self.apply_seam.lock().expect("seam poisoned") = Some(after);
+    pub fn arm_copy_drift(&self, mode: ShadowCopyDrift) {
+        *self.copy_seam.lock().expect("copy seam poisoned") = Some(mode);
     }
 
     #[cfg(not(test))]
-    fn check_apply_seam(&self, _processed: usize) -> Result<(), ExecError> {
-        Ok(())
+    fn check_copy_seam(&self, _owner: &Path, _attempt: usize) {}
+}
+
+/// Map a canonical tree-manifest refusal of the shadow copy onto the typed
+/// orchestrator error space: an oversize stays `Oversized` (a refused cap,
+/// never corruption), an unavailable base stays `NotFound`, and every other
+/// refusal (special file, malformed name, i/o) is a typed workspace drift —
+/// the shadow is never begun from a tree the manifest cannot prove.
+fn shadow_copy_error(what: &str, e: faktor_fs::tree_manifest::TreeManifestError) -> ExecError {
+    use faktor_fs::tree_manifest::TreeManifestError as E;
+    match e {
+        E::Oversized(message) => ExecError::Oversized(format!("{what}: {message}")),
+        E::RootUnavailable(message) => ExecError::NotFound(format!("{what}: {message}")),
+        other => ExecError::WorkspaceDrift(format!("{what}: {other}")),
     }
+}
+
+/// Refuse a checkout carrying a symlink that a LITERAL manifest-faithful
+/// copy could not keep inside the daemon-owned shadow: an absolute target
+/// (it would point back at the user checkout) or a relative target that
+/// climbs above `base`. A relative in-root link is copied literally and
+/// resolves inside the shadow exactly as it did in the checkout, so it is
+/// accepted. (The canonical manifest itself hashes link targets literally
+/// and never follows them; this pre-check only keeps `begin_shadow`'s
+/// historic no-escape contract with a manifest-faithful copy.)
+fn reject_escaping_links(base: &Path, max_entries: usize) -> Result<(), ExecError> {
+    use std::path::Component;
+    let manifest = faktor_fs::tree_manifest::tree_manifest(base, max_entries).map_err(|e| {
+        shadow_copy_error(&format!("shadow base manifest of {}", base.display()), e)
+    })?;
+    for entry in manifest.entries() {
+        if entry.kind != faktor_fs::tree_manifest::TreeEntryKind::Symlink {
+            continue;
+        }
+        let path = base.join(&entry.normalized_path);
+        let target = std::fs::read_link(&path).map_err(|e| {
+            ExecError::WorkspaceDrift(format!(
+                "symlink {:?} cannot be read literally: {e}",
+                entry.normalized_path
+            ))
+        })?;
+        let refuse = |detail: String| {
+            ExecError::WorkspaceDrift(format!(
+                "symlink escape rejected: {:?} -> {detail}",
+                entry.normalized_path
+            ))
+        };
+        if target.is_absolute() {
+            return Err(refuse(format!(
+                "{} (an absolute target cannot stay inside the shadow copy)",
+                target.display()
+            )));
+        }
+        // Lexically resolve the relative target against the link's directory;
+        // any climb above the base root is an escape.
+        let mut depth = entry.normalized_path.matches('/').count();
+        for component in target.components() {
+            match component {
+                Component::Normal(_) => depth += 1,
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if depth == 0 {
+                        return Err(refuse(format!(
+                            "{} (climbs above the checkout root)",
+                            target.display()
+                        )));
+                    }
+                    depth -= 1;
+                }
+                _ => {
+                    return Err(refuse(format!("{} (malformed)", target.display())));
+                }
+            }
+        }
+        // A relative link that cannot be resolved even in the checkout would
+        // make the literal shadow copy unusable (and `snapshot_tree` refuses
+        // it later anyway): refuse it here, before anything is written.
+        if std::fs::canonicalize(&path).is_err() {
+            return Err(refuse(format!("{} (broken link)", target.display())));
+        }
+    }
+    Ok(())
 }
 
 impl Drop for ShadowRoots {
@@ -1081,27 +812,6 @@ impl Drop for ShadowRoots {
         // crash that skipped this.
         self.shutdown();
     }
-}
-
-/// Per-file outcome of one CAS apply.
-enum ApplyFailure {
-    Conflict(String),
-    Hard(ExecError),
-}
-
-/// Public helper: an empty decision is `([], [])` — never valid for a
-/// non-empty change set ([`validate_decision`] refuses undecided paths).
-pub fn auto_approve(cs: &ChangeSet) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let mut all: Vec<PathBuf> = cs.files.iter().map(|f| f.path.clone()).collect();
-    all.sort();
-    (all, Vec::new())
-}
-
-/// Convenience: the auto-approve decision of a staged change set (used by
-/// the executor's direct-integration path; exposed for the presentation
-/// surface).
-pub fn shadow_decision_of(cs: &ChangeSet) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    auto_approve(cs)
 }
 
 #[cfg(test)]

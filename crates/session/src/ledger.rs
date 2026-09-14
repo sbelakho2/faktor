@@ -760,6 +760,63 @@ pub struct CompletionStepStatusRow {
     pub at_ms: i64,
 }
 
+/// The explicit outcome of one durable read (mandate: missing vs corrupt).
+/// The four cases are NEVER collapsed: every consumer matches them and
+/// applies its own policy.
+///
+/// - [`Self::Missing`]: the row genuinely does not exist — the caller
+///   applies its migration/not-found policy;
+/// - [`Self::PresentValid`]: present and strictly decoded — the caller uses
+///   it;
+/// - [`Self::PresentMalformed`]: present but undecodable or shape-invalid —
+///   corruption, refused with a typed `CorruptDurableState`, never "absent";
+/// - [`Self::StoreFailure`]: the durable read itself failed (store/I/O) — an
+///   error, never "nothing happened".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableRead<T> {
+    Missing,
+    PresentValid(T),
+    PresentMalformed(String),
+    StoreFailure(String),
+}
+
+impl<T> DurableRead<T> {
+    /// Classify one session-read failure: a strict decode/shape refusal is
+    /// corruption (`PresentMalformed`); everything else is a store failure.
+    pub fn from_session_error(e: SessionError) -> Self {
+        match e {
+            SessionError::Malformed(detail) => Self::PresentMalformed(detail),
+            other => Self::StoreFailure(other.to_string()),
+        }
+    }
+
+    /// The row genuinely does not exist.
+    pub fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
+    /// Present and strictly decoded.
+    pub fn valid_ref(&self) -> Option<&T> {
+        match self {
+            Self::PresentValid(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Present and strictly decoded (owned).
+    pub fn valid(self) -> Option<T> {
+        match self {
+            Self::PresentValid(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Present but corrupt.
+    pub fn is_present_malformed(&self) -> bool {
+        matches!(self, Self::PresentMalformed(_))
+    }
+}
+
 /// One integrated isolated child of an [`IntegrationRecordRow`]: the child,
 /// the staged change-set it contributed and the content digest of its
 /// candidate root at integration time.
@@ -1751,6 +1808,25 @@ pub(crate) fn validate_completion_contract_set(
     Ok(())
 }
 
+/// Shape of one stored TREE-snapshot digest: the versioned canonical
+/// tree-manifest digest (`tm1:` + 64 hex, `faktor_fs::tree_manifest`) or the
+/// legacy 64-char hex content-only digest (accepted so rows written before
+/// the canonical manifest still decode). The two shapes can never compare
+/// equal, so a legacy record fails equality loudly instead of silently
+/// matching the canonical definition.
+fn check_snapshot_digest(value: &str, what: &str) -> Result<(), SessionError> {
+    let legacy =
+        value.len() == MAX_RUN_BASE_DIGEST_BYTES && value.bytes().all(|b| b.is_ascii_hexdigit());
+    if legacy || faktor_fs::tree_manifest::is_tree_manifest_digest(value) {
+        Ok(())
+    } else {
+        Err(SessionError::Malformed(format!(
+            "ledger {what} must be a canonical `tm1:<64-hex>` tree-manifest digest or a \
+             64-char hex legacy digest"
+        )))
+    }
+}
+
 /// Shape bounds of one `completion_step_status` row, shared by the appender
 /// and the strict decoder (a hostile raw row must fail loudly on read too).
 pub(crate) fn validate_completion_step_status(
@@ -1777,12 +1853,13 @@ pub(crate) fn validate_completion_step_status(
         )));
     }
     if let Some(hash) = snapshot {
-        if hash.is_empty()
-            || hash.len() > MAX_VERIFICATION_TREE_HASH_BYTES
-            || !hash.bytes().all(|b| b.is_ascii_hexdigit())
-        {
+        let legacy = !hash.is_empty()
+            && hash.len() <= MAX_VERIFICATION_TREE_HASH_BYTES
+            && hash.bytes().all(|b| b.is_ascii_hexdigit());
+        if !legacy && !faktor_fs::tree_manifest::is_tree_manifest_digest(hash) {
             return Err(SessionError::Malformed(
-                "ledger completion_step_status snapshot must be non-empty hex within \
+                "ledger completion_step_status snapshot must be a canonical `tm1:<64-hex>` \
+                 tree-manifest digest or a non-empty legacy hex digest within \
                  MAX_VERIFICATION_TREE_HASH_BYTES"
                     .into(),
             ));
@@ -1829,13 +1906,13 @@ pub(crate) fn validate_integration_record(
         check_id(base, "base_revision")?;
     }
     if let Some(base) = &record.base_snapshot {
-        check_hex(base, "base_snapshot")?;
+        check_snapshot_digest(base, "base_snapshot")?;
     }
     // Explicit identity fields (hardening): each carries its own bound and
     // shape; the deprecated alias must AGREE with the explicit field when
     // both are present, so a tampered row can never name two base roots.
     if let Some(base) = &record.run_base_snapshot {
-        check_hex(base, "run_base_snapshot")?;
+        check_snapshot_digest(base, "run_base_snapshot")?;
         if record
             .base_snapshot
             .as_deref()
@@ -1847,10 +1924,10 @@ pub(crate) fn validate_integration_record(
         }
     }
     if let Some(candidate) = &record.candidate_snapshot {
-        check_hex(candidate, "candidate_snapshot")?;
+        check_snapshot_digest(candidate, "candidate_snapshot")?;
     }
     if let Some(landed) = &record.landed_snapshot {
-        check_hex(landed, "landed_snapshot")?;
+        check_snapshot_digest(landed, "landed_snapshot")?;
         if !record.final_snapshot_hash.is_empty() && record.final_snapshot_hash != *landed {
             return Err(SessionError::Malformed(
                 "ledger integration_record landed_snapshot and final_snapshot_hash disagree".into(),
@@ -1879,7 +1956,7 @@ pub(crate) fn validate_integration_record(
     // An EMPTY final hash is the record-first in-flight marker; a non-empty
     // one is the binding digest.
     if !record.final_snapshot_hash.is_empty() {
-        check_hex(&record.final_snapshot_hash, "final_snapshot_hash")?;
+        check_snapshot_digest(&record.final_snapshot_hash, "final_snapshot_hash")?;
     }
     if record.integrated_files.len() > MAX_INTEGRATION_FILES {
         return Err(SessionError::Oversized(format!(
@@ -1939,7 +2016,7 @@ pub(crate) fn validate_integration_record(
     for source in &record.sources {
         check_id(&source.child_id, "source child_id")?;
         check_id(&source.change_set_id, "source change_set_id")?;
-        check_hex(&source.candidate_root_hash, "source candidate_root_hash")?;
+        check_snapshot_digest(&source.candidate_root_hash, "source candidate_root_hash")?;
     }
     if record.source_count < record.sources.len() as u64 {
         return Err(SessionError::Malformed(
@@ -1967,15 +2044,6 @@ pub(crate) fn validate_integration_record(
 /// Shape bounds of one `run_base` row, shared by the appender and the
 /// strict decoder.
 pub(crate) fn validate_run_base_record(record: &RunBaseRecord) -> Result<(), SessionError> {
-    let check_hex = |value: &str, what: &str| -> Result<(), SessionError> {
-        if value.len() != MAX_RUN_BASE_DIGEST_BYTES || !value.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            return Err(SessionError::Malformed(format!(
-                "ledger run_base {what} must be the 64-char hex BLAKE3"
-            )));
-        }
-        Ok(())
-    };
     if record.run_id.is_empty() || record.run_id.len() > MAX_INTEGRATION_ID_BYTES {
         return Err(SessionError::Malformed(
             "ledger run_base run_id must be 1..=MAX_INTEGRATION_ID_BYTES".into(),
@@ -1986,8 +2054,17 @@ pub(crate) fn validate_run_base_record(record: &RunBaseRecord) -> Result<(), Ses
             "ledger run_base workspace_id/worktree_id must be non-zero".into(),
         ));
     }
-    check_hex(&record.snapshot_hash, "snapshot_hash")?;
-    check_hex(&record.manifest_digest, "manifest_digest")?;
+    check_snapshot_digest(&record.snapshot_hash, "snapshot_hash")?;
+    let manifest_legacy = record.manifest_digest.len() == MAX_RUN_BASE_DIGEST_BYTES
+        && record
+            .manifest_digest
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit());
+    if !manifest_legacy {
+        return Err(SessionError::Malformed(
+            "ledger run_base manifest_digest must be the 64-char hex BLAKE3".into(),
+        ));
+    }
     if record.root.is_empty() || record.root.len() > MAX_RUN_BASE_ROOT_BYTES {
         return Err(SessionError::Malformed(
             "ledger run_base root must be 1..=MAX_RUN_BASE_ROOT_BYTES".into(),
@@ -2033,8 +2110,8 @@ pub(crate) fn validate_integration_txn(row: &IntegrationTxnRow) -> Result<(), Se
             "ledger integration_txn candidate_root must be 1..=MAX_INTEGRATION_ROOT_BYTES".into(),
         ));
     }
-    check_hex(&row.run_base_snapshot, "run_base_snapshot")?;
-    check_hex(
+    check_snapshot_digest(&row.run_base_snapshot, "run_base_snapshot")?;
+    check_snapshot_digest(
         &row.verified_candidate_snapshot,
         "verified_candidate_snapshot",
     )?;
@@ -3383,6 +3460,43 @@ impl SessionHandle {
         Ok(latest)
     }
 
+    /// [`Self::ledger_completion_contract`] with the explicit read
+    /// classification: a corrupt entry stream is `PresentMalformed` (never
+    /// "no contract"), a failed read is `StoreFailure`, and only a genuinely
+    /// absent contract is `Missing`.
+    pub fn ledger_completion_contract_read(
+        &self,
+        task_id: u64,
+    ) -> DurableRead<CompletionContractRow> {
+        let mut latest: Option<CompletionContractRow> = None;
+        let entries = match self.all_entries_decoded() {
+            Ok(entries) => entries,
+            Err(e) => return DurableRead::from_session_error(e),
+        };
+        for entry in entries {
+            if let LedgerPayload::CompletionContractSet {
+                task_id: row_task,
+                revision,
+                contract,
+            } = entry.payload
+            {
+                if row_task == task_id {
+                    // Entries ascend by seq: the last match wins.
+                    latest = Some(CompletionContractRow {
+                        seq: entry.seq,
+                        task_id: row_task,
+                        revision,
+                        contract,
+                    });
+                }
+            }
+        }
+        match latest {
+            Some(row) => DurableRead::PresentValid(row),
+            None => DurableRead::Missing,
+        }
+    }
+
     /// The exact contract row of one `(task_id, revision)`, if any.
     pub fn ledger_completion_contract_at(
         &self,
@@ -3541,6 +3655,31 @@ impl SessionHandle {
         Ok(latest)
     }
 
+    /// [`Self::ledger_integration_record_for_task`] with the explicit read
+    /// classification (corrupt stream = `PresentMalformed`; failed read =
+    /// `StoreFailure`; genuinely absent = `Missing`).
+    pub fn ledger_integration_record_for_task_read(
+        &self,
+        task_id: u64,
+    ) -> DurableRead<IntegrationRecordRow> {
+        let mut latest: Option<IntegrationRecordRow> = None;
+        let entries = match self.all_entries_decoded() {
+            Ok(entries) => entries,
+            Err(e) => return DurableRead::from_session_error(e),
+        };
+        for entry in entries {
+            if let LedgerPayload::IntegrationRecorded { record } = entry.payload {
+                if record.task_id == task_id {
+                    latest = Some(record);
+                }
+            }
+        }
+        match latest {
+            Some(row) => DurableRead::PresentValid(row),
+            None => DurableRead::Missing,
+        }
+    }
+
     /// Every durable integration record of one task, ascending by seq.
     pub fn ledger_integration_records_for_task(
         &self,
@@ -3585,6 +3724,28 @@ impl SessionHandle {
         Ok(latest)
     }
 
+    /// [`Self::ledger_run_base_get`] with the explicit read classification
+    /// (corrupt stream = `PresentMalformed`; failed read = `StoreFailure`;
+    /// genuinely absent run base = `Missing`, the legacy/direct-run policy).
+    pub fn ledger_run_base_read(&self, run_id: &str) -> DurableRead<RunBaseRecord> {
+        let mut latest: Option<RunBaseRecord> = None;
+        let entries = match self.all_entries_decoded() {
+            Ok(entries) => entries,
+            Err(e) => return DurableRead::from_session_error(e),
+        };
+        for entry in entries {
+            if let LedgerPayload::RunBaseRecorded { record } = entry.payload {
+                if record.run_id == run_id {
+                    latest = Some(record);
+                }
+            }
+        }
+        match latest {
+            Some(row) => DurableRead::PresentValid(row),
+            None => DurableRead::Missing,
+        }
+    }
+
     /// Append one durable landing-transaction row (record-first: decisions +
     /// rollback blobs before the first owner write; later rows journal the
     /// per-path outcomes and the phase).
@@ -3612,6 +3773,28 @@ impl SessionHandle {
             }
         }
         Ok(latest)
+    }
+
+    /// [`Self::ledger_integration_txn_for_run`] with the explicit read
+    /// classification (corrupt stream = `PresentMalformed`; failed read =
+    /// `StoreFailure`; genuinely absent transaction = `Missing`).
+    pub fn ledger_integration_txn_read(&self, run_id: &str) -> DurableRead<IntegrationTxnRow> {
+        let mut latest: Option<IntegrationTxnRow> = None;
+        let entries = match self.all_entries_decoded() {
+            Ok(entries) => entries,
+            Err(e) => return DurableRead::from_session_error(e),
+        };
+        for entry in entries {
+            if let LedgerPayload::IntegrationTxnRecorded { row } = entry.payload {
+                if row.run_id == run_id {
+                    latest = Some(row);
+                }
+            }
+        }
+        match latest {
+            Some(row) => DurableRead::PresentValid(row),
+            None => DurableRead::Missing,
+        }
     }
 
     /// The shared typed append tail: bounds the payload, maps its entry
@@ -5100,6 +5283,82 @@ mod tests {
             contract_v3
         );
         assert_eq!(s2.ledger_completion_step_statuses(7, 4).unwrap().len(), 1);
+    }
+
+    /// FIX 2: the explicit durable-read distinction is never collapsed — a
+    /// missing row, a present valid row, a present corrupt row and a failed
+    /// store read are four distinct outcomes on every classified read.
+    #[test]
+    fn durable_read_distinguishes_missing_valid_malformed_and_store_failure() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        // (1) Missing: nothing was written for these identities.
+        assert!(s.ledger_completion_contract_read(7).is_missing());
+        assert!(s.ledger_run_base_read("run-x").is_missing());
+        assert!(s.ledger_integration_txn_read("run-x").is_missing());
+        assert!(s.ledger_integration_record_for_task_read(7).is_missing());
+        // (2) PresentValid: the typed appenders land decodable rows.
+        let contract = CompletionContract {
+            include_commit: true,
+            include_push: false,
+            include_pr: false,
+        };
+        s.ledger_completion_contract_set(7, 3, &contract)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            s.ledger_completion_contract_read(7),
+            DurableRead::PresentValid(ref row) if row.contract == contract
+        ));
+        s.ledger_run_base_set(&RunBaseRecord {
+            run_id: "run-x".into(),
+            workspace_id: 1,
+            worktree_id: 1,
+            snapshot_hash: format!("tm1:{}", "a".repeat(64)),
+            manifest_digest: "b".repeat(64),
+            root: "/base".into(),
+            created_ms: 1,
+        })
+        .unwrap();
+        assert!(matches!(
+            s.ledger_run_base_read("run-x"),
+            DurableRead::PresentValid(ref row) if row.run_id == "run-x"
+        ));
+        // (3) PresentMalformed: a raw all-false contract row (bypassing the
+        // typed appender) is CORRUPTION on read — never "no contract".
+        let s2 = session(&m);
+        m.store()
+            .append_ledger_entry(
+                s2.id,
+                ENTRY_COMPLETION_CONTRACT_SET,
+                LEDGER_ENTRY_SCHEMA_V,
+                serde_json::json!({
+                    "kind": "completion_contract_set",
+                    "task_id": 9,
+                    "revision": 1,
+                    "contract": {
+                        "include_commit": false,
+                        "include_push": false,
+                        "include_pr": false,
+                    },
+                }),
+            )
+            .unwrap();
+        assert!(
+            s2.ledger_completion_contract_read(9).is_present_malformed(),
+            "a corrupt contract row must classify as PresentMalformed"
+        );
+        // (4) StoreFailure: with the ledger table gone the SAME read is a
+        // failed store read — an error, never Missing and never "valid".
+        m.store().sql_execute("DROP TABLE ledger_entry").unwrap();
+        assert!(matches!(
+            s2.ledger_completion_contract_read(9),
+            DurableRead::StoreFailure(_)
+        ));
+        assert!(matches!(
+            s2.ledger_run_base_read("run-x"),
+            DurableRead::StoreFailure(_)
+        ));
     }
 
     /// Hostile completion rows fail the strict decode and the session-open

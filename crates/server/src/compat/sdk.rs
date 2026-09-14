@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::v756::sdk_invalid_request;
-use super::{submit_and_run, turn_machine_busy, COMPAT_MUTATION_MODE};
+use super::{submit_and_run, turn_machine_busy};
 use crate::api::{AppState, ServerDeps};
 use crate::native::{
     api_err, api_error_json, authed, exec_error_response, not_found, parse_session_id,
@@ -245,18 +245,10 @@ pub(crate) async fn prompt(
     let files = req.files.clone();
     // Synchronous submission so the response carries the TRUE queued state
     // and the REAL operation id (audit: op_id was hardcoded "turn"). The
-    // legacy surface selects the direct mutation policy: the request must
-    // never wait on the executor's synchronous shadow begin.
-    let receipt = match submit_and_run(
-        &state,
-        sid,
-        &prompt_text,
-        &files,
-        None,
-        Some(COMPAT_MUTATION_MODE),
-    )
-    .await
-    {
+    // compat surface imposes no mutation policy: the prompt travels the ONE
+    // executor path and its mutating drive executes in an isolated
+    // candidate (the daemon default).
+    let receipt = match submit_and_run(&state, sid, &prompt_text, &files, None).await {
         Ok(r) => r,
         Err(e) => return exec_error_response(&e),
     };
@@ -454,17 +446,8 @@ pub(crate) async fn sdk_prompt(
     let files = req.files.clone();
     // Synchronous submission so the response carries the TRUE queued state
     // and the REAL operation id (audit: op_id was hardcoded "turn"). The
-    // legacy surface selects the direct mutation policy (see `prompt`).
-    let receipt = match submit_and_run(
-        &state,
-        sid,
-        &prompt_text,
-        &files,
-        None,
-        Some(COMPAT_MUTATION_MODE),
-    )
-    .await
-    {
+    // same no-policy translation as `prompt`: mutating drives isolate.
+    let receipt = match submit_and_run(&state, sid, &prompt_text, &files, None).await {
         Ok(r) => r,
         Err(e) => return exec_error_response(&e),
     };

@@ -1343,6 +1343,7 @@ dependencies = [
  "blake3",
  "faktor-cas",
  "faktor-core",
+ "faktor-fs",
  "faktor-protocol",
  "faktor-store",
  "libc",

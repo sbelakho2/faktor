@@ -78,8 +78,8 @@ impl ShadowRowState {
 pub struct ShadowRow {
     pub session_id: u64,
     pub shadow_id: String,
-    /// The USER checkout the shadow was copied from (the integration
-    /// target of `commit_back`).
+    /// The USER checkout the shadow was copied from (the transactional
+    /// integration target of the executor's landing pipeline).
     pub base_root: String,
     /// The shadow's own root (daemon data dir; never inside the checkout).
     pub root: String,

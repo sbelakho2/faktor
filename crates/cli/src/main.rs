@@ -418,8 +418,9 @@ fn hook_registry(
 /// resolves to `None`, which the resolver turns into the documented Empty
 /// instruction set. While EXACTLY ONE session of the workspace carries a
 /// live shadow row (a shadowed single-agent drive), the workspace's rules
-/// resolve from that shadow root ([tasks] shadow_mutation): the drive reads
-/// the instruction environment of the world it mutates. Ambiguity (more
+/// resolve from that shadow root (P0 isolation: mutating runs always carry
+/// one): the drive reads the instruction environment of the world it
+/// mutates. Ambiguity (more
 /// than one live shadow — hostile residue the executor discipline never
 /// produces) degrades loudly to the stored root, never a guess.
 struct SessionWorkspaceRoots(Arc<SessionManager>);
@@ -946,10 +947,11 @@ fn build_daemon_core(
         warm_ollama(ollama);
     }
     // Steps 14-16 — the orchestration authorities (audits P0-20/21/23/61,
-    // P0-48 + wave-24): OrchestratorRuntime + ShadowRoots + the ONE
+    // P0-48 + P0 isolation): OrchestratorRuntime + ShadowRoots + the ONE
     // TaskExecutor over the SAME orchestrator. The executor ALWAYS carries
-    // the shadow service; the configured MutationMode decides usage only —
-    // DirectCompat keeps every run's direct behavior byte-identical.
+    // the shadow service — the production constructor requires it — so every
+    // mutating run executes in an isolated candidate; no config key, DTO
+    // field or mode value can disable isolation.
     let orchestrator =
         faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
     // Shadow mutation roots: rooted at `<data dir>/shadows`. reconcile()
@@ -961,12 +963,11 @@ fn build_daemon_core(
     if let Err(e) = shadows.reconcile() {
         tracing::warn!(error = %e, "shadow reconcile after daemon start");
     }
-    let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new_with_mode(
+    let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
         &orchestrator,
         session.clone(),
         agent.clone(),
-        Some(shadows.clone()),
-        config.tasks.mutation_mode,
+        shadows.clone(),
     );
     // P2 completion-step execution: the strict `[completion]` section feeds
     // the executor's commit/push/PR policy. An absent section keeps the
@@ -2366,12 +2367,12 @@ mod tests {
     ) -> Arc<faktor_server::native::PromptExecutionService> {
         let orchestrator =
             faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
-        let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
-            &orchestrator,
-            session.clone(),
-            agent.clone(),
-            None,
-        );
+        let tasks =
+            faktor_orchestrator::runtime::task_executor::TaskExecutor::new_owner_direct_for_test_harness(
+                &orchestrator,
+                session.clone(),
+                agent.clone(),
+            );
         faktor_server::native::PromptExecutionService::new(tasks, session.clone())
     }
 
@@ -2713,12 +2714,11 @@ mod tests {
             session.clone(),
             dir.path().join("shadows"),
         );
-        let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new_with_mode(
+        let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
             &orchestrator,
             session.clone(),
             agent.clone(),
-            Some(shadows),
-            faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
+            shadows,
         );
         let service = faktor_server::native::PromptExecutionService::new(tasks, session.clone());
         let backend = DaemonAcpBackend::new(session.clone(), agent.clone(), service.clone());

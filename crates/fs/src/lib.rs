@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 
 pub mod atomic;
 mod platform;
+pub mod tree_manifest;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsEventKind {
@@ -958,7 +959,7 @@ pub fn copy_tree_skip(
                 .ok_or_else(|| Error::malformed(format!("copy target {target:?} has no parent")))?;
             fs::create_dir_all(parent)
                 .map_err(|e| Error::internal(format!("mkdir {}: {e}", parent.display())))?;
-            let (n, hash) = copy_open_file(f, &target)?;
+            let (n, hash) = copy_open_file(f, &target, Some(meta.permissions()))?;
             if n != size {
                 // The file changed size mid-copy (an in-place, non-atomic
                 // writer): loud — never a silently torn copy.
@@ -1563,9 +1564,17 @@ fn hash_open_file(f: &fs::File) -> Result<(u64, FileHash), Error> {
 }
 
 /// Stream-copy an already-open source handle into `target` with the durable
-/// atomic sequence: unique temp + fsync + rename + parent fsync. Returns
-/// (bytes copied, hash of the copied content). Never skips, never tears.
-fn copy_open_file(f: &fs::File, target: &Path) -> Result<(u64, FileHash), Error> {
+/// atomic sequence: unique temp + (optional permission bits) + fsync +
+/// rename + parent fsync. Returns (bytes copied, hash of the copied
+/// content). Never skips, never tears. `permissions` is `Some` for the
+/// canonical manifest copy and for the stable tree copies (which must
+/// preserve the executable bit the tree identity hashes); `None` keeps the
+/// caller-created default bits.
+pub(crate) fn copy_open_file(
+    f: &fs::File,
+    target: &Path,
+    permissions: Option<fs::Permissions>,
+) -> Result<(u64, FileHash), Error> {
     let parent = target
         .parent()
         .ok_or_else(|| Error::malformed(format!("{target:?} has no parent")))?;
@@ -1599,6 +1608,10 @@ fn copy_open_file(f: &fs::File, target: &Path) -> Result<(u64, FileHash), Error>
                 .map_err(|e| Error::internal(format!("write {}: {e}", tmp.display())))?;
             hasher.update(&buf[..r]);
             copied += r as u64;
+        }
+        if let Some(perms) = permissions {
+            out.set_permissions(perms)
+                .map_err(|e| Error::internal(format!("set permissions {}: {e}", tmp.display())))?;
         }
         out.flush()
             .map_err(|e| Error::internal(format!("flush {}: {e}", tmp.display())))?;

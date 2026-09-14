@@ -135,13 +135,23 @@ impl ServerDeps {
     ) -> Self {
         let orchestrator =
             faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
-        // No shadow service in this embedded/test shape (test harnesses);
-        // the daemon's ONE TaskExecutor construction path is the CLI graph.
+        // The embedded host carries the SAME isolation authority the daemon
+        // graph does: the shadow service rooted beside the store's data dir.
+        // Mutating runs therefore always execute in an isolated candidate —
+        // there is no no-shadow production constructor.
+        let shadows_root = session
+            .store()
+            .path()
+            .parent()
+            .map(|dir| dir.join("shadows"))
+            .unwrap_or_else(|| std::env::temp_dir().join("faktor-shadows"));
+        let shadows =
+            faktor_orchestrator::runtime::shadow::ShadowRoots::new(session.clone(), shadows_root);
         let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
             &orchestrator,
             session.clone(),
             agent.clone(),
-            None,
+            shadows,
         );
         let budgets = faktor_session::DurableBudgetLedger::new(session.clone());
         Self::new_with(session, agent, permissions, orchestrator, tasks, budgets)
@@ -651,12 +661,12 @@ mod tests {
     ) {
         let orchestrator =
             faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
-        let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
-            &orchestrator,
-            session,
-            agent,
-            None,
-        );
+        let tasks =
+            faktor_orchestrator::runtime::task_executor::TaskExecutor::new_owner_direct_for_test_harness(
+                &orchestrator,
+                session,
+                agent,
+            );
         (orchestrator, tasks)
     }
 
@@ -10191,7 +10201,6 @@ mod tests {
         scripts: Vec<Vec<faktor_provider::ScriptedResponse>>,
         parked_write: bool,
         service: bool,
-        mode: faktor_orchestrator::runtime::task_executor::MutationMode,
     ) -> NativeTaskRig {
         use faktor_core::model::ModelCapabilities;
         let paced = PacedScriptedProvider::new(
@@ -10202,7 +10211,34 @@ mod tests {
             scripts,
             5,
         );
-        native_task_rig_with_provider(root, paced, parked_write, service, mode)
+        native_task_rig_with_provider(root, paced, parked_write, service)
+    }
+
+    /// [`native_task_rig`] with the always-pass verification seam wired, so
+    /// the executor's own isolation pipeline (prepare → verify → land →
+    /// complete → retire) runs end to end without a human certification.
+    fn native_task_rig_verified(
+        root: &std::path::Path,
+        scripts: Vec<Vec<faktor_provider::ScriptedResponse>>,
+        parked_write: bool,
+        service: bool,
+    ) -> NativeTaskRig {
+        use faktor_core::model::ModelCapabilities;
+        let paced = PacedScriptedProvider::new(
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            },
+            scripts,
+            5,
+        );
+        native_task_rig_with_provider_and_verification(
+            root,
+            paced,
+            parked_write,
+            service,
+            faktor_agent::VerificationService::fake_ok(),
+        )
     }
 
     /// The same rig with an EXPLICIT provider: the deterministic
@@ -10213,7 +10249,22 @@ mod tests {
         provider: Arc<dyn faktor_provider::Provider>,
         parked_write: bool,
         service: bool,
-        mode: faktor_orchestrator::runtime::task_executor::MutationMode,
+    ) -> NativeTaskRig {
+        native_task_rig_with_provider_and_verification(
+            root,
+            provider,
+            parked_write,
+            service,
+            faktor_agent::VerificationService::disabled(),
+        )
+    }
+
+    fn native_task_rig_with_provider_and_verification(
+        root: &std::path::Path,
+        provider: Arc<dyn faktor_provider::Provider>,
+        parked_write: bool,
+        service: bool,
+        verification: Arc<faktor_agent::VerificationService>,
     ) -> NativeTaskRig {
         use faktor_core::id::{TaskId, WorktreeId};
         let manager = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
@@ -10246,7 +10297,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
-            verification: faktor_agent::VerificationService::disabled(),
+            verification,
             hooks: None,
             instructions_resolver: resolver,
             routing: faktor_agent::FixedRoutingPolicy::passthrough(),
@@ -10286,19 +10337,19 @@ mod tests {
                 manager.clone(),
                 root.join("shadows"),
             );
-            faktor_orchestrator::runtime::task_executor::TaskExecutor::new_with_mode(
-                &orchestrator,
-                manager.clone(),
-                agent.clone(),
-                Some(shadows),
-                mode,
-            )
-        } else {
             faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
                 &orchestrator,
                 manager.clone(),
                 agent.clone(),
-                None,
+                shadows,
+            )
+        } else {
+            // Owner-direct low-level harness: the cfg/test-gated seam.
+            // Production code can only construct the isolating executor.
+            faktor_orchestrator::runtime::task_executor::TaskExecutor::new_owner_direct_for_test_harness(
+                &orchestrator,
+                manager.clone(),
+                agent.clone(),
             )
         };
         let deps = ServerDeps {
@@ -10430,7 +10481,7 @@ mod tests {
         // checkout through the executor's own settle paths (never a manual
         // finalize call from the test).
         let dir = tempfile::tempdir().unwrap();
-        let rig = native_task_rig(
+        let rig = native_task_rig_verified(
             dir.path(),
             vec![
                 vec![
@@ -10449,7 +10500,6 @@ mod tests {
             ],
             true,
             true,
-            faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
         );
         seed_native_owner(&rig.owner_root);
         let NativeTaskRig {
@@ -10545,18 +10595,13 @@ mod tests {
             assert_eq!(one.get(key), entry.get(key), "{key}");
         }
 
-        // Release the drive; the verified completion (certified through the
-        // durable machine) integrates through the executor's own settle
-        // paths — no finalize endpoint, no manual call.
+        // Release the drive; the executor's own isolation pipeline
+        // (prepare the candidate from the shadow run base → verify the
+        // CANDIDATE with the configured verifier → land the owner
+        // transactionally → complete the manifest-bound task → retire the
+        // shadow) runs through its settle paths — no finalize endpoint, no
+        // manual certification.
         gate.notify_waiters();
-        native_wait_session_state(
-            &manager,
-            sid,
-            faktor_core::state::AgentState::ReadyForNextTurn,
-        )
-        .await;
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        certify_native_task(&manager, sid);
         for _ in 0..600 {
             let ok = std::fs::read(owner_root.join("src/lib.rs"))
                 .map(|b| b == NATIVE_IMPL_LIB_RS.as_bytes())
@@ -10623,7 +10668,6 @@ mod tests {
             ],
             false,
             true,
-            faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
         );
         seed_native_owner(&rig.owner_root);
         let NativeTaskRig {
@@ -10806,7 +10850,6 @@ mod tests {
             ],
             false,
             false,
-            faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
         );
         seed_native_owner(&rig.owner_root);
         let NativeTaskRig {
@@ -11043,14 +11086,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sdk_compat_prompt_translates_to_the_one_executor_with_direct_mutation() {
+    async fn sdk_compat_prompt_translates_to_the_one_executor_and_isolates_mutation() {
         // Ordinary chat through the SDK compatibility surface
         // (`POST /session/{id}/prompt`) goes through
         // PromptExecutionService -> TaskExecutor (the durable in-session run
-        // appears in the native task-run listing) and the write lands in the
-        // OWNER checkout: compatibility surfaces translate the mutation
-        // policy as direct (COMPAT_MUTATION_MODE) because they must never
-        // wait on the executor's synchronous O(workspace) shadow begin.
+        // appears in the native task-run listing). The compat surfaces no
+        // longer force a mutation policy (the old COMPAT_MUTATION_MODE
+        // forcing is deleted): the daemon default applies, so the write
+        // lands in the ISOLATED candidate and the owner checkout stays
+        // byte-untouched.
         let dir = tempfile::tempdir().unwrap();
         let rig = native_task_rig(
             dir.path(),
@@ -11068,7 +11112,6 @@ mod tests {
             ]],
             false,
             true,
-            faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
         );
         seed_native_owner(&rig.owner_root);
         let NativeTaskRig {
@@ -11104,17 +11147,22 @@ mod tests {
             faktor_core::state::AgentState::ReadyForNextTurn,
         )
         .await;
-        // Direct mutation: the owner checkout holds the edit, no shadow was
-        // ever begun (the synchronous O(workspace) copy never rides the
-        // legacy request).
-        assert!(
-            manager.shadow_row(sid).unwrap().is_none(),
-            "compat prompts select the direct mutation policy"
+        // Isolated mutation: the write landed in the daemon-owned candidate;
+        // the owner checkout is byte-untouched.
+        let row = manager
+            .shadow_row(sid)
+            .unwrap()
+            .expect("a compat mutating prompt must isolate");
+        assert_eq!(row.state, faktor_session::ShadowRowState::Active);
+        assert_eq!(
+            std::fs::read(std::path::PathBuf::from(&row.root).join("src/lib.rs")).unwrap(),
+            NATIVE_IMPL_LIB_RS.as_bytes(),
+            "the compat drive wrote the isolated candidate"
         );
         assert_eq!(
             std::fs::read(owner_root.join("src/lib.rs")).unwrap(),
-            NATIVE_IMPL_LIB_RS.as_bytes(),
-            "the compat drive wrote the owner checkout directly"
+            NATIVE_OWNER_LIB_RS.as_bytes(),
+            "the owner checkout is byte-untouched"
         );
         // ONE execution path: the durable in-session run linkage row exists
         // and is listed by the native surface.
@@ -11166,7 +11214,6 @@ mod tests {
             ]],
             false,
             true,
-            faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
         );
         seed_native_owner(&rig.owner_root);
         let NativeTaskRig {
@@ -11216,18 +11263,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn frozen_wire_message_returns_promptly_without_shadow_copy_and_keeps_shape() {
-        // Regression (JetBrains split-mode smoke): the frozen v7.5.6
-        // `POST /session/{id}/message` was translated into the executor's
-        // production default (Shadow), so `TaskExecutor::start_in_session`
-        // ran a SYNCHRONOUS `ShadowRoots::begin_shadow` copy of the session
-        // workspace inline in the request. With the smoke's workspace (the
-        // daemon CWD: a huge checkout) the POST blew the 5 s wire timeout,
-        // and the synchronous copy wedged every other route. The compat
-        // translation must select DirectCompat for the frozen wire: the
-        // prompt still travels the ONE execution path (durable run row,
-        // detached recoverable drive), but the request never waits on the
-        // unrelated shadow-begin background work.
+    async fn frozen_wire_message_rides_the_isolated_executor_and_keeps_shape() {
+        // P0 isolation: the frozen v7.5.6 `POST /session/{id}/message` no
+        // longer forces a direct mutation policy (the old
+        // COMPAT_MUTATION_MODE forcing is deleted). The prompt still travels
+        // the ONE execution path (PromptExecutionService → TaskExecutor,
+        // durable run row, detached recoverable drive) and its mutating
+        // drive begins the daemon-owned isolated candidate; the wire still
+        // answers promptly and keeps the frozen shape. (The synchronous
+        // begin-shift latency concern is deferred to the later compat-removal
+        // wave; the isolation mandate wins.)
         let dir = tempfile::tempdir().unwrap();
         // Deterministic failure injection: an explicit stub whose stream
         // returns a TYPED provider error before any chunk, on every
@@ -11235,13 +11280,8 @@ mod tests {
         // workspace-path or host-speed dependence); it still travels the
         // ONE executor path (durable run row, detached recoverable drive)
         // and must surface the honest frozen-wire 502.
-        let rig = native_task_rig_with_provider(
-            dir.path(),
-            Arc::new(AlwaysFailsProvider),
-            false,
-            true,
-            faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
-        );
+        let rig =
+            native_task_rig_with_provider(dir.path(), Arc::new(AlwaysFailsProvider), false, true);
         seed_native_owner(&rig.owner_root);
         let NativeTaskRig {
             deps,
@@ -11255,11 +11295,9 @@ mod tests {
         let base = format!("http://{}", handle.addr);
         let basic = |r: reqwest::RequestBuilder| r.basic_auth("kilo", Some(pw.as_str()));
 
-        // Bounded, not host-speed-bound: a handler that wedges forever
-        // (e.g. on a synchronous shadow copy) still fails this test; the
-        // deterministic typed failure above lands the machine terminal on
-        // any host, and the no-shadow assertion below proves the actual
-        // regression contract.
+        // Bounded, not host-speed-bound: a handler that wedges forever still
+        // fails this test; the deterministic typed failure above lands the
+        // machine terminal on any host.
         let resp =
             tokio::time::timeout(
                 Duration::from_secs(90),
@@ -11283,11 +11321,13 @@ mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["ok"], false, "frozen failure shape: {body}");
         assert!(body["message"].is_string(), "{body}");
-        // The wire flow selected the direct path: no shadow was ever begun
-        // (the synchronous O(workspace) copy is exactly the regression).
+        // The wire flow rode the isolating executor: the mutating drive
+        // began the daemon-owned isolated candidate (the old direct forcing
+        // is gone). The failed drive's candidate is retired/discarded by the
+        // settlement, so only the durable row is asserted here.
         assert!(
-            manager.shadow_row(sid).unwrap().is_none(),
-            "the frozen wire must not begin a shadow worktree copy"
+            manager.shadow_row(sid).unwrap().is_some(),
+            "the frozen wire must ride the isolated (shadow) executor now"
         );
         // The smoke's settle predicate: the turn lands terminal, never stuck
         // mid-machine. Deadline-based like the POST bound above — a slow
@@ -11352,13 +11392,7 @@ mod tests {
         // on the durable assignment rows.
         use faktor_orchestrator::runtime::OrchestratorRuntime;
         let dir = tempfile::tempdir().unwrap();
-        let rig = native_task_rig(
-            dir.path(),
-            vec![],
-            false,
-            false,
-            faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
-        );
+        let rig = native_task_rig(dir.path(), vec![], false, false);
         seed_native_owner(&rig.owner_root);
         let NativeTaskRig {
             deps,
@@ -11428,13 +11462,7 @@ mod tests {
         use crate::native::{set_prompt_observer, PromptCallKind};
         use std::sync::Mutex;
         let dir = tempfile::tempdir().unwrap();
-        let rig = native_task_rig(
-            dir.path(),
-            vec![],
-            false,
-            false,
-            faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
-        );
+        let rig = native_task_rig(dir.path(), vec![], false, false);
         seed_native_owner(&rig.owner_root);
         let NativeTaskRig {
             deps,
@@ -11513,122 +11541,133 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn native_task_run_direct_compat_mode_is_byte_identical_to_no_service() {
-        // The HTTP parity test: the same goal/scripts on (a) a daemon
-        // carrying the shadow service in DirectCompat mode (the configured
-        // production escape hatch) and (b) a daemon without any shadow
-        // service (the historical wiring) must produce byte-identical
-        // outcomes — DirectCompat selects the direct workspace and nothing
-        // else.
-        async fn drive_one(
-            root: &std::path::Path,
-            service: bool,
-        ) -> (Vec<u8>, i64, serde_json::Value) {
-            let rig = native_task_rig(
-                root,
-                vec![
-                    vec![
-                        faktor_provider::ScriptedResponse::ToolCall {
-                            id: "c1".into(),
-                            name: "write_file".into(),
-                            input: serde_json::json!({
-                                "path": "src/lib.rs",
-                                "content": "pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n",
-                            }),
-                        },
-                        faktor_provider::ScriptedResponse::Text("done".into()),
-                        faktor_provider::ScriptedResponse::End,
-                    ],
-                    vec![faktor_provider::ScriptedResponse::End],
-                ],
-                false,
-                service,
-                faktor_orchestrator::runtime::task_executor::MutationMode::DirectCompat,
-            );
-            seed_native_owner(&rig.owner_root);
-            let NativeTaskRig {
-                deps,
-                manager,
-                parent: sid,
-                owner_root,
-                ..
-            } = rig;
-            let token = deps.auth_token.clone();
-            let handle = serve(deps, 0).await.unwrap();
-            let base = format!("http://{}", handle.addr);
-            let client = reqwest::Client::new();
-            // mutation_mode omitted: the daemon default decides
-            // (DirectCompat on the service daemon; no service on the
-            // historical one).
-            let resp = client
-                .post(format!("{base}/native/session/{sid}/task-runs"))
-                .bearer_auth(token.as_str())
-                .json(&serde_json::json!({"goal": "implement the change"}))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), 200);
-            let start: serde_json::Value = resp.json().await.unwrap();
-            assert!(
-                start["run_id"].as_str().unwrap().starts_with("tx-"),
-                "{start}"
-            );
-            assert_eq!(start["task_id"], 1);
-            native_wait_session_state(
-                &manager,
-                sid,
-                faktor_core::state::AgentState::ReadyForNextTurn,
-            )
-            .await;
-            // DirectCompat never shadows — even when the service exists.
-            assert!(
-                manager.shadow_row(sid).unwrap().is_none(),
-                "no shadow row may exist"
-            );
-            assert_eq!(manager.active_root(sid).unwrap(), None, "no re-pointing");
-            let final_bytes = std::fs::read(owner_root.join("src/lib.rs")).unwrap();
-            let h = manager.get_session(sid).unwrap().unwrap();
-            let messages = h.message_count().unwrap();
-            // A completed run reads Done on the per-run surface.
-            let mut done = None;
-            for _ in 0..1200 {
-                let resp = client
-                    .get(format!(
-                        "{base}/native/session/{sid}/task-runs/{}",
-                        start["run_id"].as_str().unwrap()
-                    ))
-                    .bearer_auth(token.as_str())
-                    .send()
-                    .await
-                    .unwrap();
-                let v: serde_json::Value = resp.json().await.unwrap();
-                done = Some(v.clone());
-                if v["state"] == "Done" {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            let _ = handle.shutdown.send(());
-            (final_bytes, messages, done.unwrap())
-        }
+    async fn native_task_run_start_always_isolates_and_direct_compat_is_a_400() {
+        // P0 isolation over the HTTP edge: (a) the removed `direct_compat`
+        // value is a strict DTO rejection (400) before any drive or durable
+        // run row; (b) the same start under the (wire-only) shadow policy
+        // begins the isolated candidate — the owner checkout stays
+        // byte-untouched MID-drive, and the write lands in the candidate.
         let dir = tempfile::tempdir().unwrap();
-        let (bytes_a, msgs_a, run_a) = drive_one(&dir.path().join("direct"), true).await;
-        let (bytes_b, msgs_b, run_b) = drive_one(&dir.path().join("plain"), false).await;
+        let rig = native_task_rig(
+            dir.path(),
+            vec![
+                vec![
+                    faktor_provider::ScriptedResponse::ToolCall {
+                        id: "c1".into(),
+                        name: "write_file".into(),
+                        input: serde_json::json!({
+                            "path": "src/lib.rs",
+                            "content": NATIVE_IMPL_LIB_RS,
+                        }),
+                    },
+                    faktor_provider::ScriptedResponse::Text("done".into()),
+                    faktor_provider::ScriptedResponse::End,
+                ],
+                vec![faktor_provider::ScriptedResponse::End],
+            ],
+            true,
+            true,
+        );
+        seed_native_owner(&rig.owner_root);
+        let NativeTaskRig {
+            deps,
+            manager,
+            parent: sid,
+            owner_root,
+            gate,
+            fired,
+            ..
+        } = rig;
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        // (a) the removed escape hatch is a strict 400 and never drives.
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/task-runs"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({
+                "goal": "implement the change",
+                "mutation_mode": "direct_compat",
+            }))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(
-            bytes_a, bytes_b,
-            "byte-identical owner content on both sides"
+            resp.status(),
+            400,
+            "direct_compat must stay a strict DTO 400"
         );
         assert_eq!(
-            String::from_utf8_lossy(&bytes_a),
-            "pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n"
+            manager
+                .get_session(sid)
+                .unwrap()
+                .unwrap()
+                .message_count()
+                .unwrap(),
+            0,
+            "a refused DTO never drives"
         );
-        // Durable parity: same message streams, same run projections.
-        assert_eq!(msgs_a, msgs_b, "byte-identical message streams");
-        assert_eq!(run_a["state"], run_b["state"]);
-        assert_eq!(run_a["goal"], run_b["goal"]);
-        assert_eq!(run_a["item_ids"], run_b["item_ids"]);
-        assert_eq!(run_a["task_id"], run_b["task_id"]);
-        assert_eq!(run_a["mode"], "in_session");
+        assert!(
+            manager.shadow_row(sid).unwrap().is_none(),
+            "a refused DTO never begins a shadow"
+        );
+
+        // (b) the same start under the only decodable policy isolates.
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/task-runs"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({
+                "goal": "implement the change",
+                "mutation_mode": "shadow",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let row = manager
+            .shadow_row(sid)
+            .unwrap()
+            .expect("a mutating task-run must isolate");
+        assert_eq!(row.state, faktor_session::ShadowRowState::Active);
+        // The parked write fired inside the candidate and parked the drive;
+        // the owner checkout is STILL byte-untouched mid-drive.
+        for _ in 0..3000 {
+            if fired.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read(std::path::PathBuf::from(&row.root).join("src/lib.rs")).unwrap(),
+            NATIVE_IMPL_LIB_RS.as_bytes(),
+            "the write landed in the isolated candidate"
+        );
+        assert_eq!(
+            std::fs::read(owner_root.join("src/lib.rs")).unwrap(),
+            NATIVE_OWNER_LIB_RS.as_bytes(),
+            "the owner checkout is byte-untouched mid-drive"
+        );
+        gate.notify_waiters();
+        native_wait_session_state(
+            &manager,
+            sid,
+            faktor_core::state::AgentState::ReadyForNextTurn,
+        )
+        .await;
+        assert_eq!(
+            std::fs::read(std::path::PathBuf::from(&row.root).join("src/lib.rs")).unwrap(),
+            NATIVE_IMPL_LIB_RS.as_bytes(),
+            "the write stays in the isolated candidate"
+        );
+        assert_eq!(
+            std::fs::read(owner_root.join("src/lib.rs")).unwrap(),
+            NATIVE_OWNER_LIB_RS.as_bytes(),
+            "the owner checkout stayed byte-untouched"
+        );
+        let _ = handle.shutdown.send(());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11661,6 +11700,8 @@ mod tests {
             serde_json::json!({"goal": ""}),
             serde_json::json!({"goal": "x", "bogus": 1}),
             serde_json::json!({"goal": "x", "mutation_mode": "nonsense"}),
+            // The removed direct-owner mode stays a strict DTO 400.
+            serde_json::json!({"goal": "x", "mutation_mode": "direct_compat"}),
             serde_json::json!({"goal": "x", "mutation_mode": "Shadow"}),
             serde_json::json!({"goal": "x", "routing_mode": "economy"}),
             serde_json::json!({"goal": oversized_goal}),
@@ -11744,6 +11785,7 @@ mod tests {
             serde_json::json!({"goal": "x", "criteria": ["c"], "n": "two"}),
             serde_json::json!({"goal": "x", "criteria": ["c"], "n": 2, "bogus": 1}),
             serde_json::json!({"goal": "x", "criteria": ["c"], "n": 2, "mutation_mode": "nonsense"}),
+            serde_json::json!({"goal": "x", "criteria": ["c"], "n": 2, "mutation_mode": "direct_compat"}),
             serde_json::json!({"goal": oversized_goal, "criteria": ["c"], "n": 2}),
             serde_json::json!({"goal": "x", "criteria": ["c".repeat(600)], "n": 2}),
         ];
