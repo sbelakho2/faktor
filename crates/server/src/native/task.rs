@@ -142,10 +142,11 @@ pub(crate) async fn native_task_run_state(
 /// The strict request DTO of ONE native task start
 /// (`POST /native/session/{id}/task-runs`). `work_items` is optional: an
 /// absent list starts the goal as a single MUTATING work item (`main`) —
-/// under the production default (`mutation_mode: shadow` omitted) that run
-/// works in a daemon-owned shadow of the checkout and integrates on a
-/// verified completion. `criteria` ride the durable task row's acceptance
-/// criteria. `mutation_mode` overrides the daemon default for this run.
+/// that run ALWAYS works in a daemon-owned isolated candidate and
+/// integrates on a verified completion. `criteria` ride the durable task
+/// row's acceptance criteria. `mutation_mode` is wire-compat vocabulary
+/// only (the sole decodable value is `shadow`; `direct_compat` is a strict
+/// decode error naming the removal) — it can never disable isolation.
 /// `ownership` is the LEGACY plan-global value of old clients: it is
 /// converted ONCE onto mutating items that carry no explicit ownership of
 /// their own (per-item `work_items[].ownership` always wins); the converted
@@ -469,9 +470,9 @@ pub(crate) async fn native_task_run_cancel(
 /// (`POST /native/session/{id}/tournament`). `n` is the candidate count
 /// (the executor enforces the typed 2..=4 band), `criteria` the acceptance
 /// criteria fanned out byte-identically to every candidate, and
-/// `mutation_mode` overrides the daemon default for the candidate drives.
-/// Unknown fields, typos, a missing body field or an out-of-band `n` are
-/// plain 400s.
+/// `mutation_mode` wire-compat vocabulary only (sole value: `shadow`;
+/// candidates are always isolated worktrees). Unknown fields, typos, a
+/// missing body field or an out-of-band `n` are plain 400s.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StartTournamentRequest {

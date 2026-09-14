@@ -2158,8 +2158,11 @@ fn owner_read(env: &Env, rel: &str) -> Vec<u8> {
 }
 
 fn owner_digest(env: &Env) -> String {
-    faktor_session::root_snapshot_digest(&env.owner.root, faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES)
-        .unwrap()
+    faktor_fs::tree_manifest::tree_manifest_digest(
+        &env.owner.root,
+        faktor_fs::tree_manifest::MAX_TREE_MANIFEST_ENTRIES,
+    )
+    .unwrap()
 }
 
 fn child_dir(env: &Env, run_id: &str, child_id: &str) -> std::path::PathBuf {

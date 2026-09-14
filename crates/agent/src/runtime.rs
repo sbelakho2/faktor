@@ -13542,13 +13542,17 @@ impl ReadOnlyRepo for CandidateRepo {
     }
 }
 
-/// Best-effort candidate snapshot id of the verification root. An
-/// unreadable/oversized root yields the honest `snapshot-unavailable` id —
-/// never a guessed digest.
+/// Best-effort canonical tree-manifest digest of the verification root
+/// (`tm1:<64-hex>`, the ONE tree identity shared with run bases, candidates,
+/// integration records and completion gates). An unreadable/oversized root —
+/// or one carrying special files, where tree equality is unprovable — yields
+/// the honest `snapshot-unavailable` id, never a guessed digest.
 fn root_snapshot_best_effort(ws: &faktor_fs::WorkspaceHandle) -> String {
-    faktor_session::root_snapshot_digest(ws.root(), faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES)
-        .map(|digest| format!("blake3:{digest}"))
-        .unwrap_or_else(|_| "snapshot-unavailable".into())
+    faktor_fs::tree_manifest::tree_manifest_digest(
+        ws.root(),
+        faktor_fs::tree_manifest::MAX_TREE_MANIFEST_ENTRIES,
+    )
+    .unwrap_or_else(|_| "snapshot-unavailable".into())
 }
 
 /// Evidence resolver over the attempt's OWN observed artifacts: check rows,

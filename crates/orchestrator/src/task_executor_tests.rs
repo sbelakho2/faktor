@@ -43,8 +43,8 @@ use crate::runtime::completion_steps::commit_message;
 use crate::runtime::shadow::{ShadowCopyLimits, ShadowRoots};
 use crate::runtime::task_executor::{
     compose_no_op_root_verification_status, compose_root_verification_status, MutationMode,
-    PreparedRunIntegration, RunSettlement, SettlementOutcome, TaskExecutor, TaskRunMode,
-    TaskRunRequest, TaskRunRow, TASK_RUN_ROW_KIND,
+    PreparedRunIntegration, RunSettlement, SettlementOutcome, ShadowFinalizeAction, TaskExecutor,
+    TaskRunMode, TaskRunRequest, TaskRunRow, TASK_RUN_ROW_KIND,
 };
 use crate::runtime::{CrashSeam, ExecError, OrchestratorRuntime};
 use crate::{OwnershipSpec, TaskPlan, WorkItem, WorkKind};
@@ -326,21 +326,18 @@ fn open_env_with_shadows(
     std::fs::create_dir_all(&isolated_root).unwrap();
     let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
     let shadows_root = root.join("shadows");
-    let shadows = if shadowed {
-        Some(ShadowRoots::new_with_limits(
-            manager.clone(),
-            shadows_root.clone(),
-            limits,
-        ))
+    let executor = if shadowed {
+        let shadows = ShadowRoots::new_with_limits(manager.clone(), shadows_root.clone(), limits);
+        TaskExecutor::new(&orchestrator, manager.clone(), agent.clone(), shadows)
     } else {
-        None
+        // Low-level owner-direct suite: the cfg(test) seam (no shadow
+        // service). Production code cannot construct this.
+        TaskExecutor::new_owner_direct_for_test_harness(
+            &orchestrator,
+            manager.clone(),
+            agent.clone(),
+        )
     };
-    let executor = TaskExecutor::new(
-        &orchestrator,
-        manager.clone(),
-        agent.clone(),
-        shadows.clone(),
-    );
     Arc::new(Env {
         manager,
         agent,
@@ -354,6 +351,18 @@ fn open_env_with_shadows(
 }
 
 fn build_agent(manager: Arc<SessionManager>, registry: ProviderRegistry) -> Arc<AgentRuntime> {
+    build_agent_with_verification(
+        manager,
+        registry,
+        faktor_agent::VerificationService::disabled(),
+    )
+}
+
+fn build_agent_with_verification(
+    manager: Arc<SessionManager>,
+    registry: ProviderRegistry,
+    verification: Arc<faktor_agent::VerificationService>,
+) -> Arc<AgentRuntime> {
     AgentRuntime::new(AgentDeps {
         session: manager.clone(),
         providers: Arc::new(registry),
@@ -367,7 +376,7 @@ fn build_agent(manager: Arc<SessionManager>, registry: ProviderRegistry) -> Arc<
         snapshots: None,
         sandbox: None,
         supervisor: None,
-        verification: faktor_agent::VerificationService::disabled(),
+        verification,
         hooks: None,
         instructions_resolver: faktor_instructions::no_roots_resolver(),
         routing: faktor_agent::FixedRoutingPolicy::passthrough(),
@@ -900,7 +909,11 @@ async fn second_orchestrated_run_is_refused_while_one_is_active() {
     let isolated = dir.path().join("isolated");
     std::fs::create_dir_all(&isolated).unwrap();
     let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
-    let executor = TaskExecutor::new(&orchestrator, manager.clone(), agent.clone(), None);
+    let executor = TaskExecutor::new_owner_direct_for_test_harness(
+        &orchestrator,
+        manager.clone(),
+        agent.clone(),
+    );
 
     let req = || TaskRunRequest {
         goal: "gated run".into(),
@@ -1011,7 +1024,11 @@ async fn runs_of_two_parent_sessions_proceed_concurrently_past_a_provider_barrie
     let isolated = dir.path().join("isolated");
     std::fs::create_dir_all(&isolated).unwrap();
     let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
-    let executor = TaskExecutor::new(&orchestrator, manager.clone(), agent.clone(), None);
+    let executor = TaskExecutor::new_owner_direct_for_test_harness(
+        &orchestrator,
+        manager.clone(),
+        agent.clone(),
+    );
 
     let req_for = |isolated: std::path::PathBuf| TaskRunRequest {
         goal: "parallel analysis run".into(),
@@ -1347,7 +1364,8 @@ fn hostile_requests_are_rejected_before_any_write() {
         .id();
     let agent = build_agent(manager.clone(), ProviderRegistry::new());
     let orch = OrchestratorRuntime::new(manager.clone(), agent.clone());
-    let executor = TaskExecutor::new(&orch, manager.clone(), agent.clone(), None);
+    let executor =
+        TaskExecutor::new_owner_direct_for_test_harness(&orch, manager.clone(), agent.clone());
     let isolated = dir.path().join("isolated");
 
     let mut req = TaskRunRequest {
@@ -1499,55 +1517,6 @@ fn shadow_drive_write(env: &Env, rel: &str, bytes: &[u8]) {
     std::fs::write(dst, bytes).unwrap();
 }
 
-/// The human verifier's role in the test harness: drive the durable task
-/// row to Verifying, land a passing record (empty criteria/checks — the
-/// seeded task rows carry no acceptance criteria) and complete the task.
-/// This is the ONLY producer of VerifiedComplete (task machine invariant).
-fn certify_env_task(env: &Env) {
-    let h = env.manager.get_session(env.parent).unwrap().unwrap();
-    let task_id = h.task_id().unwrap();
-    for _ in 0..8 {
-        let task = h.get_task(task_id).unwrap().unwrap();
-        let target = match task.state {
-            TaskState::Pending => TaskTransition::StartRunning,
-            TaskState::Planning => TaskTransition::PlanComplete,
-            TaskState::Running => TaskTransition::RequestVerification,
-            TaskState::Waiting => TaskTransition::ResumeFromWaiting,
-            TaskState::Blocked => TaskTransition::Unblock,
-            TaskState::NeedsVerification => TaskTransition::StartVerification,
-            TaskState::Verifying => break,
-            s => panic!("cannot certify a task at {s:?}"),
-        };
-        let rev = h.task_revision(task_id).unwrap();
-        h.transition_task(task_id, rev, target, None).unwrap();
-    }
-    let task = h.get_task(task_id).unwrap().unwrap();
-    assert_eq!(
-        task.state,
-        TaskState::Verifying,
-        "the row must reach Verifying before completion"
-    );
-    let record = h
-        .create_verification_record(
-            task_id,
-            None,
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            None,
-            VerificationStatus::Passed,
-            h.now_ms(),
-        )
-        .unwrap();
-    let rev = h.task_revision(task_id).unwrap();
-    h.complete_verified_task(task_id, rev, record).unwrap();
-    assert_eq!(
-        h.get_task(task_id).unwrap().unwrap().state,
-        TaskState::VerifiedComplete
-    );
-}
-
 fn mutating_request(env: &Env, goal: &str) -> TaskRunRequest {
     TaskRunRequest {
         goal: goal.to_string(),
@@ -1569,7 +1538,25 @@ struct GatedShadowFix {
     shadows: Arc<ShadowRoots>,
 }
 
+/// The historical gated fixture: verification disabled (the drive can never
+/// certify) with the plain text seed. Used by the crash-residue and cancel
+/// tests, which never integrate.
 fn open_gated_shadow(root: &std::path::Path) -> GatedShadowFix {
+    open_gated_shadow_with(root, faktor_agent::VerificationService::disabled(), false)
+}
+
+/// A gated fixture that CAN integrate: a fake-ok verifier + a seed Rust
+/// project so the executor's candidate verification derives a passing
+/// check. Used by the conflict-then-resolve pipeline test.
+fn open_gated_shadow_verified(root: &std::path::Path) -> GatedShadowFix {
+    open_gated_shadow_with(root, faktor_agent::VerificationService::fake_ok(), true)
+}
+
+fn open_gated_shadow_with(
+    root: &std::path::Path,
+    verification: Arc<faktor_agent::VerificationService>,
+    rust_project: bool,
+) -> GatedShadowFix {
     let manager = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
     let gated = Arc::new(GatedProvider {
         caps: ModelCapabilities {
@@ -1582,10 +1569,23 @@ fn open_gated_shadow(root: &std::path::Path) -> GatedShadowFix {
     });
     let mut registry = ProviderRegistry::new();
     registry.try_register(gated.clone()).unwrap();
-    let agent = build_agent(manager.clone(), registry);
+    let agent = build_agent_with_verification(manager.clone(), registry, verification);
     let owner_root = root.join("owner");
     std::fs::create_dir_all(&owner_root).unwrap();
     seed_owner(&owner_root);
+    if rust_project {
+        std::fs::create_dir_all(owner_root.join("src")).unwrap();
+        std::fs::write(
+            owner_root.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            owner_root.join("src/lib.rs"),
+            "pub fn value() -> u64 {\n    let base_amount: u64 = 10;\n    let increment: u64 = 32;\n    base_amount.saturating_add(increment)\n}\n",
+        )
+        .unwrap();
+    }
     let ws = manager
         .create_workspace(owner_root.to_str().unwrap())
         .unwrap();
@@ -1605,7 +1605,7 @@ fn open_gated_shadow(root: &std::path::Path) -> GatedShadowFix {
         &orchestrator,
         manager.clone(),
         agent.clone(),
-        Some(shadows.clone()),
+        shadows.clone(),
     );
     GatedShadowFix {
         manager,
@@ -1622,9 +1622,11 @@ async fn shadowed_mutating_run_writes_never_reach_user_checkout_until_verified_c
     let _heavy = heavy_guard();
     // (a)+(b) over the REAL executor: a shadowed mutating run begins a
     // durable shadow before its drive; staged writes live in the shadow
-    // while the user checkout stays byte-identical; only a
-    // VerifiedComplete + clean integration lands them, removes the shadow
-    // and retires the row.
+    // while the user checkout stays byte-identical. With no verifier
+    // configured the executor cannot verify the candidate, so the task can
+    // never complete: VerifiedComplete is the CONSEQUENCE of a successful
+    // owner landing, and the drive's shadow-world certification is never
+    // the permission to attempt it.
     let dir = tempfile::tempdir().unwrap();
     let env = open_shadow_env(dir.path(), done_script());
     seed_owner(&env.owner_root);
@@ -1649,55 +1651,63 @@ async fn shadowed_mutating_run_writes_never_reach_user_checkout_until_verified_c
         30,
     )
     .await;
-    // Let the detached post-drive finalize settle: the row is not terminal
-    // (no completion claim), so the shadow is RETAINED and the user
-    // checkout stays untouched.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(owner_bytes(&env, "a.txt"), b"base-alpha");
+    assert_eq!(
+        std::fs::read(env.owner_root.join("a.txt")).unwrap(),
+        b"base-alpha"
+    );
     assert_eq!(row.state, ShadowRowState::Active);
     // Stage the shadowed drive's writes AFTER the drive (what a
     // shadow-aware verification run would have produced).
     shadow_drive_write(&env, "a.txt", b"implemented alpha");
     shadow_drive_write(&env, "new-file.txt", b"implemented new file");
     assert_eq!(
-        owner_bytes(&env, "a.txt"),
-        b"base-alpha",
-        "user checkout untouched while the shadow holds the new world"
+        std::fs::read(env.owner_root.join("a.txt")).unwrap(),
+        b"base-alpha"
     );
     assert!(!env.owner_root.join("new-file.txt").exists());
-    // Only a verified completion integrates. A non-terminal task row is
-    // retained by the drive's one-shot finalize AND by the bounded
-    // post-drive watcher — the executor settles the run by itself, the
-    // test never drives the finalize by hand.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Even a verifier seam "certifying" the shadow world cannot complete:
+    // a proof without a tree hash predates landing, and a managed live
+    // shadow requires the finalized owner integration.
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    let err = complete_shadow_world_or_refuse(&env.manager, env.parent)
+        .expect_err("shadow-world certification must be refused");
+    assert!(
+        matches!(
+            err,
+            faktor_session::TaskError::IntegrationRecordMissing { .. }
+        ),
+        "{err}"
+    );
+    assert_ne!(
+        h.get_task(task_id).unwrap().unwrap().state,
+        TaskState::VerifiedComplete
+    );
+    // The executor's own settlement cannot verify either (no verifier):
+    // nothing lands, nothing completes, the shadow stays live.
+    let outcome = env
+        .executor
+        .settle_run(RunSettlement::InSession {
+            parent: env.parent,
+            run_id: format!("tx-session-{}", env.parent.raw()),
+        })
+        .await
+        .expect("settlement is a typed outcome, not a failure");
+    assert!(!outcome.completed);
+    assert_eq!(
+        std::fs::read(env.owner_root.join("a.txt")).unwrap(),
+        b"base-alpha"
+    );
+    assert!(!env.owner_root.join("new-file.txt").exists());
     assert_eq!(
         env.manager.shadow_row(env.parent).unwrap().unwrap().state,
-        ShadowRowState::Active,
-        "the non-terminal task row keeps the shadow live"
+        ShadowRowState::Active
     );
-    assert_eq!(owner_bytes(&env, "a.txt"), b"base-alpha");
-    certify_env_task(&env);
-    wait_until(
-        || {
-            owner_bytes(&env, "a.txt") == b"implemented alpha"
-                && owner_bytes(&env, "new-file.txt") == b"implemented new file"
-                && env.manager.shadow_row(env.parent).unwrap().is_none_or(|r| {
-                    r.state == ShadowRowState::Integrated
-                        && !std::path::PathBuf::from(&r.root).exists()
-                })
-        },
-        60,
-    )
-    .await;
-    assert_eq!(owner_bytes(&env, "a.txt"), b"implemented alpha");
-    assert_eq!(owner_bytes(&env, "new-file.txt"), b"implemented new file");
-    assert!(!shadow_dir.exists(), "clean integration removes the shadow");
-    let row = shadow_row_of(&env);
-    assert_eq!(row.state, ShadowRowState::Integrated);
-    assert_eq!(
-        env.manager.active_root(env.parent).unwrap(),
-        None,
-        "a retired shadow stops re-pointing"
+    assert_ne!(
+        h.get_task(task_id).unwrap().unwrap().state,
+        TaskState::VerifiedComplete,
+        "VerifiedComplete is impossible unless the owner integration succeeded"
     );
 }
 
@@ -1706,13 +1716,14 @@ async fn mid_drive_isolation_and_conflict_surfaces_integration_blocked_then_reso
     let _heavy = heavy_guard();
     // (a)+(c) with the drive parked mid-flight: while the drive is live the
     // user checkout is byte-identical; an external user edit during the
-    // drive conflicts at integration — the run's content never lands, the
-    // shadow is retained with the durable conflict list, and resolving the
-    // drift lets the executor's own settle paths integrate (the bounded
-    // post-drive watcher re-settles once the row is terminal; the test
-    // never drives the finalize by hand).
+    // drive conflicts at the OWNER LANDING — nothing lands, the shadow is
+    // retained (`IntegrationBlocked`) with the durable conflict list, and
+    // the task stays NON-TERMINAL: the drive's shadow-world completion is
+    // refused by the session gate, so VerifiedComplete is impossible until
+    // the landing succeeds. Resolving the drift lets the bounded watcher
+    // integrate and complete.
     let dir = tempfile::tempdir().unwrap();
-    let fix = open_gated_shadow(dir.path());
+    let fix = open_gated_shadow_verified(dir.path());
     let receipt = fix
         .executor
         .start_task(
@@ -1735,10 +1746,14 @@ async fn mid_drive_isolation_and_conflict_surfaces_integration_blocked_then_reso
     let shadow_dir = std::path::PathBuf::from(&row.root);
     // Park the drive mid-flight and write into the shadow while it runs.
     wait_until(|| fix.gated.count() >= 1, 180).await;
-    std::fs::write(shadow_dir.join("a.txt"), b"mid-drive implementation").unwrap();
+    std::fs::write(
+        shadow_dir.join("src/lib.rs"),
+        b"pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n",
+    )
+    .unwrap();
     assert_eq!(
-        std::fs::read(fix.owner_root.join("a.txt")).unwrap(),
-        b"base-alpha",
+        std::fs::read(fix.owner_root.join("src/lib.rs")).unwrap(),
+        b"pub fn value() -> u64 {\n    let base_amount: u64 = 10;\n    let increment: u64 = 32;\n    base_amount.saturating_add(increment)\n}\n",
         "user checkout byte-identical MID-drive"
     );
     assert_eq!(
@@ -1746,8 +1761,13 @@ async fn mid_drive_isolation_and_conflict_surfaces_integration_blocked_then_reso
         Some(shadow_dir.clone()),
         "active_root reports the shadow root while the drive is live"
     );
-    // The user edits the file externally during the drive.
-    std::fs::write(fix.owner_root.join("a.txt"), b"user edit during drive").unwrap();
+    // The user edits the same file externally during the drive.
+    std::fs::write(
+        fix.owner_root.join("src/lib.rs"),
+        b"pub fn value() -> u64 { 99 }\n",
+    )
+    .unwrap();
+    let user_edit = std::fs::read(fix.owner_root.join("src/lib.rs")).unwrap();
     fix.gated.open();
     wait_until(
         || {
@@ -1762,10 +1782,8 @@ async fn mid_drive_isolation_and_conflict_surfaces_integration_blocked_then_reso
         30,
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    certify_verified_complete(&fix.manager, fix.parent);
-    // The terminal VerifiedComplete converges to the durable
-    // IntegrationBlocked outcome through the executor's own settle paths.
+    // The landing blocks on the drifted owner BEFORE any write; the shadow
+    // is retained and the task stays non-terminal.
     wait_until(
         || {
             fix.manager.shadow_row(fix.parent).unwrap().unwrap().state
@@ -1775,36 +1793,72 @@ async fn mid_drive_isolation_and_conflict_surfaces_integration_blocked_then_reso
     )
     .await;
     assert_eq!(
-        std::fs::read(fix.owner_root.join("a.txt")).unwrap(),
-        b"user edit during drive",
+        std::fs::read(fix.owner_root.join("src/lib.rs")).unwrap(),
+        user_edit,
         "a conflicted user file is never overwritten"
     );
-    assert!(shadow_dir.is_dir(), "shadow retained on conflict");
     assert_eq!(
-        fix.manager.shadow_row(fix.parent).unwrap().unwrap().state,
-        ShadowRowState::IntegrationBlocked
+        std::fs::read(fix.owner_root.join("a.txt")).unwrap(),
+        b"base-alpha"
     );
-    // The user resolves the drift (reverts to the base content); the same
-    // auto decision now integrates through the settle paths.
-    std::fs::write(fix.owner_root.join("a.txt"), b"base-alpha").unwrap();
+    assert!(shadow_dir.is_dir(), "shadow retained on conflict");
+    let h = fix.manager.get_session(fix.parent).unwrap().unwrap();
+    let task = h.get_task(h.task_id().unwrap()).unwrap().unwrap();
+    assert_ne!(
+        task.state,
+        TaskState::VerifiedComplete,
+        "completion is impossible while the owner landing is blocked"
+    );
+    assert!(!task.state.is_terminal(), "the run stays recoverable");
+    assert_eq!(
+        fix.manager.active_root(fix.parent).unwrap(),
+        Some(shadow_dir.clone()),
+        "the IntegrationBlocked shadow stays the session's root until resolved"
+    );
+    // The user resolves the drift (reverts to the base content); the bounded
+    // watcher re-settles: verify + land + complete + retire.
+    std::fs::write(
+        fix.owner_root.join("src/lib.rs"),
+        b"pub fn value() -> u64 {\n    let base_amount: u64 = 10;\n    let increment: u64 = 32;\n    base_amount.saturating_add(increment)\n}\n",
+    )
+    .unwrap();
     wait_until(
         || {
-            std::fs::read(fix.owner_root.join("a.txt")).unwrap_or_default()
-                == b"mid-drive implementation"
+            std::fs::read(fix.owner_root.join("src/lib.rs")).unwrap_or_default()
+                == b"pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n"
                 && !shadow_dir.exists()
+                && fix
+                    .manager
+                    .get_session(fix.parent)
+                    .unwrap()
+                    .unwrap()
+                    .get_task(fix.manager.get_session(fix.parent).unwrap().unwrap().task_id().unwrap())
+                    .unwrap()
+                    .is_some_and(|t| t.state == TaskState::VerifiedComplete)
         },
         60,
     )
     .await;
     assert_eq!(
-        std::fs::read(fix.owner_root.join("a.txt")).unwrap(),
-        b"mid-drive implementation"
+        std::fs::read(fix.owner_root.join("src/lib.rs")).unwrap(),
+        b"pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n"
     );
     assert!(!shadow_dir.exists());
+    assert_eq!(
+        fix.manager.shadow_row(fix.parent).unwrap().unwrap().state,
+        ShadowRowState::Integrated
+    );
 }
 
-/// The verifier helper over a bare manager (used by the gated fixture).
-fn certify_verified_complete(manager: &Arc<SessionManager>, session: SessionId) {
+/// The drive's shadow-world completion attempt (the exact shape the agent
+/// runtime performs at the genuine end): route the durable task row to
+/// Verifying, land an UNBOUND passing record (`tree_hash: None`) and call
+/// the completion gate. While a managed shadow is live the gate must refuse:
+/// the shadow world is not an owner integration.
+fn complete_shadow_world_or_refuse(
+    manager: &Arc<SessionManager>,
+    session: SessionId,
+) -> Result<(), faktor_session::TaskError> {
     let h = manager.get_session(session).unwrap().unwrap();
     let task_id = h.task_id().unwrap();
     for _ in 0..8 {
@@ -1822,23 +1876,19 @@ fn certify_verified_complete(manager: &Arc<SessionManager>, session: SessionId) 
         let rev = h.task_revision(task_id).unwrap();
         h.transition_task(task_id, rev, target, None).unwrap();
     }
-    let task = h.get_task(task_id).unwrap().unwrap();
-    assert_eq!(task.state, TaskState::Verifying);
-    let record = h
-        .create_verification_record(
-            task_id,
-            None,
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            None,
-            VerificationStatus::Passed,
-            h.now_ms(),
-        )
-        .unwrap();
+    let record = h.create_verification_record(
+        task_id,
+        None,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        None,
+        VerificationStatus::Passed,
+        h.now_ms(),
+    )?;
     let rev = h.task_revision(task_id).unwrap();
-    h.complete_verified_task(task_id, rev, record).unwrap();
+    h.complete_verified_task(task_id, rev, record).map(|_| ())
 }
 
 #[test]
@@ -1854,6 +1904,19 @@ fn crashed_drive_residue_reopens_and_settles_deterministically() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fix = open_gated_shadow(dir.path());
+            // The resumed run must be verifiable: a Rust project derived
+            // checks (the fixture verifier is fake-ok below).
+            std::fs::create_dir_all(fix.owner_root.join("src")).unwrap();
+            std::fs::write(
+                fix.owner_root.join("Cargo.toml"),
+                "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .unwrap();
+            std::fs::write(
+                fix.owner_root.join("src/lib.rs"),
+                "pub fn value() -> u64 {\n    let base_amount: u64 = 10;\n    let increment: u64 = 32;\n    base_amount.saturating_add(increment)\n}\n",
+            )
+            .unwrap();
             let _receipt = fix
                 .executor
                 .start_task(
@@ -1914,7 +1977,11 @@ fn crashed_drive_residue_reopens_and_settles_deterministically() {
             .unwrap();
             r
         };
-        let agent = build_agent(manager.clone(), registry);
+        let agent = build_agent_with_verification(
+            manager.clone(),
+            registry,
+            faktor_agent::VerificationService::fake_ok(),
+        );
         // The real daemon runs crash recovery before the first request; the
         // parked drive's turn is resolved here (the same path serve_impl
         // takes on restart).
@@ -1924,7 +1991,7 @@ fn crashed_drive_residue_reopens_and_settles_deterministically() {
             &orchestrator,
             manager.clone(),
             agent.clone(),
-            Some(shadows.clone()),
+            shadows.clone(),
         );
         // The interrupted turn is reconstructed (never blindly re-run): a
         // new shadowed task over a LIVE drive is a typed Conflict naming
@@ -1969,12 +2036,15 @@ fn crashed_drive_residue_reopens_and_settles_deterministically() {
         )
         .await;
         tokio::time::sleep(Duration::from_millis(300)).await;
-        std::fs::write(new_dir.join("a.txt"), b"post-crash implementation").unwrap();
-        certify_verified_complete(&manager, parent);
+        std::fs::write(
+            new_dir.join("src/lib.rs"),
+            b"pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n",
+        )
+        .unwrap();
         // The executor's own settle paths converge to the integration (the
-        // post-drive watcher re-settles the live shadow on the terminal
-        // row) — no manual finalize call.
-        let owner = dir.path().join("owner").join("a.txt");
+        // post-drive settle + bounded watcher verify the candidate, land it
+        // transactionally and complete) — no test-side certification.
+        let owner = dir.path().join("owner").join("src/lib.rs");
         // The durable row is the authority and is written before the
         // dir cleanup (record-first); wait on the row, then assert the fs
         // effects — environment-independent on Windows and Unix alike.
@@ -1992,7 +2062,8 @@ fn crashed_drive_residue_reopens_and_settles_deterministically() {
         .await;
         wait_until(
             || {
-                std::fs::read(&owner).unwrap_or_default() == b"post-crash implementation"
+                std::fs::read(&owner).unwrap_or_default()
+                    == b"pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n"
                     && !new_dir.exists()
             },
             60,
@@ -2000,6 +2071,11 @@ fn crashed_drive_residue_reopens_and_settles_deterministically() {
         .await;
         let retired = manager.shadow_row(parent).unwrap().unwrap();
         assert_eq!(retired.state, ShadowRowState::Integrated);
+        let h = manager.get_session(parent).unwrap().unwrap();
+        assert_eq!(
+            h.get_task(h.task_id().unwrap()).unwrap().unwrap().state,
+            TaskState::VerifiedComplete
+        );
     });
 }
 
@@ -2037,7 +2113,10 @@ async fn failed_drive_keeps_shadow_for_recovery_cancel_discards() {
         "recoverable runs keep the shadow"
     );
     assert!(dir_before.is_dir());
-    assert_eq!(owner_bytes(&env, "a.txt"), b"base-alpha");
+    assert_eq!(
+        std::fs::read(env.owner_root.join("a.txt")).unwrap(),
+        b"base-alpha"
+    );
     // The operator cancels the task: the terminal Cancel drives the
     // post-drive settle paths (the bounded watcher re-settles live rows) to
     // DISCARD the shadow.
@@ -2096,7 +2175,10 @@ fn oversize_shadow_refuses_the_task_before_any_mutation() {
         .list_tasks()
         .unwrap()
         .is_empty());
-    assert_eq!(owner_bytes(&env, "a.txt"), b"base-alpha");
+    assert_eq!(
+        std::fs::read(env.owner_root.join("a.txt")).unwrap(),
+        b"base-alpha"
+    );
 }
 
 // ================================================= P0-48 shadow mutation roots
@@ -2335,38 +2417,23 @@ fn open_real_tool_env(
     verification: Arc<faktor_agent::VerificationService>,
     parked_write: bool,
 ) -> Arc<RealToolEnv> {
-    open_real_tool_env_full(
-        root,
-        scripts,
-        verification,
-        parked_write,
-        true,
-        MutationMode::Shadow,
-    )
+    open_real_tool_env_full(root, scripts, verification, parked_write, true)
 }
 
 /// [`open_real_tool_env`] with the executor's shadow wiring spelled out:
-/// `service` = carry the daemon's [`ShadowRoots`] service, `mode` = the
-/// daemon default mutation mode. The full wiring matrix of the daemon graph
-/// (service always present in production; the mode deciding usage only) is
-/// exercised through this one constructor.
+/// `service` = carry the daemon's [`ShadowRoots`] service and build the
+/// executor through the production constructor (mutating runs isolate), or
+/// build through the cfg(test) owner-direct seam. The daemon graph's
+/// production wiring always carries the service; the seam exists only for
+/// the low-level suites that predate shadow mutation.
 fn open_real_tool_env_full(
     root: &std::path::Path,
     scripts: Vec<Vec<ScriptedResponse>>,
     verification: Arc<faktor_agent::VerificationService>,
     parked_write: bool,
     service: bool,
-    mode: MutationMode,
 ) -> Arc<RealToolEnv> {
-    open_real_tool_env_inner(
-        root,
-        scripts,
-        verification,
-        parked_write,
-        service,
-        mode,
-        false,
-    )
+    open_real_tool_env_inner(root, scripts, verification, parked_write, service, false)
 }
 
 /// [`open_real_tool_env_full`] with the daemon's process supervisor wired
@@ -2376,9 +2443,8 @@ fn open_real_tool_env_supervised(
     root: &std::path::Path,
     scripts: Vec<Vec<ScriptedResponse>>,
     verification: Arc<faktor_agent::VerificationService>,
-    mode: MutationMode,
 ) -> Arc<RealToolEnv> {
-    open_real_tool_env_inner(root, scripts, verification, true, true, mode, true)
+    open_real_tool_env_inner(root, scripts, verification, true, true, true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2388,7 +2454,6 @@ fn open_real_tool_env_inner(
     verification: Arc<faktor_agent::VerificationService>,
     parked_write: bool,
     service: bool,
-    mode: MutationMode,
     with_supervisor: bool,
 ) -> Arc<RealToolEnv> {
     let manager = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
@@ -2464,15 +2529,13 @@ fn open_real_tool_env_inner(
     let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
     let executor = if service {
         let shadows = ShadowRoots::new(manager.clone(), root.join("shadows"));
-        TaskExecutor::new_with_mode(
+        TaskExecutor::new(&orchestrator, manager.clone(), agent.clone(), shadows)
+    } else {
+        TaskExecutor::new_owner_direct_for_test_harness(
             &orchestrator,
             manager.clone(),
             agent.clone(),
-            Some(shadows),
-            mode,
         )
-    } else {
-        TaskExecutor::new(&orchestrator, manager.clone(), agent.clone(), None)
     };
     let isolated_root = root.join("isolated");
     std::fs::create_dir_all(&isolated_root).unwrap();
@@ -2493,27 +2556,21 @@ fn real_env_task_row(env: &RealToolEnv) -> faktor_session::Task {
     h.get_task(h.task_id().unwrap()).unwrap().unwrap()
 }
 
-/// Settle a real-tool drive to VerifiedComplete + integration: the drive's
-/// own verified completion may auto-commit through the post-drive finalize
-/// hook; otherwise certify through the human-verifier seam. Since the
-/// wave-24 executor arms a BOUNDED post-drive watcher whenever its
-/// one-shot finalize finds the task row non-terminal, the integration lands
-/// WITHOUT any further executor call — the test polls the durable outcome
-/// instead of driving the finalize by hand.
+/// Settle a real-tool shadowed drive through the executor's OWN pipeline:
+/// the shadow-world completion the drive attempts is never the permission
+/// to complete (the session gate refuses an unbound proof while a managed
+/// shadow is live), so the post-drive settlement + bounded watcher verify
+/// the candidate, land it transactionally, complete the task and retire the
+/// shadow. The test polls the durable outcome and never certifies by hand.
 async fn settle_verified_integrate(env: &Arc<RealToolEnv>) {
     wait_until(
         || real_state_of(env) == faktor_core::state::AgentState::ReadyForNextTurn,
         60,
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    let task = real_env_task_row(env);
-    if task.state != TaskState::VerifiedComplete {
-        certify_verified_complete(&env.manager, env.parent);
-    }
     // The durable outcome converges through the executor's own settle
-    // paths (post-drive finalize, then the bounded watcher) — never a
-    // manual executor call from the test.
+    // paths (post-drive settle, then the bounded watcher) — never a manual
+    // executor call from the test.
     wait_until(
         || {
             env.manager
@@ -2524,6 +2581,7 @@ async fn settle_verified_integrate(env: &Arc<RealToolEnv>) {
                     r.state == ShadowRowState::Integrated
                         && !std::path::PathBuf::from(&r.root).exists()
                 })
+                && real_env_task_row(env).state == TaskState::VerifiedComplete
         },
         60,
     )
@@ -2538,6 +2596,7 @@ async fn settle_verified_integrate(env: &Arc<RealToolEnv>) {
         !std::path::PathBuf::from(&row.root).exists(),
         "clean integration removes the shadow directory"
     );
+    assert_eq!(real_env_task_row(env).state, TaskState::VerifiedComplete);
 }
 
 fn seed_rust(env: &RealToolEnv) {
@@ -2759,10 +2818,11 @@ async fn real_write_drive_user_drift_conflicts_at_integration_then_resolves() {
     let _heavy = heavy_guard();
     // (d): the conflict path end-to-end at the agent + executor level — the
     // drive's REAL write lands in the shadow; a mid-drive USER edit of the
-    // same file conflicts at the VerifiedComplete integration
-    // (IntegrationBlocked semantics from wave-21: the user file is never
-    // overwritten, the shadow is retained), and resolving the drift lets
-    // the same decision integrate.
+    // same file blocks the OWNER LANDING before any write (the owner stays
+    // byte-identical and the task stays non-terminal: the drive's own
+    // completion claim is refused while the managed shadow is live), and
+    // resolving the drift lets the bounded watcher verify, land and
+    // complete.
     let dir = tempfile::tempdir().unwrap();
     let env = open_real_tool_env(
         dir.path(),
@@ -2772,8 +2832,8 @@ async fn real_write_drive_user_drift_conflicts_at_integration_then_resolves() {
                     id: "c1".into(),
                     name: "write_file".into(),
                     input: serde_json::json!({
-                        "path": "a.txt",
-                        "content": "agent implementation",
+                        "path": "src/lib.rs",
+                        "content": "pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n",
                     }),
                 },
                 ScriptedResponse::Text("done".into()),
@@ -2781,13 +2841,17 @@ async fn real_write_drive_user_drift_conflicts_at_integration_then_resolves() {
             ],
             vec![ScriptedResponse::End],
         ],
-        faktor_agent::VerificationService::disabled(),
+        faktor_agent::VerificationService::fake_ok(),
         true,
     );
-    seed_owner(&env.owner_root);
+    seed_rust(&env);
+    let base_src = std::fs::read(env.owner_root.join("src/lib.rs")).unwrap();
     let receipt = env
         .executor
-        .start_task(env.parent, real_mutating_request(&env, "implement a.txt"))
+        .start_task(
+            env.parent,
+            real_mutating_request(&env, "implement src/lib.rs"),
+        )
         .expect("shadowed start");
     assert_eq!(receipt.mode, TaskRunMode::InSession);
     let row = env.manager.shadow_row(env.parent).unwrap().expect("row");
@@ -2796,26 +2860,30 @@ async fn real_write_drive_user_drift_conflicts_at_integration_then_resolves() {
     // edits the file externally.
     wait_until(|| env.fired.load(Ordering::SeqCst) >= 1, 300).await;
     assert_eq!(
-        std::fs::read(shadow_dir.join("a.txt")).unwrap(),
-        b"agent implementation",
+        std::fs::read(shadow_dir.join("src/lib.rs")).unwrap(),
+        b"pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n",
         "the agent wrote the shadow"
     );
     assert_eq!(
-        std::fs::read(env.owner_root.join("a.txt")).unwrap(),
-        b"base-alpha"
+        std::fs::read(env.owner_root.join("src/lib.rs")).unwrap(),
+        base_src
     );
-    std::fs::write(env.owner_root.join("a.txt"), b"user edit during drive").unwrap();
+    std::fs::write(
+        env.owner_root.join("src/lib.rs"),
+        b"pub fn value() -> u64 { 99 }\n",
+    )
+    .unwrap();
+    let user_edit = std::fs::read(env.owner_root.join("src/lib.rs")).unwrap();
     env.gate.notify_waiters();
     wait_until(
         || real_state_of(&env) == faktor_core::state::AgentState::ReadyForNextTurn,
         60,
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    certify_verified_complete(&env.manager, env.parent);
     // The executor's own settle paths converge to the durable
     // IntegrationBlocked outcome (the bounded post-drive watcher re-settles
-    // the live shadow on the terminal row) — no manual finalize call.
+    // the live shadow) — no manual finalize call, and no completion: the
+    // drifted owner blocks landing before any write.
     wait_until(
         || {
             env.manager.shadow_row(env.parent).unwrap().unwrap().state
@@ -2825,40 +2893,401 @@ async fn real_write_drive_user_drift_conflicts_at_integration_then_resolves() {
     )
     .await;
     assert_eq!(
-        std::fs::read(env.owner_root.join("a.txt")).unwrap(),
-        b"user edit during drive",
+        std::fs::read(env.owner_root.join("src/lib.rs")).unwrap(),
+        user_edit,
         "a conflicted user file is never overwritten"
     );
     assert!(shadow_dir.is_dir(), "the shadow is retained on conflict");
-    assert_eq!(
-        env.manager.shadow_row(env.parent).unwrap().unwrap().state,
-        ShadowRowState::IntegrationBlocked
-    );
+    let task = real_env_task_row(&env);
+    assert_ne!(task.state, TaskState::VerifiedComplete);
+    assert!(!task.state.is_terminal());
     assert_eq!(
         env.manager.active_root(env.parent).unwrap(),
         Some(shadow_dir.clone()),
-        "the IntegrationBlocked shadow stays the session's root until resolved"
+        "the blocked shadow stays the session root until resolved"
     );
-    // The user resolves the drift (back to the base digest); the same auto
-    // decision now integrates through the executor's own settle paths.
-    std::fs::write(env.owner_root.join("a.txt"), b"base-alpha").unwrap();
+    // The user resolves the drift (reverts to the base content); the same
+    // auto decision integrates through the executor's own settle paths.
+    std::fs::write(env.owner_root.join("src/lib.rs"), &base_src).unwrap();
     wait_until(
         || {
-            std::fs::read(env.owner_root.join("a.txt")).unwrap_or_default()
-                == b"agent implementation"
+            std::fs::read(env.owner_root.join("src/lib.rs")).unwrap_or_default()
+                == b"pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n"
                 && !shadow_dir.exists()
+                && real_env_task_row(&env).state == TaskState::VerifiedComplete
         },
         60,
     )
     .await;
     assert_eq!(
-        std::fs::read(env.owner_root.join("a.txt")).unwrap(),
-        b"agent implementation"
+        std::fs::read(env.owner_root.join("src/lib.rs")).unwrap(),
+        b"pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n"
     );
     assert!(!shadow_dir.exists());
     assert_eq!(
         env.manager.shadow_row(env.parent).unwrap().unwrap().state,
         ShadowRowState::Integrated
+    );
+}
+
+#[tokio::test]
+async fn shadow_crash_mid_land_recovers_from_the_durable_txn_phase() {
+    // Crash recovery of a shadowed landing: the seam stops the transaction
+    // after ONE applied path (phase `Landing`, journaled). The resume reads
+    // the durable phase, re-applies ONLY the pending paths, verifies whole-
+    // root equality with the candidate and completes — the already-applied
+    // path is never rewritten blind.
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env(
+        dir.path(),
+        vec![
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/lib.rs",
+                        "content": "pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            vec![ScriptedResponse::End],
+        ],
+        faktor_agent::VerificationService::fake_ok(),
+        true,
+    );
+    seed_rust(&env);
+    std::fs::write(env.owner_root.join("a.txt"), b"base-alpha").unwrap();
+    env.executor
+        .set_settlement_crash_seam(Some(CrashSeam::IntegrationApply { after: 1 }));
+    let receipt = env
+        .executor
+        .start_task(
+            env.parent,
+            real_mutating_request(&env, "implement the change"),
+        )
+        .expect("shadowed start");
+    assert_eq!(receipt.mode, TaskRunMode::InSession);
+    let row = env.manager.shadow_row(env.parent).unwrap().expect("row");
+    let shadow_dir = std::path::PathBuf::from(&row.root);
+    wait_until(|| env.fired.load(Ordering::SeqCst) >= 1, 300).await;
+    // The second changed path is staged in the shadow while the drive parks.
+    std::fs::write(shadow_dir.join("a.txt"), b"agent a").unwrap();
+    env.gate.notify_waiters();
+    wait_until(
+        || real_state_of(&env) == faktor_core::state::AgentState::ReadyForNextTurn,
+        60,
+    )
+    .await;
+    // The first settle applies a.txt then the seam stops it (durable
+    // `Landing` phase with the pending src/lib.rs journaled).
+    wait_until(
+        || std::fs::read(env.owner_root.join("a.txt")).unwrap_or_default() == b"agent a",
+        60,
+    )
+    .await;
+    assert_eq!(
+        std::fs::read(env.owner_root.join("src/lib.rs")).unwrap(),
+        b"pub fn value() -> u64 {\n    let base_amount: u64 = 10;\n    let increment: u64 = 32;\n    base_amount.saturating_add(increment)\n}\n",
+        "the pending path has not landed yet"
+    );
+    let candidate = root_digest(&shadow_dir);
+    // Resume from the durable phase.
+    env.executor.set_settlement_crash_seam(None);
+    let outcome = env
+        .executor
+        .settle_run(RunSettlement::InSession {
+            parent: env.parent,
+            run_id: format!("tx-session-{}", env.parent.raw()),
+        })
+        .await
+        .expect("resumed settlement");
+    assert!(outcome.completed, "{outcome:?}");
+    assert_eq!(
+        owner_digest(&env),
+        candidate,
+        "the resumed landing reached the exact candidate"
+    );
+    assert_eq!(
+        std::fs::read(env.owner_root.join("src/lib.rs")).unwrap(),
+        b"pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n"
+    );
+    assert_eq!(real_env_task_row(&env).state, TaskState::VerifiedComplete);
+    assert_eq!(
+        env.manager.shadow_row(env.parent).unwrap().unwrap().state,
+        ShadowRowState::Integrated
+    );
+}
+
+#[tokio::test]
+async fn single_item_verified_complete_implies_owner_integration_landed() {
+    // THE ordering invariant (P0-49): a single-item shadowed run may only
+    // reach VerifiedComplete AFTER a successful owner landing. The crash
+    // seam is placed after candidate verification, BEFORE the landing
+    // transaction's first durable row: the task must still be non-terminal
+    // and the owner byte-identical. Only the resumed settlement lands, and
+    // the completion proof is bound to the finalized integration record of
+    // that exact landed snapshot.
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env(
+        dir.path(),
+        vec![
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/lib.rs",
+                        "content": "pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            vec![ScriptedResponse::End],
+        ],
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+    );
+    seed_rust(&env);
+    let owner_before = owner_digest(&env);
+    // The seam is armed BEFORE the drive ends: the FIRST settlement (the
+    // post-drive hook or the watcher) verifies the candidate, then stops.
+    env.executor
+        .set_settlement_crash_seam(Some(CrashSeam::AfterPreparedVerification));
+    let receipt = env
+        .executor
+        .start_task(
+            env.parent,
+            real_mutating_request(&env, "implement the change"),
+        )
+        .expect("shadowed start");
+    assert_eq!(receipt.mode, TaskRunMode::InSession);
+    let row = env.manager.shadow_row(env.parent).unwrap().expect("row");
+    let shadow_dir = std::path::PathBuf::from(&row.root);
+    wait_until(
+        || real_state_of(&env) == faktor_core::state::AgentState::ReadyForNextTurn,
+        60,
+    )
+    .await;
+    // Wait until the seam actually fired: a candidate-bound verification
+    // record exists (the drive's own claim carries no tree hash) while the
+    // shadow is still live and the owner is untouched.
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    wait_until(
+        || {
+            h.list_verification_records(task_id)
+                .map(|records| records.iter().any(|r| r.tree_hash.is_some()))
+                .unwrap_or(false)
+                && env
+                    .manager
+                    .shadow_row(env.parent)
+                    .unwrap()
+                    .is_some_and(|r| r.state == ShadowRowState::Active)
+                && owner_digest(&env) == owner_before
+        },
+        60,
+    )
+    .await;
+    let task = real_env_task_row(&env);
+    assert_ne!(
+        task.state,
+        TaskState::VerifiedComplete,
+        "completion cannot precede the owner landing"
+    );
+    assert!(!task.state.is_terminal());
+    assert_eq!(
+        owner_digest(&env),
+        owner_before,
+        "owner untouched pre-landing"
+    );
+    let candidate = root_digest(&shadow_dir);
+    // Resume: the explicit settlement re-drives the durable phases and lands.
+    env.executor.set_settlement_crash_seam(None);
+    let outcome = env
+        .executor
+        .settle_run(RunSettlement::InSession {
+            parent: env.parent,
+            run_id: format!("tx-session-{}", env.parent.raw()),
+        })
+        .await
+        .expect("resumed settlement");
+    assert!(outcome.completed, "{outcome:?}");
+    assert_eq!(
+        owner_digest(&env),
+        candidate,
+        "the candidate landed exactly"
+    );
+    let task = real_env_task_row(&env);
+    assert_eq!(task.state, TaskState::VerifiedComplete);
+    // The completion proof is bound to the finalized integration record of
+    // the landed snapshot (the ledger sequence completion requires).
+    let integration = h
+        .ledger_integration_record_for_task(task_id.raw())
+        .unwrap()
+        .expect("a finalized integration record exists");
+    assert_eq!(integration.final_snapshot_hash, candidate);
+    assert_eq!(
+        integration.landed_snapshot.as_deref(),
+        Some(candidate.as_str())
+    );
+    assert!(h
+        .list_verification_records(task_id)
+        .unwrap()
+        .iter()
+        .any(|r| r.tree_hash.as_deref() == Some(integration.final_snapshot_hash.as_str())));
+    assert_eq!(
+        env.manager.shadow_row(env.parent).unwrap().unwrap().state,
+        ShadowRowState::Integrated
+    );
+}
+
+#[tokio::test]
+async fn later_file_conflict_mid_land_rolls_back_earlier_applies_byte_identically() {
+    // The transactional landing invariant (P0-49): a conflict on a LATER
+    // path (after an earlier path was applied) rolls the earlier apply BACK,
+    // leaving the owner BYTE-IDENTICAL to its pre-landing state — never a
+    // partial landing. The task stays non-terminal and completion remains
+    // impossible.
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env(
+        dir.path(),
+        vec![
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/lib.rs",
+                        "content": "pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            vec![ScriptedResponse::End],
+        ],
+        faktor_agent::VerificationService::fake_ok(),
+        true,
+    );
+    seed_rust(&env);
+    std::fs::write(env.owner_root.join("a.txt"), b"base-alpha").unwrap();
+    // Stop the FIRST settlement after ONE applied path ("a.txt" sorts
+    // before "src/lib.rs").
+    env.executor
+        .set_settlement_crash_seam(Some(CrashSeam::IntegrationApply { after: 1 }));
+    let receipt = env
+        .executor
+        .start_task(
+            env.parent,
+            real_mutating_request(&env, "implement the change"),
+        )
+        .expect("shadowed start");
+    assert_eq!(receipt.mode, TaskRunMode::InSession);
+    let row = env.manager.shadow_row(env.parent).unwrap().expect("row");
+    let shadow_dir = std::path::PathBuf::from(&row.root);
+    // Park the drive after its shadow write; stage the SECOND changed path
+    // directly in the shadow while it runs.
+    wait_until(|| env.fired.load(Ordering::SeqCst) >= 1, 300).await;
+    std::fs::write(shadow_dir.join("a.txt"), b"agent a").unwrap();
+    assert_eq!(
+        std::fs::read(env.owner_root.join("a.txt")).unwrap(),
+        b"base-alpha"
+    );
+    env.gate.notify_waiters();
+    wait_until(
+        || real_state_of(&env) == faktor_core::state::AgentState::ReadyForNextTurn,
+        60,
+    )
+    .await;
+    // The first settlement applies a.txt, then the seam stops it (leaving a
+    // recoverable partial landing journaled by phase).
+    wait_until(
+        || std::fs::read(env.owner_root.join("a.txt")).unwrap_or_default() == b"agent a",
+        60,
+    )
+    .await;
+    // The user edits the LATER path before the resume.
+    std::fs::write(
+        env.owner_root.join("src/lib.rs"),
+        b"pub fn value() -> u64 { 99 }\n",
+    )
+    .unwrap();
+    // Reference pre-landing tree: the base content + the user edit.
+    let reference = dir.path().join("reference");
+    std::fs::create_dir_all(reference.join("src")).unwrap();
+    std::fs::write(
+        reference.join("Cargo.toml"),
+        std::fs::read(env.owner_root.join("Cargo.toml")).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(reference.join("a.txt"), b"base-alpha").unwrap();
+    std::fs::write(
+        reference.join("src/lib.rs"),
+        b"pub fn value() -> u64 { 99 }\n",
+    )
+    .unwrap();
+    let expected = root_digest(&reference);
+    // Resume: the later-path CAS conflicts, every applied path rolls back.
+    env.executor.set_settlement_crash_seam(None);
+    let outcome = env
+        .executor
+        .settle_run(RunSettlement::InSession {
+            parent: env.parent,
+            run_id: format!("tx-session-{}", env.parent.raw()),
+        })
+        .await
+        .expect("a conflict is a typed settle outcome, not a failure");
+    let finalize = outcome.finalize.as_ref().expect("a finalize outcome");
+    assert_eq!(
+        finalize.action,
+        ShadowFinalizeAction::IntegrationBlocked,
+        "typed conflict, not a partial landing: {outcome:?}"
+    );
+    assert!(
+        finalize
+            .conflicts
+            .iter()
+            .any(|(_, detail)| detail.contains("src/lib.rs") && detail.contains("rolled back")),
+        "{outcome:?}"
+    );
+    assert!(!outcome.completed);
+    assert_eq!(
+        owner_digest(&env),
+        expected,
+        "the owner is byte-identical to its pre-landing state (earlier applies rolled back, the user edit preserved)"
+    );
+    assert_eq!(
+        std::fs::read(env.owner_root.join("a.txt")).unwrap(),
+        b"base-alpha"
+    );
+    assert_eq!(
+        std::fs::read(env.owner_root.join("src/lib.rs")).unwrap(),
+        b"pub fn value() -> u64 { 99 }\n"
+    );
+    assert_eq!(
+        env.manager.shadow_row(env.parent).unwrap().unwrap().state,
+        ShadowRowState::IntegrationBlocked
+    );
+    assert!(shadow_dir.is_dir(), "shadow retained on conflict");
+    let task = real_env_task_row(&env);
+    assert_ne!(task.state, TaskState::VerifiedComplete);
+    assert!(!task.state.is_terminal());
+    // Even the shadow-world completion is refused while the landing is
+    // blocked: no completion without a successful owner integration.
+    let err = complete_shadow_world_or_refuse(&env.manager, env.parent)
+        .expect_err("shadow-world completion must stay impossible");
+    let _ = err;
+    assert_ne!(
+        real_env_task_row(&env).state,
+        TaskState::VerifiedComplete,
+        "no completion without a successful owner integration"
     );
 }
 
@@ -2934,13 +3363,15 @@ async fn single_item_task_max_cost_micro_lands_on_the_task_row_cap_and_refuses_l
     );
 }
 
-// ============================================ mutation mode (wave-24) + cancel
-// Shadow mutation is the production default: the daemon ALWAYS carries the
-// ShadowRoots service and the executor's MutationMode (daemon default,
-// overridable per run) decides usage ONLY. DirectCompat must reproduce the
-// pre-shadow direct behavior byte-identically even with the service
-// present, and the executor exposes ONE task-level cancel authority
-// (cancel_run) the HTTP surface drives.
+// ================================ mutation isolation (P0) + task cancel
+// Every MUTATING run over the production executor ALWAYS executes in an
+// isolated candidate (the daemon always carries the ShadowRoots service;
+// the production constructor requires it). There is no mode value, config
+// key or wire field that can disable isolation; the removed `direct_compat`
+// value is a strict decode error. The cfg(test) owner-direct seam exists
+// ONLY for the low-level suites that predate shadow mutation. The executor
+// also exposes ONE task-level cancel authority (cancel_run) the HTTP
+// surface drives.
 
 fn one_write_script(content: &str) -> Vec<Vec<ScriptedResponse>> {
     vec![
@@ -2960,25 +3391,72 @@ fn one_write_script(content: &str) -> Vec<Vec<ScriptedResponse>> {
     ]
 }
 
+#[test]
+fn direct_compat_is_a_strict_decode_error_naming_the_removal() {
+    // Absence-of-variant proof: the ONLY decodable mutation mode is
+    // "shadow". The removed escape hatch decodes to a loud error naming the
+    // removal on every serde surface (CLI config, SDK/native DTOs — all
+    // share this ONE type).
+    assert_eq!(
+        serde_json::from_str::<MutationMode>("\"shadow\"").unwrap(),
+        MutationMode::Shadow
+    );
+    let err = serde_json::from_str::<MutationMode>("\"direct_compat\"")
+        .expect_err("direct_compat must not decode");
+    assert!(err.to_string().contains("removed"), "{err}");
+    let err = serde_json::from_str::<MutationMode>("\"nonsense\"")
+        .expect_err("unknown modes must not decode");
+    assert!(err.to_string().contains("unknown variant"), "{err}");
+}
+
+/// P0 isolation at the SOURCE level: `direct_compat` has no variant and no
+/// literal anywhere, the PRODUCTION constructor requires the shadow service
+/// (so no production value can disable isolation), and the ONLY no-shadow
+/// assembly path is the `#[cfg(any(test, debug_assertions))]`-gated test
+/// seam documented on [`TaskExecutor::new_owner_direct_for_test_harness`]
+/// (compiled out of release builds).
+#[test]
+fn no_production_path_can_construct_a_non_isolating_executor() {
+    const SRC: &str = include_str!("task_executor.rs");
+    assert!(
+        !SRC.contains("DirectCompat"),
+        "the removed direct-owner variant must not exist anywhere"
+    );
+    assert!(
+        SRC.contains("shadows: Arc<ShadowRoots>"),
+        "the production constructor must REQUIRE the shadow service"
+    );
+    assert!(
+        SRC.contains("#[cfg(any(test, debug_assertions))]"),
+        "the owner-direct seam must be cfg(test)/debug-assertions gated"
+    );
+    assert!(
+        SRC.contains("pub fn new_owner_direct_for_test_harness("),
+        "the gated seam is the only no-shadow constructor"
+    );
+    assert!(
+        !SRC.contains("pub fn assemble("),
+        "the shared assembly body stays private"
+    );
+}
+
 #[tokio::test]
-async fn direct_compat_with_service_is_byte_identical_to_no_service() {
-    // The parity test: the SAME scripts/goal on (a) an executor carrying
-    // the shadow service in DirectCompat mode and (b) an executor without
-    // any shadow service (the historical wiring) must produce byte-identical
-    // outcomes — the service's presence alone must never change a
-    // DirectCompat run. Both drives write DIRECTLY to the owner checkout;
-    // no shadow row exists on either side, and the durable op records +
-    // message streams match.
+async fn mutating_runs_always_isolate_and_only_the_test_seam_drives_the_owner() {
+    // (a) The PRODUCTION wiring (shadow service present, the production
+    // constructor): a single-item MUTATING run works in the isolated
+    // candidate no matter what the (wire-compat only) mutation_mode field
+    // says; the owner stays byte-identical. (b) The cfg(test) owner-direct
+    // seam (no shadow service) is the ONLY path that drives the owner
+    // checkout directly, and only tests can build it.
     let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
-    let scripts = one_write_script("direct implementation alpha");
+    let scripts = one_write_script("isolated implementation alpha");
     let env_a = open_real_tool_env_full(
         &dir.path().join("a"),
         scripts.clone(),
         faktor_agent::VerificationService::disabled(),
         false,
         true,
-        MutationMode::DirectCompat,
     );
     let env_b = open_real_tool_env_full(
         &dir.path().join("b"),
@@ -2986,19 +3464,20 @@ async fn direct_compat_with_service_is_byte_identical_to_no_service() {
         faktor_agent::VerificationService::disabled(),
         false,
         false,
-        MutationMode::Shadow, // irrelevant without the service
     );
     seed_owner(&env_a.owner_root);
     seed_owner(&env_b.owner_root);
-    let goal = "implement the direct change";
+    let goal = "implement the change";
+    let mut req_a = real_mutating_request(&env_a, goal);
+    req_a.mutation_mode = Some(MutationMode::Shadow);
     let receipt_a = env_a
         .executor
-        .start_task(env_a.parent, real_mutating_request(&env_a, goal))
-        .expect("direct-compat start over the service");
+        .start_task(env_a.parent, req_a)
+        .expect("isolated start");
     let receipt_b = env_b
         .executor
         .start_task(env_b.parent, real_mutating_request(&env_b, goal))
-        .expect("no-service start");
+        .expect("seam start");
     assert_eq!(receipt_a.mode, TaskRunMode::InSession);
     assert_eq!(receipt_b.mode, TaskRunMode::InSession);
     wait_until(
@@ -3011,51 +3490,36 @@ async fn direct_compat_with_service_is_byte_identical_to_no_service() {
         60,
     )
     .await;
-    // The state transition and the turn-record finalize are separate
-    // durable writes; wait for BOTH records to converge before reading
-    // them (Windows CI exposed the observe-order race; a fixed sleep would
-    // be environment-dependent and weaker).
-    {
-        let ha = env_a.manager.get_session(env_a.parent).unwrap().unwrap();
-        let hb = env_b.manager.get_session(env_b.parent).unwrap().unwrap();
-        let op_a = receipt_a.op_id.unwrap();
-        let op_b = receipt_b.op_id.unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
-        loop {
-            let a = ha.turn_record(op_a).unwrap().map(|r| r.status);
-            let b = hb.turn_record(op_b).unwrap().map(|r| r.status);
-            if a.is_some() && a == b {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "turn records never converged: a={a:?} b={b:?}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-    // DirectCompat with the service present NEVER shadows: no durable row,
-    // no re-pointing, and the drive wrote the OWNER checkout.
+    // (a) Production: the write landed in the isolated candidate; the owner
+    // checkout is byte-identical to its seeded content.
+    let row_a = env_a
+        .manager
+        .shadow_row(env_a.parent)
+        .unwrap()
+        .expect("a mutating run over the production executor must isolate");
+    assert_eq!(
+        std::fs::read(std::path::PathBuf::from(&row_a.root).join("a.txt")).unwrap(),
+        b"isolated implementation alpha",
+        "the write landed in the isolated candidate"
+    );
+    assert_eq!(
+        std::fs::read(env_a.owner_root.join("a.txt")).unwrap(),
+        b"base-alpha",
+        "the owner checkout stayed byte-identical"
+    );
+    // (b) The test seam: the low-level owner-direct path still works, and
+    // no production constructor can produce it.
     assert!(
-        env_a.manager.shadow_row(env_a.parent).unwrap().is_none(),
-        "DirectCompat must not begin a shadow"
+        env_b.manager.shadow_row(env_b.parent).unwrap().is_none(),
+        "the seam never begins a shadow"
     );
     assert_eq!(
-        env_a.manager.active_root(env_a.parent).unwrap(),
-        None,
-        "DirectCompat never re-points the session"
-    );
-    assert_eq!(
-        std::fs::read(env_a.owner_root.join("a.txt")).unwrap(),
-        b"direct implementation alpha",
-        "the DirectCompat drive wrote the owner checkout"
-    );
-    // Byte parity with the historical no-service wiring.
-    assert_eq!(
-        std::fs::read(env_a.owner_root.join("a.txt")).unwrap(),
         std::fs::read(env_b.owner_root.join("a.txt")).unwrap(),
-        "byte-identical owner content on both sides"
+        b"isolated implementation alpha",
+        "the seam drive wrote the owner checkout"
     );
+    // Everything else is byte-parity: same message stream and turn-record
+    // envelope on both wirings.
     let ha = env_a.manager.get_session(env_a.parent).unwrap().unwrap();
     let hb = env_b.manager.get_session(env_b.parent).unwrap().unwrap();
     assert_eq!(
@@ -3071,83 +3535,45 @@ async fn direct_compat_with_service_is_byte_identical_to_no_service() {
 }
 
 #[tokio::test]
-async fn per_run_mutation_mode_overrides_the_daemon_default() {
-    // The daemon default rides the executor construction (the mode decides
-    // usage only); a per-run `mutation_mode` overrides it in BOTH
-    // directions: a DirectCompat-defaulted daemon still shadows a run that
-    // asks for Shadow, and a Shadow-defaulted daemon (production default)
-    // drives directly a run that asks for DirectCompat.
+async fn per_run_mutation_mode_is_wire_only_and_never_disables_isolation() {
+    // The request field is decoded for wire compatibility ONLY: present,
+    // absent or explicitly "shadow", the production executor isolates every
+    // mutating run (and the removed "direct_compat" cannot even decode —
+    // covered by the decode test above).
     let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
-    // (a) daemon default DirectCompat + per-run Shadow => shadowed drive.
-    let env_a = open_real_tool_env_full(
-        &dir.path().join("a"),
-        one_write_script("shadowed by override"),
+    let env = open_real_tool_env_full(
+        dir.path(),
+        one_write_script("wire-only mode"),
         faktor_agent::VerificationService::disabled(),
         false,
         true,
-        MutationMode::DirectCompat,
     );
-    seed_owner(&env_a.owner_root);
-    let mut req_a = real_mutating_request(&env_a, "override to shadow");
-    req_a.mutation_mode = Some(MutationMode::Shadow);
-    let receipt_a = env_a
-        .executor
-        .start_task(env_a.parent, req_a)
+    seed_owner(&env.owner_root);
+    let mut req = real_mutating_request(&env, "wire-only field");
+    req.mutation_mode = Some(MutationMode::Shadow);
+    env.executor
+        .start_task(env.parent, req)
         .expect("per-run shadow start");
-    assert_eq!(receipt_a.mode, TaskRunMode::InSession);
-    let row_a = env_a
-        .manager
-        .shadow_row(env_a.parent)
-        .unwrap()
-        .expect("the per-run Shadow override began a shadow");
-    let shadow_a = std::path::PathBuf::from(&row_a.root);
     wait_until(
-        || real_state_of(&env_a) == faktor_core::state::AgentState::ReadyForNextTurn,
+        || real_state_of(&env) == faktor_core::state::AgentState::ReadyForNextTurn,
         60,
     )
     .await;
+    let row = env
+        .manager
+        .shadow_row(env.parent)
+        .unwrap()
+        .expect("the run isolated");
     assert_eq!(
-        std::fs::read(shadow_a.join("a.txt")).unwrap(),
-        b"shadowed by override",
-        "the write landed in the shadow"
+        std::fs::read(std::path::PathBuf::from(&row.root).join("a.txt")).unwrap(),
+        b"wire-only mode",
+        "the write landed in the isolated candidate"
     );
     assert_eq!(
-        std::fs::read(env_a.owner_root.join("a.txt")).unwrap(),
+        std::fs::read(env.owner_root.join("a.txt")).unwrap(),
         b"base-alpha",
         "the owner checkout stayed untouched"
-    );
-    // (b) daemon default Shadow (production default) + per-run DirectCompat
-    // => direct drive, byte-identical to the pre-shadow behavior.
-    let env_b = open_real_tool_env_full(
-        &dir.path().join("b"),
-        one_write_script("direct by override"),
-        faktor_agent::VerificationService::disabled(),
-        false,
-        true,
-        MutationMode::Shadow,
-    );
-    seed_owner(&env_b.owner_root);
-    let mut req_b = real_mutating_request(&env_b, "override to direct");
-    req_b.mutation_mode = Some(MutationMode::DirectCompat);
-    let receipt_b = env_b
-        .executor
-        .start_task(env_b.parent, req_b)
-        .expect("per-run direct start");
-    assert_eq!(receipt_b.mode, TaskRunMode::InSession);
-    wait_until(
-        || real_state_of(&env_b) == faktor_core::state::AgentState::ReadyForNextTurn,
-        60,
-    )
-    .await;
-    assert!(
-        env_b.manager.shadow_row(env_b.parent).unwrap().is_none(),
-        "the per-run DirectCompat override never shadows"
-    );
-    assert_eq!(
-        std::fs::read(env_b.owner_root.join("a.txt")).unwrap(),
-        b"direct by override",
-        "the override drive wrote the owner checkout"
     );
 }
 
@@ -3337,7 +3763,11 @@ async fn cancel_orchestrated_run_fans_cancel_to_live_children_only() {
     let isolated = dir.path().join("isolated");
     std::fs::create_dir_all(&isolated).unwrap();
     let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
-    let executor = TaskExecutor::new(&orchestrator, manager.clone(), agent.clone(), None);
+    let executor = TaskExecutor::new_owner_direct_for_test_harness(
+        &orchestrator,
+        manager.clone(),
+        agent.clone(),
+    );
     let receipt = executor
         .start_task(
             parent,
@@ -3574,11 +4004,10 @@ async fn tournament_flow_ranks_deterministically_and_discards_losers_orphan_free
 
     // A FRESH executor over the same durable store reconstructs the very
     // same Decided tournament (winner + candidate evidence).
-    let executor2 = TaskExecutor::new(
+    let executor2 = TaskExecutor::new_owner_direct_for_test_harness(
         &env.orchestrator,
         env.manager.clone(),
         env.agent.clone(),
-        None,
     );
     let reopened = executor2
         .tournament_state(env.parent, &receipt.tournament_id)
@@ -3673,11 +4102,10 @@ async fn tournament_abort_discards_all_candidates_and_is_durable() {
     )
     .is_empty());
     // Reopen: the same Aborted tournament, no winner ever proposed.
-    let executor2 = TaskExecutor::new(
+    let executor2 = TaskExecutor::new_owner_direct_for_test_harness(
         &env.orchestrator,
         env.manager.clone(),
         env.agent.clone(),
-        None,
     );
     let reopened = executor2
         .tournament_state(env.parent, &receipt.tournament_id)
@@ -3793,7 +4221,6 @@ async fn completion_steps_are_additive_and_fail_closed() {
         faktor_agent::VerificationService::disabled(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     env.executor
         .set_completion_steps(Some(completion_step_runner(dir.path())));
@@ -4294,7 +4721,6 @@ async fn settle_run_converges_after_the_commit_status_write_seam() {
         faktor_agent::VerificationService::disabled(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     env.executor
         .set_completion_steps(Some(completion_step_runner(dir.path())));
@@ -4372,7 +4798,6 @@ async fn settle_run_converges_after_the_push_status_write_seam() {
         faktor_agent::VerificationService::disabled(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     env.executor
         .set_completion_steps(Some(completion_step_runner(dir.path())));
@@ -4463,7 +4888,6 @@ async fn settle_run_converges_after_the_pr_status_write_seam() {
         faktor_agent::VerificationService::disabled(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     let mut config = crate::runtime::completion_steps::CompletionStepsConfig::default();
     // The external PR already exists: the helper reports it and exits
@@ -4635,12 +5059,19 @@ fn run_candidate_root(env: &RealToolEnv, run_id: &str) -> std::path::PathBuf {
 }
 
 fn owner_digest(env: &RealToolEnv) -> String {
-    faktor_session::root_snapshot_digest(&env.owner_root, faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES)
-        .unwrap()
+    faktor_fs::tree_manifest::tree_manifest_digest(
+        &env.owner_root,
+        faktor_fs::tree_manifest::MAX_TREE_MANIFEST_ENTRIES,
+    )
+    .unwrap()
 }
 
 fn root_digest(path: &std::path::Path) -> String {
-    faktor_session::root_snapshot_digest(path, faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES).unwrap()
+    faktor_fs::tree_manifest::tree_manifest_digest(
+        path,
+        faktor_fs::tree_manifest::MAX_TREE_MANIFEST_ENTRIES,
+    )
+    .unwrap()
 }
 
 /// Seed a REAL rust checkout with git history (the derived-check profile
@@ -4689,7 +5120,6 @@ async fn verifier_observes_candidate_not_owner() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     // Freeze the settlement right AFTER the candidate verification: the
@@ -4794,7 +5224,6 @@ async fn paths_child_changes_stay_in_its_overlay_until_the_verified_land() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     let before = owner_digest(&env);
@@ -4859,7 +5288,6 @@ async fn paths_child_out_of_scope_write_is_refused_typed_at_the_tool_gate() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     let run_id = start_paths_run(&env, "refuse the out-of-scope write", &["src"]);
@@ -4981,7 +5409,6 @@ async fn no_op_run_completes_only_through_the_reviewer_proof() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     let before = owner_digest(&env);
@@ -5044,7 +5471,6 @@ async fn no_op_run_without_a_reviewer_verdict_refuses_completion() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     let before = owner_digest(&env);
@@ -5094,7 +5520,6 @@ async fn no_op_run_with_refused_disposition_never_completes() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     let before = owner_digest(&env);
@@ -5137,7 +5562,6 @@ async fn aggregate_goal_criterion_is_reviewer_certified_over_the_candidate() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     let run_id = env
@@ -5192,7 +5616,6 @@ async fn root_record_reuse_consults_the_proof_basis() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     // Freeze right after the candidate was prepared: no root record exists
@@ -5419,7 +5842,6 @@ async fn production_tool_version_change_invalidates_proof_reuse() {
         dir.path(),
         vec![],
         faktor_agent::VerificationService::fake_ok(),
-        MutationMode::DirectCompat,
     );
     let (h, task_id, prepared, criteria) = probe_task_and_prepared(&env, "probe-run");
     let fake_bin = dir.path().join("probe-bin");
@@ -5510,7 +5932,6 @@ async fn production_basis_degrades_explicitly_and_is_reproducible() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     let (h, task_id, prepared, criteria) = probe_task_and_prepared(&env, "probe-no-supervisor");
     let snapshot = prepared.candidate_snapshot.clone();
@@ -5588,7 +6009,6 @@ async fn production_reviewer_identity_changes_the_basis_digest() {
         dir.path(),
         vec![],
         faktor_agent::VerificationService::fake_ok(),
-        MutationMode::DirectCompat,
     );
     let (h, task_id, prepared, criteria) = probe_task_and_prepared(&env, "reviewer-run");
     let snapshot = prepared.candidate_snapshot.clone();
@@ -5858,7 +6278,6 @@ async fn verification_failure_leaves_owner_byte_identical() {
         faktor_agent::VerificationService::fake(|_| Err("verification deliberately failed".into())),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     let before = owner_digest(&env);
@@ -5969,7 +6388,6 @@ async fn green_checks_but_failed_criterion_never_starts_landing() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     env.executor
@@ -6037,7 +6455,6 @@ async fn green_checks_but_unavailable_criterion_never_starts_landing() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     env.executor
@@ -6127,7 +6544,6 @@ async fn candidate_composition_conflict_leaves_owner_untouched() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     let before = owner_digest(&env);
@@ -6178,7 +6594,6 @@ async fn unrelated_owner_edit_during_children_blocks_before_landing() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     // Freeze after the candidate verification, then add the unrelated edit:
@@ -6230,7 +6645,6 @@ async fn owner_edit_after_verification_before_landing_blocks() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     env.executor
@@ -6270,7 +6684,6 @@ async fn crash_after_verified_before_land_recovers() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     env.executor
@@ -6301,7 +6714,6 @@ async fn crash_after_run_base_recorded_restarts_cleanly() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     let before = owner_digest(&env);
@@ -6351,7 +6763,6 @@ async fn crash_after_candidate_prepared_recovers() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     let before = owner_digest(&env);
@@ -6382,7 +6793,6 @@ async fn crash_after_txn_record_recovers_without_writes() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     env.executor
@@ -6418,7 +6828,6 @@ async fn crash_mid_land_recovers_or_rolls_back() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     env.executor
@@ -6463,7 +6872,6 @@ async fn rollback_never_overwrites_later_user_edit() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     env.executor
@@ -6523,7 +6931,6 @@ async fn final_owner_digest_must_equal_verified_candidate() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     env.executor
@@ -6801,7 +7208,6 @@ async fn unavailable_verdict_round_trips_through_a_store_reopen() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     let parent = env.parent;
     let h = env.manager.get_session(parent).unwrap().unwrap();
@@ -7019,7 +7425,6 @@ async fn tournament_winner_lands_through_the_one_pipeline() {
         faktor_agent::VerificationService::fake_ok(),
         false,
         false,
-        MutationMode::DirectCompat,
     );
     cs_seed_owner(&env);
     let receipt = env
@@ -7253,4 +7658,231 @@ async fn binary_attachments_admit_durably_and_unknown_digests_leave_no_run() {
         .put_attachment("image/png", Some("shot.png"), b"\x89PNG")
         .unwrap();
     crate::runtime::validate_attachment_ids(&[image]).expect("image id is structurally valid");
+}
+
+// ------------------------------- FIX 2: strict durable-read semantics
+
+/// A PRESENT-but-undecodable plan row is corrupt durable state: the
+/// settlement refuses typed instead of silently treating the run as "no
+/// plan". A genuinely MISSING plan row keeps the not-found policy (an
+/// incomplete outcome, not an error).
+#[tokio::test]
+async fn malformed_plan_row_refuses_settlement_typed_never_no_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(dir.path(), done_script());
+    let handle = env.manager.get_session(env.parent).unwrap().unwrap();
+    // (a) Not JSON at all.
+    handle
+        .upsert_memory_fact(crate::runtime::PLAN_ROW_KIND, "run-corrupt", "{not json")
+        .unwrap();
+    let err = env
+        .executor
+        .settle_run(RunSettlement::Orchestrated {
+            parent: env.parent,
+            run_id: "run-corrupt".into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ExecError::Internal(m) if m.contains("corrupt durable state")),
+        "malformed plan JSON must refuse typed: {err:?}"
+    );
+    // (b) Decodable JSON that is not a plan row (no `specs`).
+    handle
+        .upsert_memory_fact(crate::runtime::PLAN_ROW_KIND, "run-nospec", "{\"plan\":{}}")
+        .unwrap();
+    let err = env
+        .executor
+        .settle_run(RunSettlement::Orchestrated {
+            parent: env.parent,
+            run_id: "run-nospec".into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ExecError::Internal(m) if m.contains("corrupt durable state") && m.contains("specs")),
+        "a plan row without specs must refuse typed: {err:?}"
+    );
+    // (c) MISSING row: the not-found policy — an incomplete settlement, not
+    // an error and never a synthetic plan.
+    let outcome = env
+        .executor
+        .settle_run(RunSettlement::Orchestrated {
+            parent: env.parent,
+            run_id: "run-missing".into(),
+        })
+        .await
+        .expect("a missing plan row is the not-found policy");
+    assert!(!outcome.complete && !outcome.completed);
+}
+
+/// A FAILED durable read is an error, never "nothing to do": with the fact
+/// table gone, the post-run settlement pass refuses instead of reporting
+/// success with zero runs.
+#[tokio::test]
+async fn failed_durable_read_refuses_settlement_never_nothing_happened() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(dir.path(), done_script());
+    env.manager
+        .store()
+        .sql_execute("DROP TABLE memory_fact")
+        .unwrap();
+    let err = env
+        .executor
+        .settle_resolved_verifications(env.parent)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ExecError::Internal(m) if m.contains("durable read failed")),
+        "a store failure must surface as an error: {err:?}"
+    );
+}
+
+/// A poisoned active-run lock refuses WORK with the typed
+/// [`PoisonedAuthority`] error: it is neither treated as "no active run"
+/// (which would free a slot that may still be occupied) nor as "an active
+/// run" (which would silently skip the post-run settlement).
+#[tokio::test]
+async fn poisoned_active_run_lock_refuses_work_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(dir.path(), done_script());
+    env.executor.poison_active_run_lock_for_test();
+    // (a) The typed read API refuses with the named authority.
+    let poison = env.executor.active_runs_checked().unwrap_err();
+    assert_eq!(poison.authority, "active-run lock");
+    assert!(poison.to_string().contains("poisoned authority"));
+    // (b) The post-run settlement REFUSES (it used to swallow the poison as
+    // "active" and skip the run).
+    let handle = env.manager.get_session(env.parent).unwrap().unwrap();
+    handle
+        .upsert_memory_fact("verification_attempt", "root:run-poisoned", "1")
+        .unwrap();
+    let err = env
+        .executor
+        .settle_resolved_verifications(env.parent)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ExecError::Internal(m) if m.contains("poisoned authority")),
+        "settlement must refuse a poisoned lock: {err:?}"
+    );
+    // (c) Claiming a new orchestrated run refuses instead of panicking.
+    let req = request(
+        "start after poison",
+        vec![
+            wi("a", WorkKind::Analysis, &[]),
+            wi("b", WorkKind::Analysis, &["a"]),
+        ],
+        &env,
+    );
+    let err = env.executor.start_task(env.parent, req).unwrap_err();
+    assert!(
+        matches!(&err, ExecError::Internal(m) if m.contains("poisoned authority")),
+        "run admission must refuse a poisoned active-run lock: {err:?}"
+    );
+}
+
+// ------------------------------- FIX 3: tri-state re-goal
+
+/// FIX 3: the start request's criteria/attachments are tri-state — `None` =
+/// continuation (preserve), `Some(vec![])` = explicitly clear, `Some(items)`
+/// = replace; the dedicated patch wins over the legacy vector. All three
+/// outcomes are proven against the durable task row, for criteria AND
+/// attachments.
+#[tokio::test]
+async fn re_goal_tri_state_preserves_clears_and_replaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(dir.path(), done_script());
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    let a1 = h
+        .put_attachment("text/plain", Some("one.txt"), b"one")
+        .unwrap();
+    let a2 = h
+        .put_attachment("text/plain", Some("two.txt"), b"two")
+        .unwrap();
+    let item = || wi("impl", WorkKind::Implementation, &[]);
+
+    // Request-level tri-state (pure, no drive needed).
+    let mut probe = TaskRunRequest::default();
+    assert_eq!(probe.effective_criteria_patch(), None);
+    probe.criteria = vec!["legacy".into()];
+    assert_eq!(
+        probe.effective_criteria_patch(),
+        Some(vec!["legacy".into()])
+    );
+    probe.criteria_patch = Some(vec![]);
+    assert_eq!(probe.effective_criteria_patch(), Some(vec![]));
+    probe.criteria_patch = Some(vec!["new".into()]);
+    assert_eq!(probe.effective_criteria_patch(), Some(vec!["new".into()]));
+    assert_eq!(probe.effective_attachments_patch(), None);
+    probe.attachments = vec![a1.clone()];
+    assert_eq!(probe.effective_attachments_patch(), Some(vec![a1.clone()]));
+    probe.attachments_patch = Some(vec![]);
+    assert_eq!(probe.effective_attachments_patch(), Some(vec![]));
+    probe.attachments_patch = Some(vec![a2.clone()]);
+    assert_eq!(probe.effective_attachments_patch(), Some(vec![a2.clone()]));
+
+    // Run 1: seed a non-empty criteria/attachment contract.
+    let mut r1 = request("goal one", vec![item()], &env);
+    r1.criteria = vec!["c1".into()];
+    r1.attachments = vec![a1.clone()];
+    env.executor
+        .start_task(env.parent, r1)
+        .expect("first start");
+    let seed = h.get_task(task_id).unwrap().unwrap();
+    assert_eq!(seed.acceptance_criteria, vec!["c1".to_string()]);
+    assert_eq!(seed.attachments, vec![a1.clone()]);
+
+    // Run 2: `None` on both = continuation: the durable row is preserved.
+    let r2 = request("goal two", vec![item()], &env);
+    assert_eq!(r2.effective_criteria_patch(), None);
+    assert_eq!(r2.effective_attachments_patch(), None);
+    env.executor
+        .start_task(env.parent, r2)
+        .expect("second start");
+    let kept = h.get_task(task_id).unwrap().unwrap();
+    assert_eq!(
+        kept.acceptance_criteria,
+        vec!["c1".to_string()],
+        "None (continuation) must preserve criteria"
+    );
+    assert_eq!(
+        kept.attachments,
+        vec![a1.clone()],
+        "None (continuation) must preserve attachments"
+    );
+
+    // Run 3: `Some(vec![])` clears BOTH, even with a stale legacy vector
+    // present (the patch wins).
+    let mut r3 = request("goal three", vec![item()], &env);
+    r3.criteria = vec!["stale".into()];
+    r3.attachments = vec![a1.clone()];
+    r3.criteria_patch = Some(vec![]);
+    r3.attachments_patch = Some(vec![]);
+    env.executor
+        .start_task(env.parent, r3)
+        .expect("third start");
+    let cleared = h.get_task(task_id).unwrap().unwrap();
+    assert!(
+        cleared.acceptance_criteria.is_empty(),
+        "Some([]) must clear criteria: {:?}",
+        cleared.acceptance_criteria
+    );
+    assert!(
+        cleared.attachments.is_empty(),
+        "Some([]) must clear attachments: {:?}",
+        cleared.attachments
+    );
+
+    // Run 4: `Some(items)` replaces BOTH.
+    let mut r4 = request("goal four", vec![item()], &env);
+    r4.criteria_patch = Some(vec!["c2".into()]);
+    r4.attachments_patch = Some(vec![a2.clone()]);
+    env.executor
+        .start_task(env.parent, r4)
+        .expect("fourth start");
+    let replaced = h.get_task(task_id).unwrap().unwrap();
+    assert_eq!(replaced.acceptance_criteria, vec!["c2".to_string()]);
+    assert_eq!(replaced.attachments, vec![a2.clone()]);
 }

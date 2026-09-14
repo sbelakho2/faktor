@@ -6,11 +6,10 @@
 //! JetBrains) translates its DTOs into calls on this service:
 //!
 //! - [`PromptExecutionService::prompt`] — an ordinary chat prompt becomes an
-//!   IN-SESSION run through the daemon's [`TaskExecutor`]; under the
-//!   production default ([`MutationMode::Shadow`]) a mutating prompt works
-//!   in the daemon-owned shadow and only the verified integration commit
-//!   writes the user checkout. No adapter ever calls `AgentRuntime`'s drive
-//!   entries directly again.
+//!   IN-SESSION run through the daemon's [`TaskExecutor`]; a mutating prompt
+//!   works in the daemon-owned isolated candidate and only the verified
+//!   integration commit writes the user checkout. No adapter ever calls
+//!   `AgentRuntime`'s drive entries directly again.
 //! - [`PromptExecutionService::start_task`] — an explicit (multi-work-item)
 //!   task run goes through the SAME executor; the daemon allocates the
 //!   isolated candidate root itself (a client never supplies a filesystem
@@ -48,8 +47,10 @@ pub struct PromptRequest {
     pub model: Option<String>,
     /// Acceptance criteria ridden onto the run's durable task row.
     pub criteria: Vec<String>,
-    /// Per-run mutation policy override (`None` = the daemon default —
-    /// shadow mutation in production).
+    /// The run's mutation policy. Wire-compat vocabulary only: the sole
+    /// decodable value is `shadow` (a `direct_compat` value is a strict
+    /// decode error naming the removal) and the execution path ignores the
+    /// field — every mutating run executes in an isolated candidate.
     pub mutation_mode: Option<MutationMode>,
 }
 

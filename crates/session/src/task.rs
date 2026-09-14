@@ -71,6 +71,7 @@ use faktor_core::state::{
 };
 
 use crate::handle::SessionHandle;
+use crate::ledger::DurableRead;
 use crate::SessionError;
 
 /// Hard bound on one task goal (UTF-8 bytes).
@@ -84,20 +85,7 @@ pub const MAX_TASK_PLAN_STEPS: usize = 256;
 /// Hard bound on ONE plan step.
 pub const MAX_TASK_STEP_BYTES: usize = 3000;
 
-// -------------------------------------------------- root snapshot (P0 binding)
-
-/// Hard bound on one bounded root-snapshot walk (the completion binding):
-/// trees beyond it are typed Oversized refusals, never a partial digest.
-pub const MAX_ROOT_SNAPSHOT_ENTRIES: usize = 100_000;
-/// Hard depth bound of the root-snapshot walk (a hostile nested tree fails
-/// loudly instead of recursing without bound).
-pub const MAX_ROOT_SNAPSHOT_DEPTH: usize = 64;
-/// Directory names skipped at ANY depth by the root-snapshot digest: VCS
-/// bookkeeping the completion steps legitimately mutate (commits) and that
-/// is never working content. Everything else is hashed.
-pub const ROOT_SNAPSHOT_SKIP_DIRS: &[&str] = &[".git", ".hg", ".svn"];
-
-// ------------------------------------------------------ record bounds (P0-8)
+// -------------------------------------------------- record bounds (P0-8)
 
 /// Hard bound on the number of criterion verdicts in one record.
 pub const MAX_VERIFICATION_RECORD_CRITERIA: usize = 64;
@@ -961,6 +949,28 @@ pub enum TaskError {
         record: VerificationRecordId,
         missing: Vec<String>,
     },
+    #[error(
+        "verification record {record} is a binding-less LEGACY proof and can never certify \
+         task {task_id}: the modern criteria {criteria:?} require verdicts bound through their \
+         own manifest, so post-upgrade recovery forces re-verification"
+    )]
+    LegacyProofRequiresReverification {
+        task_id: TaskId,
+        record: VerificationRecordId,
+        criteria: Vec<String>,
+    },
+    #[error(
+        "mutating completion of task {task_id} refused: verification record {record} carries no \
+         canonical tree-manifest hash (`tm1:<64-hex>`), so the changed tree is unbound and the \
+         proof can never certify a mutation; re-verify the run through the manifest-bound \
+         integration path"
+    )]
+    ManifestBindingMissing {
+        task_id: TaskId,
+        record: VerificationRecordId,
+    },
+    #[error("corrupt durable state ({what}): {detail}")]
+    CorruptDurableState { what: String, detail: String },
     #[error("verification record {record} was certified against worktree {record_workspace}/{record_worktree}; the task's base worktree is {task_workspace}/{task_worktree}")]
     WorktreeMismatch {
         record: VerificationRecordId,
@@ -1010,6 +1020,12 @@ pub enum TaskError {
     },
     #[error("root snapshot unavailable: {0}")]
     RootSnapshotUnavailable(String),
+    #[error(
+        "root snapshot refused: the workspace root contains special file(s) {paths:?}; the \
+         canonical tree manifest cannot represent them, so tree equality is unprovable and \
+         completion must not proceed on a degraded comparison"
+    )]
+    RootSnapshotSpecialFile { paths: Vec<String> },
     #[error(
         "completion accounting incomplete for task {task_id}: {open_count} open reservation(s) \
          ({open_micro} micro held; {dispatched_count} already dispatched) and {uncertain_count} \
@@ -1141,132 +1157,31 @@ pub struct TaskPatch {
     pub state: Option<TaskState>,
 }
 
-/// Deterministic, bounded content digest of a workspace root (the completion
-/// binding's root snapshot): every regular file under `root` (sorted by
-/// relative path, VCS bookkeeping directories skipped) is streamed through
-/// BLAKE3 and folded with its relative path into ONE 64-char hex digest.
-///
-/// Bounded everything: beyond `max_entries` files or
-/// [`MAX_ROOT_SNAPSHOT_DEPTH`] depth the walk refuses with a typed
-/// `Oversized` error — never a partial digest, never an unbounded walk.
-/// Symlinks are followed only while they resolve INSIDE the root; an
-/// escaping link is a typed `Malformed` refusal. The digest is stable across
-/// processes/platforms for the same tree, which is what lets an integration
-/// record, a verification record and a later completion pass compare the
-/// SAME root.
-pub fn root_snapshot_digest(
-    root: &std::path::Path,
-    max_entries: usize,
-) -> Result<String, TaskError> {
-    if max_entries == 0 {
-        return Err(TaskError::Malformed(
-            "root snapshot max_entries must be >= 1".into(),
-        ));
+/// Map a canonical tree-manifest refusal onto the session's typed task error
+/// space. The canonical manifest itself lives in `faktor_fs::tree_manifest`
+/// (the ONE definition of "the same tree"); this crate only maps its typed
+/// refusals so the completion binding keeps distinct causes.
+fn task_error_from_tree_manifest(e: faktor_fs::tree_manifest::TreeManifestError) -> TaskError {
+    use faktor_fs::tree_manifest::TreeManifestError as E;
+    match e {
+        E::RootUnavailable(message) => TaskError::RootSnapshotUnavailable(message),
+        E::Malformed(message) => TaskError::Malformed(message),
+        E::Oversized(message) => TaskError::Oversized(message),
+        E::SpecialFile { paths } => TaskError::RootSnapshotSpecialFile { paths },
+        E::Io(message) => TaskError::Internal(message),
     }
-    let canonical = root
-        .canonicalize()
-        .map_err(|e| TaskError::RootSnapshotUnavailable(format!("{}: {e}", root.display())))?;
-    if !canonical.is_dir() {
-        return Err(TaskError::RootSnapshotUnavailable(format!(
-            "{} is not a directory",
-            root.display()
-        )));
-    }
-    let mut files: Vec<(String, String)> = Vec::new();
-    let mut count = 0usize;
-    // Iterative DFS with an explicit stack: every frame is one directory
-    // whose entries are sorted, so the traversal order is deterministic.
-    let mut stack: Vec<(std::path::PathBuf, String, usize)> =
-        vec![(canonical.clone(), String::new(), 0)];
-    while let Some((dir, prefix, depth)) = stack.pop() {
-        if depth > MAX_ROOT_SNAPSHOT_DEPTH {
-            return Err(TaskError::Oversized(format!(
-                "root snapshot walk exceeded MAX_ROOT_SNAPSHOT_DEPTH ({MAX_ROOT_SNAPSHOT_DEPTH})"
-            )));
-        }
-        let mut entries: Vec<(std::ffi::OsString, std::path::PathBuf, std::fs::FileType)> =
-            Vec::new();
-        let read = std::fs::read_dir(&dir).map_err(|e| {
-            TaskError::Internal(format!("root snapshot read_dir {}: {e}", dir.display()))
-        })?;
-        for entry in read {
-            let entry = entry.map_err(|e| {
-                TaskError::Internal(format!("root snapshot entry {}: {e}", dir.display()))
-            })?;
-            let path = entry.path();
-            let meta = std::fs::symlink_metadata(&path).map_err(|e| {
-                TaskError::Internal(format!("root snapshot metadata {}: {e}", path.display()))
-            })?;
-            entries.push((entry.file_name(), path, meta.file_type()));
-        }
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, path, file_type) in entries {
-            let rel = if prefix.is_empty() {
-                name.to_string_lossy().into_owned()
-            } else {
-                format!("{prefix}/{}", name.to_string_lossy())
-            };
-            let resolved = if file_type.is_symlink() {
-                let target = std::fs::canonicalize(&path).map_err(|e| {
-                    TaskError::Malformed(format!(
-                        "root snapshot symlink {rel:?} cannot be resolved: {e}"
-                    ))
-                })?;
-                if !target.starts_with(&canonical) {
-                    return Err(TaskError::Malformed(format!(
-                        "root snapshot symlink {rel:?} escapes the root"
-                    )));
-                }
-                target
-            } else {
-                path.clone()
-            };
-            let meta = std::fs::metadata(&resolved)
-                .map_err(|e| TaskError::Internal(format!("root snapshot metadata {rel:?}: {e}")))?;
-            if meta.is_dir() {
-                if ROOT_SNAPSHOT_SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
-                    continue;
-                }
-                stack.push((resolved, rel, depth + 1));
-                continue;
-            }
-            if !meta.is_file() {
-                // Sockets/FIFOs/devices are not working content: skipped (a
-                // FIFO would otherwise block the walk forever).
-                continue;
-            }
-            count += 1;
-            if count > max_entries {
-                return Err(TaskError::Oversized(format!(
-                    "root snapshot exceeds {max_entries} entries; refusing a partial digest"
-                )));
-            }
-            let mut hasher = blake3::Hasher::new();
-            let mut file = std::fs::File::open(&resolved)
-                .map_err(|e| TaskError::Internal(format!("root snapshot open {rel:?}: {e}")))?;
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                use std::io::Read;
-                let n = file
-                    .read(&mut buf)
-                    .map_err(|e| TaskError::Internal(format!("root snapshot read {rel:?}: {e}")))?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-            }
-            files.push((rel, hasher.finalize().to_hex().to_string()));
-        }
-    }
-    files.sort();
-    let mut fold = blake3::Hasher::new();
-    for (path, hash) in files {
-        fold.update(path.as_bytes());
-        fold.update(b"\0");
-        fold.update(hash.as_bytes());
-        fold.update(b"\n");
-    }
-    Ok(fold.finalize().to_hex().to_string())
+}
+
+/// The canonical tree-manifest digest of `root` (`tm1:<64-hex>`, see
+/// [`faktor_fs::tree_manifest`]): the completion binding's root snapshot.
+/// Every caller in this crate goes through the shared fs implementation —
+/// there is no second definition of "the same tree".
+fn current_manifest_digest(root: &std::path::Path) -> Result<String, TaskError> {
+    faktor_fs::tree_manifest::tree_manifest_digest(
+        root,
+        faktor_fs::tree_manifest::MAX_TREE_MANIFEST_ENTRIES,
+    )
+    .map_err(task_error_from_tree_manifest)
 }
 
 // ---------------------------------------------------- proof basis (P0)
@@ -1777,22 +1692,34 @@ impl SessionHandle {
     /// The task's ACCEPTED completion contract (the newest durable set row)
     /// and the task revision it was recorded against; `None` when the task
     /// never carried a non-default contract.
+    ///
+    /// FIX 2: the read is explicitly classified — a genuinely absent
+    /// contract is `None` (not-found policy), a PRESENT-but-corrupt contract
+    /// row is a typed [`TaskError::CorruptDurableState`], and a failed
+    /// durable read is [`TaskError::Store`] (never "no contract").
     pub fn completion_contract(
         &self,
         task_id: TaskId,
     ) -> Result<Option<(TaskRevision, CompletionContract)>, TaskError> {
-        let row = self
-            .ledger_completion_contract(task_id.raw())
-            .map_err(task_error_from_core)?;
-        let Some(row) = row else {
-            return Ok(None);
+        let row = match self.ledger_completion_contract_read(task_id.raw()) {
+            DurableRead::Missing => return Ok(None),
+            DurableRead::PresentValid(row) => row,
+            DurableRead::PresentMalformed(detail) => {
+                return Err(TaskError::CorruptDurableState {
+                    what: format!("completion contract of task {task_id}"),
+                    detail,
+                })
+            }
+            DurableRead::StoreFailure(detail) => return Err(TaskError::Store(detail)),
         };
-        let revision = TaskRevision::try_from(row.revision).map_err(|e| {
-            TaskError::Malformed(format!(
-                "stored completion contract revision {} is invalid: {e}",
-                row.revision
-            ))
-        })?;
+        let revision =
+            TaskRevision::try_from(row.revision).map_err(|e| TaskError::CorruptDurableState {
+                what: format!("completion contract revision of task {task_id}"),
+                detail: format!(
+                    "stored completion contract revision {} is invalid: {e}",
+                    row.revision
+                ),
+            })?;
         Ok(Some((revision, row.contract)))
     }
 
@@ -1824,10 +1751,20 @@ impl SessionHandle {
         // P0 binding: when the task carries a finalized integration record,
         // the step outcome references its final root snapshot. A step is
         // then only admissible while the root still digests to that
-        // snapshot; the completion gate re-checks it.
-        let integration = self
-            .ledger_integration_record_for_task(task_id.raw())
-            .map_err(task_error_from_core)?;
+        // snapshot; the completion gate re-checks it. FIX 2: the read is
+        // classified — absent is legal (no integration), a corrupt row
+        // refuses typed, and a store failure is an error.
+        let integration = match self.ledger_integration_record_for_task_read(task_id.raw()) {
+            DurableRead::Missing => None,
+            DurableRead::PresentValid(record) => Some(record),
+            DurableRead::PresentMalformed(detail) => {
+                return Err(TaskError::CorruptDurableState {
+                    what: format!("integration record of task {task_id}"),
+                    detail,
+                })
+            }
+            DurableRead::StoreFailure(detail) => return Err(TaskError::Store(detail)),
+        };
         let snapshot = integration
             .as_ref()
             .map(|r| r.final_snapshot_hash.clone())
@@ -1860,21 +1797,30 @@ impl SessionHandle {
         &self,
         task_id: TaskId,
     ) -> Result<CompletionContractGate, TaskError> {
-        let Some(row) = self
-            .ledger_completion_contract(task_id.raw())
-            .map_err(task_error_from_core)?
-        else {
-            return Ok(CompletionContractGate::Satisfied);
+        let row = match self.ledger_completion_contract_read(task_id.raw()) {
+            DurableRead::Missing => return Ok(CompletionContractGate::Satisfied),
+            DurableRead::PresentValid(row) => row,
+            // FIX 2: a present-but-corrupt contract NEVER resolves to the
+            // satisfied default — it refuses typed.
+            DurableRead::PresentMalformed(detail) => {
+                return Err(TaskError::CorruptDurableState {
+                    what: format!("completion contract of task {task_id}"),
+                    detail,
+                })
+            }
+            DurableRead::StoreFailure(detail) => return Err(TaskError::Store(detail)),
         };
         if row.contract.is_default() {
             return Ok(CompletionContractGate::Satisfied);
         }
-        let revision = TaskRevision::try_from(row.revision).map_err(|e| {
-            TaskError::Malformed(format!(
-                "stored completion contract revision {} is invalid: {e}",
-                row.revision
-            ))
-        })?;
+        let revision =
+            TaskRevision::try_from(row.revision).map_err(|e| TaskError::CorruptDurableState {
+                what: format!("completion contract revision of task {task_id}"),
+                detail: format!(
+                    "stored completion contract revision {} is invalid: {e}",
+                    row.revision
+                ),
+            })?;
         let rows = self
             .ledger_completion_step_statuses(task_id.raw(), row.revision)
             .map_err(task_error_from_core)?;
@@ -1915,6 +1861,9 @@ impl SessionHandle {
                                 ))
                             }
                             Err(e @ TaskError::RootSnapshotUnavailable(_)) => {
+                                return Ok(CompletionContractGate::Refused(e))
+                            }
+                            Err(e @ TaskError::RootSnapshotSpecialFile { .. }) => {
                                 return Ok(CompletionContractGate::Refused(e))
                             }
                             Err(e) => return Err(e),
@@ -2005,35 +1954,63 @@ impl SessionHandle {
                 status: rec.status,
             });
         }
-        let expected: Vec<(String, CriterionBinding)> = row
+        let expected: Vec<(String, CriterionBinding, bool)> = row
             .acceptance_criteria
             .iter()
             .map(|entry| {
-                let effective = Criterion::decode(entry)
-                    .map(|c| c.effective_binding())
-                    .unwrap_or_else(|| legacy_binding_for_criterion_text(entry));
-                (entry.clone(), effective)
+                // A V2-encoded criterion is MODERN (its binding is stored on
+                // the criterion itself and migrated deterministically when
+                // absent); a plain-text entry is legacy. The distinction is
+                // load-bearing below: a binding-less verdict can never cover
+                // a modern criterion.
+                let (binding, modern) = match Criterion::decode(entry) {
+                    Some(c) => (c.effective_binding(), true),
+                    None => (legacy_binding_for_criterion_text(entry), false),
+                };
+                (entry.clone(), binding, modern)
             })
             .collect();
-        let missing: Vec<String> = expected
-            .iter()
-            .filter(|(key, binding)| {
-                // A criterion is covered only by a PASSED verdict through its
-                // OWN binding. Legacy records carry no binding: they keep the
-                // V2 key+passed contract (a pre-binding record cannot be
-                // retroactively re-bound here), while every new record's
-                // binding must match the task criterion's effective binding.
-                !rec.criteria.iter().any(|cv| {
-                    cv.passed
-                        && &cv.criterion_key == key
-                        && match &cv.binding {
-                            Some(recorded) => recorded == binding,
-                            None => true,
-                        }
-                })
-            })
-            .map(|(key, _)| key.clone())
-            .collect();
+        let mut missing: Vec<String> = Vec::new();
+        let mut legacy_unbound: Vec<String> = Vec::new();
+        for (key, binding, modern) in &expected {
+            // A criterion is covered only by a PASSED verdict: every MODERN
+            // criterion additionally requires the verdict to carry ITS OWN
+            // binding (`cv.binding == Some(expected_binding)`). A
+            // binding-less verdict can never certify a modern criterion —
+            // the legacy record stays viewable but post-upgrade recovery
+            // forces re-verification (the typed outcome names the record).
+            // Legacy plain-text criteria keep the historical key+passed
+            // contract.
+            let covered = rec.criteria.iter().any(|cv| {
+                cv.passed
+                    && &cv.criterion_key == key
+                    && match (&cv.binding, modern) {
+                        (Some(recorded), _) => recorded == binding,
+                        (None, false) => true,
+                        (None, true) => false,
+                    }
+            });
+            if covered {
+                continue;
+            }
+            let only_legacy_verdict = *modern
+                && rec
+                    .criteria
+                    .iter()
+                    .any(|cv| cv.passed && &cv.criterion_key == key && cv.binding.is_none());
+            if only_legacy_verdict {
+                legacy_unbound.push(key.clone());
+            } else {
+                missing.push(key.clone());
+            }
+        }
+        if !legacy_unbound.is_empty() {
+            return Err(TaskError::LegacyProofRequiresReverification {
+                task_id,
+                record: proof,
+                criteria: legacy_unbound,
+            });
+        }
         if !missing.is_empty() {
             return Err(TaskError::CriteriaNotCovered {
                 record: proof,
@@ -2052,18 +2029,59 @@ impl SessionHandle {
                 task_worktree: base.worktree_id,
             });
         }
-        // P0 orchestrated-completion binding: a record that carries a
-        // final-integration snapshot is only valid while (a) the task holds
-        // the integration record that certified that snapshot and (b) the
-        // CURRENT root still digests to it. A later arbitrary owner-checkout
-        // edit changes the digest and refuses completion (typed); the run
-        // must re-integrate and re-verify. Records without a tree_hash keep
-        // the legacy single-session behavior byte-identically.
+        // FIX 2 classification: the task's integration record is read with
+        // the four-outcome distinction — absent is the not-found policy,
+        // present uses the row, malformed is typed corruption, and a failed
+        // store read is an error (never "nothing integrated").
+        let integration = match self.ledger_integration_record_for_task_read(task_id.raw()) {
+            DurableRead::Missing => None,
+            DurableRead::PresentValid(record) => Some(record),
+            DurableRead::PresentMalformed(detail) => {
+                return Err(TaskError::CorruptDurableState {
+                    what: format!("integration record of task {task_id}"),
+                    detail,
+                })
+            }
+            DurableRead::StoreFailure(detail) => return Err(TaskError::Store(detail)),
+        };
+        // A managed live shadow whose immutable run base is durably recorded
+        // is mutation evidence: the session's effective root is not the
+        // owner checkout and a proof without a tree hash can only certify
+        // the un-integrated shadow world.
+        let live_shadow_run_base = match self
+            .manager
+            .shadow_row(self.id)
+            .map_err(|e| TaskError::Store(e.to_string()))?
+        {
+            Some(shadow) if shadow.state.is_live() => {
+                match self.ledger_run_base_read(&shadow.shadow_id) {
+                    DurableRead::Missing => false,
+                    DurableRead::PresentValid(_) => true,
+                    DurableRead::PresentMalformed(detail) => {
+                        return Err(TaskError::CorruptDurableState {
+                            what: format!("run base of shadow {}", shadow.shadow_id),
+                            detail,
+                        })
+                    }
+                    DurableRead::StoreFailure(detail) => return Err(TaskError::Store(detail)),
+                }
+            }
+            _ => false,
+        };
+        // FIX 1: a MUTATING completion requires a canonical manifest-bound
+        // tree hash. Durable mutation evidence is exactly: the task carries
+        // an integration record (its changes landed/staged through the
+        // integration pipeline) or a live managed shadow has a recorded run
+        // base (its effective root is not the owner checkout). A plain
+        // in-session record with no such evidence is the legacy single-
+        // session contract: its criteria are still certified through their
+        // own bindings above, and the executor's shadow settlement mints the
+        // manifest-bound record whenever isolation is in force. The former
+        // "records without a tree hash keep legacy behavior" blanket branch
+        // is deleted: with durable mutation evidence, a completion without a
+        // manifest-bound tree_hash is typed-refused.
         if let Some(recorded) = rec.tree_hash.as_deref() {
-            let Some(integration) = self
-                .ledger_integration_record_for_task(task_id.raw())
-                .map_err(task_error_from_core)?
-            else {
+            let Some(integration) = integration else {
                 return Err(TaskError::IntegrationRecordMissing {
                     task_id,
                     record: proof,
@@ -2097,6 +2115,22 @@ impl SessionHandle {
                     })
                 }
             }
+        } else if integration.is_some() {
+            // Durable mutation evidence (an integration record exists) but
+            // the proof carries no manifest binding: typed refusal. The
+            // record can never certify a mutation it does not bound.
+            return Err(TaskError::ManifestBindingMissing {
+                task_id,
+                record: proof,
+            });
+        } else if live_shadow_run_base {
+            // The existing typed shadow refusal (byte-compatible): the
+            // shadow-world proof predates landing and must be re-verified
+            // after the executor lands the candidate.
+            return Err(TaskError::IntegrationRecordMissing {
+                task_id,
+                record: proof,
+            });
         }
         Ok(())
     }
@@ -2170,11 +2204,12 @@ impl SessionHandle {
         Ok(row.revision)
     }
 
-    /// The CURRENT content digest of the session's effective root (the live
-    /// shadow root while one is live, else the durable workspace root): the
-    /// exact value the completion binding compares against a verification
-    /// record's integration snapshot. `Ok(None)` when the session or its
-    /// workspace row is unknown (no root — the caller fails closed).
+    /// The CURRENT canonical tree-manifest digest of the session's effective
+    /// root (the live shadow root while one is live, else the durable
+    /// workspace root): the exact value the completion binding compares
+    /// against a verification record's integration snapshot. `Ok(None)` when
+    /// the session or its workspace row is unknown (no root — the caller
+    /// fails closed).
     pub fn current_root_snapshot_digest(&self) -> Result<Option<String>, TaskError> {
         let Some(root) = self
             .manager
@@ -2183,7 +2218,7 @@ impl SessionHandle {
         else {
             return Ok(None);
         };
-        root_snapshot_digest(&root, MAX_ROOT_SNAPSHOT_ENTRIES).map(Some)
+        current_manifest_digest(&root).map(Some)
     }
 
     /// The durable task row identified by `task_id` (session-scoped).
@@ -2514,7 +2549,7 @@ impl SessionHandle {
             .get_verification_record(proof)?
             .ok_or(TaskError::RecordNotFound(proof))?;
         if let (Some(recorded), Some(root)) = (record.tree_hash.as_deref(), candidate_root) {
-            let current = root_snapshot_digest(root, MAX_ROOT_SNAPSHOT_ENTRIES)?;
+            let current = current_manifest_digest(root)?;
             if current != recorded {
                 return Err(TaskError::IntegrationSnapshotMismatch {
                     task_id,
@@ -2845,12 +2880,17 @@ fn validate_verification_record(
         }
     }
     if let Some(hash) = tree_hash {
-        if hash.is_empty()
-            || hash.len() > MAX_VERIFICATION_TREE_HASH_BYTES
-            || !hash.bytes().all(|b| b.is_ascii_hexdigit())
-        {
+        // Two shapes stay WRITABLE: the versioned canonical tree-manifest
+        // digest (`tm1:` + 64 hex) and the legacy 64-hex content-only digest
+        // (accepted so records written before the canonical manifest still
+        // decode). The two shapes never compare equal — a legacy record
+        // fails the completion binding loudly instead of silently matching.
+        let legacy = !hash.is_empty()
+            && hash.len() <= MAX_VERIFICATION_TREE_HASH_BYTES
+            && hash.bytes().all(|b| b.is_ascii_hexdigit());
+        if !legacy && !faktor_fs::tree_manifest::is_tree_manifest_digest(hash) {
             return Err(malformed(format!(
-                "tree_hash {:?} must be non-empty hex of at most {MAX_VERIFICATION_TREE_HASH_BYTES} chars",
+                "tree_hash {:?} must be a canonical `tm1:<64-hex>` tree-manifest digest or a legacy hex digest of at most {MAX_VERIFICATION_TREE_HASH_BYTES} chars",
                 hash
             )));
         }
@@ -3078,6 +3118,43 @@ mod tests {
                 passed: true,
                 evidence: Some("exit 0".into()),
                 binding: None,
+            })
+            .collect();
+        s.create_verification_record(
+            task_id,
+            None,
+            criteria,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            VerificationStatus::Passed,
+            1,
+        )
+        .unwrap()
+    }
+
+    /// The manifest-bound twin of [`passed_record`] (FIX 1): every verdict
+    /// carries the criterion's own effective binding, so MODERN (V2) criteria
+    /// are covered through their manifest. Legacy plain-text criteria carry
+    /// the deterministically migrated binding too (honest and harmless).
+    fn passed_record_bound(
+        s: &SessionHandle,
+        task_id: TaskId,
+        criteria: &[String],
+    ) -> VerificationRecordId {
+        let criteria: Vec<CriterionVerification> = criteria
+            .iter()
+            .map(|c| {
+                let binding = Criterion::decode(c)
+                    .map(|decoded| decoded.effective_binding())
+                    .unwrap_or_else(|| legacy_binding_for_criterion_text(c));
+                CriterionVerification {
+                    criterion_key: c.clone(),
+                    passed: true,
+                    evidence: Some("exit 0".into()),
+                    binding: Some(binding),
+                }
             })
             .collect();
         s.create_verification_record(
@@ -4668,7 +4745,9 @@ mod tests {
         let migrated = s2.task_criteria(tid2).unwrap();
         let migrated_row = s2.set_task_criteria(tid2, migrated.clone()).unwrap();
         let rev2 = drive_to_verifying(&s2, tid2);
-        let record2 = passed_record(&s2, tid2, &migrated_row.acceptance_criteria);
+        // The migrated row is MODERN (V2): the record must carry the
+        // criterion's own binding to certify (FIX 1).
+        let record2 = passed_record_bound(&s2, tid2, &migrated_row.acceptance_criteria);
         let done2 = s2.complete_verified_task(tid2, rev2, record2).unwrap();
         assert_eq!(done2.state, TaskState::VerifiedComplete);
     }
@@ -4873,9 +4952,11 @@ mod tests {
             s.get_task(tid).unwrap().unwrap().state,
             TaskState::Verifying
         );
-        // A fresh record certifying the CURRENT row completes.
+        // A fresh record certifying the CURRENT row completes; the row is
+        // MODERN (V2 after the set above), so the record binds each
+        // criterion through its own effective binding (FIX 1).
         let current_keys = s.get_task(tid).unwrap().unwrap().acceptance_criteria;
-        let fresh = passed_record(&s, tid, &current_keys);
+        let fresh = passed_record_bound(&s, tid, &current_keys);
         let done = s.complete_verified_task(tid, moved, fresh).unwrap();
         assert_eq!(done.state, TaskState::VerifiedComplete);
     }
@@ -5637,8 +5718,11 @@ mod tests {
         (m, s, root)
     }
 
+    /// The canonical tree-manifest digest (the ONE root identity shared with
+    /// the fs layer's `tree_manifest`), exactly what every completion
+    /// binding compares.
     fn root_digest(root: &std::path::Path) -> String {
-        root_snapshot_digest(root, MAX_ROOT_SNAPSHOT_ENTRIES).unwrap()
+        current_manifest_digest(root).unwrap()
     }
 
     fn passed_record_with_tree(
@@ -5845,30 +5929,51 @@ mod tests {
         }
     }
 
-    /// The root-snapshot digest is deterministic, skips VCS bookkeeping and
-    /// refuses oversized walks instead of returning a partial digest.
+    /// The canonical tree-manifest digest is deterministic, skips VCS
+    /// bookkeeping and refuses oversized walks instead of returning a
+    /// partial digest; the completion-facing helper keeps the typed session
+    /// mapping (unresolvable root, special files).
     #[test]
-    fn root_snapshot_digest_is_deterministic_and_bounded() {
+    fn root_manifest_digest_is_deterministic_and_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
         std::fs::create_dir_all(root.join("a")).unwrap();
         std::fs::write(root.join("a/x.txt"), "x").unwrap();
         std::fs::write(root.join("y.txt"), "y").unwrap();
         let first = root_digest(&root);
+        assert!(
+            first.starts_with(faktor_fs::tree_manifest::TREE_MANIFEST_DIGEST_PREFIX),
+            "the canonical digest is version-prefixed: {first}"
+        );
         std::fs::write(root.join("y.txt"), "z").unwrap();
         let changed = root_digest(&root);
         assert_ne!(changed, first);
         std::fs::create_dir_all(root.join(".git/objects")).unwrap();
         std::fs::write(root.join(".git/objects/blob"), "commit state").unwrap();
         assert_eq!(root_digest(&root), changed, "VCS bookkeeping is skipped");
-        let err = root_snapshot_digest(&root, 1).unwrap_err();
-        assert!(matches!(err, TaskError::Oversized(_)), "{err}");
-        let err = root_snapshot_digest(&dir.path().join("missing"), MAX_ROOT_SNAPSHOT_ENTRIES)
-            .unwrap_err();
+        let err = faktor_fs::tree_manifest::tree_manifest_digest(&root, 1).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                faktor_fs::tree_manifest::TreeManifestError::Oversized(_)
+            ),
+            "{err}"
+        );
+        // The session mapping keeps the typed refusal for an unresolvable
+        // root and for a special file (equality is unprovable then).
+        let err = current_manifest_digest(&dir.path().join("missing")).unwrap_err();
         assert!(
             matches!(err, TaskError::RootSnapshotUnavailable(_)),
             "{err}"
         );
+        assert!(matches!(
+            task_error_from_tree_manifest(
+                faktor_fs::tree_manifest::TreeManifestError::SpecialFile {
+                    paths: vec!["pipe".into()],
+                }
+            ),
+            TaskError::RootSnapshotSpecialFile { .. }
+        ));
     }
 
     // ------------------------------------------- typed criterion bindings (P0)
@@ -5983,6 +6088,220 @@ mod tests {
             TaskState::Verifying,
             "a failed required criterion must block the task"
         );
+    }
+
+    // ------------------------------- manifest-bound proofs + durable reads (FIX 1/2)
+
+    /// FIX 1: a binding-less LEGACY record stays viewable but can never
+    /// certify a MODERN (V2-bound) task criterion: completion refuses with a
+    /// typed outcome NAMING the legacy record and post-upgrade recovery
+    /// forces re-verification. A re-verified record that carries the
+    /// criterion's own binding then completes.
+    #[test]
+    fn legacy_binding_less_record_cannot_certify_a_modern_task() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec![])).unwrap();
+        let bound = Criterion::derived(
+            "required check: cargo check",
+            CriterionOrigin::ProjectPolicy,
+            CriterionRequirement::Required,
+            None,
+        )
+        .with_binding(CriterionBinding::RequiredCheck {
+            check_id: "rust_check".into(),
+            command_digest: faktor_core::state::command_binding_digest("cargo check"),
+        });
+        s.set_task_criteria(tid, vec![bound.clone()]).unwrap();
+        let rev = drive_to_verifying(&s, tid);
+        // The legacy record: passed verdict with the right key, NO binding.
+        let legacy = s
+            .create_verification_record(
+                tid,
+                None,
+                vec![CriterionVerification {
+                    criterion_key: bound.encode(),
+                    passed: true,
+                    evidence: Some("legacy pre-binding verdict".into()),
+                    binding: None,
+                }],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Passed,
+                1,
+            )
+            .unwrap();
+        let err = s.complete_verified_task(tid, rev, legacy).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TaskError::LegacyProofRequiresReverification {
+                    task_id,
+                    record,
+                    ref criteria,
+                } if task_id == tid && record == legacy && criteria == &vec![bound.encode()]
+            ),
+            "{err}"
+        );
+        // The read-only binding mirror refuses identically (the store CAS is
+        // never reached with a legacy proof).
+        let mirror = s
+            .verify_completion_proof_binding(tid, legacy, None)
+            .unwrap_err();
+        assert!(
+            matches!(mirror, TaskError::LegacyProofRequiresReverification { .. }),
+            "{mirror}"
+        );
+        assert_eq!(
+            s.get_task(tid).unwrap().unwrap().state,
+            TaskState::Verifying,
+            "the refusal must write nothing"
+        );
+        // Re-verification: a fresh verdict through the criterion's OWN
+        // binding certifies.
+        let fresh = s
+            .create_verification_record(
+                tid,
+                None,
+                vec![CriterionVerification {
+                    criterion_key: bound.encode(),
+                    passed: true,
+                    evidence: Some("re-verified under the binding".into()),
+                    binding: bound.binding.clone(),
+                }],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Passed,
+                1,
+            )
+            .unwrap();
+        let done = s.complete_verified_task(tid, rev, fresh).unwrap();
+        assert_eq!(done.state, TaskState::VerifiedComplete);
+    }
+
+    /// FIX 1: a MUTATING completion (the task carries a durable integration
+    /// record) without a canonical manifest-bound tree hash is typed-refused:
+    /// an unbound record can never certify the landed mutation. A session
+    /// with NO durable mutation evidence keeps the legacy in-session
+    /// contract, where the record certifies through its bound criteria.
+    #[test]
+    fn mutating_completion_without_a_tree_hash_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, s, root) = real_root_session(&dir);
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec!["c1".into()]))
+            .unwrap();
+        let rev = drive_to_verifying(&s, tid);
+        // Durable mutation evidence: a finalized integration record for the
+        // task (its changes were staged/landed through the pipeline).
+        let _integration = finalized_integration(&s, tid, &root, &"d".repeat(64), &["changed.txt"]);
+        let unbound = s
+            .create_verification_record(
+                tid,
+                None,
+                vec![CriterionVerification {
+                    criterion_key: "c1".into(),
+                    passed: true,
+                    evidence: Some("unbound proof of a landed mutation".into()),
+                    binding: None,
+                }],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Passed,
+                1,
+            )
+            .unwrap();
+        let err = s.complete_verified_task(tid, rev, unbound).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TaskError::ManifestBindingMissing { task_id, record }
+                    if task_id == tid && record == unbound
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            s.get_task(tid).unwrap().unwrap().state,
+            TaskState::Verifying,
+            "the refusal must write nothing"
+        );
+        // Boundary: a session with NO durable mutation evidence (no
+        // integration record, no live shadow with a run base) keeps the
+        // legacy in-session contract — the record certifies through its
+        // criteria, so a plainly non-shadowed conversation still works.
+        let root2 = dir.path().join("root2");
+        std::fs::create_dir_all(&root2).unwrap();
+        std::fs::write(root2.join("base.txt"), "base\n").unwrap();
+        let ws2 = m.create_workspace(root2.to_str().unwrap()).unwrap();
+        let s2 = m.create_session(ws2, "t2", "ollama", "qwen3.8").unwrap();
+        let tid2 = s2.task_id().unwrap();
+        s2.create_task(criteria_task(&s2, tid2, vec!["c1".into()]))
+            .unwrap();
+        let rev2 = drive_to_verifying(&s2, tid2);
+        let plain = passed_record(&s2, tid2, &["c1".into()]);
+        let done = s2.complete_verified_task(tid2, rev2, plain).unwrap();
+        assert_eq!(done.state, TaskState::VerifiedComplete);
+    }
+
+    /// FIX 2: a PRESENT-but-corrupt completion-contract row is a typed
+    /// [`TaskError::CorruptDurableState`] (never `None`/satisfied), and a
+    /// failed durable read is [`TaskError::Store`] — while a genuinely
+    /// MISSING contract follows the not-found policy (`Ok(None)` /
+    /// satisfied gate).
+    #[test]
+    fn missing_corrupt_and_failed_durable_reads_are_distinct() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec!["c1".into()]))
+            .unwrap();
+        // (1) Missing: the not-found policy.
+        assert_eq!(s.completion_contract(tid).unwrap(), None);
+        assert_eq!(
+            s.completion_contract_gate(tid).unwrap(),
+            CompletionContractGate::Satisfied
+        );
+        // (2) PresentMalformed: a raw all-false contract row (bypassing the
+        // typed appender) refuses BOTH reads as corrupt durable state.
+        m.store()
+            .append_ledger_entry(
+                s.id,
+                crate::ledger::ENTRY_COMPLETION_CONTRACT_SET,
+                crate::ledger::LEDGER_ENTRY_SCHEMA_V,
+                serde_json::json!({
+                    "kind": "completion_contract_set",
+                    "task_id": tid.raw(),
+                    "revision": 1,
+                    "contract": {
+                        "include_commit": false,
+                        "include_push": false,
+                        "include_pr": false,
+                    },
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            s.completion_contract(tid).unwrap_err(),
+            TaskError::CorruptDurableState { .. }
+        ));
+        assert!(matches!(
+            s.completion_contract_gate(tid).unwrap_err(),
+            TaskError::CorruptDurableState { .. }
+        ));
+        // (3) StoreFailure: with the ledger table gone the same reads are
+        // errors, never "absent/satisfied".
+        m.store().sql_execute("DROP TABLE ledger_entry").unwrap();
+        let err = s.completion_contract(tid).unwrap_err();
+        assert!(matches!(err, TaskError::Store(_)), "{err:?}");
+        let err = s.completion_contract_gate(tid).unwrap_err();
+        assert!(matches!(err, TaskError::Store(_)), "{err:?}");
     }
 
     #[test]

@@ -63,7 +63,7 @@ use faktor_core::state::{
 };
 use faktor_session::task::{ProofBasis, ProofBasisCheck, ProofBasisCriterion, ProofReuse};
 use faktor_session::{
-    CompletionContractGate, SessionManager, TaskBudget, MAX_TASK_CRITERIA,
+    CompletionContractGate, SessionManager, ShadowRow, TaskBudget, MAX_TASK_CRITERIA,
     MAX_TASK_CRITERION_BYTES, MAX_TASK_GOAL_BYTES,
 };
 
@@ -102,6 +102,79 @@ const RUN_BASE_SKIP_DIRS: &[&str] = &[".git", ".hg", ".svn"];
 /// [`ExecError::WorkspaceDrift`].
 const RUN_BASE_COPY_ATTEMPTS: usize = 3;
 
+/// The canonical tree-manifest digest of one root (`tm1:<64-hex>`; the ONE
+/// tree identity defined in `faktor_fs::tree_manifest`). Every run-base,
+/// candidate, landing and shadow check goes through this helper — never a
+/// second definition of "the same tree" and never the legacy content-only
+/// digest.
+pub(super) fn root_manifest_digest(root: &std::path::Path) -> Result<String, ExecError> {
+    faktor_fs::tree_manifest::tree_manifest_digest(
+        root,
+        faktor_fs::tree_manifest::MAX_TREE_MANIFEST_ENTRIES,
+    )
+    .map_err(|e| ExecError::WorkspaceDrift(format!("root snapshot of {}: {e}", root.display())))
+}
+
+/// FIX 2: the explicit read distinction, typed inside the executor. A
+/// durable row is never collapsed into `None`: absent follows the caller's
+/// not-found policy, present-and-valid is used, PRESENT-BUT-CORRUPT refuses
+/// as [`Self::CorruptDurableState`], and a failed read refuses as
+/// [`Self::StoreFailure`] — never "nothing happened".
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DurableStateError {
+    #[error("corrupt durable state ({what}): {detail}")]
+    CorruptDurableState { what: String, detail: String },
+    #[error("durable read failed ({what}): {detail}")]
+    StoreFailure { what: String, detail: String },
+}
+
+impl From<DurableStateError> for ExecError {
+    fn from(e: DurableStateError) -> Self {
+        // ExecError is shared with every orchestrator surface; the typed
+        // refusal keeps its identity in DurableStateError and crosses the
+        // boundary with the stable `corrupt durable state` / `durable read
+        // failed` prefix.
+        ExecError::Internal(format!("{e}"))
+    }
+}
+
+/// Resolve one [`faktor_session::ledger::DurableRead`]: `Missing` = the
+/// caller's not-found policy (`Ok(None)`); valid = use; corrupt or failed =
+/// a typed refusal.
+fn durable_read_value<T>(
+    what: impl Into<String>,
+    read: faktor_session::ledger::DurableRead<T>,
+) -> Result<Option<T>, DurableStateError> {
+    use faktor_session::ledger::DurableRead as R;
+    match read {
+        R::Missing => Ok(None),
+        R::PresentValid(value) => Ok(Some(value)),
+        R::PresentMalformed(detail) => Err(DurableStateError::CorruptDurableState {
+            what: what.into(),
+            detail,
+        }),
+        R::StoreFailure(detail) => Err(DurableStateError::StoreFailure {
+            what: what.into(),
+            detail,
+        }),
+    }
+}
+
+/// Classify one session-layer read error: a strict decode/shape failure is
+/// corruption, anything else is a store failure. Never "nothing happened".
+fn classify_session_read(what: &str, e: faktor_core::Error) -> DurableStateError {
+    match e.kind {
+        faktor_core::ErrorKind::Malformed => DurableStateError::CorruptDurableState {
+            what: what.to_string(),
+            detail: e.message,
+        },
+        _ => DurableStateError::StoreFailure {
+            what: what.to_string(),
+            detail: e.message,
+        },
+    }
+}
+
 /// How one [`TaskRunRequest`] executes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -114,30 +187,48 @@ pub enum TaskRunMode {
     Orchestrated,
 }
 
-/// Where a MUTATING single-item run's writes land (the P0-48 mutation
-/// policy). The daemon's [`crate::runtime::shadow`] machinery exists
-/// whenever the executor carries a [`ShadowRoots`] service; this mode says
-/// how the service is USED for one run:
-///
-/// - `Shadow` (the production default): a single-item MUTATING run works
-///   in a daemon-owned shadow of the user checkout and only a
-///   conflict-aware verified integration commits the user checkout;
-/// - `DirectCompat`: the run drives the user checkout directly — the
-///   byte-identical behavior of every wave before shadow mutation was the
-///   default. A live shadow row left by an earlier run is settled
-///   deterministically FIRST so a "direct" run can never silently drive a
-///   stale shadow (the durable row would otherwise re-point every file
-///   consumer at it).
-///
+/// The P0 mutation policy of a MUTATING single-item run. There is exactly
+/// ONE policy — `Shadow` (the production default and the only decodable
+/// value): a single-item MUTATING run works in a daemon-owned isolated
+/// candidate (the [`crate::runtime::shadow`] machinery) and only a
+/// conflict-aware verified integration commits the user checkout.
 /// Read-only single-item runs and multi-item runs never shadow (they never
-/// mutate the owner checkout through the in-session drive), so the mode
-/// only ever changes how a MUTATING single-item run resolves its root.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+/// mutate the owner checkout through the in-session drive).
+///
+/// The type survives ONLY as the wire/config vocabulary: the legacy
+/// `direct_compat` value is a strict decode error naming its removal, and
+/// there is no mode value, config key or DTO field that can disable
+/// isolation (see [`TaskExecutor::new`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MutationMode {
     #[default]
     Shadow,
-    DirectCompat,
+}
+
+impl<'de> serde::Deserialize<'de> for MutationMode {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ModeVisitor;
+        impl serde::de::Visitor<'_> for ModeVisitor {
+            type Value = MutationMode;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("the mutation policy \"shadow\" (mutating runs always execute in an isolated candidate)")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<MutationMode, E> {
+                match value {
+                    "shadow" => Ok(MutationMode::Shadow),
+                    "direct_compat" => Err(E::custom(
+                        "mutation_mode \"direct_compat\" was removed: every mutating run executes in an isolated candidate (shadow mutation); there is no direct-owner mode",
+                    )),
+                    other => Err(E::unknown_variant(other, &["shadow"])),
+                }
+            }
+        }
+        de.deserialize_str(ModeVisitor)
+    }
 }
 
 /// The durable linkage row of ONE in-session (single-item) task run,
@@ -209,19 +300,30 @@ fn write_run_policy_row(
 }
 
 /// The run's effective no-op disposition from its durable policy row; an
-/// absent row (a legacy run), an absent field or an undecodable row resolves
-/// to the mutating-task default — never a silent `Allowed`.
-fn run_no_op_disposition(handle: &faktor_session::SessionHandle, run_id: &str) -> NoOpDisposition {
-    parent_facts(handle)
-        .ok()
-        .and_then(|facts| {
-            facts
-                .into_iter()
-                .find(|(kind, key, _)| kind == RUN_POLICY_ROW_KIND && key == run_id)
+/// absent row (a legacy run) or an absent field resolves to the
+/// mutating-task default — never a silent `Allowed`. FIX 2: a failed read
+/// and a PRESENT-but-undecodable row are errors (the corrupt row is named),
+/// never a silent default.
+fn run_no_op_disposition(
+    handle: &faktor_session::SessionHandle,
+    run_id: &str,
+) -> Result<NoOpDisposition, ExecError> {
+    let facts = parent_facts(handle)?;
+    let Some((_, _, value)) = facts
+        .into_iter()
+        .find(|(kind, key, _)| kind == RUN_POLICY_ROW_KIND && key == run_id)
+    else {
+        return Ok(NoOpDisposition::default_for_mutating_task());
+    };
+    let row: RunPolicyRow = serde_json::from_str(&value).map_err(|e| {
+        ExecError::from(DurableStateError::CorruptDurableState {
+            what: format!("run policy row of run {run_id}"),
+            detail: e.to_string(),
         })
-        .and_then(|(_, _, value)| serde_json::from_str::<RunPolicyRow>(&value).ok())
-        .and_then(|row| row.no_op_disposition)
-        .unwrap_or_else(NoOpDisposition::default_for_mutating_task)
+    })?;
+    Ok(row
+        .no_op_disposition
+        .unwrap_or_else(NoOpDisposition::default_for_mutating_task))
 }
 
 /// One native task start: a goal plus one or more work items. Dispatch is
@@ -253,9 +355,19 @@ pub struct TaskRunRequest {
     /// the drive certifies against (single-item runs always seed one;
     /// multi-item runs seed the run's ROOT row when criteria are present).
     pub criteria: Vec<String>,
-    /// Per-run mutation policy override. `None` = the daemon default the
-    /// executor was constructed with ([`MutationMode::Shadow`] unless the
-    /// daemon config selected `DirectCompat`). See [`MutationMode`].
+    /// Tri-state re-goal patch for the run's acceptance criteria (FIX 3):
+    /// `None` = continuation (the durable task row keeps its criteria),
+    /// `Some(vec![])` = explicitly CLEAR, `Some(items)` = REPLACE. When this
+    /// field is `Some` it takes precedence over the legacy `criteria` vector
+    /// (whose empty value keeps its historical continuation meaning for
+    /// every existing caller that never sets this field).
+    pub criteria_patch: Option<Vec<String>>,
+    /// The run's mutation policy. Kept for wire compatibility ONLY: the
+    /// only decodable value is [`MutationMode::Shadow`] (a `direct_compat`
+    /// value is a strict decode error naming the removal), `None` resolves
+    /// to it, and the execution path ignores the field entirely — a
+    /// mutating run ALWAYS executes in an isolated candidate. See
+    /// [`MutationMode`] and [`TaskExecutor::new`].
     pub mutation_mode: Option<MutationMode>,
     /// Files attached to the ordinary prompt (the SDK `PromptRequest.files`
     /// vocabulary). They ride the SAME in-session drive submit as a plain
@@ -271,6 +383,11 @@ pub struct TaskRunRequest {
     /// rows so a re-attach reconstructs the identical typed set and request
     /// construction resolves the same bytes.
     pub attachments: Vec<AttachmentId>,
+    /// Tri-state attachment patch (FIX 3, same contract as
+    /// [`Self::criteria_patch`]): `None` = continuation, `Some(vec![])` =
+    /// clear the durable attachment set, `Some(items)` = replace it. When
+    /// set it takes precedence over the legacy `attachments` vector.
+    pub attachments_patch: Option<Vec<AttachmentId>>,
     /// Capability ceiling of the parent (children get parent ∩ policies).
     pub parent_caps: CapabilitySet,
     pub ceilings: super::Ceilings,
@@ -306,9 +423,11 @@ impl Default for TaskRunRequest {
             max_cost_micro: None,
             auto_items: Vec::new(),
             criteria: Vec::new(),
+            criteria_patch: None,
             mutation_mode: None,
             files: Vec::new(),
             attachments: Vec::new(),
+            attachments_patch: None,
             parent_caps: CapabilitySet::new(),
             ceilings: super::Ceilings::default(),
             completion_contract: None,
@@ -344,6 +463,24 @@ impl TaskRunRequest {
                 self.criteria.len()
             )));
         }
+        // The tri-state patches are THE effective criteria/attachments when
+        // set (FIX 3): validate exactly the set that will be applied.
+        if let Some(criteria) = &self.criteria_patch {
+            if criteria.len() > MAX_TASK_CRITERIA {
+                return Err(ExecError::Oversized(format!(
+                    "{} patched acceptance criteria exceed MAX_TASK_CRITERIA ({MAX_TASK_CRITERIA})",
+                    criteria.len()
+                )));
+            }
+            for c in criteria {
+                if c.trim().is_empty() || c.len() > MAX_TASK_CRITERION_BYTES {
+                    return Err(ExecError::Oversized(format!(
+                        "a patched acceptance criterion of {} bytes exceeds MAX_TASK_CRITERION_BYTES ({MAX_TASK_CRITERION_BYTES}) or is empty",
+                        c.len()
+                    )));
+                }
+            }
+        }
         // Attachments are part of the run's contract: validated with the ONE
         // shared rule (the same MAX_FILES_PER_PROMPT / MAX_FILE_PATH_BYTES
         // bounds the single-session prompt submission enforces, plus the
@@ -353,8 +490,12 @@ impl TaskRunRequest {
         // count and structural id validity) BEFORE anything durable is
         // written; durable-row existence is resolved by the session layer at
         // admission and image delivery is gated on the chosen model's
-        // capabilities at the server DTO.
+        // capabilities at the server DTO. The effective (tri-state) set is
+        // what gets validated: `Some(vec![])` clears and validates as empty.
         super::validate_attachment_ids(&self.attachments)?;
+        if let Some(attachments) = &self.attachments_patch {
+            super::validate_attachment_ids(attachments)?;
+        }
         for c in &self.criteria {
             if c.trim().is_empty() || c.len() > MAX_TASK_CRITERION_BYTES {
                 return Err(ExecError::Oversized(format!(
@@ -401,6 +542,30 @@ impl TaskRunRequest {
             non_goals: Vec::new(),
             constraints: Vec::new(),
             work_items: self.work_items.clone(),
+        }
+    }
+
+    /// The effective tri-state acceptance-criteria patch of this request
+    /// (FIX 3): `None` = continuation, `Some(vec![])` = clear,
+    /// `Some(items)` = replace. The dedicated patch field wins when set; the
+    /// legacy `criteria` vector maps to `Some(items)` when non-empty and
+    /// `None` when empty (its historical continuation semantics).
+    pub fn effective_criteria_patch(&self) -> Option<Vec<String>> {
+        match &self.criteria_patch {
+            Some(items) => Some(items.clone()),
+            None if self.criteria.is_empty() => None,
+            None => Some(self.criteria.clone()),
+        }
+    }
+
+    /// The effective tri-state attachment patch (FIX 3): the dedicated
+    /// patch field wins; the legacy `attachments` vector maps to
+    /// `Some(items)` when non-empty and `None` when empty.
+    pub fn effective_attachments_patch(&self) -> Option<Vec<AttachmentId>> {
+        match &self.attachments_patch {
+            Some(items) => Some(items.clone()),
+            None if self.attachments.is_empty() => None,
+            None => Some(self.attachments.clone()),
         }
     }
 }
@@ -609,6 +774,43 @@ struct ActiveRun {
     run_id: String,
 }
 
+/// The typed refusal of a POISONED executor authority (FIX 2): a writer
+/// panicked while holding one of the executor's internal locks, so the
+/// authority can no longer be trusted. Every work path that must consult it
+/// refuses — it is never treated as "no active run" (which would free a
+/// slot that may still be occupied) and never as "an active run" (which
+/// would silently skip settlement).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("poisoned authority {authority}: {detail}")]
+pub struct PoisonedAuthority {
+    /// Which authority is poisoned.
+    pub authority: &'static str,
+    /// Why it is poisoned (the panic poison's message).
+    pub detail: String,
+}
+
+impl PoisonedAuthority {
+    /// The poisoned ACTIVE-RUN lock (the run-claim authority).
+    pub fn active_run_lock(detail: impl std::fmt::Display) -> Self {
+        Self {
+            authority: "active-run lock",
+            detail: format!(
+                "a writer panicked while holding it ({detail}); refusing the work rather than \
+                 guessing the active-run set"
+            ),
+        }
+    }
+}
+
+impl From<PoisonedAuthority> for ExecError {
+    fn from(e: PoisonedAuthority) -> Self {
+        // ExecError is a frozen shared type; the typed refusal keeps its own
+        // identity in PoisonedAuthority and crosses the ExecError boundary
+        // with a stable `poisoned authority` prefix.
+        ExecError::Internal(format!("poisoned authority: {e}"))
+    }
+}
+
 /// The daemon-owned candidate/isolated root allocator (audits 7/8/21/22 +
 /// P1 native mutating multi-agent): ONE authority per executor, rooted
 /// under the daemon's data directory (the directory of the session store).
@@ -665,15 +867,15 @@ impl CandidateWorkspaceService {
 /// session's own drive and multi-item runs to the orchestrator runtime's
 /// real child sessions.
 ///
-/// P0-48: the daemon ALWAYS passes a [`ShadowRoots`] service (shadow
-/// mutation is the production default); the executor's [`MutationMode`]
-/// decides usage only — `Shadow` runs single-item MUTATING runs inside a
-/// daemon-owned shadow of the user checkout and only a conflict-aware
-/// integration commit writes the user checkout (see
-/// [`TaskExecutor::finalize_shadow_run`]); `DirectCompat` keeps every run's
-/// direct behavior, byte-identical to prior waves. An executor built
-/// without the service (`None`, test harnesses) behaves exactly like
-/// `DirectCompat` regardless of the mode.
+/// P0-48: every MUTATING single-item run executes inside a daemon-owned
+/// isolated candidate (the [`ShadowRoots`] machinery) and only a
+/// conflict-aware verified integration commits the user checkout (see
+/// [`TaskExecutor::finalize_shadow_run`]); read-only runs need none. There
+/// is NO mode value, config key or DTO field that can disable isolation:
+/// the production constructor ([`TaskExecutor::new`]) REQUIRES the shadow
+/// service, and the only owner-direct executor is the `#[cfg(test)]`
+/// developer seam [`TaskExecutor::new_owner_direct_for_test_harness`],
+/// which is compiled out of release builds.
 pub struct TaskExecutor {
     orchestrator: Arc<OrchestratorRuntime>,
     session: Arc<SessionManager>,
@@ -683,13 +885,12 @@ pub struct TaskExecutor {
     /// parent sessions run concurrently through the runtime's run-scoped
     /// mirrors.
     active: Mutex<HashMap<String, ActiveRun>>,
-    /// The daemon's shadow service. Production always carries it (the mode
-    /// decides usage); `None` = no shadow machinery (test harnesses) —
-    /// every run drives the session's workspace directly.
+    /// The daemon's shadow service. Production ALWAYS carries it (the
+    /// production constructor takes an `Arc<ShadowRoots>`, not an option);
+    /// `None` exists only for the test seam
+    /// [`TaskExecutor::new_owner_direct_for_test_harness`] — the low-level
+    /// suites that genuinely drive the owner checkout directly.
     shadows: Option<Arc<ShadowRoots>>,
-    /// The daemon default of [`MutationMode`] when a run does not carry its
-    /// own per-run override.
-    mode: MutationMode,
     /// The ONE candidate-root allocator: every orchestrated run's isolated
     /// root is allocated here, never supplied by a client.
     run_roots: Arc<CandidateWorkspaceService>,
@@ -745,30 +946,56 @@ pub struct ShadowFinalize {
     pub conflicts: Vec<(std::path::PathBuf, String)>,
 }
 
+/// The retained outcome of a shadow settle that has not retired the shadow
+/// (verification pending, integration blocked, completion refused): the live
+/// row keeps re-pointing the session and a later settlement resumes.
+fn retained_shadow_finalize() -> ShadowFinalize {
+    ShadowFinalize {
+        action: ShadowFinalizeAction::Retained,
+        merged: Vec::new(),
+        rejected: Vec::new(),
+        conflicts: Vec::new(),
+    }
+}
+
 impl TaskExecutor {
-    /// [`Self::new_with_mode`] with the production default
-    /// [`MutationMode::Shadow`] (shadow mutation is the product default).
+    /// The ONE production construction path: the daemon's shadow service is
+    /// REQUIRED (mutating runs always execute in an isolated candidate), so
+    /// no production value can disable isolation. The candidate-root
+    /// allocator is rooted under the store's data directory (the daemon's
+    /// own root — never a client path).
     pub fn new(
         orchestrator: &Arc<OrchestratorRuntime>,
         session: Arc<SessionManager>,
         agent: Arc<AgentRuntime>,
-        shadows: Option<Arc<ShadowRoots>>,
+        shadows: Arc<ShadowRoots>,
     ) -> Arc<Self> {
-        Self::new_with_mode(orchestrator, session, agent, shadows, MutationMode::Shadow)
+        Self::assemble(orchestrator, session, agent, Some(shadows))
     }
 
-    /// The ONE daemon construction path: the shadow service (always
-    /// present in production) plus the configured mutation mode deciding
-    /// usage only. `None` shadows = no shadow machinery at all (test
-    /// harnesses): every run drives the session's workspace directly. The
-    /// candidate-root allocator is rooted under the store's data directory
-    /// (the daemon's own root — never a client path).
-    pub fn new_with_mode(
+    /// Test-harness seam: an executor with NO shadow service, for the
+    /// LOW-LEVEL tests that genuinely drive the owner checkout directly
+    /// (they predate shadow mutation and verify drive/durability semantics,
+    /// not the isolation policy). It is gated by `cfg(test)`/debug
+    /// assertions and is compiled OUT of release builds — production code
+    /// cannot name it, and no runtime value can flip a production executor
+    /// back to owner-direct. Never use it outside tests.
+    #[cfg(any(test, debug_assertions))]
+    pub fn new_owner_direct_for_test_harness(
+        orchestrator: &Arc<OrchestratorRuntime>,
+        session: Arc<SessionManager>,
+        agent: Arc<AgentRuntime>,
+    ) -> Arc<Self> {
+        Self::assemble(orchestrator, session, agent, None)
+    }
+
+    /// The shared assembly body. Private: `None` shadows is reachable ONLY
+    /// through the cfg-gated test seam above.
+    fn assemble(
         orchestrator: &Arc<OrchestratorRuntime>,
         session: Arc<SessionManager>,
         agent: Arc<AgentRuntime>,
         shadows: Option<Arc<ShadowRoots>>,
-        mode: MutationMode,
     ) -> Arc<Self> {
         let run_roots = Self::default_run_roots(&session);
         Arc::new(Self {
@@ -777,7 +1004,6 @@ impl TaskExecutor {
             agent,
             active: Mutex::new(HashMap::new()),
             shadows,
-            mode,
             run_roots,
             completion_steps: Mutex::new(CompletionStepsWiring::default()),
             settlement_seam: Mutex::new(None),
@@ -826,15 +1052,13 @@ impl TaskExecutor {
         workspace_id: u64,
         worktree_id: u64,
     ) -> Result<faktor_session::ledger::RunBaseRecord, ExecError> {
-        let digest = |root: &std::path::Path| -> Result<String, ExecError> {
-            faktor_session::root_snapshot_digest(root, faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES)
-                .map_err(|e| {
-                    ExecError::WorkspaceDrift(format!("root snapshot of {}: {e}", root.display()))
-                })
-        };
-        if let Some(existing) = handle
-            .ledger_run_base_get(run_id)
-            .map_err(|e| ExecError::Internal(format!("run base read: {e}")))?
+        let digest =
+            |root: &std::path::Path| -> Result<String, ExecError> { root_manifest_digest(root) };
+        if let Some(existing) = durable_read_value(
+            format!("run base of run {run_id}"),
+            handle.ledger_run_base_read(run_id),
+        )
+        .map_err(ExecError::from)?
         {
             let copied = digest(base_root)?;
             let owner = digest(owner_root)?;
@@ -857,20 +1081,27 @@ impl TaskExecutor {
                 ExecError::Internal(format!("run base dir {}: {e}", base_root.display()))
             })?;
             let before = digest(owner_root)?;
-            let manifest = faktor_fs::copy_tree_skip(
+            // The manifest-faithful copy (literal symlinks, executable-bit
+            // preservation): the run base is the SAME canonical tree as the
+            // owner, so a mode-bearing or symlinked owner can never be
+            // silently re-shaped by the copy.
+            let manifest = faktor_fs::tree_manifest::copy_tree_manifest(
                 owner_root,
                 base_root,
                 MAX_RUN_BASE_ENTRIES,
                 MAX_RUN_BASE_BYTES,
                 RUN_BASE_SKIP_DIRS,
             )
-            .map_err(|e| ExecError::from_fs("run base copy", owner_root, e))?;
+            .map_err(|e| {
+                ExecError::WorkspaceDrift(format!("run base copy of {}: {e}", owner_root.display()))
+            })?;
             let after = digest(owner_root)?;
             let copied = digest(base_root)?;
             if before == after && after == copied {
                 let rows: Vec<String> = manifest
+                    .entries()
                     .iter()
-                    .map(|e| format!("{}|{}", e.path.to_string_lossy(), e.hash.to_hex()))
+                    .map(|e| format!("{}|{}", e.normalized_path, e.payload_digest))
                     .collect();
                 let record = faktor_session::ledger::RunBaseRecord {
                     run_id: run_id.to_string(),
@@ -978,10 +1209,11 @@ impl TaskExecutor {
         &self.run_roots
     }
 
-    /// The daemon default mutation mode (per-run overrides ride the
-    /// request).
-    pub fn mode(&self) -> MutationMode {
-        self.mode
+    /// The daemon's shadow service. Production always carries it (the
+    /// production constructor requires it); `None` is the cfg-gated test
+    /// seam only.
+    pub fn shadows(&self) -> Option<Arc<ShadowRoots>> {
+        self.shadows.clone()
     }
 
     pub fn orchestrator(&self) -> &Arc<OrchestratorRuntime> {
@@ -996,23 +1228,53 @@ impl TaskExecutor {
         &self.agent
     }
 
-    /// The daemon's shadow service, when `[tasks] shadow_mutation` is on.
-    pub fn shadows(&self) -> Option<Arc<ShadowRoots>> {
-        self.shadows.clone()
-    }
-
     /// The active orchestrated run(s) being driven, newest-first
     /// (tests/UI). Runs of different parent sessions may coexist.
     pub fn active_runs(&self) -> Vec<(SessionId, String)> {
+        match self.active_runs_checked() {
+            Ok(runs) => runs,
+            // The legacy view carries no error channel; a poisoned authority
+            // is fatal here (typed consumers call
+            // [`Self::active_runs_checked`] and refuse).
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// [`Self::active_runs`] with the typed [`PoisonedAuthority`] refusal:
+    /// a poisoned active-run lock can never masquerade as "no active runs".
+    pub fn active_runs_checked(&self) -> Result<Vec<(SessionId, String)>, PoisonedAuthority> {
         let mut runs: Vec<(SessionId, String)> = self
-            .active
-            .lock()
-            .expect("active-run lock poisoned")
+            .active_guard()?
             .values()
             .map(|a| (a.parent, a.run_id.clone()))
             .collect();
         runs.sort_by(|a, b| a.1.cmp(&b.1));
-        runs
+        Ok(runs)
+    }
+
+    /// The active-run lock guard with the typed poison refusal.
+    fn active_guard(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, HashMap<String, ActiveRun>>, PoisonedAuthority> {
+        self.active
+            .lock()
+            .map_err(PoisonedAuthority::active_run_lock)
+    }
+
+    /// Adversarial test seam: poison the active-run lock exactly as a
+    /// panicking writer would (a panic while the guard is held), so the
+    /// typed [`PoisonedAuthority`] refusal can be asserted end-to-end.
+    #[cfg(test)]
+    pub(crate) fn poison_active_run_lock_for_test(&self) {
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.active.lock().expect("fresh active-run lock");
+            panic!("poison the active-run lock (test seam)");
+        }));
+        assert!(poisoned.is_err(), "the test seam must panic");
+        assert!(
+            self.active.lock().is_err(),
+            "the active-run lock must be poisoned after the seam"
+        );
     }
 
     /// The single active orchestrated run, if exactly one is being driven
@@ -1049,9 +1311,11 @@ impl TaskExecutor {
         // the server DTO): every digest must resolve to a byte-identical
         // durable row of THIS session BEFORE any shadow/run/task write —
         // an unknown or mismatched id can never leave a partial durable
-        // admission behind.
+        // admission behind. The EFFECTIVE (tri-state) set is admitted: a
+        // `Some(vec![])` clear resolves nothing, and a replacing patch is
+        // never shadowed by the stale legacy vector.
         handle
-            .resolve_attachments(&req.attachments)
+            .resolve_attachments(&req.effective_attachments_patch().unwrap_or_default())
             .map_err(|e| match e.kind {
                 faktor_core::ErrorKind::NotFound => ExecError::NotFound(e.message),
                 faktor_core::ErrorKind::Oversized => ExecError::Oversized(e.message),
@@ -1074,7 +1338,7 @@ impl TaskExecutor {
         // surface starts with NO worktree row, and the shadow/multi-agent
         // paths need a registered owner root. The daemon adopts the
         // workspace's root as the session's owner worktree exactly once,
-        // here, before any run mode decision — so Native, SDK compat and
+        // here, before any run decision — so Native, SDK compat and
         // ACP sessions all get the same owner identity without any adapter
         // constructing one.
         self.ensure_owner_identity(&handle)?;
@@ -1087,6 +1351,15 @@ impl TaskExecutor {
                 "session {parent} has live orchestrated run(s) {} left by an interrupted executor; resume (TaskExecutor::resume_run) or cancel them before starting a new task",
                 blockers.join(", ")
             )));
+        }
+        // A LIVE durable shadow re-points every session file consumer at the
+        // shadow root (`resolve_workspace_root`) — settle it deterministically
+        // BEFORE ANY run of a session that carries one (a shadowed
+        // single-item run and a multi-item run must never drive or
+        // orchestrate over a stale live shadow). A shadow whose owner
+        // integration is still pending refuses the new run typed.
+        if self.shadows.is_some() {
+            self.settle_existing_shadow(parent, &handle)?;
         }
         if req.work_items.len() == 1 {
             self.start_in_session(parent, req)
@@ -1180,7 +1453,7 @@ impl TaskExecutor {
     // ------------------------------------------------------------ internals
 
     fn occupy(&self, parent: SessionId, run_id: &str) -> Result<(), ExecError> {
-        let mut guard = self.active.lock().expect("active-run lock poisoned");
+        let mut guard = self.active_guard().map_err(ExecError::from)?;
         if guard.contains_key(run_id) {
             return Err(ExecError::Conflict(format!(
                 "run '{run_id}' is already being driven"
@@ -1208,9 +1481,17 @@ impl TaskExecutor {
     }
 
     /// Free the run's slot after its drive ended (idempotent: only clears
-    /// when the entry still names THIS run).
+    /// when the entry still names THIS run). A POISONED active-run lock
+    /// cannot be consulted: the slot stays (the authority refuses, never
+    /// silently "freed").
     fn clear_active_if(&self, parent: SessionId, run_id: &str) {
-        let mut guard = self.active.lock().expect("active-run lock poisoned");
+        let mut guard = match self.active_guard() {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("run slot of {run_id} not freed: {e}");
+                return;
+            }
+        };
         if guard
             .get(run_id)
             .is_some_and(|a| a.parent == parent && a.run_id == run_id)
@@ -1325,23 +1606,15 @@ impl TaskExecutor {
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
         let item = &req.work_items[0];
-        // P0-48 shadow gate: a shadowed single-item MUTATING run works in a
-        // daemon-owned shadow; the drive itself is byte-identical (submit +
-        // the detached daemon drive), the shadow only re-points where the
-        // session resolves files and gates the integration commit. The
-        // per-run `mutation_mode` wins over the daemon default; without the
-        // shadow service (test harnesses) no run can be shadowed.
-        let mode = req.mutation_mode.unwrap_or(self.mode);
-        let shadowed =
-            self.shadows.is_some() && mode == MutationMode::Shadow && item.kind.is_mutating();
-        // A LIVE durable shadow re-points every session file consumer at the
-        // shadow root (`resolve_workspace_root`) — settle it deterministically
-        // BEFORE ANY run of a session that carries one, in EVERY mode. A
-        // DirectCompat (or read-only) run over a stale live shadow would
-        // otherwise silently drive the shadow instead of the user checkout.
-        if self.shadows.is_some() {
-            self.settle_existing_shadow(parent, &handle)?;
-        }
+        // P0 isolation: a MUTATING single-item run ALWAYS works in a
+        // daemon-owned isolated candidate (the shadow machinery); the drive
+        // itself is byte-identical (submit + the detached daemon drive), the
+        // shadow only re-points where the session resolves files and gates
+        // the integration commit. `req.mutation_mode` is decoded for wire
+        // compatibility only — the sole decodable value is Shadow, and the
+        // decision below never consults it. Only the cfg-gated test seam
+        // (no shadow service) drives the owner directly.
+        let shadowed = self.shadows.is_some() && item.kind.is_mutating();
         let base_root = if shadowed {
             Some(self.owner_root_of(parent, &handle)?)
         } else {
@@ -1373,25 +1646,25 @@ impl TaskExecutor {
                 )));
             }
             Some(_) => {
-                // Re-goal a live row; criteria ride the same patch when the
-                // run carries any (None = the row keeps its criteria). The
-                // binary attachment set is replaced when this run carries
-                // one (None = the row keeps its durable set).
+                // FIX 3 tri-state re-goal: `None` = continuation (the row
+                // keeps its durable criteria/attachment set), `Some(vec![])`
+                // = explicitly CLEAR, `Some(items)` = REPLACE. The dedicated
+                // patch fields win; the legacy vectors keep their historical
+                // empty-means-continuation mapping through the effective
+                // accessors. Re-goaling keeps the SAME durable TaskId: every
+                // settlement path re-reads the session's task identity via
+                // `handle.task_id()`, so minting a new id for a new goal mid-
+                // conversation would strand an in-flight run's settlement on
+                // the wrong task row. A distinctly new goal instead lands a
+                // new CONTRACT (fresh criteria/attachments + a revision bump
+                // that invalidates prior proofs) on that identity.
                 handle
                     .update_task(
                         task_id,
                         faktor_session::TaskPatch {
                             goal: Some(goal.clone()),
-                            acceptance_criteria: if req.criteria.is_empty() {
-                                None
-                            } else {
-                                Some(req.criteria.clone())
-                            },
-                            attachments: if req.attachments.is_empty() {
-                                None
-                            } else {
-                                Some(req.attachments.clone())
-                            },
+                            acceptance_criteria: req.effective_criteria_patch(),
+                            attachments: req.effective_attachments_patch(),
                             ..Default::default()
                         },
                     )
@@ -1403,9 +1676,12 @@ impl TaskExecutor {
                         task_id,
                         session_id: parent,
                         goal,
-                        acceptance_criteria: req.criteria.clone(),
+                        // A fresh row has nothing to continue: `None` seeds
+                        // empty (the effective accessor's continuation
+                        // policy); an explicit patch seeds its items.
+                        acceptance_criteria: req.effective_criteria_patch().unwrap_or_default(),
                         plan: Vec::new(),
-                        attachments: req.attachments.clone(),
+                        attachments: req.effective_attachments_patch().unwrap_or_default(),
                         budget: TaskBudget {
                             max_tokens: req.max_tokens,
                             max_turns: None,
@@ -1458,13 +1734,26 @@ impl TaskExecutor {
             goal: truncate(&req.goal, MAX_GOAL_CHARS),
             item_ids: vec![item.id.clone()],
             files: req.files.clone(),
-            attachments: req.attachments.clone(),
+            // The run row carries the EFFECTIVE (tri-state) attachment set:
+            // `Some(vec![])` records a cleared set, never the stale legacy
+            // vector it overrides.
+            attachments: req.effective_attachments_patch().unwrap_or_default(),
             op_id: Some(receipt.op_id.raw()),
             model: req.model.clone(),
             budget_max_tokens: req.max_tokens,
             created_ms: now,
         };
         put_run_row(&handle, &run_id, &row)?;
+        // P0 no-op policy: the run's disposition is durable BEFORE the drive
+        // is dispatched. The shadow settlement reads it under the synthetic
+        // per-session run id (`tx-session-<session>`), so the row is written
+        // under BOTH the real run id and that id.
+        write_run_policy_row(&handle, &run_id, req.no_op_disposition)?;
+        write_run_policy_row(
+            &handle,
+            &format!("tx-session-{}", parent.raw()),
+            req.no_op_disposition,
+        )?;
         // Detached drive — the daemon's own entries, identical to the
         // direct prompt path (the drive runs session recovery first; an
         // interrupted drive resumes the SAME recorded turn on daemon start).
@@ -1550,21 +1839,16 @@ impl TaskExecutor {
                     )));
                 }
                 Some(_) => {
+                    // FIX 3 tri-state re-goal (same contract as the
+                    // in-session arm): None = continuation, Some([]) =
+                    // clear, Some(items) = replace.
                     handle
                         .update_task(
                             task_id,
                             faktor_session::TaskPatch {
                                 goal: Some(goal.clone()),
-                                acceptance_criteria: if req.criteria.is_empty() {
-                                    None
-                                } else {
-                                    Some(req.criteria.clone())
-                                },
-                                attachments: if req.attachments.is_empty() {
-                                    None
-                                } else {
-                                    Some(req.attachments.clone())
-                                },
+                                acceptance_criteria: req.effective_criteria_patch(),
+                                attachments: req.effective_attachments_patch(),
                                 ..Default::default()
                             },
                         )
@@ -1576,9 +1860,9 @@ impl TaskExecutor {
                             task_id,
                             session_id: parent,
                             goal,
-                            acceptance_criteria: req.criteria.clone(),
+                            acceptance_criteria: req.effective_criteria_patch().unwrap_or_default(),
                             plan: Vec::new(),
-                            attachments: req.attachments.clone(),
+                            attachments: req.effective_attachments_patch().unwrap_or_default(),
                             budget: faktor_session::TaskBudget::default(),
                             state: TaskState::Pending,
                             created_ms: now,
@@ -1609,8 +1893,10 @@ impl TaskExecutor {
             s.files = req.files.clone();
             // The run's BINARY attachment set rides every child spec too —
             // SEPARATE from the workspace-relative `files`; the durable plan
-            // row reconstructs the exact typed set on re-attach.
-            s.attachments = req.attachments.clone();
+            // row reconstructs the exact typed set on re-attach. The
+            // EFFECTIVE (tri-state) set is used: `Some(vec![])` carries a
+            // cleared set, never the stale legacy vector it overrides.
+            s.attachments = req.effective_attachments_patch().unwrap_or_default();
             // (audits 7/8/21/22, work-entry unification) Ownership is read
             // from the ITEM alone and lands on the durable wave-A3
             // assignment rows at compile (before any spawn); the child spec
@@ -1757,11 +2043,7 @@ impl TaskExecutor {
             .session
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
-        let current = faktor_session::root_snapshot_digest(
-            &landed.prepared.owner_root,
-            faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES,
-        )
-        .map_err(|e| ExecError::WorkspaceDrift(format!("landed root snapshot: {e}")))?;
+        let current = root_manifest_digest(&landed.prepared.owner_root)?;
         if current != landed.landed_snapshot
             || landed.landed_snapshot != landed.prepared.candidate_snapshot
         {
@@ -1828,24 +2110,34 @@ impl TaskExecutor {
 
     /// The newest durable PASSED verification record of the session's task at
     /// its CURRENT revision — the immutable basis an in-session completion
-    /// step may be authorized by. `None` (no passing record, or only records
-    /// for an older revision) runs NOTHING: a completion contract never
-    /// advances from an advisory fact.
+    /// step may be authorized by. `Ok(None)` (no passing record, or only
+    /// records for an older revision) runs NOTHING: a completion contract
+    /// never advances from an advisory fact. FIX 2: a store failure is an
+    /// error, never "no passing proof".
     fn latest_passing_proof(
         &self,
         handle: &faktor_session::SessionHandle,
         task_id: TaskId,
-    ) -> Option<VerificationRecordId> {
-        let revision = handle.task_revision(task_id).ok()?;
-        handle
-            .list_verification_records(task_id)
-            .ok()?
+    ) -> Result<Option<VerificationRecordId>, ExecError> {
+        let revision = handle.task_revision(task_id).map_err(|e| {
+            ExecError::from(classify_session_read(
+                "task revision of the completion-step proof",
+                e.into(),
+            ))
+        })?;
+        let records = handle.list_verification_records(task_id).map_err(|e| {
+            ExecError::from(classify_session_read(
+                "verification records of the completion-step proof",
+                e.into(),
+            ))
+        })?;
+        Ok(records
             .into_iter()
             .filter(|record| {
                 record.status == VerificationStatus::Passed && record.revision == revision
             })
             .max_by_key(|record| record.record_id)
-            .map(|record| record.record_id)
+            .map(|record| record.record_id))
     }
 
     // ------------------------------------------------- post-run settlement (P1)
@@ -1891,26 +2183,47 @@ impl TaskExecutor {
         let task_id = handle
             .task_id()
             .map_err(|e| ExecError::Internal(format!("task id read: {e}")))?;
-        let runs: Vec<String> = handle
-            .memory_facts()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(kind, key, _)| kind == ROOT_ATTEMPT_FACT_KIND && key.starts_with("root:"))
-            .filter_map(|(_, key, _)| key.strip_prefix("root:").map(str::to_string))
-            .filter(|run| !run.is_empty())
-            .collect();
+        // FIX 2: the verification-fact scan is an explicit durable read — a
+        // store failure is an error (never "no runs to settle") and a
+        // corrupt fact page refuses typed.
+        let runs: Vec<String> = match handle.memory_facts() {
+            Ok(facts) => facts
+                .into_iter()
+                .filter(|(kind, key, _)| kind == ROOT_ATTEMPT_FACT_KIND && key.starts_with("root:"))
+                .filter_map(|(_, key, _)| key.strip_prefix("root:").map(str::to_string))
+                .filter(|run| !run.is_empty())
+                .collect(),
+            Err(e) => {
+                return Err(ExecError::from(classify_session_read(
+                    "verification-attempt facts of the post-run settlement",
+                    e,
+                )))
+            }
+        };
         for run_id in runs {
-            let active = self
-                .active
-                .lock()
-                .map(|guard| guard.contains_key(&run_id))
-                .unwrap_or(true);
+            // A poisoned active-run lock must REFUSE the settlement pass:
+            // treating it as "active" would silently skip work and treating
+            // it as "empty" would double-drive a run.
+            let active = match self.active_guard() {
+                Ok(guard) => guard.contains_key(&run_id),
+                Err(e) => return Err(ExecError::from(e)),
+            };
             if active {
                 continue;
             }
-            let open = handle
-                .open_verification_jobs(task_id.raw())
-                .unwrap_or_default();
+            // FIX 2: open verification jobs are read explicitly. A failed
+            // read must NEVER collapse to "no open jobs" (which would let
+            // the settlement race a still-open verification). A corrupt job
+            // row refuses typed.
+            let open = match handle.open_verification_jobs(task_id.raw()) {
+                Ok(jobs) => jobs,
+                Err(e) => {
+                    return Err(ExecError::from(classify_session_read(
+                        "open verification jobs of the post-run settlement",
+                        e.into(),
+                    )))
+                }
+            };
             if !open.is_empty() {
                 continue;
             }
@@ -1927,12 +2240,22 @@ impl TaskExecutor {
         Ok(())
     }
 
-    /// The in-session arm of [`Self::settle_run`]: the drive already ran the
-    /// deterministic verification and the completion gate; this arm runs the
-    /// accepted contract's requested steps (fail-closed on the durable
-    /// verification fact) and then the exact shadow finalize of the wave-14
-    /// hook. A step failure is logged, never escalated: the durable rows
-    /// record the typed outcome and a later settlement retries.
+    /// The in-session arm of [`Self::settle_run`] — the SAME ordering the
+    /// orchestrated arm enforces:
+    ///
+    /// - a session carrying a LIVE managed shadow settles through
+    ///   prepare(candidate from the immutable shadow run base) -> verify
+    ///   (candidate) -> land(owner, transactional) -> completion steps
+    ///   against the landed proof -> `complete_verified_task`. The drive's
+    ///   shadow-world verification is never the permission to complete:
+    ///   `VerifiedComplete` is the CONSEQUENCE of a successful owner landing;
+    /// - any other in-session run (read-only, a retired shadow) keeps the
+    ///   drive's own deterministic verification + gate byte-identically:
+    ///   this arm runs the accepted contract's requested steps (fail-closed
+    ///   on the durable verification fact) and the shadow lifecycle settle.
+    ///
+    /// A step failure is logged, never escalated: the durable rows record
+    /// the typed outcome and a later settlement retries.
     async fn settle_in_session(
         self: &Arc<Self>,
         parent: SessionId,
@@ -1942,12 +2265,21 @@ impl TaskExecutor {
             .session
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        let task_id = handle.task_id()?;
+        if let Some(shadows) = self.shadows() {
+            if let Some(row) = shadows.active_shadow(parent)? {
+                if row.state.is_live() {
+                    return self
+                        .settle_shadowed_in_session(parent, run_id, &handle, task_id, row)
+                        .await;
+                }
+            }
+        }
         // Proof-validated steps: only a durable PASSED record at the task's
         // CURRENT revision authorizes any side effect. No passing proof (or
         // only stale-revision proof) runs nothing — the durable fact is
         // reporting state, never authorization.
-        let task_id = handle.task_id()?;
-        let steps = match self.latest_passing_proof(&handle, task_id) {
+        let steps = match self.latest_passing_proof(&handle, task_id)? {
             Some(proof) => match self.run_completion_steps(parent, proof).await {
                 Ok(report) => report,
                 Err(e) => {
@@ -1956,12 +2288,27 @@ impl TaskExecutor {
                 }
             },
             None => {
-                if handle
-                    .completion_contract(task_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|(_, contract)| !contract.is_default())
-                {
+                // FIX 2: the contract read is explicit. A corrupt contract
+                // refuses the settlement typed; a store failure is an error;
+                // only a genuinely absent/default contract is "nothing to
+                // report".
+                let has_contract = match handle.completion_contract(task_id) {
+                    Ok(Some((_, contract))) => !contract.is_default(),
+                    Ok(None) => false,
+                    Err(faktor_session::TaskError::CorruptDurableState { what, detail }) => {
+                        return Err(ExecError::from(DurableStateError::CorruptDurableState {
+                            what,
+                            detail,
+                        }))
+                    }
+                    Err(e) => {
+                        return Err(ExecError::from(classify_session_read(
+                            "completion contract of the in-session settlement",
+                            e.into(),
+                        )))
+                    }
+                };
+                if has_contract {
                     eprintln!(
                         "completion steps for session {parent} are refused: no durable PASSED verification record at the current revision authorizes them; nothing is committed, pushed or opened"
                     );
@@ -1986,6 +2333,288 @@ impl TaskExecutor {
             merge_proposals: Vec::new(),
             finalize,
         })
+    }
+
+    /// The single-item SHADOW arm of [`Self::settle_run`]: a one-child
+    /// instance of the normal run-base/candidate/integration architecture.
+    ///
+    /// 1. **prepare** ([`Self::prepare_shadow_integration`]): the shadow's
+    ///    candidate (its change set bound to the shadow's immutable run base)
+    ///    is staged against the durable generation; the OWNER is untouched;
+    /// 2. **verify** ([`Self::verify_prepared_integration`]) over the
+    ///    CANDIDATE root (the shadow tree: base + the one child's changes),
+    ///    creating the candidate-bound proof record;
+    /// 3. **land** ([`Self::land_verified_integration`]): the transactional
+    ///    owner landing (record-first per-path decisions + rollback blobs,
+    ///    per-path CAS, whole-root equality). A conflict rolls every applied
+    ///    path back — the owner is byte-identical to pre-landing;
+    /// 4. **completion steps against the landed proof**, then the durable
+    ///    completion gate (`complete_verified_task`);
+    /// 5. **retire** the shadow row (record-first `Integrated` + directory
+    ///    removal) ONLY after the owner holds the verified candidate.
+    ///
+    /// A landing conflict retains the shadow as `IntegrationBlocked` and
+    /// leaves the task NON-TERMINAL; a later settlement retries (the bounded
+    /// watcher, the next run's deterministic settle, or an explicit
+    /// re-settle). The shadow-world certification the drive ran can never
+    /// complete the task: while a managed shadow is live the session
+    /// completion gate refuses an unbound proof.
+    async fn settle_shadowed_in_session(
+        self: &Arc<Self>,
+        parent: SessionId,
+        run_id: String,
+        handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
+        row: ShadowRow,
+    ) -> Result<SettlementOutcome, ExecError> {
+        let shadows = self
+            .shadows()
+            .ok_or_else(|| ExecError::Internal("shadow settlement requires the service".into()))?;
+        let mut outcome = SettlementOutcome {
+            run_id: run_id.clone(),
+            orchestrated: false,
+            complete: false,
+            verified: false,
+            completed: false,
+            verification: None,
+            steps: None,
+            merge_proposals: Vec::new(),
+            finalize: None,
+        };
+        let task = handle
+            .get_task(task_id)
+            .map_err(|e| ExecError::Internal(format!("task row read: {e}")))?;
+        let Some(task) = task else {
+            return Ok(outcome);
+        };
+        match task.state {
+            TaskState::Failed | TaskState::Cancelled => {
+                shadows
+                    .discard(parent)
+                    .map_err(|e| ExecError::from_shadow("shadow discard", e))?;
+                outcome.complete = true;
+                outcome.finalize = Some(ShadowFinalize {
+                    action: ShadowFinalizeAction::Discarded,
+                    merged: Vec::new(),
+                    rejected: Vec::new(),
+                    conflicts: Vec::new(),
+                });
+                return Ok(outcome);
+            }
+            TaskState::VerifiedComplete => {
+                // Crash window: the owner landing succeeded and the task was
+                // completed, but the shadow row was not retired. The landing
+                // transaction recovery is idempotent; nothing is re-verified
+                // against a moved owner.
+                let prepared =
+                    self.prepare_shadow_integration(handle, parent, &run_id, task_id, &row)?;
+                let proof = self
+                    .recover_shadow_landing(handle, task_id, &prepared)
+                    .await?;
+                let Some(proof) = proof else {
+                    outcome.finalize = Some(retained_shadow_finalize());
+                    return Ok(outcome);
+                };
+                let landed = self.land_verified_integration(handle, &proof)?;
+                outcome.verification = Some(proof.record());
+                outcome.verified = true;
+                shadows
+                    .mark_integrated(parent)
+                    .map_err(|e| ExecError::from_shadow("shadow retirement", e))?;
+                outcome.completed = true;
+                outcome.complete = true;
+                outcome.finalize = Some(ShadowFinalize {
+                    action: ShadowFinalizeAction::Integrated,
+                    merged: landed.prepared.changed.iter().map(PathBuf::from).collect(),
+                    rejected: Vec::new(),
+                    conflicts: Vec::new(),
+                });
+                return Ok(outcome);
+            }
+            _ => {}
+        }
+        if !self.route_root_to_verifying(handle, task_id)? {
+            outcome.finalize = Some(retained_shadow_finalize());
+            return Ok(outcome);
+        }
+        // (1) PREPARE from the immutable shadow run base.
+        let prepared = self.prepare_shadow_integration(handle, parent, &run_id, task_id, &row)?;
+        self.check_settlement_seam(CrashSeam::AfterCandidatePrepared)?;
+        // (2) VERIFY the CANDIDATE (the shadow tree), under the run's no-op
+        // policy: an empty change set completes only through the reviewer's
+        // no-op proof (or the explicit Allowed disposition). The criteria are
+        // the task row already loaded above — never a second read whose
+        // absence could silently degrade to "no criteria".
+        let criteria = task.acceptance_criteria.clone();
+        let no_op = run_no_op_disposition(handle, &run_id)?;
+        let Some(proof) = self
+            .verify_prepared_integration(handle, task_id, &criteria, &prepared, no_op)
+            .await?
+        else {
+            outcome.finalize = Some(retained_shadow_finalize());
+            return Ok(outcome);
+        };
+        outcome.verification = Some(proof.record());
+        outcome.verified = true;
+        // (3) LAND the verified candidate transactionally.
+        let landed = match self.land_verified_integration(handle, &proof) {
+            Ok(landed) => landed,
+            Err(ExecError::IntegrationConflict(reason)) => {
+                // The owner is byte-identical to pre-landing (every applied
+                // path rolled back); the shadow is retained and the task
+                // stays non-terminal until the drift is resolved.
+                shadows
+                    .mark_integration_blocked(parent)
+                    .map_err(|e| ExecError::from_shadow("shadow block", e))?;
+                outcome.finalize = Some(ShadowFinalize {
+                    action: ShadowFinalizeAction::IntegrationBlocked,
+                    merged: Vec::new(),
+                    rejected: Vec::new(),
+                    conflicts: vec![(prepared.owner_root.clone(), reason)],
+                });
+                return Ok(outcome);
+            }
+            Err(e) => {
+                // A hard failure (drift, txn write, injected crash seam): the
+                // shadow stays live and a later deterministic settle resumes
+                // from the durable transaction phase.
+                return Err(e);
+            }
+        };
+        // (4) The accepted contract's steps against the LANDED proof.
+        outcome.steps = match self
+            .run_completion_steps_against_proof(parent, &landed)
+            .await
+        {
+            Ok(report) => report,
+            Err(e) => {
+                eprintln!("completion-step execution failed for shadowed run {run_id}: {e}");
+                None
+            }
+        };
+        self.check_settlement_seam(CrashSeam::BeforeTaskCompletion)?;
+        let mut completed = false;
+        match handle.completion_contract_gate(task_id) {
+            Ok(CompletionContractGate::Satisfied) => {
+                let revision = handle
+                    .task_revision(task_id)
+                    .map_err(|e| ExecError::Internal(format!("task revision read: {e}")))?;
+                match handle.complete_verified_task(task_id, revision, proof.record()) {
+                    Ok(_) => completed = true,
+                    Err(e) => {
+                        eprintln!("shadowed completion gate refused for {run_id}: {e}");
+                    }
+                }
+            }
+            Ok(CompletionContractGate::Refused(e)) => {
+                // The run stays non-terminal and a later settlement retries.
+                eprintln!("shadowed run {run_id} contract gate: {e}");
+            }
+            Err(e) => {
+                return Err(ExecError::Internal(format!(
+                    "completion contract gate read for {run_id}: {e}"
+                )));
+            }
+        }
+        outcome.completed = completed;
+        if completed {
+            // (5) Retire the shadow ONLY after the owner holds the verified
+            // candidate and the task is durably complete.
+            shadows
+                .mark_integrated(parent)
+                .map_err(|e| ExecError::from_shadow("shadow retirement", e))?;
+            outcome.complete = true;
+            outcome.finalize = Some(ShadowFinalize {
+                action: ShadowFinalizeAction::Integrated,
+                merged: landed.prepared.changed.iter().map(PathBuf::from).collect(),
+                rejected: Vec::new(),
+                conflicts: Vec::new(),
+            });
+        } else {
+            outcome.finalize = Some(retained_shadow_finalize());
+        }
+        Ok(outcome)
+    }
+
+    /// Recover the candidate-bound proof of an ALREADY LANDED shadow
+    /// integration (the crash window between completion and shadow
+    /// retirement): the landing transaction phase decides. A `Landed`
+    /// transaction with the same verified candidate is finalized idempotently
+    /// and a proof record is created/reused over the candidate snapshot.
+    /// Everything else keeps the shadow retained.
+    async fn recover_shadow_landing(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
+        prepared: &PreparedRunIntegration,
+    ) -> Result<Option<VerifiedRunIntegration>, ExecError> {
+        let Some(txn) = durable_read_value(
+            format!("landing transaction of run {}", prepared.run_id),
+            handle.ledger_integration_txn_read(&prepared.run_id),
+        )
+        .map_err(ExecError::from)?
+        else {
+            return Ok(None);
+        };
+        if txn.phase != faktor_session::ledger::IntegrationTxnPhase::Landed
+            || txn.verified_candidate_snapshot != prepared.candidate_snapshot
+        {
+            return Ok(None);
+        }
+        // FIX 2: the task row is an explicit read — a genuinely MISSING row
+        // is the not-found policy (nothing to recover), a corrupt/failed
+        // read is an error, never "no criteria".
+        let criteria = match handle
+            .get_task(task_id)
+            .map_err(|e| ExecError::from(classify_session_read("root task row read", e)))?
+        {
+            Some(task) => task.acceptance_criteria,
+            None => return Ok(None),
+        };
+        let run = faktor_agent::IntegratedRootVerification {
+            status: VerificationStatus::Passed,
+            checks: Vec::new(),
+            criteria: Vec::new(),
+            changed: prepared.changed.clone(),
+            summary: "already-landed shadow integration recovery".into(),
+            review_model_identity: None,
+        };
+        let no_op_rule = prepared.changed.is_empty();
+        let composed = if no_op_rule {
+            compose_no_op_root_verification_status(&run.checks, &run.criteria)
+        } else {
+            compose_root_verification_status(&run.checks, &run.criteria)
+        };
+        let composed = merge_verification_status(run.status, composed);
+        if composed != VerificationStatus::Passed {
+            return Ok(None);
+        }
+        let (record, basis_digest) = self
+            .find_or_create_root_verification_record(
+                handle,
+                task_id,
+                &criteria,
+                &prepared.candidate_snapshot,
+                &run,
+                prepared,
+                composed,
+            )
+            .await?;
+        VerifiedRunIntegration::from_composed_verdict(
+            prepared.clone(),
+            record,
+            &run.checks,
+            &run.criteria,
+            no_op_rule,
+            composed,
+            basis_digest,
+        )
+        .ok_or_else(|| {
+            ExecError::Internal(
+                "already-landed shadow recovery could not construct its landing proof".into(),
+            )
+        })
+        .map(Some)
     }
 
     /// The orchestrated arm of [`Self::settle_run`] — the contract the
@@ -2039,12 +2668,38 @@ impl TaskExecutor {
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
         let rows = OrchestratorRuntime::registry_rows(self.session.clone(), parent, &run_id)?;
         // The durable plan's SPAWN item set (the assignment contract): read
-        // from the persisted plan row, never from memory.
-        let plan_specs: Option<Vec<ChildSpec>> = parent_facts(&handle)?
+        // from the persisted plan row, never from memory. FIX 2: the plan row
+        // is an explicit durable read — a MISSING row is the not-found
+        // policy (nothing this settlement may name), while a PRESENT row that
+        // is undecodable or lacks its `specs` is corrupt durable state and
+        // refuses the settlement typed (never "no plan").
+        let plan_specs: Option<Vec<ChildSpec>> = match parent_facts(&handle)?
             .into_iter()
             .find(|(kind, key, _)| kind == PLAN_ROW_KIND && key == &run_id)
-            .and_then(|(_, _, value)| serde_json::from_str::<serde_json::Value>(&value).ok())
-            .and_then(|v| serde_json::from_value(v.get("specs")?.clone()).ok());
+        {
+            None => None,
+            Some((_, _, value)) => {
+                let parsed: serde_json::Value = serde_json::from_str(&value).map_err(|e| {
+                    ExecError::from(DurableStateError::CorruptDurableState {
+                        what: format!("plan row of run {run_id}"),
+                        detail: format!("stored plan row is not decodable JSON: {e}"),
+                    })
+                })?;
+                let specs = parsed.get("specs").cloned().ok_or_else(|| {
+                    ExecError::from(DurableStateError::CorruptDurableState {
+                        what: format!("plan row of run {run_id}"),
+                        detail: "stored plan row carries no `specs` array".into(),
+                    })
+                })?;
+                let specs: Vec<ChildSpec> = serde_json::from_value(specs).map_err(|e| {
+                    ExecError::from(DurableStateError::CorruptDurableState {
+                        what: format!("plan row of run {run_id}"),
+                        detail: format!("stored plan row `specs` is not a ChildSpec array: {e}"),
+                    })
+                })?;
+                Some(specs)
+            }
+        };
         let Some(plan_specs) = plan_specs else {
             // No durable plan row: nothing this settlement may name.
             return Ok(SettlementOutcome {
@@ -2075,7 +2730,21 @@ impl TaskExecutor {
             })
             .map(|r| r.child_id.clone())
             .collect();
-        let finalize = self.finalize_shadow_run(parent)?;
+        // A live shadow re-points the session's file consumers; an
+        // orchestrated settlement must never land over it. (A new run is
+        // already refused by `start_task`; this guards reopened/replayed
+        // states.)
+        if let Some(shadows) = self.shadows() {
+            if let Some(row) = shadows.active_shadow(parent)? {
+                if row.state.is_live() {
+                    return Err(ExecError::Conflict(format!(
+                        "session {parent} carries a live shadow {}; settle the shadowed run before settling an orchestrated run",
+                        row.shadow_id
+                    )));
+                }
+            }
+        }
+        let finalize = None;
         // Point 8: a tournament run lands through THIS SAME pipeline once
         // its durable decision names a winner; until then it keeps the
         // explicit-merge proposal behavior (no auto integration).
@@ -2177,11 +2846,10 @@ impl TaskExecutor {
         if !self.route_root_to_verifying(&handle, task_id)? {
             return Ok(outcome);
         }
-        let criteria = handle
-            .get_task(task_id)
-            .map_err(|e| ExecError::Internal(format!("root task row read: {e}")))?
-            .map(|t| t.acceptance_criteria)
-            .unwrap_or_default();
+        // The criteria are the durable row already loaded above: a state
+        // transition never changes them, and a second read could only
+        // degrade a vanished row to "no criteria".
+        let criteria = task.acceptance_criteria.clone();
         // (1) PREPARE: compose the candidate from the immutable run base.
         // The owner is byte-untouched by this phase.
         let candidate_ids: Vec<String> = eligible.iter().map(|r| r.child_id.clone()).collect();
@@ -2192,7 +2860,7 @@ impl TaskExecutor {
         // no-op policy: an empty aggregate change set completes only through
         // the independent reviewer's no-op criterion proof (or the explicit
         // Allowed disposition; Refused never completes).
-        let no_op = run_no_op_disposition(&handle, &run_id);
+        let no_op = run_no_op_disposition(&handle, &run_id)?;
         let Some(proof) = self
             .verify_prepared_integration(&handle, task_id, &criteria, &prepared, no_op)
             .await?
@@ -2262,21 +2930,19 @@ impl TaskExecutor {
         task_id: TaskId,
         candidate_ids: &[String],
     ) -> Result<PreparedRunIntegration, ExecError> {
-        let digest = |root: &std::path::Path| -> Result<String, ExecError> {
-            faktor_session::root_snapshot_digest(root, faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES)
-                .map_err(|e| {
-                    ExecError::WorkspaceDrift(format!("root snapshot of {}: {e}", root.display()))
-                })
-        };
+        let digest =
+            |root: &std::path::Path| -> Result<String, ExecError> { root_manifest_digest(root) };
         let owner_root = self.owner_root_of(parent, handle)?;
-        let rb = handle
-            .ledger_run_base_get(run_id)
-            .map_err(|e| ExecError::Internal(format!("run base read: {e}")))?
-            .ok_or_else(|| {
-                ExecError::IntegrationConflict(format!(
-                    "orchestrated run {run_id} has no recorded run base; refusing to stage against the live owner"
-                ))
-            })?;
+        let rb = durable_read_value(
+            format!("run base of run {run_id}"),
+            handle.ledger_run_base_read(run_id),
+        )
+        .map_err(ExecError::from)?
+        .ok_or_else(|| {
+            ExecError::IntegrationConflict(format!(
+                "orchestrated run {run_id} has no recorded run base; refusing to stage against the live owner"
+            ))
+        })?;
         let base_root = PathBuf::from(&rb.root);
         let base_snapshot = digest(&base_root)?;
         if base_snapshot != rb.snapshot_hash {
@@ -2303,14 +2969,19 @@ impl TaskExecutor {
             std::fs::create_dir_all(&candidate_root).map_err(|e| {
                 ExecError::Internal(format!("candidate dir {}: {e}", candidate_root.display()))
             })?;
-            faktor_fs::copy_tree_skip(
+            faktor_fs::tree_manifest::copy_tree_manifest(
                 &base_root,
                 &candidate_root,
                 MAX_RUN_BASE_ENTRIES,
                 MAX_RUN_BASE_BYTES,
                 RUN_BASE_SKIP_DIRS,
             )
-            .map_err(|e| ExecError::from_fs("candidate run-base copy", &base_root, e))?;
+            .map_err(|e| {
+                ExecError::WorkspaceDrift(format!(
+                    "candidate run-base copy of {}: {e}",
+                    base_root.display()
+                ))
+            })?;
             candidate_snapshot = digest(&candidate_root)?;
             if candidate_snapshot != rb.snapshot_hash {
                 return Err(ExecError::WorkspaceDrift(format!(
@@ -2458,6 +3129,100 @@ impl TaskExecutor {
         Ok(())
     }
 
+    /// PREPARE phase of one single-item SHADOW run (the one-child instance
+    /// of [`Self::prepare_run_integration`]): the shadow's staged change set
+    /// is bound to the shadow's IMMUTABLE run base (`RunBaseRecord` recorded
+    /// at `begin_shadow` under the shadow id) and the shadow tree is the
+    /// CANDIDATE (base + the one child's changes, verified byte-identical to
+    /// the staged child content). The owner is never a staging source; the
+    /// OWNER is only the materialized base under the whole-root equality
+    /// check every landing performs first, and each per-path rollback blob
+    /// is re-verified against its recorded anchor before the transaction is
+    /// recorded (see [`Self::build_path_decisions`]).
+    pub fn prepare_shadow_integration(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        parent: SessionId,
+        run_id: &str,
+        task_id: TaskId,
+        row: &ShadowRow,
+    ) -> Result<PreparedRunIntegration, ExecError> {
+        let shadows = self.shadows().ok_or_else(|| {
+            ExecError::Internal("shadow integration requires the shadow service".into())
+        })?;
+        let digest =
+            |root: &std::path::Path| -> Result<String, ExecError> { root_manifest_digest(root) };
+        let owner_root = PathBuf::from(&row.base_root).canonicalize().map_err(|e| {
+            ExecError::NotFound(format!(
+                "shadow integration target {} vanished since begin_shadow: {e}",
+                row.base_root
+            ))
+        })?;
+        let candidate_root = PathBuf::from(&row.root).canonicalize().map_err(|e| {
+            ExecError::NotFound(format!(
+                "shadow root {} is gone; discard() and begin_shadow() again: {e}",
+                row.root
+            ))
+        })?;
+        let run_base = durable_read_value(
+            format!("run base of shadow {}", row.shadow_id),
+            handle.ledger_run_base_read(&row.shadow_id),
+        )
+        .map_err(ExecError::from)?
+        .ok_or_else(|| {
+            ExecError::IntegrationConflict(format!(
+                "shadow {} has no recorded run base; refusing to integrate an unanchored candidate",
+                row.shadow_id
+            ))
+        })?;
+        let cs = shadows.stage_change_set(parent)?;
+        if cs.run_base_snapshot.as_deref() != Some(run_base.snapshot_hash.as_str()) {
+            return Err(ExecError::IntegrationConflict(format!(
+                "change set {} of shadow {} binds run base {:?} but the shadow carries {}; a stale change set is never integrated",
+                cs.id(),
+                row.shadow_id,
+                cs.run_base_snapshot,
+                run_base.snapshot_hash
+            )));
+        }
+        let candidate_snapshot = digest(&candidate_root)?;
+        let changed: Vec<String> = cs
+            .files
+            .iter()
+            .map(|entry| entry.path.to_string_lossy().into_owned())
+            .collect();
+        let source = faktor_session::IntegrationSourceRow {
+            child_id: "shadow".to_string(),
+            change_set_id: cs.id(),
+            candidate_root_hash: candidate_snapshot.clone(),
+        };
+        let sources_digest =
+            stable_list_digest(&[format!("shadow|{}|{}", cs.id(), candidate_snapshot)]);
+        let staged = vec![PreparedChildChangeSet {
+            child_id: "shadow".to_string(),
+            child_root: candidate_root.clone(),
+            change_set: cs,
+            candidate_root_hash: candidate_snapshot.clone(),
+        }];
+        Ok(PreparedRunIntegration {
+            run_id: run_id.to_string(),
+            task_id,
+            owner_root: owner_root.clone(),
+            // Materialized base: at decision time the owner root is proven
+            // byte-identical to the recorded run base before the first
+            // durable decision row or write, and every blob read is
+            // re-verified against its recorded base hash.
+            base_root: owner_root,
+            candidate_root,
+            base_snapshot: run_base.snapshot_hash,
+            candidate_snapshot,
+            changed,
+            sources: vec![source],
+            sources_digest,
+            staged,
+        })
+    }
+
     /// VERIFY phase (points 1/2/6): run the shared deterministic
     /// verification over the CANDIDATE root, persist the durable fact and a
     /// verification record bound to the CANDIDATE snapshot. `Ok(None)` for
@@ -2516,7 +3281,7 @@ impl TaskExecutor {
             // verification executor (or a later settlement) resolves it, and
             // only THAT attempt may certify (a newer attempt supersedes the
             // old one structurally; late results are typed-refused).
-            let attempt_op = match read_root_attempt_op(handle, &prepared.run_id) {
+            let attempt_op = match read_root_attempt_op(handle, &prepared.run_id)? {
                 Some(op) => op,
                 None => {
                     let op = self.session.next_op_id().raw();
@@ -2670,17 +3435,15 @@ impl TaskExecutor {
         }
         let prepared = proof.prepared();
         let owner_root = &prepared.owner_root;
-        let digest = |root: &std::path::Path| -> Result<String, ExecError> {
-            faktor_session::root_snapshot_digest(root, faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES)
-                .map_err(|e| {
-                    ExecError::WorkspaceDrift(format!("root snapshot of {}: {e}", root.display()))
-                })
-        };
+        let digest =
+            |root: &std::path::Path| -> Result<String, ExecError> { root_manifest_digest(root) };
         // Crash recovery: inspect the durable transaction of this run and
         // deterministically finish landing or roll back.
-        if let Some(mut txn) = handle
-            .ledger_integration_txn_for_run(&prepared.run_id)
-            .map_err(|e| ExecError::Internal(format!("integration txn read: {e}")))?
+        if let Some(mut txn) = durable_read_value(
+            format!("landing transaction of run {}", prepared.run_id),
+            handle.ledger_integration_txn_read(&prepared.run_id),
+        )
+        .map_err(ExecError::from)?
         {
             let same_candidate = txn.verified_candidate_snapshot == prepared.candidate_snapshot;
             match txn.phase {
@@ -2848,11 +3611,7 @@ impl TaskExecutor {
         }
         // Final equality (point 6): the landed owner root must EXACTLY
         // equal the verified candidate snapshot — never "merge returned ok".
-        let landed = faktor_session::root_snapshot_digest(
-            &owner_root,
-            faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES,
-        )
-        .map_err(|e| {
+        let landed = root_manifest_digest(&owner_root).map_err(|e| {
             ExecError::WorkspaceDrift(format!(
                 "landed root snapshot of {}: {e}",
                 owner_root.display()
@@ -2978,7 +3737,7 @@ impl TaskExecutor {
             let base_hash = base_map.get(&path).copied();
             let candidate_hash = candidate_map.get(&path).copied();
             let base_blob = match base_hash {
-                Some(_) => {
+                Some(expected) => {
                     let source = prepared.base_root.join(&path);
                     let bytes = std::fs::read(&source).map_err(|e| {
                         ExecError::WorkspaceDrift(format!(
@@ -2991,6 +3750,18 @@ impl TaskExecutor {
                         .cas()
                         .put_bounded(&bytes, faktor_fs::MAX_MERGE_FILE_BYTES as usize)
                         .map_err(|e| ExecError::Internal(format!("run base blob of {rel}: {e}")))?;
+                    // The materialized base (the shadow path reuses the
+                    // owner under the whole-root equality check) must still
+                    // match the recorded anchor: a drifted generation is a
+                    // typed refusal, never a rollback blob for the wrong
+                    // content.
+                    if stored != expected {
+                        return Err(ExecError::WorkspaceDrift(format!(
+                            "run base content of {rel} no longer matches its recorded anchor (expected {}, found {}); the generation moved",
+                            expected.to_hex(),
+                            stored.to_hex()
+                        )));
+                    }
                     Some(stored.to_hex())
                 }
                 None => None,
@@ -3176,10 +3947,12 @@ impl TaskExecutor {
         // candidate it refused to land. NOTHING is derived from
         // `sources.first()` anymore: the deprecated `base_revision` stays
         // `None`.
-        let integration_txn_id = handle
-            .ledger_integration_txn_for_run(&prepared.run_id)
-            .map_err(|e| ExecError::Internal(format!("integration txn read: {e}")))?
-            .map(|txn| txn.txn_id());
+        let integration_txn_id = durable_read_value(
+            format!("landing transaction of run {}", prepared.run_id),
+            handle.ledger_integration_txn_read(&prepared.run_id),
+        )
+        .map_err(ExecError::from)?
+        .map(|txn| txn.txn_id());
         let row = faktor_session::IntegrationRecordRow {
             run_id: prepared.run_id.clone(),
             task_id: prepared.task_id.raw(),
@@ -3252,10 +4025,12 @@ impl TaskExecutor {
         // produced this snapshot (record-first rows always exist by the
         // time an integration is finalized; a `None` here is only possible
         // for a direct caller that never landed through a txn).
-        let integration_txn_id = handle
-            .ledger_integration_txn_for_run(&prepared.run_id)
-            .map_err(|e| ExecError::Internal(format!("integration txn read: {e}")))?
-            .map(|txn| txn.txn_id());
+        let integration_txn_id = durable_read_value(
+            format!("landing transaction of run {}", prepared.run_id),
+            handle.ledger_integration_txn_read(&prepared.run_id),
+        )
+        .map_err(ExecError::from)?
+        .map(|txn| txn.txn_id());
         let row = faktor_session::IntegrationRecordRow {
             run_id: prepared.run_id.clone(),
             task_id: prepared.task_id.raw(),
@@ -3553,12 +4328,16 @@ impl TaskExecutor {
     }
 
     /// Deterministic settlement of a durable shadow left by an interrupted
-    /// drive BEFORE a new shadowed run begins:
-    /// - shadow + terminal task row → run the finalize once (integrate on
-    ///   verified-complete, discard on failure/cancel);
-    /// - shadow + non-terminal task row + no live turn → the previous drive
-    ///   crashed before certifying anything; its partial shadow is garbage →
-    ///   discard;
+    /// drive BEFORE a new run begins:
+    /// - shadow + `Failed`/`Cancelled` task row → discard;
+    /// - shadow + `VerifiedComplete` task row → the owner landing must be
+    ///   re-driven by the async settlement pipeline; a new run is refused
+    ///   (typed Conflict) until the shadow retires;
+    /// - shadow + non-terminal task row WITHOUT a shadow-world proof and no
+    ///   live turn → the crashed drive's partial shadow is garbage → discard;
+    /// - shadow + non-terminal task row WITH a shadow-world proof (the drive
+    ///   certified the shadow but integration has not run) → the async
+    ///   settlement owns the landing; a new run is refused (typed Conflict);
     /// - shadow + live turn → the previous drive is still running; a second
     ///   run cannot begin (typed Conflict).
     fn settle_existing_shadow(
@@ -3578,26 +4357,61 @@ impl TaskExecutor {
         let task_id = handle.task_id()?;
         let state = handle.get_task(task_id)?.map(|t| t.state);
         match state {
-            Some(s) if s.is_terminal() => {
-                self.finalize_shadow_run(parent)?;
+            Some(TaskState::Failed) | Some(TaskState::Cancelled) => {
+                shadows.discard(parent)?;
+            }
+            Some(TaskState::VerifiedComplete) => {
+                return Err(ExecError::Conflict(format!(
+                    "session {parent} carries the verified shadow {} whose owner integration must be re-settled before a new run starts",
+                    row.shadow_id
+                )));
             }
             Some(_) => {
                 // Non-terminal task row: is the interrupted drive still
                 // LIVE on the session? A durable ACTIVE turn record is the
                 // precise marker (the crashed drive's record stays active;
                 // an operator abort resolves it). With no live record the
-                // crashed drive's partial shadow is garbage and is
-                // discarded deterministically; with one, resume or cancel
-                // first.
+                // crashed drive's partial shadow is garbage UNLESS the drive
+                // certified the shadow world (a passing record at the
+                // current revision): that proof marks a recoverable run
+                // whose owner integration is still pending.
                 let mid_turn = self
                     .session
                     .store()
                     .active_turn_record(parent)
                     .map(|r| r.is_some())
-                    .unwrap_or(false);
+                    .map_err(|e| {
+                        ExecError::from(classify_session_read(
+                            "active turn record of the shadowed session",
+                            faktor_core::Error::from(faktor_session::SessionError::from(e)),
+                        ))
+                    })?;
                 if mid_turn {
                     return Err(ExecError::Conflict(format!(
                         "session {parent} has a live shadow {} and an active drive; the interrupted run must be resumed or cancelled before a new shadowed task starts",
+                        row.shadow_id
+                    )));
+                }
+                // FIX 2: both reads feed a gate decision — a store failure is
+                // an error, never "the shadow world was not proven".
+                let revision = handle.task_revision(task_id).map_err(|e| {
+                    ExecError::from(classify_session_read(
+                        "task revision of the interrupted shadow run",
+                        e.into(),
+                    ))
+                })?;
+                let records = handle.list_verification_records(task_id).map_err(|e| {
+                    ExecError::from(classify_session_read(
+                        "verification records of the interrupted shadow run",
+                        e.into(),
+                    ))
+                })?;
+                let shadow_world_proven = records.iter().any(|record| {
+                    record.status == VerificationStatus::Passed && record.revision == revision
+                });
+                if shadow_world_proven {
+                    return Err(ExecError::Conflict(format!(
+                        "session {parent} carries the certifiable shadow {} whose owner integration is still pending; re-settle the run before starting a new one",
                         row.shadow_id
                     )));
                 }
@@ -3611,20 +4425,16 @@ impl TaskExecutor {
     }
 
     /// Post-drive hook of a shadowed run (spawned with the detached drive):
-    /// execute the accepted completion contract's requested steps (a
-    /// no-contract run is a pure no-op) and then settle the shadow. The
-    /// runner only records step outcomes — completion still goes through the
-    /// existing gate — and every decision reads durable rows, so a crashed
-    /// executor re-runs the same decision on reopen.
+    /// settle the run through the ONE pipeline (a live shadow integrates
+    /// prepare -> verify -> land -> steps -> complete). The runner only
+    /// records step outcomes; completion goes through the durable gate.
     ///
-    /// When the drive ended BEFORE the run reached a terminal state (the
-    /// verifier may still certify in the background), a BOUNDED watcher
-    /// re-runs the decision on the next terminal end instead of leaving the
-    /// shadow live forever.
+    /// When the drive ended BEFORE the owner integration could run (the
+    /// verifier may still certify in the background, or an integration
+    /// conflict awaits the user's drift resolution), a BOUNDED watcher
+    /// re-runs the decision on the next poll instead of leaving the shadow
+    /// live forever.
     async fn after_shadowed_drive(self: &Arc<Self>, parent: SessionId) {
-        // The common settlement: the drive already ran the deterministic
-        // verification and the completion gate (single-agent ordering); this
-        // pass executes the contract's steps and finalizes the shadow.
         let run_id = format!("tx-session-{}", parent.raw());
         match self
             .settle_run(RunSettlement::InSession { parent, run_id })
@@ -3632,11 +4442,9 @@ impl TaskExecutor {
         {
             Ok(outcome) => {
                 if matches!(
-                    outcome.finalize,
-                    Some(ShadowFinalize {
-                        action: ShadowFinalizeAction::Retained,
-                        ..
-                    })
+                    outcome.finalize.as_ref().map(|f| &f.action),
+                    Some(ShadowFinalizeAction::Retained)
+                        | Some(ShadowFinalizeAction::IntegrationBlocked)
                 ) {
                     self.watch_shadow_settle(parent);
                 }
@@ -3680,7 +4488,17 @@ impl TaskExecutor {
                     .settle_run(RunSettlement::InSession { parent, run_id })
                     .await
                 {
-                    Ok(outcome) if outcome.finalize.is_none() => return,
+                    Ok(outcome)
+                        if !matches!(
+                            outcome.finalize.as_ref().map(|f| &f.action),
+                            Some(ShadowFinalizeAction::Retained)
+                                | Some(ShadowFinalizeAction::IntegrationBlocked)
+                        ) =>
+                    {
+                        // Integrated/discarded/no-live-shadow: nothing left
+                        // to watch.
+                        return;
+                    }
                     Ok(_) => {}
                     Err(e) => {
                         eprintln!("shadowed-run watch settlement failed for session {parent}: {e}");
@@ -3840,23 +4658,23 @@ impl TaskExecutor {
         Ok(())
     }
 
-    /// The durable single decision point of a shadowed run (P0-48): read the
+    /// The durable lifecycle decision of a shadowed run (P0-48/49): read the
     /// session's shadow row + task row and act ONCE per terminal state:
     ///
-    /// - `VerifiedComplete` → auto-approve the whole staged change set into
-    ///   the user checkout ([`ShadowRoots::commit_all`]); conflicts retain
-    ///   the shadow (row `IntegrationBlocked`, durable conflict list) and
-    ///   return [`ShadowFinalizeAction::IntegrationBlocked`] — the run's
-    ///   content never half-lands;
     /// - `Failed`/`Cancelled` → discard the shadow;
-    /// - any non-terminal state → nothing (the drive may continue or the
-    ///   verifier may still certify; finalize re-runs on the next terminal
-    ///   end — see [`Self::watch_shadow_settle`], and every next run's
-    ///   deterministic settlement).
+    /// - `VerifiedComplete` → RETAINED: the owner landing is owned by the
+    ///   async settlement pipeline ([`Self::settle_shadowed_in_session`]);
+    ///   a completed task can only have reached that state through a
+    ///   successful landing, so this path is the crash window between the
+    ///   completion gate and the shadow retirement, recovered by the next
+    ///   settlement;
+    /// - any non-terminal state → retained (the drive may continue or the
+    ///   settlement may still integrate; see [`Self::watch_shadow_settle`]
+    ///   and every next run's deterministic settlement).
     ///
-    /// `Ok(None)` when no live shadow exists (plain runs). Deterministic
-    /// after a crash: rows are durable and the commit itself is
-    /// CAS-replayable.
+    /// `Ok(None)` when no live shadow exists (plain runs). This function
+    /// NEVER lands content: the single commitment engine is the
+    /// transactional [`Self::land_verified_integration`] pipeline.
     pub fn finalize_shadow_run(
         self: &Arc<Self>,
         parent: SessionId,
@@ -3879,29 +4697,6 @@ impl TaskExecutor {
             return Ok(None);
         };
         match task.state {
-            TaskState::VerifiedComplete => {
-                let outcome = shadows
-                    .commit_all(parent)
-                    .map_err(|e| ExecError::from_shadow("shadowed integration commit", e))?;
-                if outcome.clean() {
-                    Ok(Some(ShadowFinalize {
-                        action: ShadowFinalizeAction::Integrated,
-                        merged: outcome.merged,
-                        rejected: outcome.rejected,
-                        conflicts: outcome.conflicts,
-                    }))
-                } else {
-                    // Conflicts: nothing landed in the user checkout. The
-                    // shadow is retained and the durable envelope carries
-                    // the integration_conflict list.
-                    Ok(Some(ShadowFinalize {
-                        action: ShadowFinalizeAction::IntegrationBlocked,
-                        merged: outcome.merged,
-                        rejected: outcome.rejected,
-                        conflicts: outcome.conflicts,
-                    }))
-                }
-            }
             TaskState::Failed | TaskState::Cancelled => {
                 shadows
                     .discard(parent)
@@ -3913,12 +4708,7 @@ impl TaskExecutor {
                     conflicts: Vec::new(),
                 }))
             }
-            _ => Ok(Some(ShadowFinalize {
-                action: ShadowFinalizeAction::Retained,
-                merged: Vec::new(),
-                rejected: Vec::new(),
-                conflicts: Vec::new(),
-            })),
+            _ => Ok(Some(retained_shadow_finalize())),
         }
     }
 
@@ -4235,6 +5025,10 @@ pub struct TournamentStartRequest {
     pub goal: String,
     pub criteria: Vec<String>,
     pub n: usize,
+    /// Decoded for wire compatibility only: the sole decodable value is
+    /// [`MutationMode::Shadow`] (a `direct_compat` value is a strict decode
+    /// error naming the removal). Candidates are ALWAYS isolated
+    /// worktrees — no value can change that.
     pub mutation_mode: Option<MutationMode>,
     pub model: Option<String>,
     pub max_tokens: Option<u64>,
@@ -4733,15 +5527,36 @@ fn root_attempt_op_key(run_id: &str) -> String {
 }
 
 /// The exact attempt op persisted for `run_id` (None before the first
-/// attempt of the run — never a guess).
-fn read_root_attempt_op(handle: &faktor_session::SessionHandle, run_id: &str) -> Option<u64> {
+/// attempt of the run — never a guess). FIX 2: a failed store read and a
+/// PRESENT-but-malformed attempt fact are errors — collapsing either into
+/// `None` would mint a superseding attempt over a live verification.
+fn read_root_attempt_op(
+    handle: &faktor_session::SessionHandle,
+    run_id: &str,
+) -> Result<Option<u64>, ExecError> {
     let key = root_attempt_op_key(run_id);
-    let facts = handle.memory_facts().ok()?;
-    facts
+    let facts = handle
+        .memory_facts()
+        .map_err(|e| ExecError::from(classify_session_read("verification-attempt facts", e)))?;
+    let Some((_, _, value)) = facts
         .iter()
         .find(|(kind, k, _)| kind == ROOT_ATTEMPT_FACT_KIND && k == &key)
-        .and_then(|(_, _, v)| v.parse::<u64>().ok())
-        .filter(|op| *op != 0)
+    else {
+        return Ok(None);
+    };
+    let op: u64 = value.parse().map_err(|_| {
+        ExecError::from(DurableStateError::CorruptDurableState {
+            what: format!("verification-attempt fact {key}"),
+            detail: format!("stored attempt op {value:?} is not a u64"),
+        })
+    })?;
+    if op == 0 {
+        return Err(ExecError::from(DurableStateError::CorruptDurableState {
+            what: format!("verification-attempt fact {key}"),
+            detail: "stored attempt op is zero".into(),
+        }));
+    }
+    Ok(Some(op))
 }
 
 /// Persist the exact verification attempt op of `run_id` durably BEFORE the
