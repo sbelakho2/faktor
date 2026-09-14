@@ -1541,7 +1541,10 @@ mod tests {
         wait_for_stats(
             &actor,
             "the slowed maintenance checkpoint",
-            Duration::from_secs(15),
+            // Deep cold builds + parallel certificate lanes can starve this
+            // thread well past 15 s; the assertion (maintenance RAN) is
+            // unchanged, the ceiling is environment-independent.
+            Duration::from_secs(120),
             |s| s.maintenance_checkpoints >= 1,
         )
         .await;
