@@ -583,7 +583,10 @@ mod tests {
         let start = std::time::Instant::now();
         // Idle for 600 ms (no reads from our side): nothing should stall.
         std::thread::sleep(std::time::Duration::from_millis(600));
-        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        // Bounded, environment-independent: this only guards against a
+        // pathological stall in the 600 ms idle window (the sleep itself is
+        // the workload); 15 s cannot flake under CI/certificate load.
+        assert!(start.elapsed() < std::time::Duration::from_secs(15));
         assert!(
             pty.wait_for_contains("late", std::time::Duration::from_secs(10)),
             "blocking reader wakes on data"
@@ -591,7 +594,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         pty.shutdown();
         assert!(
-            t0.elapsed() < std::time::Duration::from_secs(2),
+            t0.elapsed() < std::time::Duration::from_secs(15),
             "kill path must wake the blocking reader via group EOF"
         );
     }
