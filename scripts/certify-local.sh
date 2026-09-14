@@ -333,6 +333,20 @@ section_cross_target() {
     bash scripts/cross-target-check.sh
 }
 
+# Regenerate the JetBrains parity artifact the capability derivation reads
+# (target/ is disposable; a `cargo clean` must not silently downgrade the
+# labels). kotlinc runs offline; when the toolchain is genuinely absent the
+# step records a skip and the capabilities section then fails loudly rather
+# than certifying a stale claim.
+section_jetbrains_parity() {
+    if ! command -v kotlinc >/dev/null 2>&1; then
+        echo "SKIP: kotlinc unavailable; parity artifact not regenerated" >&2
+        add_skip jetbrains-parity "kotlinc unavailable"
+        return 0
+    fi
+    bash apps/jetbrains/compile-and-smoke.sh
+}
+
 # Derive target/certification/capabilities.json from repository files/scripts
 # and fail when docs/certification.md's capability table drifts from it.
 section_capabilities() {
@@ -567,6 +581,7 @@ else
     add_section section_check check "cargo check --workspace"
     add_section section_cross_target cross-target "cross-target compile (windows-msvc, skips recorded)"
     if command -v node >/dev/null 2>&1; then
+        add_section section_jetbrains_parity jetbrains-parity "JetBrains parity artifact regeneration"
         add_section section_capabilities capabilities "capability manifest + docs drift"
         add_section section_evidence_selftest evidence-selftest "certification evidence verifier selftest"
     else
