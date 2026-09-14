@@ -364,7 +364,7 @@
       },
       "call": "session.prompt",
       "id": "session.prompt",
-      "note": "Realistic SDK input union accepted (tools map, snapshotInitialization \"wait\", synthetic/time on the text part). Exact pass: the response now carries the rich SDK AssistantMessage fields (id, time.created, parentID = the durable user sequence, mode, agent, path, cost, tokens) and Part identity (id = messageID:index, sessionID, messageID) additively next to the frozen aliases. The daemon has one agent/mode (\"default\"); per-message usage is not projected by the frozen surface, so cost/tokens are zeros, never guessed numbers.",
+      "note": "Realistic SDK input union accepted (tools map, snapshotInitialization \"wait\", synthetic/time on the text part; the tools map is accepted but NOT enforced \u2014 tool availability is the daemon's bundle/CapabilitySet, documented in docs/wire-compat.md residual gaps). Exact pass: the response carries the rich SDK AssistantMessage fields (id, time.created, parentID = the durable user sequence, mode, agent, path, cost, tokens) and Part identity (id = messageID:index, sessionID, messageID) additively next to the frozen aliases. The harness's checkpoint probe (the fixture that makes the real revert/diff state exist) executes and the wrapper projects the turn's NEWEST durable assistant row \u2014 the tool-result row \u2014 so parts carry the probe's real result (excerpt/exit_code), never a synthesized text; the follow-up \"pong\" text lands on the model row, which the equivalent page steps expose. The probe scratch path is per-process and golden-normalized to @string. The daemon has one agent/mode (\"default\"); per-message usage is not projected by the frozen surface, so cost/tokens are zeros, never guessed numbers.",
       "request": {
         "body": "{\"model\":{\"modelID\":\"m\",\"providerID\":\"fake\"},\"parts\":[{\"synthetic\":false,\"text\":\"ping\",\"time\":{\"start\":0},\"type\":\"text\"}],\"snapshotInitialization\":\"wait\",\"tools\":{\"read_file\":true,\"write_file\":false}}",
         "content_type": "application/json",
@@ -405,11 +405,20 @@
           },
           "parts": [
             {
-              "id": "3:0",
+              "callID": "compat-probe-1",
+              "id": "4:0",
+              "input": null,
               "messageID": "@string",
+              "name": "unknown",
+              "output": {
+                "artifact": null,
+                "excerpt": "checkpoint probe recorded",
+                "exit_code": 0,
+                "slice_hint": null
+              },
               "sessionID": "@string",
-              "text": "pong",
-              "type": "text"
+              "state": "completed",
+              "type": "tool"
             }
           ]
         },
@@ -426,7 +435,7 @@
     },
     {
       "args": {
-        "limit": 1,
+        "limit": 3,
         "sessionID": "$sessionID"
       },
       "call": "session.messages",
@@ -434,14 +443,163 @@
         "cursor": [
           "data.0.info.messageID",
           "data.0.info.id"
+        ],
+        "cursorUser": [
+          "data.2.info.messageID",
+          "data.2.info.id"
         ]
       },
       "id": "session.messages.newest",
-      "note": "Exact pass: the entry info now carries the rich SDK Message identity (id = the durable sequence, agent, assistant-only parentID/mode/path/cost/tokens) and the text Part its SDK id/messageID, additively next to the frozen aliases. The PAGE omits the SDK `time` object and the part `sessionID` on purpose: a forked session re-times copied rows and re-points part session ids, while the frozen page contract guarantees the fork projection stays structurally equal to its source (tested in faktor-server), and the page ids are sequence-stable.",
+      "note": "Exact pass: the turn's page spans THREE durable rows now (the user prompt, the assistant row carrying the tool_call + text parts, and the tool-result assistant row), newest first; `cursor` anchors the revert target on the newest row (created after the probe checkpoint) and `cursorUser` anchors the dependency-free user message on the page tail. Info carries the rich SDK Message identity (id = durable sequence, agent, assistant-only parentID/mode/path/cost/tokens) and the Parts their SDK id/messageID, additively next to the frozen aliases. The PAGE omits the SDK `time` object and the part `sessionID` on purpose: a forked session re-times copied rows and re-points part session ids, while the frozen page contract guarantees the fork projection stays structurally equal to its source (tested in faktor-server), and the page ids are sequence-stable.",
       "request": {
         "method": "GET",
         "path": "/session/@string/message",
-        "query": "limit=@string"
+        "query": "limit=3"
+      },
+      "response": {
+        "body": [
+          {
+            "info": {
+              "agent": "default",
+              "cost": 0.0,
+              "createdMs": "@int",
+              "id": "@string",
+              "messageID": "@string",
+              "mode": "default",
+              "modelID": "m",
+              "path": {
+                "cwd": ".",
+                "root": "."
+              },
+              "providerID": "fake",
+              "role": "assistant",
+              "sessionID": "@string",
+              "tokens": {
+                "cache": {
+                  "read": 0,
+                  "write": 0
+                },
+                "input": 0,
+                "output": 0,
+                "reasoning": 0
+              }
+            },
+            "parts": [
+              {
+                "callID": "compat-probe-1",
+                "id": "4:0",
+                "input": null,
+                "messageID": "@string",
+                "name": "unknown",
+                "output": {
+                  "artifact": null,
+                  "excerpt": "checkpoint probe recorded",
+                  "exit_code": 0,
+                  "slice_hint": null
+                },
+                "state": "completed",
+                "type": "tool"
+              }
+            ]
+          },
+          {
+            "info": {
+              "agent": "default",
+              "cost": 0.0,
+              "createdMs": "@int",
+              "id": "@string",
+              "messageID": "@string",
+              "mode": "default",
+              "modelID": "m",
+              "parentID": "@string",
+              "path": {
+                "cwd": ".",
+                "root": "."
+              },
+              "providerID": "fake",
+              "role": "assistant",
+              "sessionID": "@string",
+              "tokens": {
+                "cache": {
+                  "read": 0,
+                  "write": 0
+                },
+                "input": 0,
+                "output": 0,
+                "reasoning": 0
+              }
+            },
+            "parts": [
+              {
+                "callID": "compat-probe-1",
+                "id": "3:0",
+                "input": {
+                  "content": "compat probe\n",
+                  "path": "@string"
+                },
+                "messageID": "@string",
+                "name": "checkpoint_probe",
+                "output": null,
+                "state": "completed",
+                "type": "tool"
+              },
+              {
+                "id": "3:1",
+                "messageID": "@string",
+                "text": "pong",
+                "type": "text"
+              }
+            ]
+          },
+          {
+            "info": {
+              "agent": "default",
+              "createdMs": "@int",
+              "id": "@string",
+              "messageID": "@string",
+              "model": {
+                "modelID": "m",
+                "providerID": "fake"
+              },
+              "modelID": "m",
+              "providerID": "fake",
+              "role": "user",
+              "sessionID": "@string"
+            },
+            "parts": [
+              {
+                "id": "2:0",
+                "messageID": "@string",
+                "text": "ping",
+                "type": "text"
+              }
+            ]
+          }
+        ],
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "0.info.id",
+        "0.parts.0.id"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionMessagesResponses.200",
+      "status": "passing"
+    },
+    {
+      "args": {
+        "before": "$cursor",
+        "limit": 1,
+        "sessionID": "$sessionID"
+      },
+      "call": "session.messages",
+      "id": "session.messages.before",
+      "note": "before=<cursor> paging: the wire query encoding (before=<seq>&limit=1) is locked. Exact pass: the page returns the row immediately older than the cursor (the assistant row carrying the tool_call + text parts) with the rich SDK Message identity and Part ids additively next to the frozen aliases; the page intentionally omits the SDK `time` object and part `sessionID` (fork-stable page contract, see session.messages.newest).",
+      "request": {
+        "method": "GET",
+        "path": "/session/@string/message",
+        "query": "before=@string&limit=@string"
       },
       "response": {
         "body": [
@@ -474,67 +632,22 @@
             },
             "parts": [
               {
+                "callID": "compat-probe-1",
                 "id": "3:0",
+                "input": {
+                  "content": "compat probe\n",
+                  "path": "@string"
+                },
+                "messageID": "@string",
+                "name": "checkpoint_probe",
+                "output": null,
+                "state": "completed",
+                "type": "tool"
+              },
+              {
+                "id": "3:1",
                 "messageID": "@string",
                 "text": "pong",
-                "type": "text"
-              }
-            ]
-          }
-        ],
-        "content_type": "application/json",
-        "event_stream": false,
-        "status": 200
-      },
-      "sdk_requires": [
-        "0.info.id",
-        "0.parts.0.id"
-      ],
-      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionMessagesResponses.200",
-      "status": "passing"
-    },
-    {
-      "args": {
-        "before": "$cursor",
-        "limit": 1,
-        "sessionID": "$sessionID"
-      },
-      "call": "session.messages",
-      "capture": {
-        "cursorUser": [
-          "data.0.info.messageID",
-          "data.0.info.id"
-        ]
-      },
-      "id": "session.messages.before",
-      "note": "before=<cursor> paging: the wire query encoding (before=<seq>&limit=1) is locked. Exact pass: the user entry now carries the rich SDK UserMessage fields (id, agent, model) and the text Part its SDK id/messageID, additively next to the frozen aliases; the page intentionally omits the SDK `time` object and part `sessionID` (fork-stable page contract, see session.messages.newest).",
-      "request": {
-        "method": "GET",
-        "path": "/session/@string/message",
-        "query": "before=@string&limit=@string"
-      },
-      "response": {
-        "body": [
-          {
-            "info": {
-              "agent": "default",
-              "createdMs": "@int",
-              "id": "@string",
-              "messageID": "@string",
-              "model": {
-                "modelID": "m",
-                "providerID": "fake"
-              },
-              "modelID": "m",
-              "providerID": "fake",
-              "role": "user",
-              "sessionID": "@string"
-            },
-            "parts": [
-              {
-                "id": "2:0",
-                "messageID": "@string",
-                "text": "ping",
                 "type": "text"
               }
             ]

@@ -61,6 +61,11 @@ pub struct WorkspaceData {
     /// symbol name (lowercase) -> sorted hit list.
     pub symbols: BTreeMap<String, Vec<StoredSymbolHit>>,
     pub token_count: u64,
+    /// Persisted chunk embeddings keyed by (content_hash, model_id,
+    /// model_revision, dimension). Additive: generations written before
+    /// embeddings existed decode to an empty store.
+    #[serde(default)]
+    pub embeddings: crate::EmbeddingIndex,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -69,6 +74,10 @@ pub struct StoredFile {
     pub symbols: Vec<Symbol>,
     pub modified_ms: i64,
     pub size: u64,
+    /// Chunk content hashes (additive; see
+    /// [`crate::embedding::chunk_text`]).
+    #[serde(default)]
+    pub chunks: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -97,6 +106,7 @@ impl GenerationFile {
                         symbols: e.symbols.clone(),
                         modified_ms: e.modified_ms,
                         size: e.size,
+                        chunks: e.chunks.clone(),
                     },
                 );
             }
@@ -135,6 +145,11 @@ impl GenerationFile {
                 postings,
                 symbols,
                 token_count: index.token_count() as u64,
+                embeddings: index
+                    .embedding_index(crate::WorkspaceId::new(workspace))
+                    .cloned()
+                    .unwrap_or_default()
+                    .sanitize(),
             },
         }
     }
@@ -161,6 +176,7 @@ impl GenerationFile {
                     symbols: f.symbols.clone(),
                     modified_ms: f.modified_ms,
                     size: f.size,
+                    chunks: f.chunks.clone(),
                 },
             );
         }
@@ -184,6 +200,10 @@ impl GenerationFile {
         }
         idx.symbols.insert(ws, symbols);
         idx.token_count = self.data.token_count as usize;
+        // Persisted vectors are hostile input like everything else in the
+        // envelope: invalid shapes are dropped loudly, bounds re-applied.
+        idx.embeddings
+            .insert(ws, self.data.embeddings.clone().sanitize());
         Ok(idx)
     }
 

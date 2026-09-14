@@ -11,7 +11,7 @@
       "args": {},
       "call": "provider.list",
       "id": "provider.list",
-      "note": "LOCKED (unsourceable Model metadata): the SDK's Provider.models[].Model requires api{id,url,npm}, per-token cost, limit, status and release_date. The daemon's catalog exposes real capabilities and a pricing STATE (Known|Unknown) precisely so unknown prices are never faked as 0, and it knows no npm package/release date; emitting models with fabricated metadata (or omitting the real catalog) would be worse than the honest 404. Locked until a faithful metadata projection exists.",
+      "note": "LOCKED (re-audited): the daemon catalog exposes real capabilities and a pricing STATE (Known|ConservativeCeiling|Stale|LocalZero|Unknown) but no source for the SDK Model's required api.url, api.npm, release_date or lifecycle status (alpha|beta|deprecated|active), and the SDK type makes cost.input/output/cache numeric REQUIRED (no null/optional), so PricingState::Unknown rows have NO honest numeric representation. Emitting models without those fields would violate the declared type; emitting zero costs would be the exact fabrication the catalog's Unknown state exists to prevent. Still locked until a faithful Model metadata source exists.",
       "request": {
         "method": "GET",
         "path": "/provider",
@@ -39,8 +39,13 @@
         "title": "wire-trace"
       },
       "call": "pty.create",
+      "capture": {
+        "ptyID": [
+          "data.id"
+        ]
+      },
       "id": "pty.create",
-      "note": "LOCKED (platform-dependent backend): the SDK posts POST /pty and expects the Pty object; the daemon's real PTY ops live at /pty/create, so the SDK path is honestly unregistered (404). The trace's command is POSIX `sh` while the real backend is platform-specific (ConPTY on Windows) and fails honestly there, so a 200 golden could not be an exact pass on every CI platform; the SDK's interactive connect route is also unregistered. Locked rather than half-implementing the PTY lifecycle.",
+      "note": "Exact pass: POST /pty now runs over the daemon's REAL PTY registry (AppState.ptys, the same faktor-pty authority the native session-owned terminal surface drives). The response is the SDK Pty object built from the values the spawn actually used: real id/pid, the requested command/args/cwd/title echoed, and status from the live child state (running for the interactive sh this trace creates); exitCode is omitted because the PTY backend exposes no exit-code authority (never fabricated), and sessionID is omitted because the SDK's create body carries no session id and no ownership row is minted. The pid is platform-normalized to @int in the golden; the rest of the shape is identical on the POSIX CI platforms.",
       "request": {
         "body": "{\"args\":[],\"command\":\"sh\",\"cwd\":\".\",\"size\":{\"cols\":80,\"rows\":24},\"title\":\"wire-trace\"}",
         "content_type": "application/json",
@@ -49,14 +54,50 @@
         "query": ""
       },
       "response": {
-        "body": null,
-        "content_type": "",
+        "body": {
+          "args": [],
+          "command": "sh",
+          "cwd": ".",
+          "id": "@string",
+          "pid": "@int",
+          "status": "running",
+          "title": "wire-trace"
+        },
+        "content_type": "application/json",
         "event_stream": false,
-        "status": 404
+        "status": 200
       },
-      "sdk_requires": [],
+      "sdk_requires": [
+        "id",
+        "status",
+        "pid"
+      ],
       "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#PtyCreateResponses.200 (Pty)",
-      "status": "divergence"
+      "status": "passing"
+    },
+    {
+      "args": {
+        "ptyID": "$ptyID"
+      },
+      "call": "pty.remove",
+      "id": "pty.remove",
+      "note": "Exact pass: DELETE /pty/{ptyID} terminates the real child process tree through the PTY backend's bounded shutdown (SIGTERM, grace, SIGKILL, reader join), drops the registry row and answers the SDK-declared boolean. This is the deterministic teardown of the terminal created by pty.create (the same id captured from its response).",
+      "request": {
+        "method": "DELETE",
+        "path": "/pty/@string",
+        "query": ""
+      },
+      "response": {
+        "body": true,
+        "content_type": "application/json",
+        "event_stream": false,
+        "status": 200
+      },
+      "sdk_requires": [
+        "#bool"
+      ],
+      "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#PtyRemoveResponses.200 (boolean)",
+      "status": "passing"
     },
     {
       "args": {},
@@ -128,7 +169,7 @@
       "args": {},
       "call": "global.event",
       "id": "global.event",
-      "note": "LOCKED (SSE multiplexing / no frame corpus): the request bytes (GET /global/event, auth) and the opened 200 text/event-stream are transport-locked, but the replay does not golden-compare SSE frame bodies (an idle harness emits no event), and the daemon's journal/global envelope is not the SDK's multiplexed GlobalEvent union (directory/project/workspace + payload union). Note-locked until an SDK-union frame corpus can be replayed.",
+      "note": "LOCKED (re-audited): the transport (GET /global/event, auth, 200 text/event-stream) is exact, but the daemon's GlobalEvent envelope is the frozen Faktor journal projection (type names like session_created / session_next_text_delta; payload fields like session_id) while the SDK declares a different union (type names like session.created, properties objects, string directory/project/workspace). No SDK-union frame projector exists, and the replay compares no SSE frame bodies (no frame corpus). Locked until an SDK-union projector AND a replayable frame corpus exist; emitting SDK-looking frames without one would be a fabricated multiplex.",
       "request": {
         "method": "GET",
         "path": "/global/event",

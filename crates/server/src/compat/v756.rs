@@ -63,6 +63,27 @@ pub(crate) fn wire_rich_session(
     })
 }
 
+/// The SDK `SessionN` projection with the durable revert marker attached.
+/// The marker is emitted ONLY when the caller can name the reverted-to
+/// message honestly: `wire_revert` knows it from the request it just served,
+/// while read projections (list/get) cannot recover a message identity from
+/// durable rows (the `checkpoint.restored_ms` marker records WHICH checkpoint
+/// is reverted, not the client's target message), so they omit `revert`
+/// rather than fabricate one.
+fn wire_rich_session_with_revert(
+    state: &AppState,
+    row: &faktor_store::SessionRow,
+    revert: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut session = wire_rich_session(state, row);
+    if let Some(revert) = revert {
+        if let serde_json::Value::Object(map) = &mut session {
+            map.insert("revert".into(), revert);
+        }
+    }
+    session
+}
+
 /// The SDK `SessionStatus.type` for a daemon state: every mid-turn state is
 /// `busy`, every parked/terminal state is `idle`. `retry`/`offline` require
 /// retry metadata the frozen surface does not project, so they are never
@@ -974,7 +995,7 @@ pub(crate) async fn wire_diff(
     // Full content needs the CAS blobs of both sides.
     for row in rows.into_iter().rev() {
         let status = checkpoint_diff_status(&row);
-        let diff = if wire_flag(&q.full) {
+        let (diff, counts) = if wire_flag(&q.full) {
             let before_bytes = if row.before_exists {
                 match diff_cas_bytes(&cas, &row.before_hash) {
                     Ok(b) => b,
@@ -999,21 +1020,43 @@ pub(crate) async fn wire_diff(
             } else {
                 Vec::new()
             };
-            Some(
-                faktor_snapshot::diff_lines(&before_bytes, &after_bytes)
-                    .iter()
-                    .map(faktor_snapshot::DiffLine::render)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
+            let lines = faktor_snapshot::diff_lines(&before_bytes, &after_bytes);
+            // The SDK's `SnapshotFileDiff` requires real additions/deletions
+            // counts; they are counted from the SAME unified diff that is
+            // rendered, never estimated from hashes.
+            let additions = lines
+                .iter()
+                .filter(|l| matches!(l, faktor_snapshot::DiffLine::Added(_)))
+                .count();
+            let deletions = lines
+                .iter()
+                .filter(|l| matches!(l, faktor_snapshot::DiffLine::Removed(_)))
+                .count();
+            (
+                Some(
+                    lines
+                        .iter()
+                        .map(faktor_snapshot::DiffLine::render)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                Some((additions, deletions)),
             )
         } else {
-            None
+            (None, None)
         };
-        entries.push(SnapshotFileDiff {
-            path: row.path,
-            status,
-            diff,
+        let mut entry = serde_json::json!({
+            "path": row.path,
+            "status": status,
         });
+        // Counts ride the ?full projection (the same CAS reads); without it
+        // the frozen path+status-only contract stays byte-identical.
+        if let (Some(diff_text), Some((additions, deletions))) = (diff, counts) {
+            entry["diff"] = serde_json::json!(diff_text);
+            entry["additions"] = serde_json::json!(additions);
+            entry["deletions"] = serde_json::json!(deletions);
+        }
+        entries.push(entry);
     }
     Json(entries).into_response()
 }
@@ -1141,6 +1184,13 @@ pub(crate) fn open_snapshot_target(
 /// checkpoint recorded at or before the message id: the pre-edit content is
 /// written back atomically, verified against the recorded hash. Independent
 /// user edits are never clobbered (409 conflict).
+///
+/// The 200 response is the SDK's `Session8`: the rich session projection
+/// plus the durable revert marker `revert: {messageID, workspace:
+/// "restored"}`. `messageID` is the request's own target (echoed
+/// byte-identically) and `workspace` reflects the rollback that just
+/// succeeded; the durable `checkpoint.restored_ms` row is what makes the
+/// state recoverable after a crash.
 pub(crate) async fn wire_revert(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1158,7 +1208,7 @@ pub(crate) async fn wire_revert(
         Ok(s) => s,
         Err(e) => return wire_status(e),
     };
-    let Some(_row) = (match wire_session_row(&state, sid) {
+    let Some(row) = (match wire_session_row(&state, sid) {
         Ok(r) => r,
         Err(resp) => return *resp,
     }) else {
@@ -1191,13 +1241,17 @@ pub(crate) async fn wire_revert(
     };
     let snapshots = state.deps.snapshots.as_ref().unwrap();
     match snapshots.rollback(&handle, &identity, sid, latest.id) {
-        Ok(faktor_snapshot::RollbackOutcome::Restored { path, hash }) => Json(serde_json::json!({
-            "ok": true,
-            // hash is null when the rollback DELETED the file (the before
-            // state was missing).
-            "restored": [{"path": path, "hash": hash.map(|h| h.to_hex())}],
-        }))
-        .into_response(),
+        Ok(faktor_snapshot::RollbackOutcome::Restored { .. }) => {
+            Json(wire_rich_session_with_revert(
+                &state,
+                &row,
+                Some(serde_json::json!({
+                    "messageID": req.message_id,
+                    "workspace": "restored",
+                })),
+            ))
+            .into_response()
+        }
         Ok(faktor_snapshot::RollbackOutcome::Conflict { path, .. }) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -1214,8 +1268,15 @@ pub(crate) async fn wire_revert(
 /// `POST /session/{sessionID}/unrevert` — redo: restore the checkpoint's
 /// AFTER state (the mirror of revert). Same conflict rules: only rewrites
 /// when the current content still matches the state revert left behind.
-/// The real upstream SDK sends NO body: without a target the handler
-/// refuses honestly (409) instead of failing extraction.
+///
+/// The real SDK sends NO body and carries no target: the target IS the
+/// durable revert state — the newest checkpoint whose `restored_ms` marker
+/// was written by the rollback (`snapshot.rollback`) and not yet cleared by
+/// a redo. A body, when a legacy caller sends one, is accepted but the
+/// durable marker stays the authority. With no restored checkpoint the
+/// handler refuses honestly (no silent success); a successful redo clears
+/// the marker and answers the SDK's `Session9` rich session projection
+/// (no `revert` object remains — the revert state is gone).
 pub(crate) async fn wire_unrevert(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1225,21 +1286,12 @@ pub(crate) async fn wire_unrevert(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let Some(Json(req)) = body else {
-        return wire_refused(
-            "unrevert unavailable: no revert target (the SDK sends no message id; \
-             the daemon keeps no durable revert state in this slice)",
-        );
-    };
-    let message_seq = match wire_mapper::wire_id_to_u64(&req.message_id) {
-        Ok(s) => s as i64,
-        Err(e) => return api_err(&e),
-    };
+    let _ = body;
     let sid = match parse_session_id(&session_id) {
         Ok(s) => s,
         Err(e) => return wire_status(e),
     };
-    let Some(_row) = (match wire_session_row(&state, sid) {
+    let Some(row) = (match wire_session_row(&state, sid) {
         Ok(r) => r,
         Err(resp) => return *resp,
     }) else {
@@ -1249,21 +1301,19 @@ pub(crate) async fn wire_unrevert(
         return wire_refused("unrevert unavailable: snapshots unavailable");
     }
     let store = state.deps.session.store();
-    let Some(message_ms) = (match store.message_created_ms(sid, message_seq) {
-        Ok(ms) => ms,
+    // Durable revert state: `restored_ms` is set by rollback and cleared by
+    // redo, so the newest marked row is the outstanding revert target.
+    let restored = match store.checkpoints_of(sid) {
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|c| c.restored_ms.is_some())
+            .max_by_key(|c| c.restored_ms.unwrap_or(i64::MIN)),
         Err(e) => return store_err(&e),
-    }) else {
-        return wire_refused(&format!(
-            "unrevert unavailable: unknown message id {message_seq}"
-        ));
     };
-    let Some(latest) = (match checkpoint_before(&store, sid, message_ms) {
-        Ok(c) => c,
-        Err(resp) => return *resp,
-    }) else {
-        return wire_refused(&format!(
-            "unrevert unavailable: no checkpoint before message {message_seq}"
-        ));
+    let Some(latest) = restored else {
+        return wire_refused(
+            "unrevert unavailable: no checkpoint carries a durable restored marker",
+        );
     };
     let (handle, identity) = match open_snapshot_target(&state, sid) {
         Ok(pair) => pair,
@@ -1271,13 +1321,9 @@ pub(crate) async fn wire_unrevert(
     };
     let snapshots = state.deps.snapshots.as_ref().unwrap();
     match snapshots.redo(&handle, &identity, sid, latest.id) {
-        Ok(faktor_snapshot::RollbackOutcome::Restored { path, hash }) => Json(serde_json::json!({
-            "ok": true,
-            // hash is null when the unrevert DELETED the file (the after
-            // state was missing).
-            "restored": [{"path": path, "hash": hash.map(|h| h.to_hex())}],
-        }))
-        .into_response(),
+        Ok(faktor_snapshot::RollbackOutcome::Restored { .. }) => {
+            Json(wire_rich_session(&state, &row)).into_response()
+        }
         Ok(faktor_snapshot::RollbackOutcome::Conflict { path, .. }) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({

@@ -62,8 +62,9 @@ fn stream_deadlines(request: &GenericAgentRequest) -> StreamDeadlines {
     deadlines
 }
 use faktor_provider::{
-    CanonicalUsage, ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError,
-    ProviderErrorKind, ProviderStream, RequestMessage, Role,
+    CanonicalUsage, ContentKind, EmbeddingRequest, EmbeddingResponse, GenericAgentRequest,
+    Provider, ProviderChunk, ProviderError, ProviderErrorKind, ProviderStream, RequestMessage,
+    Role,
 };
 
 const DEFAULT_BASE: &str = "http://127.0.0.1:11434";
@@ -74,6 +75,12 @@ const DEFAULT_BASE: &str = "http://127.0.0.1:11434";
 /// therefore the adapter's own bound, still capped structurally by
 /// [`faktor_provider::MAX_MEDIA_BYTES_HARD`] inside the delivery gate.
 pub const OLLAMA_MAX_IMAGE_BYTES: usize = faktor_provider::MAX_MODEL_IMAGE_BYTES;
+
+/// Hard bound on the RAW bytes of ONE `/api/embed` response body. A legal
+/// response is `inputs (≤ 64) × dimensions (≤ 8192) × 4` bytes plus JSON
+/// overhead (< 3 MiB); 8 MiB admits every legal shape while a hostile
+/// daemon cannot stream an unbounded body into RAM.
+pub const EMBED_RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct OllamaConfig {
@@ -458,6 +465,21 @@ impl OllamaProvider {
         }
         body
     }
+
+    /// Native `/api/embed` wire body: the model, the ordered batch input,
+    /// and the configured `keep_alive` — never any internal metadata
+    /// (operation/session/deadline/cancellation stay off the wire like
+    /// every other adapter call).
+    fn embed_wire_body(&self, req: &EmbeddingRequest) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "model": req.model,
+            "input": req.inputs,
+        });
+        if let Some(keep) = &self.config.keep_alive {
+            body["keep_alive"] = serde_json::json!(keep);
+        }
+        body
+    }
 }
 
 impl Provider for OllamaProvider {
@@ -523,6 +545,86 @@ impl Provider for OllamaProvider {
 
     fn max_image_bytes(&self) -> usize {
         OLLAMA_MAX_IMAGE_BYTES
+    }
+
+    /// The probed `/api/show` capability drives the embedding gate (spec
+    /// §10: discovery/probing drive behavior): an embedding-capable model
+    /// (or an operator override) admits the CLI's strict `[embeddings]`
+    /// selection; anything else refuses honestly, never a fabricated
+    /// vector. Real daemons report both `embedding` and `embeddings`
+    /// spellings — the probe accepts either.
+    fn supports_embeddings(&self, model: &str) -> bool {
+        self.capabilities(model).embeddings
+    }
+
+    /// ONE bounded `/api/embed` call (native API): the whole
+    /// [`EmbeddingRequest`] is lowered to the native wire shape
+    /// (`{"model", "input": [..]}` plus the configured `keep_alive`) and
+    /// exactly one finite vector per input is returned. The call is
+    /// synchronous by trait contract; it is bridged onto a bounded async
+    /// execution (see [`run_embedding_future`]) and the operation's
+    /// remaining deadline from [`EmbeddingRequest::meta`]
+    /// (`RequestMeta::deadline_ms`) caps the ENTIRE call — headers AND body;
+    /// without a deadline the transport's first-byte default is the bound.
+    /// Every failure is a typed [`ProviderError`] whose retryability is the
+    /// status/transport class (429/5xx/network retryable; 4xx and
+    /// policy/build refusals terminal), so the configured embedder retries
+    /// exactly per policy and never more.
+    fn embed(&self, req: EmbeddingRequest) -> Result<EmbeddingResponse, ProviderError> {
+        // Model is REQUIRED: a directly-constructed hostile request must
+        // never lower an empty model onto the wire. The bounded batch is
+        // re-validated here (defense in depth): `EmbeddingRequest::new`
+        // refuses unbounded batches, but its fields are public, so the
+        // adapter re-applies the provider's own bounds before lowering.
+        if req.model.trim().is_empty() {
+            return Err(ProviderError::new(
+                ProviderErrorKind::BadRequest,
+                "ollama embeddings require a non-empty model",
+            ));
+        }
+        validate_embedding_batch(&req.inputs)?;
+        let body = self.embed_wire_body(&req);
+        let url = format!("{}/api/embed", self.config.base_url);
+        let transport = self.transport.clone();
+        let bound_ms = if req.deadline_ms() > 0 {
+            req.deadline_ms().min(PROVIDER_CEILING_MS)
+        } else {
+            // A non-streaming POST has no idle/first-byte guard of its own:
+            // the transport's first-byte default is the fallback bound.
+            StreamDeadlines::default().first_byte_ms
+        };
+        run_embedding_future(async move {
+            let call = async {
+                let resp = execute_post_json(
+                    transport.as_ref(),
+                    &url,
+                    reqwest::header::HeaderMap::new(),
+                    &body,
+                )
+                .await
+                .map_err(ProviderError::from)?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let text = read_body_bounded(resp, EMBED_RESPONSE_MAX_BYTES)
+                        .await
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                        .unwrap_or_default();
+                    return Err(status_to_provider_error(status, text));
+                }
+                let bytes = read_body_bounded(resp, EMBED_RESPONSE_MAX_BYTES).await?;
+                let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                    ProviderError::new(
+                        ProviderErrorKind::Malformed,
+                        format!("ollama /api/embed body: {e}"),
+                    )
+                })?;
+                parse_embed_response(&req, &value)
+            };
+            match tokio::time::timeout(std::time::Duration::from_millis(bound_ms), call).await {
+                Ok(result) => result,
+                Err(_) => Err(embed_deadline_error(&req, bound_ms)),
+            }
+        })
     }
 
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
@@ -604,19 +706,8 @@ pub(crate) fn ollama_chat_stream(
                             let status = r.status();
                             if !status.is_success() {
                                 let text = r.text().await.unwrap_or_default();
-                                let kind = match status.as_u16() {
-                                    401 | 403 => ProviderErrorKind::Auth,
-                                    429 => ProviderErrorKind::RateLimited,
-                                    408 | 504 => ProviderErrorKind::Timeout,
-                                    500..=599 => ProviderErrorKind::Server,
-                                    _ => ProviderErrorKind::BadRequest,
-                                };
                                 return Some((
-                                    Err(ProviderError::with_code(
-                                        kind,
-                                        status.as_u16().to_string(),
-                                        text,
-                                    )),
+                                    Err(status_to_provider_error(status, text)),
                                     Stage::Done,
                                 ));
                             }
@@ -797,7 +888,10 @@ fn caps_from_show(model: &str, show: &ShowResponse) -> ModelCapabilities {
         let has = |name: &str| caps_list.iter().any(|c| c == name);
         caps.tools = has("tools");
         caps.vision = has("vision");
-        caps.embeddings = has("embeddings");
+        // Real Ollama daemons have shipped both spellings of the embedding
+        // capability ("embedding" in the current API, "embeddings" in older
+        // builds); accept either rather than silently disabling /api/embed.
+        caps.embeddings = has("embeddings") || has("embedding");
         caps.thinking = has("reasoning") || has("thinking");
         // A probed "reasoning" capability means the model accepts effort
         // LEVELS for the native think knob ("low"/"medium"/"high");
@@ -982,6 +1076,233 @@ fn native_image_payload(url: &str) -> String {
     }
 }
 
+/// Map a non-success HTTP status onto the typed provider error class the
+/// retry policy consumes: 401/403 Auth, 429 RateLimited, 408/504 Timeout,
+/// any 5xx Server (all retryable except Auth/BadRequest), everything else
+/// BadRequest — terminal, so a hostile/refusing call is never hammered.
+fn status_to_provider_error(status: reqwest::StatusCode, text: String) -> ProviderError {
+    let kind = match status.as_u16() {
+        401 | 403 => ProviderErrorKind::Auth,
+        429 => ProviderErrorKind::RateLimited,
+        408 | 504 => ProviderErrorKind::Timeout,
+        500..=599 => ProviderErrorKind::Server,
+        _ => ProviderErrorKind::BadRequest,
+    };
+    ProviderError::with_code(kind, status.as_u16().to_string(), text)
+}
+
+/// Re-apply the provider's embedding batch bounds to a directly-constructed
+/// request (the fields are public, so the typed constructor is not the only
+/// path to a hostile batch). Every violation is a terminal `BadRequest`
+/// BEFORE any wire byte; the wire never carries an unbounded batch.
+fn validate_embedding_batch(inputs: &[String]) -> Result<(), ProviderError> {
+    use faktor_provider::{
+        MAX_EMBEDDING_INPUTS, MAX_EMBEDDING_INPUT_BYTES, MAX_EMBEDDING_TOTAL_INPUT_BYTES,
+    };
+    if inputs.is_empty() {
+        return Err(ProviderError::new(
+            ProviderErrorKind::BadRequest,
+            "ollama /api/embed requires at least one input",
+        ));
+    }
+    if inputs.len() > MAX_EMBEDDING_INPUTS {
+        return Err(ProviderError::new(
+            ProviderErrorKind::BadRequest,
+            format!(
+                "ollama /api/embed batch carries {} inputs, over the cap of {MAX_EMBEDDING_INPUTS}",
+                inputs.len()
+            ),
+        ));
+    }
+    let mut total: usize = 0;
+    for input in inputs {
+        if input.is_empty() {
+            return Err(ProviderError::new(
+                ProviderErrorKind::BadRequest,
+                "ollama /api/embed input is empty",
+            ));
+        }
+        if input.len() > MAX_EMBEDDING_INPUT_BYTES {
+            return Err(ProviderError::new(
+                ProviderErrorKind::BadRequest,
+                format!(
+                    "ollama /api/embed input of {} bytes exceeds MAX_EMBEDDING_INPUT_BYTES ({MAX_EMBEDDING_INPUT_BYTES})",
+                    input.len()
+                ),
+            ));
+        }
+        total = total.saturating_add(input.len());
+    }
+    if total > MAX_EMBEDDING_TOTAL_INPUT_BYTES {
+        return Err(ProviderError::new(
+            ProviderErrorKind::BadRequest,
+            format!(
+                "ollama /api/embed inputs total {total} bytes, over the cap of {MAX_EMBEDDING_TOTAL_INPUT_BYTES}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Read a response body with a hard byte cap: a hostile daemon can never
+/// stream an unbounded body into memory. Over the cap is a typed
+/// `Malformed` refusal (retrying the same hostile body can never help).
+async fn read_body_bounded(
+    mut resp: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, ProviderError> {
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| ProviderError::new(ProviderErrorKind::Network, format!("ollama body: {e}")))?
+    {
+        if out.len().saturating_add(chunk.len()) > cap {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Malformed,
+                format!("ollama /api/embed response exceeds the {cap}-byte bound"),
+            ));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+/// Lower one `/api/embed` body into a validated [`EmbeddingResponse`]:
+/// exactly one array per input, uniform non-zero dimension, every component
+/// finite and within [`faktor_provider::MAX_EMBEDDING_DIMENSIONS`]. Every
+/// hostile shape (missing/mistyped array, ragged batch, wrong count, NaN /
+/// infinite component, oversized dimension) is a typed `Malformed` refusal
+/// — never a panic and never a silently truncated vector list.
+fn parse_embed_response(
+    req: &EmbeddingRequest,
+    value: &serde_json::Value,
+) -> Result<EmbeddingResponse, ProviderError> {
+    let Some(list) = value.get("embeddings").and_then(|e| e.as_array()) else {
+        return Err(ProviderError::new(
+            ProviderErrorKind::Malformed,
+            "ollama /api/embed response lacks an embeddings array",
+        ));
+    };
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(list.len());
+    for (index, item) in list.iter().enumerate() {
+        let Some(array) = item.as_array() else {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Malformed,
+                format!("ollama /api/embed entry {index} is not an array"),
+            ));
+        };
+        let mut vector: Vec<f32> = Vec::with_capacity(array.len());
+        for component in array {
+            let Some(value) = component.as_f64() else {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::Malformed,
+                    format!("ollama /api/embed entry {index} carries a non-numeric component"),
+                ));
+            };
+            vector.push(value as f32);
+        }
+        vectors.push(vector);
+    }
+    let response = EmbeddingResponse::new(vectors)?;
+    response.validate_for(req.inputs.len())?;
+    Ok(response)
+}
+
+/// The deadline exceeded error, carrying the operation lineage from
+/// [`EmbeddingRequest::meta`] so a timeout is attributable to the exact
+/// operation/session that set it.
+fn embed_deadline_error(req: &EmbeddingRequest, bound_ms: u64) -> ProviderError {
+    let lineage = match &req.meta {
+        Some(meta) => format!(
+            " (operation {}, session {})",
+            meta.operation_id, meta.session_id
+        ),
+        None => String::new(),
+    };
+    ProviderError::with_code(
+        ProviderErrorKind::Timeout,
+        "deadline",
+        format!("ollama /api/embed exceeded its {bound_ms} ms bound{lineage}"),
+    )
+}
+
+/// Drive one embedding future to completion from the SYNCHRONOUS
+/// [`Provider::embed`] surface:
+///
+/// - inside a multi-threaded tokio runtime the future runs on the current
+///   runtime under `block_in_place` (the daemon's worker keeps making
+///   progress);
+/// - anywhere else (current-thread runtimes, plain threads, tests) a
+///   dedicated named thread drives a current-thread runtime, so the caller
+///   never needs a reactor and the call site can never wedge another
+///   runtime's driver.
+///
+/// A panic inside the future is caught and typed (a provider call never
+/// aborts the caller). The call is bounded because every future passed here
+/// wraps its whole body in a `timeout`.
+fn run_embedding_future<F>(fut: F) -> Result<EmbeddingResponse, ProviderError>
+where
+    F: std::future::Future<Output = Result<EmbeddingResponse, ProviderError>> + Send + 'static,
+{
+    let panicked = |_| {
+        Err(ProviderError::new(
+            ProviderErrorKind::Malformed,
+            "ollama /api/embed call panicked",
+        ))
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::task::block_in_place(|| handle.block_on(fut))
+            }))
+            .unwrap_or_else(panicked)
+        }
+        _ => {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let spawned = std::thread::Builder::new()
+                .name("ollama-embed".into())
+                .spawn(move || {
+                    let outcome = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            rt.block_on(fut)
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(ProviderError::new(
+                                ProviderErrorKind::Malformed,
+                                "ollama /api/embed call panicked",
+                            ))
+                        }),
+                        Err(e) => Err(ProviderError::new(
+                            ProviderErrorKind::Network,
+                            format!("ollama embedding runtime unavailable: {e}"),
+                        )),
+                    };
+                    let _ = tx.send(outcome);
+                });
+            match spawned {
+                Ok(worker) => {
+                    let outcome = rx.recv().unwrap_or_else(|_| {
+                        Err(ProviderError::new(
+                            ProviderErrorKind::Network,
+                            "ollama embedding worker died before answering",
+                        ))
+                    });
+                    let _ = worker.join();
+                    outcome
+                }
+                Err(e) => Err(ProviderError::new(
+                    ProviderErrorKind::Network,
+                    format!("ollama embedding worker spawn failed: {e}"),
+                )),
+            }
+        }
+    }
+}
+
 /// Lower one generic request message into 0..n native Ollama message
 /// objects, preserving part order:
 ///
@@ -1092,7 +1413,7 @@ mod tests {
     use super::*;
     use faktor_core::cancellation::CancellationToken;
     use faktor_core::id::{OpId, SessionId};
-    use faktor_provider::egress::MockHttpTransport;
+    use faktor_provider::egress::{HttpTransport, MockHttpTransport};
     use faktor_provider::testing::{MockAction, MockServer};
     use faktor_provider::{ContentPart, RequestMessage, RequestMeta, ToolSpec};
     use faktor_security::destination::DestinationPolicy;
@@ -2717,6 +3038,318 @@ mod tests {
                 "http://mock.invalid/api/chat".to_string()
             )]
         );
+    }
+
+    // ------------------------------------------------- embeddings
+
+    fn embed_req(model: &str, inputs: &[&str]) -> EmbeddingRequest {
+        EmbeddingRequest::new(model, inputs.iter().map(|s| (*s).to_string()).collect())
+            .expect("test embedding request is within bounds")
+    }
+
+    fn embed_meta(deadline_ms: u64) -> RequestMeta {
+        RequestMeta {
+            operation_id: OpId::new(7),
+            session_id: SessionId::new(3),
+            provider: "ollama".into(),
+            attempt: 0,
+            deadline_ms,
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    /// Byte-exact `/api/embed` lowering against the mock: the model, the
+    /// ordered batch input and the configured `keep_alive` land on the wire —
+    /// and nothing else (no internal metadata); the response lowers to one
+    /// vector per input, in input order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embed_request_and_response_lower_byte_exact() {
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/api/embed",
+            MockAction::AssertThenRespond {
+                status: 200,
+                body: r#"{"model":"all-minilm","embeddings":[[0.5,-0.25],[1.0,0.0]]}"#.into(),
+                assert: Arc::new(|body: &serde_json::Value| {
+                    assert_eq!(body["model"], "all-minilm");
+                    assert_eq!(body["input"], serde_json::json!(["alpha", "beta"]));
+                    assert!(!body.as_object().unwrap().contains_key("options"));
+                    for leaked in [
+                        "operation_id",
+                        "session_id",
+                        "attempt",
+                        "deadline_ms",
+                        "cancellation",
+                    ] {
+                        assert!(
+                            !body.as_object().unwrap().contains_key(leaked),
+                            "{leaked} leaked!"
+                        );
+                    }
+                }),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        let out = provider
+            .embed(embed_req("all-minilm", &["alpha", "beta"]))
+            .unwrap();
+        assert_eq!(out.vectors, vec![vec![0.5, -0.25], vec![1.0, 0.0]]);
+        let (method, path, raw) = server.last_request().unwrap();
+        assert_eq!((method.as_str(), path.as_str()), ("POST", "/api/embed"));
+        // Byte-exact (serde_json's stable key order): model + batch input +
+        // the configured keep_alive, nothing else.
+        assert_eq!(
+            raw,
+            r#"{"input":["alpha","beta"],"keep_alive":"30m","model":"all-minilm"}"#
+        );
+    }
+
+    /// Hostile `/api/embed` bodies are typed `Malformed` refusals — wrong
+    /// dimension, ragged batches, NaN/infinite components, oversized
+    /// dimensions, wrong vector counts and mistyped shapes never panic and
+    /// never fabricate a vector.
+    #[tokio::test]
+    async fn hostile_embed_responses_are_typed_never_panicking() {
+        let oversized = format!(
+            r#"{{"embeddings":[[{}]]}}"#,
+            vec!["0.0"; faktor_provider::MAX_EMBEDDING_DIMENSIONS + 1].join(",")
+        );
+        let cases: Vec<(&str, String)> = vec![
+            ("missing array", r#"{"model":"m"}"#.into()),
+            ("mistyped array", r#"{"embeddings":"nope"}"#.into()),
+            ("mistyped entry", r#"{"embeddings":[1.0]}"#.into()),
+            ("ragged batch", r#"{"embeddings":[[1.0,2.0],[3.0]]}"#.into()),
+            (
+                "non-finite",
+                r#"{"embeddings":[[1e400,2.0],[0.0,1.0]]}"#.into(),
+            ),
+            ("wrong count", r#"{"embeddings":[[1.0,2.0]]}"#.into()),
+            ("oversized dimension", oversized),
+        ];
+        for (name, body) in cases {
+            let mock = Arc::new(MockHttpTransport::new(200, body));
+            let provider = OllamaProvider::new_with_transport(
+                OllamaConfig::new(Some("http://mock.invalid".into())),
+                mock.clone(),
+            );
+            let err = provider
+                .embed(embed_req("m", &["alpha", "beta"]))
+                .unwrap_err();
+            assert_eq!(err.kind, ProviderErrorKind::Malformed, "{name}: {err:?}");
+            assert!(!err.retryable, "{name}: a hostile body is terminal");
+        }
+        // An over-cap body is refused before any parse (bounded read).
+        let mock = Arc::new(MockHttpTransport::new(
+            200,
+            "x".repeat(EMBED_RESPONSE_MAX_BYTES + 1),
+        ));
+        let provider = OllamaProvider::new_with_transport(
+            OllamaConfig::new(Some("http://mock.invalid".into())),
+            mock,
+        );
+        let err = provider.embed(embed_req("m", &["a"])).unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::Malformed);
+        assert!(err.message.contains("exceeds"), "{err}");
+    }
+
+    /// Status and transport classes lower to the exact typed error the retry
+    /// policy consumes: 5xx/429/network are retryable, 401/4xx and
+    /// policy/build refusals are terminal.
+    #[tokio::test]
+    async fn embed_errors_are_retry_classified() {
+        let cases: [(u16, ProviderErrorKind, bool); 4] = [
+            (401, ProviderErrorKind::Auth, false),
+            (429, ProviderErrorKind::RateLimited, true),
+            (500, ProviderErrorKind::Server, true),
+            (400, ProviderErrorKind::BadRequest, false),
+        ];
+        for (status, kind, retryable) in cases {
+            let mock = Arc::new(MockHttpTransport::new(status, "denied"));
+            let provider = OllamaProvider::new_with_transport(
+                OllamaConfig::new(Some("http://mock.invalid".into())),
+                mock,
+            );
+            let err = provider.embed(embed_req("m", &["a"])).unwrap_err();
+            assert_eq!(err.kind, kind, "status {status}");
+            assert_eq!(err.retryable, retryable, "status {status}");
+            assert_eq!(err.code.as_deref(), Some(status.to_string().as_str()));
+        }
+        // Transport failure = retryable Network; a refused destination
+        // (policy/build layer) is a terminal BadRequest.
+        let transport_err = OllamaProvider::new_with_transport(
+            OllamaConfig::new(Some("http://mock.invalid".into())),
+            Arc::new(MockHttpTransport::denying(
+                faktor_provider::egress::EgressError::Transport("connection reset".into()),
+            )),
+        )
+        .embed(embed_req("m", &["a"]))
+        .unwrap_err();
+        assert_eq!(transport_err.kind, ProviderErrorKind::Network);
+        assert!(transport_err.retryable);
+        let policy_err = OllamaProvider::new_with_transport(
+            OllamaConfig::new(Some("http://mock.invalid".into())),
+            Arc::new(MockHttpTransport::denying(
+                faktor_provider::egress::EgressError::UnparseableUrl("nope".into()),
+            )),
+        )
+        .embed(embed_req("m", &["a"]))
+        .unwrap_err();
+        assert_eq!(policy_err.kind, ProviderErrorKind::BadRequest);
+        assert!(!policy_err.retryable, "a policy refusal must never retry");
+    }
+
+    /// A transport that never answers: the operation deadline from
+    /// `RequestMeta` must fire, typed `Timeout`, and the error must name the
+    /// operation/session lineage it came from.
+    struct SilentTransport;
+
+    impl HttpTransport for SilentTransport {
+        fn execute(
+            &self,
+            _req: reqwest::Request,
+        ) -> futures::future::BoxFuture<
+            '_,
+            Result<reqwest::Response, faktor_provider::egress::EgressError>,
+        > {
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                Err(faktor_provider::egress::EgressError::Transport(
+                    "never answered".into(),
+                ))
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embed_honors_the_operation_deadline_with_lineage() {
+        let provider = OllamaProvider::new_with_transport(
+            OllamaConfig::new(Some("http://mock.invalid".into())),
+            Arc::new(SilentTransport),
+        );
+        let started = std::time::Instant::now();
+        let err = provider
+            .embed(embed_req("m", &["a"]).with_meta(embed_meta(40)))
+            .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(err.kind, ProviderErrorKind::Timeout);
+        assert_eq!(err.code.as_deref(), Some("deadline"));
+        assert!(err.message.contains("operation 7"), "{err}");
+        assert!(err.message.contains("session 3"), "{err}");
+        // A zero deadline keeps the adapter's own first-byte fallback bound
+        // (never unbounded); a fast mock answers well inside it.
+        let mock = Arc::new(MockHttpTransport::new(200, r#"{"embeddings":[[1.0]]}"#));
+        let provider = OllamaProvider::new_with_transport(
+            OllamaConfig::new(Some("http://mock.invalid".into())),
+            mock,
+        );
+        let out = provider.embed(embed_req("m", &["a"])).unwrap();
+        assert_eq!(out.vectors, vec![vec![1.0]]);
+    }
+
+    /// The embedding capability flag is set from the probed `/api/show`
+    /// capabilities (both real spellings) or an operator override, and only
+    /// then does `supports_embeddings` admit the model.
+    #[tokio::test]
+    async fn embedding_capability_flag_drives_supports_embeddings() {
+        let server = MockServer::new();
+        server.route(
+            "GET",
+            "/api/tags",
+            MockAction::Respond {
+                status: 200,
+                body: r#"{"models":[{"name":"embed-a"},{"name":"embed-b"},{"name":"chat-only"}]}"#
+                    .into(),
+            },
+        );
+        server.route(
+            "POST",
+            "/api/show",
+            MockAction::Sequence {
+                // Discovery sorts names: chat-only, embed-a, embed-b.
+                actions: vec![
+                    MockAction::Respond {
+                        status: 200,
+                        body: r#"{"capabilities":["completion","tools"]}"#.into(),
+                    },
+                    MockAction::Respond {
+                        status: 200,
+                        body: r#"{"capabilities":["embedding"]}"#.into(),
+                    },
+                    MockAction::Respond {
+                        status: 200,
+                        body: r#"{"capabilities":["embeddings"]}"#.into(),
+                    },
+                ],
+            },
+        );
+        server.route(
+            "GET",
+            "/api/ps",
+            MockAction::Respond {
+                status: 200,
+                body: r#"{"models":[]}"#.into(),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        assert_eq!(provider.refresh_from_live().await.unwrap(), 3);
+        assert!(provider.capabilities("embed-a").embeddings);
+        assert!(provider.supports_embeddings("embed-a"));
+        assert!(provider.capabilities("embed-b").embeddings);
+        assert!(provider.supports_embeddings("embed-b"));
+        assert!(!provider.capabilities("chat-only").embeddings);
+        assert!(!provider.supports_embeddings("chat-only"));
+        // Unprobed models keep the conservative small-local default, which
+        // advertises embeddings: `/api/embed` serves every Ollama model, so
+        // the strict `[embeddings]` selection resolves before a probe.
+        assert!(provider.supports_embeddings("never-probed"));
+        // An operator override is authoritative.
+        let mut cfg = OllamaConfig::new(Some("http://127.0.0.1:1".into()));
+        let mut caps = ModelCapabilities::small_local();
+        caps.embeddings = true;
+        cfg.model_overrides.insert("pinned".into(), caps);
+        let provider = OllamaProvider::new(cfg);
+        assert!(provider.supports_embeddings("pinned"));
+    }
+
+    /// Model and batch are required/re-bounded: a hostile
+    /// directly-constructed request (public fields) is refused typedly
+    /// BEFORE any wire byte, even though the typed constructor is bypassed.
+    #[tokio::test]
+    async fn embed_requires_a_model_and_a_bounded_batch_before_any_wire_byte() {
+        let mock = Arc::new(MockHttpTransport::new(200, r#"{"embeddings":[[1.0]]}"#));
+        let provider = OllamaProvider::new_with_transport(
+            OllamaConfig::new(Some("http://mock.invalid".into())),
+            mock.clone(),
+        );
+        let hostile = EmbeddingRequest {
+            model: "  ".into(),
+            inputs: vec!["x".into()],
+            meta: None,
+        };
+        let err = provider.embed(hostile).unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
+        assert!(!err.retryable);
+        let oversized = EmbeddingRequest {
+            model: "m".into(),
+            inputs: vec!["x".into(); faktor_provider::MAX_EMBEDDING_INPUTS + 1],
+            meta: None,
+        };
+        let err = provider.embed(oversized).unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
+        assert!(err.message.contains("over the cap"), "{err}");
+        let empty = EmbeddingRequest {
+            model: "m".into(),
+            inputs: Vec::new(),
+            meta: None,
+        };
+        assert_eq!(
+            provider.embed(empty).unwrap_err().kind,
+            ProviderErrorKind::BadRequest
+        );
+        assert_eq!(mock.request_count(), 0, "no wire byte for a hostile batch");
     }
 
     // ------------------------------------------------- canonical usage

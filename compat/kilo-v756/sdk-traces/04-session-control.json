@@ -13,15 +13,23 @@
         "sessionID": "$sessionID"
       },
       "call": "session.diff",
-      "id": "session.diff.empty",
-      "note": "LOCKED (checkpoint-dependent content): with no checkpoint rows the bare [] trivially satisfies Array<SnapshotFileDiff>, but a non-empty entry must carry the SDK's required additions/deletions counts (plus file/patch), and this harness wires no snapshot store and the scripted provider performs no file edits, so no checkpoint row can be exercised. Promoting on an empty projection would overstate the diff surface; a non-empty golden needs real checkpoint content.",
+      "id": "session.diff.content",
+      "note": "Exact pass: the replay now carries REAL checkpoint content (the checkpoint probe tool wrote a per-process gitignored scratch file under target/ through the workspace handle and recorded the missing-to-existing transition in the CAS-backed checkpoint store), so ?full=true projects the recorded change with its real unified diff AND the SDK-required additions/deletions counts, counted from that same diff. The path is a test-fixture path, golden-normalized to @string via the driver's probePath var; an empty projection would satisfy Array<SnapshotFileDiff> trivially, so this step asserts the content branch.",
       "request": {
         "method": "GET",
         "path": "/session/@string/diff",
         "query": "full=true"
       },
       "response": {
-        "body": [],
+        "body": [
+          {
+            "additions": 1,
+            "deletions": 0,
+            "diff": "+compat probe",
+            "path": "@string",
+            "status": "added"
+          }
+        ],
         "content_type": "application/json",
         "event_stream": false,
         "status": 200
@@ -30,7 +38,7 @@
         "#nonempty"
       ],
       "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionDiffResponses.200 (Array<SnapshotFileDiff>)",
-      "status": "divergence"
+      "status": "passing"
     },
     {
       "args": {
@@ -40,7 +48,7 @@
       },
       "call": "session.diff",
       "id": "session.diff.missing-message",
-      "note": "Exact pass (error surface): an unknown messageID answers the SDK-declared 400 BadRequestError {name:'BadRequest',data:{message,kind:'Query'}} — SessionDiffErrors declares exactly 400: BadRequestError and no other class, so the refusal IS the SDK contract (the old 409 was not an SDK status). This step covers the error branch only; the 200 content projection stays locked by session.diff.empty because the daemon's non-empty entries carry the frozen {path,status,diff?} shape where the SDK requires file/patch and additions/deletions, which only real checkpoint content could exercise.",
+      "note": "Exact pass (error surface): an unknown messageID answers the SDK-declared 400 BadRequestError {name:'BadRequest',data:{message,kind:'Query'}} \u2014 SessionDiffErrors declares exactly 400 and no other class, so the refusal IS the SDK contract. The 200 content branch (with real checkpoint rows and SDK-required additions/deletions counts) is covered by the session.diff.content step that precedes this one.",
       "request": {
         "method": "GET",
         "path": "/session/@string/diff",
@@ -96,7 +104,7 @@
       },
       "call": "session.revert",
       "id": "session.revert",
-      "note": "LOCKED (no durable revert projection): the harness wires no snapshot/checkpoint store, so there is no recorded before-state to roll back to and the daemon refuses 409 {ok:false,message}. The SDK declares rich Session8 on success (and 409 SessionBusyError only for a genuinely BUSY session, which this is not); an exact pass requires a durable revert projection — backend work outside the allowed compat surface.",
+      "note": "Exact pass: with the snapshot store wired and a real checkpoint recorded before the newest message, the handler rolls the file back through the CAS-verified rollback path and answers the SDK Session8 rich session projection with the durable revert marker revert: {messageID (the request's own target, echoed), workspace: \"restored\"}. The rollback also stamps checkpoint.restored_ms, which is the durable state unrevert reads.",
       "request": {
         "body": {
           "messageID": "@string"
@@ -108,16 +116,41 @@
       },
       "response": {
         "body": {
-          "message": "revert unavailable: snapshots unavailable",
-          "ok": false
+          "createdMs": "@int",
+          "directory": ".",
+          "id": "@string",
+          "model": {
+            "id": "m",
+            "providerID": "fake"
+          },
+          "projectID": "@string",
+          "revert": {
+            "messageID": "@string",
+            "workspace": "restored"
+          },
+          "sessionID": "@string",
+          "slug": "@string",
+          "state": "ready_for_next_turn",
+          "time": {
+            "created": "@int",
+            "updated": "@int"
+          },
+          "title": "wire trace updated",
+          "updatedMs": "@int",
+          "version": "0.1.0",
+          "workspaceID": "@string"
         },
         "content_type": "application/json",
         "event_stream": false,
-        "status": 409
+        "status": 200
       },
-      "sdk_requires": [],
+      "sdk_requires": [
+        "id",
+        "revert.messageID",
+        "revert.workspace"
+      ],
       "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionRevertResponses.200 (Session8)",
-      "status": "divergence"
+      "status": "passing"
     },
     {
       "args": {
@@ -125,7 +158,7 @@
       },
       "call": "session.unrevert",
       "id": "session.unrevert",
-      "note": "LOCKED (no durable revert projection): the SDK sends NO body; the compat handler accepts the body-less form and refuses 409 because the daemon keeps no durable revert target to redo. The SDK declares rich Session9 on success; an exact pass requires durable revert state — backend work outside the allowed compat surface.",
+      "note": "Exact pass: the SDK sends NO body; the target IS the durable revert state (the newest checkpoint carrying restored_ms, written by rollback and cleared by redo). The handler redoes it through the same CAS-verified path and answers the SDK Session9 rich session projection with no `revert` object (the revert state is gone, never a stale marker).",
       "request": {
         "method": "POST",
         "path": "/session/@string/unrevert",
@@ -133,16 +166,36 @@
       },
       "response": {
         "body": {
-          "message": "unrevert unavailable: no revert target (the SDK sends no message id; the daemon keeps no durable revert state in this slice)",
-          "ok": false
+          "createdMs": "@int",
+          "directory": ".",
+          "id": "@string",
+          "model": {
+            "id": "m",
+            "providerID": "fake"
+          },
+          "projectID": "@string",
+          "sessionID": "@string",
+          "slug": "@string",
+          "state": "ready_for_next_turn",
+          "time": {
+            "created": "@int",
+            "updated": "@int"
+          },
+          "title": "wire trace updated",
+          "updatedMs": "@int",
+          "version": "0.1.0",
+          "workspaceID": "@string"
         },
         "content_type": "application/json",
         "event_stream": false,
-        "status": 409
+        "status": 200
       },
-      "sdk_requires": [],
+      "sdk_requires": [
+        "id",
+        "time.created"
+      ],
       "sdk_type": "packages/sdk/js/src/v2/gen/types.gen.ts#SessionUnrevertResponses.200 (Session9)",
-      "status": "divergence"
+      "status": "passing"
     },
     {
       "args": {
@@ -151,7 +204,7 @@
       },
       "call": "session.deleteMessage",
       "id": "session.deleteMessage",
-      "note": "Exact pass: a dependency-free message is removed durably and the SDK-declared boolean true is answered. The driver targets the page's user message (captured from session.messages.before) because the daemon refuses deleting the ACTIVE turn's newest message with 409 — the case the SDK itself declares as SessionBusyError.",
+      "note": "Exact pass: a dependency-free message is removed durably and the SDK-declared boolean true is answered. The driver targets the page's user message (captured from session.messages.before) because the daemon refuses deleting the ACTIVE turn's newest message with 409 \u2014 the case the SDK itself declares as SessionBusyError.",
       "request": {
         "method": "DELETE",
         "path": "/session/@string/message/@string",

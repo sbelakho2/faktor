@@ -1038,6 +1038,7 @@ dependencies = [
 name = "faktor-index"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "faktor-core",
  "faktor-fs",
  "faktor-store",
@@ -1459,6 +1460,7 @@ dependencies = [
  "faktor-provider",
  "faktor-server",
  "faktor-session",
+ "faktor-snapshot",
  "reqwest",
  "serde_json",
  "tempfile",

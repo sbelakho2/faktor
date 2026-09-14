@@ -2375,6 +2375,238 @@ mod tests {
         faktor_server::native::PromptExecutionService::new(tasks, session.clone())
     }
 
+    /// Every model request's system prompt, captured for wire assertions.
+    struct CapturingProvider {
+        inner: Arc<dyn Provider>,
+        systems: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Provider for CapturingProvider {
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+
+        fn capabilities(&self, model: &str) -> ModelCapabilities {
+            self.inner.capabilities(model)
+        }
+
+        fn supports_embeddings(&self, model: &str) -> bool {
+            self.inner.supports_embeddings(model)
+        }
+
+        fn embed(
+            &self,
+            req: faktor_provider::EmbeddingRequest,
+        ) -> Result<faktor_provider::EmbeddingResponse, ProviderError> {
+            self.inner.embed(req)
+        }
+
+        fn stream(&self, req: GenericAgentRequest) -> faktor_provider::ProviderStream {
+            self.systems.lock().unwrap().push(req.system.clone());
+            self.inner.stream(req)
+        }
+    }
+
+    /// A chat model that answers every stream identically (repeated evidence
+    /// turns must never run out of script).
+    struct AlwaysOk;
+
+    impl Provider for AlwaysOk {
+        fn id(&self) -> &str {
+            "fake"
+        }
+
+        fn capabilities(&self, _model: &str) -> ModelCapabilities {
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            }
+        }
+
+        fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
+            Box::pin(futures::stream::iter(vec![
+                Ok(ProviderChunk::Text { text: "ok".into() }),
+                Ok(ProviderChunk::Done),
+            ]))
+        }
+    }
+
+    /// The real daemon AgentDeps with an injected evidence provider (the
+    /// semantic E2E needs `RepoEvidence` carrying a configured embedder).
+    fn test_agent_with_evidence(
+        session: Arc<SessionManager>,
+        registry: ProviderRegistry,
+        evidence: Arc<dyn faktor_agent::EvidenceProvider>,
+    ) -> Arc<AgentRuntime> {
+        let deps = AgentDeps {
+            session: session.clone(),
+            providers: Arc::new(registry),
+            chunk_sink: None,
+            permission_requester: Arc::new(AlwaysAllow),
+            evidence,
+            tools: Arc::new(ToolRegistry::new()),
+            cas: Some(session.cas()),
+            workspaces: faktor_fs::WorkspaceFileService::new(),
+            edit: None,
+            snapshots: None,
+            sandbox: None,
+            supervisor: None,
+            verification: faktor_agent::VerificationService::disabled(),
+            hooks: None,
+            instructions_resolver: daemon_instructions_resolver(&session),
+            routing: faktor_agent::FixedRoutingPolicy::passthrough(),
+            budgets: faktor_session::DurableBudgetLedger::new(session.clone()),
+            model: "default".into(),
+            compaction_model: None,
+            compact_at_usage: 0.65,
+            instructions: "You are Faktor.".into(),
+            clock: Arc::new(SystemClock),
+            tool_call_mode: ToolCallMode::Native,
+            tool_deadline_ms: 2000,
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
+            semantic: faktor_agent::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
+        };
+        AgentRuntime::new(deps).unwrap()
+    }
+
+    /// E2E (the required turn-level fence): an ORDINARY turn whose
+    /// `[embeddings]` section selects the Ollama provider resolves through
+    /// `Config::semantic_embedder` into the REAL `OllamaProvider` talking
+    /// `/api/embed`, and the captured model request fuses the
+    /// semantically-matched evidence (a file no lexical/symbol/exact search
+    /// can find for "quantum zebra"). The SAME turn with no `[embeddings]`
+    /// section stays neutral: zero embed calls and no evidence block.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn configured_ollama_embedder_fuses_semantic_evidence_into_an_ordinary_turn() {
+        async fn captured_turn(configured: bool) -> (String, usize) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("repo");
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(
+                root.join("src").join("ledger.rs"),
+                "pub fn reconcile_accounts() -> u32 { 7 }\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("src").join("parser.rs"),
+                "pub fn parse_expr() -> u32 { 1 }\n",
+            )
+            .unwrap();
+            let session =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+
+            // The Ollama mock: every `/api/embed` call answers keyword-axis
+            // vectors in request order — query calls then the two-candidate
+            // call (twice: once per concept).
+            let server = MockServer::new();
+            server.route(
+                "POST",
+                "/api/embed",
+                MockAction::Sequence {
+                    actions: vec![
+                        MockAction::Respond {
+                            status: 200,
+                            body: r#"{"embeddings":[[1.0,0.0]]}"#.into(),
+                        },
+                        MockAction::Respond {
+                            status: 200,
+                            body: r#"{"embeddings":[[1.0,0.0],[0.0,1.0]]}"#.into(),
+                        },
+                        MockAction::Respond {
+                            status: 200,
+                            body: r#"{"embeddings":[[0.0,1.0]]}"#.into(),
+                        },
+                        MockAction::Respond {
+                            status: 200,
+                            body: r#"{"embeddings":[[1.0,0.0],[0.0,1.0]]}"#.into(),
+                        },
+                    ],
+                },
+            );
+            let base = server.base_url().await;
+            let ollama =
+                faktor_ollama::OllamaProvider::new(faktor_ollama::OllamaConfig::new(Some(base)));
+
+            let systems = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let chat = Arc::new(CapturingProvider {
+                inner: Arc::new(AlwaysOk),
+                systems: systems.clone(),
+            });
+            let mut registry = ProviderRegistry::new();
+            registry
+                .try_register(faktor_provider::InstanceProvider::wrap(
+                    chat as Arc<dyn Provider>,
+                    "fake",
+                ))
+                .unwrap();
+            registry.try_register(ollama as Arc<dyn Provider>).unwrap();
+
+            let mut config = crate::config::Config::default();
+            if configured {
+                config.embeddings = Some(crate::config::EmbeddingCfg {
+                    provider: "ollama".into(),
+                    model: "nomic-embed-text".into(),
+                    policy: crate::config::EmbeddingPolicy::BestEffort,
+                });
+            }
+            let embedder = config
+                .semantic_embedder(&registry, &faktor_core::retry::RetryPolicy::default())
+                .unwrap();
+            assert_eq!(
+                embedder.is_some(),
+                configured,
+                "the section must resolve exactly when configured"
+            );
+
+            let ws = session.create_workspace(root.to_str().unwrap()).unwrap();
+            let sid = session.create_session(ws, "idx", "fake", "m").unwrap().id();
+            let evidence = Arc::new(RepoEvidence::new(session.clone(), embedder));
+            let runtime = test_agent_with_evidence(session.clone(), registry, evidence);
+            // Ordinary turns only: the runtime hosts its own IndexService
+            // lazily, so the first turns legitimately serve while the
+            // generation builds; later turns serve the Ready generation.
+            // Poll by running ordinary turns (never by reaching into the
+            // private service), bounded.
+            let mut last_system = String::new();
+            let attempts = if configured { 120 } else { 6 };
+            for attempt in 0..attempts {
+                runtime.run_turn(sid, "quantum zebra", &[]).await.unwrap();
+                last_system = systems.lock().unwrap().last().cloned().unwrap_or_default();
+                if configured && last_system.contains("## Retrieved evidence") {
+                    break;
+                }
+                if attempt + 1 < attempts {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+            }
+            (last_system, server.request_count())
+        }
+
+        let (system, embed_calls) = captured_turn(true).await;
+        assert!(
+            embed_calls >= 2,
+            "the configured Ollama embedder must actually be called: {embed_calls}"
+        );
+        let evidence = system
+            .split("## Retrieved evidence")
+            .nth(1)
+            .unwrap_or_default();
+        assert!(
+            evidence.contains("src/ledger.rs"),
+            "the semantically-matched file must reach the captured request: {system}"
+        );
+
+        let (neutral, neutral_calls) = captured_turn(false).await;
+        assert_eq!(neutral_calls, 0, "no embedder, no embed call");
+        assert!(
+            !neutral.contains("## Retrieved evidence"),
+            "without an embedder no semantic evidence may be invented: {neutral}"
+        );
+    }
+
     /// The daemon's real write_file shape for ACP shadow tests: writes
     /// through the session's resolved workspace (the live shadow while a
     /// shadowed drive is running).

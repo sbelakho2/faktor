@@ -38,6 +38,13 @@ pub struct ProviderEmbedder {
 }
 
 impl ProviderEmbedder {
+    /// Identity for index vector persistence: the configured model plus a
+    /// revision derived from it (a model-string change is a revision
+    /// change; hosted/vendored revisions arrive with the model id).
+    pub fn identity(&self) -> (String, String) {
+        (self.model.clone(), format!("cfg:v1:{}", self.model))
+    }
+
     pub fn new(provider: Arc<dyn Provider>, model: impl Into<String>, retry: RetryPolicy) -> Self {
         Self {
             provider,
@@ -143,6 +150,10 @@ fn map_provider_error(e: ProviderError) -> Error {
 }
 
 impl faktor_search::Embedder for ProviderEmbedder {
+    fn identity(&self) -> Option<(String, String)> {
+        Some(self.identity())
+    }
+
     fn embed(&self, texts: &[String]) -> Vec<Vec<f32>> {
         // Best-effort infallible bridge; the fallible seam carries the
         // typed error and is what the search service uses.
@@ -168,11 +179,25 @@ impl faktor_search::Embedder for ProviderEmbedder {
     }
 }
 
+/// The SAME configured embedder is the additive index crate's BUILD-TIME
+/// embedding source: re-indexing drives it through
+/// [`faktor_index::EmbeddingSource`], so batching, retry policy and the
+/// bounded request/response validation above are shared between semantic
+/// search and persisted chunk-vector generation.
+impl faktor_index::EmbeddingSource for ProviderEmbedder {
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, Error> {
+        <Self as faktor_search::Embedder>::try_embed(self, texts)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use faktor_core::model::ModelCapabilities;
     use faktor_core::retry::RetryClass;
+    use faktor_ollama::{OllamaConfig, OllamaProvider};
+    use faktor_provider::egress::MockHttpTransport;
+    use faktor_provider::testing::{MockAction, MockServer};
     use faktor_provider::FakeProvider;
     use faktor_search::Embedder as _;
 
@@ -324,5 +349,66 @@ mod tests {
         let err = embedder.try_embed(&[oversized]).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Oversized);
         assert_eq!(fake.embedding_call_count(), 0);
+    }
+
+    /// The retry policy is applied to the REAL Ollama adapter's typed error
+    /// classes: a 429 (retryable) is retried per policy and succeeds; an
+    /// egress POLICY refusal (terminal BadRequest) is never retried even
+    /// with attempts left.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ollama_retry_classes_follow_the_configured_policy() {
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/api/embed",
+            MockAction::Sequence {
+                actions: vec![
+                    MockAction::Respond {
+                        status: 429,
+                        body: "slow down".into(),
+                    },
+                    MockAction::Respond {
+                        status: 200,
+                        body: r#"{"embeddings":[[1.0,2.0]]}"#.into(),
+                    },
+                ],
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        let embedder = ProviderEmbedder::new(provider, "m", policy(3, RetryClass::Always))
+            .with_sleeper(noop_sleeper());
+        let out = embedder.try_embed(&["x".into()]).unwrap();
+        assert_eq!(out, vec![vec![1.0, 2.0]]);
+        assert_eq!(server.request_count(), 2, "429 retried once, then success");
+
+        // A denied destination is a policy refusal: terminal, one attempt,
+        // no wire byte (the mock transport records only executed requests,
+        // and a denial happens before any connect).
+        let mock = Arc::new(MockHttpTransport::denying(
+            faktor_provider::egress::EgressError::UnparseableUrl("nope".into()),
+        ));
+        let denied = OllamaProvider::new_with_transport(
+            OllamaConfig::new(Some("http://mock.invalid".into())),
+            mock.clone(),
+        );
+        let embedder = ProviderEmbedder::new(denied, "m", policy(5, RetryClass::Always))
+            .with_sleeper(noop_sleeper());
+        let err = embedder.try_embed(&["x".into()]).unwrap_err();
+        assert!(
+            matches!(
+                err.kind,
+                ErrorKind::Provider {
+                    retryable: false,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            mock.request_count(),
+            1,
+            "a terminal policy refusal is never retried"
+        );
     }
 }

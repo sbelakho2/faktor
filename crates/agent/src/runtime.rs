@@ -475,6 +475,25 @@ pub trait EvidenceProvider: Send + Sync {
     fn embedder(&self) -> Option<Arc<dyn faktor_search::Embedder>> {
         None
     }
+
+    /// The embedder's stable `(model_id, revision)` when known: the index
+    /// persists vectors keyed by it so unchanged chunks are never
+    /// re-embedded. Default `None` keeps persistence off (honest).
+    fn embedding_model(&self) -> Option<(String, String)> {
+        self.embedder().and_then(|e| e.identity())
+    }
+
+    /// The index-build embedding source (the CLI's adapter over the same
+    /// configured embedder) plus its identity. Default `None`: builds stay
+    /// lexical/symbol-only even when a query-time embedder exists.
+    fn index_embedding(
+        &self,
+    ) -> Option<(
+        Arc<dyn faktor_index::EmbeddingSource>,
+        faktor_index::EmbeddingModel,
+    )> {
+        None
+    }
 }
 
 pub struct NoEvidence;
@@ -9503,6 +9522,13 @@ impl AgentRuntime {
                 self.deps.workspaces.clone(),
             ) {
                 Ok(svc) => {
+                    // Embedding persistence wiring (no re-embed of unchanged
+                    // chunks): the configured embedder + its stable identity
+                    // reach the index build through the evidence seam. No
+                    // configured embedder => lexical/symbol-only builds.
+                    if let Some((source, model)) = self.deps.evidence.index_embedding() {
+                        svc.set_embedding_source(Some(source), model);
+                    }
                     tracing::info!("repository IndexService hosted");
                     Some(svc)
                 }
