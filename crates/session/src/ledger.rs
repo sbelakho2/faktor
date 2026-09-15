@@ -121,6 +121,37 @@ pub const ENTRY_CHILD_PRESENTATION_CHANGED: &str = "child_presentation_changed";
 /// Hard bound on the child id of one presentation row.
 pub const MAX_PRESENTATION_CHILD_ID: usize = 64;
 
+// Durable terminal-lifecycle rows: the ONE authority behind every terminal
+// adapter (native HTTP + ACP). Every transition of one session-owned PTY is a
+// typed append-only row — `terminal_created` before the row is exposed,
+// `terminal_running` once the child identity is known, then exactly one
+// terminal row (`terminal_exited` when the process was observed dead,
+// `terminal_killed` when a kill routed through the pty authority, or
+// `terminal_lost` when a restart found no live authority for the row). A
+// stale lost row is finished by a typed `terminal_reconciled` row
+// (`killed`/`collected`). Every row carries the FULL ownership identity
+// (session, task, agent, operation, terminal UUID) plus the process identity
+// (pid + OS start time), so a restart scan decides reachability from one row
+// and NEVER by pid alone. The rows fold nowhere in the head and are PINNED
+// across compaction: the durable stream is the authority every adapter
+// projects and recovers from.
+pub const ENTRY_TERMINAL_CREATED: &str = "terminal_created";
+pub const ENTRY_TERMINAL_RUNNING: &str = "terminal_running";
+pub const ENTRY_TERMINAL_EXITED: &str = "terminal_exited";
+pub const ENTRY_TERMINAL_KILLED: &str = "terminal_killed";
+pub const ENTRY_TERMINAL_LOST: &str = "terminal_lost";
+pub const ENTRY_TERMINAL_RECONCILED: &str = "terminal_reconciled";
+
+/// Hard bound on one durable terminal UUID (UTF-8 bytes). The daemon mints
+/// canonical 36-byte UUID v4 strings; the bound admits every honest id.
+pub const MAX_TERMINAL_ID_BYTES: usize = 64;
+/// Hard bound on one terminal audit detail (lost reason / kill reason /
+/// reconcile disposition note).
+pub const MAX_TERMINAL_DETAIL_BYTES: usize = MAX_LEDGER_TEXT;
+/// The only legal reconcile disposition tags.
+pub const TERMINAL_RECONCILE_KILLED: &str = "killed";
+pub const TERMINAL_RECONCILE_COLLECTED: &str = "collected";
+
 // ---------------------------------------------------------------- tournament bounds
 
 /// Hard bound on the candidate band of one tournament (N = 2..=4).
@@ -284,6 +315,108 @@ pub const EDIT_TXN_OUTCOME_CONFLICTED: &str = "conflicted";
 pub struct LedgerCheckRun {
     pub id: String,
     pub passed: bool,
+}
+
+/// The durable identity + ownership of ONE session-owned terminal. Every
+/// terminal lifecycle row carries this complete record, so a restart scan
+/// never needs a second store: `terminal_id` is the authority key (UUID),
+/// `session_id`/`task_id`/`agent_id`/`operation_id` the ownership, and
+/// `pid`+`start_time_ms` the process identity (an OS start time of 0 means
+/// the process was never observed — such a row is NEVER adopted by pid
+/// alone).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalDurableRow {
+    pub terminal_id: String,
+    pub session_id: u64,
+    pub task_id: u64,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    pub operation_id: u64,
+    /// The child pid at spawn (0 = never observed).
+    pub pid: u32,
+    /// OS-reported process start-time marker in milliseconds (epoch-based
+    /// where the platform reports epoch time; since-boot ticks on Linux),
+    /// 0 = unknown. Recovery compares it for equality only — a marker is
+    /// never interpreted as a signal target.
+    pub start_time_ms: i64,
+    /// The journal time of THIS row (ms since the Unix epoch).
+    pub at_ms: i64,
+}
+
+/// The six durable terminal lifecycle kinds, in the order a healthy terminal
+/// walks them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalEventKind {
+    Created,
+    Running,
+    Exited,
+    Killed,
+    Lost,
+    Reconciled,
+}
+
+impl TerminalEventKind {
+    /// The durable `entry_type` column tag of this kind.
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            TerminalEventKind::Created => ENTRY_TERMINAL_CREATED,
+            TerminalEventKind::Running => ENTRY_TERMINAL_RUNNING,
+            TerminalEventKind::Exited => ENTRY_TERMINAL_EXITED,
+            TerminalEventKind::Killed => ENTRY_TERMINAL_KILLED,
+            TerminalEventKind::Lost => ENTRY_TERMINAL_LOST,
+            TerminalEventKind::Reconciled => ENTRY_TERMINAL_RECONCILED,
+        }
+    }
+
+    /// The short lifecycle state tag (`created|running|exited|killed|lost|
+    /// reconciled`) every projection reports.
+    pub fn state_tag(self) -> &'static str {
+        match self {
+            TerminalEventKind::Created => "created",
+            TerminalEventKind::Running => "running",
+            TerminalEventKind::Exited => "exited",
+            TerminalEventKind::Killed => "killed",
+            TerminalEventKind::Lost => "lost",
+            TerminalEventKind::Reconciled => "reconciled",
+        }
+    }
+
+    pub fn parse(tag: &str) -> Option<Self> {
+        match tag {
+            ENTRY_TERMINAL_CREATED => Some(TerminalEventKind::Created),
+            ENTRY_TERMINAL_RUNNING => Some(TerminalEventKind::Running),
+            ENTRY_TERMINAL_EXITED => Some(TerminalEventKind::Exited),
+            ENTRY_TERMINAL_KILLED => Some(TerminalEventKind::Killed),
+            ENTRY_TERMINAL_LOST => Some(TerminalEventKind::Lost),
+            ENTRY_TERMINAL_RECONCILED => Some(TerminalEventKind::Reconciled),
+            _ => None,
+        }
+    }
+
+    /// Whether the kind is terminal (no further transition except a typed
+    /// reconcile of a Lost row).
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            TerminalEventKind::Exited
+                | TerminalEventKind::Killed
+                | TerminalEventKind::Lost
+                | TerminalEventKind::Reconciled
+        )
+    }
+}
+
+/// One decoded durable terminal row (read surface).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalLedgerRecord {
+    pub seq: i64,
+    pub kind: TerminalEventKind,
+    pub row: TerminalDurableRow,
+    /// The observed exit code (Exited rows only; `None` = unknown).
+    pub exit_code: Option<i32>,
+    /// The bounded audit detail of the row (kill/lost reason, reconcile
+    /// disposition). Empty for Created/Running/Exited.
+    pub detail: String,
 }
 
 /// One staged file of a durable edit transaction (`edit_txn_prepared`).
@@ -611,6 +744,39 @@ pub enum LedgerPayload {
     /// crashed executor finishes landing or rolls back from. Pinned across
     /// compaction.
     IntegrationTxnRecorded { row: IntegrationTxnRow },
+    /// One session-owned terminal was recorded BEFORE its row was exposed:
+    /// the full ownership + process identity. A crash between this row and
+    /// `TerminalRunning` leaves a row no live authority owns, which recovery
+    /// marks Lost.
+    TerminalCreated { row: TerminalDurableRow },
+    /// The terminal's child is up and its process identity is known.
+    TerminalRunning { row: TerminalDurableRow },
+    /// The child process was observed dead (swept by the authority); the
+    /// exit code is `None` when the pty backend cannot report one.
+    TerminalExited {
+        row: TerminalDurableRow,
+        #[serde(default)]
+        exit_code: Option<i32>,
+    },
+    /// A kill routed through the pty authority terminated the tree.
+    TerminalKilled {
+        row: TerminalDurableRow,
+        reason: String,
+    },
+    /// A restart (or an unreachable row) found no live authority for the
+    /// row; the process identity decides whether the recorded process is
+    /// gone or its pid was recycled (`reason` is the bounded audit text).
+    TerminalLost {
+        row: TerminalDurableRow,
+        reason: String,
+    },
+    /// A stale Lost row was finished exactly once, typed: `disposition` is
+    /// `killed` (the row's process was proven dead/recycled and the row was
+    /// closed as killed) or `collected` (the row was retired as unreachable).
+    TerminalReconciled {
+        row: TerminalDurableRow,
+        disposition: String,
+    },
 }
 
 /// One decoded ledger row.
@@ -1116,7 +1282,45 @@ fn entry_tag_of(payload: &LedgerPayload) -> &'static str {
         LedgerPayload::IntegrationRecorded { .. } => ENTRY_INTEGRATION_RECORD,
         LedgerPayload::RunBaseRecorded { .. } => ENTRY_RUN_BASE,
         LedgerPayload::IntegrationTxnRecorded { .. } => ENTRY_INTEGRATION_TXN,
+        LedgerPayload::TerminalCreated { .. } => ENTRY_TERMINAL_CREATED,
+        LedgerPayload::TerminalRunning { .. } => ENTRY_TERMINAL_RUNNING,
+        LedgerPayload::TerminalExited { .. } => ENTRY_TERMINAL_EXITED,
+        LedgerPayload::TerminalKilled { .. } => ENTRY_TERMINAL_KILLED,
+        LedgerPayload::TerminalLost { .. } => ENTRY_TERMINAL_LOST,
+        LedgerPayload::TerminalReconciled { .. } => ENTRY_TERMINAL_RECONCILED,
     }
+}
+
+/// Project one decoded typed entry onto a durable terminal record (`None`
+/// for every non-terminal entry). The record's `kind` is the entry tag and
+/// its `detail` the kind's bounded audit text.
+fn terminal_record_of(entry: TypedLedgerEntry) -> Option<TerminalLedgerRecord> {
+    let (kind, row, exit_code, detail) = match entry.payload {
+        LedgerPayload::TerminalCreated { row } => {
+            (TerminalEventKind::Created, row, None, String::new())
+        }
+        LedgerPayload::TerminalRunning { row } => {
+            (TerminalEventKind::Running, row, None, String::new())
+        }
+        LedgerPayload::TerminalExited { row, exit_code } => {
+            (TerminalEventKind::Exited, row, exit_code, String::new())
+        }
+        LedgerPayload::TerminalKilled { row, reason } => {
+            (TerminalEventKind::Killed, row, None, reason)
+        }
+        LedgerPayload::TerminalLost { row, reason } => (TerminalEventKind::Lost, row, None, reason),
+        LedgerPayload::TerminalReconciled { row, disposition } => {
+            (TerminalEventKind::Reconciled, row, None, disposition)
+        }
+        _ => return None,
+    };
+    Some(TerminalLedgerRecord {
+        seq: entry.seq,
+        kind,
+        row,
+        exit_code,
+        detail,
+    })
 }
 
 /// Decode one typed payload from its row. Unknown `entry_type` or unknown
@@ -1357,10 +1561,137 @@ fn decode_payload(
             }
             Ok(decoded)
         }
+        ENTRY_TERMINAL_CREATED
+        | ENTRY_TERMINAL_RUNNING
+        | ENTRY_TERMINAL_EXITED
+        | ENTRY_TERMINAL_KILLED
+        | ENTRY_TERMINAL_LOST
+        | ENTRY_TERMINAL_RECONCILED => {
+            let decoded = decode(entry_type)?;
+            match &decoded {
+                LedgerPayload::TerminalCreated { row } => {
+                    validate_terminal_row(row, "terminal_created")?
+                }
+                LedgerPayload::TerminalRunning { row } => {
+                    validate_terminal_row(row, "terminal_running")?
+                }
+                LedgerPayload::TerminalExited { row, .. } => {
+                    validate_terminal_row(row, "terminal_exited")?
+                }
+                LedgerPayload::TerminalKilled { row, reason } => {
+                    validate_terminal_row(row, "terminal_killed")?;
+                    validate_terminal_detail(reason, "terminal_killed reason")?;
+                }
+                LedgerPayload::TerminalLost { row, reason } => {
+                    validate_terminal_row(row, "terminal_lost")?;
+                    validate_terminal_detail(reason, "terminal_lost reason")?;
+                }
+                LedgerPayload::TerminalReconciled { row, disposition } => {
+                    validate_terminal_row(row, "terminal_reconciled")?;
+                    if !matches!(
+                        disposition.as_str(),
+                        TERMINAL_RECONCILE_KILLED | TERMINAL_RECONCILE_COLLECTED
+                    ) {
+                        return Err(SessionError::Malformed(format!(
+                            "ledger terminal_reconciled disposition {disposition:?} is not \
+                             killed|collected"
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(SessionError::Internal(
+                        "terminal entry decode returned a non-terminal payload".into(),
+                    ))
+                }
+            }
+            Ok(decoded)
+        }
         other => Err(SessionError::Malformed(format!(
             "ledger entry type {other:?} is unknown to this reader"
         ))),
     }
+}
+
+/// Shape bounds of one durable terminal row, shared by every appender and
+/// the strict decoder (a hostile raw row fails loudly on read too). The
+/// terminal UUID is the authority key and is never pid-derived; the pid and
+/// the OS start time are the process identity (a start time of 0 = unknown,
+/// which recovery treats as unverifiable — never "alive by pid").
+fn validate_terminal_row(row: &TerminalDurableRow, what: &str) -> Result<(), SessionError> {
+    if row.terminal_id.is_empty() || row.terminal_id.len() > MAX_TERMINAL_ID_BYTES {
+        return Err(SessionError::Malformed(format!(
+            "ledger {what} terminal_id must be 1..={MAX_TERMINAL_ID_BYTES} bytes"
+        )));
+    }
+    if !row.terminal_id.is_ascii()
+        || row.terminal_id.contains('/')
+        || row.terminal_id.contains('\\')
+        || row.terminal_id.chars().any(|c| c.is_control())
+    {
+        return Err(SessionError::Malformed(format!(
+            "ledger {what} terminal_id must be printable ASCII without '/' or '\\'"
+        )));
+    }
+    if row.session_id == 0 {
+        return Err(SessionError::Malformed(format!(
+            "ledger {what} session_id must be non-zero"
+        )));
+    }
+    if row.operation_id == 0 {
+        return Err(SessionError::Malformed(format!(
+            "ledger {what} operation_id must be non-zero"
+        )));
+    }
+    if row.pid == 0 {
+        return Err(SessionError::Malformed(format!(
+            "ledger {what} pid must be non-zero"
+        )));
+    }
+    if row.start_time_ms < 0 {
+        return Err(SessionError::Malformed(format!(
+            "ledger {what} start_time_ms must be >= 0 (0 = unverified identity)"
+        )));
+    }
+    if row.at_ms <= 0 {
+        return Err(SessionError::Malformed(format!(
+            "ledger {what} at_ms must be positive"
+        )));
+    }
+    if let Some(agent_id) = &row.agent_id {
+        if agent_id.is_empty() || agent_id.len() > MAX_TERMINAL_ID_BYTES {
+            return Err(SessionError::Malformed(format!(
+                "ledger {what} agent_id must be 1..={MAX_TERMINAL_ID_BYTES} bytes when set"
+            )));
+        }
+        if !agent_id.is_ascii() || agent_id.chars().any(|c| c.is_control()) {
+            return Err(SessionError::Malformed(format!(
+                "ledger {what} agent_id must be printable ASCII"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// One bounded terminal audit detail (kill/lost reason). Non-empty and no
+/// NUL: the detail lands in operator-visible projections.
+fn validate_terminal_detail(detail: &str, what: &str) -> Result<(), SessionError> {
+    if detail.is_empty() {
+        return Err(SessionError::Malformed(format!(
+            "ledger {what} must be non-empty"
+        )));
+    }
+    if detail.len() > MAX_TERMINAL_DETAIL_BYTES {
+        return Err(SessionError::Oversized(format!(
+            "ledger {what} of {} bytes exceeds {MAX_TERMINAL_DETAIL_BYTES}",
+            detail.len()
+        )));
+    }
+    if detail.contains('\0') {
+        return Err(SessionError::Malformed(format!(
+            "ledger {what} must not contain NUL"
+        )));
+    }
+    Ok(())
 }
 
 /// Shape bounds of one `learning_record` row. Shared by the appender
@@ -2453,6 +2784,15 @@ fn fold(head: &mut LedgerHead, payload: &LedgerPayload) -> Result<(), SessionErr
         // authorities: they fold nowhere in the head and are pinned across
         // compaction (staging and crash recovery re-read them).
         LedgerPayload::RunBaseRecorded { .. } | LedgerPayload::IntegrationTxnRecorded { .. } => {}
+        // Terminal-lifecycle rows are the ONE durable authority behind the
+        // terminal service: they fold nowhere in the head and are pinned
+        // across compaction (a recovery scan re-reads the stream).
+        LedgerPayload::TerminalCreated { .. }
+        | LedgerPayload::TerminalRunning { .. }
+        | LedgerPayload::TerminalExited { .. }
+        | LedgerPayload::TerminalKilled { .. }
+        | LedgerPayload::TerminalLost { .. }
+        | LedgerPayload::TerminalReconciled { .. } => {}
     }
     Ok(())
 }
@@ -3797,6 +4137,118 @@ impl SessionHandle {
         }
     }
 
+    /// Append one `TerminalCreated` row (record-first: the durable ownership
+    /// row exists before the row is exposed by any adapter).
+    pub fn ledger_terminal_created(&self, row: &TerminalDurableRow) -> faktor_core::Result<i64> {
+        validate_terminal_row(row, "terminal_created")?;
+        self.append_typed_entry(LedgerPayload::TerminalCreated { row: row.clone() })
+    }
+
+    /// Append one `TerminalRunning` row (the child is up and its process
+    /// identity is known).
+    pub fn ledger_terminal_running(&self, row: &TerminalDurableRow) -> faktor_core::Result<i64> {
+        validate_terminal_row(row, "terminal_running")?;
+        self.append_typed_entry(LedgerPayload::TerminalRunning { row: row.clone() })
+    }
+
+    /// Append one `TerminalExited` row (the process was observed dead).
+    pub fn ledger_terminal_exited(
+        &self,
+        row: &TerminalDurableRow,
+        exit_code: Option<i32>,
+    ) -> faktor_core::Result<i64> {
+        validate_terminal_row(row, "terminal_exited")?;
+        self.append_typed_entry(LedgerPayload::TerminalExited {
+            row: row.clone(),
+            exit_code,
+        })
+    }
+
+    /// Append one `TerminalKilled` row (a kill routed through the pty
+    /// authority terminated the tree).
+    pub fn ledger_terminal_killed(
+        &self,
+        row: &TerminalDurableRow,
+        reason: &str,
+    ) -> faktor_core::Result<i64> {
+        validate_terminal_row(row, "terminal_killed")?;
+        validate_terminal_detail(reason, "terminal_killed reason")?;
+        self.append_typed_entry(LedgerPayload::TerminalKilled {
+            row: row.clone(),
+            reason: reason.to_string(),
+        })
+    }
+
+    /// Append one `TerminalLost` row (a restart found no live authority for
+    /// the row; the process identity decides the audit reason).
+    pub fn ledger_terminal_lost(
+        &self,
+        row: &TerminalDurableRow,
+        reason: &str,
+    ) -> faktor_core::Result<i64> {
+        validate_terminal_row(row, "terminal_lost")?;
+        validate_terminal_detail(reason, "terminal_lost reason")?;
+        self.append_typed_entry(LedgerPayload::TerminalLost {
+            row: row.clone(),
+            reason: reason.to_string(),
+        })
+    }
+
+    /// Append one `TerminalReconciled` row (a stale Lost row finished typed;
+    /// `disposition` is `killed` or `collected`).
+    pub fn ledger_terminal_reconciled(
+        &self,
+        row: &TerminalDurableRow,
+        disposition: &str,
+    ) -> faktor_core::Result<i64> {
+        validate_terminal_row(row, "terminal_reconciled")?;
+        if !matches!(
+            disposition,
+            TERMINAL_RECONCILE_KILLED | TERMINAL_RECONCILE_COLLECTED
+        ) {
+            return Err(SessionError::Malformed(format!(
+                "terminal reconcile disposition {disposition:?} is not killed|collected"
+            ))
+            .into());
+        }
+        self.append_typed_entry(LedgerPayload::TerminalReconciled {
+            row: row.clone(),
+            disposition: disposition.to_string(),
+        })
+    }
+
+    /// Every durable terminal row of this session above `after_seq`
+    /// (ascending), strictly decoded. The stream is the authority the
+    /// terminal service folds into per-terminal state; a corrupt terminal
+    /// row is a loud error, never a silent drop.
+    pub fn ledger_terminal_rows(
+        &self,
+        after_seq: Option<i64>,
+    ) -> faktor_core::Result<Vec<TerminalLedgerRecord>> {
+        let store = self.manager.store();
+        let mut cursor = after_seq;
+        let mut out: Vec<TerminalLedgerRecord> = Vec::new();
+        loop {
+            let page = store
+                .ledger_entries(self.id, cursor, MAX_LEDGER_PAGE)
+                .map_err(map_store_err)?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map(|r| r.seq);
+            for row in page {
+                let entry = self.decode_row(&row)?;
+                if let Some(record) = terminal_record_of(entry) {
+                    out.push(record);
+                }
+            }
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// The shared typed append tail: bounds the payload, maps its entry
     /// type, and writes the single row (gapless, always above the head's
     /// checkpoint so the fold cursor never rewinds).
@@ -3903,6 +4355,12 @@ impl SessionHandle {
         // rolls back from the transaction rows, so watermark compaction must
         // never silently delete either authority.
         let mut orchestrated_txn_seqs: Vec<i64> = Vec::new();
+        // Terminal-lifecycle rows are pinned: they are the durable authority
+        // the terminal service reconstructs every row's state from after a
+        // restart, so watermark compaction must never silently delete a
+        // terminal's history (a pruned row would turn a Lost terminal into an
+        // unknowable one).
+        let mut terminal_seqs: Vec<i64> = Vec::new();
         for entry in &entries {
             match &entry.payload {
                 LedgerPayload::GoalSet { .. } => {
@@ -3935,6 +4393,12 @@ impl SessionHandle {
                 | LedgerPayload::IntegrationTxnRecorded { .. } => {
                     orchestrated_txn_seqs.push(entry.seq)
                 }
+                LedgerPayload::TerminalCreated { .. }
+                | LedgerPayload::TerminalRunning { .. }
+                | LedgerPayload::TerminalExited { .. }
+                | LedgerPayload::TerminalKilled { .. }
+                | LedgerPayload::TerminalLost { .. }
+                | LedgerPayload::TerminalReconciled { .. } => terminal_seqs.push(entry.seq),
                 _ => {}
             }
         }
@@ -3975,6 +4439,7 @@ impl SessionHandle {
         pinned.extend(completion_seqs);
         pinned.extend(integration_seqs);
         pinned.extend(orchestrated_txn_seqs);
+        pinned.extend(terminal_seqs);
         pinned.sort_unstable();
         pinned.dedup();
         let head_json = head_to_json(&head)?;
@@ -5618,5 +6083,90 @@ mod tests {
         assert!(legacy.landed_snapshot.is_none());
         assert!(legacy.proof_basis_digest.is_none());
         assert!(legacy.integration_txn_id.is_none());
+    }
+
+    // -------------------------------------------------------- terminal rows
+
+    fn terminal_row(terminal_id: &str) -> TerminalDurableRow {
+        TerminalDurableRow {
+            terminal_id: terminal_id.to_string(),
+            session_id: 1,
+            task_id: 1,
+            agent_id: None,
+            operation_id: 7,
+            pid: 4242,
+            start_time_ms: 1_700_000_000_000,
+            at_ms: 1_700_000_000_100,
+        }
+    }
+
+    #[test]
+    fn terminal_lifecycle_rows_round_trip_and_survive_compaction() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let row = terminal_row("7f1a2b3c-0000-4000-8000-000000000001");
+        s.ledger_terminal_created(&row).unwrap();
+        s.ledger_terminal_running(&row).unwrap();
+        let exited = TerminalDurableRow {
+            at_ms: row.at_ms + 10,
+            ..row.clone()
+        };
+        s.ledger_terminal_exited(&exited, Some(0)).unwrap();
+
+        // A hostile consumer cannot forge an illegal reconcile disposition.
+        let err = s
+            .ledger_terminal_reconciled(&exited, "obliterated")
+            .unwrap_err();
+        assert!(err.to_string().contains("killed|collected"), "{err}");
+
+        let records = s.ledger_terminal_rows(None).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].kind, TerminalEventKind::Created);
+        assert_eq!(records[1].kind, TerminalEventKind::Running);
+        assert_eq!(records[2].kind, TerminalEventKind::Exited);
+        assert_eq!(records[2].exit_code, Some(0));
+        assert_eq!(records[2].row.pid, 4242);
+        assert_eq!(records[2].row.start_time_ms, 1_700_000_000_000);
+
+        // The terminal stream is pinned across compaction: turn history is
+        // pruned, every terminal row survives byte-for-byte.
+        for index in 0..40 {
+            turn_entries(&s, index + 1);
+        }
+        let report = s.compact_typed_ledger().unwrap();
+        assert!(report.deleted > 0, "{report:?}");
+        let after = s.ledger_terminal_rows(None).unwrap();
+        assert_eq!(after.len(), 3, "terminal rows are never evicted");
+        assert_eq!(after[0].row.terminal_id, row.terminal_id);
+        assert_eq!(after[2].kind, TerminalEventKind::Exited);
+    }
+
+    #[test]
+    fn terminal_row_shape_violations_are_loud_and_never_parse() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let mut zero_pid = terminal_row("7f1a2b3c-0000-4000-8000-000000000002");
+        zero_pid.pid = 0;
+        assert!(s.ledger_terminal_created(&zero_pid).is_err());
+        let mut hostile_id = terminal_row("7f1a2b3c-0000-4000-8000-000000000003");
+        hostile_id.terminal_id = "a".repeat(MAX_TERMINAL_ID_BYTES + 1);
+        assert!(s.ledger_terminal_running(&hostile_id).is_err());
+        let mut slash = terminal_row("bad/id");
+        slash.terminal_id = "bad/id".into();
+        assert!(s.ledger_terminal_created(&slash).is_err());
+        // Nothing was journaled by the refusals.
+        assert!(s.ledger_terminal_rows(None).unwrap().is_empty());
+
+        // A raw-store hostile row (valid JSON, wrong shape) fails the strict
+        // decode loudly on read instead of being treated as absent.
+        s.ledger_terminal_created(&terminal_row("7f1a2b3c-0000-4000-8000-000000000004"))
+            .unwrap();
+        raw_sql(
+            &m,
+            "UPDATE ledger_entry SET payload = json('{\"kind\":\"terminal_created\"}') \
+             WHERE entry_type = 'terminal_created'",
+        );
+        let err = s.ledger_terminal_rows(None).unwrap_err();
+        assert!(err.to_string().contains("schema"), "{err}");
     }
 }

@@ -1,23 +1,31 @@
-//! Session-owned terminal projection, ownership and bounded lifetime events.
+//! Session-owned terminal projection — a thin adapter over the ONE durable
+//! [`TerminalService`](crate::native::terminal_authority::TerminalService).
+//!
+//! Since the terminal unification there is exactly ONE daemon terminal
+//! authority: the durable `terminal_*` ledger rows governed by
+//! [`TerminalService`]. The native HTTP surface below only parses requests,
+//! calls the service, and projects the durable rows; it keeps no registry of
+//! its own. `AppState.ptys` is the frozen daemon-level compat surface (the
+//! `/pty/*` routes), `AppState.terminal_owners` is a strictly derived
+//! numeric-id → session cache and `AppState.terminal_events` a strictly
+//! derived bounded frame cache — none of them is an authority.
 
+use super::terminal_authority::{
+    ProcessIdentity, TerminalReconcileDisposition, TerminalService, TerminalServiceError,
+    TerminalSpawnRequest,
+};
+use super::*;
+use crate::api::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use faktor_core::id::SessionId;
-
-use super::*;
-use crate::api::AppState;
 
 /// `GET /native/session/{id}/terminal` — the legacy DAEMON-LEVEL terminal
 /// view (frozen by the pre-P0-62 compat tests): every registered PTY of the
-/// daemon (`{id, pid, alive}`), session id validated for route symmetry.
-///
-/// Since audit P0-62 the SESSION-SCOPED projection is
-/// `GET /native/terminals?session=<id>`: a session view never contains
-/// another session's terminals, and rows that carry ownership additionally
-/// project it here additively (`sessionId`/`taskId`/`agentId`/
-/// `operationId`/`spawnedMs`); unowned legacy rows keep the plain shape.
+/// daemon plus every durable session-owned terminal row
+/// (`{id, pid, alive}`), with the ownership projected additively when known.
+/// The SESSION-SCOPED projection is `GET /native/terminals?session=<id>`.
 pub(crate) async fn native_session_terminal(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -29,42 +37,74 @@ pub(crate) async fn native_session_terminal(
     if let Err(r) = native_resolve_session(&state, &id) {
         return *r;
     }
-    native_terminal_sweep(&state);
-    // Lock order is owners → ptys (sweep included), never the reverse.
-    let owners = state
-        .terminal_owners
-        .lock()
-        .expect("terminal owners poisoned");
-    let ptys = state.ptys.lock().expect("ptys poisoned");
-    let mut ids: Vec<u64> = ptys.keys().copied().collect();
-    ids.sort_unstable();
-    let rows: Vec<serde_json::Value> = ids
-        .iter()
-        .take(MAX_NATIVE_LIST)
-        .map(|pty_id| {
-            let p = ptys.get(pty_id).expect("id from ptys keys");
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    // The frozen daemon-level compat rows (numeric pty ids, the `/pty/*`
+    // surface) stay untouched; live session-owned rows annotate the derived
+    // session cache so the compat remove path can keep it clean.
+    {
+        let ptys = state.ptys.lock().expect("ptys poisoned");
+        let owners = state
+            .terminal_owners
+            .lock()
+            .expect("terminal owners poisoned");
+        let mut ids: Vec<u64> = ptys.keys().copied().collect();
+        ids.sort_unstable();
+        for pty_id in ids.into_iter().take(MAX_NATIVE_LIST) {
+            let pty = ptys.get(&pty_id).expect("id from ptys keys");
             let mut row = serde_json::json!({
                 "id": pty_id.to_string(),
-                "pid": p.pid(),
-                "alive": p.is_alive(),
+                "pid": pty.pid(),
+                "alive": pty.is_alive(),
             });
-            if let Some(owner) = owners.get(pty_id) {
-                row["sessionId"] = serde_json::json!(owner.session_id.to_string());
-                row["taskId"] = serde_json::json!(owner.task_id.to_string());
-                row["agentId"] = serde_json::json!(owner.agent_id);
-                row["operationId"] = serde_json::json!(owner.operation_id.to_string());
-                row["spawnedMs"] = serde_json::json!(owner.spawned_ms);
+            if let Some(session) = owners.get(&pty_id) {
+                row["sessionId"] = serde_json::json!(session.to_string());
             }
-            row
-        })
-        .collect();
+            rows.push(row);
+        }
+    }
+    // The durable session-owned rows (all sessions: this is the daemon-level
+    // view). Ids are the terminal UUIDs; the numeric `ptyId` is projected
+    // additively for rows a live pty handle of this boot owns.
+    let sessions = match state.deps.session.list_sessions(None) {
+        Ok(sessions) => sessions,
+        Err(e) => return api_err(&e),
+    };
+    let service = TerminalService::for_manager(&state.deps.session);
+    for handle in sessions {
+        match service.list(&handle.id().to_string()) {
+            Ok(views) => {
+                for view in views {
+                    if rows.len() >= MAX_NATIVE_LIST {
+                        break;
+                    }
+                    let mut row = serde_json::json!({
+                        "id": view.terminal_id,
+                        "pid": view.pid,
+                        "alive": view.alive,
+                        "sessionId": view.session_id.to_string(),
+                        "taskId": view.task_id.to_string(),
+                        "agentId": view.agent_id,
+                        "operationId": view.operation_id.to_string(),
+                        "spawnedMs": view.spawned_ms,
+                        "state": view.state_tag(),
+                    });
+                    if let Some(pty_id) = view.pty_id {
+                        row["ptyId"] = serde_json::json!(pty_id.to_string());
+                    }
+                    rows.push(row);
+                }
+            }
+            Err(e) => return terminal_error_response(e),
+        }
+    }
     Json(serde_json::json!(rows)).into_response()
 }
 
 /// Bound of one session-scoped terminal listing.
 pub(crate) const MAX_NATIVE_TERMINALS: usize = 256;
 
-/// Bounded daemon-wide terminal lifetime-event log depth.
+/// Bounded daemon-wide terminal lifetime-event cache depth (strictly derived
+/// from the durable rows on every read).
 pub(crate) const TERMINAL_EVENT_RING: usize = 512;
 
 /// Cap on one terminal spawn (mirrors `/pty/create`).
@@ -73,102 +113,42 @@ pub(crate) const MAX_NATIVE_TERMINAL_FIELD_BYTES: usize = 4096;
 /// Cap on one terminal spawn arg list.
 pub(crate) const MAX_NATIVE_TERMINAL_ARGS: usize = 256;
 
-/// The ownership of ONE session-owned terminal (P0-62). Additive rows over
-/// the daemon PTY registry: `{session_id, task_id, agent_id,
-/// operation_id}`. Unowned legacy rows (daemon-level `/pty/create` spawns
-/// predating ownership) carry no entry and are NEVER projected into a
-/// session-scoped view — the daemon owning both sessions' terminals never
-/// leaks one session's terminal into another's listing.
-#[derive(Debug, Clone)]
-pub(crate) struct NativeTerminalOwnership {
-    session_id: SessionId,
-    task_id: faktor_core::id::TaskId,
-    /// The orchestrator child agent owning the terminal, when one spawned
-    /// it; a direct session-owned terminal has `None`.
-    agent_id: Option<String>,
-    operation_id: faktor_core::id::OpId,
-    /// The child pid at spawn (kept on the ownership row so an `exited`
-    /// event still names the pid when the daemon row was already removed).
-    pid: u32,
-    spawned_ms: i64,
+/// Cap on one native terminal input payload.
+pub(crate) const MAX_NATIVE_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
+
+/// One bounded terminal lifetime frame derived from a durable row.
+fn terminal_event_frame(record: &faktor_session::TerminalLedgerRecord) -> serde_json::Value {
+    serde_json::json!({
+        "id": record.seq,
+        "type": record.kind.as_tag(),
+        "terminalId": record.row.terminal_id,
+        "ptyId": record.row.terminal_id,
+        "pid": record.row.pid,
+        "tsMs": record.row.at_ms,
+        "sessionId": record.row.session_id.to_string(),
+        "startTimeMs": record.row.start_time_ms,
+        "detail": record.detail,
+        "exitCode": record.exit_code,
+    })
 }
 
-/// Append one session-owned terminal lifetime event to the bounded ring
-/// (ids ascend from 1; at most [`TERMINAL_EVENT_RING`] entries survive).
-pub(crate) fn native_terminal_event_push(state: &AppState, event: serde_json::Value) -> u64 {
-    let id = state
-        .next_terminal_event_id
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+/// Refresh the bounded derived event cache of one session from the durable
+/// rows (the cache is NEVER an authority: it is cleared and rebuilt here).
+fn refresh_terminal_events(state: &AppState, session_id: &str) -> Result<(), TerminalServiceError> {
+    let service = TerminalService::for_manager(&state.deps.session);
+    let (records, _) = service.events(session_id, None, TERMINAL_EVENT_RING as u64)?;
     let mut ring = state
         .terminal_events
         .lock()
         .expect("terminal events poisoned");
-    ring.push_back((id, event));
-    while ring.len() > TERMINAL_EVENT_RING {
-        ring.pop_front();
+    ring.clear();
+    for record in records {
+        let cache_id = state
+            .next_terminal_event_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ring.push_back((cache_id, terminal_event_frame(&record)));
     }
-    id
-}
-
-/// Lazy lifetime sweep of session-owned terminals (P0-62): a terminal whose
-/// process exited since the last native read is removed from the daemon
-/// registry and one `exited` event lands in the bounded event log. Runs
-/// inside the native reads (listing + event log) — deliberately no
-/// background task and no unbounded lifetime (the bus philosophy: polling
-/// is lazy). Unowned legacy rows are never swept; their lifecycle stays
-/// daemon-level.
-pub(crate) fn native_terminal_sweep(state: &AppState) {
-    let mut owners = state
-        .terminal_owners
-        .lock()
-        .expect("terminal owners poisoned");
-    let mut dead: Vec<(u64, NativeTerminalOwnership)> = Vec::new();
-    {
-        let mut ptys = state.ptys.lock().expect("ptys poisoned");
-        for (id, owner) in owners.iter() {
-            match ptys.get(id) {
-                Some(p) if p.is_alive() => {}
-                Some(_) | None => {
-                    ptys.remove(id);
-                    dead.push((*id, owner.clone()));
-                }
-            }
-        }
-    }
-    for (id, owner) in dead {
-        owners.remove(&id);
-        native_terminal_event_push(
-            state,
-            serde_json::json!({
-                "type": "exited",
-                "ptyId": id.to_string(),
-                "pid": owner.pid,
-                "tsMs": state.deps.session.now_ms(),
-                "sessionId": owner.session_id.to_string(),
-            }),
-        );
-    }
-}
-
-/// One session-owned terminal row of the native view (P0-62): the daemon
-/// PTY facts plus its durable ownership. `agentId` is null for direct
-/// session-owned spawns.
-pub(crate) fn native_terminal_row(
-    ptys: &std::collections::HashMap<u64, faktor_pty::Pty>,
-    id: u64,
-    owner: &NativeTerminalOwnership,
-) -> serde_json::Value {
-    let pty = ptys.get(&id);
-    serde_json::json!({
-        "id": id.to_string(),
-        "pid": pty.map(|p| p.pid()).unwrap_or(0),
-        "alive": pty.map(|p| p.is_alive()).unwrap_or(false),
-        "sessionId": owner.session_id.to_string(),
-        "taskId": owner.task_id.to_string(),
-        "agentId": owner.agent_id,
-        "operationId": owner.operation_id.to_string(),
-        "spawnedMs": owner.spawned_ms,
-    })
+    Ok(())
 }
 
 /// Strict query DTO of the session-scoped terminal listing
@@ -180,15 +160,10 @@ pub(crate) struct NativeTerminalsQuery {
 }
 
 /// `GET /native/terminals?session=<id>` — the session-owned terminal
-/// projection (audit P0-62). Returns ONLY the terminals whose durable
-/// ownership names `session`: `{sessionId, terminals: [{id, pid, alive,
-/// sessionId, taskId, agentId, operationId, spawnedMs}], unowned, note}`.
-/// Unowned legacy rows (the daemon-level `/pty/create` surface predates
-/// ownership) are NEVER projected into a session view — they are counted in
-/// `unowned` and named in `note`, so a caller filtering session A can never
-/// see session B's terminals, and a caller of a session with no owned
-/// terminal gets a documented empty list plus the legacy-row reason, not a
-/// silent leak. Hostile session ids are 400; unknown sessions 404.
+/// projection: ONLY the durable rows whose ownership names `session`
+/// (including Lost rows; their state is explicit). `unowned` counts the
+/// frozen daemon-level `/pty/*` rows, which are never projected into a
+/// session view. Hostile session ids are 400; unknown sessions 404.
 pub(crate) async fn native_terminals(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -202,37 +177,45 @@ pub(crate) async fn native_terminals(
         Err(r) => return *r,
     };
     let sid = handle.id();
-    native_terminal_sweep(&state);
-    // Lock order is owners → ptys everywhere (sweep included), so two
-    // concurrent native reads can never deadlock on the maps.
-    let owners = state
-        .terminal_owners
-        .lock()
-        .expect("terminal owners poisoned");
-    let ptys = state.ptys.lock().expect("ptys poisoned");
-    let mut rows: Vec<serde_json::Value> = Vec::new();
-    let mut unowned: u64 = 0;
-    let mut ids: Vec<u64> = ptys.keys().copied().collect();
-    ids.sort_unstable();
-    for id in ids {
-        match owners.get(&id) {
-            Some(owner) if owner.session_id == sid => {
-                rows.push(native_terminal_row(&ptys, id, owner));
-            }
-            Some(_) => {} // another session's terminal: invisible here.
-            None => unowned += 1,
-        }
-        if rows.len() >= MAX_NATIVE_TERMINALS {
-            break;
-        }
-    }
+    let service = TerminalService::for_manager(&state.deps.session);
+    let sid_string = sid.to_string();
+    let views = match tokio::task::spawn_blocking(move || service.list(&sid_string)).await {
+        Ok(Ok(views)) => views,
+        Ok(Err(e)) => return terminal_error_response(e),
+        Err(_) => return wire_refused("terminal listing task failed"),
+    };
+    let unowned = state.ptys.lock().map(|p| p.len()).unwrap_or(0) as u64;
     let note = if unowned > 0 {
         format!(
-            "{unowned} daemon-level PTY row(s) carry no session ownership (spawned through the legacy /pty/create surface before P0-62) and are excluded from every session-scoped view"
+            "{unowned} daemon-level PTY row(s) carry no session ownership (spawned through the \
+             legacy /pty/* surface) and are excluded from every session-scoped view"
         )
     } else {
         String::new()
     };
+    let rows: Vec<serde_json::Value> = views
+        .into_iter()
+        .take(MAX_NATIVE_TERMINALS)
+        .map(|view| {
+            serde_json::json!({
+                "id": view.terminal_id,
+                "terminalId": view.terminal_id,
+                "ptyId": view.pty_id.map(|id| id.to_string()),
+                "pid": view.pid,
+                "alive": view.alive,
+                "state": view.state_tag(),
+                "sessionId": view.session_id.to_string(),
+                "taskId": view.task_id.to_string(),
+                "agentId": view.agent_id,
+                "operationId": view.operation_id.to_string(),
+                "spawnedMs": view.spawned_ms,
+                "updatedMs": view.updated_ms,
+                "startTimeMs": view.start_time_ms,
+                "exitCode": view.exit_code,
+                "detail": view.detail,
+            })
+        })
+        .collect();
     Json(serde_json::json!({
         "sessionId": sid.to_string(),
         "terminals": rows,
@@ -253,14 +236,10 @@ pub(crate) struct NativeTerminalEventsQuery {
 }
 
 /// `GET /native/session/{id}/terminal/events?after=<n>&limit=<n>` — the
-/// session-owned terminal LIFETIME event log (audit P0-62): bounded
-/// `created`/`exited` frames of the session's terminals, `id` ascending
-/// strictly above `after`. Page semantics match the native cursor pages
-/// (`hasMore` + `nextCursor`); the log is a bounded daemon ring, so frames
-/// older than the ring window are gone (an oversized `after` simply returns
-/// nothing — never an error). Exit events are appended lazily by the native
-/// reads when a swept terminal's process died. Unknown sessions 404,
-/// hostile ids 400.
+/// session-owned terminal LIFETIME event log: the durable `terminal_*` rows
+/// of the session, `id` (the durable seq) ascending strictly above `after`.
+/// The response's `id` is the durable seq, so cursors are stable across
+/// reads and restarts. Unknown sessions 404, hostile ids 400.
 pub(crate) async fn native_terminal_events(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -278,34 +257,32 @@ pub(crate) async fn native_terminal_events(
         Ok(l) => l,
         Err(e) => return wire_status(e),
     };
-    native_terminal_sweep(&state);
+    let sid_string = handle.id().to_string();
+    if let Err(e) = refresh_terminal_events(&state, &sid_string) {
+        return terminal_error_response(e);
+    }
     let after = q.after.unwrap_or(0);
     let ring = state
         .terminal_events
         .lock()
         .expect("terminal events poisoned");
-    let sid_str = handle.id().to_string();
     let mut page: Vec<serde_json::Value> = Vec::new();
     let mut more = false;
     let mut last: Option<u64> = None;
-    for (eid, event) in ring.iter() {
-        if *eid <= after {
-            continue;
-        }
-        if event.get("sessionId").and_then(|s| s.as_str()) != Some(sid_str.as_str()) {
+    for (_cache_id, event) in ring.iter() {
+        let event_id = event.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+        if event_id <= after {
             continue;
         }
         if page.len() as i64 >= limit {
             more = true;
             break;
         }
-        let mut row = event.clone();
-        row["id"] = serde_json::json!(eid);
-        page.push(row);
-        last = Some(*eid);
+        page.push(event.clone());
+        last = Some(event_id);
     }
     Json(serde_json::json!({
-        "sessionId": sid_str,
+        "sessionId": sid_string,
         "events": page,
         "hasMore": more,
         "nextCursor": if more { last.map(|v| serde_json::json!(v)) } else { Some(serde_json::Value::Null) },
@@ -330,15 +307,9 @@ pub(crate) struct NativeTerminalSpawnBody {
 }
 
 /// `POST /native/session/{id}/terminal` — spawn a SESSION-OWNED terminal
-/// (audit P0-62): the row carries `{session_id, task_id, agent_id,
-/// operation_id}` ownership (task id = the session's durable task identity;
-/// the operation id is minted from the durable op sequence — an ownership
-/// label, never a journaled operation; agent id is null for direct spawns).
-/// The strict body mirrors `/pty/create` (`{command, args?, cwd?, rows?,
-/// cols?}`) and registers the PTY in the SAME daemon registry, so the
-/// legacy daemon-level controls (update/output/remove) keep working on it —
-/// the ownership is purely additive. Unknown sessions 404; hostile ids and
-/// malformed/oversized bodies 400.
+/// through the ONE durable terminal service: the durable row carries
+/// `{session_id, task_id, agent_id, operation_id}` plus the terminal UUID
+/// and the child's process identity. The strict body mirrors `/pty/create`.
 pub(crate) async fn native_terminal_spawn(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -357,11 +328,6 @@ pub(crate) async fn native_terminal_spawn(
     let handle = match native_resolve_session(&state, &id) {
         Ok(h) => h,
         Err(r) => return *r,
-    };
-    let sid = handle.id();
-    let row = match handle.row() {
-        Ok(r) => r,
-        Err(e) => return api_err(&e),
     };
     if body.command.is_empty() || body.command.len() > MAX_NATIVE_TERMINAL_FIELD_BYTES {
         return wire_status(malformed_body(
@@ -387,63 +353,292 @@ pub(crate) async fn native_terminal_spawn(
     let cols = u16::try_from(body.cols.unwrap_or(80))
         .unwrap_or(u16::MAX)
         .max(1);
-    let cfg = faktor_pty::PtyConfig {
+    let request = TerminalSpawnRequest {
         command: body.command.clone(),
         args: body.args.clone(),
         cwd: body.cwd.clone(),
-        env: faktor_pty::EnvSpec::default_baseline(),
+        env: Vec::new(),
         rows,
         cols,
     };
-    let pty = match tokio::task::spawn_blocking(move || faktor_pty::Pty::spawn(&cfg)).await {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => {
-            return (StatusCode::BAD_REQUEST, Json(api_error_json(&e))).into_response();
-        }
-        Err(_) => return wire_refused("pty spawn task failed"),
+    let service = TerminalService::for_manager(&state.deps.session);
+    let sid = handle.id().to_string();
+    let creation = match tokio::task::spawn_blocking(move || service.spawn(&sid, &request)).await {
+        Ok(Ok(creation)) => creation,
+        Ok(Err(e)) => return terminal_error_response(e),
+        Err(_) => return wire_refused("terminal spawn task failed"),
     };
-    let pty_id = state
-        .next_pty_id
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let pid = pty.pid();
-    let operation_id = state.deps.session.next_op_id();
-    let owner = NativeTerminalOwnership {
-        session_id: sid,
-        task_id: row.task_id,
-        agent_id: None,
-        operation_id,
-        pid,
-        spawned_ms: state.deps.session.now_ms(),
-    };
-    // Lock order is owners → ptys (sweep included), never the reverse.
-    state
-        .terminal_owners
-        .lock()
-        .expect("terminal owners poisoned")
-        .insert(pty_id, owner);
-    state
-        .ptys
-        .lock()
-        .expect("ptys poisoned")
-        .insert(pty_id, pty);
-    native_terminal_event_push(
-        &state,
-        serde_json::json!({
-            "type": "created",
-            "ptyId": pty_id.to_string(),
-            "pid": pid,
-            "tsMs": state.deps.session.now_ms(),
-            "sessionId": sid.to_string(),
-        }),
-    );
+    let view = creation.view;
+    // Keep the strictly derived numeric-id session cache current for the
+    // frozen compat remove path (never an authority).
+    if let Some(pty_id) = view.pty_id {
+        state
+            .terminal_owners
+            .lock()
+            .expect("terminal owners poisoned")
+            .insert(pty_id, view.session_id.raw());
+    }
     Json(serde_json::json!({
         "ok": true,
-        "ptyId": pty_id.to_string(),
-        "pid": pid,
-        "sessionId": sid.to_string(),
-        "taskId": row.task_id.to_string(),
-        "agentId": serde_json::Value::Null,
-        "operationId": operation_id.to_string(),
+        "terminalId": view.terminal_id,
+        "ptyId": view.terminal_id,
+        "pid": view.pid,
+        "sessionId": view.session_id.to_string(),
+        "taskId": view.task_id.to_string(),
+        "agentId": view.agent_id,
+        "operationId": view.operation_id.to_string(),
+        "state": view.state_tag(),
+        "startTimeMs": view.start_time_ms,
+        "spawnedMs": view.spawned_ms,
     }))
     .into_response()
 }
+
+/// Strict native body of one terminal input write.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeTerminalInputBody {
+    data: String,
+}
+
+/// `POST /native/session/{id}/terminals/{terminal_id}/input` — write input
+/// to a Running terminal through the durable service. A Lost/unreachable
+/// row (restart) is refused with the typed 409; a foreign terminal id is an
+/// indistinguishable 404.
+pub(crate) async fn native_terminal_input(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, terminal_id)): Path<(String, String)>,
+    body: Result<Json<NativeTerminalInputBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => return wire_status(malformed_body("invalid native terminal input body")),
+    };
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    if body.data.len() > MAX_NATIVE_TERMINAL_INPUT_BYTES {
+        return wire_status(malformed_body("terminal input is oversized"));
+    }
+    let service = TerminalService::for_manager(&state.deps.session);
+    let sid = handle.id().to_string();
+    let data = body.data.into_bytes();
+    match tokio::task::spawn_blocking(move || service.input(&sid, &terminal_id, &data)).await {
+        Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(Err(e)) => terminal_error_response(e),
+        Err(_) => wire_refused("terminal input task failed"),
+    }
+}
+
+/// Strict native body of one terminal resize.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeTerminalResizeBody {
+    rows: u32,
+    cols: u32,
+}
+
+/// `POST /native/session/{id}/terminals/{terminal_id}/resize`.
+pub(crate) async fn native_terminal_resize(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, terminal_id)): Path<(String, String)>,
+    body: Result<Json<NativeTerminalResizeBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => return wire_status(malformed_body("invalid native terminal resize body")),
+    };
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    let rows = match u16::try_from(body.rows) {
+        Ok(rows) if rows > 0 => rows,
+        _ => return wire_status(malformed_body("terminal rows must be 1..=65535")),
+    };
+    let cols = match u16::try_from(body.cols) {
+        Ok(cols) if cols > 0 => cols,
+        _ => return wire_status(malformed_body("terminal cols must be 1..=65535")),
+    };
+    let service = TerminalService::for_manager(&state.deps.session);
+    let sid = handle.id().to_string();
+    match tokio::task::spawn_blocking(move || service.resize(&sid, &terminal_id, rows, cols)).await
+    {
+        Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(Err(e)) => terminal_error_response(e),
+        Err(_) => wire_refused("terminal resize task failed"),
+    }
+}
+
+/// Strict native body of one terminal kill (the reason is bounded audit
+/// text; empty = the default reason).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeTerminalKillBody {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `POST /native/session/{id}/terminals/{terminal_id}/kill` — kill through
+/// the pty authority and journal `terminal_killed` exactly once (idempotent
+/// afterwards).
+pub(crate) async fn native_terminal_kill(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, terminal_id)): Path<(String, String)>,
+    body: Result<Json<NativeTerminalKillBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let reason = match body {
+        Ok(Json(body)) => body.reason.unwrap_or_else(|| "kill requested".into()),
+        // An empty body is the default kill; malformed non-empty bodies are
+        // strict 400s.
+        Err(_) => return wire_status(malformed_body("invalid native terminal kill body")),
+    };
+    if reason.len() > 4096 || reason.contains('\0') {
+        return wire_status(malformed_body(
+            "terminal kill reason is invalid or oversized",
+        ));
+    }
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    let service = TerminalService::for_manager(&state.deps.session);
+    let sid = handle.id().to_string();
+    match tokio::task::spawn_blocking(move || service.kill(&sid, &terminal_id, &reason)).await {
+        Ok(Ok(killed)) => Json(serde_json::json!({ "ok": true, "killed": killed })).into_response(),
+        Ok(Err(e)) => terminal_error_response(e),
+        Err(_) => wire_refused("terminal kill task failed"),
+    }
+}
+
+/// Strict native body of one stale-row reconciliation.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeTerminalReconcileBody {
+    /// `killed` | `collected`.
+    disposition: String,
+    /// The caller-observed process identity, when it has one. A mismatch
+    /// with the durable row is refused and nothing is journaled.
+    #[serde(default)]
+    observed_pid: Option<u32>,
+    #[serde(default)]
+    observed_start_time_ms: Option<i64>,
+}
+
+/// `POST /native/session/{id}/terminals/{terminal_id}/reconcile` — finish a
+/// stale Lost row exactly once, typed.
+pub(crate) async fn native_terminal_reconcile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, terminal_id)): Path<(String, String)>,
+    body: Result<Json<NativeTerminalReconcileBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => return wire_status(malformed_body("invalid native terminal reconcile body")),
+    };
+    let disposition = match body.disposition.as_str() {
+        "killed" => TerminalReconcileDisposition::Killed,
+        "collected" => TerminalReconcileDisposition::Collected,
+        _ => {
+            return wire_status(malformed_body(
+                "terminal reconcile disposition must be killed|collected",
+            ))
+        }
+    };
+    let observed = match (body.observed_pid, body.observed_start_time_ms) {
+        (Some(pid), Some(start_time_ms)) => Some(ProcessIdentity { pid, start_time_ms }),
+        (None, None) => None,
+        _ => {
+            return wire_status(malformed_body(
+                "observed_pid and observed_start_time_ms must be provided together",
+            ))
+        }
+    };
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    let service = TerminalService::for_manager(&state.deps.session);
+    let sid = handle.id().to_string();
+    match tokio::task::spawn_blocking(move || {
+        service.reconcile(&sid, &terminal_id, disposition, observed)
+    })
+    .await
+    {
+        Ok(Ok(view)) => Json(serde_json::json!({
+            "ok": true,
+            "terminalId": view.terminal_id,
+            "state": view.state_tag(),
+            "reconciled": view.detail,
+        }))
+        .into_response(),
+        Ok(Err(e)) => terminal_error_response(e),
+        Err(_) => wire_refused("terminal reconcile task failed"),
+    }
+}
+
+/// Map a typed terminal service failure onto the native wire: invalid
+/// requests are 400s, foreign/unknown terminals are indistinguishable 404s,
+/// and state/lost/identity refusals are typed 409s.
+fn terminal_error_response(error: TerminalServiceError) -> Response {
+    match error {
+        TerminalServiceError::Invalid(message) => wire_status(malformed_body(&message)),
+        TerminalServiceError::Unknown { .. } | TerminalServiceError::ForeignScope { .. } => {
+            wire_status(not_found("unknown terminal for this session"))
+        }
+        TerminalServiceError::Lost { terminal_id, detail } => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "code": "lost",
+                "terminalId": terminal_id,
+                "message": detail,
+            })),
+        )
+            .into_response(),
+        TerminalServiceError::IdentityMismatch { .. } => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "ok": false, "code": "identity_mismatch", "message": error.to_string() })),
+        )
+            .into_response(),
+        TerminalServiceError::State {
+            terminal_id,
+            state,
+            message,
+        } => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "code": "state",
+                "terminalId": terminal_id,
+                "state": state,
+                "message": message,
+            })),
+        )
+            .into_response(),
+        TerminalServiceError::Unavailable(message) => wire_refused(&message),
+        TerminalServiceError::Refused(message) => wire_refused(&message),
+    }
+}
+
+/// The native ownership row cache type (kept for the frozen compat
+/// surface): numeric pty id → owning session raw id, strictly derived from
+/// the durable rows.
+pub(crate) type NativeTerminalOwnerCache = std::collections::HashMap<u64, u64>;
