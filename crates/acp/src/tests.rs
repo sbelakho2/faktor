@@ -2265,3 +2265,36 @@ async fn terminal_registry_ownership_is_session_scoped_and_bounded() {
         .expect("closed terminal is gone");
     assert_eq!(gone.code, INVALID_PARAMS);
 }
+
+#[tokio::test]
+async fn poisoned_terminal_registry_locks_recover_and_keep_serving() {
+    // Both per-connection registry locks guard plain maps (session ids, live
+    // handles) with no cross-entry invariant a panic could break. Poison
+    // both from a panicking holder and prove the next operation recovers and
+    // serves — the connection is never aborted by a poisoned registry.
+    let registry = TerminalRegistry::new(None, AcpConfig::default());
+    let sessions = Arc::clone(&registry.sessions);
+    let table = Arc::clone(&registry.table);
+    let poisoner = std::thread::spawn(move || {
+        let _sessions = sessions.lock().unwrap();
+        let _table = table.lock().unwrap();
+        panic!("poison the terminal registry locks");
+    });
+    assert!(poisoner.join().is_err());
+    assert!(registry.sessions.is_poisoned());
+    assert!(registry.table.is_poisoned());
+
+    registry.note_session("sess-a");
+    assert!(registry.knows_session("sess-a"));
+    let (main_tx, _main_rx) = tokio::sync::mpsc::channel(8);
+    let created = registry
+        .register(
+            "sess-a",
+            Arc::new(UnitHandle::new("t-1", "own-1")),
+            main_tx,
+            Negotiation::default(),
+        )
+        .unwrap();
+    assert_eq!(created["terminalId"], "t-1");
+    assert_eq!(registry.list("sess-a").unwrap().len(), 1);
+}

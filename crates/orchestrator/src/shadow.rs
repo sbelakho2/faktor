@@ -699,7 +699,13 @@ impl ShadowRoots {
     /// `before` digest and the copy. Production compiles to a no-op.
     #[cfg(test)]
     fn check_copy_seam(&self, owner: &Path, attempt: usize) {
-        let mut guard = self.copy_seam.lock().expect("copy seam poisoned");
+        // Test-only seam over plain state: a poison here can never make the
+        // seam's invariant (None/Some mode) invalid, so recover instead of
+        // panicking — poisoning one copy attempt must not abort the run.
+        let mut guard = self
+            .copy_seam
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mode = *guard;
         match mode {
             Some(ShadowCopyDrift::Once) if attempt == 1 => {
@@ -723,7 +729,10 @@ impl ShadowRoots {
     /// service instance.
     #[cfg(test)]
     pub fn arm_copy_drift(&self, mode: ShadowCopyDrift) {
-        *self.copy_seam.lock().expect("copy seam poisoned") = Some(mode);
+        *self
+            .copy_seam
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(mode);
     }
 
     #[cfg(not(test))]

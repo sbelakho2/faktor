@@ -958,9 +958,9 @@ async function startTask(
       return;
     }
     const settings: StartTaskSettings = {
-      // Empty (the default) inherits the daemon mode. direct_compat is
-      // available ONLY when the user/policy explicitly configured it; the
-      // client never downgrades a refused shadow run.
+      // Shadow-only: empty (the default) inherits the daemon's sole mode and
+      // "shadow" names it explicitly. The removed direct_compat value is a
+      // typed refusal at admission; a refused shadow run never downgrades.
       mutationMode: config('mutationMode', ''),
       maxTokens: config('budgetTokens', 0),
       maxCostMicro: config('budgetCostMicro', 0),

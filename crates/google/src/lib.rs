@@ -7,7 +7,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use faktor_core::model::ModelCapabilities;
-use faktor_provider::egress::{execute_post_json, HttpTransport, PolicyCheckedHttpTransport};
+#[cfg(test)]
+use faktor_provider::egress::PolicyCheckedHttpTransport;
+use faktor_provider::egress::{execute_post_json, HttpTransport};
 use faktor_provider::transport::{
     guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES, PROVIDER_CEILING_MS,
 };
@@ -70,17 +72,18 @@ pub struct GoogleProvider {
 }
 
 impl GoogleProvider {
-    pub fn build(config: GoogleConfig) -> Arc<dyn Provider> {
-        Self::build_with_transport(config, Arc::new(PolicyCheckedHttpTransport::permissive()))
+    /// The ONLY production constructor: the egress transport is injected
+    /// (the daemon passes the policy-checked one), so no production path can
+    /// silently fall back to a permissive default.
+    pub fn build(config: GoogleConfig, transport: Arc<dyn HttpTransport>) -> Arc<dyn Provider> {
+        Arc::new(Self { config, transport })
     }
 
-    /// Build with an injected transport (policy-checked in production,
-    /// mock in tests).
-    pub fn build_with_transport(
-        config: GoogleConfig,
-        transport: Arc<dyn HttpTransport>,
-    ) -> Arc<dyn Provider> {
-        Arc::new(Self { config, transport })
+    /// Test-only default-allow constructor (production MUST inject a
+    /// policy-checked transport; in-crate tests use this for mock servers).
+    #[cfg(test)]
+    pub fn permissive_for_tests(config: GoogleConfig) -> Arc<dyn Provider> {
+        Self::build(config, Arc::new(PolicyCheckedHttpTransport::permissive()))
     }
 
     fn wire_body(&self, req: &GenericAgentRequest) -> serde_json::Value {
@@ -515,7 +518,9 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = GoogleProvider::build(GoogleConfig::new(Some("k".into())).with_base(&base));
+        let provider = GoogleProvider::permissive_for_tests(
+            GoogleConfig::new(Some("k".into())).with_base(&base),
+        );
         let mut stream = provider.stream(req("gemini-x"));
         while let Some(chunk) = stream.next().await {
             if let Ok(ProviderChunk::Done) = chunk {
@@ -563,7 +568,9 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = GoogleProvider::build(GoogleConfig::new(Some("k".into())).with_base(&base));
+        let provider = GoogleProvider::permissive_for_tests(
+            GoogleConfig::new(Some("k".into())).with_base(&base),
+        );
         assert!(provider.document_capable("gemini-x"));
         let mut r = req("gemini-x");
         r.messages.push(RequestMessage {
@@ -617,7 +624,9 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = GoogleProvider::build(GoogleConfig::new(Some("k".into())).with_base(&base));
+        let provider = GoogleProvider::permissive_for_tests(
+            GoogleConfig::new(Some("k".into())).with_base(&base),
+        );
         assert_eq!(provider.max_image_bytes(), GOOGLE_MAX_IMAGE_BYTES);
         let mut r = req("gemini-x");
         r.messages.push(RequestMessage {
@@ -642,7 +651,7 @@ mod tests {
     async fn image_delivery_gate_refuses_visionless_pre_wire() {
         let server = MockServer::new();
         let base = server.base_url().await;
-        let provider = GoogleProvider::build(
+        let provider = GoogleProvider::permissive_for_tests(
             GoogleConfig::new(Some("k".into()))
                 .with_base(&base)
                 .with_model(
@@ -666,7 +675,9 @@ mod tests {
         assert_eq!(server.request_count(), 0, "no wire byte on a gate refusal");
 
         // Over the provider's per-image bound: typed, pre-wire.
-        let provider = GoogleProvider::build(GoogleConfig::new(Some("k".into())).with_base(&base));
+        let provider = GoogleProvider::permissive_for_tests(
+            GoogleConfig::new(Some("k".into())).with_base(&base),
+        );
         let mut r = req("gemini-x");
         r.messages.push(RequestMessage {
             role: Role::User,
@@ -782,7 +793,8 @@ mod tests {
             MockAction::Respond { status: 200, body },
         );
         let base = server.base_url().await;
-        let provider = GoogleProvider::build(GoogleConfig::new(None).with_base(&base));
+        let provider =
+            GoogleProvider::permissive_for_tests(GoogleConfig::new(None).with_base(&base));
         let mut stream = provider.stream(req("gemini-x"));
         let mut text = String::new();
         let mut call = None;
@@ -816,7 +828,8 @@ mod tests {
             MockAction::Silent { status: 200 },
         );
         let base = server.base_url().await;
-        let provider = GoogleProvider::build(GoogleConfig::new(None).with_base(&base));
+        let provider =
+            GoogleProvider::permissive_for_tests(GoogleConfig::new(None).with_base(&base));
         let mut g = req("gemini-x");
         g.meta.deadline_ms = 1200;
         let mut stream = provider.stream(g);
@@ -854,7 +867,8 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = GoogleProvider::build(GoogleConfig::new(None).with_base(&base));
+        let provider =
+            GoogleProvider::permissive_for_tests(GoogleConfig::new(None).with_base(&base));
         let mut stream = provider.stream(req("gemini-x"));
         let err = stream.next().await.unwrap().unwrap_err();
         assert_eq!(err.kind, ProviderErrorKind::RateLimited);
@@ -872,7 +886,8 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = GoogleProvider::build(GoogleConfig::new(None).with_base(&base));
+        let provider =
+            GoogleProvider::permissive_for_tests(GoogleConfig::new(None).with_base(&base));
         let mut stream = provider.stream(req("gemini-x"));
         let first = stream.next().await.unwrap();
         assert!(first.is_err());
@@ -925,7 +940,8 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = GoogleProvider::build(GoogleConfig::new(None).with_base(&base));
+        let provider =
+            GoogleProvider::permissive_for_tests(GoogleConfig::new(None).with_base(&base));
         let mut r = req("gemini-x");
         r.messages = vec![
             RequestMessage {
@@ -969,7 +985,8 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = GoogleProvider::build(GoogleConfig::new(None).with_base(&base));
+        let provider =
+            GoogleProvider::permissive_for_tests(GoogleConfig::new(None).with_base(&base));
         let mut stream = provider.stream(req("gemini-x"));
         let mut text = String::new();
         while let Some(chunk) = stream.next().await {
@@ -1016,10 +1033,8 @@ mod tests {
         let port = reqwest::Url::parse(&base).unwrap().port().unwrap();
 
         // Allowed: the allowlisted mock streams normally.
-        let provider = GoogleProvider::build_with_transport(
-            GoogleConfig::new(None).with_base(&base),
-            allow_only(port),
-        );
+        let provider =
+            GoogleProvider::build(GoogleConfig::new(None).with_base(&base), allow_only(port));
         let mut stream = provider.stream(req("gemini-x"));
         let mut text = String::new();
         while let Some(chunk) = stream.next().await {
@@ -1033,7 +1048,7 @@ mod tests {
         assert_eq!(server.request_count(), 1);
 
         // Denied: wrong-port policy fails BEFORE any network byte.
-        let denied = GoogleProvider::build_with_transport(
+        let denied = GoogleProvider::build(
             GoogleConfig::new(None).with_base(&base),
             allow_only(port.wrapping_add(1)),
         );
@@ -1043,7 +1058,7 @@ mod tests {
         assert_eq!(server.request_count(), 1, "deny happened before connect");
 
         // https-to-http mismatch against an https-only rule: pre-connect deny.
-        let mismatch = GoogleProvider::build_with_transport(
+        let mismatch = GoogleProvider::build(
             GoogleConfig::new(None).with_base(&base),
             Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
                 DestinationPolicy::parse_lines([&format!("https://127.0.0.1:{port}")]).unwrap(),
@@ -1064,7 +1079,7 @@ mod tests {
         .join("\n\n");
         let mock = Arc::new(MockHttpTransport::new(200, body));
         let as_transport: Arc<dyn HttpTransport> = mock.clone();
-        let provider = GoogleProvider::build_with_transport(
+        let provider = GoogleProvider::build(
             GoogleConfig::new(None).with_base("http://mock.invalid"),
             as_transport,
         );
@@ -1149,7 +1164,7 @@ mod tests {
             family: faktor_provider::usage_conformance::WireFamily::InclusiveTotal,
             label: "google gemini",
             request: || req("gemini-x"),
-            provider: |base: String| GoogleProvider::build(GoogleConfig::new(None).with_base(&base)),
+            provider: |base: String| GoogleProvider::permissive_for_tests(GoogleConfig::new(None).with_base(&base)),
             method: "POST",
             path: "/v1beta/models/gemini-x:streamGenerateContent",
             cases: vec![

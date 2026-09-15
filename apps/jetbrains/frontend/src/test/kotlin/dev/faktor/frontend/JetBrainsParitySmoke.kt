@@ -539,10 +539,14 @@ object JetBrainsParitySmoke {
         val panel = SettingsPanel()
         panel.setDaemonInfo("/bin/faktor-cli", "/tmp/data", "1.2.3", "http://127.0.0.1:9")
         assertTrue(panel.daemonText().contains("/bin/faktor-cli"), panel.daemonText())
-        assertEquals(listOf("default", "shadow", "direct_compat"), panel.mutationModes())
+        assertEquals(listOf("default", "shadow"), panel.mutationModes())
         assertEquals(null, panel.mutationMode())
+        // The removed direct-owner mode is not offered and cannot be
+        // selected: the surface stays shadow-only.
         panel.selectMutationMode("direct_compat")
-        assertEquals("direct_compat", panel.mutationMode())
+        assertEquals(null, panel.mutationMode())
+        panel.selectMutationMode("shadow")
+        assertEquals("shadow", panel.mutationMode())
         panel.setProviders(providers)
         assertEquals(2, panel.providerCount())
         assertEquals("alpha", panel.selectedProvider())
@@ -737,7 +741,7 @@ object JetBrainsParitySmoke {
                 // One request carries criteria + mutation mode + completion
                 // contract + the attachment set; the served task view then
                 // carries acceptance criteria.
-                chat.settingsView().selectMutationMode("direct_compat")
+                chat.settingsView().selectMutationMode("shadow")
                 chat.completionCommit.isSelected = true
                 val attachment = Files.createTempFile("faktor-parity-attach-", ".txt")
                 chat.attachmentsView().addFiles(listOf(attachment.toString()))
@@ -751,7 +755,7 @@ object JetBrainsParitySmoke {
                 assertTrue(
                     taskBody.contains("\"criteria\":[\"criterion A\",\"criterion B\"]"), taskBody
                 )
-                assertTrue(taskBody.contains("\"mutation_mode\":\"direct_compat\""), taskBody)
+                assertTrue(taskBody.contains("\"mutation_mode\":\"shadow\""), taskBody)
                 assertTrue(taskBody.contains("\"completion_contract\":{\"include_commit\":true"), taskBody)
                 assertTrue(taskBody.contains(attachment.toString()), taskBody)
                 await("task refresh after start") {
@@ -809,10 +813,11 @@ object JetBrainsParitySmoke {
                 )
             }
             registry.observables["settings"] = {
-                // The mutation-mode default the Task composer reads.
-                assertTrue(
-                    chat.settingsView().mutationModes().contains("direct_compat"),
-                    chat.settingsView().mutationModes().toString()
+                // The shadow-only mutation vocabulary the Task composer reads:
+                // the removed direct-owner mode is never offered.
+                assertEquals(
+                    listOf("default", "shadow"),
+                    chat.settingsView().mutationModes()
                 )
             }
             registry.observables["restart_reconnect"] = {

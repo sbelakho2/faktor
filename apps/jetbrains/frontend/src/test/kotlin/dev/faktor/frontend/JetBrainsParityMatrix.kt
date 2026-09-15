@@ -455,10 +455,14 @@ internal object ParityMatrix {
                         "/bin/faktor-cli", "/tmp/data", "1.2.3", "http://127.0.0.1:9"
                     )
                     assertTrue(panel.daemonText().contains("/bin/faktor-cli"), panel.daemonText())
-                    assertEquals(listOf("default", "shadow", "direct_compat"), panel.mutationModes())
+                    assertEquals(listOf("default", "shadow"), panel.mutationModes())
                     assertEquals(null, panel.mutationMode())
+                    // Shadow-only: the removed direct-owner mode cannot be
+                    // selected and never reads back.
                     panel.selectMutationMode("direct_compat")
-                    assertEquals("direct_compat", panel.mutationMode())
+                    assertEquals(null, panel.mutationMode())
+                    panel.selectMutationMode("shadow")
+                    assertEquals("shadow", panel.mutationMode())
                     panel.setUnavailable("provider read failed: daemon down")
                     assertEquals(false, panel.available())
                 },

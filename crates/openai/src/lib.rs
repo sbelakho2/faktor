@@ -26,9 +26,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use faktor_core::model::ModelCapabilities;
-use faktor_provider::egress::{
-    execute_post_json_with_extras, HttpTransport, PolicyCheckedHttpTransport,
-};
+#[cfg(test)]
+use faktor_provider::egress::PolicyCheckedHttpTransport;
+use faktor_provider::egress::{execute_post_json_with_extras, HttpTransport};
 use faktor_provider::transport::{
     guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES, PROVIDER_CEILING_MS,
 };
@@ -121,14 +121,6 @@ impl OpenAiConfig {
     }
 }
 
-/// The standard permissive checked transport (no destination policy
-/// installed => default-allow, documented). The daemon config sites must
-/// replace this with `PolicyCheckedHttpTransport::with_policy(...)` once
-/// the sandbox network gate is threaded into provider construction.
-fn default_transport() -> Arc<dyn HttpTransport> {
-    Arc::new(PolicyCheckedHttpTransport::permissive())
-}
-
 /// Authorization headers for a bearer API key (empty map when keyless).
 pub fn authorization_headers(api_key: Option<&str>) -> reqwest::header::HeaderMap {
     let mut h = reqwest::header::HeaderMap::new();
@@ -162,27 +154,18 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    pub fn build(config: OpenAiConfig) -> Arc<dyn Provider> {
-        Self::build_with_quirks(config, OpenAiQuirks::default())
+    /// The ONLY production constructor. The egress transport is injected —
+    /// the daemon passes the policy-checked transport built from its sandbox
+    /// network gate + outbound secret scan; there is no permissive default a
+    /// production path could silently fall back to.
+    pub fn build(config: OpenAiConfig, transport: Arc<dyn HttpTransport>) -> Arc<dyn Provider> {
+        Self::build_with_quirks(config, OpenAiQuirks::default(), transport)
     }
 
-    /// Build with adapter-level quirks (DeepSeek profiles set these; plain
-    /// OpenAI endpoints keep the defaults).
-    pub fn build_with_quirks(config: OpenAiConfig, quirks: OpenAiQuirks) -> Arc<dyn Provider> {
-        Self::build_with_quirks_and_transport(config, quirks, default_transport())
-    }
-
-    /// Build with an injected transport (policy-checked in production,
-    /// mock in tests).
-    pub fn build_with_transport(
-        config: OpenAiConfig,
-        transport: Arc<dyn HttpTransport>,
-    ) -> Arc<dyn Provider> {
-        Self::build_with_quirks_and_transport(config, OpenAiQuirks::default(), transport)
-    }
-
-    /// Full constructor: quirks + explicit egress transport.
-    pub fn build_with_quirks_and_transport(
+    /// Build with adapter-level quirks and an explicit egress transport
+    /// (DeepSeek profiles set the quirks; plain OpenAI endpoints keep the
+    /// defaults).
+    pub fn build_with_quirks(
         config: OpenAiConfig,
         quirks: OpenAiQuirks,
         transport: Arc<dyn HttpTransport>,
@@ -192,6 +175,28 @@ impl OpenAiProvider {
             transport,
             quirks,
         })
+    }
+
+    /// Test-only default-allow constructor: production code MUST inject a
+    /// policy-checked transport, so this helper exists solely so in-crate
+    /// tests can drive the adapter against local mock servers.
+    #[cfg(test)]
+    pub fn permissive_for_tests(config: OpenAiConfig) -> Arc<dyn Provider> {
+        Self::build(config, Arc::new(PolicyCheckedHttpTransport::permissive()))
+    }
+
+    /// Test-only default-allow constructor with quirks (see
+    /// [`Self::permissive_for_tests`]).
+    #[cfg(test)]
+    pub fn permissive_for_tests_with_quirks(
+        config: OpenAiConfig,
+        quirks: OpenAiQuirks,
+    ) -> Arc<dyn Provider> {
+        Self::build_with_quirks(
+            config,
+            quirks,
+            Arc::new(PolicyCheckedHttpTransport::permissive()),
+        )
     }
 
     fn wire_body(&self, req: &GenericAgentRequest) -> serde_json::Value {
@@ -1565,7 +1570,8 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, Some("sk-test".into())));
+        let provider =
+            OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, Some("sk-test".into())));
         let mut stream = provider.stream(req("m1"));
         let mut texts = String::new();
         while let Some(chunk) = stream.next().await {
@@ -1619,7 +1625,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None));
         assert_eq!(provider.max_image_bytes(), OPENAI_MAX_IMAGE_BYTES);
         let mut r = req("m1");
         r.messages.push(RequestMessage {
@@ -1665,7 +1671,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::responses(base, None));
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::responses(base, None));
         let mut r = req("m1");
         r.messages.push(RequestMessage {
             role: Role::User,
@@ -1721,7 +1727,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None));
         assert!(provider.document_capable("m1"));
         let mut r = req("m1");
         r.messages.push(RequestMessage {
@@ -1768,7 +1774,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::responses(base, None));
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::responses(base, None));
         let mut r = req("m1");
         r.messages.push(RequestMessage {
             role: Role::User,
@@ -1792,13 +1798,15 @@ mod tests {
     async fn image_delivery_gate_is_typed_and_pre_wire() {
         let server = MockServer::new();
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base.clone(), None).with_model(
-            "m1",
-            ModelCapabilities {
-                vision: false,
-                ..Default::default()
-            },
-        ));
+        let provider = OpenAiProvider::permissive_for_tests(
+            OpenAiConfig::chat(base.clone(), None).with_model(
+                "m1",
+                ModelCapabilities {
+                    vision: false,
+                    ..Default::default()
+                },
+            ),
+        );
         let mut r = req("m1");
         r.messages.push(RequestMessage {
             role: Role::User,
@@ -1812,7 +1820,7 @@ mod tests {
         assert_eq!(server.request_count(), 0, "no wire byte on a gate refusal");
 
         // Over the provider's own per-image bound: typed, pre-wire.
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None));
         let mut r = req("m1");
         r.messages.push(RequestMessage {
             role: Role::User,
@@ -1931,7 +1939,7 @@ mod tests {
             MockAction::Respond { status: 200, body },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None));
         let mut stream = provider.stream(req("m"));
         let mut call = None;
         while let Some(chunk) = stream.next().await {
@@ -1966,7 +1974,8 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, Some("k".into())));
+        let provider =
+            OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, Some("k".into())));
         let mut stream = provider.stream(req("m"));
         let err = stream.next().await.unwrap().unwrap_err();
         assert_eq!(err.kind, ProviderErrorKind::RateLimited);
@@ -1985,7 +1994,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None));
         let mut stream = provider.stream(req("m"));
         let first = stream.next().await.unwrap();
         assert!(first.is_err(), "malformed SSE must be an error");
@@ -2003,7 +2012,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None));
         let mut stream = provider.stream(req("m"));
         let mut done = false;
         let mut got_text = false;
@@ -2023,7 +2032,8 @@ mod tests {
     #[tokio::test]
     async fn network_death_maps_to_network_error() {
         // No server listening on this port: connect error.
-        let provider = OpenAiProvider::build(OpenAiConfig::chat("http://127.0.0.1:1", None));
+        let provider =
+            OpenAiProvider::permissive_for_tests(OpenAiConfig::chat("http://127.0.0.1:1", None));
         let mut stream = provider.stream(req("m"));
         let first = stream.next().await.unwrap();
         assert!(first.is_err());
@@ -2032,18 +2042,19 @@ mod tests {
 
     #[test]
     fn capabilities_default_and_override() {
-        let p = OpenAiProvider::build(OpenAiConfig::chat("http://x", None));
+        let p = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat("http://x", None));
         let caps = p.capabilities("unknown-model");
         assert!(caps.tools);
         assert_eq!(caps.context, 128_000);
-        let p = OpenAiProvider::build(OpenAiConfig::chat("http://x", None).with_model(
-            "small",
-            ModelCapabilities {
-                context: 8192,
-                tools: false,
-                ..Default::default()
-            },
-        ));
+        let p =
+            OpenAiProvider::permissive_for_tests(OpenAiConfig::chat("http://x", None).with_model(
+                "small",
+                ModelCapabilities {
+                    context: 8192,
+                    tools: false,
+                    ..Default::default()
+                },
+            ));
         assert!(!p.capabilities("small").tools);
         assert_eq!(p.capabilities("small").context, 8192);
     }
@@ -2074,7 +2085,7 @@ mod tests {
             );
         }
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::responses(base, None));
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::responses(base, None));
         let mut g = req("m");
         g.reasoning = Some(faktor_core::model::ReasoningMode::Medium);
         g.messages = vec![
@@ -2177,7 +2188,7 @@ mod tests {
     }
 
     fn responses_provider(base: String) -> Arc<dyn Provider> {
-        OpenAiProvider::build(OpenAiConfig::responses(base, None))
+        OpenAiProvider::permissive_for_tests(OpenAiConfig::responses(base, None))
     }
 
     /// Drain a stream to its full item sequence (errors preserved).
@@ -2766,9 +2777,9 @@ mod tests {
                 );
                 let base = server.base_url().await;
                 let provider: Arc<dyn Provider> = if responses {
-                    OpenAiProvider::build(OpenAiConfig::responses(base, None))
+                    OpenAiProvider::permissive_for_tests(OpenAiConfig::responses(base, None))
                 } else {
-                    OpenAiProvider::build(OpenAiConfig::chat(base, None))
+                    OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None))
                 };
                 let mut stream = provider.stream(req("m"));
                 let err = stream.next().await.unwrap().unwrap_err();
@@ -2792,12 +2803,12 @@ mod tests {
         // body; never both shapes.
         let responses = OpenAiProvider {
             config: OpenAiConfig::responses("http://x", None),
-            transport: default_transport(),
+            transport: Arc::new(PolicyCheckedHttpTransport::permissive()),
             quirks: OpenAiQuirks::default(),
         };
         let chat = OpenAiProvider {
             config: OpenAiConfig::chat("http://x", None),
-            transport: default_transport(),
+            transport: Arc::new(PolicyCheckedHttpTransport::permissive()),
             quirks: OpenAiQuirks::default(),
         };
         let r = responses.wire_body(&req("m"));
@@ -2826,7 +2837,7 @@ mod tests {
             } else {
                 OpenAiConfig::chat("http://mock.invalid", None)
             };
-            let provider = OpenAiProvider::build_with_transport(config, transport);
+            let provider = OpenAiProvider::build(config, transport);
             let items = drain(provider.stream(req("m"))).await;
             assert_eq!(items, vec![Ok(ProviderChunk::Done)]);
             assert_eq!(
@@ -2882,7 +2893,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None));
         let mut r = req("m");
         r.messages = vec![
             RequestMessage {
@@ -2945,7 +2956,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None));
         let mut r = req("m");
         r.messages = vec![RequestMessage {
             role: Role::Assistant,
@@ -2994,7 +3005,7 @@ mod tests {
             MockAction::Respond { status: 200, body },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None));
         let mut stream = provider.stream(req("m"));
         let mut calls: Vec<(String, serde_json::Value, bool)> = Vec::new();
         while let Some(chunk) = stream.next().await {
@@ -3040,7 +3051,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None));
         let mut stream = provider.stream(req("gpt-x"));
         let mut text = String::new();
         let mut done = false;
@@ -3077,7 +3088,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None));
         let mut stream = provider.stream(req("gpt-x"));
         let mut text = String::new();
         while let Some(chunk) = stream.next().await {
@@ -3106,7 +3117,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None));
         let mut stream = provider.stream(req("gpt-x"));
         let mut saw_err = false;
         while let Some(chunk) = stream.next().await {
@@ -3135,7 +3146,7 @@ mod tests {
             MockAction::Silent { status: 200 },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None));
         let mut g = req("gpt-x");
         g.meta.deadline_ms = 1200;
         let mut stream = provider.stream(g);
@@ -3242,10 +3253,8 @@ mod tests {
 
         // Allowed: the mock is exactly the allowlisted destination; the
         // SSE response streams normally through the injected transport.
-        let provider = OpenAiProvider::build_with_transport(
-            OpenAiConfig::chat(base.clone(), None),
-            allow_only(port),
-        );
+        let provider =
+            OpenAiProvider::build(OpenAiConfig::chat(base.clone(), None), allow_only(port));
         let mut stream = provider.stream(req("gpt-x"));
         let mut text = String::new();
         while let Some(chunk) = stream.next().await {
@@ -3260,7 +3269,7 @@ mod tests {
 
         // A second instance whose policy allows a DIFFERENT port: the same
         // request is denied BEFORE any network byte (counter stays at 1).
-        let denied = OpenAiProvider::build_with_transport(
+        let denied = OpenAiProvider::build(
             OpenAiConfig::chat(base.clone(), None),
             allow_only(port.wrapping_add(1)),
         );
@@ -3271,8 +3280,7 @@ mod tests {
 
         // https-to-http mismatch: an https-only allowlist rule denies the
         // plain-http request before connect.
-        let mismatch =
-            OpenAiProvider::build_with_transport(OpenAiConfig::chat(base, None), https_only(port));
+        let mismatch = OpenAiProvider::build(OpenAiConfig::chat(base, None), https_only(port));
         let err = first_error(mismatch.stream(req("gpt-x"))).await;
         assert!(err.message.contains("denied"), "{}", err.message);
         assert_eq!(server.request_count(), 1, "scheme mismatch: no connect");
@@ -3297,7 +3305,7 @@ mod tests {
         );
         let base = server.base_url().await;
         let port = reqwest::Url::parse(&base).unwrap().port().unwrap();
-        let provider = OpenAiProvider::build_with_transport(
+        let provider = OpenAiProvider::build(
             OpenAiConfig::responses(base.clone(), None),
             allow_only(port),
         );
@@ -3313,7 +3321,7 @@ mod tests {
         assert_eq!(text, "hi");
         assert_eq!(server.request_count(), 1);
 
-        let denied = OpenAiProvider::build_with_transport(
+        let denied = OpenAiProvider::build(
             OpenAiConfig::responses(base, None),
             allow_only(port.wrapping_add(1)),
         );
@@ -3337,10 +3345,8 @@ mod tests {
         );
         let base = server.base_url().await;
         let port = reqwest::Url::parse(&base).unwrap().port().unwrap();
-        let provider = OpenAiProvider::build_with_transport(
-            OpenAiConfig::chat(base.clone(), None),
-            allow_only(port),
-        );
+        let provider =
+            OpenAiProvider::build(OpenAiConfig::chat(base.clone(), None), allow_only(port));
         let mut stream = provider.stream(req("gpt-x"));
         let mut done = false;
         while let Some(chunk) = stream.next().await {
@@ -3363,7 +3369,7 @@ mod tests {
         })]);
         let mock = Arc::new(MockHttpTransport::new(200, canned));
         let as_transport: Arc<dyn HttpTransport> = mock.clone();
-        let provider = OpenAiProvider::build_with_transport(
+        let provider = OpenAiProvider::build(
             OpenAiConfig::chat("http://mock.invalid", None),
             as_transport,
         );
@@ -3463,7 +3469,7 @@ mod tests {
             family: faktor_provider::usage_conformance::WireFamily::InclusiveTotal,
             label: "openai chat completions",
             request: || req("m1"),
-            provider: |base: String| OpenAiProvider::build(OpenAiConfig::chat(base, None)),
+            provider: |base: String| OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None)),
             method: "POST",
             path: "/chat/completions",
             cases: vec![
@@ -3578,7 +3584,7 @@ mod tests {
             family: faktor_provider::usage_conformance::WireFamily::InclusiveTotal,
             label: "openai responses",
             request: || req("m1"),
-            provider: |base: String| OpenAiProvider::build(OpenAiConfig::responses(base, None)),
+            provider: |base: String| OpenAiProvider::permissive_for_tests(OpenAiConfig::responses(base, None)),
             method: "POST",
             path: "/responses",
             cases: vec![

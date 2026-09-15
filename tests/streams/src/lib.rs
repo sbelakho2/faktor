@@ -74,6 +74,15 @@ mod streams_tests {
     use futures::StreamExt;
     use serde_json::{json, Value};
 
+    /// Test-only default-allow egress transport: the suite drives REAL
+    /// adapters against local MockServers, so the injected transport is a
+    /// policy-checked client with no installed destination policy. This is
+    /// the test seam the adapter constructors require; production call sites
+    /// inject the daemon's policy-checked transport.
+    fn permissive_transport() -> std::sync::Arc<dyn faktor_provider::egress::HttpTransport> {
+        std::sync::Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::permissive())
+    }
+
     // ------------------------------------------------------------- harness
 
     /// One normalized stream item — the adapter-level event vocabulary every
@@ -229,7 +238,8 @@ mod streams_tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let provider =
+            OpenAiProvider::build(OpenAiConfig::chat(base, None), permissive_transport());
         drive(provider.stream(request("m"))).await
     }
 
@@ -241,7 +251,8 @@ mod streams_tests {
             MockAction::Respond { status, body },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let provider =
+            OpenAiProvider::build(OpenAiConfig::chat(base, None), permissive_transport());
         drive(provider.stream(request("m"))).await
     }
 
@@ -515,7 +526,10 @@ mod streams_tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"partial reply\"}}]}\n\n".into(),
         ])
         .await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(format!("http://{addr}"), None));
+        let provider = OpenAiProvider::build(
+            OpenAiConfig::chat(format!("http://{addr}"), None),
+            permissive_transport(),
+        );
         let norms = drive(provider.stream(request("m"))).await;
         assert_eq!(
             norms,
@@ -550,7 +564,8 @@ mod streams_tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let provider =
+            OpenAiProvider::build(OpenAiConfig::chat(base, None), permissive_transport());
         let norms = drive(provider.stream(request("m"))).await;
         assert_eq!(
             norms,
@@ -603,7 +618,8 @@ mod streams_tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::responses(base, None));
+        let provider =
+            OpenAiProvider::build(OpenAiConfig::responses(base, None), permissive_transport());
         drive(provider.stream(request("m"))).await
     }
 
@@ -611,7 +627,8 @@ mod streams_tests {
         let server = MockServer::new();
         server.route("POST", "/responses", MockAction::Respond { status, body });
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::responses(base, None));
+        let provider =
+            OpenAiProvider::build(OpenAiConfig::responses(base, None), permissive_transport());
         drive(provider.stream(request("m"))).await
     }
 
@@ -849,8 +866,10 @@ mod streams_tests {
             "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"delta\":\"partial reply\"}\n\n".into(),
         ])
         .await;
-        let provider =
-            OpenAiProvider::build(OpenAiConfig::responses(format!("http://{addr}"), None));
+        let provider = OpenAiProvider::build(
+            OpenAiConfig::responses(format!("http://{addr}"), None),
+            permissive_transport(),
+        );
         let norms = drive(provider.stream(request("m"))).await;
         assert_eq!(
             norms,
@@ -884,7 +903,8 @@ mod streams_tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OpenAiProvider::build(OpenAiConfig::responses(base, None));
+        let provider =
+            OpenAiProvider::build(OpenAiConfig::responses(base, None), permissive_transport());
         let norms = drive(provider.stream(request("m"))).await;
         assert_eq!(
             norms,
@@ -904,7 +924,7 @@ mod streams_tests {
         let server = MockServer::new();
         server.route("POST", "/api/chat", MockAction::Respond { status, body });
         let base = server.base_url().await;
-        let provider = OllamaProvider::build(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::build(OllamaConfig::new(Some(base)), permissive_transport());
         drive(provider.stream(request("qwen3.8"))).await
     }
 
@@ -1078,7 +1098,10 @@ mod streams_tests {
                 .into(),
         ])
         .await;
-        let provider = OllamaProvider::build(OllamaConfig::new(Some(format!("http://{addr}"))));
+        let provider = OllamaProvider::build(
+            OllamaConfig::new(Some(format!("http://{addr}"))),
+            permissive_transport(),
+        );
         let norms = drive(provider.stream(request("qwen3.8"))).await;
         assert_eq!(
             norms,
@@ -1113,7 +1136,7 @@ mod streams_tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::build(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::build(OllamaConfig::new(Some(base)), permissive_transport());
         let norms = drive(provider.stream(request("qwen3.8"))).await;
         assert_eq!(
             norms,
@@ -1165,7 +1188,10 @@ mod streams_tests {
             },
         );
         let base = server.base_url().await;
-        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let provider = AnthropicProvider::build(
+            AnthropicConfig::new(None).with_base(&base),
+            permissive_transport(),
+        );
         drive(provider.stream(request("claude-x"))).await
     }
 
@@ -1173,7 +1199,10 @@ mod streams_tests {
         let server = MockServer::new();
         server.route("POST", "/v1/messages", MockAction::Respond { status, body });
         let base = server.base_url().await;
-        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let provider = AnthropicProvider::build(
+            AnthropicConfig::new(None).with_base(&base),
+            permissive_transport(),
+        );
         drive(provider.stream(request("claude-x"))).await
     }
 
@@ -1384,6 +1413,7 @@ mod streams_tests {
         .await;
         let provider = AnthropicProvider::build(
             AnthropicConfig::new(None).with_base(&format!("http://{addr}")),
+            permissive_transport(),
         );
         let norms = drive(provider.stream(request("claude-x"))).await;
         assert_eq!(
@@ -1421,7 +1451,10 @@ mod streams_tests {
             },
         );
         let base = server.base_url().await;
-        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let provider = AnthropicProvider::build(
+            AnthropicConfig::new(None).with_base(&base),
+            permissive_transport(),
+        );
         let norms = drive(provider.stream(request("claude-x"))).await;
         assert_eq!(
             norms,
@@ -1467,7 +1500,10 @@ mod streams_tests {
             },
         );
         let base = server.base_url().await;
-        let provider = GoogleProvider::build(GoogleConfig::new(None).with_base(&base));
+        let provider = GoogleProvider::build(
+            GoogleConfig::new(None).with_base(&base),
+            permissive_transport(),
+        );
         drive(provider.stream(request("gemini-x"))).await
     }
 
@@ -1479,7 +1515,10 @@ mod streams_tests {
             MockAction::Respond { status, body },
         );
         let base = server.base_url().await;
-        let provider = GoogleProvider::build(GoogleConfig::new(None).with_base(&base));
+        let provider = GoogleProvider::build(
+            GoogleConfig::new(None).with_base(&base),
+            permissive_transport(),
+        );
         drive(provider.stream(request("gemini-x"))).await
     }
 
@@ -1695,8 +1734,10 @@ mod streams_tests {
                 .into(),
         ])
         .await;
-        let provider =
-            GoogleProvider::build(GoogleConfig::new(None).with_base(&format!("http://{addr}")));
+        let provider = GoogleProvider::build(
+            GoogleConfig::new(None).with_base(&format!("http://{addr}")),
+            permissive_transport(),
+        );
         let norms = drive(provider.stream(request("gemini-x"))).await;
         assert_eq!(
             norms,
@@ -1731,7 +1772,10 @@ mod streams_tests {
             },
         );
         let base = server.base_url().await;
-        let provider = GoogleProvider::build(GoogleConfig::new(None).with_base(&base));
+        let provider = GoogleProvider::build(
+            GoogleConfig::new(None).with_base(&base),
+            permissive_transport(),
+        );
         let norms = drive(provider.stream(request("gemini-x"))).await;
         assert_eq!(
             norms,
@@ -1757,7 +1801,7 @@ mod streams_tests {
             route_prefixes: vec![],
             default_caps: ModelCapabilities::default(),
         };
-        drive(gateway_build(cfg).stream(request("m"))).await
+        drive(gateway_build(cfg, permissive_transport()).stream(request("m"))).await
     }
 
     #[tokio::test]
@@ -1903,7 +1947,7 @@ mod streams_tests {
             route_prefixes: vec![],
             default_caps: ModelCapabilities::default(),
         };
-        let norms = drive(gateway_build(cfg).stream(request("m"))).await;
+        let norms = drive(gateway_build(cfg, permissive_transport()).stream(request("m"))).await;
         assert_eq!(
             norms,
             vec![
@@ -1945,7 +1989,7 @@ mod streams_tests {
             route_prefixes: vec![],
             default_caps: ModelCapabilities::default(),
         };
-        let norms = drive(gateway_build(cfg).stream(request("m"))).await;
+        let norms = drive(gateway_build(cfg, permissive_transport()).stream(request("m"))).await;
         assert_eq!(
             norms,
             vec![Norm::Text("héllo".into()), Norm::Done],
@@ -1973,7 +2017,11 @@ mod streams_tests {
             api_key: None,
             model_overrides: std::collections::HashMap::new(),
         };
-        drive(faktor_deepseek::build(cfg).stream(request("deepseek-v4-flash"))).await
+        drive(
+            faktor_deepseek::build(cfg, permissive_transport())
+                .stream(request("deepseek-v4-flash")),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -2178,7 +2226,11 @@ mod streams_tests {
             api_key: None,
             model_overrides: std::collections::HashMap::new(),
         };
-        let norms = drive(faktor_deepseek::build(cfg).stream(request("deepseek-v4-flash"))).await;
+        let norms = drive(
+            faktor_deepseek::build(cfg, permissive_transport())
+                .stream(request("deepseek-v4-flash")),
+        )
+        .await;
         assert_eq!(
             norms,
             vec![

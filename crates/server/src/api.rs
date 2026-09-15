@@ -509,6 +509,107 @@ mod tests {
     use faktor_session::BudgetAuthority;
     use std::time::Duration;
 
+    /// Test-only default-allow transport: every mock endpoint below is a
+    /// loopback server, and production construction injects the daemon's
+    /// policy-checked transport instead.
+    fn permissive_transport() -> Arc<dyn faktor_provider::egress::HttpTransport> {
+        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::permissive())
+    }
+
+    // ------------------------------------------------- poisoned authorities
+
+    /// A poisoned auth-override lock is authority-bearing: the next auth
+    /// check must return the typed internal refusal instead of panicking the
+    /// whole daemon surface.
+    #[test]
+    fn poisoned_auth_override_lock_refuses_with_typed_internal_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let state = AppState {
+            deps: Arc::new(deps),
+            auth: Arc::new(std::sync::RwLock::new(None)),
+            terminal_events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            next_terminal_event_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let auth = Arc::clone(&state.auth);
+        let poisoner = std::thread::spawn(move || {
+            let _guard = auth.write().unwrap();
+            panic!("poison the auth override");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(state.auth.is_poisoned());
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer deadbeef".parse().unwrap(),
+        );
+        let err = crate::native::authed(&headers, &state)
+            .expect_err("poisoned auth must refuse, never panic");
+        assert_eq!(err.code, "internal");
+        assert_eq!(err.http_status, 500);
+        assert!(!err.retryable);
+        assert!(err.message.contains("poison"), "{}", err.message);
+    }
+
+    /// The terminal-event ring is a strictly derived bounded cache (never an
+    /// authority): a poisoned ring recovers on the next read instead of
+    /// killing the endpoint.
+    #[tokio::test]
+    async fn poisoned_terminal_event_cache_recovers_on_next_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let session = deps.session.clone();
+        let ws = session.create_workspace("/tmp").unwrap();
+        let sid = session
+            .create_session(ws, "poisoned-terminal-events", "fake", "m")
+            .unwrap()
+            .id()
+            .to_string();
+        let state = AppState {
+            deps: Arc::new(deps),
+            auth: Arc::new(std::sync::RwLock::new(None)),
+            terminal_events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            next_terminal_event_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let ring = Arc::clone(&state.terminal_events);
+        let poisoner = std::thread::spawn(move || {
+            let _guard = ring.lock().unwrap();
+            panic!("poison the terminal event cache");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(state.terminal_events.is_poisoned());
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", token.as_str()).parse().unwrap(),
+        );
+        let query: NativeTerminalEventsQuery =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        let response = native_terminal_events(
+            axum::extract::State(state.clone()),
+            headers,
+            axum::extract::Path(sid.clone()),
+            axum::extract::Query(query),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "the derived cache must recover under poison"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["sessionId"], sid);
+        assert!(body["events"].as_array().unwrap().is_empty());
+    }
+
     /// The runtime + executor pair every test `ServerDeps` carries (the
     /// real orchestrator over the test store — the endpoints under test
     /// drive exactly what production drives).
@@ -1225,12 +1326,15 @@ mod tests {
                 ..Default::default()
             },
         );
-        let openai = faktor_openai::OpenAiProvider::build(faktor_openai::OpenAiConfig {
-            base_url: "http://127.0.0.1:1/v1".into(),
-            api_key: None,
-            family: faktor_openai::OpenAiFamily::Chat,
-            models: caps,
-        });
+        let openai = faktor_openai::OpenAiProvider::build(
+            faktor_openai::OpenAiConfig {
+                base_url: "http://127.0.0.1:1/v1".into(),
+                api_key: None,
+                family: faktor_openai::OpenAiFamily::Chat,
+                models: caps,
+            },
+            permissive_transport(),
+        );
         let deps = test_deps_with(dir.path(), vec![openai]);
         let token = deps.auth_token.clone();
         let handle = serve(deps, 0).await.unwrap();
@@ -4164,12 +4268,15 @@ mod tests {
                 ..Default::default()
             },
         );
-        let openai = faktor_openai::OpenAiProvider::build(faktor_openai::OpenAiConfig {
-            base_url: "http://127.0.0.1:1/v1".into(),
-            api_key: Some("sk-super-secret".into()),
-            family: faktor_openai::OpenAiFamily::Chat,
-            models: caps,
-        });
+        let openai = faktor_openai::OpenAiProvider::build(
+            faktor_openai::OpenAiConfig {
+                base_url: "http://127.0.0.1:1/v1".into(),
+                api_key: Some("sk-super-secret".into()),
+                family: faktor_openai::OpenAiFamily::Chat,
+                models: caps,
+            },
+            permissive_transport(),
+        );
         let deps = test_deps_with(dir.path(), vec![openai]);
         let token = deps.auth_token.clone();
         let handle = serve(deps, 0).await.unwrap();

@@ -2,7 +2,9 @@
 // session model picker): the registered providers and their known models
 // from `GET /native/providers` (falling back to the `GET /models` catalog
 // when the registry route is absent), the daemon identity the session runs
-// against, and the mutation-mode default the Task composer submits.
+// against, and the mutation-mode value the Task composer submits.
+// The mutation surface is shadow-only: `default`/`shadow`, never the
+// removed direct-owner mode (which cannot be selected or read back).
 // Selection is held here and read by the panel when it creates a session or
 // starts a task; nothing is fabricated when a route is unavailable.
 package dev.faktor.frontend
@@ -63,7 +65,6 @@ class SettingsPanel : JPanel(BorderLayout()) {
     init {
         mutationModel.addElement("default")
         mutationModel.addElement("shadow")
-        mutationModel.addElement("direct_compat")
         providerCombo.addActionListener(ActionListener { providerChanged() })
         modelCombo.addActionListener(ActionListener { emitSelection() })
         refreshButton.addActionListener { listener?.onRefreshProviders() }
@@ -193,8 +194,10 @@ class SettingsPanel : JPanel(BorderLayout()) {
 
     fun selectedModel(): String? = modelCombo.selectedItem as? String
 
-    fun mutationMode(): String? =
-        (mutationCombo.selectedItem as? String)?.takeIf { it != "default" }
+    fun mutationMode(): String? {
+        val selected = mutationCombo.selectedItem as? String ?: return null
+        return selected.takeIf { it != "default" && mutationModes().contains(it) }
+    }
 
     fun available(): Boolean = available
 
@@ -223,8 +226,11 @@ class SettingsPanel : JPanel(BorderLayout()) {
         modelCombo.selectedItem = name
     }
 
+    /** Select one offered mode; an unknown/removed mode is refused (no-op). */
     fun selectMutationMode(mode: String) {
-        mutationCombo.selectedItem = mode
+        val index = (0 until mutationModel.size)
+            .indexOfFirst { mutationModel.getElementAt(it) == mode }
+        if (index >= 0) mutationCombo.selectedIndex = index
     }
 
     fun mutationModes(): List<String> {

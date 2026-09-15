@@ -1854,7 +1854,7 @@ pub mod usage_conformance {
 ///     family: faktor_provider::usage_conformance::WireFamily::InclusiveTotal,
 ///     label: "openai chat completions",
 ///     request: || req("m1"),
-///     provider: |base: String| OpenAiProvider::build(OpenAiConfig::chat(base, None)),
+///     provider: |base: String| OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None)),
 ///     method: "POST",
 ///     path: "/chat/completions",
 ///     cases: vec![ /* one WireUsageCase per required case name */ ],

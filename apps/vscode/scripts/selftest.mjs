@@ -1233,25 +1233,64 @@ async function daemonTests() {
 // ---------------------------------------- 7. VS Code product defect fixes
 
 async function shadowDefaultTests() {
-  await test('P0 shadow default: empty setting inherits the daemon, never direct_compat', () => {
+  await test('P0 shadow-only: the setting vocabulary is shadow/empty and the removed mode never forwards', () => {
     const base = ts.startTaskRequest('goal', { mutationMode: '', maxTokens: 0, maxCostMicro: 0 });
     assert(!('mutation_mode' in base), `empty setting must omit mutation_mode: ${JSON.stringify(base)}`);
     assertDeepEqual(
       ts.startTaskRequest('goal', { mutationMode: 'shadow', maxTokens: 10, maxCostMicro: 5 }),
       { goal: 'goal', max_tokens: 10, max_cost_micro: 5, mutation_mode: 'shadow' },
     );
-    assertEqual(
-      ts.startTaskRequest('goal', { mutationMode: 'direct_compat', maxTokens: 0, maxCostMicro: 0 }).mutation_mode,
-      'direct_compat',
+    // The removed direct-owner mode can never reach the wire, even from a
+    // hostile/legacy caller that bypasses the setting enum.
+    assert(
+      !(
+        'mutation_mode' in
+        ts.startTaskRequest('goal', { mutationMode: 'direct_compat', maxTokens: 0, maxCostMicro: 0 })
+      ),
+      'the removed mode must never be forwarded',
     );
     const manifest = JSON.parse(
       readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
     );
-    assertEqual(
-      manifest.contributes.configuration.properties['faktor.mutationMode'].default,
-      '',
-      'the setting default must be inherit-daemon',
+    const setting = manifest.contributes.configuration.properties['faktor.mutationMode'];
+    assertEqual(setting.default, '', 'the setting default must be inherit-daemon');
+    assertDeepEqual(setting.enum, ['shadow', ''], 'the setting must offer shadow/empty only');
+    assert(!setting.enum.includes('direct_compat'), 'the removed mode must not be selectable');
+  });
+
+  await test('removed direct_compat is a typed strict-parse refusal before any request', async () => {
+    const calls = [];
+    const failures = [];
+    const outcome = await ts.startTaskRun({
+      client: {
+        startTaskRun: async (sessionId, request) => {
+          calls.push({ sessionId, request });
+          return taskRunStartedJson;
+        },
+      },
+      sessionId: '7',
+      goal: 'ship it',
+      settings: { mutationMode: 'direct_compat', maxTokens: 0, maxCostMicro: 0 },
+      onStarted: () => {
+        throw new Error('must not start');
+      },
+      onFailure: (failure) => failures.push(failure),
+    });
+    assertEqual(calls.length, 0, 'a removed mode must never reach the daemon');
+    assertEqual(outcome.ok, false);
+    assertEqual(outcome.runId, null);
+    assertEqual(failures.length, 1);
+    assertEqual(failures[0].kind, 'validation');
+    assertEqual(failures[0].status, null);
+    assert(
+      failures[0].message.includes('direct_compat') && failures[0].message.includes('removed'),
+      failures[0].message,
     );
+    // The strict parser is the one vocabulary authority: never coerces.
+    assertDeepEqual(ts.parseMutationModeSetting(''), { mode: '' });
+    assertDeepEqual(ts.parseMutationModeSetting('shadow'), { mode: 'shadow' });
+    assert('reason' in ts.parseMutationModeSetting('direct_compat'));
+    assert('reason' in ts.parseMutationModeSetting('nonsense'));
   });
 
   await test('409 shadow refusal is typed/actionable and attempted exactly once (no downgrade)', async () => {
@@ -1285,8 +1324,12 @@ async function shadowDefaultTests() {
     assertEqual(failures.length, 1);
     assertEqual(failures[0].kind, 'shadow_unregistered');
     assert(
-      failures[0].message.includes('direct_compat'),
-      `message must name the opt-in: ${failures[0].message}`,
+      !failures[0].message.includes('direct_compat'),
+      `message must not name a removed opt-in: ${failures[0].message}`,
+    );
+    assert(
+      failures[0].message.includes('shadow') && failures[0].message.includes('registered'),
+      `message must name the shadow/worktree cause: ${failures[0].message}`,
     );
     assert(failures[0].message.includes('native API error 409'), failures[0].message);
   });

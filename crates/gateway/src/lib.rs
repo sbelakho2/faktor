@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use faktor_core::model::ModelCapabilities;
 use faktor_openai::{OpenAiConfig, OpenAiProvider};
-use faktor_provider::egress::{HttpTransport, PolicyCheckedHttpTransport};
+use faktor_provider::egress::HttpTransport;
+#[cfg(test)]
+use faktor_provider::egress::PolicyCheckedHttpTransport;
 use faktor_provider::Provider;
 
 #[derive(Debug, Clone)]
@@ -49,25 +51,18 @@ impl GatewayConfig {
 }
 
 /// Build a gateway provider. Model routing is prefix-based and happens
-/// inside the adapter; the agent never sees it.
-pub fn build(config: GatewayConfig) -> Arc<dyn Provider> {
-    build_with_transport(config, Arc::new(PolicyCheckedHttpTransport::permissive()))
-}
-
-/// Build a gateway provider with an injected egress transport
-/// (policy-checked in production, mock in tests). The SAME transport is
-/// shared by both paths (plain forwarding through the openai provider and
-/// the extra-headers path through `HeaderGateway`), so one installed
-/// destination policy governs the whole gateway.
-pub fn build_with_transport(
-    config: GatewayConfig,
-    transport: Arc<dyn HttpTransport>,
-) -> Arc<dyn Provider> {
+/// inside the adapter; the agent never sees it. The egress transport is
+/// injected (the daemon passes the policy-checked one); there is no
+/// permissive default. The SAME transport is shared by both paths (plain
+/// forwarding through the openai provider and the extra-headers path through
+/// `HeaderGateway`), so one installed destination policy governs the whole
+/// gateway.
+pub fn build(config: GatewayConfig, transport: Arc<dyn HttpTransport>) -> Arc<dyn Provider> {
     let mut openai = OpenAiConfig::chat(&config.base_url, config.api_key.clone());
     openai = openai.with_default_caps(config.default_caps.clone());
     // Extra headers are applied by the openai transport on the gateway path
     // only (every other adapter passes an empty list).
-    let provider = OpenAiProvider::build_with_transport(openai, transport.clone());
+    let provider = OpenAiProvider::build(openai, transport.clone());
     if config.extra_headers.is_empty() && config.route_prefixes.is_empty() {
         return provider;
     }
@@ -80,6 +75,13 @@ pub fn build_with_transport(
         base_url: config.base_url,
         api_key: config.api_key,
     })
+}
+
+/// Test-only default-allow constructor: production code MUST inject a
+/// policy-checked transport; in-crate tests use this for local mock servers.
+#[cfg(test)]
+pub fn permissive_for_tests(config: GatewayConfig) -> Arc<dyn Provider> {
+    build(config, Arc::new(PolicyCheckedHttpTransport::permissive()))
 }
 
 struct HeaderGateway {
@@ -202,7 +204,7 @@ mod tests {
             route_prefixes: vec![("deepseek/".into(), "routed-model".into())],
             default_caps: ModelCapabilities::default(),
         };
-        let provider = build(cfg);
+        let provider = permissive_for_tests(cfg);
         let mut stream = provider.stream(req("deepseek/deepseek-chat"));
         while let Some(chunk) = stream.next().await {
             if let Ok(ProviderChunk::Done) = chunk {
@@ -214,7 +216,7 @@ mod tests {
     #[tokio::test]
     async fn capabilities_surface_via_caps_not_names() {
         let cfg = GatewayConfig::openrouter(None);
-        let provider = build(cfg);
+        let provider = permissive_for_tests(cfg);
         let caps = provider.capabilities("anthropic/claude-x");
         assert!(caps.tools);
         assert!(caps.vision);
@@ -246,7 +248,7 @@ mod tests {
             route_prefixes: vec![],
             default_caps: ModelCapabilities::default(),
         };
-        let provider = build(cfg);
+        let provider = permissive_for_tests(cfg);
         let mut stream = provider.stream(req("deepseek/deepseek-v4-flash"));
         while let Some(chunk) = stream.next().await {
             if let Ok(ProviderChunk::Done) = chunk {
@@ -283,8 +285,10 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider =
-            faktor_openai::OpenAiProvider::build(faktor_openai::OpenAiConfig::chat(base, None));
+        let provider = faktor_openai::OpenAiProvider::build(
+            faktor_openai::OpenAiConfig::chat(base, None),
+            Arc::new(PolicyCheckedHttpTransport::permissive()),
+        );
         let mut stream = provider.stream(req("m"));
         while let Some(chunk) = stream.next().await {
             if let Ok(ProviderChunk::Done) = chunk {
@@ -343,11 +347,11 @@ mod tests {
             }
         };
 
-        let allowed = build_with_transport(cfg(false), allow_only(port));
+        let allowed = build(cfg(false), allow_only(port));
         drain(allowed).await;
         assert_eq!(server.request_count(), 1);
 
-        let denied = build_with_transport(cfg(false), allow_only(port.wrapping_add(1)));
+        let denied = build(cfg(false), allow_only(port.wrapping_add(1)));
         let mut stream = denied.stream(req("m"));
         let err = stream
             .next()
@@ -376,11 +380,11 @@ mod tests {
                 ],
             },
         );
-        let allowed = build_with_transport(cfg(true), allow_only(port));
+        let allowed = build(cfg(true), allow_only(port));
         drain(allowed).await;
         assert_eq!(server.request_count(), 2);
 
-        let denied = build_with_transport(cfg(true), allow_only(port.wrapping_add(1)));
+        let denied = build(cfg(true), allow_only(port.wrapping_add(1)));
         let mut stream = denied.stream(req("m"));
         let err = stream
             .next()
@@ -405,7 +409,7 @@ mod tests {
             route_prefixes: vec![],
             default_caps: ModelCapabilities::default(),
         };
-        let provider = build_with_transport(cfg, as_transport);
+        let provider = build(cfg, as_transport);
         let mut stream = provider.stream(req("m"));
         let mut text = String::new();
         while let Some(chunk) = stream.next().await {
@@ -506,7 +510,7 @@ mod tests {
                 cfg.base_url = base;
                 cfg.extra_headers = vec![("x-title".into(), "Faktor".into())];
                 cfg.default_caps.tools = true;
-                build(cfg)
+                permissive_for_tests(cfg)
             },
             method: "POST",
             path: "/chat/completions",

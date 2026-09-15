@@ -502,8 +502,8 @@ impl IndexService {
         log_sweep_summary("attach", workspace.raw(), sweep);
         // Fresh workspace: resolve root + watcher handle. P0-48 root
         // re-pointing: while exactly ONE session of this workspace carries a
-        // LIVE durable shadow row (a shadowed single-agent drive under
-        // `[tasks] shadow_mutation`), the workspace's index resolves from
+        // LIVE durable shadow row (a shadowed single-agent drive — shadow
+        // mutation is the only mutation policy), the workspace's index resolves from
         // the SHADOW root — evidence and fingerprint/watch reflect the world
         // the drive mutates. Zero live shadows keep the stored workspace
         // root byte-identically; ambiguity or a corrupt registry degrades to
@@ -1955,6 +1955,9 @@ mod tests {
     /// under machine-wide load (other test binaries / cold heavy fixtures
     /// sharing the box) while builds were still making progress.
     const DEADLINE: Duration = Duration::from_secs(300);
+    /// Watcher-driven rebuilds are scheduled against machine load; this
+    /// ceiling only fails when no rebuild ever happens.
+    const WATCHER_DEADLINE: Duration = Duration::from_secs(240);
 
     struct Env {
         _dir: TempDir,
@@ -2707,7 +2710,9 @@ mod tests {
             // transient (dirty -> claim -> build happen inside one reconcile
             // pass), so the assertion is journal-based.
             write(&env.repo, "b.rs", "pub fn second_fn() {}\n");
-            let deadline = tokio::time::Instant::now() + DEADLINE;
+            // A watcher event under full-suite load can take minutes to
+            // schedule; the assertion (the rebuild happened) is unchanged.
+            let deadline = tokio::time::Instant::now() + WATCHER_DEADLINE;
             loop {
                 if let Some((St::Ready { generation }, _)) = svc.state(ws) {
                     if generation >= 2 {

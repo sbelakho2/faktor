@@ -201,6 +201,11 @@ mod tests {
     use faktor_provider::FakeProvider;
     use faktor_search::Embedder as _;
 
+    /// Test-only default-allow transport (the mock server is localhost).
+    fn permissive_transport() -> Arc<dyn faktor_provider::egress::HttpTransport> {
+        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::permissive())
+    }
+
     fn one(value: f32) -> EmbeddingResponse {
         EmbeddingResponse::new(vec![vec![value]]).unwrap()
     }
@@ -375,7 +380,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)), permissive_transport());
         let embedder = ProviderEmbedder::new(provider, "m", policy(3, RetryClass::Always))
             .with_sleeper(noop_sleeper());
         let out = embedder.try_embed(&["x".into()]).unwrap();
@@ -388,7 +393,7 @@ mod tests {
         let mock = Arc::new(MockHttpTransport::denying(
             faktor_provider::egress::EgressError::UnparseableUrl("nope".into()),
         ));
-        let denied = OllamaProvider::new_with_transport(
+        let denied = OllamaProvider::new(
             OllamaConfig::new(Some("http://mock.invalid".into())),
             mock.clone(),
         );

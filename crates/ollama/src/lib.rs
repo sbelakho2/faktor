@@ -23,9 +23,9 @@ use faktor_core::model::{ModelCapabilities, ReasoningMode};
 use faktor_provider::catalog::{
     ModelCatalogEntry, PricingState, Provenance, QualityPrior, CATALOG_FIRST_EPOCH,
 };
-use faktor_provider::egress::{
-    execute_get, execute_post_json, HttpTransport, PolicyCheckedHttpTransport,
-};
+#[cfg(test)]
+use faktor_provider::egress::PolicyCheckedHttpTransport;
+use faktor_provider::egress::{execute_get, execute_post_json, HttpTransport};
 use faktor_provider::transport::{
     guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES, PROVIDER_CEILING_MS,
 };
@@ -172,17 +172,10 @@ pub struct OllamaProvider {
 }
 
 impl OllamaProvider {
-    /// Concrete constructor (for discovery/probing APIs).
-    pub fn new(config: OllamaConfig) -> Arc<Self> {
-        Self::new_with_transport(config, Arc::new(PolicyCheckedHttpTransport::permissive()))
-    }
-
-    /// Concrete constructor with an injected transport (policy-checked in
-    /// production, mock in tests).
-    pub fn new_with_transport(
-        config: OllamaConfig,
-        transport: Arc<dyn HttpTransport>,
-    ) -> Arc<Self> {
+    /// Concrete production constructor: the egress transport is injected
+    /// (the daemon passes the policy-checked one); there is no permissive
+    /// default. Used for discovery/probing APIs.
+    pub fn new(config: OllamaConfig, transport: Arc<dyn HttpTransport>) -> Arc<Self> {
         Arc::new(Self {
             config,
             transport,
@@ -190,6 +183,14 @@ impl OllamaProvider {
             runtime_limits: std::sync::RwLock::new(HashMap::new()),
             response_seq: AtomicU64::new(0),
         })
+    }
+
+    /// Test-only default-allow constructor: production code MUST inject a
+    /// policy-checked transport; in-crate tests use this for local mock
+    /// servers.
+    #[cfg(test)]
+    pub fn permissive_for_tests(config: OllamaConfig) -> Arc<Self> {
+        Self::new(config, Arc::new(PolicyCheckedHttpTransport::permissive()))
     }
 
     /// Live capability warm-up (spec §10): `GET /api/tags` discovers the
@@ -296,8 +297,10 @@ impl OllamaProvider {
         }
     }
 
-    pub fn build(config: OllamaConfig) -> Arc<dyn Provider> {
-        Self::new(config)
+    /// Build a provider over an injected egress transport (the production
+    /// trait-object surface; see [`OllamaProvider::new`]).
+    pub fn build(config: OllamaConfig, transport: Arc<dyn HttpTransport>) -> Arc<dyn Provider> {
+        Self::new(config, transport)
     }
 
     /// Discover installed models (spec §10): `GET /api/tags`.
@@ -1502,14 +1505,16 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         let models = provider.discover_models().await.unwrap();
         assert_eq!(models, vec!["llama3.2:3b", "qwen3.8:latest"]);
     }
 
     #[tokio::test]
     async fn discovery_failure_is_loud() {
-        let provider = OllamaProvider::new(OllamaConfig::new(Some("http://127.0.0.1:1".into())));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(
+            "http://127.0.0.1:1".into(),
+        )));
         assert!(provider.discover_models().await.is_err());
     }
 
@@ -1534,7 +1539,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         let caps = provider.probe_model("qwen3.8").await.unwrap();
         assert_eq!(caps.context, 262_144);
         assert!(caps.tools);
@@ -1586,7 +1591,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::build(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         let mut stream = provider.stream(req("qwen3.8"));
         let mut text = String::new();
         while let Some(chunk) = stream.next().await {
@@ -1608,7 +1613,7 @@ mod tests {
         let server = MockServer::new();
         server.route("POST", "/api/chat", MockAction::Silent { status: 200 });
         let base = server.base_url().await;
-        let provider = OllamaProvider::build(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         let mut g = req("qwen3.8");
         g.meta.deadline_ms = 1200;
         let mut stream = provider.stream(g);
@@ -1646,7 +1651,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::build(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         let mut stream = provider.stream(req("qwen3.8"));
         let mut call = None;
         while let Some(chunk) = stream.next().await {
@@ -1673,7 +1678,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::build(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         let mut stream = provider.stream(req("qwen3.8"));
         let mut saw_error = false;
         let mut got_partial = false;
@@ -1701,7 +1706,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::build(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         let mut stream = provider.stream(req("qwen3.8"));
         let err = stream.next().await.unwrap().unwrap_err();
         assert_eq!(err.kind, ProviderErrorKind::RateLimited);
@@ -1720,14 +1725,14 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         let err = provider.probe_model("ghost").await.unwrap_err();
         assert!(err.kind == ErrorKind::NotFound, "{err:?}");
     }
 
     #[test]
     fn default_capabilities_are_small_local() {
-        let provider = OllamaProvider::build(OllamaConfig::new(None));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(None));
         let caps = provider.capabilities("anything");
         assert_eq!(caps.context, 32_768);
         assert!(caps.tools);
@@ -1753,7 +1758,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::build(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         let mut stream = provider.stream(req("qwen3.8"));
         let mut text = String::new();
         while let Some(chunk) = stream.next().await {
@@ -1800,7 +1805,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         // Before warm-up: the conservative default.
         assert_eq!(
             provider.capabilities("qwen3.8:latest").context,
@@ -1835,7 +1840,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         assert!(provider.refresh_from_live().await.is_err());
         assert_eq!(
             provider.capabilities("qwen3.8:latest").context,
@@ -1889,7 +1894,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::build(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         let chunks = stream_chunks(&*provider, req("qwen3.8")).await;
         assert!(matches!(chunks.last(), Some(ProviderChunk::Done)));
     }
@@ -1909,7 +1914,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::build(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         let mut r = req("qwen3.8");
         r.messages.push(RequestMessage {
             role: Role::User,
@@ -1972,7 +1977,7 @@ mod tests {
                 ..ModelCapabilities::default()
             },
         );
-        let provider = OllamaProvider::build(cfg);
+        let provider = OllamaProvider::permissive_for_tests(cfg);
         let mut r = req("qwen3.8");
         r.messages.push(RequestMessage {
             role: Role::User,
@@ -2011,7 +2016,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         // Capability data explicitly probed as vision-less.
         assert!(!provider.capabilities("qwen3.8").vision);
         let mut r = req("qwen3.8");
@@ -2072,7 +2077,7 @@ mod tests {
                 ..ModelCapabilities::default()
             },
         );
-        let provider = OllamaProvider::new(cfg);
+        let provider = OllamaProvider::permissive_for_tests(cfg);
         assert!(
             !provider.document_capable("qwen3.8"),
             "the native wire has no document field"
@@ -2141,7 +2146,7 @@ mod tests {
                 ..ModelCapabilities::default()
             },
         );
-        let provider = OllamaProvider::new(cfg);
+        let provider = OllamaProvider::permissive_for_tests(cfg);
         assert!(
             provider.capabilities("qwen3.8").vision,
             "adapter capability data admits vision"
@@ -2195,7 +2200,7 @@ mod tests {
                 ..ModelCapabilities::default()
             },
         );
-        let provider = OllamaProvider::new(cfg);
+        let provider = OllamaProvider::permissive_for_tests(cfg);
         let mut r = req("qwen3.8");
         r.messages.push(RequestMessage {
             role: Role::User,
@@ -2247,7 +2252,7 @@ mod tests {
                 },
             );
         }
-        let provider = OllamaProvider::new(cfg);
+        let provider = OllamaProvider::permissive_for_tests(cfg);
         let mut r = req("qwen3.8");
         r.reasoning = reasoning;
         let chunks = stream_chunks(&*provider, r).await;
@@ -2298,7 +2303,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::build(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         let chunks = stream_chunks(&*provider, req("qwen3.8")).await;
         let mut kinds = Vec::new();
         for chunk in &chunks {
@@ -2337,7 +2342,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::build(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         let chunks = stream_chunks(&*provider, req("qwen3.8")).await;
         let calls: Vec<(String, String, serde_json::Value, bool)> = chunks
             .iter()
@@ -2391,7 +2396,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         let ids: Vec<String> = stream_chunks(&*provider, req("qwen3.8"))
             .await
             .into_iter()
@@ -2448,7 +2453,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::build(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         let mut r = req("qwen3.8");
         r.messages.push(RequestMessage {
             role: Role::Assistant,
@@ -2503,7 +2508,7 @@ mod tests {
                 },
             );
             let base = server.base_url().await;
-            let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+            let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
             provider.probe_model("qwen3.8").await.unwrap()
         }
         // Nested general section + dotted arch key (field-report fixture).
@@ -2555,7 +2560,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         let ctx = provider.runtime_context("qwen3.8").await.unwrap();
         assert_eq!(ctx.model_max, 262_144, "model max comes from /api/show");
         assert_eq!(
@@ -2593,7 +2598,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         assert_eq!(
             provider.effective_context("qwen3.8").await.unwrap(),
             Some(262_144),
@@ -2625,7 +2630,7 @@ mod tests {
                 },
             );
             let base = server.base_url().await;
-            let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+            let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
             provider.effective_context("qwen3.8").await
         }
         // Garbage body: loud error, never a panic.
@@ -2696,7 +2701,7 @@ mod tests {
                 },
             );
             let base = server.base_url().await;
-            let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+            let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
             (server, provider)
         }
         // Allocated 64K of a 256K maximum: the limit is the allocation.
@@ -2778,7 +2783,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         assert_eq!(
             provider.refresh_from_live().await.unwrap(),
             1,
@@ -2825,7 +2830,7 @@ mod tests {
         };
         ps(r#"{"models":[{"name":"qwen3.8:latest","details":{"context_length":65536}}]}"#);
         let base = server.base_url().await;
-        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         assert_eq!(provider.refresh_from_live().await.unwrap(), 1);
         assert_eq!(
             provider.runtime_context_limit("qwen3.8:latest"),
@@ -3032,10 +3037,7 @@ mod tests {
         );
         let base = server.base_url().await;
         let port = reqwest::Url::parse(&base).unwrap().port().unwrap();
-        let provider = OllamaProvider::new_with_transport(
-            OllamaConfig::new(Some(base.clone())),
-            allow_only(port),
-        );
+        let provider = OllamaProvider::new(OllamaConfig::new(Some(base.clone())), allow_only(port));
         let chunks = stream_chunks(&*provider, req("qwen3.8")).await;
         assert_eq!(
             chunks.first(),
@@ -3046,7 +3048,7 @@ mod tests {
         assert!(matches!(chunks.last(), Some(ProviderChunk::Done)));
         assert_eq!(server.request_count(), 1);
 
-        let denied = OllamaProvider::new_with_transport(
+        let denied = OllamaProvider::new(
             OllamaConfig::new(Some(base.clone())),
             allow_only(port.wrapping_add(1)),
         );
@@ -3056,7 +3058,7 @@ mod tests {
         assert_eq!(server.request_count(), 1, "deny happened before connect");
 
         // https-to-http mismatch against an https-only rule: pre-connect deny.
-        let mismatch = OllamaProvider::new_with_transport(
+        let mismatch = OllamaProvider::new(
             OllamaConfig::new(Some(base.clone())),
             Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
                 DestinationPolicy::parse_lines([&format!("https://127.0.0.1:{port}")]).unwrap(),
@@ -3076,15 +3078,12 @@ mod tests {
                 body: r#"{"models":[{"name":"qwen3.8:latest"}]}"#.into(),
             },
         );
-        let provider = OllamaProvider::new_with_transport(
-            OllamaConfig::new(Some(base.clone())),
-            allow_only(port),
-        );
+        let provider = OllamaProvider::new(OllamaConfig::new(Some(base.clone())), allow_only(port));
         let models = provider.discover_models().await.unwrap();
         assert_eq!(models, vec!["qwen3.8:latest"]);
         assert_eq!(server.request_count(), 2);
 
-        let denied = OllamaProvider::new_with_transport(
+        let denied = OllamaProvider::new(
             OllamaConfig::new(Some(base)),
             allow_only(port.wrapping_add(1)),
         );
@@ -3100,7 +3099,7 @@ mod tests {
 "#;
         let mock = Arc::new(MockHttpTransport::new(200, body));
         let as_transport: Arc<dyn HttpTransport> = mock.clone();
-        let provider = OllamaProvider::new_with_transport(
+        let provider = OllamaProvider::new(
             OllamaConfig::new(Some("http://mock.invalid".into())),
             as_transport,
         );
@@ -3184,7 +3183,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         let out = provider
             .embed(embed_req("all-minilm", &["alpha", "beta"]))
             .unwrap();
@@ -3240,7 +3239,7 @@ mod tests {
         ];
         for (name, body) in cases {
             let mock = Arc::new(MockHttpTransport::new(200, body));
-            let provider = OllamaProvider::new_with_transport(
+            let provider = OllamaProvider::new(
                 OllamaConfig::new(Some("http://mock.invalid".into())),
                 mock.clone(),
             );
@@ -3255,10 +3254,8 @@ mod tests {
             200,
             "x".repeat(EMBED_RESPONSE_MAX_BYTES + 1),
         ));
-        let provider = OllamaProvider::new_with_transport(
-            OllamaConfig::new(Some("http://mock.invalid".into())),
-            mock,
-        );
+        let provider =
+            OllamaProvider::new(OllamaConfig::new(Some("http://mock.invalid".into())), mock);
         let err = provider.embed(embed_req("m", &["a"])).unwrap_err();
         assert_eq!(err.kind, ProviderErrorKind::Malformed);
         assert!(err.message.contains("exceeds"), "{err}");
@@ -3277,10 +3274,8 @@ mod tests {
         ];
         for (status, kind, retryable) in cases {
             let mock = Arc::new(MockHttpTransport::new(status, "denied"));
-            let provider = OllamaProvider::new_with_transport(
-                OllamaConfig::new(Some("http://mock.invalid".into())),
-                mock,
-            );
+            let provider =
+                OllamaProvider::new(OllamaConfig::new(Some("http://mock.invalid".into())), mock);
             let err = provider.embed(embed_req("m", &["a"])).unwrap_err();
             assert_eq!(err.kind, kind, "status {status}");
             assert_eq!(err.retryable, retryable, "status {status}");
@@ -3288,7 +3283,7 @@ mod tests {
         }
         // Transport failure = retryable Network; a refused destination
         // (policy/build layer) is a terminal BadRequest.
-        let transport_err = OllamaProvider::new_with_transport(
+        let transport_err = OllamaProvider::new(
             OllamaConfig::new(Some("http://mock.invalid".into())),
             Arc::new(MockHttpTransport::denying(
                 faktor_provider::egress::EgressError::Transport("connection reset".into()),
@@ -3298,7 +3293,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(transport_err.kind, ProviderErrorKind::Network);
         assert!(transport_err.retryable);
-        let policy_err = OllamaProvider::new_with_transport(
+        let policy_err = OllamaProvider::new(
             OllamaConfig::new(Some("http://mock.invalid".into())),
             Arc::new(MockHttpTransport::denying(
                 faktor_provider::egress::EgressError::UnparseableUrl("nope".into()),
@@ -3334,7 +3329,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn embed_honors_the_operation_deadline_with_lineage() {
-        let provider = OllamaProvider::new_with_transport(
+        let provider = OllamaProvider::new(
             OllamaConfig::new(Some("http://mock.invalid".into())),
             Arc::new(SilentTransport),
         );
@@ -3350,10 +3345,8 @@ mod tests {
         // A zero deadline keeps the adapter's own first-byte fallback bound
         // (never unbounded); a fast mock answers well inside it.
         let mock = Arc::new(MockHttpTransport::new(200, r#"{"embeddings":[[1.0]]}"#));
-        let provider = OllamaProvider::new_with_transport(
-            OllamaConfig::new(Some("http://mock.invalid".into())),
-            mock,
-        );
+        let provider =
+            OllamaProvider::new(OllamaConfig::new(Some("http://mock.invalid".into())), mock);
         let out = provider.embed(embed_req("m", &["a"])).unwrap();
         assert_eq!(out.vectors, vec![vec![1.0]]);
     }
@@ -3403,7 +3396,7 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
         assert_eq!(provider.refresh_from_live().await.unwrap(), 3);
         assert!(provider.capabilities("embed-a").embeddings);
         assert!(provider.supports_embeddings("embed-a"));
@@ -3420,7 +3413,7 @@ mod tests {
         let mut caps = ModelCapabilities::small_local();
         caps.embeddings = true;
         cfg.model_overrides.insert("pinned".into(), caps);
-        let provider = OllamaProvider::new(cfg);
+        let provider = OllamaProvider::permissive_for_tests(cfg);
         assert!(provider.supports_embeddings("pinned"));
     }
 
@@ -3430,7 +3423,7 @@ mod tests {
     #[tokio::test]
     async fn embed_requires_a_model_and_a_bounded_batch_before_any_wire_byte() {
         let mock = Arc::new(MockHttpTransport::new(200, r#"{"embeddings":[[1.0]]}"#));
-        let provider = OllamaProvider::new_with_transport(
+        let provider = OllamaProvider::new(
             OllamaConfig::new(Some("http://mock.invalid".into())),
             mock.clone(),
         );
@@ -3495,7 +3488,7 @@ mod tests {
             family: faktor_provider::usage_conformance::WireFamily::NoCacheDetail,
             label: "ollama native /api/chat",
             request: || req("qwen3.8"),
-            provider: |base: String| OllamaProvider::build(OllamaConfig::new(Some(base))),
+            provider: |base: String| OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base))),
             method: "POST",
             path: "/api/chat",
             cases: vec![

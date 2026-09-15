@@ -356,7 +356,7 @@ fn daemon_config_json_is_strict_and_pinned() {
     assert_eq!(v["providers"][0]["kind"], "open_ai");
     assert_eq!(v["providers"][0]["base_url"], "http://127.0.0.1:8080/v1");
     assert_eq!(v["sandbox"]["network"][0], "http://127.0.0.1:8080");
-    assert!(v["tasks"]["shadow_mutation"] == serde_json::Value::Bool(false));
+    assert_eq!(v["tasks"]["mutation_mode"], "shadow");
 }
 
 #[test]

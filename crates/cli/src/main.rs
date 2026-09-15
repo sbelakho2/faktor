@@ -2298,6 +2298,13 @@ mod tests {
     use futures::StreamExt;
     use std::pin::Pin;
 
+    /// Test-only default-allow transport: every mock endpoint below is a
+    /// loopback server, and production construction injects the daemon's
+    /// policy-checked transport instead.
+    fn permissive_transport() -> Arc<dyn HttpTransport> {
+        Arc::new(PolicyCheckedHttpTransport::permissive())
+    }
+
     /// Permission requester that never blocks on a UI (text-only turns never
     /// ask, but AgentDeps requires one deterministically).
     struct AlwaysAllow;
@@ -2528,8 +2535,10 @@ mod tests {
                 },
             );
             let base = server.base_url().await;
-            let ollama =
-                faktor_ollama::OllamaProvider::new(faktor_ollama::OllamaConfig::new(Some(base)));
+            let ollama = faktor_ollama::OllamaProvider::new(
+                faktor_ollama::OllamaConfig::new(Some(base)),
+                permissive_transport(),
+            );
 
             let systems = Arc::new(std::sync::Mutex::new(Vec::new()));
             let chat = Arc::new(CapturingProvider {
@@ -3179,7 +3188,7 @@ mod tests {
         assert_eq!(semantic.max_entity_refs, Some(64));
         let supervisor =
             ProcessSupervisor::new(Arc::new(faktor_cas::Cas::new(dir.path().join("cas"))));
-        let transport: Arc<dyn HttpTransport> = Arc::new(PolicyCheckedHttpTransport::permissive());
+        let transport: Arc<dyn HttpTransport> = permissive_transport();
         let registry = graph::semantic_registry(&semantic, &supervisor, &transport).unwrap();
         assert!(
             registry.providers().is_empty(),
