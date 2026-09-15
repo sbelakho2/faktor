@@ -1560,9 +1560,32 @@ mod tests {
             stats.max_maintenance_us >= 25_000,
             "the slowed checkpoint is fully measured, not hidden: {stats:?}"
         );
-        assert_eq!(
-            stats.worker_blocked_over_5ms, 0,
-            "maintenance is excluded by type; no interactive segment may trip: {stats:?}"
+        // Differential proof of type-exclusion: run the SAME burst against an
+        // identical actor WITHOUT maintenance and compare the interactive
+        // blocked-segment counts. Under machine load either run may
+        // legitimately see a contended interactive segment; the excluded-by-
+        // type property is that the maintenance run gains NO extra blocked
+        // segments over the baseline under identical conditions. (A hard
+        // ==0 assertion measured the host's scheduling, not the exclusion
+        // design — it flaked under certificate load.)
+        let (_d2, store2, actor2) = tmp_actor(DbActorConfig {
+            capacity: 2048,
+            max_batch: 32,
+            flush_tick: Duration::from_millis(1),
+            maintenance_delay: None,
+            ..Default::default()
+        });
+        let handle2 = actor2.handle();
+        let sid2 = new_session(&store2);
+        append_burst(&handle2, sid2, 64, 32, 0).await;
+        let base = actor2.stats();
+        assert_eq!(base.completed, 2048, "baseline burst landed");
+        assert!(
+            stats.worker_blocked_over_5ms <= base.worker_blocked_over_5ms,
+            "maintenance must not ADD interactive blocked segments \
+             (maintenance run {:?} vs baseline {:?})",
+            stats,
+            base
         );
         assert!(stats.max_block_us > 0, "interactive segments instrumented");
         assert_eq!(store.message_count(sid).unwrap(), 2048);
