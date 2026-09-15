@@ -206,9 +206,13 @@
 //! connection terminal registry keys rows by `(sessionId, terminalId)`,
 //! a foreign session or terminal id is a typed `-32602` denial (existence is
 //! never leaked), and `terminal/list` projects only the requesting session's
-//! rows with their ownership ids. Output arrives as bounded `session/update`
-//! extension frames (`kind: "terminalOutput"`, [`terminal_output_update`]):
-//! coalesced per pump window, capped per frame
+//! rows with their ownership ids. A durable authority can opt in
+//! ([`TerminalAuthority::exposes_durable_terminals`] /
+//! [`TerminalAuthority::list_terminals`]) to project ITS durable rows for
+//! the listing instead — including rows a restart recovered as lost — while
+//! the per-connection table keeps owning output pumping. Output arrives as
+//! bounded `session/update` extension frames (`kind: "terminalOutput"`,
+//! [`terminal_output_update`]): coalesced per pump window, capped per frame
 //! ([`AcpConfig::terminal_output_frame_max`]) and per window
 //! ([`AcpConfig::terminal_output_window_max`]), ordered by a per-terminal
 //! `seq`; when the writer queue is full or a window cap is hit, bytes are
@@ -219,9 +223,11 @@
 //! Lifetime: terminals are cancellable (per-terminal `kill`/`close`, and the
 //! connection's wind-down on EOF), bounded by [`AcpConfig::max_terminals`]
 //! and the [`AcpConfig::max_sessions`]-capped session index, session-scoped,
-//! and killed before the serve loop returns; dropping the authority handle is
-//! the final failsafe, so no child outlives its connection. This crate
-//! implements no PTY itself: everything goes through the injected
+//! and killed before the serve loop returns. The process is owned by the
+//! attached authority (the daemon's durable terminal service owns the pty
+//! and journals every transition), so dropping the connection table does not
+//! orphan or silently kill a row the durable authority still governs. This
+//! crate implements no PTY itself: everything goes through the injected
 //! [`TerminalAuthority`] seam, which the daemon maps onto `faktor-pty` and
 //! its existing session-owned terminal rows.
 //!
@@ -1647,10 +1653,37 @@ pub trait TerminalHandle: Send + Sync {
     fn kill(&self) -> Result<(), TerminalError>;
 }
 
+/// One durable session-owned terminal row as reported by a
+/// [`TerminalAuthority`] that exposes its durable store. This is the ACP
+/// projection of the authority's own rows — the authority remains the
+/// single source of truth; ACP never invents a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalAuthorityRow {
+    /// The authority's terminal UUID (the durable row key).
+    pub terminal_id: String,
+    /// The owning session.
+    pub session_id: String,
+    /// The owning session's durable task identity.
+    pub task_id: String,
+    /// The orchestrator child agent that spawned the terminal, when one did.
+    pub agent_id: Option<String>,
+    /// The durable operation id of the spawn.
+    pub operation_id: String,
+    /// The child pid at spawn (0 = never observed).
+    pub pid: u32,
+    /// The OS process start-time marker (0 = unverified identity).
+    pub start_time_ms: i64,
+    /// The durable lifecycle state (`created|running|exited|killed|lost|
+    /// reconciled`).
+    pub state: String,
+    /// Whether a live pty authority of this daemon boot owns the row.
+    pub alive: bool,
+}
+
 /// The terminal seam: the daemon attaches its existing session-owned
-/// terminal authority (faktor-pty + ownership rows) here. This crate owns
-/// no PTY of its own; absent an authority, the `faktor.terminal` extension
-/// is not negotiated and every `terminal/*` request answers `-32601`.
+/// terminal authority (faktor-pty + durable rows) here. This crate owns no
+/// PTY of its own; absent an authority, the `faktor.terminal` extension is
+/// not negotiated and every `terminal/*` request answers `-32601`.
 pub trait TerminalAuthority: Send + Sync {
     /// Create a session-owned terminal. `session_id` is the session the
     /// caller proved ownership of; the authority must enforce its own
@@ -1660,6 +1693,25 @@ pub trait TerminalAuthority: Send + Sync {
         session_id: &str,
         spec: &TerminalSpec,
     ) -> Result<Arc<dyn TerminalHandle>, TerminalError>;
+
+    /// Whether this authority exposes its durable terminal rows
+    /// ([`Self::list_terminals`]). The default is `false`: a create-only
+    /// authority keeps the ACP connection table as its listing surface.
+    fn exposes_durable_terminals(&self) -> bool {
+        false
+    }
+
+    /// The session's durable terminal rows, scope-enforced by the
+    /// authority. Only called when [`Self::exposes_durable_terminals`] is
+    /// true; the default reports the seam does not expose a listing.
+    fn list_terminals(
+        &self,
+        _session_id: &str,
+    ) -> Result<Vec<TerminalAuthorityRow>, TerminalError> {
+        Err(TerminalError::Unavailable(
+            "this terminal authority does not expose its durable rows".into(),
+        ))
+    }
 }
 
 impl<T: TerminalAuthority + ?Sized> TerminalAuthority for Arc<T> {
@@ -1669,6 +1721,14 @@ impl<T: TerminalAuthority + ?Sized> TerminalAuthority for Arc<T> {
         spec: &TerminalSpec,
     ) -> Result<Arc<dyn TerminalHandle>, TerminalError> {
         (**self).create(session_id, spec)
+    }
+
+    fn exposes_durable_terminals(&self) -> bool {
+        (**self).exposes_durable_terminals()
+    }
+
+    fn list_terminals(&self, session_id: &str) -> Result<Vec<TerminalAuthorityRow>, TerminalError> {
+        (**self).list_terminals(session_id)
     }
 }
 
@@ -3535,6 +3595,33 @@ async fn terminal_close(
 fn terminal_list(terminals: &TerminalRegistry, params: &Value) -> Result<Value, ServerError> {
     let object = strict_terminal_params(params, &["sessionId"])?;
     let session_id = require_terminal_session(terminals, object)?;
+    // When the attached authority exposes its durable rows, the listing IS
+    // the authority's projection (including Lost rows a restart recovered);
+    // otherwise the per-connection table remains the create-only surface.
+    if let Some(authority) = &terminals.authority {
+        if authority.exposes_durable_terminals() {
+            let rows = authority
+                .list_terminals(&session_id)
+                .map_err(terminal_error_to_server)?;
+            let rows: Vec<Value> = rows
+                .into_iter()
+                .map(|row| {
+                    json!({
+                        "terminalId": row.terminal_id,
+                        "sessionId": row.session_id,
+                        "taskId": row.task_id,
+                        "agentId": row.agent_id,
+                        "operationId": row.operation_id,
+                        "pid": row.pid,
+                        "startTimeMs": row.start_time_ms,
+                        "state": row.state,
+                        "alive": row.alive,
+                    })
+                })
+                .collect();
+            return Ok(json!({ "sessionId": session_id, "terminals": rows }));
+        }
+    }
     let rows = terminals.list(&session_id)?;
     Ok(json!({ "sessionId": session_id, "terminals": rows }))
 }

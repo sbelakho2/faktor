@@ -3068,3 +3068,407 @@ async fn terminal_env_allowlist_never_carries_daemon_secrets() {
         .await;
     assert_eq!(msg["result"], json!({}));
 }
+
+// ---------------------------------------------------------------------------
+// Durable terminal authority: the ACP adapter over the daemon's ONE
+// TerminalService (the same authority the native HTTP surface drives).
+// ---------------------------------------------------------------------------
+
+/// The ACP adapter over the real durable server authority — the exact
+/// delegation shape the daemon attaches with `with_terminal_authority`.
+struct DurableAuthority {
+    service: Arc<faktor_server::native::terminal_authority::TerminalService>,
+}
+
+fn map_durable_error(
+    error: faktor_server::native::terminal_authority::TerminalServiceError,
+) -> TerminalError {
+    use faktor_server::native::terminal_authority::TerminalServiceError as ServiceError;
+    match error {
+        ServiceError::Invalid(message) => TerminalError::Invalid(message),
+        ServiceError::Unknown { terminal_id, .. }
+        | ServiceError::ForeignScope { terminal_id, .. } => {
+            TerminalError::Invalid(format!("unknown terminal {terminal_id:?}"))
+        }
+        ServiceError::Lost {
+            terminal_id,
+            detail,
+        } => TerminalError::Refused(format!("terminal {terminal_id:?} is lost: {detail}")),
+        ServiceError::IdentityMismatch { terminal_id, .. } => {
+            TerminalError::Refused(format!("terminal {terminal_id:?} identity mismatch"))
+        }
+        ServiceError::State {
+            terminal_id, state, ..
+        } => TerminalError::Refused(format!("terminal {terminal_id:?} is {state}")),
+        ServiceError::Refused(message) => TerminalError::Refused(message),
+        ServiceError::Unavailable(message) => TerminalError::Unavailable(message),
+    }
+}
+
+impl TerminalAuthority for DurableAuthority {
+    fn create(
+        &self,
+        session_id: &str,
+        spec: &TerminalSpec,
+    ) -> Result<Arc<dyn TerminalHandle>, TerminalError> {
+        let request = faktor_server::native::terminal_authority::TerminalSpawnRequest {
+            command: spec.command.clone(),
+            args: spec.args.clone(),
+            cwd: spec.cwd.clone(),
+            env: spec.env.clone(),
+            rows: spec.rows,
+            cols: spec.cols,
+        };
+        let creation = self
+            .service
+            .spawn(session_id, &request)
+            .map_err(map_durable_error)?;
+        Ok(Arc::new(DurableHandle {
+            handle: creation.handle,
+        }))
+    }
+
+    fn exposes_durable_terminals(&self) -> bool {
+        true
+    }
+
+    fn list_terminals(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<faktor_acp::TerminalAuthorityRow>, TerminalError> {
+        self.service
+            .list(session_id)
+            .map_err(map_durable_error)
+            .map(|views| {
+                views
+                    .into_iter()
+                    .map(|view| {
+                        let state = view.state_tag().to_string();
+                        faktor_acp::TerminalAuthorityRow {
+                            terminal_id: view.terminal_id,
+                            session_id: view.session_id.to_string(),
+                            task_id: view.task_id.to_string(),
+                            agent_id: view.agent_id,
+                            operation_id: view.operation_id.to_string(),
+                            pid: view.pid,
+                            start_time_ms: view.start_time_ms,
+                            state,
+                            alive: view.alive,
+                        }
+                    })
+                    .collect()
+            })
+    }
+}
+
+struct DurableHandle {
+    handle: faktor_server::native::terminal_authority::TerminalHandle,
+}
+
+impl TerminalHandle for DurableHandle {
+    fn terminal_id(&self) -> &str {
+        self.handle.terminal_id()
+    }
+    fn pid(&self) -> u32 {
+        self.handle.pid()
+    }
+    fn is_alive(&self) -> bool {
+        self.handle.is_alive()
+    }
+    fn ownership_id(&self) -> &str {
+        self.handle.ownership_id()
+    }
+    fn write(&self, bytes: &[u8]) -> Result<(), TerminalError> {
+        self.handle.write(bytes).map_err(|e| match e {
+            faktor_server::native::terminal_authority::TerminalRegistryError::Invalid(m) => {
+                TerminalError::Invalid(m)
+            }
+            faktor_server::native::terminal_authority::TerminalRegistryError::Refused(m) => {
+                TerminalError::Refused(m)
+            }
+            faktor_server::native::terminal_authority::TerminalRegistryError::Unavailable(m) => {
+                TerminalError::Unavailable(m)
+            }
+        })
+    }
+    fn resize(&self, rows: u16, cols: u16) -> Result<(), TerminalError> {
+        self.handle.resize(rows, cols).map_err(|e| match e {
+            faktor_server::native::terminal_authority::TerminalRegistryError::Invalid(m) => {
+                TerminalError::Invalid(m)
+            }
+            faktor_server::native::terminal_authority::TerminalRegistryError::Refused(m) => {
+                TerminalError::Refused(m)
+            }
+            faktor_server::native::terminal_authority::TerminalRegistryError::Unavailable(m) => {
+                TerminalError::Unavailable(m)
+            }
+        })
+    }
+    fn drain_output(&self) -> Vec<u8> {
+        self.handle.drain_output()
+    }
+    fn kill(&self) -> Result<(), TerminalError> {
+        self.handle.kill().map_err(|e| match e {
+            faktor_server::native::terminal_authority::TerminalRegistryError::Invalid(m) => {
+                TerminalError::Invalid(m)
+            }
+            faktor_server::native::terminal_authority::TerminalRegistryError::Refused(m) => {
+                TerminalError::Refused(m)
+            }
+            faktor_server::native::terminal_authority::TerminalRegistryError::Unavailable(m) => {
+                TerminalError::Unavailable(m)
+            }
+        })
+    }
+}
+
+/// Backend whose one session is the REAL durable session id, so the ACP
+/// terminal calls reach the real durable authority.
+struct DurableSessionBackend {
+    session_id: String,
+}
+
+impl AcpBackend for DurableSessionBackend {
+    fn agent_info(&self) -> Value {
+        json!({ "name": "durable-terminal-agent", "version": "0.0.0" })
+    }
+    fn create_session(&self, _params: &Value) -> Result<String, String> {
+        Ok(self.session_id.clone())
+    }
+    fn prompt(&self, _session_id: &str, _text: &str) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+    fn abort(&self, _session_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn list_sessions(&self) -> Vec<String> {
+        vec![self.session_id.clone()]
+    }
+}
+
+fn durable_kinds(handle: &faktor_session::SessionHandle) -> Vec<faktor_session::TerminalEventKind> {
+    handle
+        .ledger_terminal_rows(None)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.kind)
+        .collect()
+}
+
+#[tokio::test]
+async fn durable_terminal_round_trip_through_acp_and_native_adapters_is_identical() {
+    use faktor_server::native::terminal_authority::{TerminalService, TerminalSpawnRequest};
+
+    let root = std::env::temp_dir().join(format!(
+        "kp-acp-durable-terminal-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let manager =
+        faktor_session::SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
+    let ws = manager.create_workspace("/tmp").unwrap();
+    let created = manager
+        .create_session(ws, "acp-durable-terminal", "fake", "m")
+        .unwrap();
+    let sid = created.id().to_string();
+    let session = manager.get_session(created.id()).unwrap().unwrap();
+
+    let service = TerminalService::with_identity_probe(
+        manager.clone(),
+        Arc::new(|pid: u32| (pid != 0).then_some(1_700_000_000_000)),
+    );
+    let authority: Arc<dyn TerminalAuthority> = Arc::new(DurableAuthority {
+        service: Arc::clone(&service),
+    });
+    let (mut client, _task) = start_server_with_terminals(
+        DurableSessionBackend {
+            session_id: sid.clone(),
+        },
+        authority,
+    );
+    let init = client
+        .request(
+            "initialize",
+            json!({ "protocolVersion": 1, "extensions": ["faktor.terminal"] }),
+        )
+        .await;
+    assert_eq!(init["result"]["extensions"], json!(["faktor.terminal"]));
+    assert_eq!(new_session(&mut client).await, sid);
+
+    // Adapter A (ACP): create t1.
+    let created = client
+        .request(
+            "terminal/create",
+            json!({ "sessionId": sid, "command": "/bin/sleep", "args": ["30"] }),
+        )
+        .await;
+    let t1 = match created["result"]["terminalId"].as_str() {
+        Some(id) => id.to_string(),
+        // Documented platform refusal: nothing to compare on a platform
+        // with no PTY backend.
+        None => return,
+    };
+    // Adapter B (the native backend API): create t2.
+    let spawned = service.spawn(
+        &sid,
+        &TerminalSpawnRequest {
+            command: "/bin/sleep".into(),
+            args: vec!["30".into()],
+            cwd: None,
+            env: Vec::new(),
+            rows: 24,
+            cols: 80,
+        },
+    );
+    let t2 = match spawned {
+        Ok(creation) => creation.handle.terminal_id().to_string(),
+        Err(_) => return,
+    };
+
+    // Both adapters list the SAME two durable rows (ACP projects the
+    // authority's rows, the native API folds the durable ledger).
+    let list = client
+        .request("terminal/list", json!({ "sessionId": sid }))
+        .await;
+    let acp_rows = list["result"]["terminals"].as_array().unwrap().clone();
+    assert_eq!(acp_rows.len(), 2, "{list}");
+    let mut acp_ids: Vec<String> = acp_rows
+        .iter()
+        .map(|row| row["terminalId"].as_str().unwrap().to_string())
+        .collect();
+    acp_ids.sort();
+    let mut native_ids: Vec<String> = service
+        .list(&sid)
+        .unwrap()
+        .into_iter()
+        .map(|view| view.terminal_id)
+        .collect();
+    native_ids.sort();
+    assert_eq!(acp_ids, native_ids, "both adapters see the same rows");
+    assert!(acp_rows.iter().all(|row| row["state"] == "running"));
+    assert_eq!(
+        durable_kinds(&session).len(),
+        4,
+        "2 terminals x created+running"
+    );
+
+    // Input and resize round-trip through BOTH adapters; neither is a
+    // journaled lifecycle transition. ACP drives the terminal IT created
+    // (its connection table), the native adapter drives both durable rows.
+    let msg = client
+        .request(
+            "terminal/input",
+            json!({ "sessionId": sid, "terminalId": t1, "data": "x" }),
+        )
+        .await;
+    assert_eq!(msg["result"], json!({}), "{msg}");
+    let msg = client
+        .request(
+            "terminal/resize",
+            json!({ "sessionId": sid, "terminalId": t1, "rows": 33, "cols": 121 }),
+        )
+        .await;
+    assert_eq!(msg["result"], json!({}), "{msg}");
+    for terminal in [&t1, &t2] {
+        service.input(&sid, terminal, b"y").unwrap();
+        service.resize(&sid, terminal, 24, 80).unwrap();
+    }
+    // ACP's connection ownership is enforced against the durable rows: a
+    // terminal this connection did not create is a typed refusal, and the
+    // native-created row is untouched.
+    let refused = client
+        .request(
+            "terminal/input",
+            json!({ "sessionId": sid, "terminalId": t2, "data": "z" }),
+        )
+        .await;
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    assert_eq!(
+        durable_kinds(&session).len(),
+        4,
+        "I/O journals no lifecycle row"
+    );
+
+    // Kill t1 through ACP and t2 through the native API: exactly one Killed
+    // row each, and BOTH adapters agree on the terminal states.
+    let msg = client
+        .request(
+            "terminal/kill",
+            json!({ "sessionId": sid, "terminalId": t1 }),
+        )
+        .await;
+    assert_eq!(msg["result"], json!({}), "{msg}");
+    assert!(service.kill(&sid, &t2, "native adapter kill").unwrap());
+
+    // The exact durable sequences, session-scoped and complete.
+    let records = session.ledger_terminal_rows(None).unwrap();
+    assert_eq!(
+        records.len(),
+        6,
+        "created+running+killed per terminal: {records:?}"
+    );
+    for terminal in [&t1, &t2] {
+        let kinds: Vec<faktor_session::TerminalEventKind> = records
+            .iter()
+            .filter(|record| &record.row.terminal_id == terminal)
+            .map(|record| record.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                faktor_session::TerminalEventKind::Created,
+                faktor_session::TerminalEventKind::Running,
+                faktor_session::TerminalEventKind::Killed
+            ],
+            "{terminal} has exactly one terminal state sequence"
+        );
+    }
+
+    // ACP's projection now reports the durable killed rows.
+    let list = client
+        .request("terminal/list", json!({ "sessionId": sid }))
+        .await;
+    let acp_rows = list["result"]["terminals"].as_array().unwrap();
+    assert_eq!(acp_rows.len(), 2, "{list}");
+    assert!(
+        acp_rows
+            .iter()
+            .all(|row| row["state"] == "killed" && row["alive"] == false),
+        "{list}"
+    );
+    let native_rows = service.list(&sid).unwrap();
+    assert_eq!(native_rows.len(), 2);
+    assert!(native_rows
+        .iter()
+        .all(|row| row.state_tag() == "killed" && !row.alive));
+    // The two projections are the same rows.
+    let mut native_states: Vec<(String, String)> = native_rows
+        .iter()
+        .map(|row| (row.terminal_id.clone(), row.state_tag().to_string()))
+        .collect();
+    native_states.sort();
+    let mut acp_states: Vec<(String, String)> = acp_rows
+        .iter()
+        .map(|row| {
+            (
+                row["terminalId"].as_str().unwrap().to_string(),
+                row["state"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    acp_states.sort();
+    assert_eq!(acp_states, native_states);
+
+    // A second kill through either adapter journals nothing further.
+    let msg = client
+        .request(
+            "terminal/kill",
+            json!({ "sessionId": sid, "terminalId": t1 }),
+        )
+        .await;
+    assert_eq!(msg["result"], json!({}), "{msg}");
+    assert_eq!(session.ledger_terminal_rows(None).unwrap().len(), 6);
+
+    let _ = std::fs::remove_dir_all(&root);
+}

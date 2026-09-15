@@ -18,6 +18,17 @@
 //! output volume), a background reader thread, and pre-spawn config
 //! validation ([`validation`]) that rejects hostile config (NUL bytes,
 //! oversized fields) identically on every platform before any OS call.
+//!
+//! Unix zero-orphans hardening: because a PTY child `setsid()`s out of the
+//! daemon's process group, a daemon crash would otherwise leave its whole
+//! session alive. Every unix `Pty` therefore forks a [`guardian`] process
+//! holding a control pipe plus the child's start-time-verified identity: on
+//! daemon death (pipe EOF) it SIGKILLs the recorded group, refuses when the
+//! pid was recycled, and exits without killing when the group was already
+//! reaped; the durable [`guardian::TerminalLedger`] lets a restarted daemon
+//! reconcile lost terminals typed as [`guardian::TerminalLost`] instead of
+//! trusting a pid. On Linux the child also sets `PR_SET_PDEATHSIG` as
+//! defense-in-depth (in the unix backend's pre-exec hook).
 
 mod ring;
 
@@ -41,6 +52,14 @@ mod unix;
 
 #[cfg(windows)]
 mod windows;
+
+/// Daemon-death guardian + durable terminal-identity ledger (Unix): a forked
+/// tiny process holds the PTY child's process group id and a start-time
+/// verified identity, SIGKILLs the group if the daemon dies, and refuses when
+/// the recorded pid was recycled. See the module docs for the exact EOF
+/// protocol and exit codes.
+#[cfg(unix)]
+pub mod guardian;
 
 #[cfg(unix)]
 pub use unix::Pty;

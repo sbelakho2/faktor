@@ -9,7 +9,14 @@ rust-version.workspace = true
 faktor-core.workspace = true
 libc = "0.2"
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# The adversarial integration tests drive the guardian process directly and
+# fork/SIGKILL simulated daemons; the ledger tests need a scratch dir.
+libc = "0.2"
+tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # ConPTY child containment: every spawned child is assigned to a

@@ -1222,6 +1222,8 @@ dependencies = [
  "faktor-winjob",
  "libc",
  "serde",
+ "serde_json",
+ "tempfile",
  "tracing",
  "windows-sys 0.61.2",
 ]

@@ -459,6 +459,25 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
             get(native_terminal_events),
         )
         .route("/native/session/{id}/terminal", post(native_terminal_spawn))
+        // The session-owned terminal control seam: every op routes through
+        // the ONE durable TerminalService (the ledger rows are the
+        // authority; a restarted daemon's Lost rows refuse I/O typed).
+        .route(
+            "/native/session/{id}/terminals/{terminal_id}/input",
+            post(native_terminal_input),
+        )
+        .route(
+            "/native/session/{id}/terminals/{terminal_id}/resize",
+            post(native_terminal_resize),
+        )
+        .route(
+            "/native/session/{id}/terminals/{terminal_id}/kill",
+            post(native_terminal_kill),
+        )
+        .route(
+            "/native/session/{id}/terminals/{terminal_id}/reconcile",
+            post(native_terminal_reconcile),
+        )
         .route("/native/messages", get(native_messages))
         .route("/native/events", get(native_events))
         .route("/native/providers", get(native_providers))
@@ -594,16 +613,13 @@ pub(crate) struct AppState {
     /// Unix real implementation; other platforms refuse at creation.
     pub(crate) ptys: Arc<std::sync::Mutex<std::collections::HashMap<u64, faktor_pty::Pty>>>,
     pub(crate) next_pty_id: Arc<std::sync::atomic::AtomicU64>,
-    /// Native ownership of registered PTYs (audit P0-62): one entry per
-    /// `ptys` key that a SESSION-owned spawn registered. Entries absent from
-    /// this map are unowned legacy rows (the daemon-level `/pty/create`
-    /// surface predates ownership); a session-scoped native view never
-    /// projects them. Additive: nothing here changes the daemon-wide maps.
-    pub(crate) terminal_owners: Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<u64, crate::native::terminal::NativeTerminalOwnership>,
-        >,
-    >,
+    /// Native ownership cache of session-owned PTYs (audit P0-62): numeric
+    /// pty id → owning session raw id, strictly derived from the durable
+    /// `terminal_*` rows by the native adapter (never an authority; the ONE
+    /// authority is `TerminalService` over the ledger). The frozen compat
+    /// `/pty/*` surface uses it only to drop stale annotations.
+    pub(crate) terminal_owners:
+        Arc<std::sync::Mutex<crate::native::terminal::NativeTerminalOwnerCache>>,
     /// Bounded per-daemon log of session-owned terminal lifetime events
     /// (audit P0-62): `created` at spawn, `exited` when the swept process
     /// dies. Ring-bounded; ids ascend from 1.
@@ -8084,20 +8100,26 @@ mod tests {
         Some(resp.json().await.unwrap())
     }
 
-    async fn native_remove_terminal(
+    /// Kill one durable session-owned terminal through the native control
+    /// seam; returns the status (200 on the first kill, 409 once terminal).
+    async fn native_kill_terminal(
         client: &reqwest::Client,
         base: &str,
         token: &AuthToken,
-        pty_id: &str,
-    ) {
-        let resp = client
-            .post(format!("{base}/pty/remove"))
+        sid: &str,
+        terminal_id: &str,
+    ) -> u16 {
+        client
+            .post(format!(
+                "{base}/native/session/{sid}/terminals/{terminal_id}/kill"
+            ))
             .bearer_auth(token.as_str())
-            .json(&serde_json::json!({ "pty_id": pty_id }))
+            .json(&serde_json::json!({}))
             .send()
             .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
+            .unwrap()
+            .status()
+            .as_u16()
     }
 
     /// Create a typed task row of a session (task machine semantics: only
@@ -8133,11 +8155,12 @@ mod tests {
 
     #[tokio::test]
     async fn native_terminal_ownership_scope_isolation_and_lifetime_events() {
-        // P0-62: terminals spawned under session A carry {session_id,
-        // task_id, agent_id, operation_id} ownership; the session-scoped
-        // view of B never shows A's terminal even when the daemon owns both,
-        // and the bounded lifetime log is session-scoped too. Hostile ids,
-        // bounds and strict DTO rejections behave like every native route.
+        // The terminal unification: terminals spawned under session A carry
+        // durable {session_id, task_id, agent_id, operation_id} + terminal
+        // UUID ownership; the session-scoped view of B never shows A's
+        // terminal even when the daemon owns both, and the lifetime log is
+        // the durable row stream (created -> running -> killed), session-
+        // scoped and strictly above the cursor.
         let dir = tempfile::tempdir().unwrap();
         let deps = test_deps(dir.path());
         let token = deps.auth_token.clone();
@@ -8164,7 +8187,9 @@ mod tests {
         let resp = native_get(&client, &base, &token, "/native/terminals?session=1&limt=2").await;
         assert_eq!(resp.status(), 400, "unknown query field is a 400");
 
-        // Spawn owned terminals under A and B.
+        // Spawn owned terminals under A and B through the ONE durable
+        // service. The response carries the terminal UUID plus the legacy
+        // pty alias, the durable ownership and the process identity.
         let Some(pty_a) =
             native_spawn_terminal(&client, &base, &token, &a_sid, "/bin/sleep", &["60"]).await
         else {
@@ -8184,23 +8209,26 @@ mod tests {
             let _ = handle.shutdown.send(());
             return;
         };
-        let pty_a_id = pty_a["ptyId"].as_str().unwrap().to_string();
+        let pty_a_id = pty_a["terminalId"].as_str().unwrap().to_string();
+        assert_eq!(pty_a["ptyId"], pty_a_id, "legacy alias is the UUID");
         let pid_a = pty_a["pid"].as_u64().unwrap();
         assert!(pid_a > 0);
+        assert_eq!(pty_a["state"], "running");
         assert_eq!(pty_a["sessionId"], a_sid);
         assert_eq!(pty_a["taskId"], "1", "standalone session task identity");
         assert!(pty_a["agentId"].is_null());
+        assert!(pty_a["startTimeMs"].as_i64().unwrap_or(0) > 0);
         let op_a = pty_a["operationId"].as_str().unwrap().to_string();
         assert!(!op_a.is_empty());
 
         let Some(pty_b) =
             native_spawn_terminal(&client, &base, &token, &b_sid, "/bin/sleep", &["60"]).await
         else {
-            let _ = native_remove_terminal(&client, &base, &token, &pty_a_id).await;
+            let _ = native_kill_terminal(&client, &base, &token, &a_sid, &pty_a_id).await;
             let _ = handle.shutdown.send(());
             return;
         };
-        let pty_b_id = pty_b["ptyId"].as_str().unwrap().to_string();
+        let pty_b_id = pty_b["terminalId"].as_str().unwrap().to_string();
 
         // A's scoped view: ONLY A's terminal with full ownership.
         let resp = native_get(
@@ -8218,11 +8246,13 @@ mod tests {
         let rows = body["terminals"].as_array().unwrap();
         assert_eq!(rows.len(), 1, "{body}");
         assert_eq!(rows[0]["id"], pty_a_id);
+        assert_eq!(rows[0]["terminalId"], pty_a_id);
         assert_eq!(rows[0]["pid"], pid_a);
         assert_eq!(rows[0]["alive"], true);
         assert_eq!(rows[0]["sessionId"], a_sid);
         assert_eq!(rows[0]["taskId"], "1");
         assert_eq!(rows[0]["operationId"], op_a);
+        assert_eq!(rows[0]["state"], "running");
         assert!(rows[0]["spawnedMs"].as_i64().unwrap_or(0) > 0);
         assert!(rows[0]["agentId"].is_null());
 
@@ -8238,13 +8268,36 @@ mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         let rows = body["terminals"].as_array().unwrap();
         assert_eq!(rows.len(), 1, "B sees only its own terminal: {body}");
-        assert_eq!(rows[0]["id"], pty_b_id);
+        assert_eq!(rows[0]["terminalId"], pty_b_id);
         assert!(
-            rows.iter().all(|r| r["id"] != pty_a_id),
+            rows.iter().all(|r| r["terminalId"] != pty_a_id),
             "A's terminal must never surface in B's view: {body}"
         );
 
-        // A's view still holds only A's terminal after B spawned one.
+        // Cross-session control is denied typed: B can never drive A's
+        // terminal through the IDs it can name.
+        let denied = client
+            .post(format!(
+                "{base}/native/session/{b_sid}/terminals/{pty_a_id}/input"
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"data": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), 404, "foreign scope is denied");
+        let denied = client
+            .post(format!(
+                "{base}/native/session/{b_sid}/terminals/{pty_a_id}/kill"
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), 404, "foreign kill is denied");
+
+        // A's terminal is still alive and untouched.
         let resp = native_get(
             &client,
             &base,
@@ -8253,12 +8306,11 @@ mod tests {
         )
         .await;
         let body: serde_json::Value = resp.json().await.unwrap();
-        let rows = body["terminals"].as_array().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["id"], pty_a_id);
+        assert_eq!(body["terminals"][0]["state"], "running");
+        assert_eq!(body["terminals"][0]["alive"], true);
 
-        // The legacy daemon-level view lists both (frozen pre-P0-62 shape)
-        // and annotates ownership additively when known.
+        // The legacy daemon-level view lists both (durable rows + the
+        // frozen compat PTY rows).
         let resp = native_get(
             &client,
             &base,
@@ -8269,7 +8321,6 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let rows: serde_json::Value = resp.json().await.unwrap();
         let rows = rows.as_array().unwrap();
-        assert_eq!(rows.len(), 2, "daemon view lists both PTYs: {rows:?}");
         let mine = rows
             .iter()
             .find(|r| r["id"] == pty_a_id)
@@ -8281,8 +8332,8 @@ mod tests {
             .expect("B's terminal in the daemon view");
         assert_eq!(other["sessionId"], b_sid);
 
-        // Session-scoped lifetime events: created frames with the terminal
-        // ownership; B's log never contains A's frames.
+        // Session-scoped durable lifetime events: created + running frames
+        // with the terminal ownership; B's log never contains A's frames.
         let resp = native_get(
             &client,
             &base,
@@ -8294,10 +8345,13 @@ mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["sessionId"], a_sid);
         let events = body["events"].as_array().unwrap();
-        assert_eq!(events.len(), 1, "{body}");
-        assert_eq!(events[0]["type"], "created");
+        assert_eq!(events.len(), 2, "created + running: {body}");
+        assert_eq!(events[0]["type"], "terminal_created");
+        assert_eq!(events[1]["type"], "terminal_running");
+        assert_eq!(events[0]["terminalId"], pty_a_id);
         assert_eq!(events[0]["ptyId"], pty_a_id);
         assert_eq!(events[0]["pid"], pid_a);
+        assert!(events[0]["id"].as_u64().unwrap() > 0);
         assert_eq!(body["hasMore"], false);
         assert!(body["nextCursor"].is_null());
         let resp = native_get(
@@ -8309,15 +8363,16 @@ mod tests {
         .await;
         let body: serde_json::Value = resp.json().await.unwrap();
         let events = body["events"].as_array().unwrap();
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert_eq!(
-            events[0]["ptyId"], pty_b_id,
+            events[0]["terminalId"], pty_b_id,
             "no cross-session frames: {body}"
         );
 
-        // Exited events: kill A's terminal (compat control keeps working on
-        // native-owned rows), then the next native read sweeps and logs it.
-        native_remove_terminal(&client, &base, &token, &pty_a_id).await;
+        // Kill A through the pty authority: the Killed row is journaled
+        // immediately (no lazy sweep needed) and the child tree dies.
+        let kill = native_kill_terminal(&client, &base, &token, &a_sid, &pty_a_id).await;
+        assert_eq!(kill, 200);
         let resp = native_get(
             &client,
             &base,
@@ -8327,10 +8382,10 @@ mod tests {
         .await;
         let body: serde_json::Value = resp.json().await.unwrap();
         let events = body["events"].as_array().unwrap();
-        assert_eq!(events.len(), 2, "created + exited: {body}");
-        assert_eq!(events[1]["type"], "exited");
-        assert_eq!(events[1]["ptyId"], pty_a_id);
-        assert_eq!(events[1]["pid"], pid_a, "exit event keeps the spawn pid");
+        assert_eq!(events.len(), 3, "created + running + killed: {body}");
+        assert_eq!(events[2]["type"], "terminal_killed");
+        assert_eq!(events[2]["terminalId"], pty_a_id);
+        assert_eq!(events[2]["pid"], pid_a, "kill event keeps the spawn pid");
         assert_eq!(
             body["hasMore"], false,
             "the whole log fits one page: {body}"
@@ -8344,7 +8399,20 @@ mod tests {
         )
         .await;
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["terminals"], serde_json::json!([]), "{body}");
+        assert_eq!(body["terminals"][0]["state"], "killed", "{body}");
+        assert_eq!(body["terminals"][0]["alive"], false, "{body}");
+
+        // Input on a terminal row is a typed state refusal (409).
+        let refused = client
+            .post(format!(
+                "{base}/native/session/{a_sid}/terminals/{pty_a_id}/input"
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"data": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 409, "killed terminal refuses I/O");
 
         // Bounds + hostile ids + strict DTO on the event log and spawn.
         for path in [
@@ -8407,7 +8475,10 @@ mod tests {
         assert_eq!(resp.status(), 401);
 
         // Cleanup: kill B's terminal so no test child outlives the test.
-        native_remove_terminal(&client, &base, &token, &pty_b_id).await;
+        assert_eq!(
+            native_kill_terminal(&client, &base, &token, &b_sid, &pty_b_id).await,
+            200
+        );
         let _ = handle.shutdown.send(());
     }
 

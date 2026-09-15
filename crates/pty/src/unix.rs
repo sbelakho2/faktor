@@ -14,26 +14,74 @@
 //! (waitpid), so there is exactly one owner of child reaping; `kill()`
 //! signals the group and then joins the reader thread, and `Drop` is the
 //! emergency failsafe (immediate SIGKILL + join, no grace sleeps).
+//!
+//! Zero-orphans hardening (daemon death is not a destructor):
+//!
+//! - the reader thread is the child's PARENT: it spawns the child and then
+//!   outlives it (it is also the reaper). That makes Linux's
+//!   `PR_SET_PDEATHSIG(SIGKILL)` (armed in `pre_exec`) fire exactly when the
+//!   daemon dies — with a pooled spawn thread as parent, PDEATHSIG would
+//!   fire when that thread returned and kill a healthy terminal;
+//! - immediately after the child exists, the reader thread forks a
+//!   [`GuardianHandle`](crate::guardian::GuardianHandle) holding a
+//!   CLOEXEC control pipe (write end in this process), the child's pgid and
+//!   its start-time identity. If this process dies, the pipe reaches EOF and
+//!   the guardian SIGKILLs the recorded process group unless a start-time
+//!   mismatch proves the pid was recycled. On normal shutdown the group is
+//!   killed and reaped FIRST, then the pipe is closed deliberately; the
+//!   guardian finds nothing left to kill and exits cleanly. The guardian
+//!   outlives any destructor and detaches into its own session, so it also
+//!   survives a SIGKILL aimed at the daemon's process group long enough to
+//!   enforce the kill;
+//! - [`Pty::spawn_recorded`] additionally appends the identity to a durable
+//!   [`TerminalLedger`](crate::guardian::TerminalLedger) so a restarted
+//!   daemon can report the terminal as lost
+//!   ([`TerminalLost`](crate::guardian::TerminalLost)) — typed, and without
+//!   ever signalling a possibly recycled pid.
 
 use std::fmt;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use faktor_core::error::Error;
 
+use crate::guardian::{GuardianHandle, ProcessIdentity, TerminalLedger};
 use crate::ring::Ring;
 use crate::validation::validate_spawn_config;
 use crate::PtyConfig;
 
 /// One live PTY. Sync API (the master side is O_NONBLOCK, reads are
 /// non-blocking snapshots); a background thread owns the child (reads,
-/// reaps) — dropping the handle kills the whole process group.
+/// reaps) — dropping the handle kills the whole process group. On unix the
+/// group is additionally protected by a forked daemon-death guardian.
 pub struct Pty {
     master: OwnedFd,
     pid: libc::pid_t,
     shared: Arc<(Mutex<Ring>, Condvar)>,
-    stop: Arc<std::sync::atomic::AtomicBool>,
+    stop: Arc<AtomicBool>,
     reader: Option<std::thread::JoinHandle<()>>,
+    /// Daemon-death guardian for this pty's process group (`None` after
+    /// teardown released it).
+    guardian: Option<GuardianHandle>,
+    /// Durable reconciliation row opened by [`Pty::spawn_recorded`]:
+    /// `(ledger, row id)`, marked reaped once the group is gone.
+    ledger: Option<(Arc<TerminalLedger>, String)>,
+}
+
+/// The optional durable-ledger plan of one spawn (see
+/// [`Pty::spawn_recorded`]).
+struct LedgerPlan {
+    ledger: Arc<TerminalLedger>,
+    owner: String,
+}
+
+/// Facts produced by the child-spawning reader thread and handed back to the
+/// caller: the child pid, its guardian, and the durable row when requested.
+struct ChildSpawn {
+    pid: libc::pid_t,
+    guardian: GuardianHandle,
+    ledger: Option<(Arc<TerminalLedger>, String)>,
 }
 
 unsafe impl Send for Pty {}
@@ -49,9 +97,35 @@ impl fmt::Debug for Pty {
 
 impl Pty {
     /// Create the pty and spawn the child with its stdio on the slave.
+    ///
+    /// On unix the child's process group is additionally protected by a
+    /// forked daemon-death guardian (see [`crate::guardian`]): if this
+    /// process dies without reaping the child, the guardian SIGKILLs the
+    /// whole group.
     pub fn spawn(cfg: &PtyConfig) -> Result<Self, Error> {
-        use std::os::unix::process::CommandExt;
+        Self::spawn_inner(cfg, None)
+    }
 
+    /// Like [`Pty::spawn`], plus a durable [`TerminalLedger`] row carrying
+    /// the child's start-time-verified identity, so a RESTARTED daemon can
+    /// reconcile this terminal as [`crate::guardian::TerminalLost`] instead
+    /// of trusting a bare pid. A normal shutdown marks the row reaped; a
+    /// crash leaves it live for the next `reconcile()`.
+    pub fn spawn_recorded(
+        cfg: &PtyConfig,
+        ledger: &Arc<TerminalLedger>,
+        owner: &str,
+    ) -> Result<Self, Error> {
+        Self::spawn_inner(
+            cfg,
+            Some(LedgerPlan {
+                ledger: ledger.clone(),
+                owner: owner.to_string(),
+            }),
+        )
+    }
+
+    fn spawn_inner(cfg: &PtyConfig, ledger_plan: Option<LedgerPlan>) -> Result<Self, Error> {
         validate_spawn_config(cfg)?;
         // 1. Open the master; grant + unlock + resolve the slave path.
         let master_fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
@@ -99,125 +173,71 @@ impl Pty {
             libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
 
-        // 3. Spawn: stdio = slave, setsid + TIOCSCTTY pre-exec.
-        let mut cmd = std::process::Command::new(&cfg.command);
-        cmd.args(&cfg.args);
-        if let Some(cwd) = &cfg.cwd {
-            cmd.current_dir(cwd);
+        // 3. The reader's private BLOCKING duplicate of the master, made
+        //    BEFORE any process exists: data wakes read(2), EOF (every slave
+        //    fd closed — the group died) wakes it at shutdown, and a failure
+        //    here can never leak a process.
+        let reader_master = unsafe { libc::dup(master.as_raw_fd()) };
+        if reader_master < 0 {
+            return Err(Error::internal("dup master failed"));
         }
-        // THE identical environment authority the supervised spawn path
-        // uses: env_clear, then the resolved EnvSpec (deny-set filtered,
-        // GIT_TERMINAL_PROMPT safety default). PTY children never inherit
-        // the daemon environment implicitly.
-        cfg.env.apply(&mut cmd);
-        let slave_stdio = unsafe { std::process::Stdio::from_raw_fd(slave_fd.into_raw_fd()) };
-        cmd.stdin(slave_stdio);
-        let dup = |fd: RawFd| unsafe { libc::dup(fd) };
-        let err1 = dup(slave);
-        let err2 = dup(slave);
-        if err1 < 0 || err2 < 0 {
-            return Err(Error::internal("dup slave failed"));
-        }
-        cmd.stdout(unsafe { std::process::Stdio::from_raw_fd(err1) });
-        cmd.stderr(unsafe { std::process::Stdio::from_raw_fd(err2) });
+        let reader_master = unsafe { OwnedFd::from_raw_fd(reader_master) };
+        let f = unsafe { libc::fcntl(reader_master.as_raw_fd(), libc::F_GETFL) };
         unsafe {
-            cmd.pre_exec(move || {
-                // New session + controlling terminal on the slave.
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let r = libc::ioctl(slave, libc::TIOCSCTTY as libc::c_ulong, 0);
-                if r != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+            libc::fcntl(
+                reader_master.as_raw_fd(),
+                libc::F_SETFL,
+                f & !libc::O_NONBLOCK,
+            );
         }
-        let child = cmd
-            .spawn()
-            .map_err(|e| Error::not_found(format!("spawn {}: {e}", cfg.command)))?;
-        let pid = child.id() as libc::pid_t;
-        // The Child handle is intentionally dropped after spawn: the reader
-        // thread is the SINGLE reaper (waitpid). Keeping a second std Child
-        // whose Drop/wait could race the reader's waitpid would create two
-        // reapers (audit P0-56).
-        drop(child);
-        // NOTE: the slave fd was moved into the child's stdio above; it
-        // must NOT be closed here (double close aborts under Rust's IO
-        // safety checks).
 
-        // 4. Reader + single reaper thread. The thread owns its OWN
-        // duplicate of the master fd, made BLOCKING: data wakes read(2),
-        // and EOF (the whole process group's slave fds closed) wakes it at
-        // shutdown — no EAGAIN polling loop, no periodic sleep while idle.
+        // 4. Spawn the child ON the reader thread, which then stays alive as
+        //    its single reaper. Two deliberate consequences: (a) the child's
+        //    parent thread outlives the child, so Linux PR_SET_PDEATHSIG
+        //    (armed in pre_exec) fires on DAEMON death and never on a pooled
+        //    spawn thread returning; (b) the guardian fork happens on the
+        //    same thread immediately after spawn — the unguarded window is
+        //    the few syscalls between them.
         let shared = Arc::new((Mutex::new(Ring::new()), Condvar::new()));
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<Result<ChildSpawn, Error>>();
         let reader = {
             let shared = shared.clone();
             let stop = stop.clone();
-            let master_fd = unsafe { libc::dup(master.as_raw_fd()) };
-            if master_fd < 0 {
-                return Err(Error::internal("dup master failed"));
-            }
-            // The duplicate is blocking; only the thread touches it.
-            let f = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
-            unsafe {
-                libc::fcntl(master_fd, libc::F_SETFL, f & !libc::O_NONBLOCK);
-            }
+            let cfg = cfg.clone();
             std::thread::spawn(move || {
-                let mfd = master_fd;
-                let mut buf = [0u8; 8192];
-                loop {
-                    let n = unsafe { libc::read(mfd, buf.as_mut_ptr().cast(), buf.len()) };
-                    if n > 0 {
-                        let (ring, cv) = &*shared;
-                        ring.lock().unwrap().push(&buf[..n as usize]);
-                        cv.notify_all();
-                    } else if n == 0 {
-                        break; // EOF: every slave fd closed
-                    } else {
-                        let err = std::io::Error::last_os_error();
-                        match err.raw_os_error() {
-                            Some(libc::EINTR) => {}
-                            _ => break, // real error: nothing more to read
-                        }
+                let spawned = match spawn_child(&cfg, slave_fd, ledger_plan) {
+                    Ok(spawned) => spawned,
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        return;
                     }
-                }
-                // Reap the child — the ONLY waitpid in this crate. Normal
-                // children are zombies by now (EOF after group death or
-                // natural exit) so WNOHANG succeeds immediately. A child
-                // that outlives its stdio (daemonized) is polled at a low
-                // cadence until the kill path sets `stop`, then one final
-                // blocking wait (the group is being SIGKILLed).
-                loop {
-                    let mut status = 0;
-                    let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-                    if r == pid {
-                        break;
-                    }
-                    if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
-                    {
-                        break;
-                    }
-                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
-                        let mut status = 0;
-                        let _ = unsafe { libc::waitpid(pid, &mut status, 0) };
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                unsafe {
-                    libc::close(mfd);
-                }
+                };
+                let pid = spawned.pid;
+                let _ = tx.send(Ok(spawned));
+                reader_loop(reader_master, pid, shared, stop);
             })
+        };
+        let spawned = match rx.recv() {
+            Ok(Ok(spawned)) => spawned,
+            Ok(Err(e)) => {
+                let _ = reader.join();
+                return Err(e);
+            }
+            Err(_) => {
+                let _ = reader.join();
+                return Err(Error::internal("pty spawn thread died"));
+            }
         };
 
         Ok(Self {
             master,
-            pid,
+            pid: spawned.pid,
             shared,
             stop,
             reader: Some(reader),
+            guardian: Some(spawned.guardian),
+            ledger: spawned.ledger,
         })
     }
 
@@ -383,35 +403,214 @@ impl Pty {
                 }
             }
         }
-        self.join_reader();
+        self.settle();
     }
 
-    /// Kill the process group (SIGTERM, short grace, SIGKILL) and join the
-    /// reader thread. Idempotent; kept for compatibility with `kill()`.
+    /// Kill the process group (SIGTERM, short grace, SIGKILL), reap the
+    /// child, release the guardian and settle the durable row. Idempotent;
+    /// kept for compatibility with `kill()`.
     pub fn kill(&mut self) {
         self.shutdown();
     }
 
-    fn join_reader(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    /// Teardown (idempotent): reap the child on the reader thread, then
+    /// release the guardian DELIBERATELY — the pipe closes after the group
+    /// was killed and reaped, so the guardian finds nothing to kill and
+    /// exits without signalling (a descendant that outlived the leader is
+    /// SIGKILLed here). Finally the durable ledger row is marked reaped.
+    fn settle(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
         if let Some(handle) = self.reader.take() {
             let _ = handle.join();
+        }
+        if let Some(mut guardian) = self.guardian.take() {
+            guardian.release();
+        }
+        if let Some((ledger, row)) = self.ledger.take() {
+            let _ = ledger.mark_reaped(&row);
         }
     }
 }
 
 impl Drop for Pty {
     /// Emergency failsafe ONLY: immediate SIGKILL of the group (no grace
-    /// sleep on the caller's thread) then join the reader thread. Live
-    /// objects should use [`Pty::shutdown`] for the graceful SIGTERM path.
+    /// sleep on the caller's thread) then reap + deliberate guardian
+    /// release. Live objects should use [`Pty::shutdown`] for the graceful
+    /// SIGTERM path.
     fn drop(&mut self) {
         if self.pid > 0 {
             unsafe {
                 libc::kill(-self.pid, libc::SIGKILL);
             }
         }
-        self.join_reader();
+        self.settle();
     }
+}
+
+/// Spawn the child (stdio on the slave) and its guardian. Runs ON the
+/// reader thread: it is the child's parent and stays alive until the child
+/// is reaped, so Linux `PR_SET_PDEATHSIG` (armed in the pre-exec hook) is a
+/// DAEMON-death signal, never a spawn-thread-exit signal.
+fn spawn_child(
+    cfg: &PtyConfig,
+    slave: OwnedFd,
+    ledger_plan: Option<LedgerPlan>,
+) -> Result<ChildSpawn, Error> {
+    use std::os::unix::process::CommandExt;
+
+    let mut cmd = std::process::Command::new(&cfg.command);
+    cmd.args(&cfg.args);
+    if let Some(cwd) = &cfg.cwd {
+        cmd.current_dir(cwd);
+    }
+    // THE identical environment authority the supervised spawn path uses:
+    // env_clear, then the resolved EnvSpec (deny-set filtered,
+    // GIT_TERMINAL_PROMPT safety default). PTY children never inherit the
+    // daemon environment implicitly.
+    cfg.env.apply(&mut cmd);
+    let slave_fd = slave.into_raw_fd();
+    cmd.stdin(unsafe { std::process::Stdio::from_raw_fd(slave_fd) });
+    let dup = |fd: RawFd| unsafe { libc::dup(fd) };
+    let err1 = dup(slave_fd);
+    let err2 = dup(slave_fd);
+    if err1 < 0 || err2 < 0 {
+        unsafe {
+            if err1 >= 0 {
+                libc::close(err1);
+            }
+            if err2 >= 0 {
+                libc::close(err2);
+            }
+        }
+        return Err(Error::internal("dup slave failed"));
+    }
+    cmd.stdout(unsafe { std::process::Stdio::from_raw_fd(err1) });
+    cmd.stderr(unsafe { std::process::Stdio::from_raw_fd(err2) });
+    unsafe {
+        cmd.pre_exec(move || {
+            // New session + controlling terminal on the slave.
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let r = libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0);
+            if r != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            #[cfg(target_os = "linux")]
+            {
+                // Defense-in-depth only (the guardian is the cross-Unix
+                // mechanism): when the daemon dies this child is SIGKILLed
+                // by the kernel even in the window before the guardian
+                // exists. The parent is the reader thread, which outlives
+                // the child, so a pooled spawn thread returning can never
+                // fire it. Best-effort: a kernel/seccomp refusal must not
+                // fail the spawn, because the guardian still covers it.
+                let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+            }
+            Ok(())
+        });
+    }
+    let child = cmd
+        .spawn()
+        .map_err(|e| Error::not_found(format!("spawn {}: {e}", cfg.command)))?;
+    let pid = child.id() as libc::pid_t;
+    // The Child handle is intentionally dropped after spawn: the reader
+    // thread is the SINGLE reaper (waitpid). Keeping a second std Child
+    // whose Drop/wait could race the reader's waitpid would create two
+    // reapers (audit P0-56).
+    drop(child);
+    // NOTE: the slave fd was moved into the child's stdio above; it must
+    // NOT be closed here (double close aborts under Rust's IO safety
+    // checks).
+
+    // Guardian immediately (the smallest possible unguarded window). On
+    // failure the just-spawned group is killed and reaped rather than
+    // exposed unguarded.
+    let identity = ProcessIdentity::capture(pid as u32, pid as u32);
+    let mut guardian = match GuardianHandle::spawn(identity) {
+        Ok(guardian) => guardian,
+        Err(e) => {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+            reap_blocking(pid);
+            return Err(e);
+        }
+    };
+    let ledger = match ledger_plan {
+        None => None,
+        Some(plan) => match plan.ledger.record_spawn(&plan.owner, &identity) {
+            Ok(row) => Some((plan.ledger, row)),
+            Err(e) => {
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+                reap_blocking(pid);
+                guardian.release();
+                return Err(e);
+            }
+        },
+    };
+    Ok(ChildSpawn {
+        pid,
+        guardian,
+        ledger,
+    })
+}
+
+fn reap_blocking(pid: libc::pid_t) {
+    let mut status = 0;
+    let _ = unsafe { libc::waitpid(pid, &mut status, 0) };
+}
+
+/// The reader + single reaper loop: blocking reads into the bounded ring,
+/// then exactly one waitpid for the child. Owns its private blocking master
+/// duplicate (closed when this returns, on every path).
+fn reader_loop(
+    mfd: OwnedFd,
+    pid: libc::pid_t,
+    shared: Arc<(Mutex<Ring>, Condvar)>,
+    stop: Arc<AtomicBool>,
+) {
+    let mfd_raw = mfd.as_raw_fd();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = unsafe { libc::read(mfd_raw, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            let (ring, cv) = &*shared;
+            ring.lock().unwrap().push(&buf[..n as usize]);
+            cv.notify_all();
+        } else if n == 0 {
+            break; // EOF: every slave fd closed
+        } else {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) => {}
+                _ => break, // real error: nothing more to read
+            }
+        }
+    }
+    // Reap the child — the ONLY waitpid in this crate. Normal children are
+    // zombies by now (EOF after group death or natural exit) so WNOHANG
+    // succeeds immediately. A child that outlives its stdio (daemonized) is
+    // polled at a low cadence until the kill path sets `stop`, then one
+    // final blocking wait (the group is being SIGKILLed).
+    loop {
+        let mut status = 0;
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if r == pid {
+            break;
+        }
+        if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+            break;
+        }
+        if stop.load(Ordering::SeqCst) {
+            reap_blocking(pid);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // The private master duplicate closes here via Drop, on every path.
 }
 
 #[cfg(test)]
@@ -762,5 +961,62 @@ mod tests {
         cfg.args = vec!["-c".into(), "echo\0owned".into()];
         let err = Pty::spawn(&cfg).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Malformed);
+    }
+
+    #[test]
+    fn pty_child_outlives_a_transient_spawning_thread() {
+        // Regression guard for Linux PR_SET_PDEATHSIG: the child is spawned
+        // by the reader thread, which outlives it, so a short-lived CALLER
+        // (a pooled spawn_blocking thread) exiting must never be mistaken
+        // for daemon death and kill a healthy terminal.
+        let cfg = sh_cfg("sleep 30");
+        let mut pty = std::thread::spawn(move || Pty::spawn(&cfg).unwrap())
+            .join()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(
+            pty.is_alive(),
+            "the spawning thread's exit is not daemon death"
+        );
+        pty.shutdown();
+    }
+
+    #[test]
+    fn spawn_holds_a_guardian_released_only_after_teardown() {
+        let cfg = sh_cfg("sleep 30");
+        let mut pty = Pty::spawn(&cfg).unwrap();
+        let guardian_pid = pty.guardian.as_ref().expect("guardian forked").pid();
+        assert!(guardian_pid > 0);
+        assert_eq!(
+            unsafe { libc::kill(guardian_pid as libc::pid_t, 0) },
+            0,
+            "guardian is alive while the pty is"
+        );
+        pty.shutdown();
+        assert!(pty.guardian.is_none(), "teardown releases the guardian");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while unsafe { libc::kill(guardian_pid as libc::pid_t, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "guardian exits after the deliberate release"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn spawn_recorded_settles_the_durable_row_on_normal_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(TerminalLedger::open(dir.path()).unwrap());
+        let cfg = sh_cfg("echo recorded; exit 0");
+        let mut pty = Pty::spawn_recorded(&cfg, &ledger, "session:5/task:1").unwrap();
+        assert!(pty.wait_for_contains("recorded", std::time::Duration::from_secs(10)));
+        pty.shutdown();
+        let report = ledger.reconcile().unwrap();
+        assert_eq!(
+            report.lost,
+            vec![],
+            "a cleanly reaped terminal is never reported lost"
+        );
     }
 }
