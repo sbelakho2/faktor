@@ -18764,11 +18764,16 @@ mod tests {
         // passing suite.
         let (manager, session, dir) = make_background_env("\t@true\n", None);
         let root = dir.path().join("ws");
-        for i in 0..=faktor_verify::MAX_INVENTORY_FILES {
-            let sub = root.join(format!("gen/g{:02}", i % 40));
-            std::fs::create_dir_all(&sub).unwrap();
-            std::fs::write(sub.join(format!("f{i:04}.rs")), b"// filler\n").unwrap();
+        // A tree deeper than the inventory's default depth budget: discovery
+        // is typed non-Complete (the correctness ceiling is a RESOURCE
+        // budget now) and no smaller passing suite may be derived from the
+        // bounded view.
+        let mut deep = root.join("gen");
+        for i in 0..=faktor_verify::MAX_INVENTORY_DEPTH {
+            deep = deep.join(format!("d{i:02}"));
         }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("filler.rs"), b"// filler\n").unwrap();
         let (mut deps, _d) = deps_sharing_session(
             manager.clone(),
             Arc::new(scripted_provider(vec![

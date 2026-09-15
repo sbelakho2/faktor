@@ -143,18 +143,20 @@ non-success `CI_PIPELINE_STATUS`. `scripts/woodpecker/setup.md` documents
 the agent labels, self-hosted macOS/Windows agents, trusted-volume caching
 and the free cloud tier (linux runners only).
 
-The table above is the **trusted** lane set (`trusted.yaml`: `push`/`tag`, with
-the named-volume caches and the release `[perf]` budgets). PRs run the reduced,
-**volume-free** `pr.yaml` copy of the correctness lanes (`linux`, `static`,
-`docs`, `vscode`, `vscode-visual`, `vscode-visual-with-skip`,
-`jetbrains-build`, `jetbrains-smoke`) plus its own certificate; branch
-protection requires the resulting `ci/woodpecker/pr/pr` workflow status. The
-`nightly.yaml` cron workflow owns the campaigns that are too long for
-push/PR: the ignored `[fault]` campaign at scale, the longrun
+The table above is the **trusted** lane set (`.woodpecker/trusted/trusted.yaml`:
+`push`/`tag`, with the named-volume caches and the release `[perf]` budgets).
+PRs run the reduced, **volume-free** `.woodpecker/untrusted/pr.yaml` copy of
+the correctness lanes (`linux`, `static`, `docs`, `vscode`, `vscode-visual`,
+`vscode-visual-with-skip`, `jetbrains-build`, `jetbrains-smoke`) plus its own
+certificate; branch protection requires the resulting
+`ci/woodpecker/pr/pr` workflow status. The
+`.woodpecker/trusted/nightly.yaml` cron workflow owns the campaigns that are
+too long for push/PR: the ignored `[fault]` campaign at scale, the longrun
 suite, efficiency, economy, the coding-benchmark smoke, the provider-key
 real-model run (an explicit recorded skip unless keys are supplied
 out-of-band) and supply-chain evidence. It writes lane markers and its own
-certificate.
+certificate. §2.11 describes the two-project trust boundary that keeps the PR
+workflow from ever obtaining a volume mount.
 
 100% requires the linux certificate green at the exact commit, plus the
 platform certificates when self-hosted darwin/windows agents exist. The
@@ -415,7 +417,45 @@ commit.
 | `acp_subset` | IMPLEMENTED | `crates/acp` (`AcpMethod::Initialize`) + `crates/acp/tests/interop.rs` + official `agent-client-protocol` client crate in `tests/acp-official` |
 | `openai_responses` | IMPLEMENTED | `crates/openai/src/lib.rs`: `OpenAiFamily::Responses` dispatch + `responses_body`/`responses_stream` codecs + the adversarial `responses_*` stream tests |
 | `windows_job_containment` | IMPLEMENTED | `crates/winjob/src/lib.rs` (`CreateJobObjectW`, `SetInformationJobObject`, `AssignProcessToJobObject`, `KILL_ON_JOB_CLOSE`) + `crates/pty/src/windows.rs` (`CREATE_SUSPENDED`, `assign_strict`, kill-on-close spawn test) |
-| `certification_evidence_chain` | IMPLEMENTED | `scripts/certification/evidence.mjs` (`faktor-cert-evidence/v1`, `verify-markers`, `faktor-woodpecker-lane/v2`) + `scripts/certification/evidence.schema.json` + `scripts/certify-local.sh` (`evidence_gate`) + v2 lane markers in `.woodpecker/pr.yaml` |
+| `certification_evidence_chain` | IMPLEMENTED | `scripts/certification/evidence.mjs` (`faktor-cert-evidence/v1`, `verify-markers`, `faktor-woodpecker-lane/v2`) + `scripts/certification/evidence.schema.json` + `scripts/certify-local.sh` (`evidence_gate`) + v2 lane markers in `.woodpecker/untrusted/pr.yaml` |
+
+### 2.11 CI trust boundary (untrusted PR / trusted push)
+
+CI is two Woodpecker projects over the same repository, each with a
+server-side trust flag and pipeline path that repository content cannot
+change:
+
+| Project | Server-side settings | Pipeline path | Events |
+| --- | --- | --- | --- |
+| untrusted | `trusted.volumes=false`, `allow_pr=true` | `.woodpecker/untrusted/` | `pull_request` |
+| trusted | `trusted.volumes=true` (admin), `allow_pr=false` | `.woodpecker/trusted/` | `push`, `tag`, `cron` |
+
+The invariant: Woodpecker refuses volume mounts at policy level for an
+untrusted project, and a PR diff cannot edit project settings or pipeline
+paths. A PR therefore cannot obtain a named volume, cannot redirect the
+trusted project onto its own YAML, and cannot add a workflow that a project
+loads outside its configured path. `.woodpecker/pr.yaml`, `.woodpecker/trusted.yaml`
+and `.woodpecker/nightly.yaml` at the top level are in-repo symlinks for
+tooling only; no regular workflow file exists there, so an empty pipeline
+path fails closed instead of falling back to the default resolution.
+
+Defense-in-depth only (never the boundary): the PR workflow's
+`storage-policy` step and certificate reject a `volumes:` key, a
+`faktor-trusted-*`/`faktor-nightly-*` reference, or a workflow file at the
+`.woodpecker/` top level; `scripts/woodpecker/verify-boundary.sh` re-checks
+the layout offline and both projects' settings with credentials. Certificate
+steps pass `--yaml-dir` for their own file set, so command-set drift is still
+verified against the true source. No PR step pipes a remote script into a
+shell: the JetBrains smoke installs the pinned rustup-init binary after
+verifying its published SHA-256
+(`20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c`,
+rustup 1.28.2, `x86_64-unknown-linux-gnu`) and pins the `1.98.0` toolchain;
+the remaining PR fetches are package-manager downloads (`npx @vscode/vsce`,
+`npm install playwright`) whose output is gated by the VSIX verifier and the
+pinned visual baselines.
+
+`scripts/woodpecker/setup.md` documents the two-project layout, the exact
+server-side settings and UI steps, and what a PR diff cannot change.
 
 ---
 

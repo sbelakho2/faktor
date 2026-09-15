@@ -1,0 +1,378 @@
+# Faktor CI — pull_request workflow for the UNTRUSTED Woodpecker project.
+#
+# TRUST BOUNDARY (mechanical, server-side): this file lives at the pipeline
+# path of a project whose server-side setting is trusted=false. Woodpecker
+# refuses `volumes:` for such a project at policy level, so a PR that edits
+# this file cannot obtain a volume mount. Trust and the pipeline path are
+# project settings on the server; a PR diff cannot change either one. The
+# TRUSTED project points only at `.woodpecker/trusted/`, so pull_request
+# events can never reach the caches. See scripts/woodpecker/setup.md §5.
+#
+# UNTRUSTED EVENT: EPHEMERAL STORAGE ONLY. This file must never declare
+# `volumes:` and must never set CARGO_TARGET_DIR to a named-volume path.
+# Everything a PR job writes stays inside the per-pipeline workspace and is
+# discarded when the pipeline ends. The trusted caches (`faktor-trusted-*`,
+# used by `.woodpecker/trusted/trusted.yaml`) and the cron caches
+# (`faktor-nightly-*`) are therefore out of reach of PR code.
+#
+# The step set is deliberately reduced: the release `[perf]` budgets (and the
+# trusted/platform certificates) belong to the trusted project; a PR still
+# runs the full correctness set (fmt/clippy/check/test/doctor,
+# static+security+fuzz, docs-sync, VSIX build+verify, required chromium render
+# gate, JetBrains build+smoke) without a warm cache.
+#
+# Bootstrap audit: this workflow contains NO `curl … | sh`-style step. The
+# one remaining toolchain bootstrap (JetBrains smoke) downloads the pinned
+# rustup-init binary, verifies its published SHA-256, and then executes it.
+#
+# Commit-status context (default `WOODPECKER_STATUS_CONTEXT_FORMAT`):
+#   ci/woodpecker/pr/pr — this is the context branch protection requires.
+
+labels:
+  platform: linux/amd64
+
+when:
+  - event: pull_request
+
+steps:
+  # ------------------------------------------------------ storage policy --
+  # Defense-in-depth ONLY (a PR can delete this guard). The actual boundary
+  # is the untrusted project's server-side trusted=false + pipeline path.
+  - name: storage-policy
+    image: alpine:3.20
+    commands:
+      - |
+        set -eu
+        if grep -nE '^[[:space:]]*volumes:' .woodpecker/untrusted/pr.yaml; then
+          echo "POLICY VIOLATION: .woodpecker/untrusted/pr.yaml must not declare volumes (untrusted event)" >&2
+          exit 1
+        fi
+        if grep -vE '^[[:space:]]*#' .woodpecker/untrusted/pr.yaml | grep -nE 'faktor-(trusted|nightly)-'; then
+          echo "POLICY VIOLATION: .woodpecker/untrusted/pr.yaml must not reference trusted/cron cache volumes" >&2
+          exit 1
+        fi
+        # No workflow may sit at the top level: both projects must select an
+        # explicit, server-side pipeline path (`.woodpecker/untrusted/` or
+        # `.woodpecker/trusted/`). The top-level entries are inert symlinks
+        # kept for in-repo tooling; a regular file there would be loadable by
+        # a default-path project and is treated as a violation.
+        stray="$(find .woodpecker -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) -print 2>/dev/null || true)"
+        if [ -n "$stray" ]; then
+          echo "POLICY VIOLATION: workflow file(s) at the .woodpecker/ top level: $stray" >&2
+          exit 1
+        fi
+        for link in .woodpecker/pr.yaml .woodpecker/trusted.yaml .woodpecker/nightly.yaml; do
+          if [ -e "$link" ] && [ ! -L "$link" ]; then
+            echo "POLICY VIOLATION: $link must be a symlink (or absent), never a real workflow file" >&2
+            exit 1
+          fi
+        done
+        echo "storage policy: PR workflow declares no volumes; project layout intact"
+
+  # ---------------------------------------------------------------- linux --
+  - name: linux
+    image: rust:1.98
+    environment:
+      RUST_BACKTRACE: "1"
+    commands:
+      - apt-get update && apt-get install -y --no-install-recommends python3 procps ca-certificates
+      - rustup component add rustfmt clippy
+      - cargo fmt --check
+      - cargo check --workspace --all-features
+      - cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - cargo test --workspace --all-features
+      - cargo run -p faktor-cli -- doctor --data-dir /tmp/kp-ci
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        apt-get update && apt-get install -y --no-install-recommends python3 procps ca-certificates
+        rustup component add rustfmt clippy
+        cargo fmt --check
+        cargo check --workspace --all-features
+        cargo clippy --workspace --all-targets --all-features -- -D warnings
+        cargo test --workspace --all-features
+        cargo run -p faktor-cli -- doctor --data-dir /tmp/kp-ci
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        artifacts="[]"
+        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"linux","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/linux.json
+  - name: static
+    image: rust:1.98
+    environment:
+      RUST_BACKTRACE: "1"
+    commands:
+      - cargo test -p faktor-tests-static-authority
+      - cargo test -p faktor-security
+      - cargo test -p faktor-tests-fuzz-seeds
+      - SUPPLY_CHAIN_BUILD=1 SUPPLY_CHAIN_ARTIFACTS="target/release/faktor-cli" bash scripts/supply-chain.sh
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        cargo test -p faktor-tests-static-authority
+        cargo test -p faktor-security
+        cargo test -p faktor-tests-fuzz-seeds
+        SUPPLY_CHAIN_BUILD=1 SUPPLY_CHAIN_ARTIFACTS="target/release/faktor-cli" bash scripts/supply-chain.sh
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        artifacts="[]"
+        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"static","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/static.json
+  - name: docs
+    image: rust:1.98
+    environment:
+      RUST_BACKTRACE: "1"
+    commands:
+      - cargo doc --workspace --all-features --no-deps
+      - bash scripts/branding-scan.sh
+      - bash scripts/check-docs-sync.sh
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        cargo doc --workspace --all-features --no-deps
+        bash scripts/branding-scan.sh
+        bash scripts/check-docs-sync.sh
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        artifacts="[]"
+        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"docs","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/docs.json
+  - name: vscode
+    image: node:24
+    commands:
+      - apt-get update && apt-get install -y --no-install-recommends unzip ca-certificates
+      - cd apps/vscode
+      - npm ci
+      - npm run build
+      - node scripts/selftest.mjs
+      - npm run prepackage:vsix
+      - npx --yes @vscode/vsce package --out faktor-ci.vsix
+      - node scripts/verify-vsix.mjs faktor-ci.vsix --min-webview-files 25
+      - rm -rf /tmp/faktor-vsix && mkdir -p /tmp/faktor-vsix && unzip -q faktor-ci.vsix -d /tmp/faktor-vsix
+      - node scripts/verify-vsix.mjs faktor-ci.vsix --extract-dir /tmp/faktor-vsix/extension
+      - node scripts/selftest.mjs --packaged /tmp/faktor-vsix/extension
+      - node scripts/verify-vsix.mjs faktor-ci.vsix --ide-load
+      - cd "$CI_WORKSPACE"
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        apt-get update && apt-get install -y --no-install-recommends unzip ca-certificates
+        cd apps/vscode
+        npm ci
+        npm run build
+        node scripts/selftest.mjs
+        npm run prepackage:vsix
+        npx --yes @vscode/vsce package --out faktor-ci.vsix
+        node scripts/verify-vsix.mjs faktor-ci.vsix --min-webview-files 25
+        rm -rf /tmp/faktor-vsix && mkdir -p /tmp/faktor-vsix && unzip -q faktor-ci.vsix -d /tmp/faktor-vsix
+        node scripts/verify-vsix.mjs faktor-ci.vsix --extract-dir /tmp/faktor-vsix/extension
+        node scripts/selftest.mjs --packaged /tmp/faktor-vsix/extension
+        node scripts/verify-vsix.mjs faktor-ci.vsix --ide-load
+        cd "$CI_WORKSPACE"
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        artifact_path="apps/vscode/faktor-ci.vsix"
+        artifact_sha="$(sha256sum "$artifact_path" | cut -d' ' -f1)"
+        artifacts="[{\"path\":\"$artifact_path\",\"sha256\":\"sha256:$artifact_sha\"}]"
+        artifact_digest="$(printf 'sha256:%s\t%s\n' "$artifact_sha" "$artifact_path" | sha256sum | cut -d' ' -f1)"
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"vscode","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/vscode.json
+  - name: vscode-visual
+    image: node:24
+    commands:
+      - export FAKTOR_PLAYWRIGHT="$CI_WORKSPACE/target/visual-playwright/node_modules/playwright"
+      - node scripts/webview-visual-check.mjs --self-test
+      - npm install --prefix target/visual-playwright --no-save playwright
+      - target/visual-playwright/node_modules/.bin/playwright install --with-deps chromium
+      - node scripts/webview-visual-check.mjs
+      - |
+        node -e '
+          const fs = require("node:fs");
+          const report = JSON.parse(
+            fs.readFileSync("ui/kilo-v756-webview/dist/visual-report.json", "utf8"),
+          );
+          const status = report.render && report.render.status;
+          if (status !== "passed") {
+            console.error("REQUIRED render gate did not pass (render.status=" + status + ")");
+            process.exit(1);
+          }
+          console.log("render gate passed (" + (report.render.states || "?") + " states)");
+        '
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        export FAKTOR_PLAYWRIGHT="$CI_WORKSPACE/target/visual-playwright/node_modules/playwright"
+        node scripts/webview-visual-check.mjs --self-test
+        npm install --prefix target/visual-playwright --no-save playwright
+        target/visual-playwright/node_modules/.bin/playwright install --with-deps chromium
+        node scripts/webview-visual-check.mjs
+        node -e '
+        const fs = require("node:fs");
+        const report = JSON.parse(
+        fs.readFileSync("ui/kilo-v756-webview/dist/visual-report.json", "utf8"),
+        );
+        const status = report.render && report.render.status;
+        if (status !== "passed") {
+        console.error("REQUIRED render gate did not pass (render.status=" + status + ")");
+        process.exit(1);
+        }
+        console.log("render gate passed (" + (report.render.states || "?") + " states)");
+        '
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        artifacts="[]"
+        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"vscode-visual","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/vscode-visual.json
+  - name: vscode-visual-with-skip
+    image: node:24
+    depends_on: [vscode-visual]
+    when:
+      status: [success, failure]
+    environment:
+      VISUAL_PLAYWRIGHT_DIR: target/visual-playwright-diagnostics
+    commands:
+      - bash scripts/ci-vscode-visual.sh
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        bash scripts/ci-vscode-visual.sh
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        artifacts="[]"
+        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"vscode-visual-with-skip","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/vscode-visual-with-skip.json
+  - name: jetbrains-build
+    image: eclipse-temurin:17-jdk
+    commands:
+      - cd apps/jetbrains
+      - ./gradlew :frontend:buildPlugin --no-daemon --stacktrace
+      - cd "$CI_WORKSPACE"
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        cd apps/jetbrains
+        ./gradlew :frontend:buildPlugin --no-daemon --stacktrace
+        cd "$CI_WORKSPACE"
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        artifact_path="$(find apps/jetbrains/frontend/build/distributions -maxdepth 1 -name '*.zip' -print -quit 2>/dev/null || true)"
+        if [ -n "$artifact_path" ]; then
+          artifact_sha="$(sha256sum "$artifact_path" | cut -d' ' -f1)"
+          artifacts="[{\"path\":\"$artifact_path\",\"sha256\":\"sha256:$artifact_sha\"}]"
+          artifact_digest="$(printf 'sha256:%s\t%s\n' "$artifact_sha" "$artifact_path" | sha256sum | cut -d' ' -f1)"
+        else
+          artifacts="[]"
+          artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        fi
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"jetbrains-build","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/jetbrains-build.json
+  - name: jetbrains-smoke
+    image: ubuntu:24.04
+    environment:
+      RUST_BACKTRACE: "1"
+      DEBIAN_FRONTEND: noninteractive
+    commands:
+      - apt-get update && apt-get install -y --no-install-recommends build-essential curl pkg-config libssl-dev kotlin openjdk-11-jre-headless ca-certificates
+      - |
+        set -eu
+        curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init
+        printf '%s  %s\n' 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c /tmp/rustup-init | sha256sum -c -
+        chmod +x /tmp/rustup-init
+        /tmp/rustup-init -y --profile minimal --default-toolchain 1.98.0
+      - . "$HOME/.cargo/env"
+      - bash apps/jetbrains/compile-and-smoke.sh
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        apt-get update && apt-get install -y --no-install-recommends build-essential curl pkg-config libssl-dev kotlin openjdk-11-jre-headless ca-certificates
+        set -eu
+        curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init
+        printf '%s  %s\n' 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c /tmp/rustup-init | sha256sum -c -
+        chmod +x /tmp/rustup-init
+        /tmp/rustup-init -y --profile minimal --default-toolchain 1.98.0
+        . "$HOME/.cargo/env"
+        bash apps/jetbrains/compile-and-smoke.sh
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        artifacts="[]"
+        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"jetbrains-smoke","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/jetbrains-smoke.json
+  - name: certificate
+    image: node:24
+    depends_on:
+      - storage-policy
+      - linux
+      - static
+      - docs
+      - vscode
+      - vscode-visual
+      - vscode-visual-with-skip
+      - jetbrains-build
+      - jetbrains-smoke
+    when:
+      status: [success, failure]
+    commands:
+      - node scripts/certification/evidence.mjs verify-markers --workflow pr --yaml-dir .woodpecker/untrusted --lanes-dir target/certification/lanes --out target/certification/ci-certification.json --pipeline-status "$CI_PIPELINE_STATUS" --run-id "$CI_PIPELINE_NUMBER"
+      - node scripts/certification/evidence.mjs write --kind ci_certification_pr --status passed --from-markers target/certification/lanes --commands "woodpecker pr workflow certificate"

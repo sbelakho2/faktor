@@ -1,43 +1,97 @@
-//! Bounded repository discovery with an EXPLICIT completeness verdict
-//! (audit: verification must not depend on a partial view of the repo).
+//! Repository discovery that scales to real repositories without losing the
+//! fail-closed completeness verdict (audit: verification must not depend on
+//! a partial view of the repo).
 //!
-//! Repository profiling decides which checks are REQUIRED. A bounded walk
-//! that silently stops at an entry cap, truncates a directory listing,
-//! skips an unreadable subtree or refuses a symlink can therefore derive a
-//! SMALLER passing suite than the repository actually demands. This module
-//! makes the walk's limits part of the result: [`RepoInventory`] carries the
-//! discovered files AND a typed [`InventoryCompleteness`], and ANY value
-//! other than `Complete` prohibits a `Passed` verification verdict — the
-//! caller must classify the attempt `Unavailable` with the typed reason.
+//! The previous correctness ceiling (500 files, 200 entries per directory,
+//! depth 6) was too small for normal repositories: verification then
+//! (correctly) refused `Passed`, but the product must actually verify such
+//! repositories. Discovery is therefore bounded by RESOURCE budgets sized
+//! for large repositories — never by a correctness ceiling:
 //!
-//! The walk is deterministic (sorted per directory), bounded (files,
-//! per-directory page, depth), and symlink-safe: a symlink entry is never
-//! followed (so cyclic/hostile links can neither loop nor hide a subtree),
-//! and its presence makes the inventory non-Complete (`Unreadable` — the
-//! tree could not be vouched for at that path).
+//! - **Git repositories** are discovered through `git ls-files -z` plus a
+//!   bounded `git ls-files --others --exclude-standard -z` for untracked
+//!   files, both executed through the workspace
+//!   [`faktor_terminal::ProcessSupervisor`] with a per-command deadline and
+//!   byte-bounded output. A successful listing is
+//!   [`InventoryCompleteness::Complete`]. Exceeding the output byte budget is
+//!   [`InventoryCompleteness::OutputCapped`]; a deadline or spawn failure
+//!   after git was selected is [`InventoryCompleteness::GitUnavailable`]; an
+//!   untracked listing longer than the configured budget is
+//!   [`InventoryCompleteness::UntrackedBudgetExceeded`] WITH the excluded
+//!   count. Nothing is ever silently truncated.
+//! - **Non-Git** roots (git absent, not a repository, non-zero exit) use a
+//!   bounded native traversal and record the typed reason in
+//!   [`InventorySource`]. The traversal is bounded by RESOURCE budgets (max
+//!   paths, max metadata bytes, max wall, max depth, per-directory page);
+//!   exceeding any budget returns a typed non-Complete verdict.
+//! - **Manifest discovery is targeted**: every directory prefix observed in
+//!   the inventory is probed for the recognized manifest names
+//!   ([`MANIFEST_PROBE_NAMES`]), so a manifest is never missed merely
+//!   because a bounded walk stopped short of it (the frontier can be
+//!   arbitrarily deep). RULE: a recognized manifest that exists on disk but
+//!   is ABSENT from the inventory (gitignored, excluded by the skip set, or
+//!   over a discovery budget) surfaces as
+//!   [`InventoryCompleteness::ManifestExcluded`]; a content-deciding
+//!   manifest (`CMakeLists.txt`/`Makefile`/`*.csproj`) larger than the
+//!   derived-profile content-probe cap surfaces as
+//!   [`InventoryCompleteness::ManifestOversized`], because the evidence
+//!   derived from its content would silently change. Both are conservative
+//!   over-approximations: the inventory drives profile derivation before
+//!   changed-file mapping, so a missed manifest MAY change the derived check
+//!   set, and a `Passed` verdict must never rest on it.
 //!
-//! Caps mirror the integrated-root discovery path: 500 files, 200 entries
-//! per directory page, depth 6. Caps are REFUSALS, never truncation.
+//! The walk is deterministic (breadth-first, sorted per directory), bounded,
+//! and symlink-safe: a symlink entry is never followed (so cyclic/hostile
+//! links can neither loop nor hide a subtree), and its presence makes the
+//! inventory non-Complete ([`InventoryCompleteness::Unreadable`] — the tree
+//! could not be vouched for at that path).
+//!
+//! ANY value other than [`InventoryCompleteness::Complete`] prohibits a
+//! `Passed` verification verdict: the caller must classify the attempt
+//! `Unavailable` with the typed reason.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
+use std::ffi::OsString;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
-/// Hard cap on the files one inventory may certify. A walk that would
-/// exceed it reports [`InventoryCompleteness::EntryLimitExceeded`].
-pub const MAX_INVENTORY_FILES: usize = 500;
-/// Hard cap on one directory's listed children. A directory with more
-/// children reports [`InventoryCompleteness::DirectoryPageTruncated`].
-pub const MAX_INVENTORY_DIR_PAGE: usize = 200;
-/// Hard cap on the scanned depth (the root is depth 0). Any entry beyond
-/// this depth reports [`InventoryCompleteness::DepthLimitExceeded`].
-pub const MAX_INVENTORY_DEPTH: usize = 6;
-/// Internal per-directory iteration bound: a hostile directory with
-/// millions of entries is abandoned as a truncated page once this many
-/// entries were observed (memory/cpu stay bounded).
-const MAX_DIR_SCAN_ENTRIES: usize = 4096;
+use faktor_terminal::{EnvSpec, ProcessOwner, ProcessSupervisor, SpawnConfig};
 
-/// Directories never walked (vcs metadata and dependency/build trees) —
-/// the same fixed skip set the bounded evidence/verification walks use.
+/// Default hard cap on the scanned depth (the root is depth 0), generous for
+/// real repositories. A directory beyond it reports
+/// [`InventoryCompleteness::DepthBudgetExceeded`].
+pub const MAX_INVENTORY_DEPTH: usize = 64;
+/// Default resource budget on observed directory entries (files +
+/// directories) of one discovery.
+pub const DEFAULT_INVENTORY_MAX_PATHS: usize = 250_000;
+/// Default cumulative metadata budget of one native traversal: the sum of
+/// the file sizes observed (metadata only — never file contents).
+pub const DEFAULT_INVENTORY_METADATA_BYTES: u64 = 512 * 1024 * 1024;
+/// Default wall budget of one whole discovery (git + traversal + probing).
+pub const DEFAULT_INVENTORY_WALL: Duration = Duration::from_secs(120);
+/// Absolute wall ceiling of one discovery, whatever a configured budget
+/// requests: discovery itself is never unbounded.
+pub const MAX_INVENTORY_WALL_CEILING: Duration = Duration::from_secs(3600);
+/// Default bound on one directory's listed children.
+pub const DEFAULT_INVENTORY_DIR_PAGE: usize = 64 * 1024;
+/// Default byte budget of each `git ls-files` stream.
+pub const DEFAULT_GIT_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+/// Default wall budget of each git command.
+pub const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default budget of admitted untracked (non-ignored) files.
+pub const DEFAULT_UNTRACKED_BUDGET: usize = 10_000;
+
+/// Bound of the git failure reason retained on the inventory (a bounded
+/// first line, never the raw stream).
+const GIT_REASON_MAX_CHARS: usize = 240;
+/// Bounded stderr head captured from each git command (diagnostics only).
+const GIT_STDERR_CAP: usize = 16 * 1024;
+
+/// Directories never walked and never probed (vcs metadata and
+/// dependency/build trees) — the same fixed skip set the bounded
+/// evidence/verification walks use. The skip set is a deliberate scope
+/// exclusion, not silent truncation: a manifest below a skipped directory is
+/// out of scope for this inventory and is never probed.
 pub const INVENTORY_SKIP_DIRS: &[&str] = &[
     ".git",
     ".hg",
@@ -48,20 +102,116 @@ pub const INVENTORY_SKIP_DIRS: &[&str] = &[
     "dist",
 ];
 
-/// Whether a discovery walk certified the WHOLE repository under its caps.
+/// The recognized project manifests probed at every directory prefix of the
+/// inventory. This mirrors the marker set the project-profile derivation
+/// understands; its presence decides components, languages, build systems,
+/// toolchains and test frameworks — hence the completeness rule above.
+pub const MANIFEST_PROBE_NAMES: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "setup.py",
+    "requirements.txt",
+    "Pipfile",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "CMakeLists.txt",
+    "Makefile",
+    "makefile",
+    "GNUmakefile",
+    "meson.build",
+    "build.ninja",
+    "MODULE.bazel",
+    "WORKSPACE",
+    "WORKSPACE.bazel",
+    "platformio.ini",
+    "west.yml",
+    "west.yaml",
+    "CMakePresets.json",
+];
+
+/// The resource budgets of one discovery, configurable per call. Exceeding
+/// any of them is a typed non-Complete verdict, never silent truncation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventoryBudget {
+    /// Max observed directory entries (files + directories) for a native
+    /// traversal, and max file paths admitted from a git listing.
+    pub max_paths: usize,
+    /// Max cumulative metadata bytes (sum of observed file sizes) of a
+    /// native traversal.
+    pub max_metadata_bytes: u64,
+    /// Max wall time of the whole discovery (git, traversal and probing).
+    pub max_wall: Duration,
+    /// Max scanned depth of a native traversal (the root is depth 0).
+    pub max_depth: usize,
+    /// Max children of one directory listed by a native traversal.
+    pub max_dir_page: usize,
+    /// Max bytes retained from each `git ls-files` stream.
+    pub git_output_bytes: usize,
+    /// Max wall time of each git command.
+    pub git_timeout: Duration,
+    /// Max untracked (non-ignored) files admitted from git.
+    pub max_untracked: usize,
+    /// Program invoked for git discovery (default `git`; tests and hosts
+    /// pin an explicit path here).
+    pub git_program: OsString,
+}
+
+impl Default for InventoryBudget {
+    fn default() -> Self {
+        Self {
+            max_paths: DEFAULT_INVENTORY_MAX_PATHS,
+            max_metadata_bytes: DEFAULT_INVENTORY_METADATA_BYTES,
+            max_wall: DEFAULT_INVENTORY_WALL,
+            max_depth: MAX_INVENTORY_DEPTH,
+            max_dir_page: DEFAULT_INVENTORY_DIR_PAGE,
+            git_output_bytes: DEFAULT_GIT_OUTPUT_BYTES,
+            git_timeout: DEFAULT_GIT_TIMEOUT,
+            max_untracked: DEFAULT_UNTRACKED_BUDGET,
+            git_program: OsString::from("git"),
+        }
+    }
+}
+
+/// Whether a discovery certified the WHOLE repository under its budgets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InventoryCompleteness {
-    /// Every entry within the caps was read; the file list is the whole
+    /// Every entry within the budgets was read; the file list is the whole
     /// bounded view and profiling may proceed.
     Complete,
-    /// The file cap was exceeded: the walk saw more files than
-    /// [`MAX_INVENTORY_FILES`].
-    EntryLimitExceeded,
-    /// An entry existed beyond [`MAX_INVENTORY_DEPTH`].
-    DepthLimitExceeded,
-    /// A directory carried more children than [`MAX_INVENTORY_DIR_PAGE`]
-    /// (or more than the internal scan bound).
-    DirectoryPageTruncated,
+    /// A discovery stream exceeded its byte budget (git output over
+    /// [`InventoryBudget::git_output_bytes`]).
+    OutputCapped { limit_bytes: usize },
+    /// Git was selected but could not complete (deadline, spawn or listing
+    /// failure): the repository cannot be certified from a partial view.
+    GitUnavailable { reason: String },
+    /// More untracked files than [`InventoryBudget::max_untracked`] were
+    /// observed; the count beyond the budget is surfaced, never hidden.
+    UntrackedBudgetExceeded { observed: usize, budget: usize },
+    /// A recognized manifest exists on disk but is absent from the
+    /// inventory (gitignored, skipped, or over a budget); the derived check
+    /// set could change.
+    ManifestExcluded { path: String },
+    /// A content-deciding manifest (`CMakeLists.txt`, `Makefile`,
+    /// `*.csproj`) is larger than the derived-profile content-probe cap, so
+    /// the evidence derived from its content would silently change.
+    ManifestOversized { path: String, bytes: u64 },
+    /// The path budget was exceeded: the traversal saw more entries than
+    /// [`InventoryBudget::max_paths`].
+    PathBudgetExceeded { seen: usize, max: usize },
+    /// The cumulative metadata budget was exceeded.
+    MetadataBudgetExceeded { seen_bytes: u64, max_bytes: u64 },
+    /// The wall budget ran out mid-discovery.
+    WallBudgetExceeded { max: Duration },
+    /// An entry existed beyond [`InventoryBudget::max_depth`].
+    DepthBudgetExceeded { max_depth: usize },
+    /// A directory carried more children than
+    /// [`InventoryBudget::max_dir_page`].
+    DirectoryPageTruncated { limit: usize },
     /// One path could not be read as a plain file/directory entry (a
     /// permission failure, an I/O error, or a symlink the walk refuses to
     /// follow).
@@ -77,14 +227,42 @@ impl InventoryCompleteness {
     pub fn reason(&self) -> Option<String> {
         match self {
             Self::Complete => None,
-            Self::EntryLimitExceeded => Some(format!(
-                "repository inventory exceeded the {MAX_INVENTORY_FILES}-file cap; refusing to derive a smaller check suite"
+            Self::OutputCapped { limit_bytes } => Some(format!(
+                "repository discovery output exceeded the {limit_bytes}-byte budget; refusing to derive a check suite from a truncated listing"
             )),
-            Self::DepthLimitExceeded => Some(format!(
-                "repository inventory exceeded the depth-{MAX_INVENTORY_DEPTH} cap; a manifest or source beyond the frontier may be missing"
+            Self::GitUnavailable { reason } => Some(format!(
+                "git repository discovery could not complete ({reason}); refusing to certify the repository from a partial view"
             )),
-            Self::DirectoryPageTruncated => Some(format!(
-                "repository inventory truncated a directory listing at the {MAX_INVENTORY_DIR_PAGE}-entry page cap; the bounded view is not the whole tree"
+            Self::UntrackedBudgetExceeded { observed, budget } => {
+                let excluded = observed.saturating_sub(*budget);
+                Some(format!(
+                    "repository discovery observed {observed} untracked paths, over the {budget}-path budget; {excluded} excluded paths are not in the inventory"
+                ))
+            }
+            Self::ManifestExcluded { path } => Some(format!(
+                "recognized project manifest {path:?} exists but was excluded from the inventory; the derived check set could change"
+            )),
+            Self::ManifestOversized { path, bytes } => Some(format!(
+                "recognized project manifest {path:?} is {bytes} bytes, over the content-probe budget; check evidence derived from its content could silently change"
+            )),
+            Self::PathBudgetExceeded { seen, max } => Some(format!(
+                "repository discovery exceeded the {max}-path budget (observed {seen}); refusing to derive a smaller check suite"
+            )),
+            Self::MetadataBudgetExceeded {
+                seen_bytes,
+                max_bytes,
+            } => Some(format!(
+                "repository discovery exceeded the {max_bytes}-byte metadata budget (observed {seen_bytes}); the bounded view is not the whole tree"
+            )),
+            Self::WallBudgetExceeded { max } => Some(format!(
+                "repository discovery exceeded its {}s wall budget; the bounded view is not the whole tree",
+                max.as_secs()
+            )),
+            Self::DepthBudgetExceeded { max_depth } => Some(format!(
+                "repository inventory exceeded the depth-{max_depth} budget; a manifest or source beyond the frontier may be missing"
+            )),
+            Self::DirectoryPageTruncated { limit } => Some(format!(
+                "repository inventory truncated a directory listing at the {limit}-entry page budget; the bounded view is not the whole tree"
             )),
             Self::Unreadable { path } => Some(format!(
                 "repository inventory could not read {path:?} (unreadable path or a symlink the walk refuses to follow)"
@@ -93,12 +271,27 @@ impl InventoryCompleteness {
     }
 }
 
-/// The bounded discovery result: the sorted workspace-relative file paths
-/// plus the COMPLETENESS of the walk that produced them.
+/// How the inventory was discovered (typed provenance; a git failure is
+/// never silent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InventorySource {
+    /// `git ls-files` was the authority.
+    Git,
+    /// Git was unusable (absent / not a repository / non-zero exit): the
+    /// native bounded traversal was the authority, with the typed reason.
+    NativeGitFallback { reason: String },
+    /// A native bounded traversal was used directly.
+    Native,
+}
+
+/// The bounded discovery result: the sorted workspace-relative file paths,
+/// the COMPLETENESS of the discovery that produced them, and the typed
+/// source (git vs native fallback).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoInventory {
     pub files: Vec<String>,
     pub completeness: InventoryCompleteness,
+    pub source: InventorySource,
 }
 
 impl Default for RepoInventory {
@@ -106,6 +299,7 @@ impl Default for RepoInventory {
         Self {
             files: Vec::new(),
             completeness: InventoryCompleteness::Complete,
+            source: InventorySource::Native,
         }
     }
 }
@@ -115,7 +309,7 @@ impl RepoInventory {
         self.completeness.is_complete()
     }
 
-    /// `None` when the walk was Complete; otherwise the typed reason a
+    /// `None` when the discovery was Complete; otherwise the typed reason a
     /// verification verdict must surface instead of `Passed`.
     pub fn refusal_reason(&self) -> Option<String> {
         self.completeness.reason()
@@ -126,16 +320,291 @@ fn posix_rel(parts: &[String]) -> String {
     parts.join("/")
 }
 
-/// Discover a repository's bounded file inventory. Deterministic
-/// (breadth-first, sorted per directory), symlink-safe, and honest about
-/// every cap: the first non-Complete condition encountered in walk order is
-/// reported (walk order is stable, so the verdict is stable).
+fn join_rel(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// True when a non-final path component is a skipped directory (the skip
+/// policy applies to directories, never to a file that merely shares the
+/// name).
+fn under_skip_dir(path: &str) -> bool {
+    let mut segments = path.split('/').peekable();
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            return false;
+        }
+        if INVENTORY_SKIP_DIRS.contains(&segment) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a manifest's CONTENT decides check families. A bounded content
+/// probe whose marker is missed silently (the manifest is oversized) can
+/// therefore change the derived check set, so such a manifest is surfaced.
+fn content_decides_checks(name: &str) -> bool {
+    matches!(
+        name,
+        "CMakeLists.txt" | "Makefile" | "makefile" | "GNUmakefile"
+    ) || name.ends_with(".csproj")
+}
+
+/// Discover a repository's bounded file inventory with the default resource
+/// budgets. Deterministic (git order aside: sorted), symlink-safe, and
+/// honest about every budget: the first non-Complete condition encountered
+/// in discovery order is reported (discovery order is stable, so the verdict
+/// is stable).
 pub fn discover_repo_inventory(root: &Path) -> RepoInventory {
+    discover_repo_inventory_with_budget(root, &InventoryBudget::default())
+}
+
+/// [`discover_repo_inventory`] under explicit resource budgets (adversarial
+/// tests and callers with tighter scope). Git is attempted first; a git
+/// failure falls back to the native traversal with the typed reason, while
+/// git LIMIT hits (output cap, untracked cap, deadline) are typed
+/// non-Complete verdicts — a limit hit is never silently papered over by a
+/// fallback that would implicitly claim git-equivalence.
+pub fn discover_repo_inventory_with_budget(root: &Path, budget: &InventoryBudget) -> RepoInventory {
+    let wall = budget.max_wall.min(MAX_INVENTORY_WALL_CEILING);
+    let deadline = Instant::now() + wall;
+    if budget.max_wall.is_zero() {
+        // No discovery method can run within the budget: typed refusal
+        // before any process or directory is touched.
+        return RepoInventory {
+            files: Vec::new(),
+            completeness: InventoryCompleteness::WallBudgetExceeded {
+                max: budget.max_wall,
+            },
+            source: InventorySource::Native,
+        };
+    }
+    let (mut files, mut completeness, source) = match try_git_inventory(root, budget, deadline) {
+        GitAttempt::Complete(files) => {
+            (files, InventoryCompleteness::Complete, InventorySource::Git)
+        }
+        GitAttempt::Incomplete(inventory) => return inventory,
+        GitAttempt::Fallback { reason } => {
+            let native = native_inventory(root, budget, deadline);
+            (
+                native.files,
+                native.completeness,
+                InventorySource::NativeGitFallback { reason },
+            )
+        }
+    };
+    if completeness.is_complete() {
+        files.sort();
+        files.dedup();
+        if let Some(probe) = probe_manifests(root, &files, budget, deadline) {
+            completeness = probe;
+        }
+    }
+    RepoInventory {
+        files,
+        completeness,
+        source,
+    }
+}
+
+enum GitAttempt {
+    Complete(Vec<String>),
+    Incomplete(RepoInventory),
+    Fallback { reason: String },
+}
+
+/// The narrowed result of one supervised `git` invocation.
+enum GitRun {
+    Output(String),
+    /// Output exceeded the byte budget: the listing is partial.
+    Capped,
+    /// The command hit its deadline (the remaining discovery wall budget,
+    /// capped by the per-command git timeout).
+    TimedOut {
+        after: Duration,
+    },
+    /// Spawn failure or non-zero exit (e.g. "not a git repository").
+    Failed {
+        reason: String,
+    },
+}
+
+/// The child environment of a git discovery: the toolchain allowlist
+/// (PATH/HOME/...) plus `GIT_CEILING_DIRECTORIES` pinned to the parent of
+/// the root, so git never ascends into an enclosing repository and lists
+/// paths outside the verification root. The root itself is still checked.
+fn git_env(root: &Path) -> EnvSpec {
+    let mut entries: Vec<(OsString, OsString)> = faktor_core::command::TOOLCHAIN_ENV_ALLOWLIST
+        .iter()
+        .map(|name| (OsString::from(*name), OsString::new()))
+        .collect();
+    if let Some(parent) = root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        entries.push((
+            OsString::from("GIT_CEILING_DIRECTORIES"),
+            parent.as_os_str().to_os_string(),
+        ));
+    }
+    EnvSpec::Explicit(entries)
+}
+
+fn bounded_git_reason(text: &str) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    line.chars().take(GIT_REASON_MAX_CHARS).collect()
+}
+
+fn run_git(root: &Path, budget: &InventoryBudget, deadline: Instant, args: &[&str]) -> GitRun {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let timeout = budget.git_timeout.min(remaining);
+    if timeout.is_zero() {
+        return GitRun::TimedOut {
+            after: Duration::ZERO,
+        };
+    }
+    let cfg = SpawnConfig {
+        cmd: budget.git_program.to_string_lossy().into_owned(),
+        args: args.iter().map(|arg| (*arg).to_string()).collect(),
+        cwd: root.to_path_buf(),
+        env: git_env(root),
+        owner: ProcessOwner::Daemon,
+        capture: true,
+        artifact_max: budget.git_output_bytes.max(4096),
+        network_isolation: faktor_terminal::NetworkIsolation::Inherit,
+    };
+    match ProcessSupervisor::shared().run_sync(
+        cfg,
+        timeout,
+        budget.git_output_bytes,
+        GIT_STDERR_CAP,
+    ) {
+        Ok(out) if out.timed_out => GitRun::TimedOut { after: timeout },
+        Ok(out) if out.exit_code != Some(0) => {
+            let reason = bounded_git_reason(&out.stderr_head);
+            GitRun::Failed {
+                reason: if reason.is_empty() {
+                    format!("git exited with {:?}", out.exit_code)
+                } else {
+                    reason
+                },
+            }
+        }
+        Ok(out) if out.stdout_truncated => GitRun::Capped,
+        Ok(out) => GitRun::Output(out.stdout_head),
+        Err(e) => GitRun::Failed {
+            reason: format!("git could not be spawned: {e}"),
+        },
+    }
+}
+
+fn parse_z(text: &str) -> Vec<String> {
+    text.split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn git_incomplete(completeness: InventoryCompleteness) -> GitAttempt {
+    GitAttempt::Incomplete(RepoInventory {
+        files: Vec::new(),
+        completeness,
+        source: InventorySource::Git,
+    })
+}
+
+fn try_git_inventory(root: &Path, budget: &InventoryBudget, deadline: Instant) -> GitAttempt {
+    if !root.is_dir() {
+        return GitAttempt::Fallback {
+            reason: "repository root is not a readable directory".to_string(),
+        };
+    }
+    let tracked = match run_git(root, budget, deadline, &["ls-files", "-z"]) {
+        GitRun::Output(text) => parse_z(&text),
+        GitRun::Capped => {
+            return git_incomplete(InventoryCompleteness::OutputCapped {
+                limit_bytes: budget.git_output_bytes,
+            })
+        }
+        GitRun::TimedOut { after } => {
+            return git_incomplete(InventoryCompleteness::GitUnavailable {
+                reason: format!("git ls-files exceeded its {}ms deadline", after.as_millis()),
+            })
+        }
+        GitRun::Failed { reason } => return GitAttempt::Fallback { reason },
+    };
+    if tracked.len() > budget.max_paths {
+        return git_incomplete(InventoryCompleteness::PathBudgetExceeded {
+            seen: tracked.len(),
+            max: budget.max_paths,
+        });
+    }
+    let untracked = match run_git(
+        root,
+        budget,
+        deadline,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    ) {
+        GitRun::Output(text) => parse_z(&text),
+        GitRun::Capped => {
+            return git_incomplete(InventoryCompleteness::OutputCapped {
+                limit_bytes: budget.git_output_bytes,
+            })
+        }
+        GitRun::TimedOut { after } => {
+            return git_incomplete(InventoryCompleteness::GitUnavailable {
+                reason: format!(
+                    "git ls-files --others exceeded its {}ms deadline",
+                    after.as_millis()
+                ),
+            })
+        }
+        GitRun::Failed { reason } => {
+            return git_incomplete(InventoryCompleteness::GitUnavailable { reason })
+        }
+    };
+    if untracked.len() > budget.max_untracked {
+        return git_incomplete(InventoryCompleteness::UntrackedBudgetExceeded {
+            observed: untracked.len(),
+            budget: budget.max_untracked,
+        });
+    }
+    if tracked.len() + untracked.len() > budget.max_paths {
+        return git_incomplete(InventoryCompleteness::PathBudgetExceeded {
+            seen: tracked.len() + untracked.len(),
+            max: budget.max_paths,
+        });
+    }
+    let mut files: Vec<String> = tracked
+        .into_iter()
+        .chain(untracked)
+        .filter(|path| !under_skip_dir(path))
+        .collect();
+    files.sort();
+    files.dedup();
+    GitAttempt::Complete(files)
+}
+
+/// The bounded native traversal: breadth-first, sorted per directory,
+/// symlinks never followed. Every budget hit is a typed verdict.
+fn native_inventory(root: &Path, budget: &InventoryBudget, deadline: Instant) -> RepoInventory {
     let mut files: Vec<String> = Vec::new();
     let mut completeness = InventoryCompleteness::Complete;
+    let mut paths_seen: usize = 0;
+    let mut bytes_seen: u64 = 0;
     let mut queue: VecDeque<(usize, Vec<String>)> = VecDeque::new();
     queue.push_back((0, Vec::new()));
     'walk: while let Some((depth, dir_parts)) = queue.pop_front() {
+        if Instant::now() >= deadline {
+            completeness = InventoryCompleteness::WallBudgetExceeded {
+                max: budget.max_wall,
+            };
+            break 'walk;
+        }
         let abs = if dir_parts.is_empty() {
             root.to_path_buf()
         } else {
@@ -151,11 +620,25 @@ pub fn discover_repo_inventory(root: &Path) -> RepoInventory {
             }
         };
         let mut names: Vec<(String, std::fs::FileType)> = Vec::new();
-        let mut seen = 0usize;
         for entry in entries {
-            seen += 1;
-            if seen > MAX_DIR_SCAN_ENTRIES {
-                completeness = InventoryCompleteness::DirectoryPageTruncated;
+            paths_seen += 1;
+            if paths_seen > budget.max_paths {
+                completeness = InventoryCompleteness::PathBudgetExceeded {
+                    seen: paths_seen,
+                    max: budget.max_paths,
+                };
+                break 'walk;
+            }
+            if names.len() >= budget.max_dir_page {
+                completeness = InventoryCompleteness::DirectoryPageTruncated {
+                    limit: budget.max_dir_page,
+                };
+                break 'walk;
+            }
+            if paths_seen.is_multiple_of(4096) && Instant::now() >= deadline {
+                completeness = InventoryCompleteness::WallBudgetExceeded {
+                    max: budget.max_wall,
+                };
                 break 'walk;
             }
             let entry = match entry {
@@ -171,8 +654,8 @@ pub fn discover_repo_inventory(root: &Path) -> RepoInventory {
             // symlink_metadata-based classification: a symlink stays a
             // symlink (never followed), so cyclic links cannot loop and a
             // linked subtree can never hide from the completeness verdict.
-            let file_type = match std::fs::symlink_metadata(entry.path()) {
-                Ok(meta) => meta.file_type(),
+            let meta = match std::fs::symlink_metadata(entry.path()) {
+                Ok(meta) => meta,
                 Err(_) => {
                     let mut path = dir_parts.clone();
                     path.push(name);
@@ -182,13 +665,19 @@ pub fn discover_repo_inventory(root: &Path) -> RepoInventory {
                     break 'walk;
                 }
             };
-            names.push((name, file_type));
+            if meta.file_type().is_file() {
+                bytes_seen = bytes_seen.saturating_add(meta.len());
+                if bytes_seen > budget.max_metadata_bytes {
+                    completeness = InventoryCompleteness::MetadataBudgetExceeded {
+                        seen_bytes: bytes_seen,
+                        max_bytes: budget.max_metadata_bytes,
+                    };
+                    break 'walk;
+                }
+            }
+            names.push((name, meta.file_type()));
         }
-        if names.len() > MAX_INVENTORY_DIR_PAGE {
-            completeness = InventoryCompleteness::DirectoryPageTruncated;
-            break 'walk;
-        }
-        names.sort_by_key(|(name, _)| name.clone());
+        names.sort_by(|(a, _), (b, _)| a.cmp(b));
         for (name, file_type) in names {
             let mut parts = dir_parts.clone();
             parts.push(name.clone());
@@ -202,17 +691,15 @@ pub fn discover_repo_inventory(root: &Path) -> RepoInventory {
                 if INVENTORY_SKIP_DIRS.contains(&name.as_str()) {
                     continue;
                 }
-                if depth + 1 > MAX_INVENTORY_DEPTH {
-                    completeness = InventoryCompleteness::DepthLimitExceeded;
+                if depth + 1 > budget.max_depth {
+                    completeness = InventoryCompleteness::DepthBudgetExceeded {
+                        max_depth: budget.max_depth,
+                    };
                     break 'walk;
                 }
                 queue.push_back((depth + 1, parts));
             } else {
                 files.push(posix_rel(&parts));
-                if files.len() > MAX_INVENTORY_FILES {
-                    completeness = InventoryCompleteness::EntryLimitExceeded;
-                    break 'walk;
-                }
             }
         }
     }
@@ -221,13 +708,88 @@ pub fn discover_repo_inventory(root: &Path) -> RepoInventory {
     RepoInventory {
         files,
         completeness,
+        source: InventorySource::Native,
     }
+}
+
+/// Targeted manifest discovery: probe every directory prefix observed in
+/// the inventory for the recognized manifest names, and surface the first
+/// completeness violation in deterministic order (root first, sorted dirs,
+/// fixed name order). The rule is documented at the module level.
+fn probe_manifests(
+    root: &Path,
+    files: &[String],
+    budget: &InventoryBudget,
+    deadline: Instant,
+) -> Option<InventoryCompleteness> {
+    let mut dirs: BTreeSet<String> = BTreeSet::new();
+    dirs.insert(String::new());
+    for file in files {
+        let mut start = 0usize;
+        while let Some(pos) = file[start..].find('/') {
+            let end = start + pos;
+            dirs.insert(file[..end].to_string());
+            start = end + 1;
+        }
+    }
+    for dir in &dirs {
+        if Instant::now() >= deadline {
+            return Some(InventoryCompleteness::WallBudgetExceeded {
+                max: budget.max_wall,
+            });
+        }
+        for name in MANIFEST_PROBE_NAMES {
+            let rel = join_rel(dir, name);
+            // A case-variant of the same manifest name (Makefile/makefile)
+            // already present in the inventory covers this probe: on a
+            // case-insensitive filesystem the probe would otherwise find
+            // the present file under the other spelling and report a false
+            // exclusion. Only one variant is ever read by profile
+            // derivation, so skipping cannot hide a check-affecting
+            // manifest.
+            let case_variant_present = MANIFEST_PROBE_NAMES.iter().any(|other| {
+                !other.eq(name)
+                    && other.eq_ignore_ascii_case(name)
+                    && files.binary_search(&join_rel(dir, other)).is_ok()
+            });
+            if files.binary_search(&rel).is_ok() {
+                if content_decides_checks(name) {
+                    if let Ok(meta) = std::fs::symlink_metadata(root.join(&rel)) {
+                        if meta.file_type().is_file() && meta.len() > crate::derive::MAX_PROBE_BYTES
+                        {
+                            return Some(InventoryCompleteness::ManifestOversized {
+                                path: rel,
+                                bytes: meta.len(),
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
+            if case_variant_present {
+                continue;
+            }
+            match std::fs::symlink_metadata(root.join(&rel)) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Some(InventoryCompleteness::Unreadable { path: rel });
+                }
+                Ok(meta) if meta.file_type().is_file() => {
+                    return Some(InventoryCompleteness::ManifestExcluded { path: rel });
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Some(InventoryCompleteness::Unreadable { path: rel }),
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
 
     fn write(root: &Path, rel: &str) {
         let path = root.join(rel);
@@ -236,6 +798,41 @@ mod tests {
         }
         fs::write(path, b"x").unwrap();
     }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_git(dir: &Path) {
+        git(dir, &["init", "-q"]);
+        git(dir, &["add", "-A"]);
+    }
+
+    fn deep_dir(depth: usize) -> String {
+        (0..depth)
+            .map(|i| format!("d{i:02}"))
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    // ---------------------------------------------------------- native basics
 
     #[test]
     fn complete_small_repo_is_complete_and_sorted() {
@@ -254,6 +851,10 @@ mod tests {
             ]
         );
         assert!(inv.refusal_reason().is_none());
+        assert!(
+            matches!(&inv.source, InventorySource::NativeGitFallback { reason } if !reason.is_empty()),
+            "a non-repository root must record its typed fallback: {inv:?}"
+        );
     }
 
     #[test]
@@ -268,85 +869,401 @@ mod tests {
     }
 
     #[test]
-    fn five_hundred_one_files_is_an_entry_limit_refusal() {
+    fn unreadable_root_is_reported_not_empty_complete() {
         let dir = tempfile::tempdir().unwrap();
-        // Spread across directories so no single page exceeds the
-        // directory cap: the FILE cap is the condition under test.
-        for i in 0..=MAX_INVENTORY_FILES {
-            write(dir.path(), &format!("d{}/f{i:04}.rs", i % 40));
-        }
-        let inv = discover_repo_inventory(dir.path());
+        let missing = dir.path().join("does-not-exist");
+        let inv = discover_repo_inventory(&missing);
         assert_eq!(
             inv.completeness,
-            InventoryCompleteness::EntryLimitExceeded,
+            InventoryCompleteness::Unreadable {
+                path: String::new()
+            }
+        );
+        assert!(inv.files.is_empty());
+        assert!(inv.refusal_reason().is_some());
+    }
+
+    // ------------------------------------------------------------- git path
+
+    #[test]
+    fn git_repo_with_five_thousand_tracked_files_and_deep_manifests_is_complete() {
+        if !git_available() {
+            eprintln!("skipping git discovery test: git is not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let deep = deep_dir(12);
+        write(dir.path(), &format!("{deep}/Cargo.toml"));
+        write(dir.path(), &format!("{deep}/package.json"));
+        write(dir.path(), &format!("{deep}/src/lib.rs"));
+        for i in 0..5000 {
+            write(dir.path(), &format!("src/g{:02}/f{i:05}.txt", i % 50));
+        }
+        init_git(dir.path());
+
+        let inv = discover_repo_inventory(dir.path());
+        assert_eq!(inv.source, InventorySource::Git, "{inv:?}");
+        assert_eq!(inv.completeness, InventoryCompleteness::Complete);
+        assert_eq!(inv.files.len(), 5003, "5k sources + 2 manifests + lib.rs");
+        assert!(
+            inv.files.contains(&format!("{deep}/Cargo.toml")),
+            "a depth-12 manifest beyond the old depth-6 frontier must be discovered"
+        );
+
+        // The derived check set is the right one for the deep component.
+        let profile = crate::derive::detect_project_profile(dir.path(), &inv.files);
+        let changed = vec![PathBuf::from(format!("{deep}/src/lib.rs"))];
+        let specs = crate::derive::derive_checks(&profile, &changed).unwrap();
+        let cargo = specs
+            .iter()
+            .find(|spec| spec.id.ends_with("rust_check"))
+            .expect("the deep Cargo component must derive a cargo check");
+        assert_eq!(cargo.cwd_rel, PathBuf::from(&deep));
+        assert!(specs.iter().any(|spec| spec.program == "cargo"));
+    }
+
+    #[test]
+    fn outer_repository_never_leaks_into_an_inner_root() {
+        if !git_available() {
+            eprintln!("skipping git discovery test: git is not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "sub/inner.rs");
+        write(dir.path(), "outer.rs");
+        init_git(dir.path());
+        // `dir` is a repository; `dir/sub` is inside it but is not its own
+        // repository. Discovery rooted at `sub` must not list the outer
+        // repository's tracked paths (the ceiling env stops the ascent).
+        let inner = dir.path().join("sub");
+        let inv = discover_repo_inventory(&inner);
+        assert!(
+            matches!(&inv.source, InventorySource::NativeGitFallback { .. }),
+            "an enclosing repository must not be probed through: {inv:?}"
+        );
+        assert_eq!(inv.completeness, InventoryCompleteness::Complete);
+        assert_eq!(inv.files, vec!["inner.rs".to_string()]);
+    }
+
+    #[test]
+    fn untracked_budget_caps_surface_the_excluded_count() {
+        if !git_available() {
+            eprintln!("skipping git discovery test: git is not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "tracked.txt");
+        git(dir.path(), &["init", "-q"]);
+        git(dir.path(), &["add", "tracked.txt"]);
+        for i in 0..20 {
+            write(dir.path(), &format!("u{i:02}.txt"));
+        }
+        let budget = InventoryBudget {
+            max_untracked: 5,
+            ..Default::default()
+        };
+        let inv = discover_repo_inventory_with_budget(dir.path(), &budget);
+        assert_eq!(
+            inv.completeness,
+            InventoryCompleteness::UntrackedBudgetExceeded {
+                observed: 20,
+                budget: 5
+            },
             "{inv:?}"
         );
-        assert!(inv.refusal_reason().unwrap().contains("file cap"));
+        let reason = inv.refusal_reason().unwrap();
+        assert!(
+            reason.contains("20 untracked") && reason.contains("15 excluded"),
+            "the exclusion count must be surfaced: {reason}"
+        );
+        assert!(!inv.is_complete());
     }
 
     #[test]
-    fn five_hundred_files_is_complete_at_the_cap() {
-        let dir = tempfile::tempdir().unwrap();
-        for i in 0..MAX_INVENTORY_FILES {
-            write(dir.path(), &format!("d{}/f{i:04}.rs", i % 40));
+    fn git_output_cap_is_typed_and_never_silent() {
+        if !git_available() {
+            eprintln!("skipping git discovery test: git is not installed");
+            return;
         }
-        let inv = discover_repo_inventory(dir.path());
-        assert_eq!(inv.completeness, InventoryCompleteness::Complete);
-        assert_eq!(inv.files.len(), MAX_INVENTORY_FILES);
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..64 {
+            write(dir.path(), &format!("f{i:02}.txt"));
+        }
+        init_git(dir.path());
+        let budget = InventoryBudget {
+            git_output_bytes: 16,
+            ..Default::default()
+        };
+        let inv = discover_repo_inventory_with_budget(dir.path(), &budget);
+        assert_eq!(
+            inv.completeness,
+            InventoryCompleteness::OutputCapped { limit_bytes: 16 },
+            "{inv:?}"
+        );
+        assert!(inv.refusal_reason().unwrap().contains("16-byte budget"));
     }
 
     #[test]
-    fn over_two_hundred_directory_children_is_a_page_truncation_refusal() {
+    fn absent_git_falls_back_typed_to_native() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/lib.rs");
+        let budget = InventoryBudget {
+            git_program: OsString::from("faktor-no-such-git-binary"),
+            ..Default::default()
+        };
+        let inv = discover_repo_inventory_with_budget(dir.path(), &budget);
+        assert!(
+            matches!(&inv.source, InventorySource::NativeGitFallback { .. }),
+            "{inv:?}"
+        );
+        assert_eq!(inv.completeness, InventoryCompleteness::Complete);
+        assert_eq!(inv.files, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[test]
+    fn ignored_manifest_is_typed_incompleteness() {
+        if !git_available() {
+            eprintln!("skipping git discovery test: git is not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/lib.rs");
+        fs::write(dir.path().join(".gitignore"), b"Cargo.toml\n").unwrap();
+        write(dir.path(), "Cargo.toml");
+        init_git(dir.path());
+        let inv = discover_repo_inventory(dir.path());
+        assert_eq!(inv.source, InventorySource::Git);
+        assert_eq!(
+            inv.completeness,
+            InventoryCompleteness::ManifestExcluded {
+                path: "Cargo.toml".to_string()
+            },
+            "{inv:?}"
+        );
+        assert!(inv
+            .refusal_reason()
+            .unwrap()
+            .contains("derived check set could change"));
+    }
+
+    // ------------------------------------------------------- resource budgets
+
+    #[test]
+    fn path_budget_exceeded_is_typed_and_prohibits_passed() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..100 {
+            write(dir.path(), &format!("d{}/f{i:03}.rs", i % 10));
+        }
+        let budget = InventoryBudget {
+            max_paths: 10,
+            ..Default::default()
+        };
+        let inv = discover_repo_inventory_with_budget(dir.path(), &budget);
+        assert!(
+            matches!(
+                inv.completeness,
+                InventoryCompleteness::PathBudgetExceeded { max: 10, .. }
+            ),
+            "{inv:?}"
+        );
+        assert!(!inv.is_complete());
+        assert!(inv.refusal_reason().unwrap().contains("10-path budget"));
+    }
+
+    #[test]
+    fn metadata_budget_exceeded_is_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "big.bin");
+        let budget = InventoryBudget {
+            max_metadata_bytes: 0,
+            ..Default::default()
+        };
+        let inv = discover_repo_inventory_with_budget(dir.path(), &budget);
+        assert!(
+            matches!(
+                inv.completeness,
+                InventoryCompleteness::MetadataBudgetExceeded { max_bytes: 0, .. }
+            ),
+            "{inv:?}"
+        );
+        assert!(!inv.is_complete());
+    }
+
+    #[test]
+    fn wall_budget_exceeded_is_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/lib.rs");
+        let budget = InventoryBudget {
+            git_program: OsString::from("faktor-no-such-git-binary"),
+            max_wall: Duration::ZERO,
+            ..Default::default()
+        };
+        let inv = discover_repo_inventory_with_budget(dir.path(), &budget);
+        assert_eq!(
+            inv.completeness,
+            InventoryCompleteness::WallBudgetExceeded {
+                max: Duration::ZERO
+            },
+            "{inv:?}"
+        );
+        assert!(!inv.is_complete());
+    }
+
+    #[test]
+    fn directory_page_budget_truncation_is_typed() {
         let dir = tempfile::tempdir().unwrap();
         let wide = dir.path().join("wide");
         fs::create_dir_all(&wide).unwrap();
-        for i in 0..=MAX_INVENTORY_DIR_PAGE {
-            fs::write(wide.join(format!("c{i:03}")), b"x").unwrap();
+        for i in 0..5 {
+            fs::write(wide.join(format!("c{i}")), b"x").unwrap();
         }
-        let inv = discover_repo_inventory(dir.path());
+        let budget = InventoryBudget {
+            max_dir_page: 2,
+            ..Default::default()
+        };
+        let inv = discover_repo_inventory_with_budget(dir.path(), &budget);
         assert_eq!(
             inv.completeness,
-            InventoryCompleteness::DirectoryPageTruncated,
+            InventoryCompleteness::DirectoryPageTruncated { limit: 2 },
             "{inv:?}"
         );
-        assert!(inv.refusal_reason().unwrap().contains("page cap"));
+        assert!(inv
+            .refusal_reason()
+            .unwrap()
+            .contains("2-entry page budget"));
     }
 
     #[test]
-    fn exactly_two_hundred_children_is_complete() {
+    fn ten_thousand_entry_directory_stays_bounded_and_complete() {
         let dir = tempfile::tempdir().unwrap();
         let wide = dir.path().join("wide");
         fs::create_dir_all(&wide).unwrap();
-        for i in 0..MAX_INVENTORY_DIR_PAGE {
-            fs::write(wide.join(format!("c{i:03}")), b"x").unwrap();
+        for i in 0..10_000 {
+            fs::write(wide.join(format!("c{i:05}")), b"x").unwrap();
         }
         let inv = discover_repo_inventory(dir.path());
-        assert_eq!(inv.completeness, InventoryCompleteness::Complete);
-        assert_eq!(inv.files.len(), MAX_INVENTORY_DIR_PAGE);
+        assert_eq!(inv.completeness, InventoryCompleteness::Complete, "{inv:?}");
+        assert_eq!(inv.files.len(), 10_000);
     }
 
     #[test]
-    fn manifest_beyond_depth_six_is_a_depth_refusal() {
+    fn manifest_beyond_the_depth_budget_is_a_typed_refusal() {
         let dir = tempfile::tempdir().unwrap();
-        // depth 1..=6 directories, manifest at depth 7: beyond the cap.
-        write(dir.path(), "a/b/c/d/e/f/g/Cargo.toml");
+        let mut deep = dir.path().to_path_buf();
+        for i in 0..=MAX_INVENTORY_DEPTH {
+            deep = deep.join(format!("d{i:02}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("Cargo.toml"), b"x").unwrap();
         let inv = discover_repo_inventory(dir.path());
         assert_eq!(
             inv.completeness,
-            InventoryCompleteness::DepthLimitExceeded,
+            InventoryCompleteness::DepthBudgetExceeded {
+                max_depth: MAX_INVENTORY_DEPTH
+            },
             "{inv:?}"
         );
         assert!(inv.refusal_reason().unwrap().contains("depth"));
     }
 
     #[test]
-    fn manifest_at_depth_six_is_scanned() {
+    fn manifest_at_depth_twelve_is_discovered() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "a/b/c/d/e/f/Cargo.toml");
+        let deep = deep_dir(12);
+        write(dir.path(), &format!("{deep}/Cargo.toml"));
+        write(dir.path(), &format!("{deep}/src/lib.rs"));
         let inv = discover_repo_inventory(dir.path());
-        assert_eq!(inv.completeness, InventoryCompleteness::Complete);
-        assert!(inv.files.iter().any(|f| f.ends_with("Cargo.toml")));
+        assert_eq!(inv.completeness, InventoryCompleteness::Complete, "{inv:?}");
+        assert!(
+            inv.files.contains(&format!("{deep}/Cargo.toml")),
+            "a depth-12 manifest is well within the generous budgets: {inv:?}"
+        );
     }
+
+    #[test]
+    fn large_native_tree_of_fifty_thousand_files_with_deep_manifest_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = deep_dir(12);
+        write(dir.path(), &format!("{deep}/CMakeLists.txt"));
+        write(dir.path(), &format!("{deep}/src/main.c"));
+        for d in 0..100 {
+            let sub = dir.path().join(format!("src/g{d:03}"));
+            fs::create_dir_all(&sub).unwrap();
+            for f in 0..500 {
+                fs::write(sub.join(format!("f{f:03}.rs")), b"// x\n").unwrap();
+            }
+        }
+        let inv = discover_repo_inventory(dir.path());
+        assert_eq!(
+            inv.completeness,
+            InventoryCompleteness::Complete,
+            "{:?}",
+            inv.completeness
+        );
+        assert!(inv.files.len() >= 50_002, "{} files", inv.files.len());
+        assert!(inv.files.contains(&format!("{deep}/CMakeLists.txt")));
+
+        let profile = crate::derive::detect_project_profile(dir.path(), &inv.files);
+        let changed = vec![PathBuf::from(format!("{deep}/src/main.c"))];
+        let specs = crate::derive::derive_checks(&profile, &changed).unwrap();
+        assert!(
+            specs
+                .iter()
+                .any(|spec| spec.id.ends_with("cmake_configure")),
+            "the deep CMake component must derive its configure check: {specs:?}"
+        );
+    }
+
+    // --------------------------------------------------- manifest completeness
+
+    #[test]
+    fn makefile_case_variant_is_not_a_false_exclusion() {
+        // On a case-insensitive filesystem (`Makefile` present) the probe of
+        // the lowercase spelling must not report a phantom exclusion.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Makefile");
+        write(dir.path(), "src/main.c");
+        let inv = discover_repo_inventory(dir.path());
+        assert_eq!(inv.completeness, InventoryCompleteness::Complete, "{inv:?}");
+    }
+
+    #[test]
+    fn oversized_content_deciding_manifest_is_typed_incompleteness() {
+        let dir = tempfile::tempdir().unwrap();
+        let oversized = vec![b'x'; (crate::derive::MAX_PROBE_BYTES + 1) as usize];
+        fs::write(dir.path().join("Makefile"), &oversized).unwrap();
+        write(dir.path(), "src/main.c");
+        let inv = discover_repo_inventory(dir.path());
+        assert!(
+            matches!(
+                &inv.completeness,
+                InventoryCompleteness::ManifestOversized { path, bytes }
+                    if path == "Makefile" && *bytes > crate::derive::MAX_PROBE_BYTES
+            ),
+            "{inv:?}"
+        );
+        assert!(!inv.is_complete());
+        assert!(inv
+            .refusal_reason()
+            .unwrap()
+            .contains("content-probe budget"));
+    }
+
+    #[test]
+    fn oversized_non_deciding_manifest_stays_advisory_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let oversized = vec![b'x'; (crate::derive::MAX_PROBE_BYTES + 1) as usize];
+        fs::write(dir.path().join("package.json"), &oversized).unwrap();
+        write(dir.path(), "src/app.ts");
+        let inv = discover_repo_inventory(dir.path());
+        assert_eq!(
+            inv.completeness,
+            InventoryCompleteness::Complete,
+            "package.json content is advisory only: {inv:?}"
+        );
+    }
+
+    // -------------------------------------------------------------- hostile
 
     #[test]
     fn unreadable_subdirectory_is_reported_and_never_silently_skipped() {
@@ -401,20 +1318,5 @@ mod tests {
                 "a symlink must make the inventory non-Complete: {inv:?}"
             );
         }
-    }
-
-    #[test]
-    fn unreadable_root_is_reported_not_empty_complete() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("does-not-exist");
-        let inv = discover_repo_inventory(&missing);
-        assert_eq!(
-            inv.completeness,
-            InventoryCompleteness::Unreadable {
-                path: String::new()
-            }
-        );
-        assert!(inv.files.is_empty());
-        assert!(inv.refusal_reason().is_some());
     }
 }

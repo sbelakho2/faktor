@@ -404,13 +404,13 @@ const SURFACES = {
       ]) &&
         hasText('scripts/certification/evidence.schema.json', 'faktor-cert-evidence/v1') &&
         hasText('scripts/certify-local.sh', 'evidence_gate') &&
-        hasText('.woodpecker/pr.yaml', 'faktor-woodpecker-lane/v2'),
+        hasText('.woodpecker/untrusted/pr.yaml', 'faktor-woodpecker-lane/v2'),
     ),
     evidence: [
       'scripts/certification/evidence.mjs',
       'scripts/certification/evidence.schema.json',
       'scripts/certify-local.sh',
-      '.woodpecker/pr.yaml',
+      '.woodpecker/untrusted/pr.yaml',
     ],
   }),
 };

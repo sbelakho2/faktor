@@ -199,7 +199,11 @@ impl Default for DerivationLimits {
     }
 }
 
-const MAX_PROBE_BYTES: u64 = 256 * 1024;
+/// Bounded content-probe cap of one manifest: a larger manifest's content
+/// is never read, so content-derived evidence is silently unavailable. The
+/// inventory surfaces oversized CONTENT-DECIDING manifests
+/// (`crates/verify/src/inventory.rs`, `ManifestOversized`) against this cap.
+pub(crate) const MAX_PROBE_BYTES: u64 = 256 * 1024;
 const NOMINAL_QUICK: Duration = Duration::from_secs(60);
 const NOMINAL_UNIT: Duration = Duration::from_secs(600);
 
