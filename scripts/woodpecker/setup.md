@@ -4,27 +4,45 @@ The CI for this repository is defined by the workflow files in
 [`.woodpecker/`](../../.woodpecker) and runs on
 [Woodpecker CI](https://woodpecker-ci.org). This directory holds a local
 server/agent stack (`docker-compose.yml`), the activation script
-(`activate.sh`) and the operator notes below.
+(`activate.sh`), the boundary verifier (`verify-boundary.sh`) and the
+operator notes below.
 
 Targeted version: **Woodpecker 3.x** (verified against the 3.18 documentation
-and the v3.18.0 source; the syntax also validates against the 2.8 subset it
+and the v3.18.0 API; the syntax also validates against the 2.8 subset it
 uses: matrix, labels, steps, workflow-level `when`, `depends_on`, status
 filters, cron filters).
 
-## 1. Pipeline model
+## 1. Pipeline model: two projects, one repository
 
-By default Woodpecker resolves pipeline configs in this order:
-`.woodpecker/*.{yaml,yml}` -> `.woodpecker.yaml` -> `.woodpecker.yml`
-(project settings -> *Pipeline path* empty). This repository therefore has
-**no root `.woodpecker.yml`**: the folder files below are the single source
-of truth, and each file is one workflow with its own `when` filter and its own
-commit status.
+The repository is enabled **twice** on the same Woodpecker instance, as two
+projects with different server-side trust and different pipeline paths:
 
-| File (workflow) | Event filter | Storage | Contents |
-| --- | --- | --- | --- |
-| `.woodpecker/pr.yaml` (`pr`) | `pull_request` | **no volumes at all** | reduced lane set: `storage-policy`, `linux`, `static`, `docs`, `vscode`, `vscode-visual`, `vscode-visual-with-skip`, `jetbrains-build`, `jetbrains-smoke`, then the aggregate `certificate` |
-| `.woodpecker/trusted.yaml` (`trusted`) | `push` (any branch) + `tag` (linux); `push` to `main` for darwin/windows | trusted named volumes `faktor-trusted-*` | full linux lane set incl. release `[perf]` + `certificate`; darwin/windows matrix combos + per-platform certificates |
-| `.woodpecker/nightly.yaml` (`nightly`) | `cron` job `nightly` | own `faktor-nightly-*` volumes | `[fault]` at scale, longrun, efficiency, economy, coding-benchmark smoke, provider-key real-model run (recorded skip by default), supply-chain, then `certificate-nightly` |
+| Project | Server-side settings | Pipeline path | Events | Workflows |
+| --- | --- | --- | --- | --- |
+| **untrusted** | `trusted.volumes=false`, `allow_pr=true` | `.woodpecker/untrusted/` | `pull_request` | `pr.yaml` (`pr`) |
+| **trusted** | `trusted.volumes=true` (admin), `allow_pr=false` | `.woodpecker/trusted/` | `push`, `tag`, `cron` | `trusted.yaml` (`trusted`) + `nightly.yaml` (`nightly`) |
+
+`pull_request` events only ever reach the untrusted project, and Woodpecker
+refuses `volumes:` at policy level for a project that is not trusted. The
+trusted project never loads the PR workflow because its *pipeline path* — a
+project setting on the server, not a repository file — points at
+`.woodpecker/trusted/` only.
+
+There are **no workflow files at the `.woodpecker/` top level**, so the
+default resolution (`.woodpecker/*.{yaml,yml}` -> `.woodpecker.yaml` ->
+`.woodpecker.yml`, used when *Pipeline path* is empty) finds nothing: an
+unset path fails closed instead of silently loading another project's
+workflow. `.woodpecker/pr.yaml`, `trusted.yaml` and `nightly.yaml` are
+in-repo symlinks to the real files, kept only so repository tooling that
+references the historical paths (`scripts/capabilities-manifest.mjs`, the
+evidence selftest) keeps working; they must never be selected as a project
+pipeline path.
+
+| File (workflow) | Project | Event filter | Storage | Contents |
+| --- | --- | --- | --- | --- |
+| `.woodpecker/untrusted/pr.yaml` (`pr`) | untrusted | `pull_request` | **no volumes at all** | reduced lane set: `storage-policy`, `linux`, `static`, `docs`, `vscode`, `vscode-visual`, `vscode-visual-with-skip`, `jetbrains-build`, `jetbrains-smoke`, then the aggregate `certificate` |
+| `.woodpecker/trusted/trusted.yaml` (`trusted`) | trusted | `push` (any branch) + `tag` (linux); `push` to `main` for darwin/windows | trusted named volumes `faktor-trusted-*` | full linux lane set incl. release `[perf]` + `certificate`; darwin/windows matrix combos + per-platform certificates |
+| `.woodpecker/trusted/nightly.yaml` (`nightly`) | trusted | `cron` job `nightly` | own `faktor-nightly-*` volumes | `[fault]` at scale, longrun, efficiency, economy, coding-benchmark smoke, provider-key real-model run (recorded skip by default), supply-chain, then `certificate-nightly` |
 
 `labels: platform: ${platform}` (trusted) or `labels: platform: linux/amd64`
 (pr/cron) routes workflows to agents. The deprecated `runs_on` key is **not**
@@ -33,7 +51,8 @@ status of dependent tasks, and `runs_on: [macos]` would make the workflow
 match no status and never run. Agent selection is `labels`.
 
 The darwin and windows combos are gated to `push` on `main` (change
-`branch: main` in `.woodpecker/trusted.yaml` if your default branch differs).
+`branch: main` in `.woodpecker/trusted/trusted.yaml` if your default branch
+differs).
 
 ## 2. Start the server
 
@@ -61,23 +80,24 @@ Developer settings → OAuth Apps):
 - Homepage URL: `$WOODPECKER_HOST`
 - Authorization callback URL: `$WOODPECKER_HOST/authorize`
 
-## 3. Activate the repository
+## 3. Activate the repository (two projects)
 
 **Forge webhook and commit-status behavior.** Activating a repository in
 Woodpecker installs the forge webhook and starts processing its events:
 `push`, `tag` and `pull_request` (the webhook for `pull_request` is only
-honored while *Allow pull requests* is enabled, which is the default).
-Pipelines are triggered per event and each **workflow file** posts its own
-commit status; with the default server settings (`WOODPECKER_STATUS_CONTEXT`
-= `ci/woodpecker`, `WOODPECKER_STATUS_CONTEXT_FORMAT` =
+honored while *Allow pull requests* is enabled, which the untrusted project
+keeps enabled and the trusted project disables). Pipelines are triggered per
+event and each **workflow file** posts its own commit status; with the default
+server settings (`WOODPECKER_STATUS_CONTEXT` = `ci/woodpecker`,
+`WOODPECKER_STATUS_CONTEXT_FORMAT` =
 `{{ .context }}/{{ .event }}/{{ .workflow }}`) the contexts are:
 
-| Event | Context |
-| --- | --- |
-| pull request | `ci/woodpecker/pr/pr` |
-| push to main (any branch) | `ci/woodpecker/push/trusted` |
-| tag | `ci/woodpecker/tag/trusted` |
-| cron | `ci/woodpecker/cron/nightly` |
+| Event | Project | Context |
+| --- | --- | --- |
+| pull request | untrusted | `ci/woodpecker/pr/pr` |
+| push (any branch) | trusted | `ci/woodpecker/push/trusted` |
+| tag | trusted | `ci/woodpecker/tag/trusted` |
+| cron | trusted | `ci/woodpecker/cron/nightly` |
 
 A workflow excluded by its `when` filter posts nothing. Server overrides of
 `WOODPECKER_STATUS_CONTEXT(_FORMAT)` rename every context; use the resulting
@@ -86,13 +106,20 @@ strings in branch protection.
 ### 3a. UI steps (no account scripts required)
 
 1. Log into Woodpecker with an admin/owner account and enable the repository
-   (*Repositories → Add*).
-2. Leave the **pipeline path** empty: the default resolution finds the
-   `.woodpecker/` folder (it takes precedence over any root file; this repo
-   has none).
-3. Confirm the webhook was installed (forge → repository → Webhooks) and that
-   *Allow pull requests* is enabled in the Woodpecker project settings.
-4. Continue with §5 (trust) and §6 (cron).
+   (*Repositories → Add*). This first project is the **untrusted** one.
+2. Untrusted project settings: **Pipeline path** = `.woodpecker/untrusted/`,
+   *Allow pull requests* = on, *Trusted* = off (leave the admin-only default
+   off; never enable it here).
+3. Create the **trusted** project over the same repository. `activate.sh`
+   performs the project-scoped activation/lookup (`?project=trusted`); the UI
+   equivalent depends on whether your instance supports several projects per
+   repository. If it does not, stop — a single trusted project cannot run
+   `pull_request` events without granting them volume access (§5).
+4. Trusted project settings: **Pipeline path** = `.woodpecker/trusted/`,
+   *Allow pull requests* = off, *Trusted* = on (server admin only). Register
+   the `nightly` cron here (§6).
+5. Confirm the webhook delivers push, tag and pull_request events, and keep
+   *Require approval for forked repositories* enabled (Woodpecker default).
 
 ### 3b. Scripted activation (`activate.sh`)
 
@@ -101,28 +128,42 @@ export WOODPECKER_HOST="https://<your-instance>"     # no trailing slash
 export WOODPECKER_TOKEN="<personal access token>"    # Woodpecker UI -> user settings
 bash scripts/woodpecker/activate.sh <owner/repo> \
   --timeout-minutes 1560 \
-  --trusted                 # instance admin only; only for the named-volume caches
+  --trusted                 # instance admin only; grants trusted.volumes to the TRUSTED project
 ```
 
-The script is idempotent and uses the Woodpecker 3.x API (all paths verified
-against v3.18.0):
+The script is idempotent and uses the Woodpecker 3.x API. It configures the
+untrusted project **first** (`trusted.volumes=false`, `allow_pr=true`,
+`config_file=.woodpecker/untrusted/`) and then the trusted project
+(`config_file=.woodpecker/trusted/`, `allow_pr=false`,
+`trusted.volumes=true` with `--trusted`), and it registers cron `nightly`
+on the trusted project only:
 
 - `GET /api/user` — token check;
-- `POST /api/repos?forge_remote_id=<id>` — activate (409 = already active);
-  `<id>` comes from `GET /api/repos/lookup/<owner>/<repo>` when the repo is
-  already known, otherwise from `gh api repos/<owner>/<repo> --jq .id` or the
-  `FORGE_REMOTE_ID` environment variable;
-- `PATCH /api/repos/<repo_id> {"timeout":<minutes>}` — the pipeline timeout
+- `GET /api/repos/lookup/<owner>/<repo>[?project=trusted]` — resolve each
+  project when it already exists;
+- `POST /api/repos?forge_remote_id=<id>[&project=trusted]` — activate the
+  repository (untrusted project) and create the second, trusted project
+  (409/refusal = create it in the UI and pass `--trusted-repo-id`);
+  `<id>` comes from `FORGE_REMOTE_ID` or `gh api repos/<owner>/<repo> --jq .id`;
+- `PATCH /api/repos/<untrusted_id>` `{"config_file":".woodpecker/untrusted/",
+  "allow_pr":true,"trusted":{"volumes":false}}`;
+- `PATCH /api/repos/<trusted_id>` `{"config_file":".woodpecker/trusted/",
+  "allow_pr":false,"trusted":{"volumes":true}}` (the volumes grant is
+  instance-admin only; without `--trusted` the script reports the stored
+  value and what still needs granting);
+- `PATCH /api/repos/<trusted_id> {"timeout":<minutes>}` — the pipeline timeout
   (needed by the nightly longrun campaign; see §6);
-- `PATCH /api/repos/<repo_id> {"trusted":{"volumes":true}}` — trusted volumes
-  (instance-admin token only, `--trusted`);
-- `POST|PATCH /api/repos/<repo_id>/secrets[/<name>]` — secrets (`--secret
-  NAME=VALUE`, repeatable; **none are required by default**);
-- `GET|POST|PATCH /api/repos/<repo_id>/cron` — register/patch the `nightly`
-  cron job (§6);
+- `POST|PATCH /api/repos/<trusted_id>/secrets[/<name>]` — secrets (`--secret
+  NAME=VALUE`, repeatable; **none are required by default**, and the untrusted
+  project never gets secrets);
+- `GET|POST|PATCH /api/repos/<trusted_id>/cron` — register/patch the
+  `nightly` cron job (§6);
 - `--run-now` triggers the job once after registration;
-- the script prints the branch-protection setup for `ci/woodpecker/pr/pr`
-  (§7). Use `--dry-run` to print every call without sending it.
+- the script prints exactly which server-side settings are required and the
+  branch-protection setup for `ci/woodpecker/pr/pr` (§7). Use `--dry-run` to
+  print every call without sending it, and `--untrusted-repo-id`/
+  `--trusted-repo-id` (or `WOODPECKER_UNTRUSTED_REPO_ID`/
+  `WOODPECKER_TRUSTED_REPO_ID`) to skip lookup/creation.
 
 ### 3c. Activation status in this checkout
 
@@ -136,15 +177,14 @@ this change. The exact commands to run somewhere with credentials are:
 export WOODPECKER_HOST="https://<your-instance>"
 export WOODPECKER_TOKEN="<personal access token>"
 bash scripts/woodpecker/activate.sh <owner/repo> --timeout-minutes 1560 --trusted --run-now
-# then verify:
-curl -fsS -H "Authorization: Bearer $WOODPECKER_TOKEN" \
-  "$WOODPECKER_HOST/api/repos/lookup/<owner>/<repo>" | python3 -m json.tool
-curl -fsS -H "Authorization: Bearer $WOODPECKER_TOKEN" \
-  "$WOODPECKER_HOST/api/repos/<repo_id>/cron" | python3 -m json.tool
+# then verify the boundary (layout guards + both server-side projects):
+bash scripts/woodpecker/verify-boundary.sh <owner/repo>
 ```
 
-If the API path differs on a future Woodpecker minor, use the UI equivalents
-(Project settings, Cron Jobs) — §3a, §4 and §6 give the exact fields.
+`--dry-run` on either script prints every planned API call without sending
+one. If the API path differs on a future Woodpecker minor, use the UI
+equivalents (Project settings, Cron Jobs) — §3a, §4 and §6 give the exact
+fields.
 
 ## 4. Secrets
 
@@ -158,70 +198,105 @@ skip marker unless `FAKTOR_BENCH_PROVIDER`, `FAKTOR_BENCH_MODEL` and
 `from_secret` reference to a secret that does not exist is a config compile
 error in Woodpecker, so the workflow does not reference secrets blindly. To
 enable real nightly runs, either provide those variables to the agent's step
-environment (self-hosted) or register repo secrets with
+environment (self-hosted) or register project secrets with
 `activate.sh --secret NAME=VALUE` and add explicit
 `environment: {FAKTOR_BENCH_API_KEY: {from_secret: ...}}` entries to the lane
-in `.woodpecker/nightly.yaml`.
+in `.woodpecker/trusted/nightly.yaml`.
 
-## 5. Volumes, trust, and the PR/trusted storage policy
+Secrets are registered on the **trusted project only** (`activate.sh` targets
+it): a secret that exists for the untrusted PR project would be readable by
+unreviewed PR code. The untrusted project needs no secrets.
 
-Woodpecker only allows `volumes:` when a **server admin marks the repository
-Trusted (volumes)** (Project settings → Trusted; the *Trusted* section is
-admin-only). Trust is per repository, **not per event**, so the CI layout is
-built around that constraint:
+## 5. The untrusted-PR / trusted-push trust boundary
 
-- `.woodpecker/pr.yaml` is the only file a `pull_request` event runs and it
-  declares **zero volumes** — PR jobs use the ephemeral per-pipeline workspace
-  only. The `storage-policy` step and the PR certificate both fail if a
-  `volumes:` key appears in that file.
-- `.woodpecker/trusted.yaml` is the only workflow that mounts the
-  `faktor-trusted-*` caches, and it only matches `push`/`tag` (collaborator
-  events). `.woodpecker/nightly.yaml` mounts its own `faktor-nightly-*`
-  volumes, so a heavy campaign can never corrupt the caches a trusted build
-  reuses.
-- Each lane gets its own target volume; the registry/git volumes are shared
-  only inside one workflow. Named volumes are agent-host scoped and cannot be
-  made branch-specific (Woodpecker does not substitute environment variables
-  in `volumes:`), which is exactly why the event-class separation above is the
-  isolation boundary.
-- If the instance cannot grant trusted status, delete every `volumes:` block
-  and `CARGO_TARGET_DIR` entry from `trusted.yaml` and `nightly.yaml`
-  (everything still runs, just without warm caches). **Never add
-  volumes to `pr.yaml`.**
+Woodpecker only allows `volumes:` when a project is marked **Trusted
+(volumes)** by a server admin (Project settings → Trusted; the *Trusted*
+section is admin-only). Trust is per **project** and lives on the server, so
+the CI is split into two projects over the one repository:
 
-**Residual risk (must stay documented):** because trust is repository-wide,
-a PR that is allowed to run and edits its own pipeline config could add
-`volumes:` and Woodpecker would honor it once the repo is trusted. Keep
-**Require approval for forked repositories** enabled (the Woodpecker default)
-and review `.woodpecker/` changes in PRs. Instances that cannot accept that
-should either skip trusted status entirely or also require approval for all
-pull requests (Project settings → Require approval for → `pull_requests`).
+- the **untrusted project** (pipeline path `.woodpecker/untrusted/`,
+  `trusted.volumes=false`, `allow_pr=true`) is the only project that handles
+  `pull_request` events. Woodpecker refuses volume mounts for it at policy
+  level, so a PR cannot obtain a volume even if it rewrites its own YAML.
+- the **trusted project** (pipeline path `.woodpecker/trusted/`,
+  `trusted.volumes=true`, `allow_pr=false`) runs `push`/`tag`
+  (`trusted.yaml`) and the `nightly` cron (`nightly.yaml`). It never loads
+  the PR workflow.
+
+The invariant: **trust and pipeline paths are project settings on the server,
+and a PR diff cannot change them.** A PR cannot mark a project trusted, cannot
+move the trusted project onto the PR YAML, and cannot add a file that a
+project loads outside its configured path. `.woodpecker/pr.yaml`,
+`.woodpecker/trusted.yaml` and `.woodpecker/nightly.yaml` at the top level
+are in-repo symlinks for tooling only; with both pipeline paths set
+explicitly they are never selected, and the default resolution must stay
+unused.
+
+Defense-in-depth (not the boundary):
+
+- `.woodpecker/untrusted/pr.yaml` declares zero volumes, and its
+  `storage-policy` step plus the PR certificate fail if a `volumes:` key
+  appears, if a `faktor-trusted-*`/`faktor-nightly-*` reference appears, or
+  if a workflow file appears at the `.woodpecker/` top level. A PR can delete
+  this guard; it cannot change the project settings.
+- `.woodpecker/trusted/nightly.yaml` uses its own `faktor-nightly-*` volumes
+  so a heavy campaign can never corrupt the caches a trusted build reuses.
+- `scripts/woodpecker/verify-boundary.sh [owner/repo]` re-checks the layout
+  offline and, with `WOODPECKER_HOST`/`WOODPECKER_TOKEN`, both projects'
+  server-side settings.
+- No CI step pipes a remote script into a shell: the JetBrains smoke
+  bootstraps Rust from the pinned rustup-init binary after verifying its
+  published SHA-256, and the toolchain comes from pinned image tags
+  (`rust:1.98`, `node:24`, `ubuntu:24.04`). The remaining PR fetches are
+  package-manager downloads (`npx @vscode/vsce`; `npm install playwright` +
+  `playwright install chromium`); they never pipe to a shell, and their
+  output is gated by the VSIX verifier and the pinned visual baselines.
+  Audit with `rg -n '\|[[:space:]]*(bash|sh)([[:space:]]|$)' .woodpecker/`.
+
+**Residual risks (must stay documented):**
+
+- A collaborator `push` runs collaborator-authored code with volumes
+  available by design; the isolation is PR-vs-push, not author-vs-author.
+- An operator who leaves a project pipeline path empty would fall back to the
+  default resolution; the top level deliberately holds no regular workflow
+  files, so that fails closed, and `activate.sh`/`verify-boundary.sh` say so
+  loudly.
+- If the instance cannot grant trusted status or cannot host two projects,
+  run everything without volumes: delete every `volumes:` block and
+  `CARGO_TARGET_DIR` entry from `.woodpecker/trusted/` (everything still
+  runs, just without warm caches) and keep the PR project untrusted.
+  **Never enable trusted volumes on the PR project.**
+- Keep *Require approval for forked repositories* enabled (Woodpecker
+  default) and review `.woodpecker/` changes in PRs.
 
 ## 6. Cron job (`nightly`)
 
-`nightly.yaml` only runs for a **cron event whose job name matches
-`when.cron`**. Register the job in the repository:
+`.woodpecker/trusted/nightly.yaml` only runs for a **cron event whose job
+name matches `when.cron`**. Register the job **on the trusted project only**
+(the untrusted PR project must have no cron job — a cron event is
+server-owned and would otherwise be one more way to reach caches). `activate.sh`
+targets the trusted project:
 
-- UI: Project settings → **Cron Jobs** → *Add*, with `nightly`: schedule
-  `0 3 * * *`, branch `main`, timezone `UTC`.
+- UI: trusted project → Project settings → **Cron Jobs** → *Add*, with
+  `nightly`: schedule `0 3 * * *`, branch `main`, timezone `UTC`.
 - API/script: `bash scripts/woodpecker/activate.sh <owner/repo> --run-now`
   (idempotent; it creates or patches the job and can trigger it once),
   equivalent to
-  `POST /api/repos/{repo_id}/cron` with
+  `POST /api/repos/{trusted_repo_id}/cron` with
   `{"name":"nightly","schedule":"0 3 * * *","branch":"main","timezone":"UTC","enabled":true}`.
 
 Supported schedule syntax: standard 5-field cron plus `@daily`, `@weekly`,
 `@every 5m`, ... (see the Woodpecker Cron doc).
 
 **Timeout:** Woodpecker has no per-step timeout; pipelines are capped by the
-repository timeout (default 60 min; the settable maximum defaults to
+project timeout (default 60 min; the settable maximum defaults to
 `WOODPECKER_MAX_PIPELINE_TIMEOUT` = 120 min). The nightly longrun campaign
 therefore needs:
 
 ```sh
 # server/agent environment (docker-compose.yml sets this by default)
 WOODPECKER_MAX_PIPELINE_TIMEOUT=1560
-# repository setting
+# trusted project setting
 bash scripts/woodpecker/activate.sh <owner/repo> --timeout-minutes 1560
 ```
 
@@ -312,10 +387,10 @@ The `darwin/*` and `windows/*` combos need an agent on that OS:
    ```
 
 4. Intel Macs use `darwin/amd64`; keep the value in sync with the
-   `trusted.yaml` matrix entry. Until an agent exists, the darwin/windows
-   combos stay queued (only on `push` to `main`) and no linux job is affected;
-   if you never plan to add one, remove those matrix entries and the matching
-   jobs from the config.
+   `.woodpecker/trusted/trusted.yaml` matrix entry. Until an agent exists,
+   the darwin/windows combos stay queued (only on `push` to `main`) and no
+   linux job is affected; if you never plan to add one, remove those matrix
+   entries and the matching jobs from the config.
 
 ## 10. Certificate and aggregation
 
@@ -329,7 +404,9 @@ are not possible; the aggregate gate therefore lives **inside** each workflow:
   `depends_on` every lane of its workflow, runs with
   `when.status: [success, failure]` (a dependent is otherwise skipped when a
   dependency fails), and fails when any marker is missing, marked failed,
-  written for a foreign commit, or unexpected;
+  written for a foreign commit, or unexpected; it also passes
+  `--yaml-dir .woodpecker/untrusted` or `.woodpecker/trusted` so the
+  command-set drift check runs against its own file set (not the symlinks);
 - it additionally checks the runtime's own `CI_PIPELINE_STATUS`, which is
   `failure` when any earlier step failed, and writes
   `target/certification/ci-certification.json`
@@ -364,9 +441,10 @@ CI covers the platform lanes; `bash scripts/certify-local.sh fast`
 
 ```sh
 woodpecker-cli lint .woodpecker/            # one pass over all workflow files
+bash scripts/woodpecker/verify-boundary.sh  # layout guards (offline) + server settings (with credentials)
 python3 - <<'PY'                            # dependency-light parse gate
 import glob, yaml
-for f in sorted(glob.glob(".woodpecker/*.yml") + glob.glob(".woodpecker/*.yaml")):
+for f in sorted(glob.glob(".woodpecker/**/*.yml", recursive=True) + glob.glob(".woodpecker/**/*.yaml", recursive=True)):
     yaml.safe_load(open(f))
     print("ok", f)
 PY

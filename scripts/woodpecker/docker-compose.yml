@@ -44,8 +44,9 @@ services:
       WOODPECKER_AGENT_SECRET: ${WOODPECKER_AGENT_SECRET:?set WOODPECKER_AGENT_SECRET to the server value}
       WOODPECKER_BACKEND: docker
       WOODPECKER_MAX_WORKFLOWS: "2"
-      # Must match the matrix `platform` value in .woodpecker/trusted.yaml;
-      # an arm64 host needs platform=linux/arm64 there.
+      # Must match the matrix `platform` value in
+      # .woodpecker/trusted/trusted.yaml; an arm64 host needs
+      # platform=linux/arm64 there.
       WOODPECKER_AGENT_LABELS: "platform=linux/amd64,hostname=faktor-linux-agent"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -66,7 +67,7 @@ services:
   #     WOODPECKER_BACKEND: local
   #     WOODPECKER_MAX_WORKFLOWS: "1"
   #     # macOS Apple Silicon; use darwin/amd64 on Intel or windows/amd64 on
-  #     # Windows (and keep .woodpecker/trusted.yaml's matrix value in sync).
+  #     # Windows (and keep .woodpecker/trusted/trusted.yaml's matrix value in sync).
   #     WOODPECKER_AGENT_LABELS: "platform=darwin/arm64,hostname=faktor-darwin-agent"
   #   volumes:
   #     - woodpecker-agent-config:/etc/woodpecker
