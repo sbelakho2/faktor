@@ -7547,7 +7547,8 @@ mod tests {
         // Wait for the drive to be mid-flight (the session is actively
         // working — anything but parked/terminal), then cancel at the task
         // level.
-        for _ in 0..600 {
+        let wait_deadline = std::time::Instant::now() + Duration::from_secs(240);
+        while std::time::Instant::now() < wait_deadline {
             let st = manager.get_session(sid).unwrap().unwrap().state().unwrap();
             if !st.is_terminal()
                 && !matches!(
@@ -7575,7 +7576,8 @@ mod tests {
         assert_eq!(ack["cancelled"], true);
         // The durable outcome: task row Cancelled, session parked, task-runs
         // state Cancelled; a second cancel is a typed 409.
-        for _ in 0..300 {
+        let wait_deadline = std::time::Instant::now() + Duration::from_secs(240);
+        while std::time::Instant::now() < wait_deadline {
             let resp = native_get(
                 &client,
                 &base,
