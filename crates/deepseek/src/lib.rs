@@ -151,20 +151,22 @@ fn openai_config(config: &DeepSeekConfig) -> (OpenAiConfig, OpenAiQuirks) {
 
 /// Build a DeepSeek provider for the chosen profile. All profiles use the
 /// OpenAI-compatible wire (DeepSeek's own API is OpenAI-shaped); the profile
-/// only changes the endpoint — the agent sees one normalized provider.
-pub fn build(config: DeepSeekConfig) -> Arc<dyn Provider> {
+/// only changes the endpoint — the agent sees one normalized provider. The
+/// egress transport is injected (the daemon passes the policy-checked one);
+/// there is no permissive default.
+pub fn build(config: DeepSeekConfig, transport: Arc<dyn HttpTransport>) -> Arc<dyn Provider> {
     let (openai, quirks) = openai_config(&config);
-    OpenAiProvider::build_with_quirks(openai, quirks)
+    OpenAiProvider::build_with_quirks(openai, quirks, transport)
 }
 
-/// Build with an injected egress transport (policy-checked in production,
-/// mock in tests).
-pub fn build_with_transport(
-    config: DeepSeekConfig,
-    transport: Arc<dyn HttpTransport>,
-) -> Arc<dyn Provider> {
-    let (openai, quirks) = openai_config(&config);
-    OpenAiProvider::build_with_quirks_and_transport(openai, quirks, transport)
+/// Test-only default-allow constructor: production code MUST inject a
+/// policy-checked transport; in-crate tests use this for local mock servers.
+#[cfg(test)]
+pub fn permissive_for_tests(config: DeepSeekConfig) -> Arc<dyn Provider> {
+    build(
+        config,
+        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::permissive()),
+    )
 }
 
 pub fn provider_id() -> &'static str {
@@ -176,7 +178,7 @@ mod tests {
     use super::*;
     use faktor_core::cancellation::CancellationToken;
     use faktor_core::id::{OpId, SessionId};
-    use faktor_provider::egress::PolicyCheckedHttpTransport;
+    use faktor_provider::egress::{MockHttpTransport, PolicyCheckedHttpTransport};
     use faktor_provider::testing::{MockAction, MockServer};
     use faktor_provider::{
         ContentPart, GenericAgentRequest, ProviderChunk, RequestMessage, RequestMeta, Role,
@@ -231,7 +233,7 @@ mod tests {
             api_key: Some("sk".into()),
             model_overrides: std::collections::HashMap::new(),
         };
-        let provider = build(cfg);
+        let provider = permissive_for_tests(cfg);
         assert_eq!(provider.id(), "openai"); // the wire family, not "deepseek"
         let mut stream = provider.stream(req("deepseek-chat"));
         let mut text = String::new();
@@ -264,7 +266,7 @@ mod tests {
                 api_key: None,
                 model_overrides: std::collections::HashMap::new(),
             };
-            let provider = build(cfg);
+            let provider = permissive_for_tests(cfg);
             let caps = provider.capabilities("deepseek-chat");
             assert!(caps.tools, "deepseek family defaults to tools");
             assert!(caps.json_schema);
@@ -282,7 +284,7 @@ mod tests {
     #[test]
     fn v4_models_yield_exact_capabilities() {
         let cfg = DeepSeekConfig::direct(None);
-        let provider = build(cfg);
+        let provider = permissive_for_tests(cfg);
         for (model, max_output, vision) in [
             ("deepseek-v4-flash", V4_MAX_OUTPUT_FLASH, false),
             ("deepseek-v4-pro", V4_MAX_OUTPUT_PRO, false),
@@ -387,7 +389,7 @@ mod tests {
         cfg.profile = DeepSeekProfile::Compatible {
             base_url: base.clone(),
         };
-        let provider = build(cfg);
+        let provider = permissive_for_tests(cfg);
         let mut r = req("deepseek-v4-flash");
         r.messages = vec![
             RequestMessage {
@@ -424,7 +426,7 @@ mod tests {
                 },
             )]),
         };
-        let provider = build(cfg);
+        let provider = permissive_for_tests(cfg);
         assert!(!provider.capabilities("deepseek-chat").tools);
         assert_eq!(provider.capabilities("deepseek-chat").context, 128_000);
     }
@@ -462,7 +464,7 @@ mod tests {
             model_overrides: Default::default(),
         };
         // Allowed: streams normally through the injected transport.
-        let provider = build_with_transport(cfg.clone(), allow_only(port));
+        let provider = build(cfg.clone(), allow_only(port));
         let mut stream = provider.stream(req("deepseek-v4-flash"));
         let mut text = String::new();
         while let Some(chunk) = stream.next().await {
@@ -476,7 +478,7 @@ mod tests {
         assert_eq!(server.request_count(), 1);
 
         // Denied: wrong-port policy fails before any network byte.
-        let denied = build_with_transport(cfg, allow_only(port.wrapping_add(1)));
+        let denied = build(cfg, allow_only(port.wrapping_add(1)));
         let mut stream = denied.stream(req("deepseek-v4-flash"));
         let err = stream
             .next()
@@ -486,6 +488,44 @@ mod tests {
         assert!(err.message.contains("denied"), "{}", err.message);
         assert!(!err.retryable, "denied destinations are never retried");
         assert_eq!(server.request_count(), 1, "deny happened before connect");
+    }
+
+    #[tokio::test]
+    async fn mock_transport_canned_sse_drives_the_parser_without_http() {
+        // No server exists: the canned SSE body drives the deepseek profile's
+        // parser through the injected transport, and the recorded request
+        // proves the adapter used the mock (end to end, quirks included).
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"can\"}}]}\n\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\"ned\"},\"finish_reason\":\"stop\"}]}\n\n\
+                    data: [DONE]\n\n";
+        let mock = Arc::new(MockHttpTransport::new(200, body));
+        let as_transport: Arc<dyn HttpTransport> = mock.clone();
+        let cfg = DeepSeekConfig {
+            profile: DeepSeekProfile::Compatible {
+                base_url: "http://mock.invalid".into(),
+            },
+            api_key: None,
+            model_overrides: Default::default(),
+        };
+        let provider = build(cfg, as_transport);
+        let mut stream = provider.stream(req("deepseek-v4-flash"));
+        let mut text = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk.unwrap() {
+                ProviderChunk::Text { text: t } => text.push_str(&t),
+                ProviderChunk::Done => break,
+                _ => {}
+            }
+        }
+        assert_eq!(text, "canned");
+        assert_eq!(mock.request_count(), 1);
+        assert_eq!(
+            mock.requests(),
+            vec![(
+                "POST".to_string(),
+                "http://mock.invalid/chat/completions".to_string()
+            )]
+        );
     }
 
     // ------------------------------------------------- canonical usage
@@ -576,7 +616,7 @@ mod tests {
                     api_key: None,
                     model_overrides: std::collections::HashMap::new(),
                 };
-                build(cfg)
+                permissive_for_tests(cfg)
             },
             method: "POST",
             path: "/chat/completions",

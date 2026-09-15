@@ -59,7 +59,16 @@ pub(crate) fn authed(headers: &HeaderMap, state: &AppState) -> Result<(), ApiErr
     // legacy per-start token keep the old clients and tests working. The
     // effective password is the `auth.set` override when one is active,
     // else the startup env password (`auth.remove` returns to it).
-    let auth = state.auth.read().expect("auth override poisoned");
+    // A poisoned auth-override lock is an authority failure, not a cache
+    // miss: recover nothing and authenticate no one. The typed refusal keeps
+    // the daemon alive (every handler answers a loud internal error) instead
+    // of a panic cascade through the auth gate.
+    let auth = state.auth.read().map_err(|_| ApiError {
+        code: "internal",
+        message: "server auth override lock is poisoned; refusing to authenticate".into(),
+        http_status: 500,
+        retryable: false,
+    })?;
     let password = auth.as_ref().unwrap_or(&state.deps.server_password);
     if password.check_authorization(authorization)
         || check_password(password, None, x_kilo)

@@ -146,7 +146,7 @@ fn refresh_terminal_events(state: &AppState, session_id: &str) -> Result<(), Ter
     let mut ring = state
         .terminal_events
         .lock()
-        .expect("terminal events poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     ring.clear();
     for record in records {
         let cache_id = state
@@ -266,7 +266,7 @@ pub(crate) async fn native_terminal_events(
     let ring = state
         .terminal_events
         .lock()
-        .expect("terminal events poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut page: Vec<serde_json::Value> = Vec::new();
     let mut more = false;
     let mut last: Option<u64> = None;

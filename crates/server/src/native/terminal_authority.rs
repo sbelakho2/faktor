@@ -2284,4 +2284,42 @@ mod tests {
         assert!(!service.kill(&sid, &terminal_id, "late kill").unwrap());
         assert_eq!(terminal_kinds(&handle).len(), 3);
     }
+
+    #[test]
+    fn poisoned_service_locks_recover_on_next_authority_op() {
+        // The live map, the inflight set, the per-session fold cache and the
+        // recovery serializer are all DERIVED from the durable ledger rows —
+        // no cross-entry invariant can be left broken by a panicking holder.
+        // Poison every one of them and prove the next authority operation
+        // recovers and serves instead of panicking (no panic cascade).
+        let (_dir, manager) = manager();
+        let sid = session(&manager, "terminal-poison");
+        let (probe, _map) = recording_probe();
+        let service = TerminalService::detached(manager, probe);
+
+        let poisoner = {
+            let service = Arc::clone(&service);
+            std::thread::spawn(move || {
+                let _live = service.live.lock().unwrap();
+                let _inflight = service.inflight.lock().unwrap();
+                let _index = service.index.lock().unwrap();
+                let _recovery = service.recovery_lock.lock().unwrap();
+                panic!("poison every terminal-service lock");
+            })
+        };
+        assert!(poisoner.join().is_err(), "the holder must unwind");
+        assert!(service.live.is_poisoned());
+        assert!(service.inflight.is_poisoned());
+        assert!(service.index.is_poisoned());
+        assert!(service.recovery_lock.is_poisoned());
+
+        // list() touches the recovery serializer + index + live map; the
+        // durable rows stay the authority and the answer must be served.
+        let rows = service.list(&sid).unwrap();
+        assert!(rows.is_empty(), "{rows:?}");
+        assert!(service
+            .session_rows(SessionId::new(sid.parse().unwrap()))
+            .is_empty());
+        assert_eq!(service.live_rows(), 0);
+    }
 }

@@ -1394,6 +1394,397 @@ mod tests {
         .unwrap();
         assert!(!is_test_rel_at(tmp.path(), "x/src/shadow_tests.rs"));
     }
+
+    // -------------------------------------- permissive-constructor scan
+
+    /// The wire-family adapters whose production constructors must never
+    /// build the default-allow transport: the daemon injects the
+    /// policy-checked one.
+    const PERMISSIVE_ADAPTERS: [&str; 6] = [
+        "openai",
+        "anthropic",
+        "google",
+        "deepseek",
+        "gateway",
+        "ollama",
+    ];
+
+    /// Production adapter code must not construct ANY egress transport — the
+    /// `Arc<dyn HttpTransport>` is injected by the daemon. Matching the type
+    /// prefixes catches the permissive default (`::permissive()`,
+    /// `::with_policy(None)`) and a self-built policy client alike; only
+    /// test-gated code may hold these constructors.
+    const TRANSPORT_CTOR_MARKERS: [&str; 2] =
+        ["PolicyCheckedHttpTransport::", "CheckedHttpClient::"];
+
+    /// Mask comments and string/char literals (raw and escaped) with spaces,
+    /// preserving byte length, so braces and marker text inside them can
+    /// never shift or trip the structural scan. Malformed input is left as
+    /// is (the conservative direction: the scan can only over-report).
+    fn mask_noncode(src: &str) -> String {
+        let b = src.as_bytes();
+        // Index-preserving UTF-8 check: every masked span is replaced by
+        // ASCII spaces, so the result must stay valid.
+        let mut out = b.to_vec();
+        let mut i = 0usize;
+        while i < b.len() {
+            if b[i] == b'/' && b.get(i + 1) == Some(&b'/') {
+                while i < b.len() && b[i] != b'\n' {
+                    out[i] = b' ';
+                    i += 1;
+                }
+                continue;
+            }
+            if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                out[i] = b' ';
+                if i + 1 < b.len() {
+                    out[i + 1] = b' ';
+                }
+                i += 2;
+                while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                    if b[i] != b'\n' {
+                        out[i] = b' ';
+                    }
+                    i += 1;
+                }
+                if i < b.len() {
+                    out[i] = b' ';
+                    if i + 1 < b.len() {
+                        out[i + 1] = b' ';
+                    }
+                    i += 2;
+                }
+                continue;
+            }
+            let raw_start = {
+                let mut j = i;
+                if b.get(j) == Some(&b'b') {
+                    j += 1;
+                }
+                if b.get(j) == Some(&b'r') {
+                    Some(j + 1)
+                } else {
+                    None
+                }
+            };
+            if let Some(mut j) = raw_start {
+                let mut hashes = 0usize;
+                while b.get(j) == Some(&b'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if b.get(j) == Some(&b'"') {
+                    let end = find_raw_string_end(b, j + 1, hashes).unwrap_or(b.len());
+                    for k in i..end {
+                        if b[k] != b'\n' {
+                            out[k] = b' ';
+                        }
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+            let string_start = if b[i] == b'"' {
+                Some(i + 1)
+            } else if b.get(i) == Some(&b'b') && b.get(i + 1) == Some(&b'"') {
+                Some(i + 2)
+            } else {
+                None
+            };
+            if let Some(mut j) = string_start {
+                while j < b.len() {
+                    if b[j] == b'\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if b[j] == b'"' {
+                        j += 1;
+                        break;
+                    }
+                    j += 1;
+                }
+                let end = j.min(b.len());
+                for k in i..end {
+                    if b[k] != b'\n' {
+                        out[k] = b' ';
+                    }
+                }
+                i = end;
+                continue;
+            }
+            if b[i] == b'\'' {
+                if b.get(i + 1) == Some(&b'\\') {
+                    let mut j = i + 2;
+                    while j < b.len() && b[j] != b'\'' {
+                        j += 1;
+                    }
+                    let end = (j + 1).min(b.len());
+                    for k in i..end {
+                        if b[k] != b'\n' {
+                            out[k] = b' ';
+                        }
+                    }
+                    i = end;
+                    continue;
+                }
+                if b.get(i + 2) == Some(&b'\'') {
+                    for k in i..i + 3 {
+                        if b[k] != b'\n' {
+                            out[k] = b' ';
+                        }
+                    }
+                    i += 3;
+                    continue;
+                }
+                // otherwise a lifetime like `'a` / `'_`: code, not a literal.
+            }
+            i += 1;
+        }
+        String::from_utf8(out).expect("masking preserves UTF-8")
+    }
+
+    fn find_raw_string_end(b: &[u8], mut j: usize, hashes: usize) -> Option<usize> {
+        while j < b.len() {
+            if b[j] == b'"' {
+                let closed = (0..hashes).all(|h| b.get(j + 1 + h) == Some(&b'#'));
+                if closed {
+                    return Some(j + 1 + hashes);
+                }
+            }
+            j += 1;
+        }
+        None
+    }
+
+    /// Byte spans of items gated by `#[cfg(...test...)]` (but never
+    /// `#[cfg(not(test))]`, which is production). Spans include the
+    /// attribute so a marker inside the gated item is exempt.
+    fn test_gated_spans(masked: &str) -> Vec<(usize, usize)> {
+        let b = masked.as_bytes();
+        let mut spans = Vec::new();
+        let mut search = 0usize;
+        while let Some(rel) = masked[search..].find("#[cfg(") {
+            let start = search + rel;
+            let mut j = start + "#[cfg(".len();
+            let mut depth = 1usize;
+            while j < b.len() && depth > 0 {
+                match b[j] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            let words: Vec<&str> = masked[start..j]
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .filter(|w| !w.is_empty())
+                .collect();
+            let gated = words.contains(&"test") && !words.contains(&"not");
+            if gated {
+                let mut k = j;
+                while k < b.len() && b[k] != b'{' && b[k] != b';' {
+                    k += 1;
+                }
+                if k < b.len() && b[k] == b'{' {
+                    let mut depth = 0usize;
+                    let mut m = k;
+                    while m < b.len() {
+                        match b[m] {
+                            b'{' => depth += 1,
+                            b'}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        m += 1;
+                    }
+                    spans.push((start, (m + 1).min(b.len())));
+                }
+            }
+            search = j;
+        }
+        spans
+    }
+
+    /// Offenders of one file: every transport construction outside any
+    /// test-gated item (the `permissive_for_tests` helper must itself be
+    /// `#[cfg(test)]`, so it is exempt through its attribute — not by name).
+    fn transport_ctor_offenders(rel: &str, source: &str) -> Vec<String> {
+        let masked = mask_noncode(source);
+        let spans = test_gated_spans(&masked);
+        let mut hits: Vec<usize> = TRANSPORT_CTOR_MARKERS
+            .iter()
+            .flat_map(|m| masked.match_indices(m).map(|(idx, _)| idx))
+            .collect();
+        hits.sort_unstable();
+        let mut offenders = Vec::new();
+        for idx in hits {
+            if spans.iter().any(|(s, e)| idx >= *s && idx < *e) {
+                continue;
+            }
+            let line = source[..idx].matches('\n').count() + 1;
+            let text = source.lines().nth(line - 1).unwrap_or("").trim();
+            offenders.push(format!("{rel}:{line}: {text}"));
+        }
+        offenders
+    }
+
+    /// Total marker occurrences in one file (masked), so the certification
+    /// can prove its walk actually saw the test helpers instead of passing
+    /// vacuously.
+    fn transport_ctor_hits(source: &str) -> usize {
+        let masked = mask_noncode(source);
+        TRANSPORT_CTOR_MARKERS
+            .iter()
+            .map(|m| masked.matches(m).count())
+            .sum()
+    }
+
+    /// The constructor certification: every transport construction in the
+    /// six adapters must live in test-gated code. A production constructor
+    /// that silently defaults to default-allow (or self-builds any egress
+    /// client instead of taking the injected one) fails here.
+    #[test]
+    fn no_transport_ctor_outside_test_code_in_adapters() {
+        let crates_root = crates_root();
+        let mut offenders: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
+        let mut hits = 0usize;
+        for krate in PERMISSIVE_ADAPTERS {
+            let mut stack = vec![crates_root.join(krate).join("src")];
+            while let Some(dir) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Ok(file_type) = entry.file_type() else {
+                        continue;
+                    };
+                    if file_type.is_dir() {
+                        stack.push(path);
+                        continue;
+                    }
+                    if !(file_type.is_file()
+                        && path.extension().and_then(|e| e.to_str()) == Some("rs"))
+                    {
+                        continue;
+                    }
+                    scanned += 1;
+                    let rel = path
+                        .strip_prefix(&crates_root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string();
+                    let rel = normalize_rel(&rel);
+                    if is_test_rel_at(&crates_root, &rel) {
+                        continue;
+                    }
+                    let Ok(source) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    hits += transport_ctor_hits(&source);
+                    offenders.extend(transport_ctor_offenders(&rel, &source));
+                }
+            }
+        }
+        assert!(scanned >= 6, "constructor scan walked nothing: {scanned}");
+        assert!(
+            hits >= 6,
+            "constructor scan found no transport constructor at all ({hits} hits): \
+             the walk is not covering the adapter sources"
+        );
+        assert!(
+            offenders.is_empty(),
+            "egress transport constructed in production adapter code:\n  {}\n\
+             Every adapter constructor must take the injected Arc<dyn HttpTransport>; \
+             transport construction belongs in #[cfg(test)] helpers only.",
+            offenders.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn transport_ctor_scan_splits_production_from_test_helpers() {
+        // A production constructor is an offender; the cfg(test) helper and
+        // the cfg(test) module beside it are exempt.
+        let mixed = r#"
+pub fn build(config: C) -> P {
+    Arc::new(PolicyCheckedHttpTransport::permissive())
+}
+#[cfg(test)]
+pub fn permissive_for_tests(config: C) -> P {
+    build(config, Arc::new(PolicyCheckedHttpTransport::permissive()))
+}
+#[cfg(all(test, feature = "x"))]
+mod tests {
+    fn t() { let _ = PolicyCheckedHttpTransport::permissive(); }
+}
+"#;
+        let offenders = transport_ctor_offenders("openai/src/lib.rs", mixed);
+        assert_eq!(offenders.len(), 1, "{offenders:?}");
+        assert!(
+            offenders[0].starts_with("openai/src/lib.rs:3:"),
+            "{offenders:?}"
+        );
+
+        // `#[cfg(not(test))]` is production: it must NOT exempt.
+        let not_test = r#"
+#[cfg(not(test))]
+fn build(config: C) -> P {
+    Arc::new(PolicyCheckedHttpTransport::permissive())
+}
+"#;
+        assert_eq!(
+            transport_ctor_offenders("x/src/lib.rs", not_test).len(),
+            1,
+            "cfg(not(test)) is production code"
+        );
+
+        // A self-built policy transport (or the other default-allow spelling,
+        // `with_policy(None)`) is caught by the same prefix scan.
+        let self_built = r#"
+pub fn build(config: C) -> P {
+    let c = CheckedHttpClient::with_policy(None);
+    let t = PolicyCheckedHttpTransport::with_policy(None);
+    let _ = (c, t);
+    build_over(config)
+}
+#[cfg(test)]
+fn build_over(config: C) -> P { panic!() }
+"#;
+        let offenders = transport_ctor_offenders("x/src/lib.rs", self_built);
+        assert_eq!(offenders.len(), 2, "{offenders:?}");
+        assert!(
+            offenders.iter().all(|o| o.starts_with("x/src/lib.rs:")),
+            "{offenders:?}"
+        );
+
+        // Braces and marker text inside literals, raw strings and comments
+        // neither trip nor desynchronize the scan.
+        let tricky = r##"
+pub fn ok(config: C, transport: Arc<dyn HttpTransport>) -> P {
+    let _doc = "PolicyCheckedHttpTransport::permissive() inside a string {";
+    let _raw = r#"{"a": "}"}"#;
+    // PolicyCheckedHttpTransport::permissive() in a comment {{
+    build(config, transport)
+}
+#[cfg(test)]
+mod tests {
+    fn t() {
+        // the `}` above must not close this module early
+        let _ = PolicyCheckedHttpTransport::permissive();
+    }
+}
+"##;
+        assert!(
+            transport_ctor_offenders("x/src/lib.rs", tricky).is_empty(),
+            "literals/comments must be masked: {:?}",
+            transport_ctor_offenders("x/src/lib.rs", tricky)
+        );
+    }
 }
 
 #[cfg(test)]

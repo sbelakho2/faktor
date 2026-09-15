@@ -915,7 +915,8 @@ export interface StartTaskRunRequest {
   readonly model?: string;
   readonly max_tokens?: number;
   readonly max_cost_micro?: number;
-  readonly mutation_mode?: string;
+  /** Shadow-only wire vocabulary: the sole accepted value (absent = shadow). */
+  readonly mutation_mode?: 'shadow';
   /** Workspace-relative attachment paths (the same vocabulary as a prompt). */
   readonly files?: readonly string[];
   /** Durable typed binary attachments uploaded BEFORE this start. Each id

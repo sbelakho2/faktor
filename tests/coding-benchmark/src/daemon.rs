@@ -1061,7 +1061,7 @@ pub fn write_config_file(data_dir: &Path, cfg: &DaemonBenchConfig) -> Result<Pat
         "routing_mode": { "pinned": { "provider": pin_id(cfg.provider), "model": cfg.model } },
         "mcp": [],
         "verification": { "quick_max_s": 60, "unit_max_s": 600, "full_as_background": true },
-        "tasks": { "shadow_mutation": false },
+        "tasks": { "mutation_mode": "shadow" },
     });
     if cfg.base_url.is_some() || !cfg.network_rows.is_empty() {
         let mut rows = cfg.network_rows.clone();

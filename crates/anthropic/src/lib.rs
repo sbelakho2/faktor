@@ -8,7 +8,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use faktor_core::model::ModelCapabilities;
-use faktor_provider::egress::{execute_post_json, HttpTransport, PolicyCheckedHttpTransport};
+#[cfg(test)]
+use faktor_provider::egress::PolicyCheckedHttpTransport;
+use faktor_provider::egress::{execute_post_json, HttpTransport};
 use faktor_provider::transport::{
     guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES, PROVIDER_CEILING_MS,
 };
@@ -84,17 +86,18 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    pub fn build(config: AnthropicConfig) -> Arc<dyn Provider> {
-        Self::build_with_transport(config, Arc::new(PolicyCheckedHttpTransport::permissive()))
+    /// The ONLY production constructor: the egress transport is injected
+    /// (the daemon passes the policy-checked one), so no production path can
+    /// silently fall back to a permissive default.
+    pub fn build(config: AnthropicConfig, transport: Arc<dyn HttpTransport>) -> Arc<dyn Provider> {
+        Arc::new(Self { config, transport })
     }
 
-    /// Build with an injected transport (policy-checked in production,
-    /// mock in tests).
-    pub fn build_with_transport(
-        config: AnthropicConfig,
-        transport: Arc<dyn HttpTransport>,
-    ) -> Arc<dyn Provider> {
-        Arc::new(Self { config, transport })
+    /// Test-only default-allow constructor (production MUST inject a
+    /// policy-checked transport; in-crate tests use this for mock servers).
+    #[cfg(test)]
+    pub fn permissive_for_tests(config: AnthropicConfig) -> Arc<dyn Provider> {
+        Self::build(config, Arc::new(PolicyCheckedHttpTransport::permissive()))
     }
 
     fn wire_body(&self, req: &GenericAgentRequest) -> serde_json::Value {
@@ -622,8 +625,9 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider =
-            AnthropicProvider::build(AnthropicConfig::new(Some("sk".into())).with_base(&base));
+        let provider = AnthropicProvider::permissive_for_tests(
+            AnthropicConfig::new(Some("sk".into())).with_base(&base),
+        );
         let mut stream = provider.stream(req("claude-x"));
         while let Some(chunk) = stream.next().await {
             if let Ok(ProviderChunk::Done) = chunk {
@@ -668,7 +672,8 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let provider =
+            AnthropicProvider::permissive_for_tests(AnthropicConfig::new(None).with_base(&base));
         assert_eq!(provider.max_image_bytes(), ANTHROPIC_MAX_IMAGE_BYTES);
         let mut r = req("claude-x");
         r.messages.push(RequestMessage {
@@ -732,7 +737,8 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let provider =
+            AnthropicProvider::permissive_for_tests(AnthropicConfig::new(None).with_base(&base));
         assert!(provider.document_capable("claude-x"));
         let mut r = req("claude-x");
         r.messages.push(RequestMessage {
@@ -766,7 +772,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let provider = AnthropicProvider::build(visionless);
+        let provider = AnthropicProvider::permissive_for_tests(visionless);
         let mut r = req("claude-x");
         r.messages.push(RequestMessage {
             role: Role::User,
@@ -779,7 +785,8 @@ mod tests {
         assert!(err.message.contains("vision"), "{err}");
         assert_eq!(server.request_count(), 0, "no wire byte on a gate refusal");
 
-        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let provider =
+            AnthropicProvider::permissive_for_tests(AnthropicConfig::new(None).with_base(&base));
         let mut r = req("claude-x");
         r.messages.push(RequestMessage {
             role: Role::User,
@@ -824,7 +831,8 @@ mod tests {
             MockAction::Respond { status: 200, body },
         );
         let base = server.base_url().await;
-        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let provider =
+            AnthropicProvider::permissive_for_tests(AnthropicConfig::new(None).with_base(&base));
         let mut stream = provider.stream(req("claude-x"));
         let mut text = String::new();
         let mut call = None;
@@ -870,7 +878,8 @@ mod tests {
             MockAction::Respond { status: 200, body },
         );
         let base = server.base_url().await;
-        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let provider =
+            AnthropicProvider::permissive_for_tests(AnthropicConfig::new(None).with_base(&base));
         let mut stream = provider.stream(req("claude-x"));
         let mut usage = None;
         while let Some(chunk) = stream.next().await {
@@ -912,7 +921,8 @@ mod tests {
             MockAction::Respond { status: 200, body },
         );
         let base = server.base_url().await;
-        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let provider =
+            AnthropicProvider::permissive_for_tests(AnthropicConfig::new(None).with_base(&base));
         let mut stream = provider.stream(req("claude-x"));
         let mut items = Vec::new();
         while let Some(item) = stream.next().await {
@@ -933,7 +943,8 @@ mod tests {
         let server = MockServer::new();
         server.route("POST", "/v1/messages", MockAction::Silent { status: 200 });
         let base = server.base_url().await;
-        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let provider =
+            AnthropicProvider::permissive_for_tests(AnthropicConfig::new(None).with_base(&base));
         let mut g = req("claude-x");
         g.meta.deadline_ms = 1200;
         let mut stream = provider.stream(g);
@@ -971,7 +982,8 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let provider =
+            AnthropicProvider::permissive_for_tests(AnthropicConfig::new(None).with_base(&base));
         let mut stream = provider.stream(req("claude-x"));
         let err = stream.next().await.unwrap().unwrap_err();
         assert_eq!(err.kind, ProviderErrorKind::RateLimited);
@@ -989,7 +1001,8 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let provider =
+            AnthropicProvider::permissive_for_tests(AnthropicConfig::new(None).with_base(&base));
         let mut stream = provider.stream(req("claude-x"));
         let first = stream.next().await.unwrap();
         assert!(first.is_err());
@@ -997,7 +1010,7 @@ mod tests {
 
     #[test]
     fn caps_default_and_override() {
-        let p = AnthropicProvider::build(AnthropicConfig::new(None));
+        let p = AnthropicProvider::permissive_for_tests(AnthropicConfig::new(None));
         assert!(p.capabilities("any").tools);
         assert_eq!(p.capabilities("any").context, 200_000);
     }
@@ -1040,7 +1053,8 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let provider =
+            AnthropicProvider::permissive_for_tests(AnthropicConfig::new(None).with_base(&base));
         let mut r = req("claude-x");
         r.messages = vec![
             RequestMessage {
@@ -1084,7 +1098,8 @@ mod tests {
             },
         );
         let base = server.base_url().await;
-        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let provider =
+            AnthropicProvider::permissive_for_tests(AnthropicConfig::new(None).with_base(&base));
         let mut stream = provider.stream(req("m"));
         let mut text = String::new();
         while let Some(chunk) = stream.next().await {
@@ -1133,7 +1148,7 @@ mod tests {
 
         // Allowed: the allowlisted mock streams normally through the
         // injected transport.
-        let provider = AnthropicProvider::build_with_transport(
+        let provider = AnthropicProvider::build(
             AnthropicConfig::new(None).with_base(&base),
             allow_only(port),
         );
@@ -1151,7 +1166,7 @@ mod tests {
 
         // Denied: a second instance whose policy allows a different port
         // fails BEFORE any network byte (the mock counter stays put).
-        let denied = AnthropicProvider::build_with_transport(
+        let denied = AnthropicProvider::build(
             AnthropicConfig::new(None).with_base(&base),
             allow_only(port.wrapping_add(1)),
         );
@@ -1162,7 +1177,7 @@ mod tests {
 
         // https-to-http mismatch against an https-only rule: denied before
         // connect as well.
-        let mismatch = AnthropicProvider::build_with_transport(
+        let mismatch = AnthropicProvider::build(
             AnthropicConfig::new(None).with_base(&base),
             Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
                 DestinationPolicy::parse_lines([&format!("https://127.0.0.1:{port}")]).unwrap(),
@@ -1186,7 +1201,7 @@ mod tests {
         .join("\n\n");
         let mock = Arc::new(MockHttpTransport::new(200, body));
         let as_transport: Arc<dyn HttpTransport> = mock.clone();
-        let provider = AnthropicProvider::build_with_transport(
+        let provider = AnthropicProvider::build(
             AnthropicConfig::new(None).with_base("http://mock.invalid"),
             as_transport,
         );
@@ -1268,7 +1283,7 @@ mod tests {
             family: faktor_provider::usage_conformance::WireFamily::SplitCache,
             label: "anthropic messages",
             request: || req("claude-x"),
-            provider: |base: String| AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base)),
+            provider: |base: String| AnthropicProvider::permissive_for_tests(AnthropicConfig::new(None).with_base(&base)),
             method: "POST",
             path: "/v1/messages",
             cases: vec![

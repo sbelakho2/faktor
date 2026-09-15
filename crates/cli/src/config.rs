@@ -1173,9 +1173,7 @@ impl ProviderCfg {
         match self {
             ProviderCfg::Ollama { base_url, .. } => {
                 let cfg = faktor_ollama::OllamaConfig::new(base_url.clone());
-                Some(faktor_ollama::OllamaProvider::new_with_transport(
-                    cfg, transport,
-                ))
+                Some(faktor_ollama::OllamaProvider::new(cfg, transport))
             }
             _ => None,
         }
@@ -1186,22 +1184,22 @@ impl ProviderCfg {
         let provider: Arc<dyn Provider> = match self {
             ProviderCfg::Ollama { base_url, .. } => {
                 let cfg = faktor_ollama::OllamaConfig::new(base_url.clone());
-                faktor_ollama::OllamaProvider::new_with_transport(cfg, transport.clone())
+                faktor_ollama::OllamaProvider::new(cfg, transport.clone())
             }
             ProviderCfg::OpenAi { base_url, .. } => {
                 let mut cfg = faktor_openai::OpenAiConfig::chat(base_url, self.key());
                 cfg.family = self
                     .openai_family()
                     .expect("open_ai entries always select an OpenAI family");
-                faktor_openai::OpenAiProvider::build_with_transport(cfg, transport.clone())
+                faktor_openai::OpenAiProvider::build(cfg, transport.clone())
             }
             ProviderCfg::Anthropic { .. } => {
                 let cfg = faktor_anthropic::AnthropicConfig::new(self.key());
-                faktor_anthropic::AnthropicProvider::build_with_transport(cfg, transport.clone())
+                faktor_anthropic::AnthropicProvider::build(cfg, transport.clone())
             }
             ProviderCfg::Google { .. } => {
                 let cfg = faktor_google::GoogleConfig::new(self.key());
-                faktor_google::GoogleProvider::build_with_transport(cfg, transport.clone())
+                faktor_google::GoogleProvider::build(cfg, transport.clone())
             }
             ProviderCfg::DeepSeek {
                 profile, base_url, ..
@@ -1251,7 +1249,7 @@ impl ProviderCfg {
                         return Err(format!("unknown deepseek profile {other:?}"));
                     }
                 };
-                faktor_deepseek::build_with_transport(cfg, transport.clone())
+                faktor_deepseek::build(cfg, transport.clone())
             }
             ProviderCfg::Gateway { base_url, .. } => {
                 let cfg = faktor_gateway::GatewayConfig {
@@ -1262,7 +1260,7 @@ impl ProviderCfg {
                     route_prefixes: vec![],
                     default_caps: ModelCapabilities::default(),
                 };
-                faktor_gateway::build_with_transport(cfg, transport.clone())
+                faktor_gateway::build(cfg, transport.clone())
             }
         };
         // Billing-origin audit: EVERY configured endpoint is wrapped with

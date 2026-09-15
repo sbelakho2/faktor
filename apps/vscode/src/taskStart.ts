@@ -1,11 +1,12 @@
 // Pure task-start policy for the VS Code product surface.
 //
-// P0 Shadow default: the `faktor.mutationMode` setting defaults to ""
-// (inherit-daemon). The client sends `mutation_mode` ONLY when the user
-// configured an explicit value and NEVER fabricates `direct_compat` as a
-// fallback: a daemon 409 (conflict) is a typed, actionable refusal that
-// names the cause and the explicit opt-in, and it is attempted exactly
-// ONCE. There is no 409 -> direct_compat downgrade path anywhere.
+// P0 shadow-only mutation policy: the daemon's sole mode is shadow mutation
+// (every mutating run works in an isolated candidate), so the client's
+// `faktor.mutationMode` setting vocabulary is "" (inherit-daemon; the
+// production default) or "shadow" (explicit). The removed `direct_compat`
+// value is a typed strict-parse refusal at start admission — never
+// forwarded, never fabricated, and never a downgrade target. A daemon 409
+// (conflict) stays a typed, actionable refusal attempted exactly ONCE.
 //
 // Dependency-free (no vscode import) so scripts/selftest.mjs drives it
 // with a fake client.
@@ -150,8 +151,38 @@ export function parsePendingSubmission(raw: unknown): PendingSubmission | null {
   };
 }
 
-/** The `faktor.mutationMode` setting vocabulary. `''` = inherit-daemon. */
-export type MutationModeSetting = '' | 'shadow' | 'direct_compat';
+/** The `faktor.mutationMode` setting vocabulary (shadow-only). */
+export type MutationModeSetting = '' | 'shadow';
+
+/**
+ * Strict parse of one raw `faktor.mutationMode` value. `''`/absent is the
+ * inherit-daemon default; `"shadow"` names the daemon's only mutation mode
+ * explicitly. The removed `direct_compat` value is refused with the typed
+ * removal reason (the same vocabulary the daemon's own strict decode and
+ * config parser use), and every unknown value is refused as unknown. The
+ * function never coerces and never falls back silently.
+ */
+export function parseMutationModeSetting(
+  raw: unknown,
+): { readonly mode: MutationModeSetting } | { readonly reason: string } {
+  if (raw === undefined || raw === null || raw === '') {
+    return { mode: '' };
+  }
+  if (raw === 'shadow') {
+    return { mode: 'shadow' };
+  }
+  if (raw === 'direct_compat') {
+    return {
+      reason:
+        'mutation_mode "direct_compat" was removed: every mutating run executes in an ' +
+        'isolated candidate (shadow mutation); there is no direct-owner mode. Remove the ' +
+        'setting or set "faktor.mutationMode" to "shadow".',
+    };
+  }
+  return {
+    reason: `unknown mutation mode ${JSON.stringify(raw)}: shadow mutation is the only mode`,
+  };
+}
 
 /** Bounds of one composer attachment list (mirror the daemon's own caps). */
 export const MAX_WEBVIEW_FILES = 64;
@@ -274,6 +305,7 @@ export function parseCompletionContract(
 }
 
 export interface StartTaskSettings {
+  /** The raw `faktor.mutationMode` value; parsed strictly at admission. */
   readonly mutationMode: string;
   readonly maxTokens: number;
   readonly maxCostMicro: number;
@@ -289,7 +321,6 @@ export interface StartTaskSettings {
 export type StartFailureKind =
   | 'shadow_unregistered'
   | 'validation'
-  | 'conflict'
   | 'auth'
   | 'server'
   | 'transport';
@@ -340,7 +371,10 @@ export function hasCompletionSteps(contract: NativeCompletionContract | null): b
 
 /**
  * Build the strict request body. The empty setting (inherit-daemon) OMITS
- * `mutation_mode` entirely; only an explicit user/policy value is sent.
+ * `mutation_mode` entirely; only the explicit `"shadow"` value is sent.
+ * The removed `direct_compat` value and any unknown value are dropped here
+ * (the start admission path refuses them loudly BEFORE the wire); the
+ * request builder never coerces a removed mode into a fabricated payload.
  *
  * A NON-DEFAULT completion contract is refused by the daemon on the plain
  * prompt path, so the request pairs it with ONE explicit mutating work item
@@ -376,36 +410,25 @@ export function startTaskRequest(goal: string, settings: StartTaskSettings): Sta
         }
       : {}),
   };
-  if (settings.mutationMode === 'shadow' || settings.mutationMode === 'direct_compat') {
-    return { ...request, mutation_mode: settings.mutationMode };
+  const mode = parseMutationModeSetting(settings.mutationMode);
+  if ('mode' in mode && mode.mode === 'shadow') {
+    return { ...request, mutation_mode: 'shadow' };
   }
   return request;
 }
 
-function failureOf(error: unknown, settings: StartTaskSettings): StartFailure {
+function failureOf(error: unknown): StartFailure {
   if (error instanceof NativeApiError) {
     if (error.status === 409) {
-      const shadowed = settings.mutationMode !== 'direct_compat';
-      if (shadowed) {
-        return {
-          kind: 'shadow_unregistered',
-          status: error.status,
-          code: error.code,
-          message:
-            'cannot start task: the daemon refused the shadowed run because the session is ' +
-            'not registered in the daemon worktree registry (shadow mutation needs a ' +
-            `registered workspace/worktree). Server said: ${error.message}. Restart the ` +
-            'daemon so a registered session is created, or opt in explicitly with ' +
-            '"faktor.mutationMode": "direct_compat".',
-        };
-      }
       return {
-        kind: 'conflict',
+        kind: 'shadow_unregistered',
         status: error.status,
         code: error.code,
         message:
-          'cannot start task: the daemon refused the run even though direct_compat was ' +
-          `configured. Server said: ${error.message}.`,
+          'cannot start task: the daemon refused the shadowed run because the session is ' +
+          'not registered in the daemon worktree registry (shadow mutation needs a ' +
+          `registered workspace/worktree). Server said: ${error.message}. Restart the ` +
+          'daemon so a registered session is created, then retry.',
       };
     }
     const kind: StartFailureKind =
@@ -428,7 +451,9 @@ function failureOf(error: unknown, settings: StartTaskSettings): StartFailure {
 /**
  * Start ONE task run: exactly one request, no downgrade retry. The outcome
  * is always returned (never thrown) so callers can ack the composer and
- * report the error deterministically.
+ * report the error deterministically. A removed/unknown mutation mode is a
+ * typed `validation` refusal BEFORE any request: the removed value never
+ * reaches the wire and is never silently ignored.
  */
 export async function startTaskRun(input: {
   readonly client: StartRunClient;
@@ -438,13 +463,24 @@ export async function startTaskRun(input: {
   readonly onStarted: (started: NativeTaskRunStarted) => void;
   readonly onFailure: (failure: StartFailure) => void;
 }): Promise<StartTaskOutcome> {
+  const mode = parseMutationModeSetting(input.settings.mutationMode);
+  if ('reason' in mode) {
+    const failure: StartFailure = {
+      kind: 'validation',
+      status: null,
+      code: 'invalid_mutation_mode',
+      message: `cannot start task: ${mode.reason}`,
+    };
+    input.onFailure(failure);
+    return { ok: false, runId: null, started: null, failure };
+  }
   const request = startTaskRequest(input.goal, input.settings);
   try {
     const started = await input.client.startTaskRun(input.sessionId, request);
     input.onStarted(started);
     return { ok: true, runId: started.run_id, started, failure: null };
   } catch (error) {
-    const failure = failureOf(error, input.settings);
+    const failure = failureOf(error);
     input.onFailure(failure);
     return { ok: false, runId: null, started: null, failure };
   }

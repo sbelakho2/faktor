@@ -200,6 +200,35 @@ fn stable_copy_refuses_a_permanently_drifting_owner_typed() {
     }
 }
 
+#[test]
+fn poisoned_copy_seam_recovers_and_begin_still_succeeds() {
+    // The stable-copy seam is plain None/Some state: a panicking holder can
+    // poison its mutex but cannot corrupt an invariant, so the next begin
+    // must recover the guard and proceed — a test-seam poison must never
+    // abort the run with a panic cascade.
+    let fix = open_fix(default_limits());
+    let seam = Arc::clone(&fix.shadows.copy_seam);
+    let poisoner = std::thread::spawn(move || {
+        let _guard = seam.lock().unwrap();
+        panic!("poison the copy seam");
+    });
+    assert!(poisoner.join().is_err());
+    assert!(fix.shadows.copy_seam.is_poisoned());
+
+    // Arming after the poison recovers the guard…
+    fix.shadows.arm_copy_drift(ShadowCopyDrift::Once);
+    // …and the seam still fires: the once-drift is observed and retried.
+    let shadow = fix
+        .shadows
+        .begin_shadow(fix.session, &fix.user)
+        .expect("a poisoned seam recovers and begin proceeds");
+    assert_eq!(
+        fs::read(shadow.root.join("shadow-copy-drift.txt")).unwrap(),
+        b"drift on attempt 1"
+    );
+    assert_eq!(owner_digest(&fix), run_base_of(&fix).snapshot_hash);
+}
+
 // ---------------------------------------------------------------- staging
 
 #[test]
