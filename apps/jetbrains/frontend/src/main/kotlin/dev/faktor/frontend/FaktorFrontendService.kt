@@ -378,7 +378,7 @@ class FaktorFrontendService(
         clientOrThrow().spawnTerminal(requireSession(), command, args, cwd, rows, cols)
 
     fun terminalOutput(ptyId: String): NativeTerminalOutput =
-        clientOrThrow().terminalOutput(ptyId)
+        clientOrThrow().terminalOutput(requireSession(), ptyId)
 
     // --------------------------------------------------------------- agents
 

@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
 
-use faktor_core::{PROTOCOL_V756, UX_BASELINE, VERSION};
+use faktor_core::{UX_BASELINE, VERSION};
 use serde::{Deserialize, Serialize};
 
 /// The frozen corpus size. A task may be added only by changing this constant
@@ -488,7 +488,7 @@ pub fn render_corpus_markdown(corpus: &TaskCorpus) -> String {
     let mut out = String::new();
     out.push_str("# Faktor benchmark corpus\n\n");
     out.push_str(&format!(
-        "Frozen 11-task corpus. Kernel {VERSION} (protocol {PROTOCOL_V756}, baseline {UX_BASELINE}). \
+        "Frozen 11-task corpus. Kernel {VERSION} (baseline {UX_BASELINE}). \
          Live lanes run only with {LIVE_ENV}=1.\n\n"
     ));
     out.push_str("| id | category | verification | deceptive | criteria | prompt chars |\n");
@@ -1064,7 +1064,7 @@ mod tests {
             rendered.contains(VERSION),
             "report must stamp the kernel version"
         );
-        assert!(rendered.contains(PROTOCOL_V756) && rendered.contains(UX_BASELINE));
+        assert!(rendered.contains(UX_BASELINE));
 
         let data_rows: Vec<&str> = rendered
             .lines()

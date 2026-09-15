@@ -19,10 +19,9 @@ use std::time::{Duration, Instant};
 
 use crate::fixtures::{fixture_seeds, FixtureSeed};
 use crate::{
-    harness_acp_frame_decoder, harness_compat_dto_decode, harness_destination_policy_parser,
-    harness_event_payload_decode, harness_path_normalization, harness_provider_line_framing,
-    harness_sse_frame_parser, harness_tokenizer_pricing_parse, harness_tool_json_repair_parse, Lcg,
-    Outcome,
+    harness_acp_frame_decoder, harness_destination_policy_parser, harness_event_payload_decode,
+    harness_path_normalization, harness_provider_line_framing, harness_tokenizer_pricing_parse,
+    harness_tool_json_repair_parse, Lcg, Outcome,
 };
 
 /// One named harness under campaign.
@@ -38,16 +37,8 @@ pub const HARNESSES: &[HarnessCase] = &[
         run: harness_provider_line_framing,
     },
     HarnessCase {
-        name: "sse_frame",
-        run: harness_sse_frame_parser,
-    },
-    HarnessCase {
         name: "acp_frame",
         run: harness_acp_frame_decoder,
-    },
-    HarnessCase {
-        name: "compat_dto",
-        run: harness_compat_dto_decode,
     },
     HarnessCase {
         name: "tool_json",

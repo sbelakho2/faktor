@@ -126,7 +126,7 @@
 //! `TaskExecutor`/`AgentRuntime`/session/verification services.
 //!
 //! * **`session/load`** — the backend hook returns the frozen native
-//!   `faktor_protocol::v756::MessagesPage` for a session it owns. The crate
+//!   `faktor_protocol::native::MessagesPage` for a session it owns. The crate
 //!   maps the page (newest-first natively) into chronological official
 //!   replay frames: `user_message_chunk`/`agent_message_chunk` text,
 //!   `agent_thought_chunk` for reasoning/summary/system parts, `tool_call`
@@ -250,7 +250,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use faktor_protocol::v756::{MessagesPage, Part as NativePart};
+use faktor_protocol::native::{MessagesPage, Part as NativePart};
 
 use crate::protocol::AcpMethod;
 
@@ -2136,7 +2136,7 @@ pub trait AcpBackend: Send + Sync {
         BackendCapabilities::default()
     }
     /// The bounded native message history of a session this backend owns,
-    /// as the frozen `faktor_protocol::v756::MessagesPage`. Implementations
+    /// as the frozen `faktor_protocol::native::MessagesPage`. Implementations
     /// must refuse ([`LoadSessionError::NotFound`]) for sessions they do not
     /// own and must only report [`BackendCapabilities::load_session`] when
     /// this hook can produce a complete bounded page.

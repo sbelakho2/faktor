@@ -32,10 +32,10 @@ This workspace is a Rust implementation of the Faktor architecture spec
    configured minimum reduction. Reject summaries that reduce context by ~1%.
 8. **Zero orphans.** Every child process has a runtime owner. If the session
    dies, ownership transfers deliberately or the process dies.
-9. **Wire compatibility is a frozen contract.** `faktor-protocol::v756` golden
-   tests lock request/response/SSE/JSON-field-presence/null-behavior/error-code
-   behavior. Do not change it without updating the fixtures in
-   `compat/kilo-v756/`.
+9. **The native protocol is the daemon's own contract.** Faktor Native
+   Protocol v1 (`docs/native-protocol.md`) evolves with the runtime; there is
+   no foreign wire-compatibility surface. The retired v7.5.6 compatibility
+   subsystem must not be reintroduced as a release objective.
 
 ## Verification
 

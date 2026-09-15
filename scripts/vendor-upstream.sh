@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Vendor the frozen upstream UI paths into ui/ and compat/, then verify hashes.
+# Vendor the pinned upstream UI paths into ui/ and compat/ (JetBrains), then verify hashes.
 #
 #   scripts/vendor-upstream.sh          fetch both pins, re-copy, re-hash, verify
 #   scripts/vendor-upstream.sh --check  verify the existing vendored trees only (offline)

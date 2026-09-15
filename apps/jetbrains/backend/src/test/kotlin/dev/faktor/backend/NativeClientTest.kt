@@ -8,7 +8,7 @@
 //     maps 401/500 bodies to typed errors, and enforces the body bound.
 //   * NativeEventStream: fake SSE daemon tests frames, heartbeat handling,
 //     oversized-frame dropping, reconnect with cursor resume (the second
-//     request must carry events_after=<last delivered id>).
+//     request must carry after=<last delivered id>).
 //   * NativeBridgeSmoke: a real `faktor-cli` daemon end-to-end (start,
 //     authenticate, create session, prompt, SSE, task-run/agent/usage/
 //     verification/evidence routes), mirroring BackendSmoke.
@@ -618,10 +618,10 @@ private fun assertClientRoutes() {
     val daemon = FakeDaemon()
     daemon.on("GET", "/native/health") { _, response -> response.json(200, HEALTH_JSON) }
     daemon.on("GET", "/native/ready") { _, response -> response.json(200, READY_JSON) }
-    daemon.on("POST", "/session/create") { _, response -> response.json(200, CREATED_JSON) }
-    daemon.on("GET", "/session/list") { _, response -> response.json(200, SESSIONS_JSON) }
+    daemon.on("POST", "/native/session") { _, response -> response.json(200, CREATED_JSON) }
+    daemon.on("GET", "/native/sessions") { _, response -> response.json(200, SESSIONS_JSON) }
     daemon.on("GET", "/models") { _, response -> response.json(200, MODELS_JSON) }
-    daemon.on("POST", "/session/prompt") { _, response -> response.json(200, PROMPT_JSON) }
+    daemon.on("POST", "/native/session/7/prompt") { _, response -> response.json(200, PROMPT_JSON) }
     daemon.on("POST", "/native/session/7/abort") { _, response -> response.json(200, ABORT_JSON) }
     daemon.on("GET", "/session/7/projection") { _, response ->
         response.json(200, PROJECTION_JSON)
@@ -693,12 +693,12 @@ private fun assertClientRoutes() {
 
         val first = daemon.requests[0]
         assertEquals("Bearer tok", first.headers["authorization"])
-        val create = daemon.requests.first { it.method == "POST" && it.path == "/session/create" }
+        val create = daemon.requests.first { it.method == "POST" && it.path == "/native/session" }
         assertEquals(
             "{\"provider\":\"p\",\"model\":\"m\",\"workspace\":\"/ws\",\"title\":\"T\"}",
             create.body
         )
-        val prompt = daemon.requests.first { it.path == "/session/prompt" }
+        val prompt = daemon.requests.first { it.path == "/native/session/7/prompt" }
         assertEquals("{\"session_id\":\"7\",\"prompt\":\"hi\"}", prompt.body)
         val boardRead = daemon.requests.first {
             it.method == "GET" && it.path == "/native/session/7/board"
@@ -789,8 +789,8 @@ private fun awaitLatch(latch: CountDownLatch, timeoutMs: Long, what: String) {
 private fun assertSseStreaming() {
     val daemon = FakeDaemon()
     val held = CountDownLatch(1)
-    daemon.on("GET", "/api/session/42/events") { request, response ->
-        val after = request.query["events_after"]?.toLongOrNull() ?: 0L
+    daemon.on("GET", "/native/session/42/events") { request, response ->
+        val after = request.query["after"]?.toLongOrNull() ?: 0L
         if (after < 1L) {
             response.stream(200, "text/event-stream") { writer ->
                 writer.comment("keep-alive")
@@ -826,9 +826,9 @@ private fun assertSseStreaming() {
         assertEquals(2L, stream.cursor)
         assertTrue(errors.isEmpty(), "no frame errors expected: $errors")
         val second = daemon.requests.first {
-            it.path == "/api/session/42/events" && it.query["events_after"] == "1"
+            it.path == "/native/session/42/events" && it.query["after"] == "1"
         }
-        assertEquals("1", second.query["events_after"])
+        assertEquals("1", second.query["after"])
         assertEquals("Bearer tok", second.headers["authorization"])
         assertEquals("text/event-stream", second.headers["accept"])
     } finally {
@@ -844,7 +844,7 @@ private fun assertSseOversizedFrame() {
     val bigData = StringBuilder("{\"x\":\"")
     for (i in 0 until 200) bigData.append('a')
     bigData.append("\"}")
-    daemon.on("GET", "/api/session/9/events") { _, response ->
+    daemon.on("GET", "/native/session/9/events") { _, response ->
         response.stream(200, "text/event-stream") { writer ->
             writer.frame(9, "agent_state_changed", bigData.toString())
             writer.frame(10, "agent_state_changed", "{\"event\":\"agent_state_changed\"}")
@@ -925,7 +925,7 @@ object NativeBridgeSmoke {
                     if (!ready.ready) fail("daemon never became ready")
                 }
                 var sessionId: String? = null
-                step("create native session (POST /session/create)") {
+                step("create native session (POST /native/session)") {
                     val created = client.createSession(
                         "default", "default", null, "native bridge smoke"
                     )
@@ -945,7 +945,7 @@ object NativeBridgeSmoke {
                         stream = s
                         s.start()
                     }
-                    step("prompt (POST /session/prompt)") {
+                    step("prompt (POST /native/session/{id}/prompt)") {
                         val receipt = client.prompt(sid, "ping from native bridge smoke")
                         if (!receipt.accepted) fail("prompt not accepted")
                         println("  op=${receipt.opId} queued=${receipt.queued}")

@@ -4,7 +4,7 @@
 //! state machine, the conversation view, tool-run ledger, permissions,
 //! checkpoints, memory facts, compaction records and crash recovery. It sits
 //! directly on `faktor-store` (SQLite) and `faktor-cas` (content-addressed
-//! blobs) and speaks the frozen `faktor-protocol::v756` shapes. The agent
+//! blobs) and speaks the Faktor-native `faktor-protocol::native` shapes. The agent
 //! reasoning loop (`faktor-agent`) drives this crate with commands; tools and
 //! providers never touch session persistence directly (Commandment 1).
 //!
@@ -61,7 +61,6 @@ pub mod payload;
 pub mod process;
 pub mod read_service;
 pub mod recovery;
-pub mod sse;
 pub mod task;
 pub mod verification_job;
 
@@ -123,7 +122,6 @@ pub use read_service::{
     DEFAULT_READ_WORKERS, MAX_READ_WORKERS,
 };
 pub use recovery::{FileHasher, RecoveredOp, RecoveryAction, RecoveryReport, SystemFileHasher};
-pub use sse::JournalFrame;
 pub use task::{
     CompletionContractGate, Task, TaskBudget, TaskError, TaskPatch, VerificationRecord,
     MAX_TASK_CRITERIA, MAX_TASK_CRITERION_BYTES, MAX_TASK_GOAL_BYTES, MAX_TASK_PLAN_STEPS,

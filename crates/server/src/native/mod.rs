@@ -1,8 +1,8 @@
 //! Faktor Native Protocol v1 handlers (docs/native-protocol.md).
 //!
 //! Split out of the `api` monolith (audits 81-83/94). Native modules depend
-//! only on core/runtime crates and on this module's shared glue; they never
-//! import the v7.5.6 compatibility surface (`crate::compat`).
+//! only on core/runtime crates and on this module's shared glue; no
+//! compatibility surface exists.
 
 use crate::auth::{check_bearer, check_password};
 use axum::extract::{Path, Query, State};
@@ -102,16 +102,9 @@ pub(crate) fn agent_state_tag(s: AgentState) -> String {
         .to_string()
 }
 
-pub(crate) fn api_error_json(e: &faktor_core::error::Error) -> serde_json::Value {
-    serde_json::json!({ "ok": false, "code": format!("{:?}", e.kind).to_lowercase(), "message": e.message })
-}
-
 // ------------------------------------------------------------ disposal & auth
 
 pub(crate) fn wire_refused(message: &str) -> Response {
-    // Same frozen body as the wire `RevertResponse { ok: false, message }`
-    // (the field always serializes here), without importing the v7.5.6 DTO
-    // into the native layer.
     (
         StatusCode::CONFLICT,
         Json(serde_json::json!({ "ok": false, "message": message })),

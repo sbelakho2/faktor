@@ -29,7 +29,7 @@
 //!   yields exactly one terminal state sequence.
 //! - No second PTY implementation exists here: every terminal is spawned
 //!   through `faktor-pty` with the one env-clear [`EnvSpec`] authority.
-//!   The legacy daemon-level `/pty/*` surface (compat) keeps its own raw
+//!   The retired daemon-level `/pty/*` surface kept its own raw
 //!   PTY map in `AppState`; session-owned rows never enter it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1168,6 +1168,68 @@ impl TerminalService {
         }
         pty.write_all(data)
             .map_err(|e| TerminalServiceError::Refused(e.message))
+    }
+
+    /// The bounded output snapshot of one Running session-owned terminal:
+    /// `(rendered output, alive)`. Session scope is enforced exactly like
+    /// [Self::input]; a terminal without a live ring of this boot is a
+    /// typed `Lost`, never fabricated bytes. Reading never drains.
+    pub fn output_snapshot(
+        &self,
+        session_id: &str,
+        terminal_id: &str,
+    ) -> Result<(String, bool), TerminalServiceError> {
+        let handle = self.session_handle(session_id)?;
+        let sid = handle.id();
+        self.ensure_recovered(&handle, sid.raw())?;
+        self.sweep_live();
+        let terminals = self.fold(&handle, sid.raw())?;
+        let entry = terminals
+            .get(terminal_id)
+            .ok_or_else(|| TerminalServiceError::Unknown {
+                session_id: session_id.to_string(),
+                terminal_id: terminal_id.to_string(),
+            })?;
+        if entry.row.session_id != sid.raw() {
+            return Err(TerminalServiceError::ForeignScope {
+                session_id: session_id.to_string(),
+                terminal_id: terminal_id.to_string(),
+            });
+        }
+        let live = match entry.state {
+            TerminalEventKind::Running => {
+                self.live_row(terminal_id)
+                    .ok_or_else(|| TerminalServiceError::Lost {
+                        terminal_id: terminal_id.to_string(),
+                        detail: "the pty authority of this daemon boot does not own the row".into(),
+                    })?
+            }
+            TerminalEventKind::Lost => {
+                return Err(TerminalServiceError::Lost {
+                    terminal_id: terminal_id.to_string(),
+                    detail: entry.detail.clone(),
+                })
+            }
+            other => {
+                return Err(TerminalServiceError::State {
+                    terminal_id: terminal_id.to_string(),
+                    state: other.state_tag(),
+                    message: "only a running terminal exposes output".into(),
+                })
+            }
+        };
+        if live.session_id != sid {
+            return Err(TerminalServiceError::ForeignScope {
+                session_id: session_id.to_string(),
+                terminal_id: terminal_id.to_string(),
+            });
+        }
+        let pty = live
+            .pty
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let output = String::from_utf8_lossy(&pty.snapshot()).into_owned();
+        Ok((output, pty.is_alive()))
     }
 
     /// Resize a Running terminal through the pty authority.

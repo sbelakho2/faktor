@@ -1,6 +1,6 @@
 // Session history + daemon restart/reconnect surface (upstream
 // `session/history` and the restart/connection controls): the durable
-// session list (`GET /session/list`), selection that reopens a session, and
+// session list (`GET /native/sessions`), selection that reopens a session, and
 // explicit daemon restart / SSE reconnect controls. The reconnect readout
 // shows the exact cursor the stream will resume from, so a restart can
 // neither duplicate nor skip journal frames.

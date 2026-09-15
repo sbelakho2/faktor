@@ -1219,6 +1219,7 @@ name = "faktor-pty"
 version = "0.1.0"
 dependencies = [
  "faktor-core",
+ "faktor-fs",
  "faktor-winjob",
  "libc",
  "serde",
@@ -1448,26 +1449,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
-]
-
-[[package]]
-name = "faktor-tests-compat"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "blake3",
- "faktor-agent",
- "faktor-core",
- "faktor-fs",
- "faktor-instructions",
- "faktor-provider",
- "faktor-server",
- "faktor-session",
- "faktor-snapshot",
- "reqwest",
- "serde_json",
- "tempfile",
- "tokio",
 ]
 
 [[package]]

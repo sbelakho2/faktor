@@ -49,7 +49,7 @@ use faktor_core::state::{
 };
 use faktor_core::time::Clock;
 use faktor_core::WorkspaceIdentity;
-use faktor_protocol::v756::ToolResultBody;
+use faktor_protocol::native::ToolResultBody;
 use faktor_provider::{
     CanonicalUsage, CapabilityValidator, ContentPart, GenericAgentRequest, ProviderChunk,
     ProviderError, ProviderErrorKind, ProviderRegistry, ReportedCost, RequestMessage, RequestMeta,
@@ -14784,7 +14784,7 @@ mod tests {
             .iter()
             .flat_map(|m| m.parts.iter())
             .filter_map(|p| match p {
-                faktor_protocol::v756::Part::Text { text } => Some(text),
+                faktor_protocol::native::Part::Text { text } => Some(text),
                 _ => None,
             })
             .collect();
@@ -14899,7 +14899,7 @@ mod tests {
             .messages
             .iter()
             .flat_map(|m| m.parts.iter())
-            .any(|p| matches!(p, faktor_protocol::v756::Part::ToolResult { .. }));
+            .any(|p| matches!(p, faktor_protocol::native::Part::ToolResult { .. }));
         assert!(has_tool_result, "tool result part must be durable");
         // Tool ran exactly once (never replayed).
         let runs = handle.pending_tool_runs().unwrap();
@@ -15492,8 +15492,8 @@ mod tests {
             .parts
             .iter()
             .map(|p| match p {
-                faktor_protocol::v756::Part::Reasoning { .. } => "reasoning",
-                faktor_protocol::v756::Part::Text { .. } => "text",
+                faktor_protocol::native::Part::Reasoning { .. } => "reasoning",
+                faktor_protocol::native::Part::Text { .. } => "text",
                 other => panic!("unexpected durable part {other:?}"),
             })
             .collect();
@@ -15503,13 +15503,13 @@ mod tests {
             "thinking rows precede text rows in the durable part order"
         );
         match &assistant.parts[0] {
-            faktor_protocol::v756::Part::Reasoning { text } => {
+            faktor_protocol::native::Part::Reasoning { text } => {
                 assert_eq!(text, "let me think");
             }
             other => panic!("wrong part {other:?}"),
         }
         match &assistant.parts[1] {
-            faktor_protocol::v756::Part::Text { text } => {
+            faktor_protocol::native::Part::Text { text } => {
                 assert_eq!(text, "the answer", "reasoning must never leak into text");
             }
             other => panic!("wrong part {other:?}"),
@@ -23538,7 +23538,7 @@ mod tests {
             .iter()
             .flat_map(|m| m.parts.iter())
             .filter_map(|p| match p {
-                faktor_protocol::v756::Part::Text { text } => Some(text.clone()),
+                faktor_protocol::native::Part::Text { text } => Some(text.clone()),
                 _ => None,
             })
             .collect();

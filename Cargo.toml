@@ -45,7 +45,6 @@ members = [
     "tests/longrun",
     "tests/quality",
     "tests/streams",
-    "tests/compat",
     "tests/benchmark",
     "tests/economy",
     "tests/efficiency",

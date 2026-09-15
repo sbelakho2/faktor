@@ -431,10 +431,8 @@ pub(crate) async fn native_session_agents(
     }
 }
 
-/// Native-local twin of the frozen wire `NativeAbortRequest` (same fields,
-/// same `deny_unknown_fields` strictness, so the wire shape is identical).
-/// The native layer never imports v7.5.6 DTOs; follow-up: promote this DTO
-/// to a `faktor-protocol` native module once the compat surface is retired.
+/// The native abort request DTO (strict `deny_unknown_fields`: an unknown
+/// field or typo is a 400).
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeAbortRequest {
@@ -627,11 +625,10 @@ pub(crate) struct NativeEventsQuery {
     limit: Option<u64>,
 }
 
-/// `GET /native/events?session=<id>&after=<seq>&limit=<n>` — the native
-/// twin of the `/api/session/{id}/events` journal stream (audit P0-64):
-/// durable journal events with `seq > after` ascending, one strict-DTO page
-/// at a time (`hasMore`/`nextCursor`), same bounded catch-up paging as the
-/// SSE journal poll (page cap 256). `after` is the raw per-session journal
+/// `GET /native/events?session=<id>&after=<seq>&limit=<n>` — the paged
+/// native journal read: durable journal events with `seq > after`
+/// ascending, one strict-DTO page at a time (`hasMore`/`nextCursor`), the
+/// same bounded catch-up paging as the native SSE stream (page cap 256). `after` is the raw per-session journal
 /// sequence (0 = from the beginning). Unknown sessions 404; hostile ids
 /// 400.
 pub(crate) async fn native_events(
@@ -663,21 +660,7 @@ pub(crate) async fn native_events(
     } else {
         None
     };
-    let rows: Vec<serde_json::Value> = page_events
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "seq": e.seq.raw(),
-                "kind": serde_json::to_string(&e.kind)
-                    .unwrap_or_default()
-                    .trim_matches('"'),
-                "state": agent_state_tag(e.state),
-                "opId": e.op_id.map(|o| o.to_string()),
-                "tsMs": e.ts_ms,
-                "payload": e.payload,
-            })
-        })
-        .collect();
+    let rows: Vec<serde_json::Value> = page_events.iter().map(native_event_row).collect();
     Json(serde_json::json!({
         "sessionId": handle.id().to_string(),
         "events": rows,
@@ -685,4 +668,389 @@ pub(crate) async fn native_events(
         "nextCursor": next_cursor.map(|v| serde_json::json!(v)).unwrap_or(serde_json::Value::Null),
     }))
     .into_response()
+}
+
+/// One native journal frame row. The `/native/events` cursor pages and the
+/// native SSE stream carry the exact same shape.
+pub(crate) fn native_event_row(e: &faktor_core::event::Event) -> serde_json::Value {
+    serde_json::json!({
+        "seq": e.seq.raw(),
+        "kind": serde_json::to_string(&e.kind)
+            .unwrap_or_default()
+            .trim_matches('"'),
+        "state": agent_state_tag(e.state),
+        "opId": e.op_id.map(|o| o.to_string()),
+        "tsMs": e.ts_ms,
+        "payload": e.payload,
+    })
+}
+
+/// Strict native SSE query of `/native/session/{id}/events`.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeSessionEventsQuery {
+    #[serde(default)]
+    after: Option<u64>,
+}
+
+/// `GET /native/session/{id}/events?after=<seq>` — the native durable
+/// journal SSE stream (cursor `after` = replay `seq > after`, 0 = from the
+/// beginning). Frames are `id: <seq>`, `event: <kind>`, `data:
+/// <native_event_row>`; heartbeats (`event: heartbeat`) keep proxies alive
+/// and are ignored by clients. Catch-up is paged (bounded), so a reconnect
+/// against a huge journal can never balloon RAM and resumes exactly from
+/// the cursor. Unknown sessions 404; hostile ids 400.
+pub(crate) async fn native_session_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<NativeSessionEventsQuery>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    let cursor = q.after.unwrap_or(0) as i64;
+    let stream = native_journal_stream(handle, cursor);
+    axum::response::sse::Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(std::time::Duration::from_secs(5))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+/// The bounded, paged journal poll behind the native SSE stream: at most
+/// [`MAX_NATIVE_EVENT_PAGE`] frames per poll are materialized; when the
+/// page is exhausted the stream sleeps and emits a heartbeat. The journal
+/// is the source of truth and the frame `id:` is the resume cursor.
+fn native_journal_stream(
+    handle: faktor_session::SessionHandle,
+    cursor: i64,
+) -> impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
+       + Send
+       + 'static {
+    futures_util::stream::unfold(
+        (
+            handle,
+            cursor,
+            std::collections::VecDeque::<axum::response::sse::Event>::new(),
+        ),
+        move |(handle, mut cursor, mut queue)| async move {
+            if let Some(frame) = queue.pop_front() {
+                return Some((
+                    Ok::<axum::response::sse::Event, std::convert::Infallible>(frame),
+                    (handle, cursor, queue),
+                ));
+            }
+            let events = handle
+                .events_range(
+                    cursor.saturating_add(1) as u64,
+                    Some(MAX_NATIVE_EVENT_PAGE as u64),
+                )
+                .unwrap_or_default();
+            let mut batch = std::collections::VecDeque::new();
+            let mut advanced = false;
+            for e in events {
+                let seq = e.seq.raw();
+                let kind = serde_json::to_string(&e.kind)
+                    .unwrap_or_default()
+                    .trim_matches('"')
+                    .to_string();
+                let data =
+                    serde_json::to_string(&native_event_row(&e)).unwrap_or_else(|_| "{}".into());
+                batch.push_back(
+                    axum::response::sse::Event::default()
+                        .event(kind)
+                        .id(seq.to_string())
+                        .data(data),
+                );
+                cursor = e.seq.raw() as i64;
+                advanced = true;
+            }
+            if advanced {
+                if let Some(frame) = batch.pop_front() {
+                    return Some((
+                        Ok::<axum::response::sse::Event, std::convert::Infallible>(frame),
+                        (handle, cursor, batch),
+                    ));
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            Some((
+                Ok::<axum::response::sse::Event, std::convert::Infallible>(
+                    axum::response::sse::Event::default()
+                        .event("heartbeat")
+                        .data("{}"),
+                ),
+                (handle, cursor, queue),
+            ))
+        },
+    )
+}
+
+// ------------------------------------------------------------ permissions
+
+/// Strict native permissions query (`GET /native/permissions`).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativePermissionsQuery {
+    #[serde(default)]
+    session: Option<String>,
+}
+
+/// `GET /native/permissions?session=<id>` — the pending permission
+/// requests of the daemon (optionally filtered to one session):
+/// `{permissions: [{id, session_id, capability, detail}]}`. Bounded by the
+/// requester's live pending set.
+pub(crate) async fn native_permissions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<NativePermissionsQuery>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let filter = match q.session.as_deref() {
+        Some(raw) => match parse_session_id(raw) {
+            Ok(id) => Some(id),
+            Err(e) => return wire_status(e),
+        },
+        None => None,
+    };
+    let permissions: Vec<serde_json::Value> = state
+        .deps
+        .permissions
+        .pending_views()
+        .into_iter()
+        .filter(|v| filter.is_none_or(|f| v.session_id == f))
+        .map(|v| {
+            serde_json::json!({
+                "id": v.id.to_string(),
+                "session_id": v.session_id.to_string(),
+                "capability": v.capability,
+                "detail": v.detail,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "permissions": permissions })).into_response()
+}
+
+/// Strict native permission-reply DTO (`POST /native/permission/reply`).
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativePermissionReplyRequest {
+    pub permission_id: String,
+    pub decision: String,
+}
+
+/// `POST /native/permission/reply` — resolve ONE pending permission
+/// request with `allow`/`deny`. Unknown/already-resolved ids are a typed
+/// 409 (never a double-resolve), malformed bodies a 400.
+pub(crate) async fn native_permission_reply(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<NativePermissionReplyRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(_) => return wire_status(malformed_body("invalid native permission reply body")),
+    };
+    let pid: i64 = match req.permission_id.parse() {
+        Ok(p) if p > 0 => p,
+        _ => {
+            return wire_status(malformed_body(&format!(
+                "invalid permission id {:?}",
+                req.permission_id
+            )))
+        }
+    };
+    let decision = match req.decision.as_str() {
+        "allow" => faktor_core::capability::PermissionDecision::Allow,
+        "deny" => faktor_core::capability::PermissionDecision::Deny,
+        other => return wire_status(malformed_body(&format!("invalid decision {other:?}"))),
+    };
+    if !state.deps.permissions.resolve(pid, decision) {
+        return wire_status(ApiError {
+            code: "conflict",
+            message: format!("permission {pid} unknown or already resolved"),
+            http_status: 409,
+            retryable: false,
+        });
+    }
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+// ------------------------------------------------------- session bootstrap
+
+/// Strict native create-session DTO (`POST /native/session`).
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeCreateSessionRequest {
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// `POST /native/session` — create one durable session on a workspace root
+/// (the request's `workspace`, else the daemon's own directory). Strict
+/// DTO: an unknown field is a 400. Provider/model bounds are enforced by
+/// the session authority; a workspace that cannot be registered is a
+/// typed error, never a half-created session.
+pub(crate) async fn native_create_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<NativeCreateSessionRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(_) => return wire_status(malformed_body("invalid native create-session body")),
+    };
+    if req.provider.trim().is_empty() || req.model.trim().is_empty() {
+        return wire_status(malformed_body("provider and model must not be empty"));
+    }
+    let root = req
+        .workspace
+        .clone()
+        .or_else(|| state.deps.directory.clone())
+        .unwrap_or_else(|| ".".to_string());
+    let ws = match state.deps.session.create_workspace(&root) {
+        Ok(ws) => ws,
+        Err(e) => return api_err(&e),
+    };
+    let title = req.title.unwrap_or_else(|| "session".into());
+    match state
+        .deps
+        .session
+        .create_session(ws, &title, &req.provider, &req.model)
+    {
+        Ok(handle) => {
+            let row = handle.row().ok();
+            Json(serde_json::json!({
+                "id": handle.id().to_string(),
+                "title": row.as_ref().map(|r| r.title.clone()).unwrap_or(title),
+                "created_ms": row.map(|r| r.created_ms).unwrap_or(0),
+            }))
+            .into_response()
+        }
+        Err(e) => api_err(&e),
+    }
+}
+
+/// `GET /native/sessions` — the durable session listing (newest first,
+/// bounded): `{sessions: [{id, title, provider, model, state}]}`. The
+/// listing is naturally bounded by the store's newest-first read; the
+/// response caps at [`MAX_NATIVE_SESSION_LISTING`] entries.
+pub(crate) async fn native_list_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let sessions = match state.deps.session.list_sessions(None) {
+        Ok(s) => s,
+        Err(e) => return api_err(&e),
+    };
+    let rows: Vec<serde_json::Value> = sessions
+        .iter()
+        .take(MAX_NATIVE_SESSION_LISTING)
+        .map(|h| match h.row() {
+            Ok(row) => serde_json::json!({
+                "id": row.id.to_string(),
+                "title": row.title,
+                "provider": row.provider,
+                "model": row.model,
+                "state": agent_state_tag(row.state),
+            }),
+            Err(_) => serde_json::json!({
+                "id": h.id().to_string(),
+                "title": "",
+                "provider": "",
+                "model": "",
+                "state": "unknown",
+            }),
+        })
+        .collect();
+    Json(serde_json::json!({ "sessions": rows })).into_response()
+}
+
+/// Hard cap of one native session listing.
+pub(crate) const MAX_NATIVE_SESSION_LISTING: usize = 1000;
+
+/// Strict native ordinary-prompt DTO (`POST /native/session/{id}/prompt`).
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativePromptRequestBody {
+    pub session_id: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+/// `POST /native/session/{id}/prompt` — run ONE ordinary prompt through
+/// the daemon's ONE executor entry ([`PromptExecutionService`]); the body's
+/// `session_id` must match the path id. Returns the durable receipt
+/// `{op_id, run_id, accepted, queued}`. Empty prompts are a typed 400;
+/// unknown sessions 404.
+pub(crate) async fn native_prompt(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Result<Json<NativePromptRequestBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(_) => return wire_status(malformed_body("invalid native prompt body")),
+    };
+    let sid = match parse_session_id(&id) {
+        Ok(s) => s,
+        Err(e) => return wire_status(e),
+    };
+    let body_sid = match parse_session_id(&req.session_id) {
+        Ok(s) => s,
+        Err(e) => return wire_status(e),
+    };
+    if sid != body_sid {
+        return wire_status(malformed_body(&format!(
+            "path session id {sid} does not match body session id {body_sid}"
+        )));
+    }
+    match state.deps.session.get_session(sid) {
+        Ok(Some(_)) => {}
+        Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
+        Err(e) => return api_err(&e),
+    }
+    let service = PromptExecutionService::from_state(&state);
+    let request = PromptRequest {
+        prompt: req.prompt,
+        files: req.files,
+        ..Default::default()
+    };
+    match service.prompt(sid, request).await {
+        Ok(receipt) => Json(serde_json::json!({
+            "op_id": receipt.op_id.to_string(),
+            "run_id": receipt.run_id,
+            "accepted": receipt.accepted,
+            "queued": receipt.queued,
+        }))
+        .into_response(),
+        Err(e) => exec_error_response(&e),
+    }
 }

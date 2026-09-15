@@ -163,13 +163,13 @@ class NativeClient(
         title: String? = null
     ): NativeSessionCreated = parseNativeSessionCreated(
         request(
-            "POST", "/session/create", null,
+            "POST", "/native/session", null,
             NativeRequests.createSession(provider, model, workspace, title)
         )
     )
 
     fun listSessions(): List<NativeSessionSummary> =
-        parseNativeSessionList(request("GET", "/session/list"))
+        parseNativeSessionList(request("GET", "/native/sessions"))
 
     fun modelCatalog(): List<NativeModelInfo> =
         parseNativeModelCatalog(request("GET", "/models"))
@@ -177,7 +177,7 @@ class NativeClient(
     fun prompt(sessionId: String, prompt: String, files: List<String>? = null): NativePromptReceipt =
         parseNativePromptReceipt(
             request(
-                "POST", "/session/prompt", null,
+                "POST", "/native/session/" + encode(sessionId) + "/prompt", null,
                 NativeRequests.prompt(sessionId, prompt, files)
             )
         )
@@ -358,13 +358,13 @@ class NativeClient(
 
     fun permissions(sessionId: String): List<NativePermissionEntry> =
         parseNativePermissionList(
-            request("GET", "/permission/list", query("session_id" to sessionId))
+            request("GET", "/native/permissions", query("session" to sessionId))
         )
 
     fun replyPermission(permissionId: String, decision: String): NativePermissionAck =
         parseNativePermissionAck(
             request(
-                "POST", "/permission/reply", null,
+                "POST", "/native/permission/reply", null,
                 NativeRequests.permissionReply(permissionId, decision)
             )
         )
@@ -416,10 +416,14 @@ class NativeClient(
     )
 
     /** Snapshot available output of one PTY (does not drain the buffer). */
-    fun terminalOutput(ptyId: String): NativeTerminalOutput =
+    fun terminalOutput(sessionId: String, terminalId: String): NativeTerminalOutput =
         parseNativeTerminalOutput(
-            ptyId,
-            request("GET", "/pty/" + encode(ptyId) + "/output")
+            terminalId,
+            request(
+                "GET",
+                "/native/session/" + encode(sessionId) + "/terminals/" +
+                    encode(terminalId) + "/output"
+            )
         )
 
     // --------------------------------------------------------------- agents

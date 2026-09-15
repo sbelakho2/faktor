@@ -1,23 +1,17 @@
-//! faktor-server — the HTTP/SSE surface of the daemon, speaking the frozen
-//! v7.5.6 protocol. The UI connection is disposable: turns run detached from
-//! any SSE connection and resume from the journal.
+//! faktor-server — the HTTP/SSE surface of the daemon, speaking the
+//! Faktor-native protocol. The UI connection is disposable: turns run
+//! detached from any connection and resume from the journal.
 //!
 //! Auth: the frontend generates `FAKTOR_SERVER_PASSWORD` and passes it via env;
-//! every endpoint (including `/global/health`) requires it, in the frozen
-//! `Authorization: Basic base64("kilo:"+password)` form, with the
-//! `Authorization: Bearer` and `x-faktor-server-password` header forms
-//! retained. The legacy `/api/hello` stays public as an alias probe.
+//! every endpoint requires it, in the `Authorization: Basic
+//! base64("kilo:"+password)` form, with the `Authorization: Bearer` and
+//! `x-faktor-server-password` header forms retained.
 
 pub mod api;
 pub mod auth;
-pub mod coalesce;
-pub mod compat;
-pub mod global;
 pub mod native;
 pub mod permission;
 
 pub use api::{empty_evidence_store, serve, EvidenceStoreHandle, ServerDeps, ServerHandle};
 pub use auth::{check_bearer, check_password, AuthToken, ServerPassword};
-pub use coalesce::DeltaCoalescer;
-pub use global::GlobalEventBus;
 pub use permission::{ChannelPermissionRequester, PendingPermission};

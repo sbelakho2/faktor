@@ -4,17 +4,14 @@ Product name: Faktor. The native surface carries zero legacy-brand
 tokens: crates faktor-*, env FAKTOR_*, headers x-faktor-*, data dir
 .faktor, handshake "faktor server listening on http://127.0.0.1:<port>".
 
-Exceptions: upstream historical identifiers inside frozen compatibility
-fixtures and attribution/license notices. The frozen legacy surfaces that
-must keep old forms are isolated under `compat/` and `vendor/` (their
-upstream mirrors may not exist yet; both the scan and the CI tolerate
-absence); the scanner's path allowlist (documented in its header) covers
-exactly those trees plus the two frozen legacy mirrors that keep old
-forms by design — the v7.5.6 wire mirror inside the protocol crate and
-the legacy JetBrains IDE shell under `apps/` — none of which is ever
-rendered to Faktor users. Attribution references to the upstream product
-in prose (e.g. "the upstream shell", gateway profiles) are permitted;
-wordmark strings are not.
+Exceptions: upstream historical identifiers inside pinned upstream
+sources and attribution/license notices. The vendored trees that must
+keep old forms are isolated under `compat/`, `vendor/`, `third-party/`
+and the vendored webview bundle under `apps/vscode/media/` (upstream
+mirrors may not exist yet; both the scan and the CI tolerate absence).
+Attribution references to the upstream product in prose (e.g. "the
+upstream shell", gateway profiles) are permitted; wordmark strings are
+not.
 
 CI enforces the wordmark allowlist (token list and path allowlist in
 `scripts/branding-scan.sh`) in two modes:

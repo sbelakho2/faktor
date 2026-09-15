@@ -14,15 +14,14 @@ Faktor is a native Rust engine whose compatibility target is the **Kilo
 Code v7.5.6 UI experience — visual/behavioral, not wire-level**: the old
 UI must look and behave the same against the Faktor daemon, but the daemon
 does NOT speak the old backend's protocol as its architecture. Backend
-protocol compatibility is not the architecture; the daemon's own surface
-is the **Faktor Native Protocol v1** (§16, `docs/native-protocol.md`), and
-the v7.5.6 wire contract survives only as optional migration/test glue
-(`compat/kilo-v756`) for driving the old UI shells. **Client-parity
-status: PARTIAL** — the blanket byte-for-byte claim is retired; each
-client feature below carries an explicit status label (IMPLEMENTED /
-PARTIAL / BLOCKED_EXTERNAL / UNIMPLEMENTED / CERTIFIED). The derived
-client shells below are compatibility fixtures; the engine under them is
-a durable, journaled, bounded runtime. The LLM is used only where
+wire compatibility is not a release objective; it was retired by explicit
+owner decision, and the daemon's own surface is the **Faktor Native
+Protocol v1** (§16, `docs/native-protocol.md`). **Client-parity status:
+PARTIAL** — the blanket byte-for-byte claim is retired; each client
+feature below carries an explicit status label (IMPLEMENTED / PARTIAL /
+BLOCKED_EXTERNAL / UNIMPLEMENTED / CERTIFIED). The derived client shells
+below are compatibility fixtures; the engine under them is a durable,
+journaled, bounded runtime. The LLM is used only where
 reasoning is actually needed — indexing, retrieval, compaction of
 historical turns, and deterministic bookkeeping are local.
 
@@ -34,10 +33,8 @@ historical turns, and deterministic bookkeeping are local.
   the VSIX and render-gated (`vscode-visual`); the derived shell in
   `apps/vscode/` is IMPLEMENTED and CI-tested against the daemon. Client UI
   parity is **PARTIAL**: the executable parity matrices (VS Code visual
-  render + frozen-upstream replay + JetBrains behavioral/visual matrices)
-  are the only evidence `ui_parity` accepts; the JetBrains behavioral and
-  visual matrices exist and pass, and `ui_parity` stays PARTIAL on the
-  remaining upstream-replay gap (§1).
+  render + JetBrains behavioral/visual matrices) are the only evidence
+  `ui_parity` accepts, and the JetBrains matrices exist and pass (§1).
 - **JetBrains shell:** native Kotlin bridge in `apps/jetbrains/`
   (`:shared` + `:backend` + `:frontend` compile and smoke-test against the
   real daemon). The frontend is a native Swing tool-window panel
@@ -57,16 +54,13 @@ historical turns, and deterministic bookkeeping are local.
   parity results, and the upstream Gradle build is not run offline.
   The bridge is UI-framework independent and the same panel is the single
   rendering implementation.
-- **Protocol:** the v7.5.6 server contract subset (§16) is **compat glue
-  only** — golden fixtures in `compat/kilo-v756/` keep the old UI shells
-  testable against this daemon. Nothing in the runtime depends on it: the
-  daemon's native surface is Faktor Native Protocol v1
-  (`docs/native-protocol.md`), and the compat surface may be retired
-  whenever the old UI generation is. Wire-parity status is **PARTIAL** and
-  measured, never asserted: the required replay writes
-  `target/certification/kilo-compat.json` and currently records requests
-  37/37 exact, responses 33/37 exact with 4 locked divergences
-  (`docs/wire-compat.md`).
+- **Protocol:** the daemon's native surface is Faktor Native Protocol v1
+  (`docs/native-protocol.md`): durable, cursor-paged HTTP endpoints owned
+  by this runtime. The v7.5.6 wire-compatibility subsystem (frozen routes,
+  DTO mirror, fixture corpus, certification replay) was **retired by
+  explicit owner decision**; no Kilo wire/behavior parity is claimed or
+  measured. The v7.5.6 frontend sources remain vendored as a pinned UI
+  source dependency (`ui/kilo-v756-webview`) only.
 
 **Non-goals:** reimplementing the old TypeScript/Bun engine or merging
 newer UI releases wholesale. Improving the v7.5.6 wire protocol is not a
@@ -81,12 +75,11 @@ server-side behavior ships through the native protocol instead.
 ┌────────────────────────── IDE clients (UI targets) ────────────────────────┐
 │  VS Code v7.5.6 webview (apps/vscode)  JetBrains native bridge (apps/jetbrains)│
 └────────────────────────────────────┬─────────────────────────────────────┘
-                                     │ HTTP + SSE (Faktor Native Protocol v1;
-                                     │  v7.5.6 wire compat surface optional)
+                                     │ HTTP (Faktor Native Protocol v1)
                                      ▼
                     ┌───────────────────────────────────┐
-                    │  faktor-server  (HTTP/SSE surface) │  auth: FAKTOR_SERVER_PASSWORD
-                    │  startup line, /global/event bus  │  (Basic | Bearer | x-faktor-server-password)
+                    │  faktor-server  (HTTP surface)     │  auth: FAKTOR_SERVER_PASSWORD
+                    │  startup line, /native/* routes   │  (Basic | Bearer | x-faktor-server-password)
                     └────────────────┬──────────────────┘
                                      │ commands (faktor-session API, synchronous)
                                      ▼
@@ -140,10 +133,9 @@ Rules that shape the diagram (Commandments):
    session dies, ownership transfers deliberately or the process dies (§10).
 6. **UI compatibility is the target; the wire is owned, not frozen.**
    Faktor Native Protocol v1 (§16, `docs/native-protocol.md`) is the
-   daemon's own HTTP/SSE contract and evolves with the runtime. The
-   v7.5.6 wire contract is optional migration/test glue
-   (`compat/kilo-v756`) against the old UI — it never constrains the
-   runtime and is not an architectural dependency.
+   daemon's own HTTP contract and evolves with the runtime. The retired
+   v7.5.6 wire surface never constrained the runtime and was not an
+   architectural dependency.
 
 ---
 
@@ -153,9 +145,7 @@ Rules that shape the diagram (Commandments):
 apps/        frozen UI compatibility fixtures
   vscode/       v7.5.6-derived client shell (webview vendored; UI parity: PARTIAL — executable parity matrices incomplete)
   jetbrains/    native Kotlin bridge + Swing panel (upstream 7.1.2 vendored/pinned; behavioral+visual parity matrices IMPLEMENTED, HEAD-bound)
-compat/      optional v7.5.6 migration/test glue against the old UI
-  kilo-v756/    frozen v7.5.6 wire contract fixtures (golden JSON); the
-                daemon never depends on them — old-UI shells do
+compat/      pinned upstream reference corpora
   jetbrains-712/ pinned upstream JetBrains 7.1.2 source (per-file SHA-256
                 manifest in ui/upstream.json); the reference, never a
                 second renderer
@@ -173,7 +163,7 @@ Crate responsibilities (each crate's module doc is authoritative):
 | `core` | Pure types, std-only, no workspace deps: IDs, `Error`/`ErrorKind`, `AgentState` + `SessionLifecycle` machines, `EventKind`/`Event`, `OpMeta`/`RecoveryStrategy`/`EffectStatus`, `CancellationToken`, `Clock`/`Deadline`, `RetryPolicy`, `ModelCapabilities`, `ResourceClass`/`ResourceLimits`, `Capability`/`PermissionDecision`/`NetworkPolicy`, `FileHash`, `WorkspaceIdentity`. |
 | `cas` | Content-addressed blob storage: BLAKE3 identity + Zstd compression, sharded layout (`ab/cdef…`), atomic writes (temp + fsync + rename), reads verify the hash. |
 | `store` | SQLite persistence: WAL, single logical writer + bounded reader pool, busy timeout, explicit transactional migrations, integrity checks, automatic backups. Large blobs live in the CAS; SQLite stores hashes. Message/part rows store JSON so the store stays protocol-agnostic. |
-| `protocol` | The optional v7.5.6 compat contract (`v756` shapes, `sse` frames, `ApiError` mapping, `fixtures`): migration/test glue against the old UI, not the daemon's architecture. Golden tests lock request/response/SSE/JSON-field-presence/null-behavior/error-code behavior against `compat/kilo-v756/`. The native contract lives in `faktor-server` + `faktor-core` and is specified in `docs/native-protocol.md`. |
+| `protocol` | Faktor-owned protocol types (`native` shapes for the conversation view/paging/state projection, `ApiError` mapping). The daemon's own contract lives in `faktor-server` + `faktor-core` and is specified in `docs/native-protocol.md`. |
 | `session` | The durable half of a session: journaled state machine (commands append events through `StateMachine`-validated transitions), conversation view, tool-run ledger, permission requests, checkpoints, memory facts, compaction records, crash recovery, owned processes. Synchronous `Send + Sync` API on `faktor-store` + `faktor-cas`. |
 | `agent` | The durable agent reasoning loop: drives the session with commands, streams providers, schedules tools through `faktor-scheduler`, keeps context bounded via `faktor-context`. No provider-name conditionals; state-aware continuation; repair once, never five times; loop detection. |
 | `context` | Bounded context construction (five memory classes, §8), durable task ledger, compaction engine that cannot death-spiral, artifact writer, budget, estimator. |
@@ -197,7 +187,7 @@ Crate responsibilities (each crate's module doc is authoritative):
 | `index` | Hybrid repository index: lexical inverted index plus tree-sitter symbol index (Rust/Python), incrementally updated, bounded by caps, workspace-isolated. |
 | `search` | Hybrid retrieval with rank fusion: exact + lexical + symbol (+ optional semantic) fused by reciprocal rank weighted by symbol relevance, lexical score, semantic score, file recency, task affinity; evidence packages retrieved before serious reasoning turns. |
 | `memory` | Long-term structured session memory: durable task state and structured facts (the transcript is *not* memory), compact context render for the semi-stable memory class. |
-| `server` | The HTTP/SSE surface of the daemon: Faktor Native Protocol v1 (`docs/native-protocol.md`) plus the optional v7.5.6 compat routes (§16). The UI connection is disposable: turns run detached from any SSE connection and resume from the journal. |
+| `server` | The HTTP surface of the daemon: Faktor Native Protocol v1 (`docs/native-protocol.md`). The UI connection is disposable: turns run detached from any connection and resume from the journal. |
 | `cli` | `serve` (prints the frozen startup line), `run` (headless one-prompt), `doctor` (self-check: store, CAS, integrity, permissions, providers), `sessions` (list). Logging goes to stderr; stdout is the startup-line contract. |
 
 ---
@@ -829,8 +819,8 @@ entries) and verify idempotent, tamper-loud behavior.
 
 Test crates (each an independent workspace member):
 
-- `tests/integration` — end-to-end HTTP/SSE behavior against the daemon's
-  surfaces: native protocol v1 (primary) and the v7.5.6 compat routes.
+- `tests/integration` — end-to-end behavior against the daemon: crash
+  recovery, permissions, compaction, paging and the native HTTP surface.
 - `tests/fault` — fault injection: crash, corruption, truncation, races.
 - `tests/soak` — long-run stability (memory bounds, journal growth).
 - `tests/performance` — perf gates (§13) — `[perf]`.
@@ -862,8 +852,7 @@ the product never regresses:
 
 | Stage | Deliverable |
 |---|---|
-| A. Freeze | lock the v7.5.6 UI baselines (visual/behavioral) and the compat fixture corpus (`compat/kilo-v756/`) for old-UI shells |
-| B. Compat server | optional HTTP/SSE glue shell that passes the v756 suite byte-for-byte (startup line, password auth, GlobalEvent envelope) — test harness for the old UI, never a runtime dependency |
+| A. Freeze | lock the v7.5.6 UI baselines (visual/behavioral) and the pinned frontend source (`ui/kilo-v756-webview`) for old-UI shells |
 | C. Persistence | `faktor-store` + `faktor-cas` + the durable session state machine (journal, tool-run ledger, recovery) |
 | D. Providers | `faktor-provider` hub + adapter families + registry + capability normalization |
 | E. Tools | transactional edit, native snapshots, fs/git, terminal supervision, MCP/LSP, sandbox |
@@ -872,79 +861,45 @@ the product never regresses:
 | H. Indexing | hybrid index + rank-fused retrieval + structured memory |
 | I. Snapshots | CAS checkpoints with rollback verification wired into edits |
 | J. Agent manager | daemon-owned background agents (Agent Manager cards) |
-| K. Compat retirement | remove the optional v7.5.6 compat surface + fixtures when the old UI generation is retired — nothing in the runtime depends on them (the native protocol is the daemon's own surface) |
+| K. Compat retirement (DONE) | the optional v7.5.6 wire-compatibility surface + fixtures were removed by explicit owner decision — nothing in the runtime depended on them; the native protocol is the daemon's own surface |
 
 ---
 
-## 16. Faktor Native Protocol v1 and the v7.5.6 compat surface
+## 16. Faktor Native Protocol v1
 
-The daemon's own HTTP/SSE contract is **Faktor Native Protocol v1**
+The daemon's own HTTP contract is **Faktor Native Protocol v1**
 (`docs/native-protocol.md`): session/turn/task/operation lifetimes,
-cursor-based paging, and the native endpoints. It is not a compatibility
-artifact — it evolves with the runtime, and its fixtures/tests are
-ordinary crate tests.
+cursor-based paging, and the native endpoints under `/native/...` plus the
+projection/catalog surfaces. It is not a compatibility artifact — it
+evolves with the runtime, and its tests are ordinary crate tests.
 
-The **v7.5.6 wire surface** documented below is optional **migration/test
-glue against the old UI**: the derived shells in `apps/` speak it, the
-runtime never depends on it, and it can be retired with the old UI
-generation. Within the glue itself the contract stays frozen: changing
-compat wire behavior requires updating fixtures first.
+The **v7.5.6 wire-compatibility subsystem was retired by explicit owner
+decision**: the frozen routes, the mirrored DTOs, the fixture corpus
+(`compat/kilo-v756/`), the fixture generators/replayers and the
+`kilo-compat` certification lane no longer exist. No Kilo wire/behavior
+parity is claimed or measured. The v7.5.6 frontend sources remain vendored
+as a pinned UI source dependency (`ui/kilo-v756-webview`) and are served
+by the IDE shells through the native bridge.
 
-This section documents the **subset** of the v7.5.6 server contract this
-daemon implements: the golden fixtures, the routes actually wired, and the
-auth forms actually accepted. It is not the full extension contract.
-
-- **Fixture corpus:** `compat/kilo-v756/` golden tests in
-  `faktor-protocol` lock request/response/SSE/JSON-field-presence/null-
-  behavior/error-code behavior byte-for-byte. Fixture files present:
-  `startup_line.json`, `hello.json`, `create_session.json`,
-  `messages_page.json`, `sse_frames.json`, `global_event.json`,
-  `password_auth.json`, `basic_auth.json`, `errors.json`,
-  `provider_list.json`, `wire_session_create.json`,
-  `wire_message_send.json`, `wire_part_union.json`.
-  `compat/jetbrains-712/` is reserved for the JetBrains split-mode corpus.
 - **Startup line:** `kilo serve --port 0` prints exactly
   `faktor server listening on http://127.0.0.1:<port>` and **nothing else**
-  to stdout (logging goes to stderr). The frozen client parses stdout for
-  this line — there is no JSON handshake on stdout (the legacy handshake
-  type is test-only and never printed). The password never appears on
-  stdout.
+  to stdout (logging goes to stderr). The client parses stdout for this
+  line; there is no JSON handshake. The password never appears on stdout.
 - **Auth:** the frontend generates a 64-hex `FAKTOR_SERVER_PASSWORD` and
-  passes it via the environment. The frozen v7.5.6 extension authenticates
-  **every** request — `/global/health` included — with
-  `Authorization: Basic base64("kilo:" + password)`. The Faktor-native
+  passes it via the environment. Every endpoint is authenticated with
+  `Authorization: Basic base64("kilo:" + password)`; the Faktor-native
   forms `Authorization: Bearer <password>` and `x-faktor-server-password:
   <password>` remain accepted, and the legacy per-start `AuthToken` keeps
   old clients/tests working. `Bearer <password>` is **not** the only
   accepted claim; wrong/missing credentials → 401.
-- **REST surface (exactly what is wired):**
-  - SDK-shaped: `/session/create`, `/session/prompt`, `/session/abort`,
-    `/session/messages`, `/session/state`, `/session/list`,
-    `/permission/reply`, `/permission/list`, `/provider/list`,
-    `/global/health`, `/global/event`, `/question/reply`,
-    `/question/list`, `/network/reply`, `/network/list`, `/config/get`,
-    `/config/set`.
-  - Legacy aliases (kept wired; their tests must keep passing):
-    `/api/hello`, `/api/session`, `/api/sessions`,
-    `/api/session/{id}`, `/api/session/{id}/state`,
-    `/api/session/{id}/messages`, `/api/session/{id}/events`,
-    `/api/session/{id}/prompt`, `/api/session/{id}/abort`,
-    `/api/perm/{id}/resolve`, `/api/provider`.
-  - Wire surface: `/session`, `/session/{sessionID}`,
-    `/session/{sessionID}/message`, `/session/{sessionID}/abort`,
-    `/session/{sessionID}/diff`, `/session/{sessionID}/revert`,
-    `/session/{sessionID}/unrevert`.
+- **Native surface:** `/session/{id}/projection`, `/models`,
+  `/capabilities`, and the `/native/...` mounts (health/ready, usage,
+  session listings, task runs, tournaments, terminals, attachments,
+  evidence, semantic introspection, messages/events cursor pages). See
+  `docs/native-protocol.md` for the endpoint list and paging semantics.
 - **Strictness:** `deny_unknown_fields` on request bodies (unknown fields
-  → 422); unknown sessions → 404; malformed ids/empty prompts → 400;
+  → 400); unknown sessions → 404; malformed ids/empty prompts → 400;
   oversized → 413-class `Oversized`; protocol drift is loud, never silent.
-- **GlobalEvent envelope:** every global frame is
-  `{ directory, project, workspace, payload }` with the payload's `type`
-  as discriminator; SSE `event:` field is optional. Resume cursor =
-  event id, replaying `id > after` from the bounded ring.
-- **SseEvent frame contract:** `to_frame(seq)` / `from_frame` are golden-
-  tested against `sse_frames.json`; interior chunk events without message
-  context are skipped by the per-session projection (the state endpoints
-  carry that information).
 - **Error mapping:** `faktor_protocol::error::from_core` maps every
-  `faktor-core` error to a frozen `ApiError { code, message, http_status,
-  retryable }` (locked by `errors.json`).
+  `faktor-core` error to an `ApiError { code, message, http_status,
+  retryable }`.

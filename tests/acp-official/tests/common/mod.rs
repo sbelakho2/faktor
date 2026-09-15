@@ -41,7 +41,9 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use faktor_acp::{
     AcpServer, AcpStreamBackend, BackendCapabilities, EmitError, LoadSessionError, PromptCtx,
 };
-use faktor_protocol::v756::{Message as NativeMessage, MessagesPage, PageMeta, Part as NativePart};
+use faktor_protocol::native::{
+    Message as NativeMessage, MessagesPage, PageMeta, Part as NativePart,
+};
 
 /// Bound used by every test wait; a hang is a failure, never a skip.
 pub const WAIT: Duration = Duration::from_secs(10);

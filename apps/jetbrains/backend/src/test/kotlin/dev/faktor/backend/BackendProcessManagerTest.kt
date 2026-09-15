@@ -11,18 +11,11 @@
 package dev.faktor.backend
 
 import dev.faktor.shared.BasicAuth
-import dev.faktor.shared.HealthResult
-import dev.faktor.shared.MessageModel
-import dev.faktor.shared.MessageSendRequest
-import dev.faktor.shared.Model
-import dev.faktor.shared.Part
-import dev.faktor.shared.SessionCreateRequest
+import dev.faktor.shared.NativeRequests
 import dev.faktor.shared.StartupLine
-import dev.faktor.shared.parseHealth
-import dev.faktor.shared.parseMessageCount
-import dev.faktor.shared.parseMessageId
-import dev.faktor.shared.parseSessionId
-import dev.faktor.shared.parseSessionState
+import dev.faktor.shared.parseNativeHealth
+import dev.faktor.shared.parseNativePromptReceipt
+import dev.faktor.shared.parseNativeSessionCreated
 import java.nio.file.Files
 import java.nio.file.Paths
 object BackendProcessManagerTest {
@@ -31,8 +24,8 @@ object BackendProcessManagerTest {
     fun runAll() {
         assertFixtureStartupLine()
         assertFixtureAuthHeader()
-        assertRequestJsonShapes()
-        assertResponseParsers()
+        assertNativeRequestShapes()
+        assertNativeResponseParsers()
         assertMissingBinaryFailsLoudly()
         println("PASS all unit assertions")
     }
@@ -75,43 +68,56 @@ object BackendSmoke {
                 connection = manager.start()
                 println("  port=${connection!!.port} pid=${connection!!.pid()}")
             }
-            if (connection != null) {
-                step("health (GET /global/health)") {
-                    val h: HealthResult = manager.health(connection!!)
+            val conn = connection
+            if (conn != null) {
+                val client = NativeClient.forConnection(conn)
+                step("native health (GET /native/health)") {
+                    val h = client.health()
                     if (!h.ok) fail("health ok=false")
                     if (h.version.isEmpty()) fail("health version is empty")
-                    if (h.protocol.isEmpty()) fail("health protocol is empty")
                 }
-                step("create session (POST /session)") {
-                    sessionId = manager.createSession(connection!!, "kotlin split-mode smoke")
-                    if (sessionId!!.isEmpty()) fail("empty sessionID")
+                step("native readiness (GET /native/ready)") {
+                    if (!client.awaitReady(10_000L).ready) fail("daemon never reported ready")
                 }
-                step("send message (POST /session/{id}/message)") {
-                    try {
-                        val messageId = manager.sendMessage(
-                            connection!!, sessionId!!, "ping from kotlin smoke"
-                        )
-                        if (messageId.isEmpty()) fail("empty messageID")
-                    } catch (e: BackendException) {
-                        // A provider-less daemon ends the turn without an
-                        // assistant reply: the frozen wire answers 502 and
-                        // the session lands failed_recoverable (accepted
-                        // below). Any other failure stays fatal.
-                        if (e.status != 502) throw e
-                        println("  no provider reply (HTTP 502 accepted)")
+                var sessionId: String? = null
+                step("create session (POST /native/session)") {
+                    sessionId = client.createSession(
+                        "default", "default", null, "kotlin split-mode smoke"
+                    ).id
+                    if (sessionId!!.isEmpty()) fail("empty session id")
+                }
+                val sid = sessionId
+                if (sid != null) {
+                    step("prompt (POST /native/session/{id}/prompt)") {
+                        val receipt = client.prompt(sid, "ping from kotlin smoke")
+                        if (!receipt.accepted) fail("prompt was not accepted")
                     }
-                }
-                step("session state settles (ready_for_next_turn | failed_recoverable)") {
-                    val state = manager.awaitSettledState(connection!!, sessionId!!)
-                    println("  state=$state")
-                    if (state != "ready_for_next_turn" && state != "failed_recoverable") {
-                        fail("unexpected settled state $state")
+                    step("session state settles (ready_for_next_turn | failed_*)") {
+                        val deadline = System.currentTimeMillis() + 20_000L
+                        var machine = "unknown"
+                        while (System.currentTimeMillis() < deadline) {
+                            machine = client.projection(sid).machine
+                            if (machine == "ready_for_next_turn" ||
+                                machine == "failed_recoverable" ||
+                                machine == "failed_permanent"
+                            ) {
+                                break
+                            }
+                            Thread.sleep(200L)
+                        }
+                        println("  state=$machine")
+                        if (machine != "ready_for_next_turn" &&
+                            machine != "failed_recoverable" &&
+                            machine != "failed_permanent"
+                        ) {
+                            fail("unexpected settled state $machine")
+                        }
                     }
-                }
-                step("list messages (GET /session/{id}/message?limit=5)") {
-                    val count = manager.listMessages(connection!!, sessionId!!)
-                    println("  messages=$count")
-                    if (count < 1) fail("expected >= 1 message, got $count")
+                    step("list messages (GET /native/messages)") {
+                        val page = client.messages(sid, null, 5)
+                        println("  messages=${page.messages.size}")
+                        if (page.messages.isEmpty()) fail("expected >= 1 message")
+                    }
                 }
             }
         } finally {
@@ -181,87 +187,40 @@ private fun assertFixtureAuthHeader() {
     assertEquals("Authorization", BasicAuth.HEADER_NAME)
 }
 
-private fun assertRequestJsonShapes() {
-    val create = SessionCreateRequest(
-        title = "T",
-        model = Model(id = "m1", providerID = "ollama", variant = "fast")
+private fun assertNativeRequestShapes() {
+    assertEquals(
+        "{\"provider\":\"p\",\"model\":\"m\"}",
+        NativeRequests.createSession("p", "m"),
+        "minimal native create-session body"
     )
     assertEquals(
-        "{\"title\":\"T\",\"model\":{\"id\":\"m1\",\"providerID\":\"ollama\",\"variant\":\"fast\"}}",
-        create.toJson()
-    )
-    assertEquals("{\"title\":\"T\"}", SessionCreateRequest(title = "T").toJson())
-    assertEquals("{}", SessionCreateRequest().toJson())
-
-    val send = MessageSendRequest(
-        model = MessageModel(providerID = "ollama", modelID = "qwen3.8"),
-        parts = listOf(Part.TextPart("hi"))
+        "{\"provider\":\"p\",\"model\":\"m\",\"workspace\":\"/ws\",\"title\":\"T\"}",
+        NativeRequests.createSession("p", "m", "/ws", "T"),
+        "full native create-session body"
     )
     assertEquals(
-        "{\"model\":{\"providerID\":\"ollama\",\"modelID\":\"qwen3.8\"}," +
-            "\"parts\":[{\"type\":\"text\",\"text\":\"hi\"}]}",
-        send.toJson()
-    )
-
-    val tool = MessageSendRequest(
-        model = MessageModel(providerID = "p", modelID = "m"),
-        parts = listOf(Part.ToolPart(callId = "c1", name = "read_file", input = "{}"))
-    )
-    assertEquals(
-        "{\"model\":{\"providerID\":\"p\",\"modelID\":\"m\"}," +
-            "\"parts\":[{\"type\":\"tool\",\"callID\":\"c1\",\"name\":\"read_file\",\"input\":{}}]}",
-        tool.toJson()
-    )
-
-    val escaped = MessageSendRequest(
-        model = MessageModel(providerID = "p", modelID = "m"),
-        parts = listOf(Part.TextPart("say \"hi\"\nnext"))
-    )
-    assertEquals(
-        "{\"model\":{\"providerID\":\"p\",\"modelID\":\"m\"}," +
-            "\"parts\":[{\"type\":\"text\",\"text\":\"say \\\"hi\\\"\\nnext\"}]}",
-        escaped.toJson()
+        "{\"session_id\":\"7\",\"prompt\":\"hi\",\"files\":[\"a.txt\"]}",
+        NativeRequests.prompt("7", "hi", listOf("a.txt")),
+        "native prompt body"
     )
 }
 
-private fun assertResponseParsers() {
-    assertEquals(
-        "42",
-        parseSessionId("{\"sessionID\":\"42\",\"title\":\"T\",\"createdMs\":1750000000000}")
+private fun assertNativeResponseParsers() {
+    val created = parseNativeSessionCreated(
+        "{\"id\":\"7\",\"title\":\"T\",\"created_ms\":1750000000000}"
     )
-    assertEquals(
-        "7",
-        parseMessageId("{\"messageID\":\"7\",\"accepted\":true,\"queued\":false}")
-    )
-    val h = parseHealth("{\"ok\":true,\"version\":\"0.5.0\",\"protocol\":\"v756\"}")
-    assertTrue(h.ok, "health ok")
-    assertEquals("0.5.0", h.version)
-    assertEquals("v756", h.protocol)
-    assertEquals(
-        2,
-        parseMessageCount(
-            "{\"sessionID\":\"1\",\"hasMore\":false," +
-                "\"messages\":[" +
-                "{\"messageID\":\"1\",\"role\":\"user\",\"parts\":[],\"createdMs\":1}," +
-                "{\"messageID\":\"2\",\"role\":\"assistant\",\"parts\":[],\"createdMs\":2}" +
-                "]}"
-        )
-    )
-    assertEquals(
-        "failed_recoverable",
-        parseSessionState(
-            "{\"sessionID\":\"1\",\"title\":\"t\",\"state\":\"failed_recoverable\"," +
-                "\"createdMs\":1,\"updatedMs\":2}"
-        )
-    )
-    // The current daemon answers the wire page as a bare array; both shapes
-    // are accepted (the envelope is the frozen fixture).
-    assertEquals(
-        1,
-        parseMessageCount(
-            "[{\"info\":{\"messageID\":\"1\",\"role\":\"assistant\"},\"parts\":[]}]"
-        )
-    )
+    assertEquals("7", created.id)
+    assertEquals("T", created.title)
+    assertEquals(1750000000000L, created.createdMs)
+
+    val receipt = parseNativePromptReceipt("{\"op_id\":\"42\",\"accepted\":true,\"queued\":false}")
+    assertEquals("42", receipt.opId)
+    assertTrue(receipt.accepted, "accepted")
+    assertTrue(!receipt.queued, "not queued")
+
+    val health = parseNativeHealth("{\"ok\":true,\"version\":\"0.5.0\"}")
+    assertTrue(health.ok, "health ok")
+    assertEquals("0.5.0", health.version)
 }
 
 private fun assertMissingBinaryFailsLoudly() {

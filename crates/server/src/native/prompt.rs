@@ -2,8 +2,8 @@
 //! prompts and task starts (audit: "normal chat still bypasses the
 //! shadow/TaskExecutor architecture").
 //!
-//! Every protocol adapter (Native, SDK compatibility, ACP, VS Code,
-//! JetBrains) translates its DTOs into calls on this service:
+//! Every protocol adapter (Native, ACP, VS Code, JetBrains) translates its
+//! DTOs into calls on this service:
 //!
 //! - [`PromptExecutionService::prompt`] — an ordinary chat prompt becomes an
 //!   IN-SESSION run through the daemon's [`TaskExecutor`]; a mutating prompt
@@ -17,7 +17,7 @@
 //!
 //! The service is a stateless facade over the daemon's ONE `TaskExecutor`
 //! and ONE `SessionManager`; constructing it per call cannot create a second
-//! execution authority, and both the SDK compat surface and the ACP backend
+//! execution authority, and both the HTTP surface and the ACP backend
 //! observe the same underlying instances (see the identity spy tests).
 
 use std::sync::{Arc, Mutex};
@@ -47,7 +47,7 @@ pub struct PromptRequest {
     pub model: Option<String>,
     /// Acceptance criteria ridden onto the run's durable task row.
     pub criteria: Vec<String>,
-    /// The run's mutation policy. Wire-compat vocabulary only: the sole
+    /// The run's mutation policy. Legacy vocabulary only: the sole
     /// decodable value is `shadow` (a `direct_compat` value is a strict
     /// decode error naming the removal) and the execution path ignores the
     /// field — every mutating run executes in an isolated candidate.

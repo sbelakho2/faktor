@@ -24,22 +24,13 @@
 #     jars, cargo artifacts, tarballs). Binary payloads are matched
 #     byte-level (grep -a), so packaged binaries must carry no token.
 #
-# Exemption policy — legacy wordmark tokens survive ONLY in frozen
-# compatibility material and in tooling that must spell the tokens. Whole
+# Exemption policy — legacy wordmark tokens survive ONLY in vendored
+# upstream material and in tooling that must spell the tokens. Whole
 # application/IDE trees (apps/vscode, apps/jetbrains, crates, tests, docs)
 # are NEVER exempt: they are scanned like everything else.
-#   * paths under compat/ and vendor/ and third-party/  — frozen
-#     compatibility fixtures and upstream sources (e.g.
-#     compat/kilo-v756, vendor/upstream-kilo); entries that do not exist
-#     are tolerated
-#   * crates/protocol/src/v756/  — frozen v7.5.6 wire mirror of the
-#     compat/kilo-v756 fixtures; the retained legacy handshake prefix
-#     lives here so the daemon can reject the old handshake loudly
-#   * crates/server/src/api.rs    — the frozen v756 auth/legacy-handshake
-#     tests assert the legacy forms (which the server still must not emit)
-#   * tests/fuzz-seeds/src/compat_dto.rs — the compat-DTO fuzz seed must
-#     spell the legacy handshake prefix to fuzz the decoder that rejects it
-#     (single file, same frozen-compat rationale as the two above)
+#   * paths under compat/ and vendor/ and third-party/  — pinned upstream
+#     sources (e.g. compat/jetbrains-712, vendor/upstream-kilo); entries
+#     that do not exist are tolerated
 #   * scripts/check-docs-sync.sh  — the docs-drift guard must spell the
 #     forbidden identifiers to scan docs/architecture.md for them (same
 #     self-reference as this script)
@@ -71,9 +62,8 @@ TOKENS=(
 
 # Path fragments that mark an exempt path. Matching is case-insensitive on
 # the path relative to the scan root. Precise exemptions only: compat/
-# vendor/ third-party/ trees, the two frozen legacy mirrors (v7.5.6 wire
-# mirror in the protocol crate, frozen v756 tests in server/src/api.rs)
-# and self-referential tooling. No whole application/IDE trees.
+# vendor/ third-party/ trees and self-referential tooling. No whole
+# application/IDE trees.
 ALLOWLIST_FRAGMENTS=(
   '/compat/'
   '/vendor/'
@@ -84,9 +74,6 @@ ALLOWLIST_FRAGMENTS=(
   # source is vendored upstream — the same exemption class as compat/ —
   # and the exemption is a path fragment, not a whole IDE tree.
   '/media/kilo-v756-webview/'
-  '/crates/protocol/src/v756/'
-  '/crates/server/src/api.rs'
-  '/tests/fuzz-seeds/src/compat_dto.rs'
   '/scripts/check-docs-sync.sh'
 )
 
@@ -168,9 +155,8 @@ done < <(collect_files)
 
 # Metadata scan (source mode only): manifest/package fields, Clap command
 # names, Cargo.toml [[bin]] name fields, and default data-dir constants in
-# crates/cli. The frozen wire mirrors keep legacy FORMS only (never
-# package/manifest names), so this pass has no exemptions of its own beyond
-# is_skipped.
+# crates/cli. Vendored trees keep legacy FORMS only (never package/manifest
+# names), so this pass has no exemptions of its own beyond is_skipped.
 meta_hits=0
 if [ "$MODE" = source ]; then
   while IFS= read -r file; do

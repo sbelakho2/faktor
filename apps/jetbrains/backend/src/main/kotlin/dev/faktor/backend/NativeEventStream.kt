@@ -1,7 +1,6 @@
-// SSE client for the daemon's journal event stream
-// (`GET /api/session/{id}/events?events_after=<cursor>`), the stream the
-// native server projects from the durable journal. Mirrors the VS Code
-// eventStream.ts semantics:
+// SSE client for the daemon's native journal event stream
+// (`GET /native/session/{id}/events?after=<cursor>`), the stream the native
+// server projects from the durable journal. Semantics:
 //
 //  - every frame carries `event:` (projection type), `id:` (the journal
 //    sequence — the resume cursor) and one JSON `data:` line;
@@ -158,8 +157,8 @@ class NativeEventStream(
     /** Connects and pumps frames until the stream ends. */
     private fun connectOnce(http: HttpClient) {
         val url = baseUrl.trimEnd('/') +
-            "/api/session/" + URLEncoder.encode(sessionId, "UTF-8") +
-            "/events?events_after=" + cursorValue
+            "/native/session/" + URLEncoder.encode(sessionId, "UTF-8") +
+            "/events?after=" + cursorValue
         val request = HttpRequest.newBuilder(URI.create(url))
             .timeout(Duration.ofMillis(timeoutMs))
             .header("Authorization", "Bearer $bearerToken")
@@ -172,7 +171,7 @@ class NativeEventStream(
         if (response.statusCode() !in 200..299) {
             val detail = response.body().use { readErrorBody(it) }
             throw NativeProtocolException(
-                "GET /api/session/{id}/events",
+                "GET /native/session/{id}/events",
                 "stream rejected with HTTP ${response.statusCode()}$detail"
             )
         }
@@ -333,5 +332,5 @@ class NativeEventStream(
 
     private fun wrap(e: Exception): Exception =
         if (e is NativeProtocolException) e
-        else NativeProtocolException("GET /api/session/{id}/events", e.message ?: e.javaClass.simpleName)
+        else NativeProtocolException("GET /native/session/{id}/events", e.message ?: e.javaClass.simpleName)
 }

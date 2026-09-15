@@ -3,8 +3,8 @@
 //
 // Every status is DERIVED from repository files and scripts — never from
 // prose. The generator probes the pinned vendored UI tree, the extension
-// sources, the JetBrains backend/frontend sources, the frozen compat
-// fixtures and the ACP subset, then writes:
+// sources, the JetBrains backend/frontend sources, the vendored UI tree
+// and the ACP subset, then writes:
 //
 //   target/certification/capabilities.json
 //
@@ -74,7 +74,6 @@ function statusFromMarkers(present, complete) {
 
 const VENDORED_WEBVIEW_ROOT = 'ui/kilo-v756-webview';
 const JETBRAINS_712_ROOT = 'compat/jetbrains-712';
-const KILO_COMPAT_REPORT = 'target/certification/kilo-compat.json';
 const JETBRAINS_PARITY_MATRIX = 'target/certification/jetbrains-parity.json';
 const VSCODE_VISUAL_MATRIX = `${VENDORED_WEBVIEW_ROOT}/dist/visual-report.json`;
 
@@ -212,38 +211,6 @@ function vscodeVisualResult() {
   };
 }
 
-// The frozen-upstream client replay is the executable behavioral matrix for
-// the v7.5.6 wire surface. IMPLEMENTED only when the report is bound to the
-// exact HEAD and responses are N/N; documented divergences keep PARTIAL.
-function compatV756Result() {
-  const report = readJson(KILO_COMPAT_REPORT);
-  const evidence = ['tests/compat', 'compat/kilo-v756/sdk-traces', KILO_COMPAT_REPORT];
-  if (!report || report.schema !== 'faktor-kilo-compat/v1') {
-    return {
-      status: 'PARTIAL',
-      evidence: evidence.filter((rel) => file(rel) || dir(rel)),
-      detail: 'no usable kilo-compat report: the fixture corpus exists, the executable replay is unproven',
-    };
-  }
-  const responses = report.responses || {};
-  const requests = report.requests || {};
-  const bound = HEAD !== null && report.commit === HEAD;
-  const exact =
-    Number.isInteger(responses.total) &&
-    responses.total > 0 &&
-    responses.passed === responses.total &&
-    report.status === 'passed';
-  const detail =
-    `requests ${requests.passed || 0}/${requests.total || 0}, responses ${responses.passed || 0}/${responses.total || 0} exact, ` +
-    `${report.required_divergences || 0} required divergences` +
-    (bound ? '' : ` (report commit ${report.commit} != HEAD ${HEAD || 'unknown'})`);
-  return {
-    status: bound && exact ? 'IMPLEMENTED' : 'PARTIAL',
-    evidence: evidence.filter((rel) => file(rel) || dir(rel)),
-    detail,
-  };
-}
-
 function vscodeWebviewStatus() {
   if (!file('apps/vscode/src/webview.ts') || !file('apps/vscode/src/kilo-bridge.ts')) {
     return 'ABSENT';
@@ -346,10 +313,6 @@ const SURFACES = {
     ...visualMatrixResult(JETBRAINS_PARITY_MATRIX),
     evidence: [JETBRAINS_PARITY_MATRIX, JETBRAINS_712_ROOT, 'ui/upstream.json'],
   }),
-  // compat_v756 derives from the REQUIRED kilo-compat replay report, never
-  // from fixture-file existence: IMPLEMENTED only when the report is bound
-  // to this exact HEAD and every response is an exact pass (N/N).
-  compat_v756: () => compatV756Result(),
   // ui_parity depends on executable parity results (the VS Code visual
   // render matrix + the frozen-upstream behavioral replay + the JetBrains
   // parity matrices). Vendored files or pinned directories alone never make
@@ -357,7 +320,6 @@ const SURFACES = {
   ui_parity: () => {
     const axes = {
       vscode_visual: vscodeVisualResult(),
-      upstream_behavioral: compatV756Result(),
       jetbrains_behavioral: behavioralMatrixResult(JETBRAINS_PARITY_MATRIX),
       jetbrains_visual: visualMatrixResult(JETBRAINS_PARITY_MATRIX),
     };
@@ -373,7 +335,6 @@ const SURFACES = {
       status,
       evidence: [
         VSCODE_VISUAL_MATRIX,
-        KILO_COMPAT_REPORT,
         JETBRAINS_PARITY_MATRIX,
         JETBRAINS_712_ROOT,
         'ui/upstream.json',
@@ -488,8 +449,7 @@ function buildManifest() {
 //   (a) the file()/dir() probes stop distinguishing files from directories;
 //   (b) a provenance/parity label is claimed without its artifact: the
 //       JetBrains pin present => assets=VENDORED, parity labels require a
-//       real matrix report, compat_v756=IMPLEMENTED requires a HEAD-bound
-//       N/N kilo-compat report, and ui_parity=IMPLEMENTED requires every
+//       real matrix report, and ui_parity=IMPLEMENTED requires every
 //       executable parity axis.
 function selfCheck(manifest) {
   const problems = [];
@@ -505,7 +465,6 @@ function selfCheck(manifest) {
   const frontend = manifest.surfaces.jetbrains_frontend.status;
   const behavioral = manifest.surfaces.jetbrains_behavioral_parity.status;
   const visual = manifest.surfaces.jetbrains_visual_parity.status;
-  const compat = manifest.surfaces.compat_v756.status;
   const uiParity = manifest.surfaces.ui_parity.status;
 
   if (pin) {
@@ -539,25 +498,9 @@ function selfCheck(manifest) {
       'jetbrains_visual_parity claims IMPLEMENTED without a rendered comparison against pinned baselines',
     );
   }
-  if (compat === 'IMPLEMENTED') {
-    const report = readJson(KILO_COMPAT_REPORT);
-    const exact =
-      report &&
-      report.status === 'passed' &&
-      report.commit === HEAD &&
-      report.responses &&
-      report.responses.total > 0 &&
-      report.responses.passed === report.responses.total;
-    if (!exact) {
-      problems.push(
-        'compat_v756 claims IMPLEMENTED without a HEAD-bound kilo-compat report whose responses are N/N',
-      );
-    }
-  }
   if (uiParity === 'IMPLEMENTED') {
     const axes = [
       vscodeVisualResult().status,
-      compatV756Result().status,
       behavioralMatrixResult(JETBRAINS_PARITY_MATRIX).status,
       visualMatrixResult(JETBRAINS_PARITY_MATRIX).status,
     ];

@@ -20,36 +20,28 @@
 //!    emitted stream: lines and multibyte runes split across chunks must
 //!    reassemble identically; strict UTF-8 rejections and the line cap must
 //!    be split-independent).
-//! 2. [`harness_sse_frame_parser`] — the frozen v7.5.6 SSE frame parser:
-//!    arbitrary text and truncated/mutated frames must never panic, and
-//!    every successfully parsed frame must round-trip (parse(encode(x)) ==
-//!    x).
-//! 3. [`harness_acp_frame_decoder`] — the ACP Content-Length frame
+//! 2. [`harness_acp_frame_decoder`] — the ACP Content-Length frame
 //!    decoder: arbitrary byte streams (hostile headers, oversized
 //!    declarations, truncated bodies) must never panic; a decoded frame
 //!    must consume no more than the input and re-encode into a frame that
 //!    decodes back to the identical JSON-RPC value.
-//! 4. [`harness_compat_dto_decode`] — the frozen v7.5.6 compat DTOs: every
-//!    hostile JSON shape decodes to a typed accept/reject, an accepted
-//!    decode re-serializes and re-decodes to the identical value, and the
-//!    legacy `Handshake` line round-trips.
-//! 5. [`harness_tool_json_repair_parse`] — tool-call JSON repair/parse:
+//! 3. [`harness_tool_json_repair_parse`] — tool-call JSON repair/parse:
 //!    the single deterministic repair pass and every `ToolCallMode` parse
 //!    are panic-free, bounded (≤64 calls) and deterministic; repaired
 //!    values must reparse exactly.
-//! 6. [`harness_path_normalization`] — workspace-relative path resolution
+//! 4. [`harness_path_normalization`] — workspace-relative path resolution
 //!    (traversal/symlink-safe): arbitrary path text must never panic and a
 //!    successful resolution must NEVER land outside the workspace root
 //!    (escapes are typed denials).
-//! 7. [`harness_event_payload_decode`] — the journal event payload decoder
+//! 5. [`harness_event_payload_decode`] — the journal event payload decoder
 //!    across every `EventKind` and hostile schema versions: arbitrary JSON
 //!    must never panic; decode outcomes are either typed rejections or
 //!    typed decodes.
-//! 8. [`harness_destination_policy_parser`] — the destination allowlist
+//! 6. [`harness_destination_policy_parser`] — the destination allowlist
 //!    parser (`DestinationRule`/`DestinationPolicy`): arbitrary rule text
 //!    must never panic, a successful multi-line parse must agree with the
 //!    per-entry parse, and reparsing must be idempotent.
-//! 9. [`harness_tokenizer_pricing_parse`] — the pure model → tokenizer
+//! 7. [`harness_tokenizer_pricing_parse`] — the pure model → tokenizer
 //!    mapping and the pricing-snapshot/pricing-state decoders: arbitrary
 //!    model strings and hostile pricing JSON must never panic; accepted
 //!    snapshots round-trip, the mapping is total and deterministic, and an
@@ -57,10 +49,9 @@
 //!
 //! # Seeds
 //!
-//! [`fixtures`] loads the checked-in `compat/kilo-v756/` and
-//! `fixtures/providers/` corpora; the campaign replays them (also mutated)
-//! and `fuzz/seed-corpus.sh` regenerates the libFuzzer corpora from the
-//! same files.
+//! [`fixtures`] loads the checked-in `fixtures/providers/` corpus; the
+//! campaign replays it (also mutated) and `fuzz/seed-corpus.sh` regenerates
+//! the libFuzzer corpora from the same files.
 //!
 //! # Real fuzzer interface
 //!
@@ -164,13 +155,11 @@ impl Lcg {
 
 pub mod acp_frame;
 pub mod campaign;
-pub mod compat_dto;
 pub mod destination_policy;
 pub mod event_payload;
 pub mod fixtures;
 pub mod line_framing;
 pub mod path_normalization;
-pub mod sse_frame;
 pub mod tokenizer_pricing;
 pub mod tool_json;
 
@@ -179,12 +168,10 @@ pub mod supply_chain;
 
 pub use acp_frame::harness_acp_frame_decoder;
 pub use campaign::{run_campaign, CampaignConfig, CampaignReport, HARNESSES};
-pub use compat_dto::harness_compat_dto_decode;
 pub use destination_policy::harness_destination_policy_parser;
 pub use event_payload::harness_event_payload_decode;
 pub use line_framing::harness_provider_line_framing;
 pub use path_normalization::harness_path_normalization;
-pub use sse_frame::{harness_sse_frame_parser, harness_sse_frame_truncation};
 pub use tokenizer_pricing::harness_tokenizer_pricing_parse;
 pub use tool_json::harness_tool_json_repair_parse;
 
@@ -206,17 +193,8 @@ pub mod fuzz_entry {
         require_clean("provider_line_framing", harness_provider_line_framing(data));
     }
 
-    pub fn no_panic_sse_frame(data: &[u8]) {
-        require_clean("sse_frame", harness_sse_frame_parser(data));
-        require_clean("sse_frame_truncation", harness_sse_frame_truncation(data));
-    }
-
     pub fn no_panic_acp_frame(data: &[u8]) {
         require_clean("acp_frame", harness_acp_frame_decoder(data));
-    }
-
-    pub fn no_panic_compat_dto(data: &[u8]) {
-        require_clean("compat_dto", harness_compat_dto_decode(data));
     }
 
     pub fn no_panic_tool_json(data: &[u8]) {
