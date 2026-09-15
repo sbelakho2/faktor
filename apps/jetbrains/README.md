@@ -16,7 +16,7 @@ rendering implementation; the vendored tree is not a second renderer.
 
 | Module | Contents |
 | --- | --- |
-| `:shared` | `dev.faktor.shared` — plain Kotlin data classes with zero dependencies. `Protocol.kt` is the frozen v7.5.6 wire contract (legacy migration glue); `NativeProtocol.kt` is the native surface: a JSON value model, a recursive-descent reader/writer, typed DTO parsers (incl. providers and terminals), and the strict request bodies. |
+| `:shared` | `dev.faktor.shared` — plain Kotlin data classes with zero dependencies. `Protocol.kt` holds only the daemon stdout startup-line and Basic auth forms; `NativeProtocol.kt` is the native surface: a JSON value model, a recursive-descent reader/writer, typed DTO parsers (incl. providers and terminals), and the strict request bodies. |
 | `:backend` | `dev.faktor.backend` — `BackendProcessManager` (launch, startup line, bounded stdout drainer, SIGTERM-then-forcible stop), `NativeClient` (bearer-authenticated HTTP client of the native endpoints incl. providers/terminals/output), `NativeEventStream` (SSE journal stream with cursor resume and bounded backoff). |
 | `:frontend` | `dev.faktor.frontend` — `FaktorFrontendService` (the UI-free bridge: start/stop/attach/restart, session, task-run/agent/usage/verification/evidence/provider/terminal routing, stream lifecycle and `reconnectStream` cursor resume), `FaktorChatPanel` (native Swing tool-window panel with Status, Task, Task Tree, Agents, Permissions, Tournament, Board, Evidence, Terminal, Settings and History tabs) plus the section panels (`TaskTreePanel`, `BlockersPanel`, `PermissionsPanel`, `TerminalPanel`, `SettingsPanel`, `HistoryPanel`, `TournamentPanel`, `BoardPanel`, `EvidenceNavigatorPanel`, `AttachmentsPanel`) and `FaktorToolWindowFactory` (the IntelliJ tool-window host). `FaktorFrontendApp` launches the panel standalone. `src/main/resources/META-INF/plugin.xml` is the real plugin descriptor (`dev.faktor.jetbrains`, name/vendor `Faktor`, version `0.1.0`, `since-build 241`). |
 
@@ -29,8 +29,8 @@ rendering implementation; the vendored tree is not a second renderer.
   `faktor server listening on http://127.0.0.1:<port>`.
 - The native client authenticates every request with
   `Authorization: Bearer <password>`; the frozen v7.5.6 client keeps
-  `Authorization: Basic base64("kilo:" + password)` for the compat
-  surface (that literal is part of the frozen wire, not product
+  `Authorization: Basic base64("kilo:" + password)` for every daemon
+  request (that literal is a retained auth form, not product
   branding).
 - `stop()` is SIGTERM first, `destroyForcibly()` only after a 3s grace;
   the stdout drainer and the SSE thread stop with the process.
@@ -119,7 +119,7 @@ This builds `faktor-cli` if missing and then:
 1. compiles `shared + backend + test + frontend` (Swing included) with
    `kotlinc` (kotlin-stdlib.jar from the compiler distribution, no
    network, no Gradle);
-2. runs `BackendSmoke <binary>` — the frozen v7.5.6 wire flow (start →
+2. runs `BackendSmoke <binary>` — the native flow (start →
    health → create session → send message → settle → messages → stop);
    a provider-less daemon answers the message send with HTTP 502 and the
    session lands `failed_recoverable`, both accepted as honest outcomes;

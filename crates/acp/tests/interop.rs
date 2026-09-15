@@ -41,7 +41,9 @@ use faktor_acp::{
     AcpStreamBackend, AgentStateStatus, PermissionOption, PromptCtx, TerminalAuthority,
     TerminalError, TerminalHandle, TerminalSpec,
 };
-use faktor_protocol::v756::{Message as NativeMessage, MessagesPage, PageMeta, Part as NativePart};
+use faktor_protocol::native::{
+    Message as NativeMessage, MessagesPage, PageMeta, Part as NativePart,
+};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const QUIESCE: Duration = Duration::from_millis(300);

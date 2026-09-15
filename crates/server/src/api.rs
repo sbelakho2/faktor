@@ -1,52 +1,40 @@
-//! The daemon's HTTP/SSE surface.
+//! The daemon's HTTP surface.
 //!
-//! Two surfaces coexist (architecture §16): the **Faktor Native Protocol
-//! v1** endpoints (`/session/{id}/projection`, `/models`,
-//! `/capabilities`, plus the audit 55-56 `/native/...` mounts:
-//! liveness/readiness, durable session listings and the usage aggregate;
-//! documented in `docs/native-protocol.md`) — the
-//! daemon's own contract, UI compatibility being the target — and the
-//! **v7.5.6 wire compatibility surface (subset)** retained as
-//! migration/test glue against the old UI:
-//! the SDK-shaped REST surface (`/session/...`, `/permission/...`,
-//! `/provider/list`, `/global/health`, `/global/event`,
-//! `/question/...`, `/network/...`, `/config/...`) and the wire surface
-//! the frozen v7.5.6 extension actually calls (`/session`,
-//! `/session/{sessionID}`, `/session/{sessionID}/message`,
-//! `/session/{sessionID}/abort`, `/session/{sessionID}/diff`,
-//! `/session/{sessionID}/revert`, `/session/{sessionID}/unrevert`), all
-//! behind password auth (`FAKTOR_SERVER_PASSWORD` via
+//! One surface: the **Faktor Native Protocol v1** endpoints
+//! (`/session/{id}/projection`, `/models`, `/capabilities`, plus the
+//! `/native/...` mounts: liveness/readiness, durable session listings,
+//! usage aggregate, task runs, tournaments, terminals, attachments,
+//! evidence, semantic introspection; documented in
+//! `docs/native-protocol.md`) — the daemon's own contract. All endpoints
+//! stay behind password auth (`FAKTOR_SERVER_PASSWORD` via
 //! `Authorization: Basic base64("kilo:"+password)`, with the Bearer and
-//! `x-faktor-server-password` forms retained). The old `/api/...` routes stay
-//! wired as aliases; their tests must keep passing.
-
-//! Layout after the audit 81-83/94 split: handler bodies live in
-//! [`crate::native`] (Faktor Native Protocol v1) and [`crate::compat`]
-//! (frozen v7.5.6/SDK glue). This module keeps router assembly plus the
-//! re-exports the tests and the daemon entry points consume; the native
-//! layer never imports the compatibility layer.
+//! `x-faktor-server-password` forms retained).
 //!
-//! Two surfaces coexist (architecture §16): the **Faktor Native Protocol
-//! v1** endpoints and the **v7.5.6 wire compatibility surface (subset)**.
-//! Both stay behind password auth.
+//! Layout: handler bodies live in [`crate::native`] (Faktor Native
+//! Protocol v1). This module keeps router assembly plus the re-exports the
+//! tests and the daemon entry points consume.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use axum::Router;
 use tokio::sync::oneshot;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use faktor_agent::AgentRuntime;
-use faktor_protocol::v756::{startup_line, Handshake};
 use faktor_session::SessionManager;
 
 use crate::auth::{AuthToken, ServerPassword};
 use crate::permission::ChannelPermissionRequester;
 
-pub(crate) use crate::compat::*;
 pub(crate) use crate::native::*;
+
+/// The startup line the daemon prints after binding (frozen stdout
+/// contract; nothing else may be printed on stdout).
+pub fn startup_line(port: u16) -> String {
+    format!("faktor server listening on http://127.0.0.1:{port}")
+}
 
 /// Handle to the daemon's evidence store: an evidence store behind a
 /// process-wide lock, so the server can hold it while producers (future
@@ -90,7 +78,7 @@ pub struct ServerDeps {
     pub auth_token: AuthToken,
     /// The password the frontend generated and passed via `FAKTOR_SERVER_PASSWORD`.
     pub server_password: ServerPassword,
-    /// Workspace root carried on global event envelopes.
+    /// The workspace root carried on the server's dependency envelope.
     pub directory: Option<String>,
     pub version: String,
     /// Real workspace file service for revert/unrevert/diff (None = the wire
@@ -221,20 +209,7 @@ impl ServerDeps {
         self
     }
 
-    /// Legacy JSON handshake line (test-only detail; never printed by the
-    /// CLI — the frontend parses the startup line instead).
-    pub fn handshake_line(&self, addr: SocketAddr) -> String {
-        Handshake {
-            version: self.version.clone(),
-            protocol: faktor_core::PROTOCOL_V756.to_string(),
-            pid: std::process::id() as u64,
-            auth_token: self.auth_token.as_str().to_string(),
-            port: addr.port(),
-        }
-        .to_line()
-    }
-
-    /// The frozen stdout line: `faktor server listening on http://127.0.0.1:<port>`.
+    /// The startup line the CLI prints on stdout after binding.
     pub fn startup_line(&self, addr: SocketAddr) -> String {
         startup_line(addr.port())
     }
@@ -243,19 +218,16 @@ impl ServerDeps {
 pub struct ServerHandle {
     pub addr: SocketAddr,
     pub shutdown: oneshot::Sender<()>,
-    /// Legacy JSON handshake line (kept for old tests; not printed).
-    pub handshake: String,
-    /// The frozen startup line the CLI prints on stdout after binding.
+    /// The startup line the CLI prints on stdout after binding.
     pub startup_line: String,
 }
 
 /// Bind (port 0 = ephemeral) and serve. Returns once listening.
 pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHandle> {
-    // Bind first, then compute the lines (needs the bound address) and
+    // Bind first, then compute the line (needs the bound address) and
     // finally move the deps into the router.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     let addr = listener.local_addr()?;
-    let handshake = deps.handshake_line(addr);
     let startup_line = deps.startup_line(addr);
     // Readiness (audit 55): the flag starts false and flips true ONLY when
     // setup completes. Recovery runs before serve in the caller (the CLI
@@ -266,124 +238,19 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
     // false forever: /native/ready answers 503 {ready:false}.
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let set_ready = !deps.simulate_not_ready;
-    // The SDK `global.event` union projector (`GET /global/event`): the
-    // durable journal + message/part rows + the live chunk sink, projected
-    // into the SDK `GlobalEvent` frames the unmodified v7.5.6 client parses.
-    let projector = Arc::new(crate::compat::SdkGlobalProjector::new(
-        deps.session.clone(),
-        deps.directory.clone(),
-        deps.version.clone(),
-    ));
-    // Live chunk fan-out (audit round 11): low-latency session.next.*.delta
-    // frames from the agent's bounded, coalescing stream (audit 41),
-    // independent of the journal re-diff window. The task ends when the
-    // sender half is dropped; push_chunk only appends to the bounded global
-    // ring, so a slow SSE subscriber can never back up this drainer.
+    // Live chunk path (audit 41): the agent's bounded, coalescing chunk
+    // sink must stay drained, but the native surface is durable and
+    // journal-driven (clients page `/native/events` and `/native/messages`),
+    // so there is no live subscriber to fan out to. The bounded channel is
+    // consumed eagerly so the agent's sink never coalesces under a dead
+    // consumer.
     if let Some(mut rx) = deps.chunk_rx.take() {
-        let projector2 = projector.clone();
-        tokio::spawn(async move {
-            while let Some(chunk) = rx.recv().await {
-                projector2.push_chunk(chunk);
-            }
-        });
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
     }
     let app = Router::new()
-        // Legacy aliases (frozen for old tests).
-        .route("/api/hello", get(hello))
-        .route("/api/session", post(create_session))
-        .route("/api/sessions", get(list_sessions))
-        .route("/api/session/{id}", get(session_state))
-        .route("/api/session/{id}/state", get(session_state))
-        .route("/api/session/{id}/messages", get(messages))
-        .route("/api/session/{id}/events", get(events))
-        .route("/api/session/{id}/prompt", post(prompt))
-        .route("/api/session/{id}/abort", post(abort))
-        .route("/api/perm/{id}/resolve", post(resolve_permission))
-        .route("/api/provider", get(provider_list))
-        // SDK-shaped primary surface.
-        .route("/session/create", post(create_session))
-        .route("/session/prompt", post(sdk_prompt))
-        .route("/session/abort", post(sdk_abort))
-        .route("/session/messages", get(sdk_messages))
-        .route("/session/state", get(sdk_session_state))
-        .route("/session/list", get(list_sessions))
-        .route("/permission/reply", post(permission_reply))
-        .route("/permission/list", get(permission_list))
-        .route("/provider/list", get(provider_list))
-        .route("/global/health", get(health))
-        .route("/global/event", get(global_events))
-        .route("/question/reply", post(question_reply))
-        .route("/question/list", get(question_list))
-        .route("/network/reply", post(network_reply))
-        .route("/network/list", get(network_list))
-        .route("/config/get", get(config_get))
-        .route("/config/set", post(config_set))
-        // SDK-exact aliases: the exact paths/methods the unmodified
-        // `@kilocode/sdk@7.5.6` client calls (see compat/kilo-v756/sdk-traces).
-        // They answer the SDK-declared shapes; the legacy daemon aliases
-        // above/below keep their own contracts.
-        .route("/config", get(config_get_bare))
-        .route("/permission", get(permission_list_sdk))
-        .route("/question", get(question_list_sdk))
-        .route("/network", get(network_list_sdk))
-        .route("/provider", get(provider_list_sdk))
-        // v7.5.6 wire compatibility surface (subset): the routes the frozen
-        // extension actually calls.
-        .route(
-            "/session",
-            post(wire_create_session).get(wire_list_sessions),
-        )
-        .route(
-            "/session/{sessionID}",
-            get(wire_session_summary)
-                .post(wire_session_update)
-                .patch(wire_session_update_patch)
-                .delete(wire_session_delete),
-        )
-        .route("/session/{sessionID}/fork", post(wire_session_fork))
-        .route(
-            "/session/{sessionID}/summarize",
-            post(wire_session_summarize),
-        )
-        .route(
-            "/session/{sessionID}/message",
-            post(wire_message_send).get(wire_messages_page),
-        )
-        .route(
-            "/session/{sessionID}/message/{messageID}",
-            delete(wire_message_delete),
-        )
-        .route("/session/{sessionID}/abort", post(wire_abort))
-        .route("/session/{sessionID}/diff", get(wire_diff))
-        .route("/session/{sessionID}/revert", post(wire_revert))
-        .route("/session/{sessionID}/unrevert", post(wire_unrevert))
-        .route("/session/{sessionID}/state", get(wire_session_state))
-        .route("/session/{sessionID}/status", get(wire_session_state))
-        .route("/session/status", get(wire_session_status_query))
-        .route("/question/reject", post(question_reject))
-        .route("/network/reject", post(network_reject))
-        .route("/config/update", post(config_update))
-        .route("/config/warnings", get(config_warnings))
-        .route(
-            "/config/overlay",
-            get(config_overlay_get).post(config_overlay),
-        )
-        .route("/config/overlayUpdate", post(config_overlay_update))
-        .route("/pty/create", post(pty_create))
-        .route("/pty/update", post(pty_update))
-        .route("/pty/remove", post(pty_remove))
-        .route("/pty", post(sdk_pty_create))
-        .route("/pty/{ptyID}", delete(sdk_pty_remove))
-        .route("/pty/{pty_id}/output", get(pty_output))
-        .route("/global/dispose", post(dispose_all_sessions))
-        .route("/instance/dispose", post(dispose_all_sessions))
-        .route("/instance/reload", post(instance_reload))
-        .route("/auth/set", post(auth_set))
-        .route("/auth/remove", post(auth_remove))
         // Faktor Native Protocol v1 (docs/native-protocol.md): the daemon's
-        // OWN surface, optimized around this runtime. UI compatibility is
-        // the target — these handlers speak native JSON, never the v7.5.6
-        // wire DTOs.
+        // OWN surface, optimized around this runtime. These handlers speak
+        // native JSON.
         .route("/session/{id}/projection", get(native_session_projection))
         .route("/models", get(native_models))
         .route("/capabilities", get(native_capabilities))
@@ -394,6 +261,14 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
         .route("/native/health", get(native_health))
         .route("/native/ready", get(native_ready))
         .route("/native/usage", get(native_usage))
+        // Session bootstrap (native): create one durable session on a
+        // workspace root, list the durable sessions, and run ONE ordinary
+        // prompt through the daemon's executor entry.
+        .route("/native/session", post(native_create_session))
+        .route("/native/sessions", get(native_list_sessions))
+        .route("/native/session/{id}/prompt", post(native_prompt))
+        // The native durable journal SSE stream (cursor-resumable).
+        .route("/native/session/{id}/events", get(native_session_events))
         .route("/native/session/{id}/turns", get(native_session_turns))
         .route("/native/session/{id}/tasks", get(native_session_tasks))
         .route(
@@ -478,6 +353,15 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
             "/native/session/{id}/terminals/{terminal_id}/reconcile",
             post(native_terminal_reconcile),
         )
+        .route(
+            "/native/session/{id}/terminals/{terminal_id}/output",
+            get(native_terminal_output),
+        )
+        // Native permission surface: the live pending set and the ONE
+        // resolve path (409 on unknown/already-resolved, never a double
+        // grant).
+        .route("/native/permissions", get(native_permissions))
+        .route("/native/permission/reply", post(native_permission_reply))
         .route("/native/messages", get(native_messages))
         .route("/native/events", get(native_events))
         .route("/native/providers", get(native_providers))
@@ -564,14 +448,7 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .with_state(AppState {
             deps: Arc::new(deps),
-            projector,
-            config: Arc::new(std::sync::RwLock::new(serde_json::Value::Object(
-                Default::default(),
-            ))),
             auth: Arc::new(std::sync::RwLock::new(None)),
-            ptys: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            next_pty_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            terminal_owners: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             terminal_events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             next_terminal_event_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             ready: ready.clone(),
@@ -591,7 +468,6 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
     Ok(ServerHandle {
         addr,
         shutdown: shutdown_tx,
-        handshake,
         startup_line,
     })
 }
@@ -601,25 +477,9 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) deps: Arc<ServerDeps>,
-    /// SDK `GlobalEvent` union projector behind `GET /global/event`
-    /// (crate::compat::sdk): the durable journal + message/part rows + the
-    /// live chunk sink, mapped to the vendored v7.5.6 union frames.
-    pub(crate) projector: Arc<crate::compat::SdkGlobalProjector>,
-    pub(crate) config: Arc<std::sync::RwLock<serde_json::Value>>,
     /// Runtime server-password override (`auth.set`); `None` = the startup
-    /// env password (`ServerDeps.server_password`) applies (`auth.remove`).
+    /// env password (`ServerDeps.server_password`) applies.
     pub(crate) auth: Arc<std::sync::RwLock<Option<ServerPassword>>>,
-    /// Live PTYs (audit round 11): session-owned interactive terminals,
-    /// Unix real implementation; other platforms refuse at creation.
-    pub(crate) ptys: Arc<std::sync::Mutex<std::collections::HashMap<u64, faktor_pty::Pty>>>,
-    pub(crate) next_pty_id: Arc<std::sync::atomic::AtomicU64>,
-    /// Native ownership cache of session-owned PTYs (audit P0-62): numeric
-    /// pty id → owning session raw id, strictly derived from the durable
-    /// `terminal_*` rows by the native adapter (never an authority; the ONE
-    /// authority is `TerminalService` over the ledger). The frozen compat
-    /// `/pty/*` surface uses it only to drop stale annotations.
-    pub(crate) terminal_owners:
-        Arc<std::sync::Mutex<crate::native::terminal::NativeTerminalOwnerCache>>,
     /// Bounded per-daemon log of session-owned terminal lifetime events
     /// (audit P0-62): `created` at spawn, `exited` when the swept process
     /// dies. Ring-bounded; ids ascend from 1.
@@ -634,22 +494,6 @@ pub(crate) struct AppState {
     /// answers 200 `{ready:true}` once it is set; 503 `{ready:false}`
     /// before/without it (`ServerDeps.simulate_not_ready`).
     pub(crate) ready: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl AppState {
-    /// Build the SDK global-event projector for a manually assembled
-    /// `AppState` (native test harnesses). Lives here, not in the native
-    /// modules, so the native layer keeps its no-compat-dependency rule.
-    #[cfg(test)]
-    pub(crate) fn test_projector(
-        session: Arc<faktor_session::SessionManager>,
-    ) -> Arc<crate::compat::SdkGlobalProjector> {
-        Arc::new(crate::compat::SdkGlobalProjector::new(
-            session,
-            None,
-            "test".into(),
-        ))
-    }
 }
 
 // ------------------------------------------------------------------ handlers
@@ -686,1502 +530,6 @@ mod tests {
         (orchestrator, tasks)
     }
 
-    #[test]
-    fn handshake_line_is_frozen_shape() {
-        let session = SessionManager::open(
-            std::env::temp_dir().join("kp-hs-store"),
-            std::env::temp_dir().join("kp-hs-cas"),
-            false,
-        )
-        .unwrap();
-        let agent = AgentRuntime::new(faktor_agent::AgentDeps {
-            session: SessionManager::open(
-                std::env::temp_dir().join("kp-hs-store2"),
-                std::env::temp_dir().join("kp-hs-cas2"),
-                false,
-            )
-            .unwrap(),
-            providers: Arc::new(faktor_provider::ProviderRegistry::new()),
-            chunk_sink: None,
-            permission_requester: ChannelPermissionRequester::new(Duration::from_secs(1)),
-            evidence: Arc::new(faktor_agent::NoEvidence),
-            tools: Arc::new(faktor_agent::ToolRegistry::new()),
-            cas: None,
-            workspaces: faktor_fs::WorkspaceFileService::new(),
-            edit: None,
-            snapshots: None,
-            sandbox: None,
-            supervisor: None,
-            verification: faktor_agent::VerificationService::disabled(),
-            model: "m".into(),
-            compaction_model: None,
-            compact_at_usage: 0.65,
-            instructions: "i".into(),
-            hooks: None,
-            instructions_resolver: faktor_instructions::no_roots_resolver(),
-            routing: faktor_agent::FixedRoutingPolicy::passthrough(),
-            budgets: Arc::new(faktor_session::NoopBudget),
-            clock: Arc::new(faktor_core::time::SystemClock),
-            tool_call_mode: faktor_agent::ToolCallMode::Native,
-            tool_deadline_ms: 1000,
-            retry_policy: faktor_core::retry::RetryPolicy::default(),
-            semantic: faktor_agent::fallback_semantic_registry(),
-            context_prior: None,
-            efficiency: Default::default(),
-        })
-        .unwrap();
-        let permissions = ChannelPermissionRequester::new(Duration::from_secs(1));
-        let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
-        let deps = ServerDeps {
-            budgets: faktor_session::DurableBudgetLedger::new(session.clone()),
-            session,
-            agent,
-            permissions,
-            orchestrator,
-            tasks,
-            auth_token: AuthToken::generate(),
-            server_password: ServerPassword::generate(),
-            directory: None,
-            version: "0.1.0".into(),
-            fs: None,
-            snapshots: None,
-            chunk_rx: None,
-            simulate_not_ready: false,
-            evidence: None,
-            semantic: None,
-        };
-        let addr: SocketAddr = "127.0.0.1:45678".parse().unwrap();
-        let line = deps.handshake_line(addr);
-        assert!(line.starts_with("FAKTOR_PLUS_HANDSHAKE "));
-        let hs = Handshake::from_line(&line).unwrap();
-        assert_eq!(hs.protocol, "v756");
-        assert_eq!(hs.port, 45678);
-        assert_eq!(hs.auth_token, deps.auth_token.as_str());
-        // The frozen stdout contract is the startup line, and the password
-        // never appears in it (no token on stdout).
-        let startup = deps.startup_line(addr);
-        assert_eq!(startup, "faktor server listening on http://127.0.0.1:45678");
-        assert!(!startup.contains(&deps.server_password.as_str()[..8]));
-    }
-
-    #[tokio::test]
-    async fn unauthorized_requests_rejected_before_handlers() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        // No token.
-        let resp = client
-            .post(format!("http://{}/api/session", handle.addr))
-            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
-        // Wrong token.
-        let resp = client
-            .post(format!("http://{}/api/session", handle.addr))
-            .bearer_auth("wrong")
-            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn hello_is_public_and_correct() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let resp = client
-            .get(format!("http://{}/api/hello", handle.addr))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["protocol"], "v756");
-        assert_eq!(body["auth_required"], true);
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn full_flow_create_prompt_messages_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let token = deps.auth_token.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        // Create session.
-        let resp = client
-            .post(format!("{base}/api/session"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({
-                "provider": "fake",
-                "model": "m",
-                "workspace": "/tmp",
-                "title": "t1",
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["id"].as_str().unwrap().to_string();
-
-        // Prompt.
-        let resp = client
-            .post(format!("{base}/api/session/{sid}/prompt"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({"prompt": "hi", "files": []}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let pr: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(pr["accepted"], true);
-
-        // State reflects the turn (may still be running — poll until ready).
-        // Deadline-based, host-speed independent: 100 fixed 20 ms polls was
-        // a wall-clock assumption the slower Windows runner exhausted while
-        // the drive was still `preparing`. The terminal set and the
-        // assertion are unchanged, so a genuinely stuck turn still fails
-        // here (with the observed state in the panic).
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
-        let state = loop {
-            let resp = client
-                .get(format!("{base}/api/session/{sid}/state"))
-                .bearer_auth(token.as_str())
-                .send()
-                .await
-                .unwrap();
-            let body: serde_json::Value = resp.json().await.unwrap();
-            let state = body["agent_state"]["state"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            if matches!(
-                state.as_str(),
-                "ready_for_next_turn" | "completed" | "cancelled"
-            ) {
-                break state;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break state;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
-        assert_eq!(state, "ready_for_next_turn", "turn must complete");
-
-        // Messages contain the exchange.
-        let resp = client
-            .get(format!("{base}/api/session/{sid}/messages?limit=10"))
-            .bearer_auth(token.as_str())
-            .send()
-            .await
-            .unwrap();
-        let page: serde_json::Value = resp.json().await.unwrap();
-        assert!(page["messages"].as_array().unwrap().len() >= 2, "{page}");
-
-        // Malformed body → 400; unknown route → 404; unknown session → 404.
-        let resp = client
-            .post(format!("{base}/api/session/{sid}/prompt"))
-            .bearer_auth(token.as_str())
-            .body("{not json")
-            .header("content-type", "application/json")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400);
-        let resp = client
-            .get(format!("{base}/api/nope"))
-            .bearer_auth(token.as_str())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-        let resp = client
-            .get(format!("{base}/api/session/999999/state"))
-            .bearer_auth(token.as_str())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sse_streams_and_resumes_from_cursor() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let token = deps.auth_token.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        let resp = client
-            .post(format!("{base}/api/session"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
-            .send()
-            .await
-            .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["id"].as_str().unwrap().to_string();
-
-        // Subscribe before the prompt so we see the whole sequence.
-        let mut sse = client
-            .get(format!("{base}/api/session/{sid}/events?events_after=0"))
-            .bearer_auth(token.as_str())
-            .send()
-            .await
-            .unwrap()
-            .bytes_stream();
-
-        client
-            .post(format!("{base}/api/session/{sid}/prompt"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({"prompt": "hi"}))
-            .send()
-            .await
-            .unwrap();
-
-        use futures_util::StreamExt;
-        let mut saw_state = false;
-        let mut text = String::new();
-        for _ in 0..200 {
-            match tokio::time::timeout(Duration::from_millis(200), sse.next()).await {
-                Ok(Some(Ok(chunk))) => {
-                    text.push_str(&String::from_utf8_lossy(&chunk));
-                    if text.contains("agent_state_changed") {
-                        saw_state = true;
-                    }
-                    if saw_state {
-                        break;
-                    }
-                }
-                Ok(Some(Err(_))) => break,
-                Ok(None) | Err(_) => break,
-            }
-        }
-        assert!(saw_state, "SSE must deliver state events; got: {text}");
-
-        // Resume from a cursor: events_after=1 skips the SessionCreated frame.
-        let resp = client
-            .get(format!("{base}/api/session/{sid}/events?events_after=1"))
-            .bearer_auth(token.as_str())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn permission_flow_blocks_until_resolved() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let token = deps.auth_token.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        let resp = client
-            .post(format!("{base}/api/session"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-
-        // The fake provider script makes a tool call, so the turn blocks on
-        // permission. Resolve it through the frozen API.
-        let mut registry = faktor_provider::ProviderRegistry::new();
-        registry
-            .try_register(Arc::new(FakeProvider::with_script(
-                "fake",
-                ModelCapabilities {
-                    tools: true,
-                    ..Default::default()
-                },
-                vec![
-                    faktor_provider::ScriptedResponse::ToolCall {
-                        id: "c1".into(),
-                        name: "echo".into(),
-                        input: serde_json::json!({"x": 1}),
-                    },
-                    faktor_provider::ScriptedResponse::End,
-                ],
-            )))
-            .unwrap();
-        let session =
-            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
-        let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
-        let mut tools = faktor_agent::ToolRegistry::new();
-        tools.register(faktor_agent::Tool {
-            name: "echo".into(),
-            description: "d".into(),
-            input_schema: serde_json::json!({}),
-            resource_class: faktor_core::resource::ResourceClass::Cpu,
-            capability: None,
-            recovery_hint: faktor_agent::RecoveryHint::Idempotent,
-            path_args: vec![],
-            execute: Arc::new(|_ctx, _args| {
-                Box::pin(async move { Ok(faktor_agent::ToolOutcome::default()) })
-            }),
-        });
-        let agent = AgentRuntime::new(faktor_agent::AgentDeps {
-            session: session.clone(),
-            providers: Arc::new(registry),
-            chunk_sink: None,
-            permission_requester: permissions.clone(),
-            evidence: Arc::new(faktor_agent::NoEvidence),
-            tools: Arc::new(tools),
-            cas: None,
-            workspaces: faktor_fs::WorkspaceFileService::new(),
-            edit: None,
-            snapshots: None,
-            sandbox: None,
-            supervisor: None,
-            verification: faktor_agent::VerificationService::disabled(),
-            model: "m".into(),
-            compaction_model: None,
-            compact_at_usage: 0.65,
-            instructions: "You are a test server agent.".into(),
-            hooks: None,
-            instructions_resolver: faktor_instructions::no_roots_resolver(),
-            routing: faktor_agent::FixedRoutingPolicy::passthrough(),
-            budgets: Arc::new(faktor_session::NoopBudget),
-            clock: Arc::new(faktor_core::time::SystemClock),
-            tool_call_mode: faktor_agent::ToolCallMode::Native,
-            tool_deadline_ms: 2000,
-            retry_policy: faktor_core::retry::RetryPolicy::default(),
-            semantic: faktor_agent::fallback_semantic_registry(),
-            context_prior: None,
-            efficiency: Default::default(),
-        })
-        .unwrap();
-        // Replace the running server's deps by serving a second one on the
-        // same store (the first server's fake provider has no tool call, so
-        // the permission test needs its own instance).
-        let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
-        let deps2 = ServerDeps {
-            budgets: faktor_session::DurableBudgetLedger::new(session.clone()),
-            session: session.clone(),
-            agent,
-            permissions: permissions.clone(),
-            orchestrator,
-            tasks,
-            auth_token: token.clone(),
-            server_password: ServerPassword::generate(),
-            directory: None,
-            version: "0.1.0".into(),
-            fs: None,
-            snapshots: None,
-            chunk_rx: None,
-            simulate_not_ready: false,
-            evidence: None,
-            semantic: None,
-        };
-        let handle2 = serve(deps2, 0).await.unwrap();
-        let base2 = format!("http://{}", handle2.addr);
-        let resp = client
-            .post(format!("{base2}/api/session"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
-            .send()
-            .await
-            .unwrap();
-        let created2: serde_json::Value = resp.json().await.unwrap();
-        let sid2 = created2["id"].as_str().unwrap().to_string();
-        client
-            .post(format!("{base2}/api/session/{sid2}/prompt"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({"prompt": "use tools"}))
-            .send()
-            .await
-            .unwrap();
-
-        // The turn blocks on permission; resolve through the API.
-        let mut resolved = false;
-        for _ in 0..100 {
-            if let Some(pid) = permissions.pending_ids().first().copied() {
-                let resp = client
-                    .post(format!("{base2}/api/perm/{pid}/resolve"))
-                    .bearer_auth(token.as_str())
-                    .json(&serde_json::json!({
-                        "permission_id": pid.to_string(),
-                        "decision": "allow",
-                    }))
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(resp.status(), 200);
-                resolved = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(resolved, "permission must surface and resolve");
-
-        // The turn must now complete.
-        let mut done = false;
-        for _ in 0..100 {
-            let id = parse_session_id(&sid2).unwrap();
-            let state = session.get_session(id).unwrap().unwrap().state().unwrap();
-            if matches!(state, faktor_core::state::AgentState::ReadyForNextTurn) {
-                done = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(done, "turn must finish after permission grant");
-
-        // Double resolve → conflict.
-        let resp = client
-            .post(format!("{base2}/api/perm/1/resolve"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({"permission_id": "1", "decision": "allow"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 409);
-        let _ = handle.shutdown.send(());
-        let _ = handle2.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn sdk_routes_require_password_and_health_requires_basic() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let token = deps.auth_token.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        // /global/health requires auth now (the frozen client authenticates
-        // every request, this one included). Basic is accepted.
-        let resp = client
-            .get(format!("{base}/global/health"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
-        let resp = client
-            .get(format!("{base}/global/health"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], true);
-        assert_eq!(body["protocol"], "v756");
-        assert!(body["version"].is_string());
-        // Wrong Basic credentials are rejected.
-        let resp = client
-            .get(format!("{base}/global/health"))
-            .basic_auth("kilo", Some("wrong"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
-
-        // Every other endpoint requires the password. Bodies are valid (the
-        // auth gate runs inside the handler, after extraction) so the 401 is
-        // the auth gate, not a parse error.
-        let cases: &[(&str, &str, serde_json::Value)] = &[
-            (
-                "post",
-                "/session/create",
-                serde_json::json!({"provider": "fake", "model": "m"}),
-            ),
-            (
-                "post",
-                "/session/prompt",
-                serde_json::json!({"session_id": "1", "prompt": "x"}),
-            ),
-            (
-                "post",
-                "/session/abort",
-                serde_json::json!({"session_id": "1"}),
-            ),
-            (
-                "get",
-                "/session/messages?session_id=1",
-                serde_json::json!({}),
-            ),
-            ("get", "/session/state?session_id=1", serde_json::json!({})),
-            ("get", "/session/list", serde_json::json!({})),
-            ("get", "/global/health", serde_json::json!({})),
-            ("get", "/session", serde_json::json!({})),
-            (
-                "post",
-                "/session",
-                serde_json::json!({"model": {"id": "m", "providerID": "fake"}}),
-            ),
-            ("get", "/session/1", serde_json::json!({})),
-            (
-                "post",
-                "/session/1/message",
-                serde_json::json!({"model": {"providerID": "fake", "modelID": "m"},
-                    "parts": [{"type": "text", "text": "hi"}]}),
-            ),
-            ("get", "/session/1/message?limit=1", serde_json::json!({})),
-            ("post", "/session/1/abort", serde_json::json!({})),
-            ("get", "/session/1/diff", serde_json::json!({})),
-            (
-                "post",
-                "/session/1/revert",
-                serde_json::json!({"messageID": "1"}),
-            ),
-            (
-                "post",
-                "/session/1/unrevert",
-                serde_json::json!({"messageID": "1"}),
-            ),
-            (
-                "post",
-                "/permission/reply",
-                serde_json::json!({"permission_id": "1", "decision": "allow"}),
-            ),
-            ("get", "/permission/list", serde_json::json!({})),
-            ("get", "/provider/list", serde_json::json!({})),
-            ("get", "/global/event?after=0", serde_json::json!({})),
-            (
-                "post",
-                "/question/reply",
-                serde_json::json!({"question_id": "q", "decision": "d"}),
-            ),
-            ("get", "/question/list", serde_json::json!({})),
-            (
-                "post",
-                "/network/reply",
-                serde_json::json!({"network_id": "n", "decision": "d"}),
-            ),
-            ("get", "/network/list", serde_json::json!({})),
-            ("get", "/config/get", serde_json::json!({})),
-            ("post", "/config/set", serde_json::json!({"config": {}})),
-            ("get", "/config", serde_json::json!({})),
-            ("get", "/permission", serde_json::json!({})),
-            ("get", "/question", serde_json::json!({})),
-            ("get", "/network", serde_json::json!({})),
-            ("get", "/session/status?session_id=1", serde_json::json!({})),
-            ("get", "/session/1/status", serde_json::json!({})),
-            ("post", "/session/1/fork", serde_json::json!({})),
-            ("post", "/session/1/summarize", serde_json::json!({})),
-            ("delete", "/session/1", serde_json::json!({})),
-            ("delete", "/session/1/message/1", serde_json::json!({})),
-            (
-                "post",
-                "/question/reject",
-                serde_json::json!({"question_id": "1"}),
-            ),
-            (
-                "post",
-                "/network/reject",
-                serde_json::json!({"network_id": "1"}),
-            ),
-            (
-                "post",
-                "/config/update",
-                serde_json::json!({"config": {"model": "m"}}),
-            ),
-            ("get", "/config/warnings", serde_json::json!({})),
-            ("get", "/config/overlay", serde_json::json!({})),
-            ("post", "/config/overlay", serde_json::json!({"config": {}})),
-            (
-                "post",
-                "/config/overlayUpdate",
-                serde_json::json!({"config": {}}),
-            ),
-            ("patch", "/session/1", serde_json::json!({"title": "t"})),
-            ("post", "/pty/create", serde_json::json!({})),
-            ("post", "/pty/update", serde_json::json!({})),
-            ("post", "/pty/remove", serde_json::json!({})),
-            ("post", "/pty", serde_json::json!({})),
-            ("delete", "/pty/1", serde_json::json!({})),
-            ("post", "/global/dispose", serde_json::json!({})),
-            ("post", "/instance/dispose", serde_json::json!({})),
-            ("post", "/instance/reload", serde_json::json!({})),
-            ("post", "/auth/set", serde_json::json!({"password": null})),
-            ("post", "/auth/remove", serde_json::json!({})),
-        ];
-        for (method, path, body) in cases {
-            let resp = if *method == "get" {
-                client.get(format!("{base}{path}")).send().await.unwrap()
-            } else if *method == "delete" {
-                client.delete(format!("{base}{path}")).send().await.unwrap()
-            } else if *method == "patch" {
-                client
-                    .patch(format!("{base}{path}"))
-                    .json(body)
-                    .send()
-                    .await
-                    .unwrap()
-            } else {
-                client
-                    .post(format!("{base}{path}"))
-                    .json(body)
-                    .send()
-                    .await
-                    .unwrap()
-            };
-            assert_eq!(
-                resp.status(),
-                401,
-                "{method} {path} without password must be 401"
-            );
-            let body: serde_json::Value = resp.json().await.unwrap();
-            assert_eq!(body["error"]["code"], "unauthorized");
-        }
-
-        // Wrong password is rejected in both header forms.
-        let resp = client
-            .post(format!("{base}/session/create"))
-            .bearer_auth("wrong-password")
-            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
-        let resp = client
-            .post(format!("{base}/session/create"))
-            .header("x-faktor-server-password", "wrong-password")
-            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
-
-        // The password works in all three header forms.
-        let resp = client
-            .post(format!("{base}/session/create"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let resp = client
-            .post(format!("{base}/session/create"))
-            .bearer_auth(pw.as_str())
-            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let resp = client
-            .post(format!("{base}/session/create"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        // A wrong Basic username is rejected.
-        let resp = client
-            .post(format!("{base}/session/create"))
-            .basic_auth("admin", Some(pw.as_str()))
-            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
-        // The legacy per-start bearer token still works.
-        let resp = client
-            .post(format!("{base}/session/create"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn wire_surface_full_flow_with_basic_auth() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let session = deps.session.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-        let basic = |r: reqwest::RequestBuilder| r.basic_auth("kilo", Some(pw.as_str()));
-
-        // POST /session: the x-faktor-directory header wins over workspaceID,
-        // and the model.providerID drives the provider.
-        let resp = basic(
-            client
-                .post(format!("{base}/session"))
-                .header("x-faktor-directory", "/tmp")
-                .json(&serde_json::json!({
-                    "parentID": null,
-                    "title": "wire t1",
-                    "agent": "default",
-                    "model": {"id": "m", "providerID": "fake", "variant": null},
-                    "metadata": {"origin": "audit-round-2"},
-                    "permission": null,
-                    "platform": "darwin",
-                    "workspaceID": "/ignored",
-                    "sandboxInheritanceToken": null,
-                })),
-        )
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), 200, "create must succeed");
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["sessionID"].as_str().unwrap().to_string();
-        assert_eq!(created["title"], "wire t1");
-        assert!(created["createdMs"].as_i64().unwrap() > 0);
-        // The created session row carries the header workspace, not
-        // workspaceID (the header wins by contract).
-        let sid_parsed = parse_session_id(&sid).unwrap();
-        let row = session
-            .get_session(sid_parsed)
-            .unwrap()
-            .unwrap()
-            .row()
-            .unwrap();
-        let ws = session.create_workspace("/tmp").unwrap();
-        assert_eq!(row.workspace_id, ws, "header workspace must win");
-        assert_eq!(row.provider, "fake");
-        assert_eq!(row.model, "m");
-
-        // GET /session lists it — the SDK `session.list` contract: a BARE
-        // `Session1[]` of rich sessions (the old `{sessions:[…]}` envelope
-        // was the scaffold alias; the SDK shape is the contract).
-        let resp = basic(client.get(format!("{base}/session")))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let list: serde_json::Value = resp.json().await.unwrap();
-        let sessions = list
-            .as_array()
-            .unwrap_or_else(|| panic!("session.list must be a bare array: {list}"));
-        let ids: Vec<&str> = sessions
-            .iter()
-            .filter_map(|s| s["sessionID"].as_str())
-            .collect();
-        assert!(ids.contains(&sid.as_str()));
-        let summary = sessions
-            .iter()
-            .find(|s| s["sessionID"].as_str() == Some(sid.as_str()))
-            .unwrap();
-        assert!(summary["createdMs"].as_i64().unwrap() > 0);
-        assert!(summary["updatedMs"].as_i64().unwrap() > 0);
-        assert!(summary["state"].is_string());
-        // Rich `Session1` fields ride the same entry.
-        assert!(summary["id"].is_string());
-        assert!(summary["slug"].is_string());
-        assert!(summary["projectID"].is_string());
-        assert!(summary["directory"].is_string());
-        assert!(summary["version"].is_string());
-        assert!(summary["time"]["created"].is_i64());
-
-        // GET /session/{sessionID} summary.
-        let resp = basic(client.get(format!("{base}/session/{sid}")))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["sessionID"], sid);
-        assert_eq!(body["title"], "wire t1");
-
-        // PATCH /session/{sessionID} — the SDK `session.update` method:
-        // the rich Session4 projection, additively next to the frozen
-        // aliases. The durable title is the field this slice owns.
-        let resp = basic(
-            client
-                .patch(format!("{base}/session/{sid}"))
-                .json(&serde_json::json!({"title": "wire t1 patched"})),
-        )
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["title"], "wire t1 patched");
-        assert_eq!(body["id"], sid);
-        assert_eq!(body["sessionID"], sid);
-        assert!(body["time"]["updated"].is_i64());
-        // Metadata/permission/archive are NOT durable here: the SDK-declared
-        // 400 InvalidRequestError, never a silent drop.
-        let resp = basic(
-            client
-                .patch(format!("{base}/session/{sid}"))
-                .json(&serde_json::json!({"metadata": {"x": 1}})),
-        )
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), 400);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["_tag"], "InvalidRequestError");
-        // The refused patch changed nothing.
-        let resp = basic(client.get(format!("{base}/session/{sid}")))
-            .send()
-            .await
-            .unwrap();
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["title"], "wire t1 patched");
-
-        // POST /session/{sessionID}/message with a full parts[] payload.
-        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
-            &serde_json::json!({
-                "messageID": null,
-                "model": {"providerID": "fake", "modelID": "m"},
-                "agent": null,
-                "noReply": false,
-                "tools": ["read_file"],
-                "format": null,
-                "system": null,
-                "variant": null,
-                "snapshotInitialization": false,
-                "editorContext": {"file": "a.rs"},
-                "parts": [
-                    {"type": "text", "text": "fix it"},
-                    {"type": "file", "path": "b.rs", "content": "fn b() {}", "mode": "edit"},
-                    {"type": "tool", "callID": "c1", "name": "read_file",
-                     "input": {"path": "a.rs"}, "state": "running", "output": null}
-                ]
-            }),
-        ))
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), 200);
-        // Frozen send shape: {info: AssistantMessage, parts: Part[]} — the
-        // info is the durable assistant message of the accepted turn, the
-        // parts its wire parts (top level has exactly info+parts; the old
-        // {messageID, accepted, queued} envelope is gone).
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(
-            body.as_object().unwrap().keys().collect::<Vec<_>>(),
-            vec!["info", "parts"]
-        );
-        assert_eq!(body["info"]["sessionID"], sid);
-        assert_eq!(body["info"]["role"], "assistant");
-        let assistant_seq: i64 = body["info"]["messageID"].as_str().unwrap().parse().unwrap();
-        assert!(assistant_seq > 1, "assistant lands after the user prompt");
-        assert!(body["info"]["createdMs"].as_i64().unwrap() > 0);
-        assert_eq!(body["info"]["providerID"], "fake");
-        assert_eq!(body["info"]["modelID"], "m");
-        let send_parts = body["parts"].as_array().unwrap();
-        assert!(!send_parts.is_empty(), "{body}");
-        assert!(
-            send_parts
-                .iter()
-                .any(|p| p["type"] == "text" && p["text"] == "pong"),
-            "the fake provider's reply rides the parts: {body}"
-        );
-
-        // The wire messages page is the frozen array of {info, parts}.
-        let resp = basic(client.get(format!("{base}/session/{sid}/message?limit=10")))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        assert_eq!(resp.headers().get("x-has-more").unwrap(), "false");
-        let page: serde_json::Value = resp.json().await.unwrap();
-        let messages = page.as_array().unwrap();
-        assert!(messages.len() >= 2, "{page}");
-        // Newest first; entries are {info, parts} with wire field names.
-        let first = &messages[0];
-        assert_eq!(
-            first.as_object().unwrap().keys().collect::<Vec<_>>(),
-            vec!["info", "parts"]
-        );
-        assert!(first["info"]["messageID"]
-            .as_str()
-            .unwrap()
-            .parse::<u64>()
-            .is_ok());
-        assert!(first["info"]["createdMs"].as_i64().unwrap() > 0);
-        assert_eq!(first["info"]["providerID"], "fake");
-        assert_eq!(first["info"]["modelID"], "m");
-        // The assistant reply text survives as a wire text part.
-        let text = first["parts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p["type"] == "text")
-            .map(|p| p["text"].as_str().unwrap_or(""))
-            .unwrap_or("");
-        assert_eq!(text, "pong");
-        // The PROMPT message itself appears with its text part (user rows
-        // are projected from their stored text).
-        let prompt = messages
-            .iter()
-            .find(|m| m["info"]["role"] == "user")
-            .expect("the user prompt message must be on the page");
-        assert_eq!(prompt["info"]["messageID"], "2", "first user seq is 2");
-        let prompt_text = prompt["parts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p["type"] == "text")
-            .map(|p| p["text"].as_str().unwrap_or(""))
-            .unwrap_or("");
-        // The stored prompt is the mapper's text+file concatenation.
-        assert!(
-            prompt_text.contains("fix it"),
-            "prompt text must appear: {prompt_text:?}"
-        );
-        assert!(
-            prompt_text.contains("fn b() {}"),
-            "file content rides the prompt: {prompt_text:?}"
-        );
-        // Paging: before=1 (nothing older than seq 1) is an empty page with
-        // x-has-more false; unknown cursors are the server's clamp.
-        let resp = basic(client.get(format!("{base}/session/{sid}/message?before=1&limit=1")))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        assert_eq!(resp.headers().get("x-has-more").unwrap(), "false");
-        assert_eq!(
-            resp.json::<serde_json::Value>().await.unwrap(),
-            serde_json::json!([])
-        );
-
-        // POST abort with the frozen body shape. The SDK declares
-        // `200: boolean`: the daemon reports whether at least one operation
-        // was actually cancelled (a just-finished turn may still own a
-        // tracked op; a fully idle session answers `false`).
-        let resp = basic(
-            client
-                .post(format!("{base}/session/{sid}/abort"))
-                .json(&serde_json::json!({"messageID": null})),
-        )
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert!(body.is_boolean(), "the SDK shape is a boolean: {body}");
-
-        // Adversarial: empty parts → 400; unknown body fields → 422; empty
-        // body message → 400; unknown session → 404; non-numeric id → 400.
-        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
-            &serde_json::json!({
-                "model": {"providerID": "fake", "modelID": "m"},
-                "parts": []
-            }),
-        ))
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), 400);
-        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
-            &serde_json::json!({
-                "model": {"providerID": "fake", "modelID": "m"},
-                "parts": [{"type": "text", "text": "x"}],
-                "smuggled": true
-            }),
-        ))
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), 422);
-        // Only control-plane parts → the mapped prompt is empty → 400.
-        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
-            &serde_json::json!({
-                "model": {"providerID": "fake", "modelID": "m"},
-                "parts": [{"type": "reasoning", "text": "think"}]
-            }),
-        ))
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), 400);
-        // Unknown wire part kind → 422 (deny_unknown_fields on the union).
-        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
-            &serde_json::json!({
-                "model": {"providerID": "fake", "modelID": "m"},
-                "parts": [{"type": "escape_hatch", "text": "x"}]
-            }),
-        ))
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), 422);
-        for path in [
-            "/session/999999",
-            "/session/999999/message",
-            "/session/999999/abort",
-            "/session/999999/diff",
-            "/session/999999/revert",
-            "/session/999999/unrevert",
-        ] {
-            let resp = if path.ends_with("/revert") {
-                basic(
-                    client
-                        .post(format!("{base}{path}"))
-                        .json(&serde_json::json!({"messageID": "1"})),
-                )
-                .send()
-                .await
-                .unwrap()
-            } else if path.ends_with("/message") {
-                basic(
-                    client
-                        .post(format!("{base}{path}"))
-                        .json(&serde_json::json!({
-                            "model": {"providerID": "fake", "modelID": "m"},
-                            "parts": [{"type": "text", "text": "x"}]
-                        })),
-                )
-                .send()
-                .await
-                .unwrap()
-            } else if path.ends_with("/abort") {
-                basic(
-                    client
-                        .post(format!("{base}{path}"))
-                        .json(&serde_json::json!({})),
-                )
-                .send()
-                .await
-                .unwrap()
-            } else if path.ends_with("/unrevert") {
-                // unrevert shares revert's strict body contract.
-                basic(
-                    client
-                        .post(format!("{base}{path}"))
-                        .json(&serde_json::json!({"messageID": "1"})),
-                )
-                .send()
-                .await
-                .unwrap()
-            } else {
-                basic(client.get(format!("{base}{path}")))
-                    .send()
-                    .await
-                    .unwrap()
-            };
-            assert_eq!(resp.status(), 404, "{path} must 404");
-        }
-        let resp = basic(client.get(format!("{base}/session/not-a-number")))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400);
-        let resp = basic(client.get(format!("{base}/session/0")))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400);
-        // /session/{sessionID} GET with an unknown session → 404; with the
-        // known one it already worked above.
-        let resp = basic(client.get(format!("{base}/session/999999")))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-
-        let _ = handle.shutdown.send(());
-    }
-
-    /// A wire-testing daemon whose provider records the model of every
-    /// request streamed through it (asserts the per-message override
-    /// actually reaches the agent).
-    fn recording_wire_deps(root: &std::path::Path, provider: Arc<FakeProvider>) -> ServerDeps {
-        let mut registry = faktor_provider::ProviderRegistry::new();
-        registry.try_register(provider).unwrap();
-        let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
-        let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
-        let agent = AgentRuntime::new(faktor_agent::AgentDeps {
-            session: session.clone(),
-            providers: Arc::new(registry),
-            chunk_sink: None,
-            permission_requester: permissions.clone(),
-            evidence: Arc::new(faktor_agent::NoEvidence),
-            tools: Arc::new(faktor_agent::ToolRegistry::new()),
-            cas: None,
-            workspaces: faktor_fs::WorkspaceFileService::new(),
-            edit: None,
-            snapshots: None,
-            sandbox: None,
-            supervisor: None,
-            verification: faktor_agent::VerificationService::disabled(),
-            model: "m".into(),
-            compaction_model: None,
-            compact_at_usage: 0.65,
-            instructions: "You are a test server agent.".into(),
-            hooks: None,
-            instructions_resolver: faktor_instructions::no_roots_resolver(),
-            routing: faktor_agent::FixedRoutingPolicy::passthrough(),
-            budgets: Arc::new(faktor_session::NoopBudget),
-            clock: Arc::new(faktor_core::time::SystemClock),
-            tool_call_mode: faktor_agent::ToolCallMode::Native,
-            tool_deadline_ms: 2000,
-            retry_policy: faktor_core::retry::RetryPolicy::default(),
-            semantic: faktor_agent::fallback_semantic_registry(),
-            context_prior: None,
-            efficiency: Default::default(),
-        })
-        .unwrap();
-        let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
-        ServerDeps {
-            budgets: faktor_session::DurableBudgetLedger::new(session.clone()),
-            session,
-            agent,
-            permissions,
-            orchestrator,
-            tasks,
-            auth_token: AuthToken::generate(),
-            server_password: ServerPassword::generate(),
-            directory: None,
-            version: "0.1.0".into(),
-            fs: None,
-            snapshots: None,
-            chunk_rx: None,
-            simulate_not_ready: false,
-            evidence: None,
-            semantic: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn message_model_override_applied_via_wire() {
-        let dir = tempfile::tempdir().unwrap();
-        let provider = Arc::new(FakeProvider::with_script(
-            "fake",
-            ModelCapabilities {
-                tools: true,
-                ..Default::default()
-            },
-            vec![
-                faktor_provider::ScriptedResponse::Text("pong".into()),
-                faktor_provider::ScriptedResponse::End,
-            ],
-        ));
-        let deps = recording_wire_deps(dir.path(), provider.clone());
-        let pw = deps.server_password.clone();
-        let session = deps.session.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-        let basic = |r: reqwest::RequestBuilder| r.basic_auth("kilo", Some(pw.as_str()));
-
-        // Session configured with model m1.
-        let resp = basic(
-            client
-                .post(format!("{base}/session"))
-                .json(&serde_json::json!({"model": {"id": "m1", "providerID": "fake"}})),
-        )
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), 200);
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["sessionID"].as_str().unwrap().to_string();
-        let sid_parsed = parse_session_id(&sid).unwrap();
-        let row = session
-            .get_session(sid_parsed)
-            .unwrap()
-            .unwrap()
-            .row()
-            .unwrap();
-        assert_eq!(row.model, "m1");
-
-        // Message overriding to m2 within the same provider.
-        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
-            &serde_json::json!({
-                "model": {"providerID": "fake", "modelID": "m2"},
-                "parts": [{"type": "text", "text": "use m2"}],
-            }),
-        ))
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), 200);
-        // Frozen send shape: the durable assistant message of the accepted
-        // turn (the response arrived AFTER the turn completed) with its
-        // parts; info carries the model that was actually used.
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["info"]["role"], "assistant");
-        assert_eq!(body["info"]["sessionID"], sid);
-        assert!(body["info"]["messageID"]
-            .as_str()
-            .unwrap()
-            .parse::<u64>()
-            .is_ok());
-        assert_eq!(body["info"]["modelID"], "m2");
-        assert!(!body["parts"].as_array().unwrap().is_empty());
-        assert!(
-            body.as_object().unwrap().get("accepted").is_none(),
-            "the old envelope is gone: {body}"
-        );
-
-        // The agent's wire request carried m2 — the override applies.
-        let mut recorded = None;
-        for _ in 0..100 {
-            if let Some(m) = provider.last_request_model() {
-                recorded = Some(m);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(
-            recorded.as_deref(),
-            Some("m2"),
-            "the override must reach the agent's wire request"
-        );
-        // The journaled session row keeps its configured model.
-        let row = session
-            .get_session(sid_parsed)
-            .unwrap()
-            .unwrap()
-            .row()
-            .unwrap();
-        assert_eq!(row.model, "m1", "override must not mutate the session row");
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn message_model_provider_mismatch_409() {
-        let dir = tempfile::tempdir().unwrap();
-        let provider = Arc::new(FakeProvider::with_script(
-            "fake",
-            ModelCapabilities {
-                tools: true,
-                ..Default::default()
-            },
-            vec![
-                faktor_provider::ScriptedResponse::Text("pong".into()),
-                faktor_provider::ScriptedResponse::End,
-            ],
-        ));
-        let deps = recording_wire_deps(dir.path(), provider.clone());
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-        let basic = |r: reqwest::RequestBuilder| r.basic_auth("kilo", Some(pw.as_str()));
-
-        let resp = basic(
-            client
-                .post(format!("{base}/session"))
-                .json(&serde_json::json!({"model": {"id": "m1", "providerID": "fake"}})),
-        )
-        .send()
-        .await
-        .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["sessionID"].as_str().unwrap().to_string();
-
-        // A provider that is not the session's provider: honest 409, and
-        // nothing is spawned (no request can reach the provider).
-        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
-            &serde_json::json!({
-                "model": {"providerID": "other", "modelID": "m2"},
-                "parts": [{"type": "text", "text": "hi"}],
-            }),
-        ))
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), 409);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], false);
-        assert_eq!(body["message"], "provider mismatch");
-        assert!(
-            provider.last_request_model().is_none(),
-            "a mismatched message must never reach the provider"
-        );
-
-        // The session still accepts a matching message afterwards.
-        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
-            &serde_json::json!({
-                "model": {"providerID": "fake", "modelID": "m1"},
-                "parts": [{"type": "text", "text": "hi"}],
-            }),
-        ))
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), 200);
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn message_without_model_uses_session_model() {
-        let dir = tempfile::tempdir().unwrap();
-        let provider = Arc::new(FakeProvider::with_script(
-            "fake",
-            ModelCapabilities {
-                tools: true,
-                ..Default::default()
-            },
-            vec![
-                faktor_provider::ScriptedResponse::Text("pong".into()),
-                faktor_provider::ScriptedResponse::End,
-            ],
-        ));
-        let deps = recording_wire_deps(dir.path(), provider.clone());
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-        let basic = |r: reqwest::RequestBuilder| r.basic_auth("kilo", Some(pw.as_str()));
-
-        // Session configured with model m1; the message carries the
-        // session's own model (no effective override).
-        let resp = basic(
-            client
-                .post(format!("{base}/session"))
-                .json(&serde_json::json!({"model": {"id": "m1", "providerID": "fake"}})),
-        )
-        .send()
-        .await
-        .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["sessionID"].as_str().unwrap().to_string();
-
-        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
-            &serde_json::json!({
-                "model": {"providerID": "fake", "modelID": "m1"},
-                "parts": [{"type": "text", "text": "plain"}],
-            }),
-        ))
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), 200);
-
-        let mut recorded = None;
-        for _ in 0..100 {
-            if let Some(m) = provider.last_request_model() {
-                recorded = Some(m);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(
-            recorded.as_deref(),
-            Some("m1"),
-            "the session model must be used when nothing overrides it"
-        );
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn wire_diff_revert_unrevert_are_honest_stubs() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        let resp = client
-            .post(format!("{base}/session"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
-            .send()
-            .await
-            .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["sessionID"].as_str().unwrap().to_string();
-
-        // diff: frozen SnapshotFileDiff[] shape — an honest empty array
-        // when the session has no checkpoint rows (nothing to diff).
-        let resp = client
-            .get(format!("{base}/session/{sid}/diff"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(
-            body,
-            serde_json::json!([]),
-            "no checkpoints → the frozen array projection is empty"
-        );
-        // Same for the filter forms: an unknown message is the SDK's
-        // declared `400 BadRequestError` (SessionDiffErrors declares 400 and
-        // no other error class), never a silently ignored filter.
-        let resp = client
-            .get(format!("{base}/session/{sid}/diff?message=99"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["name"], "BadRequest");
-        assert!(body["data"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("unknown message id"));
-        // A non-session diff path is a loud 404 like every other wire route.
-        let resp = client
-            .get(format!("{base}/session/999999/diff"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-
-        // revert/unrevert: honest {ok:false} + message with 409, never a
-        // silent success.
-        for path in ["revert", "unrevert"] {
-            let resp = client
-                .post(format!("{base}/session/{sid}/{path}"))
-                .basic_auth("kilo", Some(pw.as_str()))
-                .json(&serde_json::json!({"messageID": "1"}))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), 409, "{path} must be refused honestly");
-            let body: serde_json::Value = resp.json().await.unwrap();
-            assert_eq!(body["ok"], false);
-            assert!(body["message"].as_str().unwrap().contains("unavailable"));
-        }
-        // Malformed revert body / message id → 400/422; missing body → 422.
-        let resp = client
-            .post(format!("{base}/session/{sid}/revert"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"messageID": "not-a-number"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400);
-        let resp = client
-            .post(format!("{base}/session/{sid}/revert"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 422, "missing messageID is a strict-body 422");
-        let resp = client
-            .post(format!("{base}/session/{sid}/revert"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"messageID": "1", "extra": 1}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 422);
-        let _ = handle.shutdown.send(());
-    }
-
     /// A daemon whose wire snapshot surface is wired to the real native
     /// store: same store + CAS the session manager opened, plus a file
     /// service. Returns the deps, the checkpoint store used to record edits,
@@ -2201,1255 +549,6 @@ mod tests {
         ));
         let deps = deps.with_snapshots(fs.clone(), snapshots.clone());
         (deps, snapshots, fs)
-    }
-
-    #[tokio::test]
-    async fn revert_restores_file_via_wire() {
-        let dir = tempfile::tempdir().unwrap();
-        let ws_root = dir.path().join("ws");
-        std::fs::create_dir_all(&ws_root).unwrap();
-        let (deps, snapshots, fs) = wire_snapshot_deps(dir.path());
-        let session_mgr = deps.session.clone();
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        // Create a session rooted at the real workspace dir.
-        let resp = client
-            .post(format!("{base}/session"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .header("x-faktor-directory", ws_root.to_str().unwrap())
-            .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid: u64 = created["sessionID"].as_str().unwrap().parse().unwrap();
-        let session = faktor_core::id::SessionId::new(sid);
-
-        // Record a checkpoint exactly like the edit engine would: original
-        // content captured, file edited, after-content stored in the CAS.
-        let file = ws_root.join("notes.txt");
-        std::fs::write(&file, b"original\n").unwrap();
-        let before = snapshots
-            .before_write(session, "notes.txt", b"original\n")
-            .unwrap();
-        let ws_handle = fs
-            .open(faktor_core::WorkspaceId::new(sid), ws_root.clone())
-            .unwrap();
-        let after = ws_handle
-            .write_atomic(std::path::Path::new("notes.txt"), b"edited by agent\n")
-            .unwrap();
-        snapshots
-            .after_write(session, "notes.txt", before, after, 0, b"edited by agent\n")
-            .unwrap();
-        // The message the user asks to revert to arrives AFTER the edit was
-        // checkpointed (revert-to-message = undo everything since it).
-        let store = session_mgr.store();
-        store
-            .put_message(session, 1, "user", serde_json::json!({"text": "fix it"}))
-            .unwrap();
-        assert_eq!(std::fs::read(&file).unwrap(), b"edited by agent\n");
-
-        // POST revert: the file must be restored to the pre-edit state and
-        // the SDK Session8 projection must carry the durable revert marker.
-        let resp = client
-            .post(format!("{base}/session/{sid}/revert"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"messageID": "1"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["id"], sid.to_string());
-        assert_eq!(body["revert"]["messageID"], "1");
-        assert_eq!(body["revert"]["workspace"], "restored");
-        assert_eq!(std::fs::read(&file).unwrap(), b"original\n");
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn revert_conflict_409_via_wire() {
-        let dir = tempfile::tempdir().unwrap();
-        let ws_root = dir.path().join("ws");
-        std::fs::create_dir_all(&ws_root).unwrap();
-        let (deps, snapshots, fs) = wire_snapshot_deps(dir.path());
-        let session_mgr = deps.session.clone();
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        let resp = client
-            .post(format!("{base}/session"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .header("x-faktor-directory", ws_root.to_str().unwrap())
-            .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
-            .send()
-            .await
-            .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid: u64 = created["sessionID"].as_str().unwrap().parse().unwrap();
-        let session = faktor_core::id::SessionId::new(sid);
-
-        let file = ws_root.join("notes.txt");
-        std::fs::write(&file, b"original\n").unwrap();
-        let before = snapshots
-            .before_write(session, "notes.txt", b"original\n")
-            .unwrap();
-        let ws_handle = fs
-            .open(faktor_core::WorkspaceId::new(sid), ws_root.clone())
-            .unwrap();
-        let after = ws_handle
-            .write_atomic(std::path::Path::new("notes.txt"), b"edited by agent\n")
-            .unwrap();
-        snapshots
-            .after_write(session, "notes.txt", before, after, 0, b"edited by agent\n")
-            .unwrap();
-        session_mgr
-            .store()
-            .put_message(session, 1, "user", serde_json::json!({"text": "fix it"}))
-            .unwrap();
-        // The user edits the file independently after the agent's edit:
-        // revert must conflict and never clobber.
-        std::fs::write(&file, b"user owns this now\n").unwrap();
-
-        let resp = client
-            .post(format!("{base}/session/{sid}/revert"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"messageID": "1"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 409);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], false);
-        assert_eq!(body["conflict"]["path"], "notes.txt");
-        assert_eq!(
-            std::fs::read(&file).unwrap(),
-            b"user owns this now\n",
-            "a conflict must never overwrite the user's content"
-        );
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn unrevert_restores_after_state_via_wire() {
-        let dir = tempfile::tempdir().unwrap();
-        let ws_root = dir.path().join("ws");
-        std::fs::create_dir_all(&ws_root).unwrap();
-        let (deps, snapshots, fs) = wire_snapshot_deps(dir.path());
-        let session_mgr = deps.session.clone();
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        let resp = client
-            .post(format!("{base}/session"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .header("x-faktor-directory", ws_root.to_str().unwrap())
-            .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
-            .send()
-            .await
-            .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid: u64 = created["sessionID"].as_str().unwrap().parse().unwrap();
-        let session = faktor_core::id::SessionId::new(sid);
-
-        let file = ws_root.join("notes.txt");
-        std::fs::write(&file, b"original\n").unwrap();
-        let before = snapshots
-            .before_write(session, "notes.txt", b"original\n")
-            .unwrap();
-        let ws_handle = fs
-            .open(faktor_core::WorkspaceId::new(sid), ws_root.clone())
-            .unwrap();
-        let after = ws_handle
-            .write_atomic(std::path::Path::new("notes.txt"), b"edited by agent\n")
-            .unwrap();
-        snapshots
-            .after_write(session, "notes.txt", before, after, 0, b"edited by agent\n")
-            .unwrap();
-        session_mgr
-            .store()
-            .put_message(session, 1, "user", serde_json::json!({"text": "fix it"}))
-            .unwrap();
-
-        // revert → pre-edit state; unrevert → the after state comes back.
-        // The unrevert target is the DURABLE restored marker, not the body:
-        // the SDK sends no body at all.
-        let resp = client
-            .post(format!("{base}/session/{sid}/revert"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"messageID": "1"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        assert_eq!(std::fs::read(&file).unwrap(), b"original\n");
-        let resp = client
-            .post(format!("{base}/session/{sid}/unrevert"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"messageID": "1"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["id"], sid.to_string());
-        assert!(
-            body.get("revert").is_none(),
-            "a redone revert state must not project a stale marker: {body}"
-        );
-        assert_eq!(std::fs::read(&file).unwrap(), b"edited by agent\n");
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn diff_returns_projected_array_with_filters_via_wire() {
-        // Frozen shape: SnapshotFileDiff[] — one entry per recorded
-        // file-change checkpoint row, newest first, with added|deleted|
-        // modified status and (only with ?full=1) the unified diff content.
-        // Filters: ?message=<seq> limits to ONE checkpoint (the newest one
-        // recorded at-or-before that message), ?file=<rel> filters paths.
-        let dir = tempfile::tempdir().unwrap();
-        let ws_root = dir.path().join("ws");
-        std::fs::create_dir_all(&ws_root).unwrap();
-        let (deps, snapshots, fs) = wire_snapshot_deps(dir.path());
-        let session_mgr = deps.session.clone();
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        let resp = client
-            .post(format!("{base}/session"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .header("x-faktor-directory", ws_root.to_str().unwrap())
-            .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
-            .send()
-            .await
-            .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid: u64 = created["sessionID"].as_str().unwrap().parse().unwrap();
-        let session = faktor_core::id::SessionId::new(sid);
-
-        // No checkpoints yet: the frozen array projection is empty.
-        let resp = client
-            .get(format!("{base}/session/{sid}/diff"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        assert_eq!(
-            resp.json::<serde_json::Value>().await.unwrap(),
-            serde_json::json!([])
-        );
-
-        // Timeline: message1, then edit A (f.txt modified), then message2,
-        // then creation B (created-empty.txt), then deletion C (f.txt).
-        let store = session_mgr.store();
-        store
-            .put_message(session, 1, "user", serde_json::json!({"text": "one"}))
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        let before_text = "line1\nline2\nline3\nline4\nold\nline6\nline7\n";
-        let after_text = "line1\nline2\nline3\nline4\nnew\nline6\nline7\n";
-        let file = ws_root.join("f.txt");
-        std::fs::write(&file, before_text).unwrap();
-        let before = snapshots
-            .before_write(session, "f.txt", before_text.as_bytes())
-            .unwrap();
-        let ws_handle = fs
-            .open(faktor_core::WorkspaceId::new(sid), ws_root.clone())
-            .unwrap();
-        let after = ws_handle
-            .write_atomic(std::path::Path::new("f.txt"), after_text.as_bytes())
-            .unwrap();
-        snapshots
-            .after_write(session, "f.txt", before, after, 0, after_text.as_bytes())
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        store
-            .put_message(session, 2, "user", serde_json::json!({"text": "two"}))
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        // Creation: an empty-file row must project status "added", never a
-        // no-op (hash("")==hash("")).
-        let empty_hash = snapshots
-            .before_write(session, "created-empty.txt", b"")
-            .unwrap();
-        let file2 = ws_root.join("created-empty.txt");
-        snapshots
-            .record_change(
-                session,
-                "created-empty.txt",
-                faktor_snapshot::FileState::missing(),
-                None,
-                faktor_snapshot::FileState::existing(empty_hash),
-                Some(b""),
-            )
-            .unwrap();
-        std::fs::write(&file2, b"").unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        // Deletion C: a pure-removal row.
-        snapshots
-            .record_change(
-                session,
-                "f.txt",
-                faktor_snapshot::FileState::existing(after),
-                None,
-                faktor_snapshot::FileState::missing(),
-                None,
-            )
-            .unwrap();
-
-        // Default projection: ALL rows, newest first, statuses only.
-        let resp = client
-            .get(format!("{base}/session/{sid}/diff"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        let arr = body.as_array().unwrap();
-        assert_eq!(arr.len(), 3, "{body}");
-        let statuses: Vec<(&str, &str)> = arr
-            .iter()
-            .map(|e| (e["path"].as_str().unwrap(), e["status"].as_str().unwrap()))
-            .collect();
-        assert_eq!(
-            statuses,
-            vec![
-                ("f.txt", "deleted"),
-                ("created-empty.txt", "added"),
-                ("f.txt", "modified")
-            ],
-            "newest checkpoint first with exact status tags"
-        );
-        // Without ?full=1 entries carry path+status only (no diff).
-        for e in arr {
-            assert!(!e.as_object().unwrap().contains_key("diff"), "{e}");
-        }
-
-        // ?file=<rel> filters the projection to that path.
-        let resp = client
-            .get(format!("{base}/session/{sid}/diff?file=f.txt"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        let body: serde_json::Value = resp.json().await.unwrap();
-        let arr = body.as_array().unwrap();
-        assert_eq!(arr.len(), 2, "{body}");
-        assert!(
-            arr.iter().all(|e| e["path"] == "f.txt"),
-            "file filter must apply: {body}"
-        );
-        // Unknown file → empty array (200, never an error).
-        let resp = client
-            .get(format!("{base}/session/{sid}/diff?file=nope.rs"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        assert_eq!(
-            resp.json::<serde_json::Value>().await.unwrap(),
-            serde_json::json!([])
-        );
-
-        // ?message=<seq> limits to ONE checkpoint: message 1 predates every
-        // checkpoint → empty; message 2 (recorded after edit A, before B/C)
-        // → exactly edit A's row.
-        let resp = client
-            .get(format!("{base}/session/{sid}/diff?message=1"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.json::<serde_json::Value>().await.unwrap(),
-            serde_json::json!([]),
-            "no checkpoint existed at message 1"
-        );
-        let resp = client
-            .get(format!("{base}/session/{sid}/diff?message=2"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        let body: serde_json::Value = resp.json().await.unwrap();
-        let arr = body.as_array().unwrap();
-        assert_eq!(arr.len(), 1, "{body}");
-        assert_eq!(arr[0]["path"], "f.txt");
-        assert_eq!(arr[0]["status"], "modified");
-        // An unknown message is the SDK's declared 400 BadRequestError,
-        // never an empty success.
-        let resp = client
-            .get(format!("{base}/session/{sid}/diff?message=99"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["name"], "BadRequest");
-        assert!(body["data"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("unknown message id"));
-
-        // ?full=1 adds the unified content to every entry (resolution via
-        // the CAS), newest first.
-        let resp = client
-            .get(format!("{base}/session/{sid}/diff?full=1"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        let arr = body.as_array().unwrap();
-        assert_eq!(arr.len(), 3);
-        // Newest entry: the deletion of f.txt diff must be pure removals.
-        let del = &arr[0];
-        assert_eq!(del["status"], "deleted");
-        let diff = del["diff"].as_str().unwrap();
-        assert!(
-            diff.lines().any(|l| l == "-new"),
-            "deletion must diff as removals: {diff}"
-        );
-        // Oldest entry: the modification of f.txt with full context.
-        let modified_entry = &arr[2];
-        assert_eq!(modified_entry["status"], "modified");
-        let diff = modified_entry["diff"].as_str().unwrap();
-        assert!(diff.lines().any(|l| l == "-old"), "removal missing: {diff}");
-        assert!(
-            diff.lines().any(|l| l == "+new"),
-            "addition missing: {diff}"
-        );
-        assert!(
-            diff.lines().any(|l| l == " line2"),
-            "context missing: {diff}"
-        );
-        // The creation entry carries the added status with full content too.
-        assert_eq!(arr[1]["status"], "added");
-        assert!(arr[1]["diff"].is_string());
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn revert_unknown_message_id_409_via_wire() {
-        let dir = tempfile::tempdir().unwrap();
-        let ws_root = dir.path().join("ws");
-        std::fs::create_dir_all(&ws_root).unwrap();
-        let (deps, _snapshots, _fs) = wire_snapshot_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        let resp = client
-            .post(format!("{base}/session"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .header("x-faktor-directory", ws_root.to_str().unwrap())
-            .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
-            .send()
-            .await
-            .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["sessionID"].as_str().unwrap().to_string();
-        // No message with seq 42 exists: honest 409, never a silent no-op.
-        let resp = client
-            .post(format!("{base}/session/{sid}/revert"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"messageID": "42"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 409);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], false);
-        assert!(body["message"]
-            .as_str()
-            .unwrap()
-            .contains("unknown message id"));
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn sdk_full_flow_create_prompt_state_messages_abort_list() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        // Create.
-        let resp = client
-            .post(format!("{base}/session/create"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({
-                "provider": "fake",
-                "model": "m",
-                "workspace": "/tmp",
-                "title": "sdk t1",
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["id"].as_str().unwrap().to_string();
-        assert_eq!(created["title"], "sdk t1");
-        assert!(created["created_ms"].as_i64().unwrap() > 0);
-
-        // Prompt with files + models (models is opaque, must be accepted).
-        let resp = client
-            .post(format!("{base}/session/prompt"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({
-                "session_id": sid,
-                "prompt": "hi",
-                "files": ["a.rs"],
-                "models": {"main": {"provider": "fake", "model": "m"}},
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let pr: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(pr["accepted"], true);
-        assert_eq!(pr["queued"], false);
-        assert!(pr["op_id"].is_string());
-
-        // State converges.
-        let mut state = String::new();
-        for _ in 0..100 {
-            let resp = client
-                .get(format!("{base}/session/state?session_id={sid}"))
-                .header("x-faktor-server-password", pw.as_str())
-                .send()
-                .await
-                .unwrap();
-            let body: serde_json::Value = resp.json().await.unwrap();
-            state = body["agent_state"]["state"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            if matches!(
-                state.as_str(),
-                "ready_for_next_turn" | "completed" | "cancelled"
-            ) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(state, "ready_for_next_turn", "turn must complete");
-
-        // Messages page.
-        let resp = client
-            .get(format!("{base}/session/messages?session_id={sid}&limit=10"))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let page: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(page["session_id"], sid);
-        assert!(page["messages"].as_array().unwrap().len() >= 2, "{page}");
-
-        // Abort (nothing running now): frozen shape, no error.
-        let resp = client
-            .post(format!("{base}/session/abort"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"session_id": sid}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let ab: serde_json::Value = resp.json().await.unwrap();
-        assert!(ab["aborted"].is_array());
-
-        // List contains the session.
-        let resp = client
-            .get(format!("{base}/session/list"))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap();
-        let list: serde_json::Value = resp.json().await.unwrap();
-        let ids: Vec<&str> = list["sessions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|s| s["id"].as_str())
-            .collect();
-        assert!(ids.contains(&sid.as_str()));
-
-        // Unknown sessions are loud 404s on every SDK route.
-        for (method, path) in [
-            ("get", "/session/state?session_id=999999"),
-            ("get", "/session/messages?session_id=999999"),
-        ] {
-            let resp = if method == "get" {
-                client
-                    .get(format!("{base}{path}"))
-                    .header("x-faktor-server-password", pw.as_str())
-                    .send()
-                    .await
-                    .unwrap()
-            } else {
-                unreachable!()
-            };
-            assert_eq!(resp.status(), 404, "{path}");
-        }
-        let resp = client
-            .post(format!("{base}/session/prompt"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"session_id": "999999", "prompt": "x"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-        let resp = client
-            .post(format!("{base}/session/abort"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"session_id": "999999"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-
-        // Malformed ids and empty prompts are 400s.
-        let resp = client
-            .post(format!("{base}/session/prompt"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"session_id": "0", "prompt": "x"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400);
-        let resp = client
-            .post(format!("{base}/session/prompt"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"session_id": sid, "prompt": "   "}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400);
-        // Unknown fields in the SDK body are protocol drift (422 from the
-        // deny_unknown_fields extraction gate).
-        let resp = client
-            .post(format!("{base}/session/prompt"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"session_id": sid, "prompt": "x", "evil": true}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 422);
-
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn global_event_stream_delivers_sdk_frames_and_resumes() {
-        use futures_util::StreamExt;
-        let dir = tempfile::tempdir().unwrap();
-        let mut deps = test_deps(dir.path());
-        deps.directory = Some("/w".into());
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        let mut sse = client
-            .get(format!("{base}/global/event?after=0"))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap()
-            .bytes_stream();
-
-        let resp = client
-            .post(format!("{base}/session/create"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
-            .send()
-            .await
-            .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["id"].as_str().unwrap().to_string();
-
-        // Read frames until the SDK `session.created` frame arrives; record
-        // its SSE id.
-        let mut buf = String::new();
-        let mut created_id = None;
-        for _ in 0..300 {
-            match tokio::time::timeout(Duration::from_millis(200), sse.next()).await {
-                Ok(Some(Ok(chunk))) => {
-                    buf.push_str(&String::from_utf8_lossy(&chunk));
-                    if let Some(id) = frame_id_containing(&buf, "\"type\":\"session.created\"") {
-                        created_id = Some(id);
-                        break;
-                    }
-                }
-                Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
-            }
-        }
-        let created_id = created_id.expect("session.created frame must arrive");
-        // The SDK envelope carries the session's durable workspace root.
-        assert!(
-            buf.contains("\"directory\":\".\""),
-            "SDK envelope directory missing: {buf}"
-        );
-        // The projected frame must satisfy the declared SDK shape.
-        let frames = parse_sdk_frames(&buf);
-        let created_frame = frames
-            .iter()
-            .find(|(_, v)| v["payload"]["type"] == "session.created")
-            .map(|(_, v)| v.clone())
-            .expect("projected session.created frame");
-        assert!(created_frame["payload"]["id"].as_str().is_some());
-        assert_eq!(created_frame["payload"]["properties"]["sessionID"], sid);
-        assert_eq!(created_frame["payload"]["properties"]["info"]["id"], sid);
-
-        // Prompt: the SDK projector answers session.turn.open (journal
-        // PromptReceived) and message.updated / message.part.updated from
-        // the durable rows.
-        client
-            .post(format!("{base}/session/prompt"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"session_id": sid, "prompt": "hi"}))
-            .send()
-            .await
-            .unwrap();
-        let mut saw_turn_open = false;
-        for _ in 0..300 {
-            match tokio::time::timeout(Duration::from_millis(200), sse.next()).await {
-                Ok(Some(Ok(chunk))) => {
-                    buf.push_str(&String::from_utf8_lossy(&chunk));
-                    if buf.contains("\"type\":\"session.turn.open\"") {
-                        saw_turn_open = true;
-                        break;
-                    }
-                }
-                Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
-            }
-        }
-        assert!(
-            saw_turn_open,
-            "stream must deliver session.turn.open; got: {buf}"
-        );
-        drop(sse);
-
-        // Resume after the created frame: no replay of session.created, but
-        // the subsequent frames are delivered with strictly larger ids.
-        let mut sse2 = client
-            .get(format!("{base}/global/event?after={created_id}"))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap()
-            .bytes_stream();
-        client
-            .post(format!("{base}/session/prompt"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"session_id": sid, "prompt": "again"}))
-            .send()
-            .await
-            .unwrap();
-        let mut buf2 = String::new();
-        let mut resumed = false;
-        for _ in 0..300 {
-            match tokio::time::timeout(Duration::from_millis(200), sse2.next()).await {
-                Ok(Some(Ok(chunk))) => {
-                    buf2.push_str(&String::from_utf8_lossy(&chunk));
-                    if buf2.contains("\"type\":\"session.turn.open\"") {
-                        resumed = true;
-                        break;
-                    }
-                }
-                Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
-            }
-        }
-        assert!(
-            resumed,
-            "resumed stream must deliver new frames; got: {buf2}"
-        );
-        assert!(
-            !buf2.contains("session.created"),
-            "resume after {created_id} must not replay session.created"
-        );
-        // Every resumed frame's id is strictly greater than the cursor.
-        for (id, frame) in parse_sdk_frames(&buf2) {
-            assert!(
-                id > created_id,
-                "resume cursor violated: {id} <= {created_id}"
-            );
-            assert!(frame["payload"]["type"] != "session.created");
-        }
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn global_event_oversized_after_is_clamped_and_negative_rejected() {
-        use futures_util::StreamExt;
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        // u64::MAX is clamped (stream stays open, never an error).
-        let resp = client
-            .get(format!("{base}/global/event?after={}", u64::MAX))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let mut sse = resp.bytes_stream();
-        let mut saw_data = false;
-        for _ in 0..50 {
-            match tokio::time::timeout(Duration::from_millis(200), sse.next()).await {
-                Ok(Some(Ok(chunk))) => {
-                    let text = String::from_utf8_lossy(&chunk);
-                    if text.contains("data:") {
-                        saw_data = true;
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        assert!(
-            saw_data,
-            "clamped stream must stay alive (heartbeat/frames)"
-        );
-        drop(sse);
-
-        // Negative after is malformed: 400.
-        let resp = client
-            .get(format!("{base}/global/event?after=-1"))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400);
-
-        // No password on the event stream: 401.
-        let resp = client
-            .get(format!("{base}/global/event?after=0"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn permission_reply_and_list_via_sdk() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut registry = faktor_provider::ProviderRegistry::new();
-        registry
-            .try_register(Arc::new(FakeProvider::with_script(
-                "fake",
-                ModelCapabilities {
-                    tools: true,
-                    ..Default::default()
-                },
-                vec![
-                    faktor_provider::ScriptedResponse::ToolCall {
-                        id: "c1".into(),
-                        name: "echo".into(),
-                        input: serde_json::json!({"x": 1}),
-                    },
-                    faktor_provider::ScriptedResponse::End,
-                ],
-            )))
-            .unwrap();
-        let session =
-            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
-        let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
-        let mut tools = faktor_agent::ToolRegistry::new();
-        tools.register(faktor_agent::Tool {
-            name: "echo".into(),
-            description: "d".into(),
-            input_schema: serde_json::json!({}),
-            resource_class: faktor_core::resource::ResourceClass::Cpu,
-            capability: None,
-            recovery_hint: faktor_agent::RecoveryHint::Idempotent,
-            path_args: vec![],
-            execute: Arc::new(|_ctx, _args| {
-                Box::pin(async move { Ok(faktor_agent::ToolOutcome::default()) })
-            }),
-        });
-        let agent = AgentRuntime::new(faktor_agent::AgentDeps {
-            session: session.clone(),
-            providers: Arc::new(registry),
-            chunk_sink: None,
-            permission_requester: permissions.clone(),
-            evidence: Arc::new(faktor_agent::NoEvidence),
-            tools: Arc::new(tools),
-            cas: None,
-            workspaces: faktor_fs::WorkspaceFileService::new(),
-            edit: None,
-            snapshots: None,
-            sandbox: None,
-            supervisor: None,
-            verification: faktor_agent::VerificationService::disabled(),
-            model: "m".into(),
-            compaction_model: None,
-            compact_at_usage: 0.65,
-            instructions: "You are a test server agent.".into(),
-            hooks: None,
-            instructions_resolver: faktor_instructions::no_roots_resolver(),
-            routing: faktor_agent::FixedRoutingPolicy::passthrough(),
-            budgets: Arc::new(faktor_session::NoopBudget),
-            clock: Arc::new(faktor_core::time::SystemClock),
-            tool_call_mode: faktor_agent::ToolCallMode::Native,
-            tool_deadline_ms: 2000,
-            retry_policy: faktor_core::retry::RetryPolicy::default(),
-            semantic: faktor_agent::fallback_semantic_registry(),
-            context_prior: None,
-            efficiency: Default::default(),
-        })
-        .unwrap();
-        let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
-        let deps = ServerDeps {
-            budgets: faktor_session::DurableBudgetLedger::new(session.clone()),
-            session: session.clone(),
-            agent,
-            permissions: permissions.clone(),
-            orchestrator,
-            tasks,
-            auth_token: AuthToken::generate(),
-            server_password: ServerPassword::generate(),
-            directory: None,
-            version: "0.1.0".into(),
-            fs: None,
-            snapshots: None,
-            chunk_rx: None,
-            simulate_not_ready: false,
-            evidence: None,
-            semantic: None,
-        };
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        let resp = client
-            .post(format!("{base}/session/create"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
-            .send()
-            .await
-            .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["id"].as_str().unwrap().to_string();
-        client
-            .post(format!("{base}/session/prompt"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"session_id": sid, "prompt": "use tools"}))
-            .send()
-            .await
-            .unwrap();
-
-        // The permission surfaces in /permission/list with its session.
-        let mut pid = None;
-        let perm_deadline = std::time::Instant::now() + Duration::from_secs(90);
-        loop {
-            if std::time::Instant::now() >= perm_deadline {
-                break;
-            }
-            let resp = client
-                .get(format!("{base}/permission/list?session_id={sid}"))
-                .header("x-faktor-server-password", pw.as_str())
-                .send()
-                .await
-                .unwrap();
-            let list: serde_json::Value = resp.json().await.unwrap();
-            let perms = list["permissions"].as_array().unwrap();
-            assert!(
-                perms
-                    .iter()
-                    .all(|p| p["session_id"].as_str() == Some(sid.as_str())),
-                "session filter must apply"
-            );
-            if let Some(first) = perms.first() {
-                assert_eq!(first["capability"], "execute_shell");
-                assert!(first["detail"].is_object());
-                pid = first["id"].as_str().map(String::from);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let pid = pid.expect("permission must surface in /permission/list");
-
-        // SDK-exact routes: `GET /permission` is the declared BARE
-        // `PermissionRequest[]` over the same real pending state.
-        let resp = client
-            .get(format!("{base}/permission"))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let sdk_list: serde_json::Value = resp.json().await.unwrap();
-        let sdk_perm = sdk_list
-            .as_array()
-            .unwrap_or_else(|| panic!("/permission must be a bare array: {sdk_list}"))
-            .iter()
-            .find(|p| p["id"].as_str() == Some(pid.as_str()))
-            .unwrap_or_else(|| panic!("pending permission missing from /permission: {sdk_list}"));
-        assert_eq!(sdk_perm["sessionID"], sid);
-        assert_eq!(sdk_perm["permission"], "execute_shell");
-        assert!(sdk_perm["patterns"].is_array());
-        assert!(sdk_perm["metadata"]["detail"].is_object());
-        assert!(sdk_perm["always"].as_array().unwrap().is_empty());
-        // `/question` and `/network` are the SDK's other two list surfaces:
-        // no structured question / reconnect-wait state exists in this
-        // slice, so they are truthfully empty while the ask rides
-        // `/permission`.
-        for path in ["question", "network"] {
-            let resp = client
-                .get(format!("{base}/{path}"))
-                .header("x-faktor-server-password", pw.as_str())
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), 200, "{path}");
-            let body: serde_json::Value = resp.json().await.unwrap();
-            assert_eq!(
-                body,
-                serde_json::json!([]),
-                "{path} must be a bare empty array"
-            );
-        }
-
-        // Resolve through /permission/reply.
-        let resp = client
-            .post(format!("{base}/permission/reply"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"permission_id": pid, "decision": "allow"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], true);
-
-        // The turn completes.
-        let mut done = false;
-        for _ in 0..100 {
-            let id = parse_session_id(&sid).unwrap();
-            let state = session.get_session(id).unwrap().unwrap().state().unwrap();
-            if matches!(state, faktor_core::state::AgentState::ReadyForNextTurn) {
-                done = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(done, "turn must finish after permission grant");
-
-        // The resolved permission is gone from the list.
-        let resp = client
-            .get(format!("{base}/permission/list"))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap();
-        let list: serde_json::Value = resp.json().await.unwrap();
-        assert!(list["permissions"].as_array().unwrap().is_empty());
-
-        // Double reply → 409; malformed ids/decisions → 400.
-        let resp = client
-            .post(format!("{base}/permission/reply"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"permission_id": pid, "decision": "allow"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 409);
-        let resp = client
-            .post(format!("{base}/permission/reply"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"permission_id": "bogus", "decision": "allow"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400);
-        let resp = client
-            .post(format!("{base}/permission/reply"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"permission_id": "1", "decision": "maybe"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400);
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn question_network_and_config_endpoints() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        // Questions: empty list; unknown replies are loud 404s.
-        let resp = client
-            .get(format!("{base}/question/list"))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["questions"], serde_json::json!([]));
-        let resp = client
-            .post(format!("{base}/question/reply"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"question_id": "q1", "decision": "allow"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-        let resp = client
-            .post(format!("{base}/question/reply"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"question_id": "", "decision": "allow"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400);
-
-        // Networks: same shapes.
-        let resp = client
-            .get(format!("{base}/network/list"))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap();
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["networks"], serde_json::json!([]));
-        let resp = client
-            .post(format!("{base}/network/reply"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"network_id": "n1", "decision": "deny"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-
-        // Config: set → get roundtrip.
-        let resp = client
-            .post(format!("{base}/config/set"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"config": {"model": "qwen3.8", "nested": {"a": [1, 2]}}}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let resp = client
-            .get(format!("{base}/config/get"))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap();
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["config"]["model"], "qwen3.8");
-        assert_eq!(body["config"]["nested"]["a"], serde_json::json!([1, 2]));
-
-        // Oversized config is rejected (bounded everything).
-        let big = "x".repeat(1024 * 1024 + 1);
-        let resp = client
-            .post(format!("{base}/config/set"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"config": {"blob": big}}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 413);
-
-        // Config is still the previous value after the rejection.
-        let resp = client
-            .get(format!("{base}/config/get"))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap();
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["config"]["model"], "qwen3.8");
-
-        // All three areas require auth.
-        for (method, path) in [
-            ("get", "/config/get"),
-            ("get", "/question/list"),
-            ("get", "/network/list"),
-        ] {
-            let resp = if method == "get" {
-                client.get(format!("{base}{path}")).send().await.unwrap()
-            } else {
-                unreachable!()
-            };
-            assert_eq!(resp.status(), 401, "{path}");
-        }
-        let _ = handle.shutdown.send(());
-    }
-
-    fn frame_id_containing(buf: &str, needle: &str) -> Option<u64> {
-        for frame in buf.split("\n\n") {
-            if !frame.contains(needle) {
-                continue;
-            }
-            for line in frame.lines() {
-                if let Some(id) = line.strip_prefix("id: ") {
-                    return id.trim().parse().ok();
-                }
-            }
-        }
-        None
-    }
-
-    fn parse_sdk_frames(buf: &str) -> Vec<(u64, serde_json::Value)> {
-        let mut out = Vec::new();
-        for frame in buf.split("\n\n") {
-            let mut id: Option<u64> = None;
-            let mut data: Option<serde_json::Value> = None;
-            for line in frame.lines() {
-                if let Some(v) = line.strip_prefix("id: ") {
-                    id = v.trim().parse().ok();
-                } else if let Some(v) = line.strip_prefix("data: ") {
-                    data = serde_json::from_str(v).ok();
-                }
-            }
-            let (Some(id), Some(data)) = (id, data) else {
-                continue;
-            };
-            if data.get("payload").is_none() {
-                continue; // keep-alive heartbeat, not an SDK frame
-            }
-            out.push((id, data));
-        }
-        out
     }
 
     fn test_deps(root: &std::path::Path) -> ServerDeps {
@@ -3531,1830 +630,215 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn legacy_prompt_on_unknown_session_is_404_with_real_op_id() {
-        // Audit round 8: the legacy prompt answered 200 accepted:true for
-        // sessions that do not exist, and the op_id was hardcoded "turn".
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let token = deps.auth_token.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-        // Unknown session id.
-        let resp = client
-            .post(format!("{base}/api/session/999999/prompt"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({"prompt": "hi", "files": []}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            404,
-            "unknown session must 404, never a phantom 200"
-        );
-        // A real session returns a REAL operation id (never the literal
-        // "turn") — abort correlation depends on it.
-        let resp = client
-            .post(format!("{base}/api/session"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({
-                "provider": "fake",
-                "model": "m",
-                "workspace": "/tmp",
-                "title": "t-opid",
-            }))
-            .send()
-            .await
-            .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["id"].as_str().unwrap().to_string();
-        let resp = client
-            .post(format!("{base}/api/session/{sid}/prompt"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({"prompt": "second prompt", "files": []}))
-            .send()
-            .await
-            .unwrap();
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["accepted"], true);
-        let op = body["op_id"].as_str().unwrap_or("");
-        assert!(
-            !op.is_empty() && op != "turn",
-            "op_id must be real, got {op:?}"
-        );
-        // The op_id parses as a u64 operation id.
-        assert!(op.parse::<u64>().is_ok());
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn sdk_abort_honors_targeted_op_id() {
-        // The SDK abort body carries an op_id; aborting one queued prompt
-        // must cancel exactly that row and leave the session machine
-        // untouched (audit round 8: the field was ignored and abort was
-        // always all-ops).
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let token = deps.auth_token.clone();
-        let manager = deps.session.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-        // Deterministic busy state, handle-side: prompt A lands the machine
-        // in Preparing (not PROMPTABLE); prompt B durably queues.
-        let ws = manager.create_workspace("/tmp").unwrap();
-        let session = manager.create_session(ws, "t-abort", "fake", "m").unwrap();
-        let session_id = session.id().to_string();
-        let _ = session.submit_prompt("first", &[]).unwrap();
-        let second = session.submit_prompt("second", &[]).unwrap();
-        assert!(second.queued, "second prompt must queue behind Preparing");
-        let op_id = second.op_id.to_string();
-        // Targeted abort of the QUEUED prompt via the SDK surface.
-        let resp = client
-            .post(format!("{base}/session/abort"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({"session_id": session_id, "op_id": op_id}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let aborted: serde_json::Value = resp.json().await.unwrap();
-        let list = aborted["aborted"].as_array().unwrap();
-        assert!(
-            list.iter().any(|o| o.as_str() == Some(op_id.as_str())),
-            "targeted abort must report the cancelled op: {list:?}"
-        );
-        // The queued row is durably cancelled; the machine never moved.
-        assert_eq!(
-            session.state().unwrap(),
-            faktor_core::state::AgentState::Preparing,
-            "a queued-prompt kill must not touch the state machine"
-        );
-        assert_eq!(session.queued_prompt_count().unwrap(), 0);
-        let _ = handle.shutdown.send(());
-    }
-
     // ------------------------------------------------------------------
-    // P0 wire-compat round: the added operations (status aliases, fork,
+    // P0 round: the added operations (status aliases, fork,
     // summarize, delete, deleteMessage, question/network over the permission
     // machinery, config update/warnings/overlay, pty rejection, dispose,
     // auth rotation) each do real work and refuse loudly where the runtime
     // cannot honor them.
 
-    #[tokio::test]
-    async fn session_get_and_status_aliases_serve_the_state_projection() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-        let basic = |r: reqwest::RequestBuilder| r.basic_auth("kilo", Some(pw.as_str()));
-
-        let resp = basic(
-            client
-                .post(format!("{base}/session"))
-                .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}})),
-        )
-        .send()
-        .await
-        .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["sessionID"].as_str().unwrap().to_string();
-
-        // session.get == the summary handler (GET /session/{sessionID}).
-        let resp = basic(client.get(format!("{base}/session/{sid}")))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let summary: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(summary["sessionID"], sid);
-        assert!(summary["title"].is_string());
-        assert!(summary["state"].is_string());
-
-        // /session/{sessionID}/status == the state projection.
-        let resp = basic(client.get(format!("{base}/session/{sid}/status")))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let view: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(view["session_id"], sid);
-        assert_eq!(view["agent_state"]["state"], "idle");
-
-        // /session/status?session_id= == the same view.
-        let resp = basic(client.get(format!("{base}/session/status?session_id={sid}")))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let view2: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(view, view2);
-
-        // Both aliases are loud 404s for unknown sessions.
-        for path in [
-            "/session/999999/status",
-            "/session/status?session_id=999999",
-        ] {
-            let resp = basic(client.get(format!("{base}{path}")))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), 404, "{path}");
-        }
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn fork_copies_history_and_stays_independent() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let session_mgr = deps.session.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-        let basic = |r: reqwest::RequestBuilder| r.basic_auth("kilo", Some(pw.as_str()));
-
-        // Source session with one completed exchange.
-        let resp = basic(
-            client
-                .post(format!("{base}/session"))
-                .json(&serde_json::json!({
-                    "title": "orig",
-                    "model": {"id": "m", "providerID": "fake"}
-                })),
-        )
-        .send()
-        .await
-        .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["sessionID"].as_str().unwrap().to_string();
-        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
-            &serde_json::json!({
-                "model": {"providerID": "fake", "modelID": "m"},
-                "parts": [{"type": "text", "text": "hello fork"}],
-            }),
-        ))
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), 200);
-
-        let source_page = || async {
-            let resp = basic(client.get(format!("{base}/session/{sid}/message?limit=100")))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), 200);
-            resp.json::<serde_json::Value>().await.unwrap()
-        };
-        let before = source_page().await;
-        assert!(before.as_array().unwrap().len() >= 2, "{before}");
-
-        // Fork: a NEW session titled "<orig> (fork)".
-        let resp = basic(client.post(format!("{base}/session/{sid}/fork")))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
-        let forked: serde_json::Value = resp.json().await.unwrap();
-        let fork_sid = forked["sessionID"].as_str().unwrap().to_string();
-        assert_ne!(fork_sid, sid);
-        assert_eq!(forked["title"], "orig (fork)");
-        assert!(forked["createdMs"].as_i64().unwrap() > 0);
-
-        // The fork's message array equals the source's once the ids that
-        // differ BY CONSTRUCTION are normalized (the fork is a new session
-        // with its own sessionID and its own row createdMs): same messages,
-        // same order, same parts.
-        let resp = basic(client.get(format!("{base}/session/{fork_sid}/message?limit=100")))
-            .send()
-            .await
-            .unwrap();
-        let after = resp.json::<serde_json::Value>().await.unwrap();
-        assert_eq!(
-            normalize_page(&after),
-            normalize_page(&before),
-            "fork history must equal the source's"
-        );
-
-        // Independence: new messages on the ORIGINAL never appear on the
-        // fork (the fake provider's script is one-shot, so the new message
-        // is appended durably handle-side, exactly like a turn would).
-        let original = session_mgr
-            .get_session(parse_session_id(&sid).unwrap())
-            .unwrap()
-            .unwrap();
-        let mid = original
-            .put_message(
-                original.proposed_message_seq().unwrap(),
-                "user",
-                serde_json::json!({"text": "third turn"}),
-            )
-            .unwrap();
-        original.put_text_part(mid, "direct text").unwrap();
-        let grown = source_page().await;
-        assert!(grown.as_array().unwrap().len() > before.as_array().unwrap().len());
-        let resp = basic(client.get(format!("{base}/session/{fork_sid}/message?limit=100")))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            normalize_page(&resp.json::<serde_json::Value>().await.unwrap()),
-            normalize_page(&after),
-            "the fork must not see the original's new messages"
-        );
-        let _ = handle.shutdown.send(());
-    }
-
     /// Drop the ids that differ by construction between a session and its
     /// fork (info.sessionID and the row createdMs) for equality checks.
-    fn normalize_page(page: &serde_json::Value) -> serde_json::Value {
-        let mut out = page.clone();
-        if let Some(arr) = out.as_array_mut() {
-            for entry in arr {
-                if let Some(info) = entry["info"].as_object_mut() {
-                    info.remove("sessionID");
-                    info.remove("createdMs");
-                }
-            }
-        }
-        out
-    }
+
+    // ---------------------------------------------------------------- native v1
 
     #[tokio::test]
-    async fn fork_unknown_session_is_404() {
+    async fn native_bootstrap_strict_dtos_and_cursor_stream() {
         let dir = tempfile::tempdir().unwrap();
         let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-        let resp = client
-            .post(format!("{base}/session/999999/fork"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn summarize_returns_the_sdk_boolean_with_a_bounded_digest_computed() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        let resp = client
-            .post(format!("{base}/session"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({
-                "title": "digest me",
-                "model": {"id": "m", "providerID": "fake"}
-            }))
-            .send()
-            .await
-            .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["sessionID"].as_str().unwrap().to_string();
-
-        // The SDK declares `200: boolean`. The bounded digest over the
-        // newest messages is still computed server-side (the real work);
-        // the type has no text field for it.
-        let resp = client
-            .post(format!("{base}/session/{sid}/summarize"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body, serde_json::json!(true));
-
-        // After a turn the same SDK boolean answers over a non-empty
-        // session (the digest is bounded by construction).
-        let resp = client
-            .post(format!("{base}/session/{sid}/message"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({
-                "model": {"providerID": "fake", "modelID": "m"},
-                "parts": [{"type": "text", "text": "summarize this"}],
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let resp = client
-            .post(format!("{base}/session/{sid}/summarize"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        assert_eq!(
-            resp.json::<serde_json::Value>().await.unwrap(),
-            serde_json::json!(true)
-        );
-        // Unknown sessions stay 404 (never a fabricated success).
-        let resp = client
-            .post(format!("{base}/session/999999/summarize"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn session_delete_refuses_mid_turn_and_ends_durably() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let manager = deps.session.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        // A busy session (handle-side submit → Preparing, no driver): DELETE
-        // must refuse with an explicit 409, never silently "succeed".
-        let ws = manager.create_workspace("/tmp").unwrap();
-        let busy = manager.create_session(ws, "busy", "fake", "m").unwrap();
-        let busy_id = busy.id().to_string();
-        busy.submit_prompt("first", &[]).unwrap();
-        assert!(busy.state().unwrap().is_active());
-        let resp = client
-            .delete(format!("{base}/session/{busy_id}"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 409, "mid-turn delete must be refused");
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], false);
-        assert!(body["message"].as_str().unwrap().contains("mid-turn"));
-
-        // An idle session deletes: durable end (lifecycle Closed, state
-        // Completed), prompts refused afterwards.
-        let resp = client
-            .post(format!("{base}/session"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
-            .send()
-            .await
-            .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid: u64 = created["sessionID"].as_str().unwrap().parse().unwrap();
-        let resp = client
-            .delete(format!("{base}/session/{sid}"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        // SDK-declared `200: boolean`.
-        assert_eq!(body, serde_json::json!(true));
-        let row = manager
-            .get_session(faktor_core::id::SessionId::new(sid))
-            .unwrap()
-            .unwrap()
-            .row()
-            .unwrap();
-        assert!(row.lifecycle.is_terminal(), "durable Closed tombstone");
-        assert_eq!(row.state, faktor_core::state::AgentState::Completed);
-        // Prompts on the deleted session are refused (never a phantom run).
-        let resp = client
-            .post(format!("{base}/session/{sid}/message"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({
-                "model": {"providerID": "fake", "modelID": "m"},
-                "parts": [{"type": "text", "text": "nope"}],
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 409, "deleted sessions refuse prompts");
-        // Double delete is a loud conflict, and the tombstone is durable
-        // across a manager reopen.
-        let resp = client
-            .delete(format!("{base}/session/{sid}"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 409);
-        drop(manager);
-        let reopened =
-            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
-        let row = reopened
-            .get_session(faktor_core::id::SessionId::new(sid))
-            .unwrap()
-            .unwrap()
-            .row()
-            .unwrap();
-        assert!(row.lifecycle.is_terminal(), "Closed survives reopen");
-        // A PARKED session (turn finished → ReadyForNextTurn, no active
-        // turn record) is deletable: the session layer's active-state
-        // predicate covers the parked machine, so the compat route
-        // completes the durable close through the daemon's own end path;
-        // the SDK delete contract (boolean; only 400/404 declared) has no
-        // 409 for this state.
-        let resp = client
-            .post(format!("{base}/session"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
-            .send()
-            .await
-            .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let parked: u64 = created["sessionID"].as_str().unwrap().parse().unwrap();
-        let resp = client
-            .post(format!("{base}/session/{parked}/message"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({
-                "model": {"providerID": "fake", "modelID": "m"},
-                "parts": [{"type": "text", "text": "finish the turn"}],
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let parked_row = reopened
-            .get_session(faktor_core::id::SessionId::new(parked))
-            .unwrap()
-            .unwrap()
-            .row()
-            .unwrap();
-        assert_eq!(
-            parked_row.state,
-            faktor_core::state::AgentState::ReadyForNextTurn
-        );
-        let resp = client
-            .delete(format!("{base}/session/{parked}"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "parked delete must succeed");
-        assert_eq!(
-            resp.json::<serde_json::Value>().await.unwrap(),
-            serde_json::json!(true)
-        );
-        let parked_row = reopened
-            .get_session(faktor_core::id::SessionId::new(parked))
-            .unwrap()
-            .unwrap()
-            .row()
-            .unwrap();
-        assert!(
-            parked_row.lifecycle.is_terminal(),
-            "parked delete must be durably Closed"
-        );
-        // Unknown session delete → 404.
-        let resp = client
-            .delete(format!("{base}/session/999999"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn delete_message_refuses_dependencies_and_removes_durably() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let manager = deps.session.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        // Seed rows directly: seq1 user, seq2 assistant with a tool_call,
-        // seq3 assistant with the tool_result referencing call c1, seq4
-        // plain text.
-        let ws = manager.create_workspace("/tmp").unwrap();
-        let s = manager.create_session(ws, "t-del", "fake", "m").unwrap();
-        let sid = s.id().to_string();
-        let store = manager.store();
-        store
-            .put_message(s.id(), 1, "user", serde_json::json!({"text": "run tools"}))
-            .unwrap();
-        let m2 = store
-            .put_message(s.id(), 2, "assistant", serde_json::json!({"parts": []}))
-            .unwrap();
-        store
-            .put_part(
-                m2,
-                "tool_call",
-                serde_json::json!({
-                    "tool_call_id": "c1",
-                    "name": "echo",
-                    "input": {"x": 1},
-                    "state": "completed"
-                }),
-            )
-            .unwrap();
-        let m3 = store
-            .put_message(s.id(), 3, "assistant", serde_json::json!({"parts": []}))
-            .unwrap();
-        store
-            .put_part(
-                m3,
-                "tool_result",
-                serde_json::json!({"tool_call_id": "c1", "excerpt": "out"}),
-            )
-            .unwrap();
-        store
-            .put_message(s.id(), 4, "user", serde_json::json!({"text": "plain"}))
-            .unwrap();
-
-        // Unknown message → 404; malformed id → explicit refusal.
-        let resp = client
-            .delete(format!("{base}/session/{sid}/message/99"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-        let resp = client
-            .delete(format!("{base}/session/{sid}/message/abc"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 409);
-
-        // The tool-result message has a dependency → refused with the clear
-        // dependency error.
-        let resp = client
-            .delete(format!("{base}/session/{sid}/message/3"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 409);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], false);
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap()
-                .contains("tool-result dependencies"),
-            "{body}"
-        );
-        // The tool-call message is referenced by that result → same refusal.
-        let resp = client
-            .delete(format!("{base}/session/{sid}/message/2"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 409);
-        assert_eq!(store.message_count(s.id()).unwrap(), 4);
-
-        // A dependency-free message is removed DURABLY: the SDK-declared
-        // boolean `true`, the row and its parts are gone, and the surviving
-        // sequences are stable.
-        let resp = client
-            .delete(format!("{base}/session/{sid}/message/1"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body, serde_json::json!(true));
-        assert_eq!(store.message_count(s.id()).unwrap(), 3);
-        assert_eq!(store.message_created_ms(s.id(), 1).unwrap(), None);
-        // Surviving rows keep their sequences (2, 3, 4); a second delete of
-        // the same message is an honest 404.
-        let resp = client
-            .delete(format!("{base}/session/{sid}/message/1"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-        let resp = client
-            .delete(format!("{base}/session/{sid}/message/4"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        // The deleted message no longer appears in the wire page.
-        let resp = client
-            .get(format!("{base}/session/{sid}/message"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let page: serde_json::Value = resp.json().await.unwrap();
-        let seqs: Vec<&str> = page
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|e| e["info"]["messageID"].as_str())
-            .collect();
-        assert_eq!(seqs, vec!["3", "2"], "rows removed, seqs stable: {seqs:?}");
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn delete_message_refuses_in_flight_newest_message() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let manager = deps.session.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-        let ws = manager.create_workspace("/tmp").unwrap();
-        let s = manager
-            .create_session(ws, "t-inflight", "fake", "m")
-            .unwrap();
-        let sid = s.id().to_string();
-        // An active turn whose assistant reply (the newest message) is
-        // mid-stream.
-        s.submit_prompt("stream me", &[]).unwrap();
-        // The prompt materializes at seq 2; the streaming assistant reply
-        // (the newest message, identity = durable seq) is seq 3.
-        let mid = s
-            .put_message(3, "assistant", serde_json::json!({"parts": []}))
-            .unwrap();
-        s.put_text_part(mid, "partial").unwrap();
-        s.append_event(
-            faktor_core::event::EventKind::ContextPrepared,
-            faktor_core::state::AgentState::BuildingContext,
-            None,
-            None,
-        )
-        .unwrap();
-        s.append_event(
-            faktor_core::event::EventKind::ModelStarted,
-            faktor_core::state::AgentState::WaitingForModel,
-            None,
-            None,
-        )
-        .unwrap();
-        s.append_event(
-            faktor_core::event::EventKind::ModelChunkReceived,
-            faktor_core::state::AgentState::Streaming,
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(s.state().unwrap().is_active());
-        let resp = client
-            .delete(format!("{base}/session/{sid}/message/3"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 409);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert!(
-            body["message"].as_str().unwrap().contains("in flight"),
-            "{body}"
-        );
-        assert_eq!(s.message_count().unwrap(), 2, "nothing was removed");
-        // The just-streamed message is gone from the wire page only AFTER
-        // the turn is over; while active it stays.
-        assert!(s.state().unwrap().is_active());
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn session_update_persists_title_durably() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let manager = deps.session.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-        let ws = manager.create_workspace("/tmp").unwrap();
-        let s = manager
-            .create_session(ws, "orig title", "fake", "m")
-            .unwrap();
-        let sid = s.id().to_string();
-
-        // Rename via the wire surface.
-        let resp = client
-            .post(format!("{base}/session/{sid}"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"title": "renamed by wire"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["sessionID"], sid);
-        assert_eq!(body["title"], "renamed by wire");
-        assert!(body["updatedMs"].as_i64().unwrap() > 0);
-        // The GET summary reads the durable row.
-        let resp = client
-            .get(format!("{base}/session/{sid}"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        let summary: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(summary["title"], "renamed by wire");
-        assert_eq!(s.title().unwrap(), "renamed by wire");
-        // Control characters are stripped by the session layer.
-        let resp = client
-            .post(format!("{base}/session/{sid}"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"title": "clean\n\tname\u{7f}done"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["title"], "cleannamedone");
-        // Hostile titles refuse.
-        let resp = client
-            .post(format!("{base}/session/{sid}"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"title": "\n\r\u{0}"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400, "control-only title refuses");
-        let long = "x".repeat(300);
-        let resp = client
-            .post(format!("{base}/session/{sid}"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"title": long}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 413, "oversized title refuses");
-        // Unknown fields (the per-turn envelope) are protocol drift.
-        // The per-turn envelope fields (model/provider) are protocol drift:
-        // the strict DTO rejects them (the wire client never sends them).
-        let resp = client
-            .post(format!("{base}/session/{sid}"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"title": "x", "model": {"id": "m"}}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 422, "{:?}", resp.text().await);
-        assert_eq!(
-            s.title().unwrap(),
-            "cleannamedone",
-            "nothing hostile landed"
-        );
-        // Unknown session → 404.
-        let resp = client
-            .post(format!("{base}/session/9999"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"title": "x"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-        // The durable row keeps the last good title after a full reopen of
-        // the manager on the SAME data dir.
-        drop(handle);
-        let m2 =
-            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
-        let row = m2.get_session(s.id()).unwrap().unwrap().row().unwrap();
-        assert_eq!(row.title, "cleannamedone", "title persists across reopen");
-    }
-
-    #[tokio::test]
-    async fn question_and_network_ops_resolve_pending_permissions() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut registry = faktor_provider::ProviderRegistry::new();
-        registry
-            .try_register(Arc::new(FakeProvider::with_script(
-                "fake",
-                ModelCapabilities {
-                    tools: true,
-                    ..Default::default()
-                },
-                vec![
-                    faktor_provider::ScriptedResponse::ToolCall {
-                        id: "c1".into(),
-                        name: "echo".into(),
-                        input: serde_json::json!({"x": 1}),
-                    },
-                    faktor_provider::ScriptedResponse::ToolCall {
-                        id: "c2".into(),
-                        name: "curl".into(),
-                        input: serde_json::json!({"url": "https://example.com"}),
-                    },
-                    faktor_provider::ScriptedResponse::End,
-                ],
-            )))
-            .unwrap();
-        let session =
-            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
-        let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
-        let mut tools = faktor_agent::ToolRegistry::new();
-        tools.register(faktor_agent::Tool {
-            name: "echo".into(),
-            description: "d".into(),
-            input_schema: serde_json::json!({}),
-            resource_class: faktor_core::resource::ResourceClass::Cpu,
-            capability: None,
-            recovery_hint: faktor_agent::RecoveryHint::Idempotent,
-            path_args: vec![],
-            execute: Arc::new(|_ctx, _args| {
-                Box::pin(async move { Ok(faktor_agent::ToolOutcome::default()) })
-            }),
-        });
-        // A REAL network capability request (Capability::Network) — the
-        // frozen network surface maps to these.
-        tools.register(faktor_agent::Tool {
-            name: "curl".into(),
-            description: "d".into(),
-            input_schema: serde_json::json!({}),
-            resource_class: faktor_core::resource::ResourceClass::Cpu,
-            capability: Some(faktor_core::capability::Capability::Network {
-                destination: "https://example.com".into(),
-            }),
-            recovery_hint: faktor_agent::RecoveryHint::UnknownEffect,
-            path_args: vec![],
-            execute: Arc::new(|_ctx, _args| {
-                Box::pin(async move { Ok(faktor_agent::ToolOutcome::default()) })
-            }),
-        });
-        let agent = AgentRuntime::new(faktor_agent::AgentDeps {
-            session: session.clone(),
-            providers: Arc::new(registry),
-            chunk_sink: None,
-            permission_requester: permissions.clone(),
-            evidence: Arc::new(faktor_agent::NoEvidence),
-            tools: Arc::new(tools),
-            cas: None,
-            workspaces: faktor_fs::WorkspaceFileService::new(),
-            edit: None,
-            snapshots: None,
-            sandbox: None,
-            supervisor: None,
-            verification: faktor_agent::VerificationService::disabled(),
-            model: "m".into(),
-            compaction_model: None,
-            compact_at_usage: 0.65,
-            instructions: "You are a test server agent.".into(),
-            hooks: None,
-            instructions_resolver: faktor_instructions::no_roots_resolver(),
-            routing: faktor_agent::FixedRoutingPolicy::passthrough(),
-            budgets: Arc::new(faktor_session::NoopBudget),
-            clock: Arc::new(faktor_core::time::SystemClock),
-            tool_call_mode: faktor_agent::ToolCallMode::Native,
-            tool_deadline_ms: 2000,
-            retry_policy: faktor_core::retry::RetryPolicy::default(),
-            semantic: faktor_agent::fallback_semantic_registry(),
-            context_prior: None,
-            efficiency: Default::default(),
-        })
-        .unwrap();
-        let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
-        let deps = ServerDeps {
-            budgets: faktor_session::DurableBudgetLedger::new(session.clone()),
-            session: session.clone(),
-            agent,
-            permissions: permissions.clone(),
-            orchestrator,
-            tasks,
-            auth_token: AuthToken::generate(),
-            server_password: ServerPassword::generate(),
-            directory: None,
-            version: "0.1.0".into(),
-            fs: None,
-            snapshots: None,
-            chunk_rx: None,
-            simulate_not_ready: false,
-            evidence: None,
-            semantic: None,
-        };
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        let resp = client
-            .post(format!("{base}/session/create"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
-            .send()
-            .await
-            .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["id"].as_str().unwrap().to_string();
-        // Non-blocking prompt: the turn parks on the two permission hops.
-        client
-            .post(format!("{base}/session/prompt"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"session_id": sid, "prompt": "network please"}))
-            .send()
-            .await
-            .unwrap();
-
-        // The shell-class request surfaces under /question/list; the
-        // network-class one under /network/list — never mixed. The tool
-        // batch requests permissions SEQUENTIALLY, so the shell question
-        // parks first and the network request only parks after it resolves.
-        let mut question_id = None;
-        for _ in 0..100 {
-            let resp = client
-                .get(format!("{base}/question/list?session_id={sid}"))
-                .header("x-faktor-server-password", pw.as_str())
-                .send()
-                .await
-                .unwrap();
-            let list: serde_json::Value = resp.json().await.unwrap();
-            for q in list["questions"].as_array().unwrap() {
-                assert_ne!(q["capability"], "network", "shell class only: {q}");
-                assert_eq!(q["session_id"], sid);
-                if q["capability"] == "execute_shell" {
-                    question_id = q["id"].as_str().map(String::from);
-                }
-            }
-            if question_id.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let question_id = question_id.expect("shell permission must surface as a question");
-        // Nothing is pending on the network surface yet (the shell request
-        // parks BEFORE the batch reaches the network call).
-        let resp = client
-            .get(format!("{base}/network/list"))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap();
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["networks"], serde_json::json!([]));
-
-        // Cross-class attempts are unknown on the other surface (404), and
-        // unknown ids stay 404.
-        let resp = client
-            .post(format!("{base}/question/reply"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"question_id": "q1", "decision": "allow"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-
-        // question.reply (allow) resolves the shell hop for real.
-        let resp = client
-            .post(format!("{base}/question/reply"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"question_id": question_id, "decision": "allow"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], true);
-
-        // With the shell hop granted, the batch reaches the network call:
-        // it parks on the network surface with the exact capability tag.
-        let mut network_id = None;
-        for _ in 0..100 {
-            let resp = client
-                .get(format!("{base}/network/list?session_id={sid}"))
-                .header("x-faktor-server-password", pw.as_str())
-                .send()
-                .await
-                .unwrap();
-            let list: serde_json::Value = resp.json().await.unwrap();
-            for n in list["networks"].as_array().unwrap() {
-                assert_eq!(n["capability"], "network", "network class only: {n}");
-                assert_eq!(n["session_id"], sid);
-                network_id = n["id"].as_str().map(String::from);
-            }
-            if network_id.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let network_id = network_id.expect("network permission must surface as a network");
-        // The shell permission is NOT a network: cross-class 404.
-        let resp = client
-            .post(format!("{base}/network/reply"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"network_id": question_id, "decision": "deny"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404, "shell ids are not network requests");
-
-        // network.reject is deny, and the network hop is resolved.
-        let resp = client
-            .post(format!("{base}/network/reject"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"network_id": network_id}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        // A resolved id is no longer pending: a second attempt is a loud
-        // 404 (the id is unknown to the open-request set — same semantics
-        // as the reply surface), never a silent double-deny.
-        let resp = client
-            .post(format!("{base}/network/reject"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"network_id": network_id}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404, "resolved ids leave the pending set");
-
-        // Both lists drain as the hops resolve.
-        let mut drained = false;
-        for _ in 0..100 {
-            let resp = client
-                .get(format!("{base}/question/list"))
-                .header("x-faktor-server-password", pw.as_str())
-                .send()
-                .await
-                .unwrap();
-            let q: serde_json::Value = resp.json().await.unwrap();
-            let resp = client
-                .get(format!("{base}/network/list"))
-                .header("x-faktor-server-password", pw.as_str())
-                .send()
-                .await
-                .unwrap();
-            let n: serde_json::Value = resp.json().await.unwrap();
-            if q["questions"].as_array().unwrap().is_empty()
-                && n["networks"].as_array().unwrap().is_empty()
-            {
-                drained = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(drained, "resolved permissions must leave both lists");
-        // The denied network tool made the turn end (deny returns the
-        // machine to a non-busy landing state); nothing is left pending.
-        let mut done = false;
-        for _ in 0..100 {
-            let st = session
-                .get_session(faktor_core::id::SessionId::new(sid.parse().unwrap()))
-                .unwrap()
-                .unwrap()
-                .state()
-                .unwrap();
-            if !turn_machine_busy(st) {
-                done = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(done, "turn must finish after both hops resolved");
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn config_update_warnings_overlay_and_overlay_update() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        // update applies ONLY the daemon-editable keys onto the store.
-        let resp = client
-            .post(format!("{base}/config/update"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"config": {
-                "model": "qwen3.8",
-                "compact_at_usage": 0.8,
-                "instructions": "be brief"
-            }}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        // A second update merges, preserving earlier keys.
-        let resp = client
-            .post(format!("{base}/config/update"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"config": {"model": "gpt-x"}}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let resp = client
-            .get(format!("{base}/config/get"))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap();
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["config"]["model"], "gpt-x");
-        assert_eq!(body["config"]["compact_at_usage"], 0.8);
-        assert_eq!(body["config"]["instructions"], "be brief");
-
-        // Provider keys are NOT daemon-editable: clear 400, nothing applied.
-        let resp = client
-            .post(format!("{base}/config/update"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"config": {"providers": {"ollama": {}}}}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("not daemon-editable"),
-            "{body}"
-        );
-        // Warnings: the SDK-declared bare `Array<{path,message}>`; a
-        // full-replace config/set can smuggle anything in and the warning
-        // surface reports it instead of silently accepting. `path` is the
-        // documented literal runtime label (this daemon's config has no
-        // file layer).
-        let resp = client
-            .post(format!("{base}/config/set"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"config": {
-                "compact_at_usage": 7,
-                "model": 5,
-                "smuggled_key": true
-            }}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let resp = client
-            .get(format!("{base}/config/warnings"))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        let warnings = body
-            .as_array()
-            .unwrap_or_else(|| panic!("config.warnings must be a bare array: {body}"));
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w["message"].as_str().unwrap().contains("compact_at_usage")),
-            "{warnings:?}"
-        );
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w["message"].as_str().unwrap().contains("smuggled_key")),
-            "{warnings:?}"
-        );
-        assert!(
-            warnings.iter().all(|w| w["path"] == "runtime"),
-            "the runtime source label is documented: {warnings:?}"
-        );
-        // A valid config warns about nothing (overlay = full replace, so no
-        // smuggled key survives from the previous config/set).
-        let resp = client
-            .post(format!("{base}/config/overlay"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"config": {
-                "model": "m", "compact_at_usage": 0.5, "instructions": "i"
-            }}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let resp = client
-            .get(format!("{base}/config/warnings"))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap();
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body, serde_json::json!([]));
-
-        // The SDK's `GET /config` serves the BARE config object (no
-        // envelope); the legacy `/config/get` keeps `{config}`.
-        let resp = client
-            .get(format!("{base}/config"))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["model"], "m");
-        assert_eq!(body["compact_at_usage"], 0.5);
-        assert_eq!(body["instructions"], "i");
-
-        // The SDK's `GET /config/overlay` is a one-layer projection: the
-        // runtime object is the single source (no fabricated file targets).
-        let resp = client
-            .get(format!("{base}/config/overlay"))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["scope"], "global");
-        assert_eq!(body["effective"]["model"], "m");
-        assert_eq!(body["global"]["model"], "m");
-        assert_eq!(body["project"], serde_json::json!({}));
-        assert_eq!(body["sources"][0]["kind"], "runtime");
-        assert_eq!(body["targets"]["global"]["exists"], false);
-        assert_eq!(body["fields"]["model"]["value"], "m");
-        assert_eq!(body["fields"]["model"]["editable"], true);
-        assert_eq!(body["fields"]["instructions"]["source"], "system");
-        assert_eq!(body["collections"], serde_json::json!({}));
-
-        // overlay replaces the whole view; overlayUpdate merges into it.
-        let resp = client
-            .post(format!("{base}/config/overlay"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"config": {"a": 1}}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let resp = client
-            .post(format!("{base}/config/overlayUpdate"))
-            .header("x-faktor-server-password", pw.as_str())
-            .json(&serde_json::json!({"config": {"b": 2}}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let resp = client
-            .get(format!("{base}/config/get"))
-            .header("x-faktor-server-password", pw.as_str())
-            .send()
-            .await
-            .unwrap();
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["config"], serde_json::json!({"a": 1, "b": 2}));
-        // Non-object configs are malformed on every apply surface.
-        for path in ["/config/update", "/config/overlay", "/config/overlayUpdate"] {
-            let resp = client
-                .post(format!("{base}{path}"))
-                .header("x-faktor-server-password", pw.as_str())
-                .json(&serde_json::json!({"config": [1, 2]}))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), 400, "{path}");
-        }
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn pty_lifecycle_through_the_wire() {
-        // Audit round 11: PTYs are real on Unix — create/update(write+
-        // resize)/output/remove round-trip through the HTTP surface. The
-        // old explicit-409 test is replaced by this one; non-Unix keeps
-        // the honest refusal path in the handler itself.
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-        let auth = |r: reqwest::RequestBuilder| r.header("x-faktor-server-password", pw.as_str());
-        // Create a shell that echoes a typed line back.
-        let resp = auth(
-            client
-                .post(format!("{base}/pty/create"))
-                .json(&serde_json::json!({
-                    "command": "sh",
-                    "args": ["-c", "stty -echo; read x; echo out:$x; sleep 2"],
-                    "cols": 80,
-                    "rows": 24,
-                })),
-        )
-        .send()
-        .await
-        .unwrap();
-        #[cfg(unix)]
-        {
-            assert_eq!(resp.status(), 200, "pty/create must succeed on unix");
-            let created: serde_json::Value = resp.json().await.unwrap();
-            let pty_id = created["pty_id"].as_str().unwrap().to_string();
-            assert!(created["pid"].as_u64().unwrap() > 0);
-            // Write input + resize in one update.
-            let resp = auth(
-                client
-                    .post(format!("{base}/pty/update"))
-                    .json(&serde_json::json!({
-                        "pty_id": pty_id,
-                        "data": "hello wire\n",
-                        "rows": 33,
-                        "cols": 121,
-                    })),
-            )
-            .send()
-            .await
-            .unwrap();
-            assert_eq!(resp.status(), 200);
-            // Poll the output snapshot until the echo arrives.
-            let mut saw = false;
-            for _ in 0..100 {
-                let resp = auth(client.get(format!("{base}/pty/{pty_id}/output")))
-                    .send()
-                    .await
-                    .unwrap();
-                let body: serde_json::Value = resp.json().await.unwrap();
-                let out = body["output"].as_str().unwrap_or("");
-                if out.contains("out:hello wire") {
-                    saw = true;
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            assert!(saw, "the pty must echo the wire input back");
-            // Remove kills and cleans up; second remove stays idempotent.
-            let resp = auth(
-                client
-                    .post(format!("{base}/pty/remove"))
-                    .json(&serde_json::json!({"pty_id": pty_id})),
-            )
-            .send()
-            .await
-            .unwrap();
-            assert_eq!(resp.status(), 200);
-            let resp = auth(
-                client
-                    .post(format!("{base}/pty/remove"))
-                    .json(&serde_json::json!({"pty_id": pty_id})),
-            )
-            .send()
-            .await
-            .unwrap();
-            assert_eq!(resp.status(), 200);
-            // Unknown pty output is a loud 404.
-            let resp = auth(client.get(format!("{base}/pty/999999/output")))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), 404);
-        }
-        #[cfg(not(unix))]
-        {
-            // Windows now has a REAL ConPTY backend (journaled, session-
-            // owned, lifecycle-tested in faktor-pty): creation succeeds
-            // exactly like Unix, and the remove path above proves the
-            // session-owned teardown. The old 409 expectation encoded the
-            // pre-ConPTY era and is deliberately gone.
-            assert_eq!(
-                resp.status(),
-                200,
-                "ConPTY is a real implementation: creation must succeed"
-            );
-        }
-        let _ = handle.shutdown.send(());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn sdk_pty_create_and_remove_through_the_wire() {
-        // The SDK's own create/remove route pair over the REAL PTY registry:
-        // POST /pty answers the SDK `Pty` object from the values the spawn
-        // actually used (no fabricated exitCode/sessionID), and DELETE
-        // /pty/{ptyID} kills the real child tree and answers the declared
-        // boolean; unknown/malformed ids are the SDK-declared errors.
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-        let auth = |r: reqwest::RequestBuilder| r.header("x-faktor-server-password", pw.as_str());
-        let resp = auth(client.post(format!("{base}/pty")).json(&serde_json::json!({
-            "command": "sh",
-            "args": [],
-            "cwd": ".",
-            "title": "sdk-pty",
-            "size": {"rows": 24, "cols": 80},
-        })))
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), 200, "SDK pty create must succeed on unix");
-        let pty: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(pty["command"], "sh");
-        assert_eq!(pty["args"], serde_json::json!([]));
-        assert_eq!(pty["cwd"], ".");
-        assert_eq!(pty["title"], "sdk-pty");
-        assert_eq!(pty["status"], "running");
-        assert!(pty["pid"].as_u64().unwrap() > 0);
-        assert!(
-            pty.get("exitCode").is_none(),
-            "the PTY backend exposes no exit code: it must be omitted, never fabricated"
-        );
-        assert!(
-            pty.get("sessionID").is_none(),
-            "the SDK create body carries no session id: ownership must not be invented"
-        );
-        let pty_id = pty["id"].as_str().unwrap().to_string();
-        assert!(pty_id.parse::<u64>().unwrap() > 0);
-        // Note: the sandboxed file execution of this test suite may keep `sh`
-        // alive; remove is the deterministic teardown and answers the SDK's
-        // bare boolean.
-        let resp = auth(client.delete(format!("{base}/pty/{pty_id}")))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        assert_eq!(
-            resp.json::<serde_json::Value>().await.unwrap(),
-            serde_json::json!(true)
-        );
-        // Already removed → the SDK-declared 404 PtyNotFoundError.
-        let resp = auth(client.delete(format!("{base}/pty/{pty_id}")))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["_tag"], "PtyNotFoundError");
-        // Malformed id → 400 InvalidRequestError (SDK create/remove declare
-        // no 422; a non-numeric path is a request error).
-        let resp = auth(client.delete(format!("{base}/pty/not-a-number")))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["_tag"], "InvalidRequestError");
-        let _ = handle.shutdown.send(());
-    }
-    #[tokio::test]
-    async fn dispose_ends_all_sessions_and_reload_acknowledges() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let session = deps.session.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        let resp = client
-            .post(format!("{base}/session"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
-            .send()
-            .await
-            .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid: u64 = created["sessionID"].as_str().unwrap().parse().unwrap();
-        // One completed exchange so dispose has real sessions to end.
-        let resp = client
-            .post(format!("{base}/session/{sid}/message"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({
-                "model": {"providerID": "fake", "modelID": "m"},
-                "parts": [{"type": "text", "text": "hi"}],
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-
-        // instance.reload re-runs daemon recovery (idempotent) → the
-        // SDK-declared boolean `true`.
-        let resp = client
-            .post(format!("{base}/instance/reload"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body, serde_json::json!(true));
-
-        // global.dispose ends every session durably.
-        let resp = client
-            .post(format!("{base}/global/dispose"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body, serde_json::json!(true));
-        let row = session
-            .get_session(faktor_core::id::SessionId::new(sid))
-            .unwrap()
-            .unwrap()
-            .row()
-            .unwrap();
-        assert!(row.lifecycle.is_terminal(), "dispose ends sessions durably");
-        assert_eq!(row.state, faktor_core::state::AgentState::Completed);
-        // A second dispose over zero live sessions still answers ok.
-        let resp = client
-            .post(format!("{base}/instance/dispose"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn auth_set_rotates_the_password_and_remove_restores_env_password() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let startup_pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        let new_pw = "x".repeat(64);
-        // Rotate to an explicit secret.
-        let resp = client
-            .post(format!("{base}/auth/set"))
-            .basic_auth("kilo", Some(startup_pw.as_str()))
-            .json(&serde_json::json!({"password": new_pw}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], true);
-        assert_eq!(body["password"], new_pw);
-
-        // The OLD password is rejected everywhere; the new one works.
-        let resp = client
-            .get(format!("{base}/global/health"))
-            .basic_auth("kilo", Some(startup_pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            401,
-            "old password must be rejected after set"
-        );
-        let resp = client
-            .get(format!("{base}/global/health"))
-            .basic_auth("kilo", Some(new_pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        // Rotating without a password generates a fresh secret (returned).
-        let resp = client
-            .post(format!("{base}/auth/set"))
-            .basic_auth("kilo", Some(new_pw.as_str()))
-            .json(&serde_json::json!({"password": null}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        let rotated = body["password"].as_str().unwrap().to_string();
-        assert_ne!(rotated, new_pw);
-        assert_eq!(rotated.len(), 64);
-        // Malformed passwords (empty / oversized) are 400s.
-        let resp = client
-            .post(format!("{base}/auth/set"))
-            .basic_auth("kilo", Some(rotated.as_str()))
-            .json(&serde_json::json!({"password": ""}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400);
-        // auth.remove returns to the STARTUP env password.
-        let resp = client
-            .post(format!("{base}/auth/remove"))
-            .basic_auth("kilo", Some(rotated.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let resp = client
-            .get(format!("{base}/global/health"))
-            .basic_auth("kilo", Some(rotated.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401, "rotated password dies with remove");
-        let resp = client
-            .get(format!("{base}/global/health"))
-            .basic_auth("kilo", Some(startup_pw.as_str()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "env password semantics restored");
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn queued_message_send_is_202_with_an_empty_assistant_placeholder() {
-        // A message accepted behind an active logical turn queues durably:
-        // the response is HTTP 202 + the standard {info, parts} shape with
-        // empty parts and an empty messageID (nothing is materialized yet —
-        // documented choice; the frozen DTO rejects an extra queued flag).
-        let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
-        let manager = deps.session.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        // Busy session: prompt A lands the machine in Preparing (no driver).
-        let ws = manager.create_workspace("/tmp").unwrap();
-        let busy = manager.create_session(ws, "t-queue", "fake", "m").unwrap();
-        let sid = busy.id().to_string();
-        busy.submit_prompt("first", &[]).unwrap();
-        assert!(busy.state().unwrap().is_active());
-
-        let resp = client
-            .post(format!("{base}/session/{sid}/message"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({
-                "model": {"providerID": "fake", "modelID": "m"},
-                "parts": [{"type": "text", "text": "queued prompt"}],
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 202, "queueing is marked by HTTP 202");
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["info"]["role"], "assistant");
-        assert_eq!(body["info"]["sessionID"], sid);
-        assert_eq!(body["info"]["messageID"], "", "nothing materialized yet");
-        assert_eq!(body["parts"], serde_json::json!([]));
-        assert!(
-            body.as_object().unwrap().get("queued").is_none(),
-            "the frozen DTO carries no queued field: {body}"
-        );
-        // The prompt really queued durably.
-        assert_eq!(busy.queued_prompt_count().unwrap(), 1);
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn message_send_with_no_assistant_content_is_an_honest_502() {
-        // A provider that ends cleanly WITHOUT any content produces no
-        // durable assistant row: the frozen send shape cannot be built, so
-        // the endpoint fails loudly instead of fabricating a message.
-        let dir = tempfile::tempdir().unwrap();
-        let provider = Arc::new(FakeProvider::with_script(
-            "fake",
-            ModelCapabilities::default(),
-            vec![faktor_provider::ScriptedResponse::End],
-        ));
-        let deps = recording_wire_deps(dir.path(), provider);
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        let resp = client
-            .post(format!("{base}/session"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
-            .send()
-            .await
-            .unwrap();
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["sessionID"].as_str().unwrap().to_string();
-
-        let resp = client
-            .post(format!("{base}/session/{sid}/message"))
-            .basic_auth("kilo", Some(pw.as_str()))
-            .json(&serde_json::json!({
-                "model": {"providerID": "fake", "modelID": "m"},
-                "parts": [{"type": "text", "text": "say nothing"}],
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 502);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], false);
-        assert!(body["message"]
-            .as_str()
-            .unwrap()
-            .contains("without an assistant reply"));
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn provider_list_serves_real_models_and_capabilities() {
-        // The model selector must enumerate what the daemon can ACTUALLY
-        // serve: an adapter with configured models lists them with their
-        // real capabilities (audit: one fabricated 'default' per provider).
-        let dir = tempfile::tempdir().unwrap();
-        // Register an OpenAI adapter with two known models on top of the
-        // fake test provider.
-        let mut caps = std::collections::HashMap::new();
-        caps.insert(
-            "gpt-x".to_string(),
-            faktor_core::model::ModelCapabilities {
-                context: 128_000,
-                max_output: 16_384,
-                tools: true,
-                ..Default::default()
-            },
-        );
-        let openai = faktor_openai::OpenAiProvider::build(faktor_openai::OpenAiConfig {
-            base_url: "http://127.0.0.1:1/v1".into(),
-            api_key: None,
-            family: faktor_openai::OpenAiFamily::Chat,
-            models: caps,
-        });
-        let deps = test_deps_with(dir.path(), vec![openai]);
         let token = deps.auth_token.clone();
         let handle = serve(deps, 0).await.unwrap();
         let client = reqwest::Client::new();
         let base = format!("http://{}", handle.addr);
+
+        // Strict create DTO: an unknown field or empty provider is a 400.
+        for body in [
+            serde_json::json!({"provider": "fake", "model": "m", "smuggled": 1}),
+            serde_json::json!({"provider": "", "model": "m"}),
+        ] {
+            let resp = client
+                .post(format!("{base}/native/session"))
+                .bearer_auth(token.as_str())
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{body}");
+        }
+        // One durable session on the workspace root.
         let resp = client
-            .get(format!("{base}/provider/list"))
+            .post(format!("{base}/native/session"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({
+                "provider": "fake", "model": "m", "workspace": "/tmp", "title": "t-bootstrap",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let sid = created["id"].as_str().unwrap().to_string();
+        assert_eq!(created["title"], "t-bootstrap");
+        assert!(created["created_ms"].as_i64().unwrap() > 0);
+
+        // The durable listing carries it.
+        let listing: serde_json::Value = client
+            .get(format!("{base}/native/sessions"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(listing["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == sid && s["title"] == "t-bootstrap"));
+
+        // Prompt strictness: id mismatch, empty prompt, unknown session.
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/prompt"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"session_id": "999", "prompt": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/prompt"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"session_id": sid, "prompt": "   "}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let resp = client
+            .post(format!("{base}/native/session/999999/prompt"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"session_id": "999999", "prompt": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        // A real prompt is accepted and lands on the ONE executor entry.
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/prompt"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"session_id": sid, "prompt": "hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let receipt: serde_json::Value = resp.json().await.unwrap();
+        assert!(!receipt["op_id"].as_str().unwrap().is_empty());
+        assert!(receipt["accepted"].as_bool().unwrap());
+
+        // Native permission surface: the live set is empty, ids/decisions
+        // are strict, and an unknown resolve is a typed 409 (never a
+        // double grant).
+        let listing: serde_json::Value = client
+            .get(format!("{base}/native/permissions?session={sid}"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listing["permissions"], serde_json::json!([]));
+        let resp = client
+            .get(format!("{base}/native/permissions?session=abc"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let resp = client
+            .get(format!("{base}/native/permissions?sessionId={sid}"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "unknown query fields stay strict");
+        for (body, expect) in [
+            (
+                serde_json::json!({"permission_id": "1", "decision": "maybe"}),
+                400,
+            ),
+            (
+                serde_json::json!({"permission_id": "0", "decision": "allow"}),
+                400,
+            ),
+            (
+                serde_json::json!({"permission_id": "999", "decision": "allow", "x": 1}),
+                400,
+            ),
+        ] {
+            let resp = client
+                .post(format!("{base}/native/permission/reply"))
+                .bearer_auth(token.as_str())
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), expect, "{body}");
+        }
+        // An unknown id is the requester's documented pre-resolution: the
+        // first reply lands, the second is a typed 409 (never a double
+        // grant).
+        let body = serde_json::json!({"permission_id": "999", "decision": "allow"});
+        let resp = client
+            .post(format!("{base}/native/permission/reply"))
+            .bearer_auth(token.as_str())
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{body}");
+        let resp = client
+            .post(format!("{base}/native/permission/reply"))
+            .bearer_auth(token.as_str())
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "double resolve is a typed conflict");
+
+        // The native SSE stream replays the durable journal from cursor 0.
+        let resp = client
+            .get(format!("{base}/native/session/{sid}/events?after=0"))
             .bearer_auth(token.as_str())
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        let providers = body["providers"].as_array().unwrap();
-        // The openai adapter entry lists gpt-x (its real model) with the
-        // configured context.
-        let openai_entry = providers
-            .iter()
-            .find(|p| p["kind"] == "openai")
-            .expect("openai adapter listed");
-        let models = openai_entry["models"].as_array().unwrap();
+        use futures_util::StreamExt;
+        let mut body = resp.bytes_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), body.next())
+            .await
+            .expect("stream must not hang")
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8_lossy(&first);
+        assert!(text.contains("id: "), "frame carries a cursor id: {text}");
         assert!(
-            models
-                .iter()
-                .any(|m| m["id"] == "gpt-x" && m["capabilities"]["context"] == 128_000),
-            "real model with real capabilities: {models:?}"
+            text.contains("event: "),
+            "frame carries an event kind: {text}"
         );
+        assert!(text.contains("data: "), "frame carries data: {text}");
+        // Unknown query fields stay strict 400s.
+        let resp = client
+            .get(format!("{base}/native/session/{sid}/events?aftr=1"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
         let _ = handle.shutdown.send(());
     }
-
-    // ---------------------------------------------------------------- native v1
 
     #[tokio::test]
     async fn native_projection_idle_session_shape_auth_and_errors() {
@@ -5365,25 +849,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let deps = test_deps(dir.path());
         let token = deps.auth_token.clone();
+        let ws = deps.session.create_workspace("/tmp").unwrap();
+        let created = deps
+            .session
+            .create_session(ws, "t-proj", "fake", "m")
+            .unwrap();
+        let sid = created.id().to_string();
         let handle = serve(deps, 0).await.unwrap();
         let client = reqwest::Client::new();
         let base = format!("http://{}", handle.addr);
-
-        let resp = client
-            .post(format!("{base}/api/session"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({
-                "provider": "fake",
-                "model": "m",
-                "workspace": "/tmp",
-                "title": "t-proj",
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["id"].as_str().unwrap().to_string();
 
         // Native endpoints are auth-required like every daemon route.
         for path in [
@@ -5532,64 +1006,37 @@ mod tests {
             efficiency: Default::default(),
         })
         .unwrap();
+        let manager = session.clone();
+        let driver = agent.clone();
         let deps = ServerDeps::new(session, agent, permissions.clone());
         let token = deps.auth_token.clone();
+        let ws = manager.create_workspace("/tmp").unwrap();
+        let created = manager.create_session(ws, "t-drive", "fake", "m").unwrap();
+        let sid = created.id().to_string();
         let handle = serve(deps, 0).await.unwrap();
         let client = reqwest::Client::new();
         let base = format!("http://{}", handle.addr);
 
-        // Session via the wire surface (its message endpoint is the test
-        // pattern for driving a full turn synchronously).
-        let resp = client
-            .post(format!("{base}/session"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({
-                "title": "t-drive",
-                "model": {"id": "m", "providerID": "fake"},
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["sessionID"].as_str().unwrap().to_string();
-
-        // The fake provider makes one write_file tool call; the turn
-        // blocks on the permission hop until the daemon resolves it.
-        let drive = async {
-            let resp = client
-                .post(format!("{base}/session/{sid}/message"))
-                .bearer_auth(token.as_str())
-                .json(&serde_json::json!({
-                    "model": {"providerID": "fake", "modelID": "m"},
-                    "parts": [{"type": "text", "text": "change src/a.txt"}],
-                }))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
-        };
+        // The fake provider makes one write_file tool call; the turn blocks
+        // on the permission hop until the in-process requester resolves it.
+        let drive_id = created.id();
+        let drive =
+            tokio::spawn(async move { driver.run_turn(drive_id, "change src/a.txt", &[]).await });
         let resolve = async {
             for _ in 0..100 {
                 if let Some(pid) = permissions.pending_ids().first().copied() {
-                    let resp = client
-                        .post(format!("{base}/api/perm/{pid}/resolve"))
-                        .bearer_auth(token.as_str())
-                        .json(&serde_json::json!({
-                            "permission_id": pid.to_string(),
-                            "decision": "allow",
-                        }))
-                        .send()
-                        .await
-                        .unwrap();
-                    assert_eq!(resp.status(), 200);
+                    assert!(
+                        permissions.resolve(pid, PermissionDecision::Allow),
+                        "the permission hop resolves once"
+                    );
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             panic!("tool permission never surfaced");
         };
-        tokio::join!(drive, resolve);
+        let (drive_result, ()) = tokio::join!(drive, resolve);
+        drive_result.unwrap().unwrap();
 
         // Wait for the machine to land on its terminal turn state.
         let mut body = serde_json::Value::Null;
@@ -5692,25 +1139,15 @@ mod tests {
             efficiency: Default::default(),
         })
         .unwrap();
+        let driver = agent.clone();
         let deps = ServerDeps::new(session.clone(), agent, permissions.clone());
         let token = deps.auth_token.clone();
+        let ws = session.create_workspace("/tmp").unwrap();
+        let created = session.create_session(ws, "t-prefix", "fake", "m").unwrap();
+        let sid = created.id().to_string();
         let handle = serve(deps, 0).await.unwrap();
         let client = reqwest::Client::new();
         let base = format!("http://{}", handle.addr);
-
-        let resp = client
-            .post(format!("{base}/session"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({
-                "title": "t-prefix",
-                "model": {"id": "m", "providerID": "fake"},
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["sessionID"].as_str().unwrap().to_string();
 
         let projection = || async {
             client
@@ -5724,17 +1161,7 @@ mod tests {
                 .unwrap()
         };
 
-        let resp = client
-            .post(format!("{base}/session/{sid}/message"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({
-                "model": {"providerID": "fake", "modelID": "m"},
-                "parts": [{"type": "text", "text": "hi"}],
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+        driver.run_turn(created.id(), "hi", &[]).await.unwrap();
 
         // Wait for the terminal machine state, then read the projection.
         let mut body = serde_json::Value::Null;
@@ -5975,28 +1402,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let deps = test_deps(dir.path());
         let token = deps.auth_token.clone();
+        let driver = deps.agent.clone();
+        let ws = deps.session.create_workspace("/tmp").unwrap();
+        let created = deps
+            .session
+            .create_session(ws, "t-turns", "fake", "m")
+            .unwrap();
+        let sid = created.id().to_string();
         let handle = serve(deps, 0).await.unwrap();
         let client = reqwest::Client::new();
         let base = format!("http://{}", handle.addr);
 
-        let resp = client
-            .post(format!("{base}/api/session"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid = created["id"].as_str().unwrap().to_string();
-        let resp = client
-            .post(format!("{base}/api/session/{sid}/prompt"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({"prompt": "hi", "files": []}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
+        let drive_id = created.id();
+        tokio::spawn(async move {
+            let _ = driver.run_turn(drive_id, "hi", &[]).await;
+        });
 
         // Poll the native turns listing until the durable record lands.
         let mut body = serde_json::Value::Null;
@@ -6415,15 +1835,11 @@ mod tests {
         let session = manager.create_session(ws, "t-pty", "fake", "m").unwrap();
         let sid = session.id().to_string();
 
-        let resp = client
-            .post(format!("{base}/pty/create"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({"command": "/bin/sleep", "args": ["30"]}))
-            .send()
-            .await
-            .unwrap();
-        if resp.status() != 200 {
-            // Platform refusal (documented): the terminal view stays empty.
+        let Some(created) =
+            native_spawn_terminal(&client, &base, &token, &sid, "/bin/sleep", &["30"]).await
+        else {
+            // Platform refusal (documented): the session terminal view stays
+            // empty and honest.
             let resp = client
                 .get(format!("{base}/native/session/{sid}/terminal"))
                 .bearer_auth(token.as_str())
@@ -6437,9 +1853,8 @@ mod tests {
             );
             let _ = handle.shutdown.send(());
             return;
-        }
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let pty_id = created["pty_id"].as_str().unwrap().to_string();
+        };
+        let pty_id = created["terminalId"].as_str().unwrap().to_string();
         let pid = created["pid"].as_u64().unwrap_or(0);
         assert!(pid > 0);
 
@@ -6460,25 +1875,52 @@ mod tests {
         assert_eq!(mine["pid"], pid);
         assert_eq!(mine["alive"], true);
 
-        // Removing it clears the listing (and remove is idempotent).
+        // The bounded output snapshot reads through the ONE terminal
+        // authority; unknown terminals are typed 404s, never fabricated
+        // bytes.
         let resp = client
-            .post(format!("{base}/pty/remove"))
+            .get(format!(
+                "{base}/native/session/{sid}/terminals/{pty_id}/output"
+            ))
             .bearer_auth(token.as_str())
-            .json(&serde_json::json!({"pty_id": pty_id}))
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
+        let out: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["alive"], true);
+        let resp = client
+            .get(format!(
+                "{base}/native/session/{sid}/terminals/not-a-terminal/output"
+            ))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        // Killing it is terminal: the durable row stays in the session view
+        // with state killed and alive false.
+        assert_eq!(
+            native_kill_terminal(&client, &base, &token, &sid, &pty_id).await,
+            200
+        );
         let resp = client
             .get(format!("{base}/native/session/{sid}/terminal"))
             .bearer_auth(token.as_str())
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            resp.json::<serde_json::Value>().await.unwrap(),
-            serde_json::json!([])
-        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let mine = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == pty_id)
+            .expect("the killed terminal row stays durable");
+        assert_eq!(mine["alive"], false);
+        assert_eq!(mine["state"], "killed");
         let _ = handle.shutdown.send(());
     }
 
@@ -7322,35 +2764,6 @@ mod tests {
                 }
             });
             Box::pin(stream)
-        }
-    }
-
-    /// Explicit deterministic failure injection for the frozen-wire
-    /// regression test: EVERY stream call fails with a typed provider error
-    /// before any chunk is produced. The failure is platform-independent —
-    /// it depends on no workspace path, environment or host timing.
-    struct AlwaysFailsProvider;
-
-    impl faktor_provider::Provider for AlwaysFailsProvider {
-        fn id(&self) -> &str {
-            "fake"
-        }
-        fn capabilities(&self, _model: &str) -> ModelCapabilities {
-            ModelCapabilities {
-                tools: true,
-                ..Default::default()
-            }
-        }
-        fn stream(
-            &self,
-            _req: faktor_provider::GenericAgentRequest,
-        ) -> faktor_provider::ProviderStream {
-            let failed: Result<faktor_provider::ProviderChunk, faktor_provider::ProviderError> =
-                Err(faktor_provider::ProviderError::new(
-                    faktor_provider::ProviderErrorKind::Malformed,
-                    "frozen wire: injected provider failure (deterministic)",
-                ));
-            Box::pin(futures_util::stream::iter(vec![failed]))
         }
     }
 
@@ -8310,7 +3723,7 @@ mod tests {
         assert_eq!(body["terminals"][0]["alive"], true);
 
         // The legacy daemon-level view lists both (durable rows + the
-        // frozen compat PTY rows).
+        // retired compat PTY rows).
         let resp = native_get(
             &client,
             &base,
@@ -9257,6 +4670,7 @@ mod tests {
         let deps = test_deps_full(dir.path(), vec![Arc::new(CacheUsageProvider)]);
         let token = deps.auth_token.clone();
         let manager = deps.session.clone();
+        let tasks = deps.tasks.clone();
         let handle = serve(deps, 0).await.unwrap();
         let client = reqwest::Client::new();
         let base = format!("http://{}", handle.addr);
@@ -9269,18 +4683,19 @@ mod tests {
         // The session row task identity drives the reserve (task 1 row).
         assert_eq!(s.task_id().unwrap().raw(), 1);
 
-        // Drive the turn through the wire surface exactly like the UI.
-        let resp = client
-            .post(format!("{base}/session/{sid}/message"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({
-                "model": {"providerID": "fake", "modelID": "m"},
-                "parts": [{"type": "text", "text": "hi"}],
-            }))
-            .send()
+        // Drive the turn through the ONE executor entry ordinary prompts
+        // use (the same edge the HTTP handler reaches).
+        let service = crate::native::PromptExecutionService::new(tasks, manager.clone());
+        service
+            .prompt(
+                s.id(),
+                crate::native::PromptRequest {
+                    prompt: "hi".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
         let mut body = serde_json::Value::Null;
         for _ in 0..300 {
             let resp = native_get(
@@ -10755,8 +6170,7 @@ mod tests {
         // Force the regression's precondition: the owner workspace's
         // worktree row is NOT id 1 (a decoy workspace registered first,
         // then the owner row recreated), so the standalone default 1 names
-        // no row of this workspace. The rig's own session is irrelevant;
-        // the extension creates a FRESH session via the wire.
+        // no row of this workspace. The rig's own session is irrelevant.
         let ws = manager
             .create_workspace(owner_root.to_str().unwrap())
             .unwrap();
@@ -10781,36 +6195,13 @@ mod tests {
             "the owner row id shifted away from the default"
         );
 
-        // The extension's session creation: POST /session/create with the
-        // window's workspace root. Creation-time registration must adopt
-        // the session onto the workspace's real owner worktree.
-        let resp = client
-            .post(format!("{base}/session/create"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({
-                "provider": "fake",
-                "model": "m",
-                "workspace": owner_root.to_str().unwrap(),
-                "title": "extension session",
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let created: serde_json::Value = resp.json().await.unwrap();
-        let sid =
-            SessionId::try_from(created["id"].as_str().unwrap().parse::<u64>().unwrap()).unwrap();
-        assert_eq!(
-            manager
-                .get_session(sid)
-                .unwrap()
-                .unwrap()
-                .row()
-                .unwrap()
-                .worktree_id,
-            faktor_core::id::WorktreeId::new(owner_wt as u64),
-            "the created session must be registered on its workspace owner row"
-        );
+        // The native session creation path leaves the standalone default
+        // worktree; the self-heal below forces the regression precondition
+        // (a session naming no row of its workspace) before the task start.
+        let sid = manager
+            .create_session(ws, "extension session", "fake", "m")
+            .unwrap()
+            .id();
 
         // Adversarial self-heal probe: an OLDER session (or one created
         // before creation-time registration existed) still holds the
@@ -11157,117 +6548,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sdk_compat_prompt_translates_to_the_one_executor_and_isolates_mutation() {
-        // Ordinary chat through the SDK compatibility surface
-        // (`POST /session/{id}/prompt`) goes through
-        // PromptExecutionService -> TaskExecutor (the durable in-session run
-        // appears in the native task-run listing). The compat surfaces no
-        // longer force a mutation policy (the old COMPAT_MUTATION_MODE
-        // forcing is deleted): the daemon default applies, so the write
-        // lands in the ISOLATED candidate and the owner checkout stays
-        // byte-untouched.
-        let dir = tempfile::tempdir().unwrap();
-        let rig = native_task_rig(
-            dir.path(),
-            vec![vec![
-                faktor_provider::ScriptedResponse::ToolCall {
-                    id: "c1".into(),
-                    name: "write_file".into(),
-                    input: serde_json::json!({
-                        "path": "src/lib.rs",
-                        "content": NATIVE_IMPL_LIB_RS,
-                    }),
-                },
-                faktor_provider::ScriptedResponse::Text("done".into()),
-                faktor_provider::ScriptedResponse::End,
-            ]],
-            false,
-            true,
-        );
-        seed_native_owner(&rig.owner_root);
-        let NativeTaskRig {
-            deps,
-            manager,
-            parent: sid,
-            owner_root,
-            ..
-        } = rig;
-        let token = deps.auth_token.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        let resp = client
-            .post(format!("{base}/session/prompt"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({
-                "session_id": sid.to_string(),
-                "prompt": "implement the change",
-                "files": []
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["accepted"], true, "{body}");
-        assert_ne!(body["op_id"], "turn", "the real session op id rides");
-        native_wait_session_state(
-            &manager,
-            sid,
-            faktor_core::state::AgentState::ReadyForNextTurn,
-        )
-        .await;
-        // Isolated mutation: the write landed in the daemon-owned candidate;
-        // the owner checkout is byte-untouched.
-        let row = manager
-            .shadow_row(sid)
-            .unwrap()
-            .expect("a compat mutating prompt must isolate");
-        assert_eq!(row.state, faktor_session::ShadowRowState::Active);
-        assert_eq!(
-            std::fs::read(std::path::PathBuf::from(&row.root).join("src/lib.rs")).unwrap(),
-            NATIVE_IMPL_LIB_RS.as_bytes(),
-            "the compat drive wrote the isolated candidate"
-        );
-        assert_eq!(
-            std::fs::read(owner_root.join("src/lib.rs")).unwrap(),
-            NATIVE_OWNER_LIB_RS.as_bytes(),
-            "the owner checkout is byte-untouched"
-        );
-        // ONE execution path: the durable in-session run linkage row exists
-        // and is listed by the native surface.
-        let resp = client
-            .get(format!("{base}/native/session/{sid}/task-runs"))
-            .bearer_auth(token.as_str())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let runs: serde_json::Value = resp.json().await.unwrap();
-        let run = runs
-            .as_array()
-            .and_then(|runs| {
-                runs.iter().find(|r| {
-                    r["mode"] == "in_session"
-                        && r["run_id"].as_str().is_some_and(|id| id.starts_with("tx-"))
-                })
-            })
-            .unwrap_or_else(|| {
-                panic!("the compat prompt must leave a durable executor run: {runs}")
-            });
-        assert_eq!(run["goal"], "implement the change", "{run}");
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_ordinary_prompt_uses_the_shadow_executor_and_keeps_the_owner_untouched() {
         // The NATIVE ordinary prompt (no explicit work items) keeps the
         // daemon default shadow mutation: its write lands in the daemon
         // shadow and the owner checkout stays byte-untouched until a
         // verified integration. (The moved coverage of the pre-regression
-        // `sdk_compat_...` test: the native surface is where shadowing is
-        // the promise; compatibility surfaces are direct.)
+        // the native surface is where shadowing is the promise; the
+        // retired compatibility surfaces were direct.)
         let dir = tempfile::tempdir().unwrap();
         let rig = native_task_rig(
             dir.path(),
@@ -11329,228 +6616,6 @@ mod tests {
             std::fs::read(owner_root.join("src/lib.rs")).unwrap(),
             NATIVE_OWNER_LIB_RS.as_bytes(),
             "the owner checkout is byte-untouched"
-        );
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn frozen_wire_message_rides_the_isolated_executor_and_keeps_shape() {
-        // P0 isolation: the frozen v7.5.6 `POST /session/{id}/message` no
-        // longer forces a direct mutation policy (the old
-        // COMPAT_MUTATION_MODE forcing is deleted). The prompt still travels
-        // the ONE execution path (PromptExecutionService → TaskExecutor,
-        // durable run row, detached recoverable drive) and its mutating
-        // drive begins the daemon-owned isolated candidate; the wire still
-        // answers promptly and keeps the frozen shape. (The synchronous
-        // begin-shift latency concern is deferred to the later compat-removal
-        // wave; the isolation mandate wins.)
-        let dir = tempfile::tempdir().unwrap();
-        // Deterministic failure injection: an explicit stub whose stream
-        // returns a TYPED provider error before any chunk, on every
-        // platform. The drive therefore fails identically everywhere (no
-        // workspace-path or host-speed dependence); it still travels the
-        // ONE executor path (durable run row, detached recoverable drive)
-        // and must surface the honest frozen-wire 502.
-        let rig =
-            native_task_rig_with_provider(dir.path(), Arc::new(AlwaysFailsProvider), false, true);
-        seed_native_owner(&rig.owner_root);
-        let NativeTaskRig {
-            deps,
-            manager,
-            parent: sid,
-            ..
-        } = rig;
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-        let basic = |r: reqwest::RequestBuilder| r.basic_auth("kilo", Some(pw.as_str()));
-
-        // Bounded, not host-speed-bound: a handler that wedges forever still
-        // fails this test; the deterministic typed failure above lands the
-        // machine terminal on any host.
-        let resp =
-            tokio::time::timeout(
-                Duration::from_secs(90),
-                basic(client.post(format!("{base}/session/{sid}/message")).json(
-                    &serde_json::json!({
-                        "messageID": null,
-                        "model": {"providerID": "fake", "modelID": "m"},
-                        "parts": [{"type": "text", "text": "ping from the frozen wire"}],
-                    }),
-                ))
-                .send(),
-            )
-            .await
-            .expect("the frozen message handler must answer within the wire timeout")
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            502,
-            "a turn without an assistant reply is an honest frozen-wire 502"
-        );
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], false, "frozen failure shape: {body}");
-        assert!(body["message"].is_string(), "{body}");
-        // The wire flow rode the isolating executor: the mutating drive
-        // began the daemon-owned isolated candidate (the old direct forcing
-        // is gone). The failed drive's candidate is retired/discarded by the
-        // settlement, so only the durable row is asserted here.
-        assert!(
-            manager.shadow_row(sid).unwrap().is_some(),
-            "the frozen wire must ride the isolated (shadow) executor now"
-        );
-        // The smoke's settle predicate: the turn lands terminal, never stuck
-        // mid-machine. Deadline-based like the POST bound above — a slow
-        // host may still be finishing the drive here.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
-        let mut settled = manager.get_session(sid).unwrap().unwrap().state().unwrap();
-        loop {
-            if matches!(
-                settled,
-                faktor_core::state::AgentState::ReadyForNextTurn
-                    | faktor_core::state::AgentState::FailedRecoverable
-            ) {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            settled = manager.get_session(sid).unwrap().unwrap().state().unwrap();
-        }
-        assert!(
-            matches!(
-                settled,
-                faktor_core::state::AgentState::ReadyForNextTurn
-                    | faktor_core::state::AgentState::FailedRecoverable
-            ),
-            "unexpected settled state {settled:?}"
-        );
-        // The smoke's GET /session/{id}/message?limit=5: the frozen bare
-        // array of {info, parts}; the user prompt row is durable. Bounded
-        // for a slow host, never a strict wall-clock assumption.
-        let resp = tokio::time::timeout(
-            Duration::from_secs(30),
-            basic(client.get(format!("{base}/session/{sid}/message?limit=5"))).send(),
-        )
-        .await
-        .expect("the frozen message page must answer within the wire timeout")
-        .unwrap();
-        assert_eq!(resp.status(), 200);
-        let page: serde_json::Value = resp.json().await.unwrap();
-        let messages = page.as_array().expect("frozen page is a bare array");
-        assert!(!messages.is_empty(), "expected >= 1 message, got {page}");
-        let first = &messages[0];
-        assert_eq!(first["info"]["role"], "user");
-        assert!(
-            first["info"]["messageID"]
-                .as_str()
-                .is_some_and(|m| !m.is_empty()),
-            "the user row carries its durable id: {first}"
-        );
-        assert_eq!(first["parts"][0]["type"], "text");
-        assert_eq!(first["parts"][0]["text"], "ping from the frozen wire");
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn frozen_wire_unshadowable_checkout_answers_promptly_and_settles() {
-        // REGRESSION (live daemon): a checkout beyond the shadow copy caps
-        // (the smoke's cwd is the repo root: tens of GiB of build artifacts)
-        // must never send the frozen handler into the unbounded manifest
-        // walk — the historic phase that hung `POST /session/{id}/message`
-        // and starved every other request. The bounded preflight refuses the
-        // candidate, the turn is admitted and lands FailedRecoverable, and
-        // the handler projects the frozen 502 with the user row durable.
-        let dir = tempfile::tempdir().unwrap();
-        let rig =
-            native_task_rig_with_provider(dir.path(), Arc::new(AlwaysFailsProvider), false, true);
-        seed_native_owner(&rig.owner_root);
-        // A sparse file far beyond the byte cap: metadata-cheap to create,
-        // and (without the bounded preflight) ~128 GiB of content hashing to
-        // walk twice — the historic unbounded phase, caught by the timeout
-        // below on any host.
-        let oversize = rig.owner_root.join("oversize-build-artifact.bin");
-        let file = std::fs::File::create(&oversize).unwrap();
-        file.set_len(64 * 1024 * 1024 * 1024).unwrap();
-        drop(file);
-        let NativeTaskRig {
-            deps,
-            manager,
-            parent: sid,
-            ..
-        } = rig;
-        let pw = deps.server_password.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-        let basic = |r: reqwest::RequestBuilder| r.basic_auth("kilo", Some(pw.as_str()));
-
-        // Bounded, not host-speed-bound: a handler wedged in the manifest
-        // walk fails this test within seconds.
-        let resp =
-            tokio::time::timeout(
-                Duration::from_secs(10),
-                basic(client.post(format!("{base}/session/{sid}/message")).json(
-                    &serde_json::json!({
-                        "messageID": null,
-                        "model": {"providerID": "fake", "modelID": "m"},
-                        "parts": [{"type": "text", "text": "ping an unshadowable checkout"}],
-                    }),
-                ))
-                .send(),
-            )
-            .await
-            .expect("the frozen message handler must answer promptly on an unshadowable checkout")
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            502,
-            "an un-isolatable turn is an honest frozen-wire 502"
-        );
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], false, "frozen failure shape: {body}");
-        assert!(body["message"].is_string(), "{body}");
-        // The turn settled recoverably; no isolation candidate was created.
-        assert_eq!(
-            manager.get_session(sid).unwrap().unwrap().state().unwrap(),
-            faktor_core::state::AgentState::FailedRecoverable
-        );
-        assert!(
-            manager.shadow_row(sid).unwrap().is_none(),
-            "the refused candidate must not leave a shadow row"
-        );
-        // The user prompt is durable, so the frozen page still serves it.
-        let page: serde_json::Value =
-            basic(client.get(format!("{base}/session/{sid}/message?limit=5")))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
-        let messages = page.as_array().expect("frozen page is a bare array");
-        assert!(
-            messages
-                .iter()
-                .any(|m| m["parts"][0]["text"] == "ping an unshadowable checkout"),
-            "the durable user row must survive the refused isolation: {page}"
-        );
-        // The admitted run projects through the native run listing as the
-        // failed run it is — no phantom, no 404.
-        let runs: serde_json::Value =
-            basic(client.get(format!("{base}/native/session/{sid}/task-runs")))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
-        assert!(
-            runs.as_array()
-                .is_some_and(|rows| rows.iter().any(|r| r["state"] == "Failed")),
-            "the admitted run must project as Failed: {runs}"
         );
         let _ = handle.shutdown.send(());
     }
@@ -11620,94 +6685,6 @@ mod tests {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        let _ = handle.shutdown.send(());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sdk_and_native_prompts_hit_the_same_execution_service() {
-        // The identity spy: one observer records every PromptExecutionService
-        // call with the `Arc` pointers of the underlying TaskExecutor +
-        // SessionManager. The SDK compat prompt and the native task start
-        // must report the SAME pointers (one execution authority, never a
-        // per-adapter runtime).
-        use crate::native::{set_prompt_observer, PromptCallKind};
-        use std::sync::Mutex;
-        let dir = tempfile::tempdir().unwrap();
-        let rig = native_task_rig(dir.path(), vec![], false, false);
-        seed_native_owner(&rig.owner_root);
-        let NativeTaskRig {
-            deps,
-            manager,
-            parent: sid,
-            ..
-        } = rig;
-        let tasks_ptr = std::sync::Arc::as_ptr(&deps.tasks) as usize;
-        let sessions_ptr = std::sync::Arc::as_ptr(&deps.session) as usize;
-        let seen: Arc<Mutex<Vec<(PromptCallKind, usize, usize)>>> = Arc::new(Mutex::new(vec![]));
-        let sink = seen.clone();
-        set_prompt_observer(Some(Arc::new(move |call| {
-            // Other tests run in parallel in this binary; only calls on THIS
-            // test's executor are the tripwire.
-            if call.tasks_ptr == tasks_ptr {
-                sink.lock()
-                    .unwrap()
-                    .push((call.kind, call.tasks_ptr, call.sessions_ptr));
-            }
-        })));
-        let token = deps.auth_token.clone();
-        let handle = serve(deps, 0).await.unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("http://{}", handle.addr);
-
-        // SDK compat prompt.
-        let resp = client
-            .post(format!("{base}/session/prompt"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({
-                "session_id": sid.to_string(),
-                "prompt": "hello",
-                "files": []
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        native_wait_session_state(
-            &manager,
-            sid,
-            faktor_core::state::AgentState::ReadyForNextTurn,
-        )
-        .await;
-        // Native ordinary prompt (goal only).
-        let resp = client
-            .post(format!("{base}/native/session/{sid}/task-runs"))
-            .bearer_auth(token.as_str())
-            .json(&serde_json::json!({"goal": "hello native"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        set_prompt_observer(None);
-
-        let calls = seen.lock().unwrap().clone();
-        assert!(
-            calls.len() >= 2,
-            "both adapter prompts must hit the one service: {calls:?}"
-        );
-        assert!(
-            calls.iter().any(|(k, _, _)| *k == PromptCallKind::Prompt),
-            "the SDK/native prompt calls were observed: {calls:?}"
-        );
-        for (kind, tasks, sessions) in &calls {
-            assert_eq!(
-                *tasks, tasks_ptr,
-                "call {kind:?} must execute on the ONE TaskExecutor"
-            );
-            assert_eq!(
-                *sessions, sessions_ptr,
-                "call {kind:?} must execute on the ONE SessionManager"
-            );
         }
         let _ = handle.shutdown.send(());
     }
@@ -12642,11 +7619,9 @@ mod tests {
     fn server_reaches_task_start_only_through_the_executor() {
         // The single-authority source scan: in the NON-TEST server code the
         // ONLY TaskExecutor start edge is the native start handler, the
-        // ONLY TaskRunRequest construction lives in that same handler, and
-        // the legacy prompt-drive helper (submit_and_run) never constructs a
-        // task run — the prompt surface stays a prompt surface. The scan
-        // spans every server source file of the audit 81-83/94 split
-        // (api router assembly + native/* + compat/*).
+        // ONLY TaskRunRequest construction lives in that same handler. The
+        // scan spans every server source file of the audit 81-83/94 split
+        // (api router assembly + native/*).
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let api_src = std::fs::read_to_string(root.join("api.rs")).expect("api.rs source");
         let mut src = api_src
@@ -12665,9 +7640,6 @@ mod tests {
             "native/usage.rs",
             "native/semantic.rs",
             "native/models.rs",
-            "compat/mod.rs",
-            "compat/sdk.rs",
-            "compat/v756.rs",
         ] {
             src.push_str(
                 &std::fs::read_to_string(root.join(module)).expect("server module source"),
@@ -12725,33 +7697,9 @@ mod tests {
             .collect();
         assert_eq!(requests.len(), 1, "one TaskRunRequest site: {requests:?}");
         assert!(in_handler(requests[0]), "line {}", requests[0]);
-        // The legacy prompt helper never touches run rows or the executor.
-        let helper = lines
-            .iter()
-            .position(|l| l.contains("fn submit_and_run("))
-            .expect("submit_and_run exists");
-        let mut depth = 0usize;
-        let mut helper_end = lines.len();
-        let mut opened = false;
-        for (j, l) in lines.iter().enumerate().skip(helper) {
-            depth = depth
-                .saturating_add(l.chars().filter(|&c| c == '{').count())
-                .saturating_sub(l.chars().filter(|&c| c == '}').count());
-            opened |= depth > 0;
-            if opened && j > helper && depth == 0 {
-                helper_end = j + 1;
-                break;
-            }
-        }
-        for l in &lines[helper..helper_end] {
-            assert!(
-                !l.contains(".start_task(") && !l.contains("task_executor::TaskRunRequest"),
-                "prompt helper must never start a task run: {l}"
-            );
-        }
         // (work-entry unification) NO non-test server code drives the agent
         // directly: every ordinary prompt and every explicit task start goes
-        // through the PromptExecutionService (compat translates DTOs only).
+        // through the PromptExecutionService.
         let drives: Vec<usize> = lines
             .iter()
             .enumerate()
@@ -13448,55 +8396,4 @@ mod tests {
     }
 
     // ------------------------------------------------ split invariants
-
-    #[test]
-    fn native_modules_never_depend_on_the_compat_surface() {
-        // Dependency direction (audits 81-83): the native layer never
-        // imports the v7.5.6 compatibility DTOs or the compat module; the
-        // compat layer may import native's shared glue.
-        let sources: [(&str, &str); 12] = [
-            ("native/mod.rs", include_str!("native/mod.rs")),
-            ("native/prompt.rs", include_str!("native/prompt.rs")),
-            ("native/session.rs", include_str!("native/session.rs")),
-            ("native/task.rs", include_str!("native/task.rs")),
-            ("native/agents.rs", include_str!("native/agents.rs")),
-            ("native/board.rs", include_str!("native/board.rs")),
-            ("native/evidence.rs", include_str!("native/evidence.rs")),
-            (
-                "native/verification.rs",
-                include_str!("native/verification.rs"),
-            ),
-            ("native/terminal.rs", include_str!("native/terminal.rs")),
-            ("native/usage.rs", include_str!("native/usage.rs")),
-            ("native/semantic.rs", include_str!("native/semantic.rs")),
-            ("native/models.rs", include_str!("native/models.rs")),
-        ];
-        for (name, src) in sources {
-            for (idx, line) in src.lines().enumerate() {
-                let code = line.trim_start();
-                if code.starts_with("//") {
-                    continue;
-                }
-                assert!(
-                    !line.contains("crate::compat"),
-                    "{name}:{} references the compat module: {line}",
-                    idx + 1
-                );
-                assert!(
-                    !line.contains("faktor_protocol::v756"),
-                    "{name}:{} references v7.5.6 DTOs: {line}",
-                    idx + 1
-                );
-            }
-        }
-        let compat = concat!(
-            include_str!("compat/mod.rs"),
-            include_str!("compat/sdk.rs"),
-            include_str!("compat/v756.rs")
-        );
-        assert!(
-            compat.contains("crate::native::"),
-            "compat depends on native's shared glue"
-        );
-    }
 }

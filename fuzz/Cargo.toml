@@ -33,22 +33,8 @@ bench = false
 doc = false
 
 [[bin]]
-name = "sse_frame"
-path = "fuzz_targets/sse_frame.rs"
-test = false
-bench = false
-doc = false
-
-[[bin]]
 name = "acp_frame"
 path = "fuzz_targets/acp_frame.rs"
-test = false
-bench = false
-doc = false
-
-[[bin]]
-name = "compat_dto"
-path = "fuzz_targets/compat_dto.rs"
 test = false
 bench = false
 doc = false

@@ -1,13 +1,13 @@
 // Native Swing tool-window panel for the Faktor bridge. Every interaction
 // routes to a native endpoint through FaktorFrontendService:
 //
-//   chat input  -> POST /session/prompt (abort -> POST /native/session/{id}/abort)
+//   chat input  -> POST /native/session/{id}/prompt (abort -> POST /native/session/{id}/abort)
 //   task goal   -> POST /native/session/{id}/task-runs (cancel -> .../cancel)
 //   agents      -> GET /native/agents + pause/resume/cancel/retry/steer/model/budget
 //   status      -> GET /session/{id}/projection, /native/usage,
 //                  /native/session/{id}/usage, /native/session/{id}/verification
 //   evidence    -> GET /native/evidence/{id} + POST /native/evidence/{id}/retrieve
-//   streaming   -> SSE /api/session/{id}/events with cursor resume
+//   streaming   -> SSE /native/session/{id}/events with cursor resume
 //
 // Swing/JCEF decision: JCEF hosting needs the IntelliJ Platform/JCEF runtime
 // which the repository's offline build does not carry, so the panel is a

@@ -7,6 +7,9 @@ rust-version.workspace = true
 
 [dependencies]
 faktor-core.workspace = true
+# The guardian ledger rewrite goes through the shared atomic-write authority
+# (unique temp + fsync + rename) instead of a hand-rolled sequence.
+faktor-fs.workspace = true
 libc = "0.2"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

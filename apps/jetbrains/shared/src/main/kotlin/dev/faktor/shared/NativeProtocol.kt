@@ -834,7 +834,7 @@ data class NativeProviderInfo(
 // Session-owned PTY projection: `GET /native/terminals?session=<id>`,
 // `GET /native/session/{id}/terminal/events`,
 // `POST /native/session/{id}/terminal` and the legacy output snapshot
-// `GET /pty/{ptyId}/output`. Unowned legacy rows are never projected into a
+// `GET /native/session/{id}/terminals/{terminalId}/output`. Unowned legacy rows are never projected into a
 // session view; the page names them in `unowned`/`note` instead.
 
 data class NativeTerminal(
@@ -950,7 +950,7 @@ fun parseNativeReady(json: String): NativeReady {
 }
 
 fun parseNativeSessionCreated(json: String): NativeSessionCreated {
-    val v = JsonCodec.parse(json).view("POST /session/create")
+    val v = JsonCodec.parse(json).view("POST /native/session")
     return NativeSessionCreated(
         id = v.field("id").string(),
         title = v.field("title").string(),
@@ -959,7 +959,7 @@ fun parseNativeSessionCreated(json: String): NativeSessionCreated {
 }
 
 fun parseNativeSessionList(json: String): List<NativeSessionSummary> {
-    val v = JsonCodec.parse(json).view("GET /session/list")
+    val v = JsonCodec.parse(json).view("GET /native/sessions")
     val sessions = v.field("sessions").array()
     return sessions.map {
         NativeSessionSummary(
@@ -988,7 +988,7 @@ fun parseNativeModelCatalog(json: String): List<NativeModelInfo> {
 }
 
 fun parseNativePromptReceipt(json: String): NativePromptReceipt {
-    val v = JsonCodec.parse(json).view("POST /session/prompt")
+    val v = JsonCodec.parse(json).view("POST /native/session/{id}/prompt")
     return NativePromptReceipt(
         opId = v.field("op_id").string(),
         accepted = v.field("accepted").bool(),
@@ -1527,7 +1527,7 @@ fun parseNativePresentationAck(json: String): NativePresentationAck {
 // ----------------------------------------------------------- permission parse
 
 fun parseNativePermissionList(json: String): List<NativePermissionEntry> {
-    val v = JsonCodec.parse(json).view("GET /permission/list")
+    val v = JsonCodec.parse(json).view("GET /native/permissions")
     return v.field("permissions").array().map {
         NativePermissionEntry(
             id = it.field("id").string(),
@@ -1539,7 +1539,7 @@ fun parseNativePermissionList(json: String): List<NativePermissionEntry> {
 }
 
 fun parseNativePermissionAck(json: String): NativePermissionAck =
-    NativePermissionAck(JsonCodec.parse(json).view("POST /permission/reply").field("ok").bool())
+    NativePermissionAck(JsonCodec.parse(json).view("POST /native/permission/reply").field("ok").bool())
 
 // -------------------------------------------------- provider registry parse
 
@@ -1627,7 +1627,7 @@ fun parseNativeTerminalSpawned(json: String): NativeTerminalSpawned {
 }
 
 fun parseNativeTerminalOutput(ptyId: String, json: String): NativeTerminalOutput {
-    val v = JsonCodec.parse(json).view("GET /pty/{id}/output")
+    val v = JsonCodec.parse(json).view("GET /native/session/{id}/terminals/{terminal_id}/output")
     if (!v.field("ok").bool()) v.fail("server did not acknowledge the terminal output read")
     return NativeTerminalOutput(
         ptyId = ptyId,

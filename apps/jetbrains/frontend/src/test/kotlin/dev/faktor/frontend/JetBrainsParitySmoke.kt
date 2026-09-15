@@ -698,11 +698,11 @@ object JetBrainsParitySmoke {
                 )
                 chat.permissionsView().submitReply("deny")
                 await("permission reply routed") {
-                    daemon.lastRequest("POST", "/permission/reply") != null
+                    daemon.lastRequest("POST", "/native/permission/reply") != null
                 }
                 assertEquals(
                     "{\"permission_id\":\"7\",\"decision\":\"deny\"}",
-                    daemon.lastRequest("POST", "/permission/reply")!!.body
+                    daemon.lastRequest("POST", "/native/permission/reply")!!.body
                 )
             }
             registry.observables["terminal"] = {
@@ -864,10 +864,10 @@ object JetBrainsParitySmoke {
             assertEquals(before, resumed, "reconnect resumes from the delivered cursor")
             await("resumed stream delivers the next frame") { service.streamCursor() >= 3L }
             val resumedRequests = daemon.requests
-                .filter { it.path == "/api/session/7/events" && it.query["events_after"] == "2" }
+                .filter { it.path == "/native/session/7/events" && it.query["after"] == "2" }
             assertTrue(
                 resumedRequests.isNotEmpty(),
-                "the second SSE connection must resume at events_after=2"
+                "the second SSE connection must resume at after=2"
             )
         } finally {
             service.stop()
@@ -957,8 +957,8 @@ object JetBrainsParitySmoke {
     private fun registerRoutes(daemon: ParityFakeDaemon) {
         daemon.on("GET", "/native/health") { _, response -> response.json(200, HEALTH_JSON) }
         daemon.on("GET", "/native/ready") { _, response -> response.json(200, READY_JSON) }
-        daemon.on("POST", "/session/create") { _, response -> response.json(200, CREATED_JSON) }
-        daemon.on("GET", "/session/list") { _, response -> response.json(200, PARITY_SESSIONS_JSON) }
+        daemon.on("POST", "/native/session") { _, response -> response.json(200, CREATED_JSON) }
+        daemon.on("GET", "/native/sessions") { _, response -> response.json(200, PARITY_SESSIONS_JSON) }
         daemon.on("GET", "/models") { _, response -> response.json(200, PARITY_MODELS_JSON) }
         daemon.on("GET", "/native/providers") { _, response -> response.json(200, PARITY_PROVIDERS_JSON) }
         daemon.on("GET", "/native/usage") { _, response -> response.json(200, USAGE_JSON) }
@@ -984,8 +984,8 @@ object JetBrainsParitySmoke {
             response.json(200, PARITY_TOURNAMENTS_LIST_JSON)
         }
         daemon.on("GET", "/native/session/7/board") { _, response -> response.json(200, PARITY_BOARD_PAGE_JSON) }
-        daemon.on("GET", "/permission/list") { _, response -> response.json(200, PARITY_PERMISSION_LIST_JSON) }
-        daemon.on("POST", "/permission/reply") { _, response -> response.json(200, PERMISSION_ACK_JSON) }
+        daemon.on("GET", "/native/permissions") { _, response -> response.json(200, PARITY_PERMISSION_LIST_JSON) }
+        daemon.on("POST", "/native/permission/reply") { _, response -> response.json(200, PERMISSION_ACK_JSON) }
         daemon.on("GET", "/native/agents") { _, response -> response.json(200, PARITY_AGENTS_JSON) }
         daemon.on("GET", "/native/terminals") { _, response -> response.json(200, PARITY_TERMINALS_JSON) }
         daemon.on("GET", "/native/session/7/terminal/events") { _, response ->
@@ -994,11 +994,11 @@ object JetBrainsParitySmoke {
         daemon.on("POST", "/native/session/7/terminal") { _, response ->
             response.json(200, PARITY_TERMINAL_SPAWNED_JSON)
         }
-        daemon.on("GET", "/pty/6/output") { _, response -> response.json(200, PARITY_TERMINAL_OUTPUT_JSON) }
-        daemon.on("GET", "/pty/5/output") { _, response -> response.json(200, PARITY_TERMINAL_OUTPUT_JSON) }
+        daemon.on("GET", "/native/session/7/terminals/6/output") { _, response -> response.json(200, PARITY_TERMINAL_OUTPUT_JSON) }
+        daemon.on("GET", "/native/session/7/terminals/5/output") { _, response -> response.json(200, PARITY_TERMINAL_OUTPUT_JSON) }
         for (session in listOf("7", "8")) {
-            daemon.on("GET", "/api/session/$session/events") { request, response ->
-                val after = request.query["events_after"]?.toLongOrNull() ?: 0L
+            daemon.on("GET", "/native/session/$session/events") { request, response ->
+                val after = request.query["after"]?.toLongOrNull() ?: 0L
                 response.stream(200, "text/event-stream") { writer ->
                     if (after < 1L) {
                         writer.frame(1L, "message", "{\"event\":\"message\",\"kind\":\"message\",\"state\":\"one\"}")

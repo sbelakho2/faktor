@@ -1665,7 +1665,7 @@ pub(crate) mod tests {
         s.put_tool_result_part(
             mid3,
             "c1",
-            &faktor_protocol::v756::ToolResultBody {
+            &faktor_protocol::native::ToolResultBody {
                 excerpt: "out".into(),
                 exit_code: Some(0),
                 artifact: None,

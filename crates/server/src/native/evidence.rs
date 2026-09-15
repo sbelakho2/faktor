@@ -390,17 +390,8 @@ mod tests {
         .unwrap();
         let deps = ServerDeps::new(session, agent, permissions);
         AppState {
-            projector: crate::api::AppState::test_projector(deps.session.clone()),
             deps: std::sync::Arc::new(deps),
-            config: std::sync::Arc::new(std::sync::RwLock::new(serde_json::Value::Object(
-                Default::default(),
-            ))),
             auth: std::sync::Arc::new(std::sync::RwLock::new(None)),
-            ptys: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            next_pty_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            terminal_owners: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
             terminal_events: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::new(),
             )),

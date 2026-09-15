@@ -1,8 +1,6 @@
-// The Faktor backend process manager: the JetBrains-side mirror of the
-// v7.5.6 backend-management pattern. It launches the faktor-cli binary,
-// parses the frozen
-// startup line from stdout, authenticates with the frontend-generated
-// password, and speaks the v7.5.6 wire surface over java.net.http.
+// The Faktor backend process manager: it launches the faktor-cli binary,
+// parses the startup line from stdout, and carries the frontend-generated
+// password/port for the native client (NativeClient / NativeEventStream).
 //
 // Rules observed:
 //  - stdout is drained on a dedicated thread so a full pipe never deadlocks
@@ -13,29 +11,13 @@
 //    code and a bounded stdout tail.
 package dev.faktor.backend
 
-import dev.faktor.shared.BasicAuth
-import dev.faktor.shared.HealthResult
-import dev.faktor.shared.MessageModel
-import dev.faktor.shared.MessageSendRequest
-import dev.faktor.shared.Part
-import dev.faktor.shared.SessionCreateRequest
 import dev.faktor.shared.StartupLine
-import dev.faktor.shared.parseHealth
-import dev.faktor.shared.parseMessageCount
-import dev.faktor.shared.parseMessageId
-import dev.faktor.shared.parseSessionId
-import dev.faktor.shared.parseSessionState
 import java.io.BufferedReader
 import java.io.IOException
 import java.io.InputStreamReader
-import java.net.URI
-import java.net.http.HttpClient
-import java.net.http.HttpRequest
-import java.net.http.HttpResponse
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.SecureRandom
-import java.time.Duration
 import java.util.ArrayDeque
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -72,19 +54,12 @@ class BackendConnection(
 class BackendProcessManager(private val binaryPath: Path, private val dataDir: Path) {
 
     companion object {
-        private const val STARTUP_TIMEOUT_MS = 5_000L
+        private const val STARTUP_TIMEOUT_MS = 20_000L
         private const val STOP_GRACE_MS = 3_000L
-        private const val HTTP_TIMEOUT_SECONDS = 5L
         private const val PASSWORD_HEX_BYTES = 32
-        private const val TERMINAL_STATE_POLL_MS = 200L
-        private const val TERMINAL_STATE_DEADLINE_MS = 20_000L
     }
 
     private val rng = SecureRandom()
-
-    private val http: HttpClient = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS))
-        .build()
 
     /** Starts the daemon and waits (bounded) for the frozen startup line. */
     fun start(): BackendConnection {
@@ -138,115 +113,6 @@ class BackendProcessManager(private val binaryPath: Path, private val dataDir: P
             process.waitFor(1, TimeUnit.SECONDS)
         }
         connection.sink.stop()
-    }
-
-    /** `GET /global/health` (auth required). Throws on 401 / IO / bad body. */
-    fun health(connection: BackendConnection): HealthResult {
-        val resp = request(connection, "GET", "/global/health", null)
-        return parseHealth(resp.body)
-    }
-
-    /** `POST /session` with the wire shape; returns the `sessionID`. */
-    fun createSession(connection: BackendConnection, title: String): String {
-        val body = SessionCreateRequest(title = title).toJson()
-        val resp = request(connection, "POST", "/session", body)
-        return parseSessionId(resp.body)
-    }
-
-    /**
-     * `POST /session/{sessionID}/message` with parts=[{type:text,...}];
-     * returns the `messageID`. The daemon runs the turn detached; the state
-     * settles asynchronously (poll via [sessionState]).
-     */
-    fun sendMessage(connection: BackendConnection, sessionId: String, text: String): String {
-        val body = MessageSendRequest(
-            model = MessageModel(providerID = "default", modelID = "default"),
-            parts = listOf(Part.TextPart(text))
-        ).toJson()
-        val resp = request(connection, "POST", "/session/$sessionId/message", body)
-        return parseMessageId(resp.body)
-    }
-
-    /** `GET /session/{sessionID}/message?limit=5` → number of messages in the page. */
-    fun listMessages(connection: BackendConnection, sessionId: String): Int {
-        val resp = request(connection, "GET", "/session/$sessionId/message?limit=5", null)
-        return parseMessageCount(resp.body)
-    }
-
-    /** `GET /session/{sessionID}` → the wire `state` string (e.g. `ready_for_next_turn`). */
-    fun sessionState(connection: BackendConnection, sessionId: String): String {
-        val resp = request(connection, "GET", "/session/$sessionId", null)
-        return parseSessionState(resp.body)
-    }
-
-    /**
-     * Polls the session state until it lands on `ready_for_next_turn` or
-     * `failed_recoverable` (the two outcomes the smoke accepts: a provider
-     * gap leaves the session failed_recoverable, never stuck mid-turn).
-     * Throws [BackendException] when the deadline expires.
-     */
-    fun awaitSettledState(connection: BackendConnection, sessionId: String): String {
-        val deadline = System.currentTimeMillis() + TERMINAL_STATE_DEADLINE_MS
-        var last: String? = null
-        while (true) {
-            last = try {
-                sessionState(connection, sessionId)
-            } catch (e: BackendException) {
-                last
-            }
-            if (last == "ready_for_next_turn" || last == "failed_recoverable") {
-                return last!!
-            }
-            if (System.currentTimeMillis() >= deadline) {
-                throw BackendException(
-                    "session $sessionId did not settle within ${TERMINAL_STATE_DEADLINE_MS}ms; " +
-                        "last state=${last ?: "unknown"}"
-                )
-            }
-            Thread.sleep(TERMINAL_STATE_POLL_MS)
-        }
-    }
-
-    private data class HttpResponseLite(val status: Int, val body: String)
-
-    private fun request(
-        connection: BackendConnection,
-        method: String,
-        path: String,
-        body: String?
-    ): HttpResponseLite {
-        val builder = HttpRequest.newBuilder(URI.create(connection.baseUrl + path))
-            .timeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS))
-            .header(BasicAuth.HEADER_NAME, BasicAuth(connection.password).headerValue)
-            .header("Accept", "application/json")
-        if (body != null) {
-            builder.header("Content-Type", "application/json")
-            builder.method(method, HttpRequest.BodyPublishers.ofString(body))
-        } else {
-            builder.method(method, HttpRequest.BodyPublishers.noBody())
-        }
-        val resp = try {
-            http.send(builder.build(), HttpResponse.BodyHandlers.ofString())
-        } catch (e: IOException) {
-            throw BackendException(
-                "request $method $path failed (daemon crashed?): ${e.message}",
-                cause = e
-            )
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-            throw BackendException("request $method $path interrupted", cause = e)
-        }
-        if (resp.statusCode() == 401) {
-            throw BackendException("$method $path: unauthorized (401)", status = 401)
-        }
-        if (resp.statusCode() !in 200..299) {
-            val bodyText = resp.body().take(500)
-            throw BackendException(
-                "$method $path: HTTP ${resp.statusCode()}: $bodyText",
-                status = resp.statusCode()
-            )
-        }
-        return HttpResponseLite(resp.statusCode(), resp.body())
     }
 
     private fun generatePassword(): String {

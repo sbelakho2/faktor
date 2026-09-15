@@ -1766,7 +1766,7 @@ mod tests {
             .append_tool_result_part(
                 mid,
                 "call_1",
-                &faktor_protocol::v756::ToolResultBody {
+                &faktor_protocol::native::ToolResultBody {
                     excerpt: "ok".into(),
                     exit_code: Some(0),
                     artifact: None,

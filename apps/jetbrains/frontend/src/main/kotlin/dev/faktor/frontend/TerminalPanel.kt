@@ -1,7 +1,7 @@
 // Session-owned terminal surface over the native ACP/PTY routes:
 // `GET /native/terminals?session=`, `GET /native/session/{id}/terminal/events`,
 // `POST /native/session/{id}/terminal` and the output snapshot
-// `GET /pty/{ptyId}/output`. Rows carry their durable ownership
+// `GET /native/session/{id}/terminals/{terminalId}/output`. Rows carry their durable ownership
 // (session/task/agent/operation/spawned ms); unowned legacy rows are shown
 // only as the page's counted `note`, never mixed into the session list.
 // Pure presentation: every action is delivered to a Listener.

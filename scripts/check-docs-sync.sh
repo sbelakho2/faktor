@@ -14,9 +14,6 @@
 #         7.1.2 pin (compat/jetbrains-712 + ui/upstream.json jetbrains_712)
 #         exists the historical JetBrains-7.1.2-scoped exemption is retired
 #         and BLOCKED_EXTERNAL may no longer describe JetBrains/UI parity;
-#       * target/certification/kilo-compat.json records status=passed
-#         (responses N/N) => the docs may not claim required divergences
-#         remain.
 # Stale/contradicting docs are a review-rejected artifact: drift must be
 # loud, never silent.
 #
@@ -54,10 +51,10 @@ for token in "${STALE_TOKENS[@]}"; do
     fi
 done
 
-# Auth drift: 'Bearer <password>' is NOT the only accepted claim. The frozen
-# v7.5.6 extension authenticates every request (including /global/health)
-# with `Authorization: Basic base64("kilo:" + password)`; the Faktor-native
-# x-faktor-server-password header and legacy per-start token also remain.
+# Auth drift: 'Bearer <password>' is NOT the only accepted claim. The
+# Basic `Authorization: Basic base64("kilo:" + password)` form is retained
+# alongside the Faktor-native x-faktor-server-password header and the
+# legacy per-start token.
 if ! grep -q "x-faktor-server-password" "$DOC"; then
     echo "STALE: 'Bearer <password>' implied as the only auth form — x-faktor-server-password must be documented" >&2
     fail=1
@@ -229,10 +226,8 @@ fi
 
 # 5. Executable results invalidate stale prose labels. The 7.1.2 pin being
 #    vendored means BLOCKED_EXTERNAL can no longer describe the JetBrains/UI
-#    parity surface; a passed kilo-compat report (responses N/N) means no
-#    truth doc may still claim the required divergences remain. These are
-#    semantic assertions over the normalized text, so wrapped claims fail
-#    with their exact fragment.
+#    parity surface. These are semantic assertions over the normalized text,
+#    so wrapped claims fail with their exact fragment.
 if [ "$JETBRAINS_PIN" -eq 1 ]; then
     for doc in "$DOC" "${TRUTH_DOCS[@]}"; do
         [ -f "$doc" ] || continue
@@ -242,17 +237,6 @@ if [ "$JETBRAINS_PIN" -eq 1 ]; then
         assert_no_contradiction "$doc" \
             'blocked[_-]?external[^.]{0,80}(jetbrains|712|client ui parity|ui parity)' \
             "describes JetBrains/UI parity as BLOCKED_EXTERNAL although the pinned 7.1.2 corpus is vendored and executable parity results are the only remaining gate"
-    done
-fi
-
-KILO_COMPAT_REPORT=target/certification/kilo-compat.json
-if [ -f "$KILO_COMPAT_REPORT" ] && \
-    grep -q '"status": "passed"' "$KILO_COMPAT_REPORT" 2>/dev/null; then
-    for doc in "$DOC" "${TRUTH_DOCS[@]}"; do
-        [ -f "$doc" ] || continue
-        assert_no_contradiction "$doc" \
-            'required divergences?[^.]{0,60}(remain|remaining|still)' \
-            "claims required kilo-compat divergences remain although target/certification/kilo-compat.json records status=passed (responses N/N)"
     done
 fi
 

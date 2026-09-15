@@ -15,7 +15,7 @@ use std::time::Duration;
 use faktor_agent::PermissionRequester;
 use faktor_core::capability::{Capability, PermissionDecision};
 use faktor_core::id::{EventSeq, OpId, SessionId};
-use faktor_protocol::v756::{
+use faktor_protocol::native::{
     Message as NativeMessage, MessagesPage, PageMeta, Part as NativePart, ToolResultBody,
 };
 use faktor_server::ChannelPermissionRequester;

@@ -3,11 +3,13 @@
 **Same Kilo Code UX. A substantially better native engine.**
 
 Faktor replaces the Kilo Code engine (TypeScript/Bun) with a native Rust
-runtime while targeting the frozen Kilo v7.5.6 IDE UX. The v7.5.6 VS Code
-webview sources are vendored under `ui/` (pinned at commit `fa02955` with a
-SHA-256 manifest) and served through `apps/vscode`; the pinned closure plus
-the Faktor companion overlay are staged into the extension's `media/` and
-ship inside the VSIX. The JetBrains 7.1.2 sources are vendored at
+runtime. The v7.5.6 VS Code webview sources are vendored under `ui/` as a
+frontend source dependency (pinned at commit `fa02955` with a SHA-256
+manifest) and served through `apps/vscode`; the pinned closure plus the
+Faktor companion overlay are staged into the extension's `media/` and
+ship inside the VSIX. Wire/behavior parity with Kilo is not a release
+objective: the daemon speaks its own native protocol. The JetBrains 7.1.2
+sources are vendored at
 `compat/jetbrains-712/` (tag `jetbrains/v7.1.2`, commit
 `436ff09e649bd0866c84bd9f98933a74cad2d25c`, also SHA-256-pinned in
 `ui/upstream.json`); `apps/jetbrains` carries the real Faktor-owned
@@ -17,7 +19,7 @@ attachments) that talk to the native daemon.
 ```
 same UI
    ↓
-small compatibility shell
+Faktor native protocol bridge
    ↓
 native Rust engineering runtime
    ↓
@@ -64,7 +66,7 @@ LLM used only where reasoning is actually needed
 ```
 apps/        (real Faktor IDE panels: the VS Code extension host/chat/cockpit and the JetBrains split-mode frontend/backend — task tree, blockers, tournament, board, evidence; no upstream JetBrains sources)
 crates/      (the Rust engine workspace, incl. winjob/pty/agent/verify/sandbox/index/cas/snapshot)
-compat/      (permanent protocol fixtures: kilo-v756/, jetbrains-712/)
+compat/      (pinned JetBrains 7.1.2 upstream corpus: jetbrains-712/)
 fixtures/    (protocol, providers, screenshots, repositories)
 tests/       (integration, soak, fault, visual, performance — adversarial only)
 ui/          (vendored frozen upstream UI: kilo-v756-webview/ + kilo-ui/, pinned manifest)
@@ -86,12 +88,10 @@ ui/          (vendored frozen upstream UI: kilo-v756-webview/ + kilo-ui/, pinned
   (`compat/jetbrains-712/`, SHA-256 in `ui/upstream.json`) with the
   Faktor-owned Swing frontend; the process manager launches the Faktor
   binary.
-- **Protocol (glue; full parity TARGET):** the real v7.5.6 contract remains
-  the compatibility destination; `compat/kilo-v756/` golden fixtures are
-  frozen and exercised byte-for-byte by `tests/compat` for the wired subset
-  (startup line, auth, sessions, messages, SSE, provider list, errors). The
-  Rust daemon must pass the full contract before the old backend is removed;
-  the native protocol stays the daemon's own surface.
+- **Protocol:** the daemon speaks the Faktor Native Protocol v1
+  (`docs/native-protocol.md`) — its own durable, cursor-paged HTTP surface.
+  The v7.5.6 wire-compatibility surface was retired by owner decision; no
+  Kilo wire/behavior parity is claimed.
 
 ## Building
 
@@ -163,7 +163,7 @@ verifying signed evidence file fails the run.
 ## Branding
 
 All user-visible metadata in this repository uses Faktor branding; legacy
-wordmark tokens survive only inside frozen compatibility fixtures and
+wordmark tokens survive only inside the vendored/pinned upstream trees and
 attribution prose (enforced by `scripts/branding-scan.sh`). The external
 GitHub repository name and description are not tracked in-tree; they were set
 with `gh repo rename` (name `faktor`) and
@@ -203,5 +203,5 @@ authoritative surface and is scan-enforced.
 | JetBrains 7.1.2 upstream assets | VENDORED (provenance only, never a parity claim) | pinned source `compat/jetbrains-712/` + per-file SHA-256 manifest `ui/upstream.json` (`jetbrains_712`) |
 | JetBrains behavioral parity | IMPLEMENTED (HEAD-bound executable matrix) | `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt` writes `target/certification/jetbrains-parity.json`: 11/11 rows against canned frames and the fake daemon |
 | JetBrains visual parity | IMPLEMENTED (offscreen render vs pinned baselines) | same matrix: 8 rendered panels against `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json` |
-| UI parity (`ui_parity`) | PARTIAL (derived in `target/certification/capabilities.json`) | JetBrains behavioral/visual, VS Code render and upstream replay axes; stays PARTIAL until the `target/certification/kilo-compat.json` responses are N/N |
+| UI parity (`ui_parity`) | PARTIAL (derived in `target/certification/capabilities.json`) | JetBrains behavioral/visual + VS Code render axes; vendored files alone never flip it |
 | Repo rename (faktor) | DONE (external) | `gh repo rename`; in-tree branding was already Faktor and is unchanged |

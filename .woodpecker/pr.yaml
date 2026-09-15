@@ -91,65 +91,6 @@ steps:
         artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"linux","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/linux.json
-  # ---------------------------------------------------------- kilo-compat --
-  # REQUIRED: the unmodified @kilocode/sdk@7.5.6 client replay against a real
-  # daemon. The rust image ships no Node; Node >= 22.15 is installed
-  # explicitly. FAKTOR_COMPAT_REQUIRE_NODE=1 makes a missing Node a hard
-  # failure (the test also records status=failed in
-  # target/certification/kilo-compat.json — never a skip), and the report is
-  # asserted below. The step's v2 marker is a dependency of the certificate
-  # step, so a missing/failed replay cannot certify. The report status stays
-  # `partial` while documented divergences remain; the capabilities manifest
-  # reads the same report to keep compat_v756 honest at the exact SHA.
-  - name: kilo-compat
-    image: rust:1.98
-    environment:
-      RUST_BACKTRACE: "1"
-      FAKTOR_COMPAT_REQUIRE_NODE: "1"
-    commands:
-      - apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg
-      - curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y --no-install-recommends nodejs
-      - node --version
-      - cargo test -p faktor-tests-compat --lib unmodified_upstream_client
-      - |
-        node -e '
-          const fs = require("node:fs");
-          const report = JSON.parse(fs.readFileSync("target/certification/kilo-compat.json", "utf8"));
-          if (report.schema !== "faktor-kilo-compat/v1") throw new Error("kilo-compat report schema " + report.schema);
-          if (report.commit !== process.env.CI_COMMIT_SHA) throw new Error("kilo-compat report commit " + report.commit + " != " + process.env.CI_COMMIT_SHA);
-          if (report.status !== "passed" && report.status !== "partial") throw new Error("kilo-compat report status " + report.status);
-          if (report.status === "passed" && report.responses.passed !== report.responses.total) throw new Error("kilo-compat status/ratio mismatch");
-          console.log("kilo-compat: requests " + report.requests.passed + "/" + report.requests.total + ", responses " + report.responses.passed + "/" + report.responses.total + ", divergences " + report.required_divergences + " (" + report.status + ")");
-        '
-      - |
-        set -eu
-        mkdir -p target/certification/lanes
-        CMDS="$(cat <<'CMDS'
-        apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg
-        curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y --no-install-recommends nodejs
-        node --version
-        cargo test -p faktor-tests-compat --lib unmodified_upstream_client
-        node -e '
-        const fs = require("node:fs");
-        const report = JSON.parse(fs.readFileSync("target/certification/kilo-compat.json", "utf8"));
-        if (report.schema !== "faktor-kilo-compat/v1") throw new Error("kilo-compat report schema " + report.schema);
-        if (report.commit !== process.env.CI_COMMIT_SHA) throw new Error("kilo-compat report commit " + report.commit + " != " + process.env.CI_COMMIT_SHA);
-        if (report.status !== "passed" && report.status !== "partial") throw new Error("kilo-compat report status " + report.status);
-        if (report.status === "passed" && report.responses.passed !== report.responses.total) throw new Error("kilo-compat status/ratio mismatch");
-        console.log("kilo-compat: requests " + report.requests.passed + "/" + report.requests.total + ", responses " + report.responses.passed + "/" + report.responses.total + ", divergences " + report.required_divergences + " (" + report.status + ")");
-        '
-        CMDS
-        )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
-        artifacts="[]"
-        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"kilo-compat","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/kilo-compat.json
   - name: static
     image: rust:1.98
     environment:
@@ -399,7 +340,6 @@ steps:
     image: node:24
     depends_on:
       - storage-policy
-      - kilo-compat
       - linux
       - static
       - docs

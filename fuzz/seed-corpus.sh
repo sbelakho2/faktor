@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Regenerate the cargo-fuzz corpora from the checked-in fixture corpora
-# (audit P0-75/P0-81): seeds come from `compat/kilo-v756/` and
-# `fixtures/providers/`, plus canonical text seeds for targets that have no
-# fixture file of their own (ACP frames, tool-call text, path/rule/model
-# strings).
+# (audit P0-75/P0-81): seeds come from `fixtures/providers/`, plus canonical
+# text seeds for targets that have no fixture file of their own (ACP frames,
+# tool-call text, path/rule/model strings).
 #
 # Env:
 #   FUZZ_CORPUS_DIR   corpus dir override (default: fuzz/corpus)
@@ -40,13 +39,9 @@ seed_text() {
     SEEDED=$((SEEDED + 1))
 }
 
-# --- compat + provider fixtures feed the DTO/event/SSE/framing targets ----
-seed_copy compat_dto "$ROOT"/compat/kilo-v756/*.json
-seed_copy event_payload "$ROOT"/compat/kilo-v756/*.json
-seed_copy sse_frame "$ROOT"/compat/kilo-v756/*.json
-seed_copy line_framing "$ROOT"/compat/kilo-v756/*.json
+# --- provider fixtures feed the event/framing targets -----------------------
+seed_copy event_payload "$ROOT"/fixtures/providers/*.json
 seed_copy line_framing "$ROOT"/fixtures/providers/*.json
-seed_copy sse_frame "$ROOT"/fixtures/providers/*.json
 seed_copy tokenizer_pricing "$ROOT"/fixtures/providers/ollama-api-show-qwen3.8.json
 
 # --- ACP frames: Content-Length framed JSON-RPC bodies ---------------------

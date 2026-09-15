@@ -1,10 +1,9 @@
 # Faktor Native Protocol v1
 
-The daemon's own HTTP/SSE surface (architecture spec §16). UI
-compatibility is the target — visual/behavioral, not wire-level — and
-this protocol is optimized around the Faktor runtime. The v7.5.6 wire
-contract is optional migration/test glue against the old UI
-(`compat/kilo-v756`, architecture §16); nothing here pretends to be it.
+The daemon's own HTTP surface (architecture spec §16). UI compatibility
+is the target — visual/behavioral, not wire-level — and this protocol is
+optimized around the Faktor runtime. Kilo wire compatibility was retired
+by explicit owner decision; nothing here pretends to be it.
 
 All endpoints require daemon auth (same `FAKTOR_SERVER_PASSWORD` /
 `Authorization` forms as the rest of the server). JSON field names on the
@@ -98,6 +97,21 @@ Implemented (this revision of the daemon):
   runtime limit).
 - `GET /native/health` / `GET /native/ready` — see "Liveness and
   readiness" above.
+- `POST /native/session` — create one durable session:
+  `{provider, model, workspace?, title?}` (strict DTO; `workspace`
+  defaults to the daemon's own directory) → `{id, title, created_ms}`.
+- `GET /native/sessions` — the durable session listing (newest first,
+  capped at 1000): `{sessions: [{id, title, provider, model, state}]}`.
+- `POST /native/session/{id}/prompt` — run ONE ordinary prompt through the
+  daemon's single executor entry: `{session_id, prompt, files?}` (the body
+  id must match the path) → `{op_id, run_id, accepted, queued}`. Empty
+  prompts are a typed 400; unknown sessions 404.
+- `GET /native/session/{id}/events?after=<seq>` — the durable journal SSE
+  stream, cursor-resumable: frames are `id: <seq>`, `event: <kind>`,
+  `data: <native_event_row>` (the exact shape of the `/native/events`
+  page rows); `event: heartbeat` keep-alives carry no id. Catch-up is
+  paged (bounded), so a reconnect against a huge journal never balloons
+  RAM and resumes exactly from the cursor.
 - `GET /native/usage` — cross-session aggregate of the durable
   context-usage facts the runtime records (memory facts kind `usage`,
   keys `budget`/`spent`, integer values): `{sessions, totals:
@@ -175,9 +189,7 @@ boundary, in one direction only:
 2. **Bridge → Rust**: the bridge is a thin client of the native
    protocol; all state lives in the daemon, all validation happens in
    the daemon.
-3. **Never pretend to be v7.5.6**: when an old-UI client speaks the old
-   wire contract, it hits the optional compat glue (`compat/kilo-v756`)
-   — a deliberately separate, fixture-locked surface. A native client
-   never fabricates v7.5.6 frames, and native endpoints never inherit
-   v7.5.6 DTO strictness quirks (unknown-field rejection, snake_case
-   envelopes) that exist only for the frozen glue.
+3. **Never pretend to be v7.5.6**: the old wire-compatibility surface was
+   retired; native endpoints own their shapes and strictness (unknown
+   fields are loud 400s), and a native client never fabricates v7.5.6
+   frames.

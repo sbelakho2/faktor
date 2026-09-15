@@ -1,7 +1,7 @@
-//! The conversation view: messages and parts, mapped to the frozen
-//! `faktor-protocol::v756` shapes. Paging never loads more than one page.
+//! The conversation view: messages and parts, mapped to the Faktor-native
+//! `faktor-protocol::native` shapes. Paging never loads more than one page.
 
-use faktor_protocol::v756::{
+use faktor_protocol::native::{
     Message as WireMessage, MessagesPage, PageMeta, Part as WirePart, ToolResultBody,
 };
 use faktor_store::{MessageRow, PartRow};
@@ -9,7 +9,7 @@ use faktor_store::{MessageRow, PartRow};
 use crate::handle::SessionHandle;
 use crate::{json_bytes, SessionError, MAX_MESSAGE_BYTES, MAX_PAGE_SIZE, MAX_PART_BYTES};
 
-/// The frozen set of part kinds.
+/// The set of part kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PartKind {
     Text,
@@ -99,7 +99,7 @@ pub(crate) fn validate_part(kind: PartKind, data: &serde_json::Value) -> Result<
     Ok(())
 }
 
-/// Map a durable part row to the frozen wire shape. Unknown kinds are loud
+/// Map a durable part row to the native shape. Unknown kinds are loud
 /// errors (corruption), never silently dropped.
 pub(crate) fn wire_part(row: &PartRow) -> Result<WirePart, SessionError> {
     let kind = PartKind::from_name(&row.kind)
@@ -261,7 +261,7 @@ impl SessionHandle {
         )
     }
 
-    /// Convenience: a `tool_result` part from a frozen wire body.
+    /// Convenience: a `tool_result` part from a native body.
     pub fn put_tool_result_part(
         &self,
         message_id: i64,
@@ -446,7 +446,7 @@ impl SessionHandle {
             .map_err(|e| crate::map_store_err(e).into())
     }
 
-    /// The frozen protocol page for the webview: metadata + one page, with the
+    /// The native protocol page for the webview: metadata + one page, with the
     /// cursor for older pages. Parts are loaded per message *in the page only*.
     pub fn messages_page(
         &self,
@@ -508,17 +508,17 @@ impl SessionHandle {
         self.messages_page(None, limit)
     }
 
-    /// The frozen `SessionState` projection the UI polls on reconnect.
-    pub fn session_state_view(&self) -> faktor_core::Result<faktor_protocol::v756::SessionState> {
+    /// The `SessionState` projection the UI polls on reconnect.
+    pub fn session_state_view(&self) -> faktor_core::Result<faktor_protocol::native::SessionState> {
         let row = self.row()?;
         let last_event_seq = self.last_event_seq()?.map(|s| s.raw() as i64).unwrap_or(0);
         let ledger = self.get_task_ledger()?;
-        Ok(faktor_protocol::v756::SessionState {
+        Ok(faktor_protocol::native::SessionState {
             session_id: self.id.to_string(),
             state: crate::state_tag(row.state),
             title: row.title,
             last_event_seq,
-            agent_state: faktor_protocol::v756::AgentStateView {
+            agent_state: faktor_protocol::native::AgentStateView {
                 state: crate::state_tag(row.state),
                 label: row.state.label().to_string(),
                 active: row.state.is_active(),
@@ -668,7 +668,7 @@ mod tests {
             .is_err());
         // Rejected parts leave no rows.
         assert!(s.parts_of(mid).unwrap().is_empty());
-        // A valid shape round-trips onto the frozen wire type.
+        // A valid shape round-trips onto the native type.
         s.put_part(
             mid,
             PartKind::ToolCall,

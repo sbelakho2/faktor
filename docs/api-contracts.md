@@ -164,41 +164,23 @@ pub fn cas(&self) -> Arc<Cas>
 ## faktor-protocol (already implemented, `crates/protocol`)
 
 ```rust
-pub mod v756 {
-    pub const HANDSHAKE_PREFIX: &str;
-    pub struct Handshake { version, protocol, pid, auth_token, port } // to_line(), from_line()
-    pub struct HelloRequest { client, version }
-    pub struct HelloResponse { ok, version, protocol, auth_required, providers: Vec<String> }
-    pub struct CreateSessionRequest { provider, model, workspace: Option<String>, title: Option<String> } // deny_unknown_fields
-    pub struct CreateSessionResponse { id, title, created_ms }
-    pub struct PromptRequest { prompt, files: Vec<String>, op_id: Option<String> }
-    pub struct PromptResponse { op_id, accepted, queued }
-    pub struct MessagesQuery { before: Option<i64>, limit: i64, events_after: Option<i64> }
-    pub struct MessagesPage { session_id, messages: Vec<Message>, has_more, next_before: Option<i64> }
-    pub struct SessionState { session_id, state, title, last_event_seq, agent_state: AgentStateView, task_ledger: Option<Value> }
-    pub struct AgentStateView { state, label, active, terminal }
-    pub struct PermissionDecisionRequest { permission_id, decision }
-    pub struct PermissionDecisionResponse { ok }
-    pub struct AbortRequest { op_id: Option<String> }
-    pub struct AbortResponse { aborted: Vec<String> }
-    pub struct ProviderList { providers: Vec<ProviderInfo> }
-    pub struct ProviderInfo { id, name, kind, models: Vec<ModelInfo> }
-    pub struct ModelInfo { id, name, capabilities: ModelCapabilities }
-    pub struct Message { id, role, session_id, seq, created_ms, parts: Vec<Part> }
-    pub enum Part { Text{text}, Reasoning{text}, ToolCall{tool_call_id,name,input,state},
-                    ToolResult{tool_call_id,result: ToolResultBody}, Summary{text} } // serde tagged "type"
-    pub struct ToolResultBody { excerpt, exit_code: Option<i32>, artifact: Option<String>, slice_hint: Option<String> }
-    pub struct ProviderConfig { id, kind, base_url, api_key_env: Option<String>, models: Vec<ModelConfig> }
-    pub struct ModelConfig { id, name, capabilities }
-}
-pub mod sse {
-    pub enum SseEvent { SessionUpdated{..}, MessageCreated{..}, MessagePartUpdated{..},
-        ToolCallState{..}, PermissionRequested{permission_id,session_id,capability,detail},
-        AgentStateChanged{..}, AgentManagerUpdate{update}, Compaction{..}, Error{session_id,code,message} }
-    // to_frame(seq)->String, from_frame(&str)->Option<(u64,SseEvent)>, event_type()
-    pub fn project_event(&Event) -> Option<(SseEvent, EventKind)>
-    pub fn state_event(session_id: &str, state: AgentState) -> SseEvent
-}
+pub const VERSION: &str; pub const UX_BASELINE: &str;
+```
+
+## faktor-protocol native types (`crates/protocol/src/native.rs`)
+
+Faktor-owned conversation/projection shapes (Native Protocol v1,
+`docs/native-protocol.md`):
+
+```rust
+pub struct Message { id, role, session_id, seq, created_ms, parts: Vec<Part> }
+pub enum Part { Text{text}, Reasoning{text}, ToolCall{tool_call_id,name,input,state},
+                ToolResult{tool_call_id,result: ToolResultBody}, Summary{text} } // serde tagged "type"
+pub struct ToolResultBody { excerpt, exit_code: Option<i32>, artifact: Option<String>, slice_hint: Option<String> }
+pub struct PageMeta { size, cursor: Option<i64>, has_more, total_estimate: Option<i64> }
+pub struct MessagesPage { session_id, messages: Vec<Message>, has_more, next_before: Option<i64>, page: PageMeta }
+pub struct SessionState { session_id, state, title, last_event_seq, agent_state: AgentStateView, task_ledger: Option<Value> }
+pub struct AgentStateView { state, label, active, terminal }
 pub struct ApiError { code, message, http_status, retryable } // from_core(&Error)->ApiError, to_json()
 ```
 

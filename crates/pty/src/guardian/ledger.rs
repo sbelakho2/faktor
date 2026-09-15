@@ -19,8 +19,9 @@
 //!   the ledger);
 //! - the file, row count, owner label, and every rewritten buffer are
 //!   bounded ([`MAX_LEDGER_BYTES`], [`MAX_LEDGER_LINES`], [`MAX_OWNER_BYTES`]);
-//! - `reconcile` rewrites atomically (tmp + rename), keeping `live` rows and
-//!   at most a bounded tail of settled rows as evidence.
+//! - `reconcile` rewrites atomically through the shared
+//!   [`faktor_fs::atomic`] authority (unique temp + fsync + rename), keeping
+//!   `live` rows and at most a bounded tail of settled rows as evidence.
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -347,34 +348,29 @@ impl TerminalLedger {
         (rows, corrupt)
     }
 
-    /// Atomic rewrite (tmp + rename): a crash mid-rewrite leaves the old
-    /// ledger intact.
+    /// Atomic rewrite through the shared [`faktor_fs::atomic`] authority
+    /// (unique temp + fsync + rename): a crash mid-rewrite leaves the old
+    /// ledger intact and the sequence is never hand-rolled here.
     fn write_rows(&self, rows: &[LedgerRow]) -> Result<(), Error> {
-        let tmp = self
-            .path
-            .with_extension(format!("tmp.{}", std::process::id()));
-        let result = (|| -> Result<(), Error> {
-            let mut f = File::create(&tmp)
-                .map_err(|e| Error::internal(format!("terminal ledger tmp: {e}")))?;
-            for row in rows {
-                serde_json::to_writer(&mut f, row)
-                    .map_err(|e| Error::internal(format!("terminal ledger encode: {e}")))?;
-                f.write_all(b"\n")
-                    .map_err(|e| Error::internal(format!("terminal ledger write: {e}")))?;
+        let mut bytes = Vec::new();
+        for row in rows {
+            serde_json::to_writer(&mut bytes, row)
+                .map_err(|e| Error::internal(format!("terminal ledger encode: {e}")))?;
+            bytes.push(b'\n');
+            if bytes.len() > MAX_LEDGER_BYTES {
+                return Err(Error::oversized(
+                    "terminal ledger rewrite exceeds the file cap",
+                ));
             }
-            f.flush()
-                .map_err(|e| Error::internal(format!("terminal ledger flush: {e}")))?;
-            std::fs::rename(&tmp, &self.path).map_err(|e| {
-                Error::internal(format!(
-                    "terminal ledger rename {}: {e}",
-                    self.path.display()
-                ))
-            })
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
         }
-        result
+        faktor_fs::atomic::atomic_replace(&self.path, &bytes).map_err(|e| {
+            Error::internal(format!(
+                "terminal ledger rewrite {}: {}",
+                self.path.display(),
+                e.message
+            ))
+        })?;
+        Ok(())
     }
 
     fn append(&self, row: &LedgerRow) -> Result<(), Error> {

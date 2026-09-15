@@ -63,9 +63,7 @@ pub use time::{Clock, Deadline, SystemClock, TestClock};
 
 /// The Faktor daemon version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// The frozen protocol version this build speaks.
-pub const PROTOCOL_V756: &str = "v756";
-/// The frozen baseline UX this build targets.
+/// The vendored baseline UX this build ships as its frontend.
 pub const UX_BASELINE: &str = "kilo-v7.5.6";
 
 /// Every file/tool call explicitly carries its workspace identity.

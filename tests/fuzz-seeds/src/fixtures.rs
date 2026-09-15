@@ -1,13 +1,9 @@
 //! Seed corpus sourcing (audit P0-75/P0-81): fuzz seeds come from the
 //! repository's EXISTING fixtures, never from invented blobs.
 //!
-//! Two checked-in fixture corpora feed the deterministic campaign and the
-//! `fuzz/seed-corpus.sh` generator:
-//!
-//! - `compat/kilo-v756/` — the frozen v7.5.6 wire goldens (compat DTOs,
-//!   SSE frames, global event envelopes, provider lists, ...);
-//! - `fixtures/providers/` — recorded provider stream bodies (OpenAI,
-//!   Anthropic, Gemini, Ollama), the line-framing/SSE source shapes.
+//! The checked-in `fixtures/providers/` corpus (recorded provider stream
+//! bodies: OpenAI, Anthropic, Gemini, Ollama) feeds the deterministic
+//! campaign and the `fuzz/seed-corpus.sh` generator.
 //!
 //! Loading is lazy and process-wide; a missing directory yields no seeds
 //! (the caller reports that honestly instead of failing the harness).
@@ -22,7 +18,7 @@ pub struct FixtureSeed {
     pub bytes: Vec<u8>,
 }
 
-const SEED_DIRS: &[&str] = &["compat/kilo-v756", "fixtures/providers"];
+const SEED_DIRS: &[&str] = &["fixtures/providers"];
 
 /// Repository root computed from this crate's manifest dir
 /// (`tests/fuzz-seeds` -> `../..`).
