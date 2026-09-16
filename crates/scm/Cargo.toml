@@ -1,0 +1,22 @@
+[package]
+name = "faktor-scm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+faktor-provider.workspace = true
+async-trait = "0.1"
+hmac = "0.12"
+sha2 = "0.10"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+[dev-dependencies]
+tokio.workspace = true
+axum = "0.8"
+tempfile.workspace = true

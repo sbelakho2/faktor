@@ -1398,6 +1398,25 @@ async fn serve_impl(
     // supervisor → checked transport → providers → router → budgets →
     // index → evidence → instructions → verification → agent →
     // orchestrator → shadows → tasks. Serve constructs NOTHING of its own.
+    // The `[cloud]` section is resolved into the daemon's own data dir
+    // BEFORE the config is consumed: when disabled (the default and every
+    // pre-cloud config) the control-plane/SCM databases are neither created
+    // nor opened, and the local daemon stays byte-identical. When enabled,
+    // the control plane and the durable SCM rows are opened here (their
+    // files live under the data dir; a hostile path is refused at startup).
+    let cloud_databases = if config.cloud.enabled {
+        let control_plane_path = config
+            .cloud
+            .control_plane_path(&data_dir)
+            .map_err(|e| format!("cloud config: {e}"))?;
+        let scm_path = config
+            .cloud
+            .scm_path(&data_dir)
+            .map_err(|e| format!("cloud config: {e}"))?;
+        Some((control_plane_path, scm_path))
+    } else {
+        None
+    };
     let graph =
         build_daemon_with_mcp_and_chunks_fast(&data_dir, Some(config), Some(chunk_sink), semantic)
             .await
@@ -1429,6 +1448,29 @@ async fn serve_impl(
         graph.budgets.clone(),
     );
     deps.chunk_rx = Some(chunk_rx);
+    if let Some((control_plane_path, scm_path)) = cloud_databases {
+        let control_plane = match control_plane_path {
+            Some(path) => Arc::new(faktor_cloud::ControlPlane::new(
+                Arc::new(
+                    faktor_cloud::SqliteControlPlaneStore::open(&path).map_err(|e| {
+                        format!("cloud control-plane store {}: {e}", path.display())
+                    })?,
+                ),
+                Arc::new(faktor_cloud::SystemClock),
+            )),
+            None => unreachable!("enabled cloud always resolves a control-plane path"),
+        };
+        let scm = match scm_path {
+            Some(path) => {
+                let store = faktor_scm::SqliteScmStore::open(&path)
+                    .map_err(|e| format!("cloud scm store {}: {e}", path.display()))?;
+                Arc::new(store) as Arc<dyn faktor_scm::ScmStore>
+            }
+            None => unreachable!("enabled cloud always resolves an scm path"),
+        };
+        deps = deps.with_control_plane(control_plane).with_scm_store(scm);
+        tracing::info!("cloud control plane enabled");
+    }
     // The ONE semantic-provider registry: the SAME Arc the graph built and
     // the agent holds — the native introspection endpoints inspect only
     // `deps.semantic` (no parallel registry exists anywhere).
@@ -5897,5 +5939,64 @@ mod tests {
         );
         drop(client);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+    }
+
+    /// Cloud-disabled parity: a daemon with `[cloud] enabled = false` (and
+    /// with an absent section) creates NO control-plane/SCM database and
+    /// keeps the frozen startup line; an enabled daemon opens exactly those
+    /// two databases under its data dir.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cloud_disabled_daemon_creates_no_cloud_databases_and_enabled_opens_them() {
+        for (label, config_json, expect_cloud) in [
+            ("absent", r#"{"model": "m"}"#, false),
+            (
+                "disabled",
+                r#"{"model": "m", "cloud": {"enabled": false}}"#,
+                false,
+            ),
+            (
+                "enabled",
+                r#"{"model": "m", "cloud": {"enabled": true, "database": "cp.db", "scm_database": "repos.db"}}"#,
+                true,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("faktor-plus.json");
+            std::fs::write(&config, config_json).unwrap();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let dir2 = dir.path().to_path_buf();
+            let daemon = tokio::task::spawn(async move {
+                serve_impl(0, dir2, Some(config), Some(ready_tx), Some(shutdown_rx)).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(60), ready_rx)
+                .await
+                .expect("serve must reach the startup line")
+                .expect("ready signal");
+            let control_plane_db = dir.path().join("cp.db");
+            let scm_db = dir.path().join("repos.db");
+            let default_control_plane_db = dir.path().join("control-plane.db");
+            let default_scm_db = dir.path().join("scm.db");
+            if expect_cloud {
+                assert!(
+                    control_plane_db.exists() && scm_db.exists(),
+                    "{label}: an enabled [cloud] section must open its databases"
+                );
+            } else {
+                assert!(
+                    !control_plane_db.exists()
+                        && !scm_db.exists()
+                        && !default_control_plane_db.exists()
+                        && !default_scm_db.exists(),
+                    "{label}: a disabled [cloud] section must create no database"
+                );
+            }
+            let _ = shutdown_tx.send(());
+            tokio::time::timeout(std::time::Duration::from_secs(30), daemon)
+                .await
+                .expect("daemon must stop on shutdown")
+                .expect("serve_impl returns Ok")
+                .unwrap();
+        }
     }
 }

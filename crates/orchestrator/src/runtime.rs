@@ -752,6 +752,20 @@ struct ExecState {
     semantic_risk: Option<RiskLevel>,
 }
 
+/// Classified lock recovery for the orchestrator's live execution mirrors
+/// (`exec` runs and their `outcomes` drive results): both are projections of
+/// DURABLE rows — the plan row, the per-child registry rows and the child op
+/// records — and are rebuilt/reconciled from them on every re-attach
+/// ([`OrchestratorRuntime::reattach`], `reconcile_from_registry`). A poisoned
+/// guard is recovered with the poison flag cleared so one panicking caller
+/// can never wedge child execution; the durable rows remain the authority.
+pub(crate) fn recover_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
 /// The orchestration runtime: the manager + agent it drives children with,
 /// and the durable control surface.
 ///
@@ -1474,7 +1488,7 @@ impl OrchestratorRuntime {
         // Crash seam: this exact window — assignments durable, no child
         // spawned yet — must re-open with the SAME child ids.
         {
-            let mut guard = self.exec.lock().expect("exec lock");
+            let mut guard = recover_lock(&self.exec);
             let exec = guard.get_mut(&run_id).expect("execution installed above");
             self.check_crash(exec, CrashSeam::AfterAssignmentsPersisted)?;
         }
@@ -1553,17 +1567,14 @@ impl OrchestratorRuntime {
     /// different sessions each own their entry.
     fn install_run(&self, state: ExecState) -> Result<(), ExecError> {
         let run_id = state.run_id.clone();
-        self.exec
-            .lock()
-            .expect("exec lock")
-            .insert(run_id.clone(), state);
+        recover_lock(&self.exec).insert(run_id.clone(), state);
         Ok(())
     }
 
     /// The mirror of the ONE run that owns `child_id` (mirrors are run
     /// scoped; a child belongs to exactly one installed run).
     fn child_mirror(&self, child_id: &str) -> Option<(String, ChildRuntime)> {
-        let guard = self.exec.lock().expect("exec lock");
+        let guard = recover_lock(&self.exec);
         for (run_id, exec) in guard.iter() {
             if let Some(row) = exec.children.get(child_id) {
                 return Some((run_id.clone(), row.clone()));
@@ -1795,13 +1806,13 @@ impl OrchestratorRuntime {
                 // task row is the truth and every registry read derives it).
                 let derived = child_task_budget_cap(&self.manager, row.session_id);
                 let owner_run = {
-                    let guard = self.exec.lock().expect("exec lock");
+                    let guard = recover_lock(&self.exec);
                     guard
                         .iter()
                         .find_map(|(r, e)| e.children.contains_key(child_id).then(|| r.clone()))
                 };
                 if let Some(run_id) = owner_run {
-                    let mut guard = self.exec.lock().expect("exec lock");
+                    let mut guard = recover_lock(&self.exec);
                     if let Some(exec) = guard.get_mut(&run_id) {
                         if let Some(c) = exec.children.get_mut(child_id) {
                             c.budget_max_tokens = derived;
@@ -2238,7 +2249,7 @@ impl OrchestratorRuntime {
     async fn drive_to_outcome(&self, run_id: &str) -> Result<PlanOutcome, ExecError> {
         let mut limits = faktor_core::resource::ResourceLimits::default();
         let scheduler = {
-            let guard = self.exec.lock().expect("exec lock");
+            let guard = recover_lock(&self.exec);
             let exec = guard
                 .get(run_id)
                 .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
@@ -2268,11 +2279,11 @@ impl OrchestratorRuntime {
     /// Classify finished drives of ONE run, write durable child rows,
     /// advance items.
     fn settle_finished_drives(&self, run_id: &str) -> Result<(), ExecError> {
-        let mut guard = self.exec.lock().expect("exec lock");
+        let mut guard = recover_lock(&self.exec);
         let exec = guard
             .get_mut(run_id)
             .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
-        let mut outcomes = exec.outcomes.lock().expect("outcome lock");
+        let mut outcomes = recover_lock(&exec.outcomes);
         let mut done: Vec<(String, ChildRuntime)> = Vec::new();
         for (child_id, op_id) in exec.drive_ops.clone() {
             if let Some(drive) = outcomes.remove(&op_id) {
@@ -2346,7 +2357,7 @@ impl OrchestratorRuntime {
         // Crash seam: a child just reached terminal state.
         {
             let terminal_child = {
-                let guard = self.exec.lock().expect("exec lock");
+                let guard = recover_lock(&self.exec);
                 let exec = guard
                     .get(run_id)
                     .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
@@ -2362,7 +2373,7 @@ impl OrchestratorRuntime {
                 }
             };
             if let Some(child_id) = terminal_child {
-                let mut guard = self.exec.lock().expect("exec lock");
+                let mut guard = recover_lock(&self.exec);
                 let exec = guard
                     .get_mut(run_id)
                     .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
@@ -2381,7 +2392,7 @@ impl OrchestratorRuntime {
         _child_id: &str,
         row: &ChildRuntime,
     ) -> Result<(), ExecError> {
-        let mut guard = self.exec.lock().expect("exec lock");
+        let mut guard = recover_lock(&self.exec);
         let exec = guard
             .get_mut(run_id)
             .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
@@ -2474,7 +2485,7 @@ impl OrchestratorRuntime {
         let mut admitted = 0usize;
         let mut newly_spawned: Vec<ChildRuntime> = Vec::new();
         {
-            let mut guard = self.exec.lock().expect("exec lock");
+            let mut guard = recover_lock(&self.exec);
             let exec = guard
                 .get_mut(run_id)
                 .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
@@ -2553,7 +2564,7 @@ impl OrchestratorRuntime {
         // admission: the decision is durable before the drive starts).
         let mut redrives = Vec::new();
         {
-            let mut guard = self.exec.lock().expect("exec lock");
+            let mut guard = recover_lock(&self.exec);
             let exec = guard
                 .get_mut(run_id)
                 .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
@@ -2644,7 +2655,7 @@ impl OrchestratorRuntime {
     }
 
     fn check_crash_seam_before_drive(&self, run_id: &str) -> Result<(), ExecError> {
-        let mut guard = self.exec.lock().expect("exec lock");
+        let mut guard = recover_lock(&self.exec);
         let exec = guard
             .get_mut(run_id)
             .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
@@ -2992,7 +3003,7 @@ impl OrchestratorRuntime {
         // identically on re-attach). An absent spec is an empty set — the
         // attachment-free behavior of every previous wave.
         let files = {
-            let guard = self.exec.lock().expect("exec lock");
+            let guard = recover_lock(&self.exec);
             guard
                 .get(run_id)
                 .and_then(|exec| exec.specs.get(&child.item_id))
@@ -3004,7 +3015,7 @@ impl OrchestratorRuntime {
         // op is registered (seed_task_attachments), so request construction
         // can resolve the byte-identical bytes.
         let attachments = {
-            let guard = self.exec.lock().expect("exec lock");
+            let guard = recover_lock(&self.exec);
             guard
                 .get(run_id)
                 .and_then(|exec| exec.specs.get(&child.item_id))
@@ -3012,7 +3023,7 @@ impl OrchestratorRuntime {
                 .unwrap_or_default()
         };
         let outcomes = {
-            let guard = self.exec.lock().expect("exec lock");
+            let guard = recover_lock(&self.exec);
             guard
                 .get(run_id)
                 .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?
@@ -3020,14 +3031,14 @@ impl OrchestratorRuntime {
                 .clone()
         };
         let parent_session = {
-            let guard = self.exec.lock().expect("exec lock");
+            let guard = recover_lock(&self.exec);
             guard
                 .get(run_id)
                 .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?
                 .parent_session
         };
         let run_id_owned = {
-            let guard = self.exec.lock().expect("exec lock");
+            let guard = recover_lock(&self.exec);
             guard
                 .get(run_id)
                 .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?
@@ -3072,7 +3083,7 @@ impl OrchestratorRuntime {
         scheduler
             .try_submit(op)
             .map_err(|e| ExecError::Conflict(format!("scheduler refused child op: {e}")))?;
-        let mut guard = self.exec.lock().expect("exec lock");
+        let mut guard = recover_lock(&self.exec);
         let exec = guard
             .get_mut(run_id)
             .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
@@ -3081,7 +3092,7 @@ impl OrchestratorRuntime {
     }
 
     fn child_prompt(&self, run_id: &str, child: &ChildRuntime) -> Result<String, ExecError> {
-        let guard = self.exec.lock().expect("exec lock");
+        let guard = recover_lock(&self.exec);
         let exec = guard
             .get(run_id)
             .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
@@ -3101,7 +3112,7 @@ impl OrchestratorRuntime {
     }
 
     fn exec_root(&self, run_id: &str) -> PathBuf {
-        let guard = self.exec.lock().expect("exec lock");
+        let guard = recover_lock(&self.exec);
         guard
             .get(run_id)
             .map(|e| e.owner.root.clone())
@@ -3109,7 +3120,7 @@ impl OrchestratorRuntime {
     }
 
     fn final_outcome(&self, run_id: &str) -> Result<PlanOutcome, ExecError> {
-        let guard = self.exec.lock().expect("exec lock");
+        let guard = recover_lock(&self.exec);
         let exec = guard
             .get(run_id)
             .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
@@ -3693,7 +3704,7 @@ fn drive_op_entry(
                 }
             }
         }
-        let mut map = outcomes.lock().unwrap();
+        let mut map = recover_lock(&outcomes);
         map.insert(
             op_id,
             DriveResult {

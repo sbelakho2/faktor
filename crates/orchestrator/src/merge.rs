@@ -1696,7 +1696,7 @@ impl OrchestratorRuntime {
         child_id: &str,
     ) -> Result<(SessionId, String, ChildRuntime), ExecError> {
         {
-            let guard = self.exec.lock().expect("exec lock");
+            let guard = recover_lock(&self.exec);
             let mut found: Vec<(SessionId, String, ChildRuntime)> = Vec::new();
             for exec in guard.values() {
                 if let Some(row) = exec.children.get(child_id) {
@@ -2519,7 +2519,7 @@ impl OrchestratorRuntime {
     }
 
     fn check_merge_seam(&self, run: &str, seam: CrashSeam) -> Result<(), ExecError> {
-        let mut guard = self.exec.lock().expect("exec lock");
+        let mut guard = recover_lock(&self.exec);
         let Some(exec) = guard.get_mut(run) else {
             return Ok(());
         };
@@ -2660,7 +2660,7 @@ impl OrchestratorRuntime {
         )?;
         row.base_snapshot_id = Some(base_id);
         row.env_snapshot_id = Some(env_id);
-        let mut guard = self.exec.lock().expect("exec lock");
+        let mut guard = recover_lock(&self.exec);
         let Some(exec) = guard.get_mut(&run) else {
             // No active execution of this run: only the durable rows
             // exist; the executor drives reviewers through the same submit
@@ -2690,7 +2690,7 @@ impl OrchestratorRuntime {
     fn next_spawn_seq(&self, parent: &SessionId, run: &str) -> Result<u64, ExecError> {
         let mut max: u64 = 0;
         {
-            let guard = self.exec.lock().expect("exec lock");
+            let guard = recover_lock(&self.exec);
             if let Some(exec) = guard.get(run) {
                 max = max.max(exec.next_child_seq.saturating_sub(1));
             }

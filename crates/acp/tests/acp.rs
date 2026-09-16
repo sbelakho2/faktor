@@ -1262,7 +1262,7 @@ impl AcpStreamBackend for NativePermissionBackend {
                 };
                 // The same decision path the daemon adapter uses: resolve
                 // the durable native request exactly once.
-                requester.resolve(permission_id, decision);
+                let _ = requester.resolve(permission_id, decision);
                 decisions.lock().unwrap().push(format!("{decision:?}"));
                 outcome_value
             };

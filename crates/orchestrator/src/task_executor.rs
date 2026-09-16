@@ -864,6 +864,19 @@ impl PoisonedAuthority {
             ),
         }
     }
+
+    /// The poisoned COMPLETION-STEP policy lock: the validated
+    /// `[completion]` execution policy can no longer be trusted, so a policy
+    /// mutation refuses rather than half-applying a commit/push/PR config.
+    pub fn completion_step_lock(detail: impl std::fmt::Display) -> Self {
+        Self {
+            authority: "completion-step policy lock",
+            detail: format!(
+                "a writer panicked while holding it ({detail}); refusing the configuration \
+                 change rather than half-applying a commit/push/PR policy"
+            ),
+        }
+    }
 }
 
 impl From<PoisonedAuthority> for ExecError {
@@ -1078,19 +1091,24 @@ impl TaskExecutor {
     /// seam fires at the FIRST matching boundary of the next settlement and
     /// is consumed; clearing it lets the recovery pass run.
     pub fn set_settlement_crash_seam(&self, seam: Option<CrashSeam>) {
-        *self
-            .settlement_seam
-            .lock()
-            .expect("settlement-seam lock poisoned") = seam.map(|s| (s, false));
+        *self.lock_settlement_seam() = seam.map(|s| (s, false));
+    }
+
+    /// The settlement crash seam with classified recovery: the seam is a
+    /// test-only DERIVED flag (the durable rows it simulates a crash across
+    /// remain the authority), so a poisoned guard is recovered with the
+    /// poison flag cleared rather than wedging the recovery pass.
+    fn lock_settlement_seam(&self) -> std::sync::MutexGuard<'_, Option<(CrashSeam, bool)>> {
+        self.settlement_seam.lock().unwrap_or_else(|poisoned| {
+            self.settlement_seam.clear_poison();
+            poisoned.into_inner()
+        })
     }
 
     /// Consume the configured settlement seam when `seam` matches it. The
     /// first match fires exactly once; later calls (the recovery pass) pass.
     fn check_settlement_seam(&self, seam: CrashSeam) -> Result<(), ExecError> {
-        let mut guard = self
-            .settlement_seam
-            .lock()
-            .expect("settlement-seam lock poisoned");
+        let mut guard = self.lock_settlement_seam();
         if let Some((configured, fired)) = guard.as_mut() {
             if *configured == seam && !*fired {
                 *fired = true;
@@ -1193,7 +1211,9 @@ impl TaskExecutor {
     /// Configure the PR/push/commit execution policy of the completion-step
     /// runner (the daemon's strict `[completion]` config section). The
     /// config is validated BEFORE it is stored; a cached runner is dropped so
-    /// the next contracted run rebuilds with the new values.
+    /// the next contracted run rebuilds with the new values. The policy lock
+    /// is AUTHORITY state: a poisoned guard refuses the change typed
+    /// ([`PoisonedAuthority`]), never half-applying a commit/push/PR policy.
     pub fn configure_completion_steps(
         &self,
         config: CompletionStepsConfig,
@@ -1202,38 +1222,44 @@ impl TaskExecutor {
         let mut wiring = self
             .completion_steps
             .lock()
-            .expect("completion-step lock poisoned");
+            .map_err(PoisonedAuthority::completion_step_lock)?;
         wiring.config = config;
         wiring.runner = None;
         Ok(())
     }
 
+    /// The completion-step wiring guard with classified recovery: the config
+    /// is the daemon's validated POLICY (mutations refuse typed on poison,
+    /// see [`Self::configure_completion_steps`]) while the cached runner is a
+    /// DERIVED cache. A poisoned guard is recovered with the poison flag
+    /// cleared and the cached runner DROPPED, so a torn config/runner pair
+    /// can never execute the OLD policy; the next contracted run rebuilds
+    /// the runner from the recovered, validated config.
+    fn lock_completion_steps(&self) -> std::sync::MutexGuard<'_, CompletionStepsWiring> {
+        self.completion_steps.lock().unwrap_or_else(|poisoned| {
+            self.completion_steps.clear_poison();
+            let mut guard = poisoned.into_inner();
+            guard.runner = None;
+            guard
+        })
+    }
+
     /// The configured completion-step policy.
     pub fn completion_steps_config(&self) -> CompletionStepsConfig {
-        self.completion_steps
-            .lock()
-            .expect("completion-step lock poisoned")
-            .config
-            .clone()
+        self.lock_completion_steps().config.clone()
     }
 
     /// Install an explicit runner (daemon wiring/tests). `None` clears it:
     /// the executor then lazily rebuilds from the agent's supervisor.
     pub fn set_completion_steps(&self, runner: Option<Arc<CompletionStepRunner>>) {
-        self.completion_steps
-            .lock()
-            .expect("completion-step lock poisoned")
-            .runner = runner;
+        self.lock_completion_steps().runner = runner;
     }
 
     /// The runner of this executor: an explicitly installed one, else one
     /// built from the agent's own process supervisor + sandbox egress gate.
     /// `None` when the daemon has no supervisor (nothing can be executed).
     fn completion_step_runner(&self) -> Result<Option<Arc<CompletionStepRunner>>, ExecError> {
-        let mut wiring = self
-            .completion_steps
-            .lock()
-            .expect("completion-step lock poisoned");
+        let mut wiring = self.lock_completion_steps();
         if let Some(runner) = &wiring.runner {
             return Ok(Some(runner.clone()));
         }

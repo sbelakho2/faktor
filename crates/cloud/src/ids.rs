@@ -1,0 +1,183 @@
+//! Typed control-plane identities and secrets.
+//!
+//! Every id is a distinct type with a strict shape (bounded printable ASCII
+//! without whitespace); deserialization re-validates, so a hostile DTO can
+//! never smuggle an invalid identity into the domain. Secrets (session
+//! tokens, invitation tokens, service-account tokens) are exposed exactly
+//! once at issuance and stored ONLY as SHA-256 hashes.
+
+use std::fmt;
+
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::error::ControlPlaneError;
+
+/// Bound on any control-plane id.
+pub const MAX_ID_BYTES: usize = 128;
+/// Bound on one bearer token (session / invitation / service account).
+pub const MAX_TOKEN_BYTES: usize = 512;
+
+fn validate_id(kind: &str, value: &str) -> Result<(), ControlPlaneError> {
+    if value.is_empty() || value.len() > MAX_ID_BYTES {
+        return Err(ControlPlaneError::Malformed(format!(
+            "{kind} id must be 1..={MAX_ID_BYTES} bytes"
+        )));
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
+    {
+        return Err(ControlPlaneError::Malformed(format!(
+            "{kind} id must be printable ASCII without whitespace, quotes or backslashes"
+        )));
+    }
+    Ok(())
+}
+
+macro_rules! string_id {
+    ($name:ident, $kind:literal) => {
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn try_new(raw: impl Into<String>) -> Result<Self, ControlPlaneError> {
+                let raw = raw.into();
+                validate_id($kind, &raw)?;
+                Ok(Self(raw))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let raw = String::deserialize(d)?;
+                Self::try_new(raw).map_err(D::Error::custom)
+            }
+        }
+    };
+}
+
+string_id!(OrganizationId, "organization");
+string_id!(UserId, "user");
+string_id!(MembershipId, "membership");
+string_id!(InvitationId, "invitation");
+string_id!(AuthSessionId, "auth session");
+string_id!(ExternalIdentityId, "external identity");
+string_id!(ServiceAccountId, "service account");
+string_id!(ApprovalId, "approval");
+
+/// The sha256 hex of one token (the ONLY form a token is stored in).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TokenHash(String);
+
+impl TokenHash {
+    pub fn try_new(raw: impl Into<String>) -> Result<Self, ControlPlaneError> {
+        let raw = raw.into();
+        if raw.len() != 64 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ControlPlaneError::Malformed(
+                "token hash must be 64 lowercase hex characters".into(),
+            ));
+        }
+        Ok(Self(raw))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Hash one presented token (the lookup key of every token table).
+    pub fn of(token: &str) -> Self {
+        Self(crate::service::sha256_hex(token.as_bytes()))
+    }
+}
+
+impl fmt::Display for TokenHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// One plaintext secret token, exposed exactly once at issuance. `Debug` is
+/// redacted; the value is never serialized.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretToken(String);
+
+impl SecretToken {
+    pub fn try_new(raw: impl Into<String>) -> Result<Self, ControlPlaneError> {
+        let raw = raw.into();
+        if raw.is_empty() || raw.len() > MAX_TOKEN_BYTES || raw.contains(char::is_whitespace) {
+            return Err(ControlPlaneError::Malformed(
+                "token must be 1..=512 non-whitespace bytes".into(),
+            ));
+        }
+        Ok(Self(raw))
+    }
+
+    /// The secret value (call sites must never log it).
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretToken(<redacted>)")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_are_bounded_and_revalidated_on_deserialize() {
+        assert!(OrganizationId::try_new("").is_err());
+        assert!(OrganizationId::try_new("has space").is_err());
+        assert!(OrganizationId::try_new("a".repeat(MAX_ID_BYTES + 1)).is_err());
+        assert!(OrganizationId::try_new("org_01h").is_ok());
+        assert!(serde_json::from_str::<UserId>("\"bad id\"").is_err());
+        assert_eq!(
+            serde_json::from_str::<UserId>("\"usr_1\"")
+                .unwrap()
+                .as_str(),
+            "usr_1"
+        );
+    }
+
+    #[test]
+    fn token_hash_shape_and_value_are_exact() {
+        assert!(TokenHash::try_new("short").is_err());
+        assert!(
+            TokenHash::try_new("Z".repeat(64)).is_err(),
+            "uppercase hex is not canonical"
+        );
+        let hash = TokenHash::of("secret");
+        assert_eq!(hash.as_str().len(), 64);
+        assert_eq!(
+            hash.as_str(),
+            "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
+        );
+    }
+
+    #[test]
+    fn secret_tokens_are_redacted_and_bounded() {
+        let token = SecretToken::try_new("abc123").unwrap();
+        assert!(!format!("{token:?}").contains("abc123"));
+        assert_eq!(token.expose(), "abc123");
+        assert!(SecretToken::try_new("").is_err());
+        assert!(SecretToken::try_new("a b").is_err());
+        assert!(SecretToken::try_new("x".repeat(MAX_TOKEN_BYTES + 1)).is_err());
+    }
+}
