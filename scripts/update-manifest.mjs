@@ -27,7 +27,22 @@
 //     [--channel stable|beta|dev] [--version V]
 //     [--commit SHA] [--out PATH] [--url-base URL] [--sign-key KEY]
 //     [--key-id ID] [--expires-in-days N] [--compat PATH] [--compat-min V]
+//     [--signatures PATH] [--require-signed-artifacts]
 //     [--require-signed] [--dry-run]
+//
+// `--signatures PATH` (produced additively by scripts/package-artifacts.sh as
+// target/certification/artifact-signatures.json) binds the OS-level signing
+// verdicts of THIS run: each record's digest must equal the artifact's
+// recorded sha256 (a doctored/mismatched artifact is refused outright), a
+// `failed` OS-signing verdict refuses the manifest, and when a certification
+// block is present each record's canonical digest is embedded into
+// `certification.evidence` as `os_signature.<artifact>` (schema-compatible:
+// the value is a 64-hex digest, exactly like the other evidence entries).
+// `--require-signed-artifacts` additionally refuses any distributable
+// artifact whose OS-signature status is not `signed` — the release policy;
+// without it unsigned artifacts are shipped with their explicit UNSIGNED
+// marker (usable locally, and the manifest itself can still be ed25519
+// signed).
 //
 // `--certification PATH` binds the provenance strictly (a certificate for
 // another commit is refused); `--certification-optional PATH` (used by the
@@ -54,6 +69,14 @@ const CHANNELS = ['stable', 'beta', 'dev'];
 const DEFAULT_MAX_VALIDITY_DAYS = 30;
 const MAX_VALIDITY_DAYS = 365;
 const DEFAULT_URL_BASE = 'https://updates.invalid/faktor';
+const SIGNATURES_SCHEMA = 'faktor-artifact-signatures/v1';
+// The OS-signing verdict vocabulary of scripts/sign-{macos,windows}.sh. A
+// `failed` verdict is never publishable; the other statuses ship with an
+// explicit marker and are refused only under --require-signed-artifacts.
+const OS_SIGNATURE_STATUSES = new Set(['signed', 'unsigned', 'skipped', 'not_applicable']);
+// Mirrors crates/updater's MAX_CERTIFICATION_EVIDENCE_ENTRIES (the manifest
+// schema is strict there; this script must never assemble a refused file).
+const MAX_CERTIFICATION_EVIDENCE = 16;
 
 function usage(code = 0) {
   const text = readFileSync(SCRIPT_PATH, 'utf8')
@@ -262,7 +285,68 @@ function artifactOsArch(entry, artifacts) {
   }
 }
 
-function assembleArtifacts(artifacts, urlBase, version) {
+// ------------------------------------------- OS-signature records (additive)
+
+// Read target/certification/artifact-signatures.json (written by
+// scripts/package-artifacts.sh step 4.5). Returns a Map artifactName ->
+// record. An absent path is an empty map (no OS signing was attempted).
+function readSignatureRecords(path) {
+  const records = new Map();
+  if (!path) {
+    return records;
+  }
+  if (!existsSync(path)) {
+    throw new Error(`OS-signature records ${path} do not exist`);
+  }
+  const parsed = readJsonStrict(path, 'OS-signature records');
+  if (parsed.schema !== SIGNATURES_SCHEMA) {
+    throw new Error(`OS-signature records schema '${parsed.schema}' != '${SIGNATURES_SCHEMA}'`);
+  }
+  for (const row of parsed.artifacts || []) {
+    if (!row || typeof row.name !== 'string' || row.name === '') {
+      throw new Error('OS-signature records carry an entry without an artifact name');
+    }
+    if (records.has(row.name)) {
+      throw new Error(`OS-signature records name artifact '${row.name}' twice`);
+    }
+    records.set(row.name, row);
+  }
+  return records;
+}
+
+// Validate one signature record against its artifacts.json entry. The record
+// must describe the SAME bytes the manifest will ship (the recorded digest
+// equality is the anti-doctoring step), carry a known status, and never
+// report `failed`. Returns the canonical digest of the record (bound into
+// the certification evidence when one exists).
+function validateSignatureRecord(entry, record, requireSigned) {
+  const signature = record.signature;
+  if (!signature || typeof signature !== 'object' || Array.isArray(signature)) {
+    throw new Error(`artifact ${entry.name} carries an OS-signature record without a signature object`);
+  }
+  if (!isDigest(record.sha256)) {
+    throw new Error(`artifact ${entry.name} OS-signature record has no 64-hex digest`);
+  }
+  if (record.sha256 !== entry.sha256) {
+    throw new Error(
+      `artifact ${entry.name} OS-signature record covers digest ${record.sha256} but artifacts.json records ${entry.sha256}: refusing (doctored or stale artifact)`,
+    );
+  }
+  const status = signature.status;
+  if (!OS_SIGNATURE_STATUSES.has(status)) {
+    throw new Error(
+      `artifact ${entry.name} OS-signature status '${status}' is not one of ${[...OS_SIGNATURE_STATUSES].join('|')}`,
+    );
+  }
+  if (requireSigned && status !== 'signed') {
+    throw new Error(
+      `artifact ${entry.name} is not OS-signed (status '${status}'): --require-signed-artifacts refuses an unsigned release`,
+    );
+  }
+  return sha256Hex(Buffer.from(canonicalJson(signature), 'utf8'));
+}
+
+function assembleArtifacts(artifacts, urlBase, version, signatureRecords, requireSignedArtifacts) {
   if (!artifacts || typeof artifacts !== 'object') {
     throw new Error('artifacts.json is not an object');
   }
@@ -274,6 +358,7 @@ function assembleArtifacts(artifacts, urlBase, version) {
   }
   const rows = [];
   const skipped = [];
+  const signatureEvidence = new Map();
   for (const entry of artifacts.artifacts || []) {
     if (!entry || entry.status !== 'built') {
       skipped.push(`${entry && entry.name ? entry.name : 'unnamed'}: not built`);
@@ -289,6 +374,24 @@ function assembleArtifacts(artifacts, urlBase, version) {
     if (!osArch) {
       skipped.push(`${entry.name}: kind '${entry.kind}' is not distributed through the updater`);
       continue;
+    }
+    const record = signatureRecords.get(entry.name);
+    if (record) {
+      const signatureDigest = validateSignatureRecord(entry, record, requireSignedArtifacts);
+      signatureEvidence.set(`os_signature.${entry.name}`, signatureDigest);
+      if (record.signature.status !== 'signed') {
+        console.error(
+          `[update-manifest] note: ${entry.name} ships with OS-signature status '${record.signature.status}' (${record.signature.detail || 'no detail'})`,
+        );
+      }
+    } else if (requireSignedArtifacts) {
+      throw new Error(
+        `artifact ${entry.name} has no OS-signature record: --require-signed-artifacts refuses an unsigned release`,
+      );
+    } else {
+      console.error(
+        `[update-manifest] note: ${entry.name} has no OS-signature record (no signing driver ran); it ships explicitly unsigned`,
+      );
     }
     const row = {
       name: entry.name,
@@ -306,7 +409,7 @@ function assembleArtifacts(artifacts, urlBase, version) {
     throw new Error('no distributable artifact was recorded built in artifacts.json');
   }
   rows.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-  return { rows, skipped };
+  return { rows, skipped, signatureEvidence };
 }
 
 function certificationBlock(certificationPath, commit) {
@@ -372,7 +475,14 @@ function assembleManifest(options) {
   if (head && commit !== head) {
     throw new Error(`commit ${commit} is not HEAD (${head}): refusing to sign an update manifest for another commit`);
   }
-  const { rows, skipped } = assembleArtifacts(artifacts, options.urlBase, version);
+  const signatureRecords = readSignatureRecords(options.signaturesPath);
+  const { rows, skipped, signatureEvidence } = assembleArtifacts(
+    artifacts,
+    options.urlBase,
+    version,
+    signatureRecords,
+    options.requireSignedArtifacts,
+  );
   for (const note of skipped) {
     console.error(`[update-manifest] skip: ${note}`);
   }
@@ -403,6 +513,27 @@ function assembleManifest(options) {
   } else {
     certification = certificationBlock(options.certificationPath, commit);
   }
+  // Bind the OS-signature records into the signed payload. The manifest
+  // schema is strict (crates/updater), so the records ride the certification
+  // block's evidence map as 64-hex canonical digests — exactly the value
+  // shape every other evidence entry uses.
+  if (certification && signatureEvidence.size > 0) {
+    for (const [key, digest] of signatureEvidence) {
+      if (key.length > 64) {
+        throw new Error(`OS-signature evidence key ${JSON.stringify(key)} exceeds 64 bytes`);
+      }
+      certification.evidence[key] = digest;
+    }
+    if (Object.keys(certification.evidence).length > MAX_CERTIFICATION_EVIDENCE) {
+      throw new Error(
+        `certification evidence would hold ${Object.keys(certification.evidence).length} entries (max ${MAX_CERTIFICATION_EVIDENCE}): refusing to assemble a manifest the Rust verifier rejects`,
+      );
+    }
+  } else if (signatureEvidence.size > 0) {
+    console.error(
+      `[update-manifest] note: ${signatureEvidence.size} OS-signature record(s) are recorded in artifacts.json/artifact-signatures.json but not embedded (no certification certificate); the artifact digests in this signed manifest cover the signed bytes`,
+    );
+  }
   if (certification) {
     manifest.certification = certification;
   }
@@ -425,6 +556,8 @@ function modeAssemble(args) {
     expiresInDays: Number(argValue(args, '--expires-in-days', String(DEFAULT_MAX_VALIDITY_DAYS))),
     compatPath: argValue(args, '--compat', ''),
     compatMin: argValue(args, '--compat-min', ''),
+    signaturesPath: argValue(args, '--signatures', ''),
+    requireSignedArtifacts: flag(args, '--require-signed-artifacts'),
     requireSigned: flag(args, '--require-signed'),
     dryRun: flag(args, '--dry-run'),
     signKey: argValue(args, '--sign-key', process.env.FAKTOR_UPDATE_SIGNING_KEY || ''),
@@ -595,6 +728,111 @@ function modeSelftest() {
     expect(
       'canonical payload is key-order independent',
       canonicalJson(manifestWithoutSignature(reordered)) === canonicalJson(manifestWithoutSignature(signed)),
+    );
+
+    // --- OS-signature records (additive packaging step 4.5) ---------------
+    const signaturesPath = join(dir, 'artifact-signatures.json');
+    const signatureRecord = (name, sha256, signature) => ({ name, sha256, status: 'built', signature });
+    const signatureRecords = (bundleOverrides = {}, vsixOverrides = {}) => ({
+      schema: SIGNATURES_SCHEMA,
+      commit,
+      os: 'darwin',
+      arch: 'arm64',
+      artifacts: [
+        signatureRecord('faktor-cli-9.9.9-darwin-arm64.tar.gz', 'a'.repeat(64), {
+          tool: 'macos', status: 'signed', scope: 'inner:bin/faktor-cli', detail: 'codesigned + notarized', marker: null, codesigned: true, notarized: true, stapled: false, ...bundleOverrides,
+        }),
+        signatureRecord('faktor-9.9.9.vsix', 'b'.repeat(64), {
+          tool: 'macos', status: 'not_applicable', scope: 'file', detail: 'extension zip', marker: null, codesigned: false, notarized: false, stapled: false, ...vsixOverrides,
+        }),
+      ],
+    });
+    const writeSignatures = (bundleOverrides = {}, vsixOverrides = {}) => {
+      writeFileSync(signaturesPath, JSON.stringify(signatureRecords(bundleOverrides, vsixOverrides)));
+    };
+    writeSignatures();
+    expect(
+      'signature-bound assembly succeeds',
+      run(['--signatures', signaturesPath, '--sign-key', keyPath, '--key-id', 'selftest']).status === 0,
+    );
+    const signedWithSignatures = JSON.parse(readFileSync(outPath, 'utf8'));
+    expect('signature-bound manifest still verifies', verifyManifestSignature(signedWithSignatures, { selftest: publicB64 }).ok);
+
+    // A doctored artifact digest (artifacts.json moved, records did not) is
+    // refused: the signature record no longer covers the shipped bytes.
+    const doctoredArtifacts = JSON.parse(readFileSync(artifactsPath, 'utf8'));
+    doctoredArtifacts.artifacts[0].sha256 = 'c'.repeat(64);
+    writeFileSync(artifactsPath, JSON.stringify(doctoredArtifacts));
+    expect(
+      'a doctored artifact digest is refused against the recorded signature',
+      run(['--signatures', signaturesPath, '--sign-key', keyPath]).status !== 0,
+    );
+    // The same doctoring is caught by the digest step even without signing.
+    expect(
+      'a doctored artifact digest is refused unsigned too',
+      run(['--signatures', signaturesPath]).status !== 0,
+    );
+    doctoredArtifacts.artifacts[0].sha256 = 'a'.repeat(64);
+    writeFileSync(artifactsPath, JSON.stringify(doctoredArtifacts));
+
+    // A `failed` OS-signing verdict can never be published.
+    writeSignatures({ status: 'failed', detail: 'codesign refused' });
+    expect(
+      'a failed OS-signing verdict refuses the manifest',
+      run(['--signatures', signaturesPath, '--sign-key', keyPath]).status !== 0,
+    );
+
+    // --require-signed-artifacts refuses an unsigned/not-applicable release
+    // and accepts an all-signed one.
+    writeSignatures();
+    expect(
+      '--require-signed-artifacts refuses a not_applicable artifact',
+      run(['--signatures', signaturesPath, '--sign-key', keyPath, '--require-signed-artifacts']).status !== 0,
+    );
+    writeSignatures({}, { status: 'signed', detail: 'fake signed' });
+    expect(
+      '--require-signed-artifacts accepts an all-signed release',
+      run(['--signatures', signaturesPath, '--sign-key', keyPath, '--require-signed-artifacts']).status === 0,
+    );
+    // A missing signature records file is a loud refusal (never "unsigned by
+    // accident").
+    expect(
+      'a missing signature records file is refused',
+      run(['--signatures', join(dir, 'absent-signatures.json')]).status !== 0,
+    );
+
+    // --- OS-signature digest binding into the certification evidence ------
+    writeSignatures();
+    writeFileSync(join(dir, 'cert-good.json'), JSON.stringify({ commit, certification_level: 'release' }));
+    expect(
+      'certification + signature records assemble',
+      run(['--signatures', signaturesPath, '--certification', join(dir, 'cert-good.json'), '--sign-key', keyPath, '--key-id', 'selftest']).status === 0,
+    );
+    const certified = JSON.parse(readFileSync(outPath, 'utf8'));
+    const bundleEvidenceKey = 'os_signature.faktor-cli-9.9.9-darwin-arm64.tar.gz';
+    expect(
+      'the OS-signature digest is bound into the signed certification evidence',
+      isDigest(certified.certification?.evidence?.[bundleEvidenceKey]),
+    );
+    expect('the certified manifest verifies', verifyManifestSignature(certified, { selftest: publicB64 }).ok);
+    const expectedSignatureDigest = sha256Hex(
+      Buffer.from(
+        canonicalJson(signatureRecords().artifacts[0].signature),
+        'utf8',
+      ),
+    );
+    expect(
+      'the bound digest is the canonical digest of the recorded verdict',
+      certified.certification?.evidence?.[bundleEvidenceKey] === expectedSignatureDigest,
+    );
+    // Tampering the verdict changes the bound digest (the anchor a verifier
+    // compares artifacts.json against).
+    writeSignatures({ detail: 'tampered detail after packaging' });
+    run(['--signatures', signaturesPath, '--certification', join(dir, 'cert-good.json'), '--sign-key', keyPath]);
+    const tamperedCertified = JSON.parse(readFileSync(outPath, 'utf8'));
+    expect(
+      'tampering the recorded verdict changes the bound digest',
+      tamperedCertified.certification?.evidence?.[bundleEvidenceKey] !== expectedSignatureDigest,
     );
 
     // A failed packaging run can never be signed.

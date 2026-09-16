@@ -124,6 +124,7 @@ class TaskTreePanel : JPanel(BorderLayout()) {
             TaskTreeNode.Goal("goal: ${model.goal.ifEmpty { "(none)" }} [${model.state}]")
         )
         root.add(criteriaNode(model))
+        root.add(proofNode(model))
         root.add(planNode(model))
         root.add(completionNode(model))
         root.add(childrenNode(model))
@@ -163,6 +164,39 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         }
         if (model.acceptanceCriteria.isEmpty()) {
             node.add(DefaultMutableTreeNode(TaskTreeNode.Plain("(none served)")))
+        }
+        return node
+    }
+
+    /**
+     * The top-level VERIFIED view from the strict proof summary. The daemon's
+     * three-way verdict is preserved: `VERIFIED` renders only for `verified`;
+     * an unavailable read lists its explicit component reasons and never the
+     * verified verdict.
+     */
+    private fun proofNode(model: TaskTreeModel): DefaultMutableTreeNode {
+        val proof = model.proof
+        val node = DefaultMutableTreeNode(
+            TaskTreeNode.Plain("verification proof: " + (proof?.summaryText() ?: "not fetched"))
+        )
+        if (proof == null) return node
+        proof.reviewer?.takeIf { it.isNotEmpty() }?.let {
+            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain(bound("reviewer: " + it, 240))))
+        }
+        proof.reason?.takeIf { it.isNotEmpty() }?.let {
+            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain(bound("reason: " + it, 240))))
+        }
+        for (entry in proof.unavailable) {
+            node.add(
+                DefaultMutableTreeNode(
+                    TaskTreeNode.Plain(
+                        bound(entry.component + " (" + entry.kind + "): " + entry.reason, 240)
+                    )
+                )
+            )
+        }
+        for (line in proof.stepLines()) {
+            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain(bound(line, 240))))
         }
         return node
     }

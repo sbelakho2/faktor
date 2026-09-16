@@ -34,6 +34,15 @@ pub(crate) mod models;
 /// The ONE product execution entry for ordinary prompts + task starts
 /// (public: the daemon's ACP host constructs it too).
 pub mod prompt;
+/// Additive read-only proof surfacing: `GET /native/tasks/{id}/proof`
+/// (the full VERIFIED story) and `GET /native/tasks/{id}/completion-steps`
+/// (per-step status/report), both session-scoped and fail-closed.
+pub(crate) mod proof;
+/// The SCM webhook surface (`POST /native/scm/webhook`; absent unless a
+/// webhook sink is wired through `ServerDeps::with_scm_webhook`). Public:
+/// the CLI implements [`scm_webhook::WebhookSink`] for the daemon's
+/// GitHub App inbox.
+pub mod scm_webhook;
 pub(crate) mod semantic;
 pub(crate) mod session;
 /// The SSO login surface (start/callback; absent unless a network OIDC
@@ -62,6 +71,8 @@ pub(crate) use enterprise::*;
 pub(crate) use evidence::*;
 pub(crate) use models::*;
 pub use prompt::*;
+pub(crate) use proof::*;
+pub(crate) use scm_webhook::*;
 pub(crate) use semantic::*;
 pub(crate) use session::*;
 pub(crate) use sso::*;

@@ -906,6 +906,7 @@ dependencies = [
 name = "faktor-cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blake3",
  "clap",
  "faktor-acp",
@@ -951,6 +952,7 @@ dependencies = [
  "faktor-worker",
  "futures",
  "rand",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

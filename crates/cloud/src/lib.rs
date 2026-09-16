@@ -54,7 +54,8 @@ pub use billing::{
 };
 pub use billing_store::{
     BillingStore, BillingStoreError, CreditAppend, CreditAppendRefusal, MemoryBillingStore,
-    StoredCreditEntry, StoredUsageEvent, UsageAppend, BILLING_SCHEMA_V2,
+    ReportPeriodRow, ReportPeriodStatus, StoredCreditEntry, StoredUsageEvent, UsageAppend,
+    BILLING_REPORT_SCHEMA_V4, BILLING_SCHEMA_V2, MAX_REPORT_PERIODS_PER_ORG,
 };
 pub use enterprise::config_layer_digest;
 pub use enterprise::{
@@ -92,7 +93,8 @@ pub use oidc::{
 };
 pub use oidc_net::{
     AsyncOidcAdapter, CachedJwksView, NetworkOidcAdapter, NetworkOidcConfig,
-    DEFAULT_DISCOVERY_MAX_AGE_MS, DEFAULT_JWKS_MAX_AGE_MS, MAX_JWKS_REFETCHES,
+    DEFAULT_DISCOVERY_MAX_AGE_MS, DEFAULT_JWKS_MAX_AGE_MS, MAX_CACHE_MAX_AGE_MS,
+    MAX_JWKS_REFETCHES,
 };
 pub use rbac::{
     authorize, Action, Denied, Principal, PrincipalSubject, Resource, Role, ALL_ACTIONS,

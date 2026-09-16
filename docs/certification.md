@@ -377,6 +377,70 @@ The offline contract still holds: packaging may *attempt* the npm registry
 for VSIX tooling, but the certificate never depends on that attempt
 succeeding — a failure is recorded as a skip with the exact error.
 
+#### 2.9.1 OS code signing and the release flow
+
+The update manifest's ed25519 signature covers *digests*; OS-level signing
+is what a host verifies before executing an artifact. Both are additive to
+the same packaging run and both are recorded, never inferred:
+
+1. `scripts/package-artifacts.sh` signs each built artifact through the
+   host driver **before** the artifact's digest is recorded, so
+   `artifacts.json` (and therefore every manifest built from it) binds the
+   *signed* bytes:
+   - `darwin`: `scripts/sign-macos.sh` — `codesign --force --options runtime
+     --timestamp --sign <identity>` for Mach-O code; `xcrun notarytool
+     submit --keychain-profile <profile> --wait` plus `xcrun stapler staple`
+     for `.app`/`.dmg`/`.pkg`; a `.tar.gz` bundle signs its inner Mach-O
+     members, repacks the archive with the same top-level layout, and
+     submits the payload as a zip (a tar.gz cannot be stapled, which the
+     verdict states honestly). Env: `FAKTOR_MACOS_SIGNING_IDENTITY`,
+     `FAKTOR_MACOS_NOTARY_PROFILE`.
+   - `mingw*/msys*/cygwin*`: `scripts/sign-windows.sh` — Authenticode via
+     `osslsigncode` (or `signtool` when present): sha256 + RFC-3161
+     timestamp for `.exe`/`.dll`/`.msi`, inner-PE signing + repack for a
+     `.tar.gz` bundle. Env: `FAKTOR_WINDOWS_CERT_FILE`,
+     `FAKTOR_WINDOWS_CERT_PASSWORD`, `FAKTOR_WINDOWS_TIMESTAMP_URL`.
+   - Every other host records an explicit `unsigned` marker naming the
+     missing driver; extension zips are `not_applicable` (a VSIX/JetBrains
+     zip is not an OS code object).
+   - **Absent env/keys are loud, never silent**: the driver prints an
+     `UNSIGNED` marker and exits 0 (the artifact stays usable locally), so a
+     normal local packaging run succeeds and the certificate never claims a
+     signature it does not have. `PACKAGE_REQUIRE_SIGNED=1` (or the driver's
+     `--require-signed`) turns any non-`signed` verdict into a fatal error;
+     `PACKAGE_SIGN=0` skips signing but still records an explicit
+     `skipped`/`UNSIGNED` marker.
+2. Per-artifact verdicts (tool, status, scope, identity, subject digest,
+   marker) are written to `artifacts.json` (each artifact's additive
+   `signature` member) and to
+   `target/certification/artifact-signatures.json`
+   (`faktor-artifact-signatures/v1`).
+3. `scripts/update-manifest.mjs --signatures <file>` verifies each record's
+   digest against the artifact digest recorded in `artifacts.json`: a
+   doctored/stale artifact is refused before anything is signed, and a
+   `failed` signing verdict refuses the manifest outright. When a
+   certification certificate is present, each record's canonical digest is
+   embedded into `certification.evidence` as `os_signature.<artifact>`
+   (64-hex, exactly like the other evidence entries, bounded to the Rust
+   verifier's 16-entry limit) so the signed payload anchors the OS-signing
+   verdicts. `--require-signed-artifacts` refuses to publish any
+   distributable artifact that is not `signed`.
+4. The signed update manifest and the artifact digests remain the only
+   thing `apply` consumes: unsigned *artifacts* are installable locally, an
+   unsigned *manifest* is always refused with the typed
+   `manifest_unsigned` refusal (the pre-existing enforcement).
+
+Self-tests (run offline by `certify-local.sh fast` via the
+`signing-selftest` section and directly as
+`bash scripts/sign-macos.sh selftest` / `bash scripts/sign-windows.sh
+selftest` / `node scripts/update-manifest.mjs selftest`): absent env yields
+the explicit UNSIGNED marker and a `--require-signed` refusal; fake
+toolchains exercise the signed path and tar.gz repacking; a doctored
+artifact fails the recorded-digest step; a doctored artifact or a tampered
+verdict record refuses the manifest and changes the certification-evidence
+digest. Real identity/notary/certificate material is operator-provided
+(CI secrets); nothing in the local certificate pretends otherwise.
+
 ### 2.10 Capability manifest (derived, machine-readable)
 
 `node scripts/capabilities-manifest.mjs` derives every surface status from
@@ -633,9 +697,40 @@ Task-mode IDE controls (both IDEs):
   `completion` block on the task view the rows are `source=daemon`; without
   it the block is derived from the DURABLE task-run state (pending, or
   all-succeeded only because the durable gate certified the task) and a
-  terminal non-certified run is reported `unavailable` with its reason. The
-  exact per-step read remains an additive native surface; a missing read is
-  never rendered as success.
+  terminal non-certified run is reported `unavailable` with its reason.
+
+One-read VERIFIED story + per-step drill-down (both routes additive,
+read-only, session-scoped by the REQUIRED `?session=<session_id>` query; a
+foreign/unknown task is a typed 404, and store failures or present-but-corrupt
+durable rows fail closed with a typed 500 naming the component):
+
+- `GET /native/tasks/{id}/proof` (`crates/server/src/native/proof.rs`) serves
+  `faktor-task-proof/v1`: the daemon's three-way `proofState`
+  (`verified`/`unverified`/`unavailable`), criteria with
+  bindings/verdicts/evidence refs, required-check totals, the review verdict
+  (including the `independent_review` criterion verdict), run-base / verified
+  / landed tree digests with `landedEqualsVerified`, the published commit OID
+  + remote-ref-derived head + the completed PR external operation's head, the
+  durable cost (spend fold, `known`/`unavailable` with the budget authority's
+  own reason), the completion contract + durable step statuses + gate, and
+  the integration record + transaction state. `verified` requires the full
+  chain: a `VerifiedComplete` task, the passing record certifying its
+  completion revision, an all-pass criterion set, every REQUIRED check
+  passing, and (when a landing exists) the landed snapshot equalling the
+  verified one. A `VerifiedComplete` claim that cannot be re-derived is
+  `unavailable` with an explicit `unavailable[]` entry distinguishing
+  `missing` / `unavailable` / `mismatch`; it is never rendered as VERIFIED.
+- `GET /native/tasks/{id}/completion-steps` serves
+  `faktor-task-completion-steps/v1`: the contract, one row per requested step
+  (`status: "missing"`, `present: false` when no durable row exists) and the
+  full bounded durable history, plus the gate verdict.
+- Both IDEs consume the summary for the top-level VERIFIED view (VS Code
+  cockpit `proof` section + `NativeClient.taskProof`; JetBrains
+  `NativeTaskProof`/`parseNativeTaskProof`, TaskTree `ProofView` and the
+  `verification proof` tree node), with the step drill-down, and render a
+  failed read as an explicit `VERIFICATION UNAVAILABLE` state — mock-payload
+  assertions for the verified, unavailable and refused states live in
+  `apps/vscode/scripts/selftest.mjs` and `FrontendSmoke.kt`.
 
 Adversarial coverage in-tree: non-succeeded step refuses `VerifiedComplete`
 and succeeded steps do not gate (`crates/session/src/task.rs`), contract

@@ -116,6 +116,11 @@ pub struct ServerDeps {
     /// The durable SCM store serving `/native/repositories`. `None` = no
     /// SCM state is wired (the route answers a typed 409 `scm_disabled`).
     pub scm: Option<Arc<dyn faktor_scm::ScmStore>>,
+    /// The wired SCM webhook sink (`POST /native/scm/webhook`): the
+    /// verified inbox claim plus the idempotent re-sync scheduling. `None` =
+    /// no GitHub App is wired (the default): the route answers a typed 409
+    /// `scm_webhook_disabled` and the daemon is otherwise byte-identical.
+    pub scm_webhook: Option<Arc<dyn crate::native::WebhookSink>>,
     /// The Wave 3 commercial metering/entitlement service. `None` = the
     /// `[billing]` section is disabled (the default): every billing route
     /// answers a typed 409 `billing_disabled` and the daemon is otherwise
@@ -218,6 +223,7 @@ impl ServerDeps {
             simulate_not_ready: false,
             control_plane: None,
             scm: None,
+            scm_webhook: None,
             billing: None,
             updater: None,
             workers: None,
@@ -268,6 +274,13 @@ impl ServerDeps {
     /// Wire the durable SCM store serving `/native/repositories`.
     pub fn with_scm_store(mut self, store: Arc<dyn faktor_scm::ScmStore>) -> Self {
         self.scm = Some(store);
+        self
+    }
+
+    /// Wire the SCM webhook sink (`POST /native/scm/webhook`). Additive:
+    /// without it the route answers a typed 409 `scm_webhook_disabled`.
+    pub fn with_scm_webhook(mut self, sink: Arc<dyn crate::native::WebhookSink>) -> Self {
+        self.scm_webhook = Some(sink);
         self
     }
 
@@ -482,6 +495,16 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
             "/native/session/{id}/tasks/{task_id}/verification",
             get(native_task_verification),
         )
+        // Additive proof surfacing (read-only, session-scoped via the
+        // REQUIRED ?session= query): the full VERIFIED story of one task in
+        // one strict payload, and the durable completion-step status/report
+        // read. Store errors and present-but-corrupt rows fail closed; the
+        // payload distinguishes missing / unavailable / corrupt explicitly.
+        .route("/native/tasks/{id}/proof", get(native_task_proof))
+        .route(
+            "/native/tasks/{id}/completion-steps",
+            get(native_task_completion_steps),
+        )
         // Native task runs (wave-24): the ONE HTTP surface that starts a
         // task through the daemon's TaskExecutor (POST), lists the
         // session's durable task runs with per-run state (GET), reads one
@@ -572,6 +595,12 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
             get(native_org_members_list).post(native_org_members_invite),
         )
         .route("/native/repositories", get(native_repositories))
+        // GitHub App webhook ingress (additive; disabled by default): the
+        // ONLY route without the daemon password — the HMAC signature is the
+        // credential, and the wired sink verifies + claims the delivery
+        // before scheduling its idempotent re-sync. Without a sink the route
+        // answers a typed 409 `scm_webhook_disabled`.
+        .route("/native/scm/webhook", post(native_scm_webhook))
         .route(
             "/native/approvals",
             get(native_approvals_list).post(native_approvals_create),
@@ -954,6 +983,7 @@ pub(crate) mod tests {
             semantic: None,
             control_plane: None,
             scm: None,
+            scm_webhook: None,
             billing: None,
             updater: None,
             workers: None,
@@ -3197,6 +3227,7 @@ pub(crate) mod tests {
             semantic: None,
             control_plane: None,
             scm: None,
+            scm_webhook: None,
             billing: None,
             updater: None,
             workers: None,
@@ -5025,6 +5056,7 @@ pub(crate) mod tests {
             semantic: None,
             control_plane: None,
             scm: None,
+            scm_webhook: None,
             billing: None,
             updater: None,
             workers: None,
@@ -6232,6 +6264,7 @@ pub(crate) mod tests {
             semantic: None,
             control_plane: None,
             scm: None,
+            scm_webhook: None,
             billing: None,
             updater: None,
             workers: None,

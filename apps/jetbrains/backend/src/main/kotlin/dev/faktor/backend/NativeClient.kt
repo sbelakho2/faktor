@@ -43,6 +43,8 @@ import dev.faktor.shared.NativeSessionCreated
 import dev.faktor.shared.NativeSessionSummary
 import dev.faktor.shared.NativeSessionUsage
 import dev.faktor.shared.NativeTaskRun
+import dev.faktor.shared.NativeTaskCompletionSteps
+import dev.faktor.shared.NativeTaskProof
 import dev.faktor.shared.NativeTaskRunCancelled
 import dev.faktor.shared.NativeTaskRunStarted
 import dev.faktor.shared.NativeTaskVerification
@@ -82,6 +84,8 @@ import dev.faktor.shared.parseNativeSessionUsage
 import dev.faktor.shared.parseNativeTaskRunCancelled
 import dev.faktor.shared.parseNativeTaskRunStarted
 import dev.faktor.shared.parseNativeTaskRuns
+import dev.faktor.shared.parseNativeTaskCompletionSteps
+import dev.faktor.shared.parseNativeTaskProof
 import dev.faktor.shared.parseNativeTaskVerification
 import dev.faktor.shared.parseNativeTaskViews
 import dev.faktor.shared.parseNativeTerminalEventPage
@@ -516,6 +520,29 @@ class NativeClient(
             request(
                 "GET",
                 "/native/session/" + encode(sessionId) + "/tasks/" + encode(taskId) + "/verification"
+            )
+        )
+
+    /**
+     * The strict proof summary (`GET /native/tasks/{id}/proof`), session
+     * scoped by the REQUIRED `session` query. Read-only and fail-closed: a
+     * corrupt store read is a typed API error the caller renders as an
+     * explicit unavailable state, never as VERIFIED.
+     */
+    fun taskProof(sessionId: String, taskId: String): NativeTaskProof =
+        parseNativeTaskProof(
+            request(
+                "GET", "/native/tasks/" + encode(taskId) + "/proof",
+                query("session" to sessionId)
+            )
+        )
+
+    /** The durable per-step status/report read (proof drill-down). */
+    fun taskCompletionSteps(sessionId: String, taskId: String): NativeTaskCompletionSteps =
+        parseNativeTaskCompletionSteps(
+            request(
+                "GET", "/native/tasks/" + encode(taskId) + "/completion-steps",
+                query("session" to sessionId)
             )
         )
 

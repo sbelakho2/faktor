@@ -27,6 +27,25 @@
 #                                   which `apply` refuses); FAKTOR_UPDATE_KEY_ID
 #                                   names the allowlisted identity
 #   FAKTOR_UPDATE_URL_BASE          distribution URL base for artifact urls
+#   PACKAGE_SIGN=0                  do not attempt OS-level signing (the
+#                                   artifacts are recorded with an explicit
+#                                   `skipped` signature marker, never a claim)
+#   PACKAGE_REQUIRE_SIGNED=1        OS signing is mandatory: a missing
+#                                   identity/certificate or an unsigned
+#                                   artifact is fatal (the drivers' loud
+#                                   UNSIGNED marker becomes a refusal)
+#
+# Additively (step 4.5) every built artifact is passed through the host's OS
+# signing driver (scripts/sign-macos.sh on darwin: codesign runtime options +
+# notarytool + staple; scripts/sign-windows.sh elsewhere when a PFX/identity
+# is configured: Authenticode). The daemon bundle's INNER bin/faktor-cli is
+# signed BEFORE checksums.txt is generated, so the bundle's recorded digest
+# covers the signed bytes. Per-artifact signature metadata (tool, status,
+# scope, identity, subject digest, marker) is recorded into artifacts.json
+# AND into target/certification/artifact-signatures.json; absent
+# env/keys produce an explicit UNSIGNED marker (never a silent claim) and the
+# artifacts stay usable locally. `--require-signed` on the drivers is wired
+# from PACKAGE_REQUIRE_SIGNED=1.
 #
 # Additively (step 5) the script assembles the SIGNED update manifest
 # (`faktor-update/v1`) from THIS run's artifacts.json + certification
@@ -52,6 +71,8 @@ SKIP_BUILD="${PACKAGE_SKIP_BUILD:-0}"
 SKIP_VSIX="${PACKAGE_SKIP_VSIX:-0}"
 SKIP_JETBRAINS="${PACKAGE_SKIP_JETBRAINS:-0}"
 REQUIRE_VSIX="${PACKAGE_REQUIRE_VSIX:-0}"
+SIGN_ARTIFACTS="${PACKAGE_SIGN:-1}"
+REQUIRE_SIGNED="${PACKAGE_REQUIRE_SIGNED:-0}"
 
 case "$OUT_DIR" in /*) ;; *) OUT_DIR="$ROOT/$OUT_DIR" ;; esac
 case "$ART_DIR" in /*) ;; *) ART_DIR="$ROOT/$ART_DIR" ;; esac
@@ -153,6 +174,115 @@ add_skip() {
     printf '[package] %-34s %-8s %s\n' "$1" "skip" "$2"
 }
 
+# ---------------------------------------------------------------------------
+# OS-level signing (step 4.5, additive). Every record here is either the
+# driver's own verdict verbatim or an explicit synthesized marker; nothing is
+# ever claimed signed without the driver saying so.
+# ---------------------------------------------------------------------------
+SIG_NAME=()
+SIG_JSON=()
+
+sig_json() {
+    # status scope detail tool
+    printf '{"tool":"%s","status":"%s","scope":"%s","subject_sha256":null,"identity":null,"detail":"%s","marker":%s}' \
+        "$(json_escape "$4")" "$(json_escape "$1")" "$(json_escape "$2")" \
+        "$(json_escape "$3")" \
+        "$(if [ "$1" = "unsigned" ] || [ "$1" = "skipped" ]; then printf '"UNSIGNED"'; else printf 'null'; fi)"
+}
+
+driver_for_host() {
+    case "$OS" in
+        darwin) printf '%s' "$ROOT/scripts/sign-macos.sh" ;;
+        mingw* | msys* | cygwin*) printf '%s' "$ROOT/scripts/sign-windows.sh" ;;
+        *) printf '' ;;
+    esac
+}
+
+# Sign one file (in place) through the host driver and record the verdict
+# under the artifact `name`. Returns non-zero only when the driver refused
+# AND PACKAGE_REQUIRE_SIGNED=1 (a mandatory-signing release); an honest
+# UNSIGNED marker is a success with FATAL untouched.
+sign_artifact() {
+    # name path kind scope
+    local name="$1" path="$2" kind="$3" scope="$4"
+    local driver out rc
+    if [ "$SIGN_ARTIFACTS" != "1" ]; then
+        SIG_NAME+=("$name")
+        SIG_JSON+=("$(sig_json skipped "$scope" "signing disabled (PACKAGE_SIGN=0)" "none")")
+        printf '[package] %-34s %-8s %s\n' "$name" "unsigned" "PACKAGE_SIGN=0"
+        if [ "$REQUIRE_SIGNED" = "1" ]; then
+            printf '[package] PACKAGE_REQUIRE_SIGNED=1 but OS signing is disabled (PACKAGE_SIGN=0)\n' >&2
+            FATAL=1
+        fi
+        return 0
+    fi
+    driver="$(driver_for_host)"
+    if [ -z "$driver" ] || [ ! -f "$driver" ]; then
+        SIG_NAME+=("$name")
+        SIG_JSON+=("$(sig_json unsigned "$scope" "no OS signing driver for host $OS" "none")")
+        printf '[package] %-34s %-8s UNSIGNED (no driver for host %s)\n' "$name" "unsigned" "$OS"
+        if [ "$REQUIRE_SIGNED" = "1" ]; then
+            FATAL=1
+        fi
+        return 0
+    fi
+    mkdir -p "$LOG_DIR"
+    if [ "$REQUIRE_SIGNED" = "1" ]; then
+        out="$(bash "$driver" sign "$path" --kind "$kind" --require-signed \
+            2>>"$LOG_DIR/package-signing.log")"
+    else
+        out="$(bash "$driver" sign "$path" --kind "$kind" 2>>"$LOG_DIR/package-signing.log")"
+    fi
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        local detail
+        detail="$(printf '%s' "$out" | sed -n 's/.*"detail":"\([^"]*\)".*/\1/p' | head -n1)"
+        [ -n "$detail" ] || detail="signing driver exited $rc; see $(rel_path "$LOG_DIR/package-signing.log")"
+        SIG_NAME+=("$name")
+        SIG_JSON+=("$(sig_json failed "$scope" "$detail" "$(basename "$driver")")")
+        printf '[package] %-34s %-8s %s\n' "$name" "failed" "OS signing refused: $detail"
+        FATAL=1
+        return 1
+    fi
+    if [ -z "$out" ]; then
+        SIG_NAME+=("$name")
+        SIG_JSON+=("$(sig_json failed "$scope" "signing driver produced no verdict" "$(basename "$driver")")")
+        printf '[package] %-34s %-8s driver produced no verdict\n' "$name" "failed"
+        FATAL=1
+        return 1
+    fi
+    SIG_NAME+=("$name")
+    # The caller knows the semantic scope (e.g. `inner:bin/faktor-cli` for a
+    # bundle whose inner executable was signed before archiving); keep it in
+    # the recorded metadata instead of the driver's generic file scope.
+    if [ "$scope" != "file" ] && [ "$scope" != "$kind" ]; then
+        out="$(printf '%s' "$out" | sed "s/\"scope\":\"[^\"]*\"/\"scope\":\"$(printf '%s' "$scope" | sed 's/[\/&]/\\&/g')\"/")"
+    fi
+    SIG_JSON+=("$out")
+    local status detail
+    status="$(printf '%s' "$out" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p' | head -n1)"
+    detail="$(printf '%s' "$out" | sed -n 's/.*"detail":"\([^"]*\)".*/\1/p' | head -n1)"
+    printf '[package] %-34s %-8s %s\n' "$name" "os-sign" "${detail:-${status:-?}}"
+    if [ "$REQUIRE_SIGNED" = "1" ] && [ "$status" != "signed" ]; then
+        printf '[package] PACKAGE_REQUIRE_SIGNED=1 but %s is not signed (status=%s)\n' \
+            "$name" "$status" >&2
+        FATAL=1
+        return 1
+    fi
+    return 0
+}
+
+sig_for() {
+    local name="$1" i
+    for i in "${!SIG_NAME[@]}"; do
+        if [ "${SIG_NAME[$i]}" = "$name" ]; then
+            printf '%s' "${SIG_JSON[$i]}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 COMMIT="$(git rev-parse HEAD 2>/dev/null || printf unknown)"
 DIRTY="$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
 VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml 2>/dev/null | head -n1)"
@@ -204,6 +334,9 @@ if [ "$CARGO_OK" = "1" ]; then
     mkdir -p "$STAGE/bin" || FATAL=1
     cp "$DAEMON_BIN" "$STAGE/bin/faktor-cli" || FATAL=1
     chmod +x "$STAGE/bin/faktor-cli" 2>/dev/null || FATAL=1
+    # OS signing happens BEFORE checksums.txt is generated so the recorded
+    # inner digest (and therefore the bundle digest) covers the SIGNED bytes.
+    sign_artifact "$BUNDLE_NAME" "$STAGE/bin/faktor-cli" daemon-bundle "inner:bin/faktor-cli"
     inner_sha="$(hash_file "$STAGE/bin/faktor-cli" 2>/dev/null || printf unknown)"
     printf '%s  bin/faktor-cli\n' "$inner_sha" >"$STAGE/checksums.txt"
     {
@@ -280,6 +413,7 @@ else
             >"$LOG_DIR/package-vsix-vsce.log" 2>&1; then
             add_artifact "$VSIX_NAME" vsix "$VSIX_PATH" "built" \
                 "vsce package ok (build: $BUILD_DETAIL)"
+            sign_artifact "$VSIX_NAME" "$VSIX_PATH" vsix "file"
             if [ "$BUILD_STATUS" != "pass" ]; then
                 printf '[package] WARNING: %s is installable but was built from a tree with a failing npm run build\n' "$VSIX_NAME"
             fi
@@ -320,6 +454,7 @@ else
     if cp "$JB_SRC" "$JB_PATH" && [ -f "$JB_PATH" ]; then
         add_artifact "$JB_NAME" jetbrains-plugin "$JB_PATH" "built" \
             "copied from $(rel_path "$JB_SRC")"
+        sign_artifact "$JB_NAME" "$JB_PATH" jetbrains-plugin "file"
     else
         add_artifact "$JB_NAME" jetbrains-plugin "$JB_PATH" "failed" \
             "copying $(rel_path "$JB_SRC") failed"
@@ -350,7 +485,7 @@ else
 fi
 
 emit_manifest() {
-    local i first
+    local i first sig
     printf '{\n'
     printf '  "schema": "faktor-artifacts/v1",\n'
     printf '  "status": "%s",\n' "$STATUS"
@@ -374,6 +509,9 @@ emit_manifest() {
         printf '"commit":"%s",' "$(json_escape "${A_COMMIT[$i]}")"
         printf '"status":"%s",' "$(json_escape "${A_STATUS[$i]}")"
         printf '"detail":"%s"' "$(json_escape "${A_DETAIL[$i]}")"
+        if sig="$(sig_for "${A_NAME[$i]}")"; then
+            printf ',"signature":%s' "$sig"
+        fi
         printf '}'
     done
     if [ "${#A_NAME[@]}" -gt 0 ]; then printf '\n  '; fi
@@ -395,6 +533,37 @@ mkdir -p "$OUT_DIR" || exit 2
 emit_manifest >"$MANIFEST.tmp" && mv "$MANIFEST.tmp" "$MANIFEST" || exit 2
 
 # ---------------------------------------------------------------------------
+# 4.5 Per-artifact OS-signature records (additive; digest-bound step 5).
+# ---------------------------------------------------------------------------
+SIGNATURES="$OUT_DIR/artifact-signatures.json"
+emit_signatures() {
+    local i first sig
+    printf '{\n'
+    printf '  "schema": "faktor-artifact-signatures/v1",\n'
+    printf '  "commit": "%s",\n' "$(json_escape "$COMMIT")"
+    printf '  "os": "%s",\n' "$(json_escape "$OS")"
+    printf '  "arch": "%s",\n' "$(json_escape "$ARCH")"
+    printf '  "timestamp": "%s",\n' "$(now_iso)"
+    printf '  "artifacts": ['
+    first=1
+    for i in "${!A_NAME[@]}"; do
+        sig="$(sig_for "${A_NAME[$i]}")" || continue
+        if [ "$first" -eq 0 ]; then printf ','; fi
+        first=0
+        printf '\n    {'
+        printf '"name":"%s",' "$(json_escape "${A_NAME[$i]}")"
+        printf '"sha256":%s,' "$(if [ -n "${A_SHA[$i]}" ]; then printf '"%s"' "$(json_escape "${A_SHA[$i]}")"; else printf 'null'; fi)"
+        printf '"status":"%s",' "$(json_escape "${A_STATUS[$i]}")"
+        printf '"signature":%s' "$sig"
+        printf '}'
+    done
+    if [ "${#A_NAME[@]}" -gt 0 ]; then printf '\n  '; fi
+    printf ']\n'
+    printf '}\n'
+}
+emit_signatures >"$SIGNATURES.tmp" && mv "$SIGNATURES.tmp" "$SIGNATURES" || exit 2
+
+# ---------------------------------------------------------------------------
 # 5. Signed update manifest (additive; assembled from this run).
 # ---------------------------------------------------------------------------
 UPDATE_MANIFEST="$OUT_DIR/update-manifest.json"
@@ -407,14 +576,23 @@ else
         um() {
             node "$ROOT/scripts/update-manifest.mjs" --artifacts "$MANIFEST" \
                 --certification-optional "$OUT_DIR/manifest.json" \
-                --out "$UPDATE_MANIFEST" --require-signed
+                --signatures "$SIGNATURES" \
+                --out "$UPDATE_MANIFEST" --require-signed \
+                ${REQUIRE_SIGNED_ARGS:-}
         }
     else
         um() {
             node "$ROOT/scripts/update-manifest.mjs" --artifacts "$MANIFEST" \
                 --certification-optional "$OUT_DIR/manifest.json" \
-                --out "$UPDATE_MANIFEST"
+                --signatures "$SIGNATURES" \
+                --out "$UPDATE_MANIFEST" \
+                ${REQUIRE_SIGNED_ARGS:-}
         }
+    fi
+    if [ "$REQUIRE_SIGNED" = "1" ]; then
+        REQUIRE_SIGNED_ARGS="--require-signed-artifacts"
+    else
+        REQUIRE_SIGNED_ARGS=""
     fi
     if node "$ROOT/scripts/update-manifest.mjs" selftest \
         >"$LOG_DIR/package-update-manifest-selftest.log" 2>&1 &&
@@ -428,12 +606,18 @@ else
     fi
 fi
 
-printf '\n[package] status=%s artifacts=%s recorded_skips=%s manifest=%s\n' \
-    "$STATUS" "${#A_NAME[@]}" "${#S_NAME[@]}" "$(rel_path "$MANIFEST")"
+printf '\n[package] status=%s artifacts=%s recorded_skips=%s signature_records=%s manifest=%s\n' \
+    "$STATUS" "${#A_NAME[@]}" "${#S_NAME[@]}" "${#SIG_NAME[@]}" "$(rel_path "$MANIFEST")"
 if [ "${#A_NAME[@]}" -gt 0 ]; then
     for i in "${!A_NAME[@]}"; do
-        printf '[package]   %-34s %-8s %12s bytes  %.12s\n' \
-            "${A_NAME[$i]}" "${A_STATUS[$i]}" "${A_SIZE[$i]:-?}" "${A_SHA[$i]:-none}"
+        sig_status="$(sig_for "${A_NAME[$i]}")"
+        if [ -n "$sig_status" ]; then
+            sig_status="$(printf '%s' "$sig_status" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p' | head -n1)"
+        else
+            sig_status="none"
+        fi
+        printf '[package]   %-34s %-8s %12s bytes  %.12s  os-sig=%s\n' \
+            "${A_NAME[$i]}" "${A_STATUS[$i]}" "${A_SIZE[$i]:-?}" "${A_SHA[$i]:-none}" "$sig_status"
     done
 fi
 if [ "$FATAL" -ne 0 ]; then

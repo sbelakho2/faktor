@@ -25,9 +25,12 @@
 #                   gates; [fault] campaigns at scale; coding-benchmark
 #                   harness smoke; efficiency harness; ACP interop;
 #                   installable artifact packaging (daemon tar.gz + VSIX +
-#                   JetBrains zip) and the installation matrix; the SIGNED
-#                   update manifest (`faktor-update/v1`) assembled from the
-#                   packaged artifacts + certification evidence by
+#                   JetBrains zip), OS-level code signing (codesign/
+#                   notarytool or Authenticode when identity/cert env is
+#                   configured; explicit UNSIGNED markers otherwise) and the
+#                   installation matrix; the SIGNED update manifest
+#                   (`faktor-update/v1`) assembled from the packaged
+#                   artifacts + certification evidence by
 #                   scripts/update-manifest.mjs (selftest first; signed when
 #                   FAKTOR_UPDATE_SIGNING_KEY is set, explicitly UNSIGNED
 #                   otherwise — never a silent claim). The packaging section
@@ -372,6 +375,16 @@ section_evidence_selftest() {
     node scripts/certification/evidence.mjs selftest
 }
 
+# Prove the OS signing drivers offline (no keys, no network, fake tools):
+# an absent identity/certificate is an explicit UNSIGNED marker (and a
+# --require-signed refusal), a configured identity signs, tar.gz inner
+# members are repacked, and a doctored artifact fails the digest step.
+section_signing_selftest() {
+    bash scripts/sign-macos.sh selftest || return 1
+    bash scripts/sign-windows.sh selftest || return 1
+    return 0
+}
+
 section_clippy() {
     cargo clippy --workspace --all-targets -- -D warnings
 }
@@ -476,8 +489,16 @@ section_install_matrix() {
 # fails the section); without it the manifest is written explicitly UNSIGNED
 # (`apply` then refuses it with a typed manifest_unsigned refusal) — the
 # certificate never claims a signature it does not have.
+#
+# When the packaging step recorded OS-signature metadata
+# ($OUT_DIR/artifact-signatures.json), it is passed through: every record's
+# digest must equal the artifact digest recorded in artifacts.json (a
+# doctored artifact refuses the manifest) and the records are digest-bound
+# into the certification evidence when a certificate is present.
 #   UPDATE_MANIFEST_CHANNEL  stable|beta|dev (default stable)
 #   FAKTOR_UPDATE_URL_BASE   distribution URL base for artifact urls
+#   PACKAGE_REQUIRE_SIGNED=1 refuse to publish an OS-unsigned release (the
+#                            same policy flag the packaging section reads)
 section_update_manifest() {
     if ! command -v node >/dev/null 2>&1; then
         echo "SKIP: node unavailable; the signed update manifest cannot be assembled" >&2
@@ -485,19 +506,28 @@ section_update_manifest() {
         return 0
     fi
     node scripts/update-manifest.mjs selftest || return 1
+    local sig_args=""
+    if [ -f "$OUT_DIR/artifact-signatures.json" ]; then
+        sig_args="--signatures $OUT_DIR/artifact-signatures.json"
+    fi
+    if [ "${PACKAGE_REQUIRE_SIGNED:-0}" = "1" ]; then
+        sig_args="$sig_args --require-signed-artifacts"
+    fi
     if [ -n "${FAKTOR_UPDATE_SIGNING_KEY:-}" ]; then
         node scripts/update-manifest.mjs \
             --artifacts "$OUT_DIR/artifacts.json" \
             --certification-optional "$MANIFEST" \
             --out "$OUT_DIR/update-manifest.json" \
             --channel "${UPDATE_MANIFEST_CHANNEL:-stable}" \
+            ${sig_args} \
             --require-signed
     else
         node scripts/update-manifest.mjs \
             --artifacts "$OUT_DIR/artifacts.json" \
             --certification-optional "$MANIFEST" \
             --out "$OUT_DIR/update-manifest.json" \
-            --channel "${UPDATE_MANIFEST_CHANNEL:-stable}"
+            --channel "${UPDATE_MANIFEST_CHANNEL:-stable}" \
+            ${sig_args}
     fi
 }
 
@@ -629,6 +659,7 @@ else
         add_skip capabilities-manifest "node is unavailable on this host; capability labels stay unknown"
         add_skip evidence-selftest "node is unavailable on this host; certified evidence cannot be verified"
     fi
+    add_section section_signing_selftest signing-selftest "OS signing drivers selftest (unsigned markers + digest refusals)"
     add_section section_clippy clippy "cargo clippy -D warnings"
     if [ "$FAST_TESTS_SKIP" -eq 1 ]; then
         FAST_TESTS_SKIPPED=1
