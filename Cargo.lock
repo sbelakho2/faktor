@@ -964,6 +964,7 @@ dependencies = [
  "faktor-core",
  "libc",
  "notify",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -996,13 +997,16 @@ version = "0.1.0"
 dependencies = [
  "faktor-cas",
  "faktor-core",
+ "faktor-fs",
  "faktor-terminal",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

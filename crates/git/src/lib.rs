@@ -15,6 +15,70 @@ use faktor_core::error::{Error, ErrorKind};
 use faktor_core::id::{SessionId, WorktreeId};
 use faktor_terminal::{ProcessOwner, ProcessSupervisor, SpawnConfig};
 
+mod guard;
+pub use guard::{
+    pid_start_marker, process_alive, DiskLease, LeaseRecord, DEFAULT_LEASE_BUDGET, LEASE_FILE,
+};
+
+/// fsync a directory so a completed rename/create is durable (best effort:
+/// platforms that refuse directory fsync are a documented no-op).
+pub(crate) fn fsync_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
+/// The repository mutation guard: the process-local per-repository write
+/// lock PLUS the durable disk lease under the repository's COMMON git dir.
+/// Every logical operation (exact-tree build + commit, push preparation,
+/// worktree mutation) takes ONE guard for the WHOLE semantic operation;
+/// git's own index/ref locks remain the inner serialization.
+pub struct RepositoryMutationGuard {
+    repo: PathBuf,
+    _local: tokio::sync::OwnedRwLockWriteGuard<()>,
+    lease: DiskLease,
+}
+
+impl std::fmt::Debug for RepositoryMutationGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RepositoryMutationGuard")
+            .field("lease", &self.lease.record())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RepositoryMutationGuard {
+    /// The lease record this guard holds (diagnostics).
+    pub fn lease(&self) -> &LeaseRecord {
+        self.lease.record()
+    }
+
+    /// The repository this guard covers (canonicalized at acquisition).
+    pub fn repo(&self) -> &Path {
+        &self.repo
+    }
+
+    /// A guarded operation must be handed the guard of ITS OWN repository.
+    pub fn assert_covers(&self, repo: &Path) -> Result<(), Error> {
+        let repo = repo
+            .canonicalize()
+            .map_err(|e| Error::not_found(format!("repository {}: {e}", repo.display())))?;
+        if repo != self.repo {
+            return Err(Error::malformed(format!(
+                "repository mutation guard covers {} but the operation targets {}",
+                self.repo.display(),
+                repo.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
     pub id: WorktreeId,
@@ -54,6 +118,52 @@ pub enum PushOutcome {
     Pushed { note: String },
     /// The remote already held the branch at the pushed commit.
     AlreadyCurrent { note: String },
+}
+
+/// One entry of the VERIFIED manifest handed to the exact-tree publication
+/// path: the relative path and its canonical state (kind / mode / payload
+/// digest / literal symlink target). The tree built from these entries is
+/// asserted equal to them before any commit exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedTreeEntry {
+    pub path: String,
+    pub state: faktor_fs::entry_state::EntryState,
+}
+
+fn is_git_oid(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Parse `git ls-tree -r -z` output (`<mode> SP <type> SP <oid> TAB <path>
+/// NUL`) into `path -> (mode octal, type, oid)`.
+fn parse_ls_tree(
+    output: &str,
+) -> Result<std::collections::BTreeMap<String, (u32, String, String)>, Error> {
+    let mut out = std::collections::BTreeMap::new();
+    for record in output.split('\0') {
+        if record.is_empty() {
+            continue;
+        }
+        let (meta, path) = record.split_once('\t').ok_or_else(|| {
+            Error::internal(format!(
+                "git ls-tree record {record:?} has no path separator"
+            ))
+        })?;
+        let mut parts = meta.split_whitespace();
+        let mode = parts
+            .next()
+            .ok_or_else(|| Error::internal("git ls-tree record has no mode"))?;
+        let kind = parts
+            .next()
+            .ok_or_else(|| Error::internal("git ls-tree record has no type"))?;
+        let oid = parts
+            .next()
+            .ok_or_else(|| Error::internal("git ls-tree record has no oid"))?;
+        let mode = u32::from_str_radix(mode, 8)
+            .map_err(|_| Error::internal(format!("git ls-tree mode {mode:?} is not octal")))?;
+        out.insert(path.to_string(), (mode, kind.to_string(), oid.to_string()));
+    }
+    Ok(out)
 }
 
 /// Deliberate network-op bound: 60 s per push/remote read so a wedged or
@@ -303,6 +413,134 @@ impl WorktreeManager {
         self.git_read_os(repo, &args, owner).await
     }
 
+    /// Run a read-only git op while the CALLER holds the repository mutation
+    /// guard: the guard IS the lock, so no lock is taken here (a guarded
+    /// operation must never self-deadlock on its own repository lock).
+    pub async fn git_unlocked(
+        &self,
+        repo: &Path,
+        args: &[&str],
+        owner: ProcessOwner,
+    ) -> Result<String, Error> {
+        let args: Vec<OsString> = args.iter().map(|s| OsString::from(*s)).collect();
+        self.git_with_timeout(repo, &args, owner, std::time::Duration::from_secs(15))
+            .await
+    }
+
+    /// [`Self::git_unlocked`] for a rev that may legitimately not resolve
+    /// (`None`), e.g. an unborn HEAD.
+    pub async fn git_probe_unlocked(
+        &self,
+        repo: &Path,
+        args: &[&str],
+        owner: ProcessOwner,
+    ) -> Result<Option<String>, Error> {
+        let args: Vec<OsString> = args.iter().map(|s| OsString::from(*s)).collect();
+        match self
+            .git_with_timeout(repo, &args, owner, std::time::Duration::from_secs(15))
+            .await
+        {
+            Ok(out) => Ok(Some(out)),
+            Err(e) if e.kind == ErrorKind::Internal => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The `HEAD` sha under an already-held mutation guard.
+    pub async fn head_sha_unlocked(
+        &self,
+        repo: &Path,
+        owner: ProcessOwner,
+    ) -> Result<Option<String>, Error> {
+        Ok(self
+            .git_probe_unlocked(repo, &["rev-parse", "--verify", "HEAD"], owner)
+            .await?
+            .map(|s| s.trim().to_string()))
+    }
+
+    /// The current branch under an already-held mutation guard.
+    pub async fn current_branch_unlocked(
+        &self,
+        repo: &Path,
+        owner: ProcessOwner,
+    ) -> Result<String, Error> {
+        Ok(self
+            .git_unlocked(repo, &["branch", "--show-current"], owner)
+            .await?
+            .trim()
+            .to_string())
+    }
+
+    /// The configured remote's URL under an already-held mutation guard
+    /// (`None` = the repository has no remotes at all).
+    pub async fn remote_url_unlocked(
+        &self,
+        repo: &Path,
+        remote: &str,
+        owner: ProcessOwner,
+    ) -> Result<Option<String>, Error> {
+        validate_remote(remote)?;
+        let listed = self.git_unlocked(repo, &["remote"], owner.clone()).await?;
+        let names: Vec<&str> = listed
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if names.is_empty() {
+            return Ok(None);
+        }
+        if !names.contains(&remote) {
+            return Err(Error::malformed(format!(
+                "remote {remote:?} is not configured (configured: {names:?})"
+            )));
+        }
+        Ok(Some(
+            self.git_unlocked(repo, &["remote", "get-url", remote], owner)
+                .await?
+                .trim()
+                .to_string(),
+        ))
+    }
+
+    /// The exact oid of `refs/heads/<branch>` on `remote` under an
+    /// already-held mutation guard (a real `ls-remote` read).
+    pub async fn remote_branch_oid_unlocked(
+        &self,
+        repo: &Path,
+        remote: &str,
+        branch: &str,
+        owner: ProcessOwner,
+    ) -> Result<Option<String>, Error> {
+        validate_remote(remote)?;
+        validate_branch(branch)?;
+        let out = self
+            .git_with_timeout(
+                repo,
+                &[
+                    OsString::from("ls-remote"),
+                    OsString::from("--heads"),
+                    OsString::from(remote),
+                    OsString::from(format!("refs/heads/{branch}")),
+                ],
+                owner,
+                GIT_NETWORK_TIMEOUT,
+            )
+            .await?;
+        let mut oid = None;
+        for line in out.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some((value, refname)) = line.split_once('\t') {
+                if refname.trim() == format!("refs/heads/{branch}") {
+                    oid = Some(value.trim().to_string());
+                }
+            }
+        }
+        Ok(oid)
+    }
+
     /// Run a mutating git op under the repository's WRITE lock (serialized
     /// per repo; unrelated repos stay concurrent).
     pub async fn git_mutate(
@@ -335,6 +573,97 @@ impl WorktreeManager {
         let lock = self.lock_for(repo);
         let _guard = lock.write().await;
         self.git(repo, args, owner).await
+    }
+
+    /// The repository's COMMON git dir (shared by every linked worktree).
+    /// `git rev-parse --git-common-dir` runs under the repository read lock;
+    /// a relative answer is resolved against the repository root.
+    pub async fn common_git_dir(&self, repo: &Path, owner: ProcessOwner) -> Result<PathBuf, Error> {
+        let out = self
+            .git_read(repo, &["rev-parse", "--git-common-dir"], owner)
+            .await?;
+        Self::resolve_common_git_dir(repo, &out)
+    }
+
+    fn resolve_common_git_dir(repo: &Path, out: &str) -> Result<PathBuf, Error> {
+        let raw = out.trim();
+        if raw.is_empty() {
+            return Err(Error::internal(format!(
+                "git rev-parse --git-common-dir of {} returned no path",
+                repo.display()
+            )));
+        }
+        let candidate = PathBuf::from(raw);
+        let path = if candidate.is_absolute() {
+            candidate
+        } else {
+            repo.join(candidate)
+        };
+        let path = path
+            .canonicalize()
+            .map_err(|e| Error::not_found(format!("common git dir of {}: {e}", repo.display())))?;
+        if !path.is_dir() {
+            return Err(Error::not_found(format!(
+                "common git dir {} is not a directory",
+                path.display()
+            )));
+        }
+        Ok(path)
+    }
+
+    /// Acquire the repository mutation guard for ONE logical operation: the
+    /// process-local write lock FIRST (so two guards of this manager can
+    /// never deadlock on the lease), then the durable disk lease under the
+    /// common git dir. A live lease held by another runtime is a typed
+    /// `Conflict` after the default budget.
+    pub async fn acquire_mutation_guard(
+        &self,
+        repo: &Path,
+        owner: ProcessOwner,
+    ) -> Result<RepositoryMutationGuard, Error> {
+        self.acquire_mutation_guard_with_budget(repo, owner, DEFAULT_LEASE_BUDGET)
+            .await
+    }
+
+    /// [`Self::acquire_mutation_guard`] with an explicit wait budget.
+    pub async fn acquire_mutation_guard_with_budget(
+        &self,
+        repo: &Path,
+        owner: ProcessOwner,
+        budget: std::time::Duration,
+    ) -> Result<RepositoryMutationGuard, Error> {
+        if !repo.is_dir() {
+            return Err(Error::not_found(format!(
+                "repository {} not found",
+                repo.display()
+            )));
+        }
+        let repo = repo
+            .canonicalize()
+            .map_err(|e| Error::not_found(format!("repository {}: {e}", repo.display())))?;
+        let lock = self.lock_for(&repo);
+        let local = lock.write_owned().await;
+        // UNLOCKED: the caller already holds this repository's write lock,
+        // so a read-locked helper here would self-deadlock.
+        let out = self
+            .git_with_timeout(
+                &repo,
+                &[
+                    OsString::from("rev-parse"),
+                    OsString::from("--git-common-dir"),
+                ],
+                owner.clone(),
+                std::time::Duration::from_secs(15),
+            )
+            .await?;
+        let common_dir = Self::resolve_common_git_dir(&repo, &out)?;
+        let purpose = format!("{owner:?}");
+        let lease = DiskLease::acquire(&common_dir, &purpose, budget)?;
+        Ok(RepositoryMutationGuard {
+            repo,
+            _local: local,
+            lease,
+        })
     }
 
     async fn git(
@@ -787,6 +1116,482 @@ impl WorktreeManager {
         } else {
             Ok(PushOutcome::Pushed { note })
         }
+    }
+
+    // ------------------------------------------- exact verified publication
+    //
+    // The commit/push path is built around ONE verified manifest (the exact
+    // `(path, kind, mode, payload)` identity the task was verified against):
+    // the git tree is constructed FROM that manifest through a private
+    // temporary index, asserted equal to it, and only then committed and
+    // published. There is no `git add -A` over an unguarded checkout, and a
+    // worktree divergence between verification and tree construction is a
+    // typed refusal with nothing committed.
+
+    async fn git_with_timeout_env(
+        &self,
+        repo: &Path,
+        args: &[OsString],
+        owner: ProcessOwner,
+        timeout: std::time::Duration,
+        extra_env: &[(OsString, OsString)],
+    ) -> Result<String, Error> {
+        if !repo.is_dir() {
+            return Err(Error::not_found(format!(
+                "repository {} not found",
+                repo.display()
+            )));
+        }
+        let env = if extra_env.is_empty() {
+            faktor_terminal::EnvSpec::default_baseline()
+        } else {
+            // The platform baseline (PATH/HOME/...) with the explicit
+            // additional entries layered on top; empty values copy the
+            // daemon's value when set, exactly like `EnvSpec::Explicit`.
+            let mut entries: Vec<(OsString, OsString)> = [
+                "PATH",
+                "HOME",
+                "TMPDIR",
+                "TEMP",
+                "TMP",
+                "SystemRoot",
+                "USERPROFILE",
+            ]
+            .iter()
+            .map(|name| (OsString::from(*name), OsString::new()))
+            .collect();
+            entries.extend(extra_env.iter().cloned());
+            faktor_terminal::EnvSpec::Explicit(entries)
+        };
+        let cfg = SpawnConfig {
+            cmd: "git".into(),
+            args: args
+                .iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect(),
+            cwd: PathBuf::from(git_path(repo)),
+            owner,
+            env,
+            ..Default::default()
+        };
+        let out = self
+            .supervisor
+            .run(cfg, timeout, CancellationToken::new())
+            .await?;
+        if out.exit_code != Some(0) {
+            return Err(Error::new(
+                ErrorKind::Internal,
+                format!(
+                    "git {} failed ({}): {}",
+                    args.iter()
+                        .map(|a| a.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    out.exit_code.unwrap_or(-1),
+                    truncate(&out.excerpt, 2000)
+                ),
+            ));
+        }
+        Ok(strip_exit_trailer(&out.excerpt))
+    }
+
+    /// Construct a git tree containing EXACTLY `entries` (the verified
+    /// manifest) from the verified worktree `root`, through a private
+    /// temporary index (`GIT_INDEX_FILE`), and assert the resulting tree
+    /// matches the manifest entry for entry. A worktree path that no longer
+    /// carries the verified state is a typed Conflict and nothing is
+    /// committed.
+    pub async fn build_tree_from_manifest(
+        &self,
+        guard: &RepositoryMutationGuard,
+        repo: &Path,
+        root: &Path,
+        entries: &[VerifiedTreeEntry],
+        owner: ProcessOwner,
+    ) -> Result<String, Error> {
+        guard.assert_covers(repo)?;
+        let scratch = tempfile::tempdir()
+            .map_err(|e| Error::internal(format!("tree-build scratch dir: {e}")))?;
+        let index_path = scratch.path().join("index");
+        let blob_path = scratch.path().join("blob");
+        let env: Vec<(OsString, OsString)> = vec![(
+            OsString::from("GIT_INDEX_FILE"),
+            index_path.as_os_str().to_os_string(),
+        )];
+        self.git_with_timeout_env(
+            repo,
+            &[OsString::from("read-tree"), OsString::from("--empty")],
+            owner.clone(),
+            std::time::Duration::from_secs(15),
+            &env,
+        )
+        .await?;
+        let mut computed: std::collections::BTreeMap<String, (u32, String)> =
+            std::collections::BTreeMap::new();
+        for entry in entries {
+            let rel = Path::new(&entry.path);
+            if entry.path.is_empty()
+                || rel
+                    .components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+                return Err(Error::malformed(format!(
+                    "verified manifest path {:?} is not a plain relative path",
+                    entry.path
+                )));
+            }
+            let live = faktor_fs::entry_state::state_of_path(&root.join(rel))?;
+            if live != entry.state {
+                return Err(Error::conflict(format!(
+                    "worktree divergence at {:?} between proof revalidation and tree construction (expected {}, found {}); nothing was committed",
+                    entry.path,
+                    entry.state.describe(),
+                    live.describe()
+                )));
+            }
+            let material = match &entry.state {
+                faktor_fs::entry_state::EntryState::Absent => {
+                    return Err(Error::malformed(format!(
+                        "the verified manifest carries an absent entry for {:?}",
+                        entry.path
+                    )))
+                }
+                faktor_fs::entry_state::EntryState::Regular { .. } => {
+                    let bytes = std::fs::read(root.join(rel))
+                        .map_err(|e| Error::internal(format!("read {:?}: {e}", entry.path)))?;
+                    if !entry.state.material_matches(&bytes) {
+                        return Err(Error::conflict(format!(
+                            "worktree divergence at {:?}: the content no longer matches the verified manifest; nothing was committed",
+                            entry.path
+                        )));
+                    }
+                    bytes
+                }
+                faktor_fs::entry_state::EntryState::Symlink { target, .. } => target.clone(),
+            };
+            std::fs::write(&blob_path, &material)
+                .map_err(|e| Error::internal(format!("stage blob of {:?}: {e}", entry.path)))?;
+            let oid = self
+                .git_with_timeout_env(
+                    repo,
+                    &[
+                        OsString::from("hash-object"),
+                        OsString::from("-w"),
+                        OsString::from("-t"),
+                        OsString::from("blob"),
+                        OsString::from("--no-filters"),
+                        OsString::from("--"),
+                        git_path(&blob_path),
+                    ],
+                    owner.clone(),
+                    std::time::Duration::from_secs(15),
+                    &env,
+                )
+                .await?
+                .trim()
+                .to_string();
+            let mode = entry
+                .state
+                .mode()
+                .ok_or_else(|| Error::malformed("absent manifest entry has no mode"))?
+                .octal();
+            self.git_with_timeout_env(
+                repo,
+                &[
+                    OsString::from("update-index"),
+                    OsString::from("--add"),
+                    OsString::from("--cacheinfo"),
+                    OsString::from(format!("{mode:o},{oid},{}", entry.path)),
+                ],
+                owner.clone(),
+                std::time::Duration::from_secs(15),
+                &env,
+            )
+            .await?;
+            computed.insert(entry.path.clone(), (mode, oid));
+        }
+        let tree = self
+            .git_with_timeout_env(
+                repo,
+                &[OsString::from("write-tree")],
+                owner.clone(),
+                std::time::Duration::from_secs(15),
+                &env,
+            )
+            .await?
+            .trim()
+            .to_string();
+        if !is_git_oid(&tree) {
+            return Err(Error::internal(format!(
+                "git write-tree returned a non-oid {tree:?}"
+            )));
+        }
+        // Independent read-back: the tree must list EXACTLY the manifest
+        // entries (path, mode, type) and the blob oids that were computed
+        // from the verified content. Anything else is a typed refusal.
+        let listing = self
+            .git_with_timeout_env(
+                repo,
+                &[
+                    OsString::from("ls-tree"),
+                    OsString::from("-r"),
+                    OsString::from("-z"),
+                    OsString::from("--full-tree"),
+                    OsString::from(&tree),
+                ],
+                owner,
+                std::time::Duration::from_secs(15),
+                &[],
+            )
+            .await?;
+        let listed = parse_ls_tree(&listing)?;
+        if listed.len() != computed.len() {
+            return Err(Error::conflict(format!(
+                "the constructed tree {tree} lists {} entries but the verified manifest has {}",
+                listed.len(),
+                computed.len()
+            )));
+        }
+        for (path, (mode, oid)) in &computed {
+            match listed.get(path) {
+                Some((listed_mode, listed_type, listed_oid))
+                    if *listed_mode == *mode && listed_type == "blob" && *listed_oid == *oid => {}
+                other => {
+                    return Err(Error::conflict(format!(
+                        "the constructed tree {tree} does not match the verified manifest at {path:?} (manifest {mode:o} {oid}, tree {other:?})"
+                    )))
+                }
+            }
+        }
+        Ok(tree)
+    }
+
+    /// The single guarded publication step: build the exact tree from the
+    /// verified manifest, commit it (verified tree + parent HEAD + message)
+    /// on `branch`, move the branch ref with the parent as old-value CAS,
+    /// then read HEAD back and assert both the commit oid and its tree.
+    /// The caller holds ONE [`RepositoryMutationGuard`] across proof
+    /// revalidation, this call and any push preparation.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_verified_tree(
+        &self,
+        guard: &RepositoryMutationGuard,
+        repo: &Path,
+        root: &Path,
+        branch: &str,
+        message: &str,
+        entries: &[VerifiedTreeEntry],
+        owner: ProcessOwner,
+    ) -> Result<CommitOutcome, Error> {
+        guard.assert_covers(repo)?;
+        validate_branch(branch)?;
+        if message.trim().is_empty() {
+            return Err(Error::malformed("commit message must not be empty"));
+        }
+        let Some(parent) = self.head_sha_unlocked(repo, owner.clone()).await? else {
+            return Ok(CommitOutcome::EmptyRepository);
+        };
+        let tree = self
+            .build_tree_from_manifest(guard, repo, root, entries, owner.clone())
+            .await?;
+        let mut args: Vec<OsString> = vec![
+            OsString::from("-c"),
+            OsString::from(format!("user.name={COMMIT_IDENTITY_NAME}")),
+            OsString::from("-c"),
+            OsString::from(format!("user.email={COMMIT_IDENTITY_EMAIL}")),
+            OsString::from("commit-tree"),
+            OsString::from(&tree),
+            OsString::from("-p"),
+            OsString::from(&parent),
+            OsString::from("-m"),
+            OsString::from(message),
+        ];
+        let commit = self
+            .git_with_timeout(
+                repo,
+                &args,
+                owner.clone(),
+                std::time::Duration::from_secs(15),
+            )
+            .await?
+            .trim()
+            .to_string();
+        args.clear();
+        if !is_git_oid(&commit) {
+            return Err(Error::internal(format!(
+                "git commit-tree returned a non-oid {commit:?}"
+            )));
+        }
+        let refname = format!("refs/heads/{branch}");
+        self.git_with_timeout(
+            repo,
+            &[
+                OsString::from("update-ref"),
+                OsString::from("-m"),
+                OsString::from("faktor: verified completion commit"),
+                OsString::from(&refname),
+                OsString::from(&commit),
+                OsString::from(&parent),
+            ],
+            owner.clone(),
+            std::time::Duration::from_secs(15),
+        )
+        .await?;
+        // The real index is refreshed to the committed tree (exactly what a
+        // normal commit does): HEAD, index and the verified worktree agree
+        // after publication, so `git status` is clean.
+        self.git_unlocked(repo, &["read-tree", &tree], owner.clone())
+            .await?;
+        // Read-back: HEAD must now be exactly the commit over the exact tree.
+        let head = self.head_sha_unlocked(repo, owner.clone()).await?;
+        if head.as_deref() != Some(commit.as_str()) {
+            return Err(Error::conflict(format!(
+                "HEAD of {} is {:?} after committing {commit}; the branch ref did not move to the verified commit",
+                repo.display(),
+                head
+            )));
+        }
+        let head_tree = self
+            .git_unlocked(repo, &["rev-parse", "HEAD^{tree}"], owner)
+            .await?
+            .trim()
+            .to_string();
+        if head_tree != tree {
+            return Err(Error::conflict(format!(
+                "HEAD^{{tree}} is {head_tree} but the verified manifest tree is {tree}"
+            )));
+        }
+        let subject = message.lines().next().unwrap_or("").trim().to_string();
+        Ok(CommitOutcome::Committed {
+            sha: commit,
+            subject,
+        })
+    }
+
+    /// The exact oid of `refs/heads/<branch>` on `remote` (a real network
+    /// read via `ls-remote`), or `None` when the remote branch does not
+    /// exist.
+    pub async fn remote_branch_oid(
+        &self,
+        repo: &Path,
+        remote: &str,
+        branch: &str,
+        owner: ProcessOwner,
+    ) -> Result<Option<String>, Error> {
+        validate_remote(remote)?;
+        validate_branch(branch)?;
+        let out = self
+            .git_with_timeout(
+                repo,
+                &[
+                    OsString::from("ls-remote"),
+                    OsString::from("--heads"),
+                    OsString::from(remote),
+                    OsString::from(format!("refs/heads/{branch}")),
+                ],
+                owner,
+                GIT_NETWORK_TIMEOUT,
+            )
+            .await?;
+        let mut oid = None;
+        for line in out.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some((value, refname)) = line.split_once('\t') {
+                if refname.trim() == format!("refs/heads/{branch}") {
+                    oid = Some(value.trim().to_string());
+                }
+            }
+        }
+        Ok(oid)
+    }
+
+    /// Push EXACTLY `commit_oid` to `refs/heads/<branch>` under the
+    /// expected-remote-state lease (`None` = the remote branch must not
+    /// exist), then read the remote ref back and require it to be the exact
+    /// oid. Returns the reconciled remote oid.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn push_exact_commit(
+        &self,
+        guard: &RepositoryMutationGuard,
+        repo: &Path,
+        remote: &str,
+        branch: &str,
+        commit_oid: &str,
+        expected_remote: Option<&str>,
+        owner: ProcessOwner,
+    ) -> Result<(PushOutcome, String), Error> {
+        guard.assert_covers(repo)?;
+        validate_remote(remote)?;
+        validate_branch(branch)?;
+        if !is_git_oid(commit_oid) {
+            return Err(Error::malformed(format!(
+                "push target {commit_oid:?} is not a git commit oid"
+            )));
+        }
+        for expected in expected_remote.iter() {
+            if !is_git_oid(expected) {
+                return Err(Error::malformed(format!(
+                    "expected remote oid {expected:?} is not a git commit oid"
+                )));
+            }
+        }
+        // Resolve the expectation when the caller has none: the lease must
+        // pin the CURRENT remote state (or "must not exist"), never a blind
+        // force.
+        let observed = match expected_remote {
+            Some(expected) => Some(expected.to_string()),
+            None => {
+                self.remote_branch_oid_unlocked(repo, remote, branch, owner.clone())
+                    .await?
+            }
+        };
+        let lease = format!(
+            "--force-with-lease=refs/heads/{branch}:{}",
+            observed.as_deref().unwrap_or("")
+        );
+        let out = self
+            .git_with_timeout(
+                repo,
+                &[
+                    OsString::from("push"),
+                    OsString::from(remote),
+                    OsString::from(format!("{commit_oid}:refs/heads/{branch}")),
+                    OsString::from(lease),
+                ],
+                owner.clone(),
+                GIT_NETWORK_TIMEOUT,
+            )
+            .await?;
+        // Reconcile the ACTUAL remote ref to the exact oid.
+        let remote_oid = self
+            .remote_branch_oid_unlocked(repo, remote, branch, owner)
+            .await?
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "remote {remote} reports no refs/heads/{branch} after the push"
+                ))
+            })?;
+        if remote_oid != commit_oid {
+            return Err(Error::conflict(format!(
+                "remote {remote} refs/heads/{branch} is {remote_oid} after the push but the verified commit is {commit_oid}"
+            )));
+        }
+        let note = out
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .to_string();
+        let outcome = if out.contains("Everything up-to-date") {
+            PushOutcome::AlreadyCurrent { note }
+        } else {
+            PushOutcome::Pushed { note }
+        };
+        Ok((outcome, remote_oid))
     }
 
     pub async fn remove(&self, wt: &Worktree) -> Result<(), Error> {
@@ -2083,6 +2888,373 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(err.kind, ErrorKind::Internal, "{err:?}");
+        }
+    }
+
+    // ------------------------------------------------ wave-0 exact publication
+
+    mod publication_tests {
+        use super::*;
+
+        fn literal_bytes(target: &Path) -> Vec<u8> {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                target.as_os_str().as_bytes().to_vec()
+            }
+            #[cfg(not(unix))]
+            {
+                target.to_string_lossy().into_owned().into_bytes()
+            }
+        }
+
+        /// The verified manifest of a root, exactly the shape the completion
+        /// step hands to the publication path.
+        fn manifest_of(root: &Path) -> Vec<VerifiedTreeEntry> {
+            let manifest = faktor_fs::tree_manifest::tree_manifest(root, 100_000).unwrap();
+            manifest
+                .entries()
+                .iter()
+                .map(|entry| {
+                    let state = match entry.kind {
+                        faktor_fs::tree_manifest::TreeEntryKind::Regular => {
+                            faktor_fs::entry_state::EntryState::from_tree_entry(entry).unwrap()
+                        }
+                        faktor_fs::tree_manifest::TreeEntryKind::Symlink => {
+                            let target =
+                                std::fs::read_link(root.join(&entry.normalized_path)).unwrap();
+                            faktor_fs::entry_state::EntryState::symlink(literal_bytes(&target))
+                                .unwrap()
+                        }
+                    };
+                    VerifiedTreeEntry {
+                        path: entry.normalized_path.clone(),
+                        state,
+                    }
+                })
+                .collect()
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn mutation_guard_serializes_two_runtimes_via_the_disk_lease() {
+            let (dir, sup, mgr, repo) = fixture().await;
+            // The second runtime is a separate manager instance (its own
+            // process-local lock): only the disk lease can serialize them.
+            let other = WorktreeManager::new(sup.clone());
+            let guard = mgr
+                .acquire_mutation_guard(&repo, ProcessOwner::Daemon)
+                .await
+                .unwrap();
+            let lease_path = dir.path().join("repo/.git").join(LEASE_FILE);
+            assert!(lease_path.exists(), "the disk lease is held while guarded");
+            let recorded: LeaseRecord =
+                serde_json::from_slice(&std::fs::read(&lease_path).unwrap()).unwrap();
+            assert_eq!(recorded.pid, std::process::id());
+            assert!(!recorded.pid_start_marker.is_empty());
+            let err = other
+                .acquire_mutation_guard_with_budget(
+                    &repo,
+                    ProcessOwner::Daemon,
+                    std::time::Duration::from_millis(200),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Conflict, "{err:?}");
+            assert!(err.message.contains("is held by pid"), "{err:?}");
+            assert!(
+                lease_path.exists(),
+                "a failed acquisition never steals the live lease"
+            );
+            drop(guard);
+            assert!(!lease_path.exists(), "release removes the owner's lease");
+            let guard = other
+                .acquire_mutation_guard(&repo, ProcessOwner::Daemon)
+                .await
+                .unwrap();
+            assert!(lease_path.exists());
+            drop(guard);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn stale_lease_from_a_dead_process_is_reconciled_by_the_manager() {
+            let (dir, _sup, mgr, repo) = fixture().await;
+            let mut dead = std::process::Command::new("true").spawn().unwrap();
+            let dead_pid = dead.id();
+            let _ = dead.wait();
+            assert!(!process_alive(dead_pid));
+            let lease_path = dir.path().join("repo/.git").join(LEASE_FILE);
+            std::fs::write(
+                &lease_path,
+                serde_json::to_vec(&LeaseRecord {
+                    pid: dead_pid,
+                    pid_start_marker: "proc:1".into(),
+                    owner: "crashed-runtime".into(),
+                    started_ms: 1,
+                    purpose: "crashed".into(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let guard = mgr
+                .acquire_mutation_guard_with_budget(
+                    &repo,
+                    ProcessOwner::Daemon,
+                    std::time::Duration::from_millis(500),
+                )
+                .await
+                .expect("a dead owner's lease is reconciled, never held forever");
+            drop(guard);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn commit_builds_the_exact_verified_manifest_tree() {
+            let (_d, _sup, mgr, repo) = fixture().await;
+            std::fs::write(repo.join("src.txt"), b"content-one").unwrap();
+            let entries = manifest_of(&repo);
+            let guard = mgr
+                .acquire_mutation_guard(&repo, ProcessOwner::Daemon)
+                .await
+                .unwrap();
+            let before_head = mgr.head_sha(&repo, ProcessOwner::Daemon).await.unwrap();
+            let out = mgr
+                .commit_verified_tree(
+                    &guard,
+                    &repo,
+                    &repo,
+                    "main",
+                    "faktor: verified tree",
+                    &entries,
+                    ProcessOwner::Daemon,
+                )
+                .await
+                .unwrap();
+            let sha = match out {
+                CommitOutcome::Committed { sha, .. } => sha,
+                other => panic!("expected a verified commit, got {other:?}"),
+            };
+            assert_eq!(
+                mgr.head_sha(&repo, ProcessOwner::Daemon).await.unwrap(),
+                Some(sha.clone())
+            );
+            // The parent is the previous HEAD (the branch ref moved under the
+            // old-value CAS).
+            let parent = mgr
+                .git_read(&repo, &["rev-parse", "HEAD^"], ProcessOwner::Daemon)
+                .await
+                .unwrap()
+                .trim()
+                .to_string();
+            assert_eq!(Some(parent), before_head);
+            // HEAD's tree lists EXACTLY the manifest (path/mode/oid).
+            let listing = mgr
+                .git_read(
+                    &repo,
+                    &["ls-tree", "-r", "--full-tree", "HEAD"],
+                    ProcessOwner::Daemon,
+                )
+                .await
+                .unwrap();
+            let mut paths: Vec<&str> = listing
+                .lines()
+                .filter_map(|l| l.split('\t').nth(1))
+                .collect();
+            paths.sort();
+            let mut expected: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+            expected.sort();
+            assert_eq!(paths, expected);
+            // The real index is refreshed to the committed tree: the working
+            // tree is clean after the verified publication.
+            assert!(mgr.is_clean(&repo, ProcessOwner::Daemon).await.unwrap());
+            drop(guard);
+
+            // A chmod-only manifest change is a DIFFERENT tree, and the
+            // committed tree is rebuilt from the manifest (not the index).
+            std::fs::write(repo.join("src.txt"), b"content-two").unwrap();
+            let entries2 = manifest_of(&repo);
+            assert_ne!(entries, entries2);
+            let guard = mgr
+                .acquire_mutation_guard(&repo, ProcessOwner::Daemon)
+                .await
+                .unwrap();
+            let out = mgr
+                .commit_verified_tree(
+                    &guard,
+                    &repo,
+                    &repo,
+                    "main",
+                    "faktor: verified tree two",
+                    &entries2,
+                    ProcessOwner::Daemon,
+                )
+                .await
+                .unwrap();
+            let sha2 = match out {
+                CommitOutcome::Committed { sha, .. } => sha,
+                other => panic!("expected a second verified commit, got {other:?}"),
+            };
+            assert_ne!(sha, sha2);
+            drop(guard);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn worktree_divergence_before_tree_construction_is_a_typed_refusal() {
+            let (_d, _sup, mgr, repo) = fixture().await;
+            let entries = manifest_of(&repo);
+            // A human edit lands after proof revalidation, before the tree
+            // build: the manifest payload no longer matches the worktree.
+            std::fs::write(repo.join("README.md"), b"# human edit\n").unwrap();
+            let guard = mgr
+                .acquire_mutation_guard(&repo, ProcessOwner::Daemon)
+                .await
+                .unwrap();
+            let before = mgr.head_sha(&repo, ProcessOwner::Daemon).await.unwrap();
+            let err = mgr
+                .commit_verified_tree(
+                    &guard,
+                    &repo,
+                    &repo,
+                    "main",
+                    "faktor: must refuse",
+                    &entries,
+                    ProcessOwner::Daemon,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Conflict, "{err:?}");
+            assert!(err.message.contains("divergence"), "{err:?}");
+            assert_eq!(
+                mgr.head_sha(&repo, ProcessOwner::Daemon).await.unwrap(),
+                before,
+                "nothing was committed"
+            );
+            drop(guard);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn push_publishes_exactly_the_verified_commit_oid() {
+            let (dir, _sup, mgr, repo) = fixture().await;
+            let bare = dir.path().join("remote.git");
+            mgr.git_mutate(
+                &repo,
+                &["init", "--bare", "-q", bare.to_str().unwrap()],
+                ProcessOwner::Daemon,
+            )
+            .await
+            .unwrap();
+            mgr.git_mutate(
+                &repo,
+                &["remote", "add", "origin", bare.to_str().unwrap()],
+                ProcessOwner::Daemon,
+            )
+            .await
+            .unwrap();
+            std::fs::write(repo.join("ship.txt"), b"ship-me").unwrap();
+            let entries = manifest_of(&repo);
+            // A stale remote expectation: an oid the remote never carried.
+            let stale_expected = "0".repeat(40);
+            let guard = mgr
+                .acquire_mutation_guard(&repo, ProcessOwner::Daemon)
+                .await
+                .unwrap();
+            let out = mgr
+                .commit_verified_tree(
+                    &guard,
+                    &repo,
+                    &repo,
+                    "main",
+                    "faktor: ship",
+                    &entries,
+                    ProcessOwner::Daemon,
+                )
+                .await
+                .unwrap();
+            let commit = match out {
+                CommitOutcome::Committed { sha, .. } => sha,
+                other => panic!("expected a commit, got {other:?}"),
+            };
+            let (outcome, remote_oid) = mgr
+                .push_exact_commit(
+                    &guard,
+                    &repo,
+                    "origin",
+                    "main",
+                    &commit,
+                    None,
+                    ProcessOwner::Daemon,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(outcome, PushOutcome::Pushed { .. }), "{outcome:?}");
+            assert_eq!(remote_oid, commit);
+            // The remote ref reads back as EXACTLY the verified oid.
+            let read_back = mgr
+                .remote_branch_oid(&repo, "origin", "main", ProcessOwner::Daemon)
+                .await
+                .unwrap();
+            assert_eq!(read_back.as_deref(), Some(commit.as_str()));
+            // A stale expected-remote-state (the artifact recorded an older
+            // head) refuses BEFORE any force.
+            let err = mgr
+                .commit_verified_tree(
+                    &guard,
+                    &repo,
+                    &repo,
+                    "main",
+                    "faktor: ship two",
+                    &{
+                        std::fs::write(repo.join("ship.txt"), b"ship-me-2").unwrap();
+                        manifest_of(&repo)
+                    },
+                    ProcessOwner::Daemon,
+                )
+                .await
+                .unwrap();
+            let newer = match err {
+                CommitOutcome::Committed { sha, .. } => sha,
+                other => panic!("expected a commit, got {other:?}"),
+            };
+            let err = mgr
+                .push_exact_commit(
+                    &guard,
+                    &repo,
+                    "origin",
+                    "main",
+                    &newer,
+                    Some(&stale_expected),
+                    ProcessOwner::Daemon,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                err.kind == ErrorKind::Internal || err.kind == ErrorKind::Conflict,
+                "a stale remote expectation must refuse: {err:?}"
+            );
+            // The remote still holds the first verified commit.
+            assert_eq!(
+                mgr.remote_branch_oid(&repo, "origin", "main", ProcessOwner::Daemon)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(commit.as_str())
+            );
+            drop(guard);
+        }
+
+        #[test]
+        fn git_oid_and_ls_tree_parsing_are_strict() {
+            assert!(is_git_oid(&"a".repeat(40)));
+            assert!(is_git_oid(&"0".repeat(64)));
+            assert!(!is_git_oid(""));
+            assert!(!is_git_oid(&"z".repeat(40)));
+            let map = parse_ls_tree(
+                "100644 blob deadbeef\tREADME.md\u{0}120000 blob cafebabe\tlink\u{0}",
+            )
+            .unwrap();
+            assert_eq!(map.len(), 2);
+            assert_eq!(map["README.md"].0, 0o100644);
+            assert_eq!(map["link"].0, 0o120000);
+            assert!(parse_ls_tree("garbage").is_err());
         }
     }
 }

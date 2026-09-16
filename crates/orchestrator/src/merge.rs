@@ -39,12 +39,15 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fs;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 
+use faktor_core::error::{Error, ErrorKind};
 use faktor_core::hash::FileHash;
 use faktor_core::id::{SessionId, WorkspaceId};
-use faktor_fs::CasMergeResult;
+use faktor_fs::tree_manifest::{CanonicalMode, TreeEntry, TreeEntryKind};
+use faktor_fs::{CasMergeResult, MAX_MERGE_FILE_BYTES};
 use faktor_semantic::{
     SemanticCall, SemanticCapabilities, SemanticDelta, SemanticDeltaKind, SemanticDeltaRequest,
     SemanticSelection, SemanticSnapshotId, GENERIC_FALLBACK_ID, SEMANTIC_SCHEMA_VERSION,
@@ -78,9 +81,66 @@ const CHUNK_BUDGET: usize = 3000;
 /// refuses loudly instead of returning a partial view.
 const MAX_FACT_PAGES: usize = 256;
 
-/// One changed file: the child's current hash (`None` = the child deleted
-/// it) and the parent path's hash at the base snapshot (`None` = the parent
-/// had no such file then; the merge is an exclusive create).
+/// True when `value` is a canonical BLAKE3 payload digest (64 hex chars).
+pub(crate) fn is_blake3_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The canonical per-path entry state is the ONE definition from
+/// `faktor_fs::entry_state`: `Absent`, a regular file (canonical mode +
+/// whole-content payload digest) or a symlink (LITERAL target bytes + their
+/// digest, never followed). Exactly the per-entry projection of the `tm1`
+/// whole-tree manifest. This module carries it through the change-set, stage,
+/// compose, landing and rollback pipeline unchanged, so a chmod-only change,
+/// a regular<->symlink kind change and a symlink retarget are first-class
+/// changes instead of looking convergent on bytes alone.
+pub use faktor_fs::entry_state::EntryState;
+
+/// The honest projection of a LEGACY byte-only durable anchor (no kind/mode
+/// was ever recorded): a regular file with the canonical non-executable
+/// mode. Never authoritative for a kind/mode-sensitive transition — such a
+/// comparison CONFLICTS loudly instead of silently folding.
+fn legacy_regular_state(hash: FileHash) -> EntryState {
+    EntryState::Regular {
+        mode: CanonicalMode::RegularFile,
+        payload: hash,
+    }
+}
+
+fn parse_tree_kind(tag: &str) -> Option<TreeEntryKind> {
+    match tag {
+        "regular" => Some(TreeEntryKind::Regular),
+        "symlink" => Some(TreeEntryKind::Symlink),
+        _ => None,
+    }
+}
+
+fn parse_canonical_mode(octal: u32) -> Option<CanonicalMode> {
+    match octal {
+        0o100_644 => Some(CanonicalMode::RegularFile),
+        0o100_755 => Some(CanonicalMode::ExecutableFile),
+        0o120_000 => Some(CanonicalMode::Symlink),
+        _ => None,
+    }
+}
+
+/// True when the kind/mode pair is the one the canonical manifest can
+/// represent (`regular`<->`100644`/`100755`, `symlink`<->`120000`).
+fn kind_mode_consistent(kind: TreeEntryKind, mode: CanonicalMode) -> bool {
+    match kind {
+        TreeEntryKind::Regular => mode != CanonicalMode::Symlink,
+        TreeEntryKind::Symlink => mode == CanonicalMode::Symlink,
+    }
+}
+
+/// One changed file: the child's canonical state (`None` = the child deleted
+/// it) and the parent path's canonical state at the base snapshot (`None` =
+/// the parent had no such file then; the merge is an exclusive create).
+///
+/// The `child_hash`/`base_hash` fields are the LEGACY byte-only mirrors every
+/// existing durable row and reader (server rendering, reopen compatibility)
+/// still carries; they are projections of the canonical payload digest and
+/// are never the authority for convergence, apply or rollback.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeEntry {
     pub path: PathBuf,
@@ -88,6 +148,88 @@ pub struct ChangeEntry {
     pub child_hash: Option<FileHash>,
     #[serde(default)]
     pub base_hash: Option<FileHash>,
+    /// Canonical child state (`None` = deletion).
+    #[serde(default)]
+    pub child: Option<EntryState>,
+    /// Canonical parent base state (`None` = the path was absent).
+    #[serde(default)]
+    pub base: Option<EntryState>,
+}
+
+impl ChangeEntry {
+    pub(crate) fn staged(
+        path: PathBuf,
+        child: Option<EntryState>,
+        base: Option<EntryState>,
+    ) -> Self {
+        Self {
+            child_hash: child.as_ref().and_then(|s| s.payload_digest()),
+            base_hash: base.as_ref().and_then(|s| s.payload_digest()),
+            path,
+            child,
+            base,
+        }
+    }
+
+    /// The canonical child state: the recorded triple, or — for a LEGACY
+    /// byte-only row — the honest regular-file projection of its content
+    /// hash (`None` = deletion).
+    pub fn child_state(&self) -> Option<EntryState> {
+        self.child
+            .clone()
+            .or_else(|| self.child_hash.map(legacy_regular_state))
+    }
+
+    /// The canonical base state (see [`Self::child_state`]).
+    pub fn base_state(&self) -> Option<EntryState> {
+        self.base
+            .clone()
+            .or_else(|| self.base_hash.map(legacy_regular_state))
+    }
+
+    /// True when this entry carries the canonical kind/mode for every side
+    /// it has (no legacy byte-only projection).
+    pub fn canonical_ready(&self) -> bool {
+        (self.child.is_some() || self.child_hash.is_none())
+            && (self.base.is_some() || self.base_hash.is_none())
+            && self.child_hash == self.child.as_ref().and_then(|s| s.payload_digest())
+            && self.base_hash == self.base.as_ref().and_then(|s| s.payload_digest())
+    }
+
+    /// Fill the legacy byte mirrors from the canonical triple and refuse a
+    /// row whose mirror CONTRADICTS the triple it projects (a corrupt or
+    /// hostile durable row). A row that carries NO canonical triple keeps
+    /// its mirrors untouched — it decodes additively as a legacy byte-only
+    /// entry.
+    pub(crate) fn normalize_mirrors(&mut self) -> Result<(), ExecError> {
+        if let Some(child) = &self.child {
+            if self
+                .child_hash
+                .zip(child.payload_digest())
+                .is_some_and(|(mirror, digest)| mirror != digest)
+            {
+                return Err(ExecError::Internal(format!(
+                    "staged change entry {:?} carries a byte-only child mirror that contradicts its canonical triple",
+                    self.path
+                )));
+            }
+            self.child_hash = child.payload_digest();
+        }
+        if let Some(base) = &self.base {
+            if self
+                .base_hash
+                .zip(base.payload_digest())
+                .is_some_and(|(mirror, digest)| mirror != digest)
+            {
+                return Err(ExecError::Internal(format!(
+                    "staged change entry {:?} carries a byte-only base mirror that contradicts its canonical triple",
+                    self.path
+                )));
+            }
+            self.base_hash = base.payload_digest();
+        }
+        Ok(())
+    }
 }
 
 /// The staged merge candidate (audit 98) — the STRUCTURED result of a
@@ -139,14 +281,27 @@ impl ChangeSet {
             ),
         ];
         for entry in &self.files {
+            // The canonical triple (kind|mode|payload) is the identity; the
+            // legacy byte mirrors are projections and never participate.
+            let side = |state: Option<EntryState>| match state {
+                Some(s) => s.describe(),
+                None => "deleted".to_string(),
+            };
             parts.push(format!(
                 "{}|{}|{}",
                 entry.path.to_string_lossy(),
-                entry.child_hash.map(|h| h.to_hex()).unwrap_or_default(),
-                entry.base_hash.map(|h| h.to_hex()).unwrap_or_default(),
+                side(entry.child_state()),
+                side(entry.base_state()),
             ));
         }
         format!("cs-{}", stable_content_digest(&parts))
+    }
+
+    /// True when every entry carries the canonical kind/mode/payload triple
+    /// (a stored legacy byte-only set is re-staged, never served as the
+    /// current candidate).
+    pub fn canonical_ready(&self) -> bool {
+        self.files.iter().all(ChangeEntry::canonical_ready)
     }
 }
 
@@ -175,11 +330,14 @@ pub(crate) fn stable_content_digest(items: &[String]) -> String {
     out
 }
 
-/// Deterministic digest of one recorded base map (sorted path|hash rows).
-pub(crate) fn base_map_digest(map: &[(PathBuf, FileHash)]) -> String {
+/// Deterministic digest of one recorded base map (sorted
+/// `path|kind|mode|payload` rows — the SAME triple identity every root
+/// snapshot uses, so a mode- or kind-only tree difference can never fold
+/// into the same map digest).
+pub(crate) fn base_map_digest(map: &[(PathBuf, EntryState)]) -> String {
     let rows: Vec<String> = map
         .iter()
-        .map(|(p, h)| format!("{}|{}", p.to_string_lossy(), h.to_hex()))
+        .map(|(p, s)| format!("{}|{}", p.to_string_lossy(), s.describe()))
         .collect();
     stable_content_digest(&rows)
 }
@@ -394,17 +552,28 @@ pub(crate) fn base_id_of(child_id: &str) -> String {
     format!("base-{child_id}")
 }
 
-/// Record one base map (path -> hash) of a child's spawn-time world under
-/// the parent session's fact space. Idempotent re-upsert per
-/// (run, child, map). Used for the PARENT map (merge CAS anchors) and the
-/// START map (what the child's own worktree contained at spawn).
+/// One durable base-map row. The canonical shape carries the full entry
+/// state; the LEGACY shape (`[path, digest]` / `[path, kind, mode, digest]`)
+/// decodes additively as the honest regular non-executable projection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum BaseMapRow {
+    Legacy(Vec<String>),
+    Canonical { path: String, state: EntryState },
+}
+
+/// Record one canonical base map (path -> kind/mode/payload triple) of a
+/// child's spawn-time world under the parent session's fact space.
+/// Idempotent re-upsert per (run, child, map). Used for the PARENT map
+/// (merge CAS anchors) and the START map (what the child's own worktree
+/// contained at spawn).
 pub(crate) fn put_base_map(
     manager: &Arc<faktor_session::SessionManager>,
     parent: SessionId,
     run: &str,
     child_id: &str,
     map: &str,
-    entries: &[(PathBuf, FileHash)],
+    entries: &[(PathBuf, EntryState)],
 ) -> Result<(), ExecError> {
     if entries.len() > MAX_BASE_ENTRIES {
         return Err(ExecError::Oversized(format!(
@@ -414,16 +583,23 @@ pub(crate) fn put_base_map(
     }
     let handle = parent_handle(manager, parent)?;
     let now = manager.now_ms();
+    let rows: Vec<BaseMapRow> = entries
+        .iter()
+        .map(|(path, state)| BaseMapRow::Canonical {
+            path: path.to_string_lossy().into_owned(),
+            state: state.clone(),
+        })
+        .collect();
+    let chunks = pack_chunks(&rows)?;
     let header = serde_json::json!({
         "child_id": child_id,
         "map": map,
         "base_id": base_id_of(child_id),
-        "chunks": pack_chunks(entries)?.len(),
+        "chunks": chunks.len(),
         "created_ms": now,
     });
     let header = serde_json::to_string(&header)
         .map_err(|e| ExecError::Internal(format!("base header: {e}")))?;
-    let chunks = pack_chunks(entries)?;
     put_chunks(
         &handle,
         KIND_BASE,
@@ -433,28 +609,96 @@ pub(crate) fn put_base_map(
     )
 }
 
-/// Read one recorded base map; `Ok(None)` when the map was never recorded
-/// (e.g. an empty start tree that was skipped at spawn).
-pub(crate) fn read_base_map(
+/// Read one recorded canonical base map; `Ok(None)` when the map was never
+/// recorded (e.g. an empty start tree that was skipped at spawn). Rows
+/// recorded by the legacy byte-only codec (`[path, hash]`) decode
+/// additively as regular non-executable entries — the only honest
+/// projection of a digest that never carried a kind/mode.
+pub(crate) fn read_base_state_map(
     manager: &Arc<faktor_session::SessionManager>,
     parent: SessionId,
     run: &str,
     child_id: &str,
     map: &str,
-) -> Result<Option<Vec<(PathBuf, FileHash)>>, ExecError> {
+) -> Result<Option<Vec<(PathBuf, EntryState)>>, ExecError> {
     let handle = parent_handle(manager, parent)?;
     let Some((_header, chunks)) = read_chunks(&handle, KIND_BASE, &base_key(run, child_id, map))?
     else {
         return Ok(None);
     };
-    let rows: Vec<[String; 2]> = unpack_chunks(&chunks)?;
+    let rows: Vec<BaseMapRow> = unpack_chunks(&chunks)?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let path = validate_rel_path_str(&row[0])?;
-        let hash = FileHash::from_hex(&row[1]).ok_or_else(|| {
-            ExecError::Internal(format!("base row of {child_id} carries a hostile hash"))
-        })?;
-        out.push((path, hash));
+        let (path, state) = match row {
+            BaseMapRow::Canonical { path, state } => (path, state),
+            BaseMapRow::Legacy(row) => {
+                let path = row.first().cloned().ok_or_else(|| {
+                    ExecError::Internal(format!("base row of {child_id} has no path"))
+                })?;
+                let state = match row.as_slice() {
+                    // Legacy byte-only row.
+                    [_path, digest] => {
+                        let hash = FileHash::from_hex(digest).ok_or_else(|| {
+                            ExecError::Internal(format!(
+                                "base row of {child_id} carries a hostile hash"
+                            ))
+                        })?;
+                        legacy_regular_state(hash)
+                    }
+                    [_path, kind, mode, digest] => {
+                        let kind = parse_tree_kind(kind).ok_or_else(|| {
+                            ExecError::Internal(format!(
+                                "base row of {child_id} carries a hostile kind"
+                            ))
+                        })?;
+                        let octal = u32::from_str_radix(mode, 8).map_err(|_| {
+                            ExecError::Internal(format!(
+                                "base row of {child_id} carries a hostile mode"
+                            ))
+                        })?;
+                        let mode = parse_canonical_mode(octal).ok_or_else(|| {
+                            ExecError::Internal(format!(
+                                "base row of {child_id} carries a hostile mode"
+                            ))
+                        })?;
+                        if !kind_mode_consistent(kind, mode) || !is_blake3_hex(digest) {
+                            return Err(ExecError::Internal(format!(
+                                "base row of {child_id} carries an inconsistent kind/mode/payload triple"
+                            )));
+                        }
+                        let payload = FileHash::from_hex(digest).ok_or_else(|| {
+                            ExecError::Internal(format!(
+                                "base row of {child_id} carries a hostile hash"
+                            ))
+                        })?;
+                        if kind == TreeEntryKind::Symlink {
+                            // A recorded legacy symlink row carries only the
+                            // target DIGEST; it is a byte-only anchor, never
+                            // canonical-ready.
+                            EntryState::Symlink {
+                                target: Vec::new(),
+                                target_digest: payload,
+                            }
+                        } else {
+                            EntryState::regular(mode, payload).map_err(|e| {
+                                ExecError::Internal(format!(
+                                    "base row of {child_id} carries an inconsistent mode: {e}"
+                                ))
+                            })?
+                        }
+                    }
+                    _ => {
+                        return Err(ExecError::Internal(format!(
+                            "base row of {child_id} has an unsupported shape ({} fields)",
+                            row.len()
+                        )))
+                    }
+                };
+                (path, state)
+            }
+        };
+        let path = validate_rel_path_str(&path)?;
+        out.push((path, state));
     }
     Ok(Some(out))
 }
@@ -548,10 +792,14 @@ fn read_change_set_at(
     let Some((header, chunks)) = read_chunks(handle, KIND_CS, key)? else {
         return Ok(None);
     };
-    let files: Vec<ChangeEntry> = unpack_chunks(&chunks)?;
-    for f in &files {
+    let mut files: Vec<ChangeEntry> = unpack_chunks(&chunks)?;
+    for f in &mut files {
         // Defense in depth: stored paths must be sane relative paths.
         validate_rel_path_str(&f.path.to_string_lossy())?;
+        // Additive codec: legacy byte-only rows decode as-is; canonical rows
+        // re-derive their compatibility mirrors (a contradictory mirror is
+        // corrupt durable state, never silently accepted).
+        f.normalize_mirrors()?;
     }
     if files.len() > MAX_CHANGES {
         return Err(ExecError::Internal(format!(
@@ -896,23 +1144,26 @@ fn write_envelope(
 
 // ------------------------------------------------------------ machinery
 
-/// Map `kind -> path` of one recorded base map.
-fn base_map_index(map: &[(PathBuf, FileHash)]) -> HashMap<PathBuf, FileHash> {
+/// Map `path -> canonical state` of one recorded base map.
+fn base_map_index(map: &[(PathBuf, EntryState)]) -> HashMap<PathBuf, EntryState> {
     map.iter().cloned().collect()
 }
 
-/// Compute the staged change entries of a child: every file of the child's
-/// current tree that differs from its START map (files it began with are
-/// skipped when unchanged; files it began with and removed are DELETION
-/// entries) with `base_hash` anchored to the recorded PARENT map (the CAS
-/// expectation against the parent worktree). Sorted by path. Entry count
+/// Compute the staged change entries of a child: every entry of the child's
+/// current tree whose canonical `(kind, mode, payload)` triple differs from
+/// its START map (files it began with are skipped ONLY when the whole triple
+/// is unchanged; files it began with and removed are DELETION entries) with
+/// the base anchor set to the recorded PARENT map triple (the CAS
+/// expectation against the parent worktree). A chmod-only change, a
+/// regular<->symlink kind change and a symlink retarget are all visible
+/// changes here — never a byte-only no-op. Sorted by path. Entry count
 /// beyond [`MAX_CHANGES`] is a typed Oversized error — the diff NEVER
 /// silently truncates.
 pub(crate) fn compute_change_entries(
     child_id: &str,
-    start: &[(PathBuf, FileHash)],
-    now: &[(PathBuf, FileHash)],
-    parent_base: &[(PathBuf, FileHash)],
+    start: &[(PathBuf, EntryState)],
+    now: &[(PathBuf, EntryState)],
+    parent_base: &[(PathBuf, EntryState)],
 ) -> Result<Vec<ChangeEntry>, ExecError> {
     let start_idx = base_map_index(start);
     let now_idx = base_map_index(now);
@@ -926,34 +1177,25 @@ pub(crate) fn compute_change_entries(
     }
     paths.sort();
     for p in paths {
-        let child = now_idx.get(&p).copied();
-        let base_start = start_idx.get(&p).copied();
+        let child = now_idx.get(&p).cloned();
+        let base_start = start_idx.get(&p).cloned();
         let entry = match (child, base_start) {
-            (Some(c), Some(s)) if c == s => continue, // untouched copy content
+            (Some(c), Some(s)) if c == s => continue, // untouched copy (whole triple)
             (Some(c), _) => {
-                let base = parent_idx.get(&p).copied();
-                ChangeEntry {
-                    path: p,
-                    child_hash: Some(c),
-                    base_hash: base,
-                }
+                let base = parent_idx.get(&p).cloned();
+                ChangeEntry::staged(p, Some(c), base)
             }
-            (None, Some(s)) => {
+            (None, Some(_s)) => {
                 // The child deleted a file it started from. The deletion
                 // anchor must exist in the parent base map, otherwise the
                 // file the child removed was never part of the parent tree
                 // at spawn — refusing loudly beats guessing.
-                let base = parent_idx.get(&p).copied().ok_or_else(|| {
+                let base = parent_idx.get(&p).cloned().ok_or_else(|| {
                     ExecError::InvalidState(format!(
                         "child {child_id} removed {p:?} which its base snapshot held but the parent tree never had at the base snapshot; refusing to stage an unsound deletion"
                     ))
                 })?;
-                let _ = s;
-                ChangeEntry {
-                    path: p,
-                    child_hash: None,
-                    base_hash: Some(base),
-                }
+                ChangeEntry::staged(p, None, Some(base))
             }
             (None, None) => continue, // unreachable: p came from a map
         };
@@ -993,6 +1235,240 @@ fn out_of_scope_change(files: &[ChangeEntry], declared: &[String]) -> Option<Str
     })
 }
 
+// --------------------------------------------- canonical entry-state CAS
+//
+// Every per-path mutation of this module goes through the ONE hardened
+// primitive family of `faktor_fs::entry_state`: a full-state
+// `(kind, mode, payload / literal target)` compare-and-swap whose
+// transitions are atomic (temp + rename, exclusive hard link, literal
+// symlink creation, the O_NOFOLLOW permission path, verified removal) and
+// NEVER follow a final symlink. The helpers below only read a staged payload
+// and map it onto those primitives.
+
+fn manifest_io(what: &str, path: &Path, e: std::io::Error) -> Error {
+    Error::internal(format!("{what} {}: {e}", path.display()))
+}
+
+#[cfg(unix)]
+pub(crate) fn literal_target_bytes(target: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    target.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn literal_target_bytes(target: &Path) -> Vec<u8> {
+    target.to_string_lossy().into_owned().into_bytes()
+}
+
+/// Read the LITERAL payload bytes of one staged entry from `root` and verify
+/// them against the recorded state: whole content for a regular file, the
+/// literal target bytes for a symlink (never followed). A kind drift, a
+/// missing path or a payload drift is a typed Conflict — a changed candidate
+/// is never merged.
+pub(crate) fn read_literal_payload(
+    root: &Path,
+    rel: &Path,
+    state: &EntryState,
+) -> Result<Vec<u8>, Error> {
+    let path = faktor_fs::entry_state::confined_path(root, rel, false)?;
+    let live = faktor_fs::entry_state::state_of_path(&path)?;
+    if live != *state {
+        return Err(Error::conflict(format!(
+            "{} drifted since it was staged (expected {}, found {}); nothing was merged",
+            path.display(),
+            state.describe(),
+            live.describe()
+        )));
+    }
+    let bytes = match &live {
+        EntryState::Absent => {
+            return Err(Error::conflict(format!(
+                "{} is absent although the staged state is {}",
+                path.display(),
+                state.describe()
+            )))
+        }
+        EntryState::Symlink { target, .. } => target.clone(),
+        EntryState::Regular { .. } => {
+            let meta =
+                fs::symlink_metadata(&path).map_err(|e| manifest_io("metadata", &path, e))?;
+            if meta.len() > MAX_MERGE_FILE_BYTES {
+                return Err(Error::oversized(format!(
+                    "staged file {} has {} bytes (cap {MAX_MERGE_FILE_BYTES}); refusing to merge it whole",
+                    path.display(),
+                    meta.len()
+                )));
+            }
+            let bytes = fs::read(&path).map_err(|e| manifest_io("read", &path, e))?;
+            if bytes.len() as u64 > MAX_MERGE_FILE_BYTES {
+                return Err(Error::oversized(format!(
+                    "staged file {} grew beyond {MAX_MERGE_FILE_BYTES} bytes while being read",
+                    path.display()
+                )));
+            }
+            bytes
+        }
+    };
+    if !state.material_matches(&bytes) {
+        return Err(Error::conflict(format!(
+            "{} drifted since it was staged (the payload no longer matches {}); nothing was merged",
+            path.display(),
+            state.describe()
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Apply one staged candidate entry: read its LITERAL payload from
+/// `src_root/src_rel` (verified against the candidate state) and publish it
+/// at `dst_root/dst_rel` through the full-state CAS against `expected`
+/// (`None` = the candidate is an exclusive create).
+pub(crate) fn apply_manifest_entry(
+    dst_root: &Path,
+    dst_rel: &Path,
+    src_root: &Path,
+    src_rel: &Path,
+    candidate: &EntryState,
+    expected: Option<&EntryState>,
+) -> Result<CasMergeResult, Error> {
+    let payload = read_literal_payload(src_root, src_rel, candidate)?;
+    let expected = expected.cloned().unwrap_or(EntryState::Absent);
+    faktor_fs::entry_state::apply_tree_entry_cas(dst_root, dst_rel, &expected, candidate, &payload)
+        .map_err(|e| cas_conflict_phrasing(dst_rel, e))
+}
+
+/// Keep the operator-visible per-path conflict wording (the merge detail
+/// rows and the server rendering speak "changed since the base snapshot"),
+/// while the full canonical-state detail from the CAS primitive is retained
+/// in parentheses.
+fn cas_conflict_phrasing(rel: &Path, e: Error) -> Error {
+    if e.kind == ErrorKind::Conflict && e.message.starts_with("cas mismatch") {
+        Error::conflict(format!(
+            "{} changed since the base snapshot; the merge did not overwrite it ({})",
+            rel.display(),
+            e.message
+        ))
+    } else {
+        e
+    }
+}
+
+/// Delete one entry through the full-state CAS against its recorded base
+/// state: a mode-only/retarget/kind user drift is a Conflict and the path is
+/// untouched; an already-absent path is [`CasMergeResult::AlreadyCurrent`].
+pub(crate) fn delete_manifest_entry(
+    dst_root: &Path,
+    dst_rel: &Path,
+    expected: &EntryState,
+) -> Result<CasMergeResult, Error> {
+    faktor_fs::entry_state::apply_tree_entry_cas(
+        dst_root,
+        dst_rel,
+        expected,
+        &EntryState::Absent,
+        &[],
+    )
+    .map_err(|e| cas_conflict_phrasing(dst_rel, e))
+}
+
+/// The canonical state of ONE manifest entry under `root`: regular entries
+/// project directly from the manifest triple; a symlink entry carries only
+/// the target DIGEST there, so its literal target bytes are read from the
+/// path itself (a final symlink is read, never followed) and re-verified
+/// against the walk's digest.
+pub(crate) fn manifest_entry_state(
+    root: &Path,
+    entry: &TreeEntry,
+) -> Result<EntryState, ExecError> {
+    match entry.kind {
+        TreeEntryKind::Regular => EntryState::from_tree_entry(entry).map_err(|e| {
+            ExecError::WorkspaceDrift(format!(
+                "manifest entry {:?} carries no canonical regular state: {e}",
+                entry.normalized_path
+            ))
+        }),
+        TreeEntryKind::Symlink => {
+            let rel = PathBuf::from(&entry.normalized_path);
+            let target = fs::read_link(root.join(&rel)).map_err(|e| {
+                ExecError::WorkspaceDrift(format!(
+                    "manifest symlink {:?}: {e}",
+                    entry.normalized_path
+                ))
+            })?;
+            let state = EntryState::symlink(literal_target_bytes(&target)).map_err(|e| {
+                ExecError::WorkspaceDrift(format!(
+                    "manifest symlink {:?}: {e}",
+                    entry.normalized_path
+                ))
+            })?;
+            if state.payload_digest_hex().as_deref() != Some(entry.payload_digest.as_str()) {
+                return Err(ExecError::WorkspaceDrift(format!(
+                    "manifest symlink {:?} target drifted between the digest walk and the literal read",
+                    entry.normalized_path
+                )));
+            }
+            Ok(state)
+        }
+    }
+}
+
+/// The canonical manifest rows of one root (`path -> kind/mode/payload`),
+/// sorted by path. This is the ONE tree walk every base/candidate/start map
+/// and staging diff is built from.
+pub(crate) fn canonical_manifest_rows(
+    root: &Path,
+    max_entries: usize,
+) -> Result<Vec<(PathBuf, EntryState)>, ExecError> {
+    let manifest = faktor_fs::tree_manifest::tree_manifest(root, max_entries)
+        .map_err(|e| manifest_error("canonical tree manifest", e))?;
+    let mut rows: Vec<(PathBuf, EntryState)> = manifest
+        .entries()
+        .iter()
+        .map(|entry| {
+            manifest_entry_state(root, entry)
+                .map(|state| (PathBuf::from(&entry.normalized_path), state))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(rows)
+}
+
+/// Map one canonical-manifest refusal onto the typed orchestrator error
+/// space: an oversize stays `Oversized` (a refused cap, never corruption),
+/// an unavailable root stays `NotFound`, and every other refusal (special
+/// file, malformed name, i/o) is workspace drift — the tree can never be
+/// proven equal.
+pub(crate) fn manifest_error(
+    what: &str,
+    e: faktor_fs::tree_manifest::TreeManifestError,
+) -> ExecError {
+    use faktor_fs::tree_manifest::TreeManifestError as E;
+    match e {
+        E::Oversized(message) => ExecError::Oversized(format!("{what}: {message}")),
+        E::RootUnavailable(message) => ExecError::NotFound(format!("{what}: {message}")),
+        other => ExecError::WorkspaceDrift(format!("{what}: {other}")),
+    }
+}
+
+/// Summed payload bytes of canonical manifest rows (regular file sizes plus
+/// literal symlink target lengths), for bounded-copy accounting.
+pub(crate) fn manifest_total_bytes(root: &Path, rows: &[(PathBuf, EntryState)]) -> u64 {
+    rows.iter()
+        .map(|(rel, state)| {
+            let path = root.join(rel);
+            match state.kind() {
+                Some(TreeEntryKind::Symlink) => fs::read_link(&path)
+                    .map(|target| literal_target_bytes(&target).len() as u64)
+                    .unwrap_or(0),
+                Some(TreeEntryKind::Regular) => fs::symlink_metadata(&path)
+                    .map(|meta| meta.len())
+                    .unwrap_or(0),
+                None => 0,
+            }
+        })
+        .sum()
+}
+
 // -------------------------------------------------- multi-child composition
 
 /// One child's change to one path, with the child provenance retained.
@@ -1003,24 +1479,26 @@ pub struct ChildChange {
 }
 
 /// One resolved per-path decision of a multi-child candidate composition:
-/// the resulting content hash (`None` = deletion) and every child that
+/// the resulting canonical state (`None` = deletion) and every child that
 /// converged on it (sorted — provenance, never a silent winner).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComposedPathChange {
     pub path: PathBuf,
-    pub child_hash: Option<FileHash>,
-    pub base_hash: Option<FileHash>,
+    pub child: Option<EntryState>,
+    pub base: Option<EntryState>,
     pub sources: Vec<String>,
 }
 
 /// Precompose N children's staged change sets into ONE deterministic
 /// per-path candidate (point 4). Rules:
 ///
-/// - every child that touches a path with the IDENTICAL resulting hash (or
-///   every child deleting it) is CONVERGENT: applied once, provenance kept;
-/// - different resulting hashes, or delete-vs-modify, are a TYPED conflict
-///   (never resolved by order);
-/// - differing base anchors for one path are a typed conflict (a drifted
+/// - every child that touches a path with the IDENTICAL resulting canonical
+///   `(kind, mode, payload)` triple (or every child deleting it) is
+///   CONVERGENT: applied once, provenance kept;
+/// - different triples (different bytes, a chmod-only difference, a
+///   regular<->symlink kind change, a symlink retarget), or
+///   delete-vs-modify, are a TYPED conflict (never resolved by order);
+/// - differing base triples for one path are a typed conflict (a drifted
 ///   generation can never be composed).
 ///
 /// The resolution is a pure function of the change-set CONTENT: the output
@@ -1045,17 +1523,27 @@ pub fn compose_child_changes(changes: &[ChangeSet]) -> Result<Vec<ComposedPathCh
     let mut out: Vec<ComposedPathChange> = Vec::with_capacity(by_path.len());
     for (path, mut group) in by_path {
         group.sort_by(|a, b| a.child_id.cmp(&b.child_id));
-        let mut bases: Vec<Option<FileHash>> = group.iter().map(|c| c.entry.base_hash).collect();
-        bases.sort_by_key(|b| b.as_ref().map(|h| h.to_hex()));
+        let mut bases: Vec<Option<EntryState>> =
+            group.iter().map(|c| c.entry.base_state()).collect();
+        bases.sort_by_key(|b| b.as_ref().map(EntryState::describe));
         bases.dedup();
         if bases.len() > 1 {
             return Err(ExecError::IntegrationConflict(format!(
-                "inter-child base drift at {}: the children name different base anchors",
-                path.display()
+                "inter-child base drift at {}: the children name different base anchors ({})",
+                path.display(),
+                bases
+                    .iter()
+                    .map(|b| b
+                        .as_ref()
+                        .map(EntryState::describe)
+                        .unwrap_or_else(|| "absent".into()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )));
         }
-        let mut results: Vec<Option<FileHash>> = group.iter().map(|c| c.entry.child_hash).collect();
-        results.sort_by_key(|r| r.as_ref().map(|h| h.to_hex()));
+        let mut results: Vec<Option<EntryState>> =
+            group.iter().map(|c| c.entry.child_state()).collect();
+        results.sort_by_key(|r| r.as_ref().map(EntryState::describe));
         results.dedup();
         if results.len() > 1 {
             let detail: Vec<String> = group
@@ -1065,25 +1553,25 @@ pub fn compose_child_changes(changes: &[ChangeSet]) -> Result<Vec<ComposedPathCh
                         "{}:{}",
                         c.child_id,
                         c.entry
-                            .child_hash
-                            .map(|h| h.to_hex())
+                            .child_state()
+                            .map(|s| s.describe())
                             .unwrap_or_else(|| "deleted".into())
                     )
                 })
                 .collect();
             return Err(ExecError::IntegrationConflict(format!(
-                "divergent inter-child changes at {}: {} (delete-vs-modify or different content); no order-based resolution exists",
+                "divergent inter-child changes at {}: {} (delete-vs-modify, different kinds/modes or different content); no order-based resolution exists",
                 path.display(),
                 detail.join(", ")
             )));
         }
-        let child_hash = results[0];
-        let base_hash = bases[0];
+        let child = results[0].clone();
+        let base = bases[0].clone();
         let sources: Vec<String> = group.iter().map(|c| c.child_id.clone()).collect();
         out.push(ComposedPathChange {
             path,
-            child_hash,
-            base_hash,
+            child,
+            base,
             sources,
         });
     }
@@ -1107,6 +1595,13 @@ pub const SEMANTIC_PREFLIGHT_MAX_CONFLICTS: usize = 8;
 /// it can only ever ADD a refusal (a delta whose digests contradict what is
 /// staged cannot be trusted), never clear or reshape a file-level CAS
 /// conflict.
+///
+/// HONEST HOLD-OUT: provider deltas carry whole-CONTENT hashes only, so the
+/// digest comparison applies to REGULAR entries (whose payload digest IS the
+/// content hash). A symlink entry's payload digest covers the literal target
+/// bytes — a different domain — and mode-only/symlink differences are not
+/// representable in the delta model, so those comparisons are skipped
+/// (the triple comparison in stage/compose/apply remains the authority).
 pub fn semantic_delta_conflicts(
     cs: &ChangeSet,
     delta: &SemanticDelta,
@@ -1123,7 +1618,9 @@ pub fn semantic_delta_conflicts(
         let Some(entry) = cs.files.iter().find(|e| e.path == path) else {
             continue;
         };
-        let reason: Option<String> = if entry.child_hash.is_none() {
+        let child = entry.child_state();
+        let base = entry.base_state();
+        let reason: Option<String> = if child.is_none() {
             if change.kind == SemanticDeltaKind::Removed {
                 None
             } else {
@@ -1136,20 +1633,26 @@ pub fn semantic_delta_conflicts(
                 "provider delta removes {entity_path} but the staged candidate keeps content"
             ))
         } else if matches!(
-            (change.new_hash, entry.child_hash),
+            (change.new_hash, child.as_ref().and_then(|s| s.payload_digest())),
             (Some(provider), Some(staged)) if provider != staged
         ) {
             let provider = change.new_hash.map(|h| h.to_hex()).unwrap_or_default();
-            let staged = entry.child_hash.map(|h| h.to_hex()).unwrap_or_default();
+            let staged = child
+                .as_ref()
+                .and_then(|s| s.payload_digest_hex())
+                .unwrap_or_default();
             Some(format!(
                 "provider candidate hash {provider} disagrees with the staged candidate hash {staged} at {entity_path}"
             ))
         } else if matches!(
-            (change.old_hash, entry.base_hash),
+            (change.old_hash, base.as_ref().and_then(|s| s.payload_digest())),
             (Some(provider), Some(staged)) if provider != staged
         ) {
             let provider = change.old_hash.map(|h| h.to_hex()).unwrap_or_default();
-            let staged = entry.base_hash.map(|h| h.to_hex()).unwrap_or_default();
+            let staged = base
+                .as_ref()
+                .and_then(|s| s.payload_digest_hex())
+                .unwrap_or_default();
             Some(format!(
                 "provider composed over base hash {provider} but the staged base hash is {staged} at {entity_path}"
             ))
@@ -1283,13 +1786,7 @@ impl OrchestratorRuntime {
         ) {
             return Ok(base_id_of(&child.child_id));
         }
-        let parent_snap = faktor_fs::snapshot_tree(owner_root, MAX_BASE_ENTRIES).map_err(|e| {
-            ExecError::from_fs("base snapshot of the parent worktree", owner_root, e)
-        })?;
-        let parent_map: Vec<(PathBuf, FileHash)> = parent_snap
-            .iter()
-            .map(|e| (e.path.clone(), e.hash))
-            .collect();
+        let parent_map = canonical_manifest_rows(owner_root, MAX_BASE_ENTRIES)?;
         put_base_map(
             &self.manager,
             parent_session,
@@ -1302,14 +1799,8 @@ impl OrchestratorRuntime {
         // empty by wave-12 spawn; reviewer copies are recorded by
         // spawn_reviewer directly).
         let child_dir = self.child_worktree_dir(child)?;
-        let start_snap = faktor_fs::snapshot_tree(&child_dir, MAX_BASE_ENTRIES).map_err(|e| {
-            ExecError::from_fs("base snapshot of the child worktree", &child_dir, e)
-        })?;
-        if !start_snap.is_empty() {
-            let start_map: Vec<(PathBuf, FileHash)> = start_snap
-                .iter()
-                .map(|e| (e.path.clone(), e.hash))
-                .collect();
+        let start_map = canonical_manifest_rows(&child_dir, MAX_BASE_ENTRIES)?;
+        if !start_map.is_empty() {
             put_base_map(
                 &self.manager,
                 parent_session,
@@ -1513,9 +2004,9 @@ impl OrchestratorRuntime {
                 }
             }
         }
-        let parent_map = read_base_map(&self.manager, parent, &run, child_id, "parent")?;
+        let parent_map = read_base_state_map(&self.manager, parent, &run, child_id, "parent")?;
         let parent_map = parent_map.unwrap_or_default();
-        let start_map = read_base_map(&self.manager, parent, &run, child_id, "start")?;
+        let start_map = read_base_state_map(&self.manager, parent, &run, child_id, "start")?;
         let start_map = start_map.unwrap_or_default();
         let child_dir = self.child_worktree_dir(&child)?;
         // Legacy rows (durable state written before ExclusivePaths became an
@@ -1537,10 +2028,7 @@ impl OrchestratorRuntime {
                 )));
             }
         }
-        let now_snap = faktor_fs::snapshot_tree(&child_dir, MAX_BASE_ENTRIES)
-            .map_err(|e| ExecError::from_fs("snapshot of the child worktree", &child_dir, e))?;
-        let now: Vec<(PathBuf, FileHash)> =
-            now_snap.iter().map(|e| (e.path.clone(), e.hash)).collect();
+        let now = canonical_manifest_rows(&child_dir, MAX_BASE_ENTRIES)?;
         let files = compute_change_entries(child_id, &start_map, &now, &parent_map)?;
         // ExclusivePaths: the declared write set is a HARD boundary inside
         // the overlay. If the overlay staged a path outside it (a tool that
@@ -1572,11 +2060,13 @@ impl OrchestratorRuntime {
     }
 
     /// Root-parameterized change-set apply (point 4): apply every entry of
-    /// `change_set` into `destination_root`, reading the child content from
-    /// `child_root`, through the shared commit-time CAS primitives
-    /// ([`faktor_fs::merge_apply_content`] / [`faktor_fs::merge_delete`]).
-    /// The destination's expected state is the entry's recorded base hash —
+    /// `change_set` into `destination_root`, reading the child payload from
+    /// `child_root`, through the canonical `(kind, mode, payload)` CAS
+    /// primitives ([`publish_manifest_entry`] / [`delete_manifest_entry`]).
+    /// The destination's expected state is the entry's recorded base triple —
     /// the SAME anchors the candidate composition and the owner landing use.
+    /// A chmod-only change flips the executable bit, a symlink is created
+    /// literally (never followed) and a kind change publishes atomically.
     /// Nothing about the child's identity or ownership is consulted: this is
     /// the pure apply primitive the composition and tests share.
     pub fn apply_change_set_to_root(
@@ -1587,17 +2077,17 @@ impl OrchestratorRuntime {
     ) -> Result<Vec<PathBuf>, ExecError> {
         let mut applied: Vec<PathBuf> = Vec::new();
         for entry in &change_set.files {
-            let outcome = match entry.child_hash {
-                Some(child_hash) => faktor_fs::merge_apply_content(
+            let outcome = match entry.child_state() {
+                Some(child) => apply_manifest_entry(
                     destination_root,
                     &entry.path,
                     child_root,
                     &entry.path,
-                    child_hash,
-                    entry.base_hash,
+                    &child,
+                    entry.base_state().as_ref(),
                 ),
-                None => match entry.base_hash {
-                    Some(base) => faktor_fs::merge_delete(destination_root, &entry.path, base),
+                None => match entry.base_state() {
+                    Some(base) => delete_manifest_entry(destination_root, &entry.path, &base),
                     None => {
                         return Err(ExecError::Internal(format!(
                             "staged deletion {:?} has no base anchor",
@@ -1985,17 +2475,17 @@ impl OrchestratorRuntime {
         child_dir: &Path,
         entry: &ChangeEntry,
     ) -> Result<(), MergeFailure> {
-        let res = match entry.child_hash {
-            Some(child_hash) => faktor_fs::merge_apply_content(
+        let res = match entry.child_state() {
+            Some(child) => apply_manifest_entry(
                 owner_root,
                 &entry.path,
                 child_dir,
                 &entry.path,
-                child_hash,
-                entry.base_hash,
+                &child,
+                entry.base_state().as_ref(),
             ),
-            None => match entry.base_hash {
-                Some(base) => faktor_fs::merge_delete(owner_root, &entry.path, base),
+            None => match entry.base_state() {
+                Some(base) => delete_manifest_entry(owner_root, &entry.path, &base),
                 None => {
                     return Err(MergeFailure::Hard(ExecError::Internal(format!(
                         "staged deletion {:?} has no base anchor",
@@ -2060,16 +2550,19 @@ impl OrchestratorRuntime {
             .join(&reviewer_id);
         std::fs::create_dir_all(&dir)
             .map_err(|e| ExecError::Internal(format!("reviewer dir {dir:?}: {e}")))?;
-        // Bounded copy of the CURRENT parent state (per-file atomic).
-        let manifest = faktor_fs::copy_tree(
+        // Bounded canonical copy of the CURRENT parent state: literal
+        // symlinks, executable bits preserved, per-file atomic. The returned
+        // manifest IS the copy's tree identity (single-pass, hash-verified).
+        let manifest = faktor_fs::tree_manifest::copy_tree_manifest(
             &plan.owner.root,
             &dir,
             MAX_BASE_ENTRIES,
             MAX_REVIEW_COPY_BYTES,
+            faktor_fs::tree_manifest::TREE_MANIFEST_SKIP_DIRS,
         )
         .map_err(|e| {
             let _ = std::fs::remove_dir_all(&dir);
-            ExecError::from_fs("reviewer worktree copy", &plan.owner.root, e)
+            manifest_error("reviewer worktree copy", e)
         })?;
         let ws = self
             .manager
@@ -2137,10 +2630,17 @@ impl OrchestratorRuntime {
             execution_phase: ExecutionPhase::Review,
         };
         // Base rows: the reviewer's own fresh copy IS its base (audit 70:
-        // "base snapshot at review start"); the manifest returned by the
-        // copy is the exact copied content (single-pass, hash-verified).
-        let manifest_map: Vec<(PathBuf, FileHash)> =
-            manifest.iter().map(|e| (e.path.clone(), e.hash)).collect();
+        // "base snapshot at review start"); the canonical manifest returned
+        // by the copy is the exact copied content (single-pass,
+        // hash-verified, kind/mode included).
+        let manifest_map: Vec<(PathBuf, EntryState)> = manifest
+            .entries()
+            .iter()
+            .map(|entry| {
+                manifest_entry_state(&dir, entry)
+                    .map(|state| (PathBuf::from(&entry.normalized_path), state))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let base_id = base_id_of(&reviewer_id);
         put_base_map(
             &self.manager,
@@ -2242,12 +2742,22 @@ enum MergeFailure {
 mod tests {
     use super::*;
 
+    /// A canonical regular (100644) entry state for a hex payload digest.
+    fn state(hex: &str) -> EntryState {
+        EntryState::regular(
+            CanonicalMode::RegularFile,
+            FileHash::from_hex(hex).expect("hex"),
+        )
+        .expect("regular state")
+    }
+
     fn entry(path: &str, child: Option<&str>, base: Option<&str>) -> ChangeEntry {
-        let hex = |h: &str| FileHash::from_hex(h).expect("hex");
         ChangeEntry {
             path: PathBuf::from(path),
-            child_hash: child.map(hex),
-            base_hash: base.map(hex),
+            child_hash: child.map(|h| FileHash::from_hex(h).expect("hex")),
+            base_hash: base.map(|h| FileHash::from_hex(h).expect("hex")),
+            child: child.map(state),
+            base: base.map(state),
         }
     }
 
@@ -2270,61 +2780,51 @@ mod tests {
     fn compute_entries_skips_unchanged_and_anchors_deletes_and_creates() {
         // Seeded start (copy of the parent): modify + delete + unchanged.
         let start = vec![
-            (PathBuf::from("a.rs"), FileHash::from_hex(H).unwrap()),
-            (PathBuf::from("gone.rs"), FileHash::from_hex(H2).unwrap()),
-            (PathBuf::from("same.rs"), FileHash::from_hex(H).unwrap()),
+            (PathBuf::from("a.rs"), state(H)),
+            (PathBuf::from("gone.rs"), state(H2)),
+            (PathBuf::from("same.rs"), state(H)),
         ];
         let now = vec![
-            (PathBuf::from("a.rs"), FileHash::from_hex(H2).unwrap()),
-            (PathBuf::from("same.rs"), FileHash::from_hex(H).unwrap()),
-            (PathBuf::from("new.rs"), FileHash::from_hex(H).unwrap()),
+            (PathBuf::from("a.rs"), state(H2)),
+            (PathBuf::from("same.rs"), state(H)),
+            (PathBuf::from("new.rs"), state(H)),
         ];
         let parent_base = vec![
-            (PathBuf::from("a.rs"), FileHash::from_hex(H).unwrap()),
-            (PathBuf::from("gone.rs"), FileHash::from_hex(H2).unwrap()),
-            (PathBuf::from("same.rs"), FileHash::from_hex(H).unwrap()),
+            (PathBuf::from("a.rs"), state(H)),
+            (PathBuf::from("gone.rs"), state(H2)),
+            (PathBuf::from("same.rs"), state(H)),
         ];
         let entries = compute_change_entries("c", &start, &now, &parent_base).unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].path, PathBuf::from("a.rs"));
-        assert_eq!(entries[0].child_hash, Some(FileHash::from_hex(H2).unwrap()));
-        assert_eq!(entries[0].base_hash, Some(FileHash::from_hex(H).unwrap()));
+        assert_eq!(entries[0].child_state(), Some(state(H2)));
+        assert_eq!(entries[0].base_state(), Some(state(H)));
         assert_eq!(entries[1].path, PathBuf::from("gone.rs"));
-        assert_eq!(entries[1].child_hash, None);
-        assert_eq!(entries[1].base_hash, Some(FileHash::from_hex(H2).unwrap()));
+        assert_eq!(entries[1].child_state(), None);
+        assert_eq!(entries[1].base_state(), Some(state(H2)));
         assert_eq!(entries[2].path, PathBuf::from("new.rs"));
-        assert_eq!(entries[2].child_hash, Some(FileHash::from_hex(H).unwrap()));
-        assert_eq!(entries[2].base_hash, None);
+        assert_eq!(entries[2].child_state(), Some(state(H)));
+        assert_eq!(entries[2].base_state(), None);
     }
 
     #[test]
     fn compute_entries_refuses_unsound_deletion_and_caps_loudly() {
         // The child deleted a file its start map had, but the parent base
         // map never contained it: staging an unsound deletion is refused.
-        let start = vec![(PathBuf::from("x"), FileHash::from_hex(H).unwrap())];
-        let now: Vec<(PathBuf, FileHash)> = vec![];
-        let parent_base: Vec<(PathBuf, FileHash)> = vec![];
+        let start = vec![(PathBuf::from("x"), state(H))];
+        let now: Vec<(PathBuf, EntryState)> = vec![];
+        let parent_base: Vec<(PathBuf, EntryState)> = vec![];
         let err = compute_change_entries("c", &start, &now, &parent_base).unwrap_err();
         assert!(matches!(err, ExecError::InvalidState(_)), "{err:?}");
         // An empty-seeded wave-12 child that wrote one file beyond the cap
         // must fail loudly at MAX_CHANGES, never truncate.
-        let many: Vec<(PathBuf, FileHash)> = (0..(MAX_CHANGES + 1))
-            .map(|i| {
-                (
-                    PathBuf::from(format!("f{i:05}.rs")),
-                    FileHash::from_hex(H).unwrap(),
-                )
-            })
+        let many: Vec<(PathBuf, EntryState)> = (0..(MAX_CHANGES + 1))
+            .map(|i| (PathBuf::from(format!("f{i:05}.rs")), state(H)))
             .collect();
         let err = compute_change_entries("c", &[], &many, &[]).unwrap_err();
         assert!(matches!(err, ExecError::Oversized(_)), "{err:?}");
-        let exactly: Vec<(PathBuf, FileHash)> = (0..MAX_CHANGES)
-            .map(|i| {
-                (
-                    PathBuf::from(format!("f{i:05}.rs")),
-                    FileHash::from_hex(H).unwrap(),
-                )
-            })
+        let exactly: Vec<(PathBuf, EntryState)> = (0..MAX_CHANGES)
+            .map(|i| (PathBuf::from(format!("f{i:05}.rs")), state(H)))
             .collect();
         assert_eq!(
             compute_change_entries("c", &[], &exactly, &[])
@@ -2777,14 +3277,18 @@ mod tests {
                 .unwrap();
 
             // Base maps: the parent tree and the child's spawn state.
-            let base = FileHash::from(*blake3::hash(b"v1-base").as_bytes());
+            let base = EntryState::regular(
+                CanonicalMode::RegularFile,
+                FileHash::from(*blake3::hash(b"v1-base").as_bytes()),
+            )
+            .unwrap();
             put_base_map(
                 &manager,
                 parent,
                 "run-1",
                 "child-0",
                 "parent",
-                &[(PathBuf::from("src/a.rs"), base)],
+                std::slice::from_ref(&(PathBuf::from("src/a.rs"), base.clone())),
             )
             .unwrap();
             put_base_map(

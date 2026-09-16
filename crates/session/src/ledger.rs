@@ -278,6 +278,32 @@ pub const INTEGRATION_RECORDED_TAG: &str = "integration_recorded";
 pub const ENTRY_RUN_BASE: &str = "run_base";
 pub const ENTRY_INTEGRATION_TXN: &str = "integration_txn";
 
+// Durable external-operation identity rows (fail-closed external effects):
+// one `external_operation` row per attempt of one provider-neutral external
+// operation (the native PR step today). The row is written BEFORE the remote
+// call and records the exact input identity the provider lookup is keyed by
+// (organization/repository + exact head/base + a stable Faktor task marker);
+// after the call an updated row records the remote object id + version. A
+// crash mid-operation therefore reconciles from the RECORDED identity instead
+// of guessing, a second operation under the same key with a different input
+// identity is a typed refusal, and no reconciliation path can ever mint a
+// duplicate remote object. The rows fold nowhere in the head and are PINNED
+// across compaction: the reconciliation authority must outlive any watermark.
+pub const ENTRY_EXTERNAL_OPERATION: &str = "external_operation";
+/// The durable VERIFIED-GIT publication artifact of a completion contract
+/// revision: the exact verified manifest + tree/commit/remote OIDs the
+/// commit/push/PR steps must publish (and re-assert before every side
+/// effect). Pinned across compaction.
+pub const ENTRY_VERIFIED_GIT_ARTIFACT: &str = "verified_git_artifact";
+
+// ---------------------------------------------------------------- external-operation bounds
+
+/// Hard bound on one external-operation id / operation key / provider /
+/// kind / remote object id / remote object version / input marker.
+pub const MAX_EXTERNAL_OPERATION_TEXT_BYTES: usize = 512;
+/// Hard bound on one organization/repository/head/base reference.
+pub const MAX_EXTERNAL_OPERATION_REF_BYTES: usize = 1024;
+
 // ---------------------------------------------------------------- run-base / txn bounds
 
 /// Hard bound on the stored run-base path.
@@ -739,11 +765,20 @@ pub enum LedgerPayload {
     /// The durable IMMUTABLE run base of one orchestrated run, recorded
     /// BEFORE the first child spawn. Pinned across compaction.
     RunBaseRecorded { record: RunBaseRecord },
+    /// One durable verified-git publication artifact of a completion
+    /// contract revision (exact manifest + tree/commit/remote OIDs).
+    /// Pinned across compaction: the completion steps re-assert it.
+    VerifiedGitArtifactRecorded { artifact: VerifiedGitArtifact },
     /// One durable landing transaction of an orchestrated run: record-first
     /// per-path decisions + rollback blobs, then the deterministic phase a
     /// crashed executor finishes landing or rolls back from. Pinned across
     /// compaction.
     IntegrationTxnRecorded { row: IntegrationTxnRow },
+    /// One durable external-operation row (write-before-call identity then
+    /// the reconciliation outcome). Pinned across compaction: the exact
+    /// recorded input identity is the only authority a restart may
+    /// reconcile an unfinished external effect from.
+    ExternalOperationRecorded { record: ExternalOperationRow },
     /// One session-owned terminal was recorded BEFORE its row was exposed:
     /// the full ownership + process identity. A crash between this row and
     /// `TerminalRunning` leaves a row no live authority owns, which recovery
@@ -1096,6 +1131,274 @@ pub struct RunBaseRecord {
     pub created_ms: i64,
 }
 
+/// One entry of the VERIFIED manifest the publication artifact binds: the
+/// workspace-relative path and its canonical entry state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedManifestEntry {
+    pub path: String,
+    pub state: faktor_fs::entry_state::EntryState,
+}
+
+/// The durable VERIFIED-GIT publication artifact of one completion contract
+/// revision. The commit step builds it from the immutable verification
+/// record's tree hash and the verified root manifest, then records the
+/// exact git tree/commit and the local/remote refs each later step must
+/// re-assert (`git_tree_oid`, `commit_oid`, `local_ref`,
+/// `remote_ref` — the encoded exact remote head).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedGitArtifact {
+    pub task_id: u64,
+    pub revision: u64,
+    /// The immutable verification record this artifact certifies.
+    pub verification_record: u64,
+    /// The exact `tm1:`/snapshot digest of the verified root the manifest
+    /// was taken from.
+    pub verified_root_digest: String,
+    /// The verified manifest, entry for entry.
+    pub verified_manifest: Vec<VerifiedManifestEntry>,
+    pub git_tree_oid: Option<String>,
+    pub commit_oid: Option<String>,
+    /// The local branch ref the commit moved (e.g. `refs/heads/main`).
+    pub local_ref: Option<String>,
+    /// The EXACT published remote ref, encoded
+    /// `<remote>:<refname>@<oid>` (produced only after a push reconciled
+    /// the live remote ref to the exact commit).
+    pub remote_ref: Option<String>,
+    pub updated_ms: i64,
+}
+
+/// The exact INPUT IDENTITY of one external operation: the tuple a
+/// provider-side reconciliation lookup is keyed by
+/// (organization/repository + exact head/base + a stable Faktor task
+/// marker). Two rows may share one operation key ONLY while this value is
+/// byte-identical; any drift is a typed refusal, never a silent second
+/// remote object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalOperationInput {
+    pub organization: String,
+    pub repository: String,
+    /// The head of the operation (a branch ref, a commit sha, ...).
+    pub head: String,
+    /// The base of the operation; empty for operations that have no base.
+    #[serde(default)]
+    pub base: String,
+    /// The stable Faktor task marker the provider lookup carries (never a
+    /// random per-call value).
+    pub marker: String,
+}
+
+/// The lifecycle state of one durable external operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalOperationState {
+    /// Recorded BEFORE the remote call: the call may or may not have
+    /// happened, so a restart MUST reconcile (never blindly re-create).
+    Prepared,
+    /// The remote object identity (id + version) is recorded.
+    Completed,
+    /// The remote call failed typed; no remote object is known to exist.
+    Failed,
+}
+
+impl ExternalOperationState {
+    /// The stable wire/durable tag of this state (also the JSON tag).
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            ExternalOperationState::Prepared => "prepared",
+            ExternalOperationState::Completed => "completed",
+            ExternalOperationState::Failed => "failed",
+        }
+    }
+}
+
+/// The durable identity + reconciliation state of ONE external operation.
+/// The row is append-only evidence: `Prepared` is journaled before the
+/// remote call, the matching `Completed`/`Failed` row after it, and every
+/// reader folds the LATEST row of an operation key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalOperationRow {
+    /// Deterministic content id over (operation key, provider, kind, input
+    /// identity) — never a random uuid, never a caller-supplied value.
+    pub id: String,
+    /// The stable operation key (`task:<id>:rev:<rev>:<provider>:<kind>`):
+    /// exactly one operation per key; a later attempt with a DIFFERENT input
+    /// identity under the same key is a typed conflict.
+    pub operation_key: String,
+    pub provider: String,
+    pub kind: String,
+    pub input: ExternalOperationInput,
+    pub state: ExternalOperationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_object_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_object_version: Option<String>,
+    pub started_at: i64,
+    /// Set when the completing row was produced by reconciling a `Prepared`
+    /// row after a crash (proving the remote call was re-derived, not
+    /// blindly repeated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciled_at: Option<i64>,
+}
+
+impl ExternalOperationRow {
+    /// The deterministic content id of one operation row: a BLAKE3 digest
+    /// over the operation key, provider/kind and the exact input identity,
+    /// with length-prefixed legs so no two distinct tuples can collide.
+    pub fn content_id(
+        operation_key: &str,
+        provider: &str,
+        kind: &str,
+        input: &ExternalOperationInput,
+    ) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"faktor-external-operation:v1\0");
+        for part in [
+            operation_key.as_bytes(),
+            provider.as_bytes(),
+            kind.as_bytes(),
+            input.organization.as_bytes(),
+            input.repository.as_bytes(),
+            input.head.as_bytes(),
+            input.base.as_bytes(),
+            input.marker.as_bytes(),
+        ] {
+            hasher.update(&(part.len() as u64).to_le_bytes());
+            hasher.update(part);
+        }
+        format!("blake3:{}", hasher.finalize().to_hex())
+    }
+}
+
+/// Shape bounds of one durable external-operation row, shared by the
+/// appender and the strict decoder (a hostile raw row fails loudly on read
+/// too). Coherence rules: a `Prepared` row carries NO remote identity, a
+/// `Completed` row carries BOTH remote id and version, a `Failed` row names
+/// no remote object, and the deterministic id must match the row content.
+fn validate_external_operation(row: &ExternalOperationRow) -> Result<(), SessionError> {
+    for (what, value, max) in [
+        ("id", row.id.as_str(), MAX_EXTERNAL_OPERATION_TEXT_BYTES),
+        (
+            "operation_key",
+            row.operation_key.as_str(),
+            MAX_EXTERNAL_OPERATION_TEXT_BYTES,
+        ),
+        (
+            "provider",
+            row.provider.as_str(),
+            MAX_EXTERNAL_OPERATION_TEXT_BYTES,
+        ),
+        ("kind", row.kind.as_str(), MAX_EXTERNAL_OPERATION_TEXT_BYTES),
+        (
+            "input.marker",
+            row.input.marker.as_str(),
+            MAX_EXTERNAL_OPERATION_TEXT_BYTES,
+        ),
+        (
+            "input.organization",
+            row.input.organization.as_str(),
+            MAX_EXTERNAL_OPERATION_REF_BYTES,
+        ),
+        (
+            "input.repository",
+            row.input.repository.as_str(),
+            MAX_EXTERNAL_OPERATION_REF_BYTES,
+        ),
+        (
+            "input.head",
+            row.input.head.as_str(),
+            MAX_EXTERNAL_OPERATION_REF_BYTES,
+        ),
+        (
+            "input.base",
+            row.input.base.as_str(),
+            MAX_EXTERNAL_OPERATION_REF_BYTES,
+        ),
+    ] {
+        if value.is_empty() || value.len() > max {
+            return Err(SessionError::Malformed(format!(
+                "ledger external_operation {what} must be 1..={max} bytes"
+            )));
+        }
+        if value.chars().any(|c| c.is_control()) {
+            return Err(SessionError::Malformed(format!(
+                "ledger external_operation {what} carries control characters"
+            )));
+        }
+    }
+    for (what, value, max) in [
+        (
+            "remote_object_id",
+            row.remote_object_id.as_deref(),
+            MAX_EXTERNAL_OPERATION_TEXT_BYTES,
+        ),
+        (
+            "remote_object_version",
+            row.remote_object_version.as_deref(),
+            MAX_EXTERNAL_OPERATION_TEXT_BYTES,
+        ),
+    ] {
+        if let Some(value) = value {
+            if value.is_empty() || value.len() > max || value.chars().any(|c| c.is_control()) {
+                return Err(SessionError::Malformed(format!(
+                    "ledger external_operation {what} must be 1..={max} bytes without control characters"
+                )));
+            }
+        }
+    }
+    match row.state {
+        ExternalOperationState::Prepared => {
+            if row.remote_object_id.is_some() || row.remote_object_version.is_some() {
+                return Err(SessionError::Malformed(
+                    "ledger external_operation prepared row may not carry a remote object identity"
+                        .into(),
+                ));
+            }
+            if row.reconciled_at.is_some() {
+                return Err(SessionError::Malformed(
+                    "ledger external_operation prepared row may not carry reconciled_at".into(),
+                ));
+            }
+        }
+        ExternalOperationState::Completed => {
+            if row.remote_object_id.is_none() || row.remote_object_version.is_none() {
+                return Err(SessionError::Malformed(
+                    "ledger external_operation completed row requires remote_object_id and remote_object_version"
+                        .into(),
+                ));
+            }
+        }
+        ExternalOperationState::Failed => {
+            if row.remote_object_id.is_some() || row.remote_object_version.is_some() {
+                return Err(SessionError::Malformed(
+                    "ledger external_operation failed row may not carry a remote object identity"
+                        .into(),
+                ));
+            }
+        }
+    }
+    if row.started_at <= 0 {
+        return Err(SessionError::Malformed(
+            "ledger external_operation started_at must be positive".into(),
+        ));
+    }
+    if let Some(reconciled_at) = row.reconciled_at {
+        if reconciled_at < row.started_at {
+            return Err(SessionError::Malformed(
+                "ledger external_operation reconciled_at precedes started_at".into(),
+            ));
+        }
+    }
+    let expected =
+        ExternalOperationRow::content_id(&row.operation_key, &row.provider, &row.kind, &row.input);
+    if row.id != expected {
+        return Err(SessionError::Malformed(format!(
+            "ledger external_operation id {} is not the deterministic content id {expected} of its key/provider/kind/input",
+            row.id
+        )));
+    }
+    Ok(())
+}
+
 /// The durable phase of one transactional owner landing (record-first).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1152,23 +1455,35 @@ pub enum IntegrationPathTxnState {
     RollbackConflict,
 }
 
-/// ONE per-path landing decision + outcome. `base_blob` is the CAS digest
-/// of the path's base content (the rollback authority); `candidate_hash` is
-/// `None` for a deletion.
+/// ONE per-path landing decision + outcome in the CANONICAL entry-state
+/// vocabulary: the base state, the verified candidate state, and the
+/// rollback CAS material (a regular base payload blob and/or a symlink
+/// literal target; the mode is part of the state). A path that was absent at
+/// the run base carries [`EntryState::Absent`] — never a `None` hash.
+///
+/// `canonical` is `false` for a LEGACY byte-only row (pre-entry-state): such
+/// a row decodes additively but is NEVER landed or rolled back from, because
+/// its byte-only anchors cannot prove kind/mode/target identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntegrationPathTxn {
     pub path: String,
-    /// Lowercase 64-hex base content digest; `None` = the path was absent at
-    /// the run base.
+    #[serde(default = "faktor_fs::entry_state::EntryState::absent")]
+    pub base_state: faktor_fs::entry_state::EntryState,
+    #[serde(default = "faktor_fs::entry_state::EntryState::absent")]
+    pub candidate_state: faktor_fs::entry_state::EntryState,
+    /// CAS digest of the base REGULAR payload blob (the rollback authority
+    /// for a regular base), when one exists.
     #[serde(default)]
-    pub base_hash: Option<String>,
-    /// Lowercase 64-hex candidate content digest; `None` = candidate deleted
-    /// the path.
+    pub rollback_blob: Option<String>,
+    /// The base SYMLINK literal target bytes (rollback authority for a
+    /// symlink base; carried inline because a literal target is not a CAS
+    /// blob), when the base was a symlink.
     #[serde(default)]
-    pub candidate_hash: Option<String>,
-    /// CAS digest of the base content blob (rollback), when one exists.
+    pub rollback_link_target: Option<Vec<u8>>,
+    /// True on every newly-written decision row. A legacy `false` row is a
+    /// typed refusal at landing/recovery time.
     #[serde(default)]
-    pub base_blob: Option<String>,
+    pub canonical: bool,
     pub state: IntegrationPathTxnState,
 }
 
@@ -1180,6 +1495,29 @@ impl IntegrationPathTxn {
             IntegrationPathTxnState::RolledBack => "rolled_back",
             IntegrationPathTxnState::Conflict => "conflict",
             IntegrationPathTxnState::RollbackConflict => "rollback_conflict",
+        }
+    }
+
+    /// True when this row carries the canonical states AND the exact
+    /// rollback material its base state requires (a regular base needs its
+    /// payload blob, a symlink base its literal target, an absent base
+    /// nothing). A legacy or material-incomplete row is never landed from.
+    pub fn canonical_ready(&self) -> bool {
+        if !self.canonical {
+            return false;
+        }
+        match &self.base_state {
+            faktor_fs::entry_state::EntryState::Absent => {
+                self.rollback_blob.is_none() && self.rollback_link_target.is_none()
+            }
+            faktor_fs::entry_state::EntryState::Regular { payload, .. } => self
+                .rollback_blob
+                .as_deref()
+                .and_then(faktor_core::hash::FileHash::from_hex)
+                .is_some_and(|blob| blob == *payload),
+            faktor_fs::entry_state::EntryState::Symlink { target, .. } => {
+                self.rollback_link_target.as_deref() == Some(target.as_slice())
+            }
         }
     }
 }
@@ -1281,7 +1619,9 @@ fn entry_tag_of(payload: &LedgerPayload) -> &'static str {
         LedgerPayload::CompletionStepStatus { .. } => ENTRY_COMPLETION_STEP_STATUS,
         LedgerPayload::IntegrationRecorded { .. } => ENTRY_INTEGRATION_RECORD,
         LedgerPayload::RunBaseRecorded { .. } => ENTRY_RUN_BASE,
+        LedgerPayload::VerifiedGitArtifactRecorded { .. } => ENTRY_VERIFIED_GIT_ARTIFACT,
         LedgerPayload::IntegrationTxnRecorded { .. } => ENTRY_INTEGRATION_TXN,
+        LedgerPayload::ExternalOperationRecorded { .. } => ENTRY_EXTERNAL_OPERATION,
         LedgerPayload::TerminalCreated { .. } => ENTRY_TERMINAL_CREATED,
         LedgerPayload::TerminalRunning { .. } => ENTRY_TERMINAL_RUNNING,
         LedgerPayload::TerminalExited { .. } => ENTRY_TERMINAL_EXITED,
@@ -1558,6 +1898,20 @@ fn decode_payload(
             let decoded = decode(entry_type)?;
             if let LedgerPayload::IntegrationTxnRecorded { row } = &decoded {
                 validate_integration_txn(row)?;
+            }
+            Ok(decoded)
+        }
+        ENTRY_VERIFIED_GIT_ARTIFACT => {
+            let decoded = decode(entry_type)?;
+            if let LedgerPayload::VerifiedGitArtifactRecorded { artifact } = &decoded {
+                validate_verified_git_artifact(artifact)?;
+            }
+            Ok(decoded)
+        }
+        ENTRY_EXTERNAL_OPERATION => {
+            let decoded = decode(entry_type)?;
+            if let LedgerPayload::ExternalOperationRecorded { record } = &decoded {
+                validate_external_operation(record)?;
             }
             Ok(decoded)
         }
@@ -2374,6 +2728,128 @@ pub(crate) fn validate_integration_record(
 
 /// Shape bounds of one `run_base` row, shared by the appender and the
 /// strict decoder.
+/// The verified-git artifact bound: a bounded manifest (entries × path
+/// bytes), hex OIDs and a well-formed encoded remote ref.
+const MAX_VERIFIED_GIT_MANIFEST_ENTRIES: usize = 200_000;
+const MAX_VERIFIED_GIT_PATH_BYTES: usize = 4096;
+
+fn is_hex_oid(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+pub(crate) fn validate_verified_git_artifact(
+    artifact: &VerifiedGitArtifact,
+) -> Result<(), SessionError> {
+    if artifact.task_id == 0 || artifact.revision == 0 || artifact.verification_record == 0 {
+        return Err(SessionError::Malformed(
+            "ledger verified_git_artifact ids must be non-zero".into(),
+        ));
+    }
+    if artifact.verified_root_digest.is_empty()
+        || artifact.verified_root_digest.len() > 128
+        || !artifact
+            .verified_root_digest
+            .bytes()
+            .all(|b| b.is_ascii_graphic())
+    {
+        return Err(SessionError::Malformed(
+            "ledger verified_git_artifact verified_root_digest must be 1..=128 printable bytes"
+                .into(),
+        ));
+    }
+    if artifact.verified_manifest.is_empty()
+        || artifact.verified_manifest.len() > MAX_VERIFIED_GIT_MANIFEST_ENTRIES
+    {
+        return Err(SessionError::Oversized(
+            "ledger verified_git_artifact manifest must be 1..=MAX_VERIFIED_GIT_MANIFEST_ENTRIES entries"
+                .into(),
+        ));
+    }
+    let mut previous: Option<&str> = None;
+    for entry in &artifact.verified_manifest {
+        if entry.path.is_empty() || entry.path.len() > MAX_VERIFIED_GIT_PATH_BYTES {
+            return Err(SessionError::Malformed(
+                "ledger verified_git_artifact manifest path must be 1..=4096 bytes".into(),
+            ));
+        }
+        let path = std::path::Path::new(&entry.path);
+        if path
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(SessionError::Malformed(
+                "ledger verified_git_artifact manifest path must be plain and relative".into(),
+            ));
+        }
+        if let Some(prev) = previous {
+            if prev >= entry.path.as_str() {
+                return Err(SessionError::Malformed(
+                    "ledger verified_git_artifact manifest paths must be strictly sorted".into(),
+                ));
+            }
+        }
+        previous = Some(&entry.path);
+    }
+    for oid in [
+        artifact.git_tree_oid.as_deref(),
+        artifact.commit_oid.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !is_hex_oid(oid) {
+            return Err(SessionError::Malformed(
+                "ledger verified_git_artifact OID must be 40/64 hex chars".into(),
+            ));
+        }
+    }
+    if let Some(r) = artifact.local_ref.as_deref() {
+        if !r.starts_with("refs/") || r.len() > 512 || r.contains(' ') {
+            return Err(SessionError::Malformed(
+                "ledger verified_git_artifact local_ref must be a well-formed ref name".into(),
+            ));
+        }
+    }
+    if let Some(remote) = artifact.remote_ref.as_deref() {
+        // Encoded `<remote>:<refname>@<oid>`; both halves must be
+        // well-formed and the oid is the exact commit the push reconciled.
+        let (remote_name, rest) = remote.split_once(':').ok_or_else(|| {
+            SessionError::Malformed(
+                "ledger verified_git_artifact remote_ref must encode <remote>:<ref>@<oid>".into(),
+            )
+        })?;
+        if remote_name.is_empty()
+            || remote_name.len() > 256
+            || remote_name.contains(|c: char| c.is_whitespace())
+        {
+            return Err(SessionError::Malformed(
+                "ledger verified_git_artifact remote name must be well-formed".into(),
+            ));
+        }
+        let (refname, oid) = rest.rsplit_once('@').ok_or_else(|| {
+            SessionError::Malformed(
+                "ledger verified_git_artifact remote_ref must encode <remote>:<ref>@<oid>".into(),
+            )
+        })?;
+        if !refname.starts_with("refs/") || refname.len() > 512 || refname.contains(' ') {
+            return Err(SessionError::Malformed(
+                "ledger verified_git_artifact remote ref name must be well-formed".into(),
+            ));
+        }
+        if !is_hex_oid(oid) {
+            return Err(SessionError::Malformed(
+                "ledger verified_git_artifact remote_ref oid must be a git oid".into(),
+            ));
+        }
+    }
+    if artifact.updated_ms <= 0 {
+        return Err(SessionError::Malformed(
+            "ledger verified_git_artifact updated_ms must be positive".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_run_base_record(record: &RunBaseRecord) -> Result<(), SessionError> {
     if record.run_id.is_empty() || record.run_id.len() > MAX_INTEGRATION_ID_BYTES {
         return Err(SessionError::Malformed(
@@ -2478,19 +2954,28 @@ pub(crate) fn validate_integration_txn(row: &IntegrationTxnRow) -> Result<(), Se
             ));
         }
         previous = Some(&path.path);
-        if let Some(hash) = &path.base_hash {
-            check_hex(hash, "path base_hash")?;
-        }
-        if let Some(hash) = &path.candidate_hash {
-            check_hex(hash, "path candidate_hash")?;
-        }
-        if let Some(blob) = &path.base_blob {
-            check_hex(blob, "path base_blob")?;
-        }
-        if path.base_hash.is_none() && path.base_blob.is_some() {
+        // The canonical states and the rollback material must be internally
+        // consistent on every NEW row: a regular base carries the CAS blob
+        // of its exact payload digest, a symlink base its exact literal
+        // target, an absent base no material at all. A legacy row
+        // (`canonical == false`) is decoded additively and refused at
+        // landing time, never validated as if it were authoritative.
+        if path.canonical && !path.canonical_ready() {
             return Err(SessionError::Malformed(
-                "ledger integration_txn path without a base hash may not carry a base blob".into(),
+                "ledger integration_txn path carries canonical states without their exact rollback material"
+                    .into(),
             ));
+        }
+        if let Some(blob) = &path.rollback_blob {
+            check_hex(blob, "path rollback_blob")?;
+        }
+        if let Some(target) = &path.rollback_link_target {
+            if target.len() > faktor_fs::tree_manifest::MAX_TREE_MANIFEST_LINK_BYTES {
+                return Err(SessionError::Oversized(
+                    "ledger integration_txn symlink rollback target exceeds the manifest bound"
+                        .into(),
+                ));
+            }
         }
     }
     if row.applied_count > row.path_count {
@@ -2784,6 +3269,15 @@ fn fold(head: &mut LedgerHead, payload: &LedgerPayload) -> Result<(), SessionErr
         // authorities: they fold nowhere in the head and are pinned across
         // compaction (staging and crash recovery re-read them).
         LedgerPayload::RunBaseRecorded { .. } | LedgerPayload::IntegrationTxnRecorded { .. } => {}
+        // Verified-git publication artifacts are the durable authority the
+        // commit/push/PR steps re-assert: they fold nowhere in the head and
+        // are pinned across compaction.
+        LedgerPayload::VerifiedGitArtifactRecorded { .. } => {}
+        // External-operation rows are the write-before-call identity of an
+        // unfinished external effect: they fold nowhere in the head and are
+        // pinned across compaction (reconciliation re-reads the exact input
+        // identity; a pruned row would turn a recorded effect into a guess).
+        LedgerPayload::ExternalOperationRecorded { .. } => {}
         // Terminal-lifecycle rows are the ONE durable authority behind the
         // terminal service: they fold nowhere in the head and are pinned
         // across compaction (a recovery scan re-reads the stream).
@@ -4064,6 +4558,42 @@ impl SessionHandle {
         Ok(latest)
     }
 
+    /// Record (or update) the durable verified-git publication artifact of a
+    /// completion contract revision. Newest row wins; the validator bounds
+    /// the manifest and the OIDs before anything is appended.
+    pub fn ledger_verified_git_artifact_set(
+        &self,
+        artifact: &VerifiedGitArtifact,
+    ) -> faktor_core::Result<i64> {
+        validate_verified_git_artifact(artifact)?;
+        let _guard = self.command_guard();
+        self.append_entry(LedgerPayload::VerifiedGitArtifactRecorded {
+            artifact: artifact.clone(),
+        })?
+        .ok_or_else(|| {
+            SessionError::Internal("ledger verified_git_artifact append returned no seq".into())
+                .into()
+        })
+    }
+
+    /// The NEWEST durable verified-git artifact of one (task, revision), or
+    /// `None` when the contract revision never published one.
+    pub fn ledger_verified_git_artifact_get(
+        &self,
+        task_id: u64,
+        revision: u64,
+    ) -> faktor_core::Result<Option<VerifiedGitArtifact>> {
+        let mut latest: Option<VerifiedGitArtifact> = None;
+        for entry in self.all_entries_decoded()? {
+            if let LedgerPayload::VerifiedGitArtifactRecorded { artifact } = entry.payload {
+                if artifact.task_id == task_id && artifact.revision == revision {
+                    latest = Some(artifact);
+                }
+            }
+        }
+        Ok(latest)
+    }
+
     /// [`Self::ledger_run_base_get`] with the explicit read classification
     /// (corrupt stream = `PresentMalformed`; failed read = `StoreFailure`;
     /// genuinely absent run base = `Missing`, the legacy/direct-run policy).
@@ -4084,6 +4614,57 @@ impl SessionHandle {
             Some(row) => DurableRead::PresentValid(row),
             None => DurableRead::Missing,
         }
+    }
+
+    /// Append one durable external-operation row. The row is validated
+    /// BEFORE it is journaled (bounded shape, state/remote-identity
+    /// coherence and the deterministic content id), so a hostile or
+    /// hand-mismatched id can never enter the stream.
+    pub fn ledger_external_operation_set(
+        &self,
+        row: &ExternalOperationRow,
+    ) -> faktor_core::Result<i64> {
+        validate_external_operation(row)?;
+        self.append_typed_entry(LedgerPayload::ExternalOperationRecorded {
+            record: row.clone(),
+        })
+    }
+
+    /// The LATEST durable row of one operation key. The explicit read
+    /// distinction is preserved: a corrupt stream is `PresentMalformed` and
+    /// a failed read is `StoreFailure` — never "no operation recorded".
+    pub fn ledger_external_operation_read(
+        &self,
+        operation_key: &str,
+    ) -> DurableRead<ExternalOperationRow> {
+        let mut latest: Option<ExternalOperationRow> = None;
+        let entries = match self.all_entries_decoded() {
+            Ok(entries) => entries,
+            Err(e) => return DurableRead::from_session_error(e),
+        };
+        for entry in entries {
+            if let LedgerPayload::ExternalOperationRecorded { record } = entry.payload {
+                if record.operation_key == operation_key {
+                    latest = Some(record);
+                }
+            }
+        }
+        match latest {
+            Some(row) => DurableRead::PresentValid(row),
+            None => DurableRead::Missing,
+        }
+    }
+
+    /// Every durable external-operation row, ascending by seq (the
+    /// reconciliation scan surface). A corrupt row refuses the whole read.
+    pub fn ledger_external_operations(&self) -> faktor_core::Result<Vec<ExternalOperationRow>> {
+        let mut out = Vec::new();
+        for entry in self.all_entries_decoded()? {
+            if let LedgerPayload::ExternalOperationRecorded { record } = entry.payload {
+                out.push(record);
+            }
+        }
+        Ok(out)
     }
 
     /// Append one durable landing-transaction row (record-first: decisions +
@@ -4361,6 +4942,10 @@ impl SessionHandle {
         // terminal's history (a pruned row would turn a Lost terminal into an
         // unknowable one).
         let mut terminal_seqs: Vec<i64> = Vec::new();
+        // External-operation rows are pinned too: a restart reconciles an
+        // unfinished external effect from the EXACT recorded input identity,
+        // so a compacted ledger must still hold every prepared/completed row.
+        let mut external_operation_seqs: Vec<i64> = Vec::new();
         for entry in &entries {
             match &entry.payload {
                 LedgerPayload::GoalSet { .. } => {
@@ -4392,6 +4977,9 @@ impl SessionHandle {
                 LedgerPayload::RunBaseRecorded { .. }
                 | LedgerPayload::IntegrationTxnRecorded { .. } => {
                     orchestrated_txn_seqs.push(entry.seq)
+                }
+                LedgerPayload::ExternalOperationRecorded { .. } => {
+                    external_operation_seqs.push(entry.seq)
                 }
                 LedgerPayload::TerminalCreated { .. }
                 | LedgerPayload::TerminalRunning { .. }
@@ -4440,6 +5028,7 @@ impl SessionHandle {
         pinned.extend(integration_seqs);
         pinned.extend(orchestrated_txn_seqs);
         pinned.extend(terminal_seqs);
+        pinned.extend(external_operation_seqs);
         pinned.sort_unstable();
         pinned.dedup();
         let head_json = head_to_json(&head)?;
@@ -4555,6 +5144,70 @@ mod tests {
         )
         .unwrap();
         s.ledger_turn_completed(turn).unwrap();
+    }
+
+    #[test]
+    fn verified_git_artifact_roundtrips_and_refuses_hostile_rows() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let state = faktor_fs::entry_state::EntryState::regular(
+            faktor_fs::tree_manifest::CanonicalMode::ExecutableFile,
+            faktor_core::hash::FileHash::from(blake3::hash(b"payload").into()),
+        )
+        .unwrap();
+        let artifact = VerifiedGitArtifact {
+            task_id: 7,
+            revision: 3,
+            verification_record: 11,
+            verified_root_digest: "tm1:abc".into(),
+            verified_manifest: vec![
+                VerifiedManifestEntry {
+                    path: "a/b.rs".into(),
+                    state: state.clone(),
+                },
+                VerifiedManifestEntry {
+                    path: "link".into(),
+                    state: faktor_fs::entry_state::EntryState::symlink(b"a/b.rs".to_vec()).unwrap(),
+                },
+            ],
+            git_tree_oid: Some("a".repeat(40)),
+            commit_oid: None,
+            local_ref: None,
+            remote_ref: None,
+            updated_ms: 1,
+        };
+        s.ledger_verified_git_artifact_set(&artifact).unwrap();
+        let read = s
+            .ledger_verified_git_artifact_get(7, 3)
+            .unwrap()
+            .expect("roundtrip");
+        assert_eq!(read, artifact);
+        assert!(s.ledger_verified_git_artifact_get(7, 4).unwrap().is_none());
+        // A hostile manifest (traversal path) is refused BEFORE any append.
+        let mut evil = artifact.clone();
+        evil.verified_manifest[0].path = "../escape.rs".into();
+        assert!(s.ledger_verified_git_artifact_set(&evil).is_err());
+        // An unsorted manifest is refused too (canonical order is the codec).
+        let mut unsorted = artifact.clone();
+        unsorted.verified_manifest.swap(0, 1);
+        assert!(s.ledger_verified_git_artifact_set(&unsorted).is_err());
+        // A hostile oid is refused.
+        let mut bad_oid = artifact.clone();
+        bad_oid.commit_oid = Some("zz".repeat(20));
+        assert!(s.ledger_verified_git_artifact_set(&bad_oid).is_err());
+        // A malformed encoded remote ref is refused.
+        let mut bad_remote = artifact.clone();
+        bad_remote.remote_ref = Some("origin:refs/heads/main@nope".into());
+        assert!(s.ledger_verified_git_artifact_set(&bad_remote).is_err());
+        let good_remote = VerifiedGitArtifact {
+            remote_ref: Some(format!("origin:refs/heads/main@{}", "b".repeat(40))),
+            commit_oid: Some("b".repeat(40)),
+            local_ref: Some("refs/heads/main".into()),
+            ..artifact
+        };
+        s.ledger_verified_git_artifact_set(&good_remote).unwrap();
+        let read = s.ledger_verified_git_artifact_get(7, 3).unwrap().unwrap();
+        assert_eq!(read.remote_ref, good_remote.remote_ref);
     }
 
     fn assert_never_lost(s: &SessionHandle, goal: &str, open_blockers: &[&str]) {
@@ -6168,5 +6821,143 @@ mod tests {
         );
         let err = s.ledger_terminal_rows(None).unwrap_err();
         assert!(err.to_string().contains("schema"), "{err}");
+    }
+
+    // ------------------------------------------- external-operation identity
+
+    const EXTERNAL_OP_KEY: &str = "task:1:rev:1:github:pull_request";
+
+    fn external_operation_row(
+        key: &str,
+        head: &str,
+        state: ExternalOperationState,
+    ) -> ExternalOperationRow {
+        let input = ExternalOperationInput {
+            organization: "acme".into(),
+            repository: "widgets".into(),
+            head: head.into(),
+            base: "main".into(),
+            marker: "faktor:task:1:rev:1".into(),
+        };
+        let completed = state == ExternalOperationState::Completed;
+        ExternalOperationRow {
+            id: ExternalOperationRow::content_id(key, "github", "pull_request", &input),
+            operation_key: key.into(),
+            provider: "github".into(),
+            kind: "pull_request".into(),
+            input,
+            state,
+            remote_object_id: completed.then(|| "pr-1".into()),
+            remote_object_version: completed.then(|| "v1".into()),
+            started_at: 7,
+            reconciled_at: None,
+        }
+    }
+
+    #[test]
+    fn external_operation_rows_round_trip_and_latest_state_wins() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let prepared =
+            external_operation_row(EXTERNAL_OP_KEY, "main", ExternalOperationState::Prepared);
+        s.ledger_external_operation_set(&prepared).unwrap();
+        assert!(s.ledger_external_operation_read("other-key").is_missing());
+        assert_eq!(
+            s.ledger_external_operation_read(EXTERNAL_OP_KEY).valid(),
+            Some(prepared.clone())
+        );
+        let mut completed = prepared.clone();
+        completed.state = ExternalOperationState::Completed;
+        completed.remote_object_id = Some("pr-1".into());
+        completed.remote_object_version = Some("v1".into());
+        completed.reconciled_at = Some(8);
+        s.ledger_external_operation_set(&completed).unwrap();
+        assert_eq!(
+            s.ledger_external_operation_read(EXTERNAL_OP_KEY).valid(),
+            Some(completed.clone()),
+            "the latest row of one operation key wins"
+        );
+        assert_eq!(
+            s.ledger_external_operations().unwrap(),
+            vec![prepared, completed]
+        );
+        // A hostile raw row is a LOUD read failure, never "no operation".
+        raw_sql(
+            &m,
+            "UPDATE ledger_entry SET payload = json('{\"kind\":\"external_operation_recorded\"}') \
+             WHERE entry_type = 'external_operation'",
+        );
+        assert!(s
+            .ledger_external_operations()
+            .unwrap_err()
+            .to_string()
+            .contains("schema"));
+        assert!(s
+            .ledger_external_operation_read(EXTERNAL_OP_KEY)
+            .is_present_malformed());
+    }
+
+    #[test]
+    fn external_operation_rows_refuse_shape_violations() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let prepared =
+            external_operation_row(EXTERNAL_OP_KEY, "main", ExternalOperationState::Prepared);
+        // A hand-mismatched deterministic id.
+        let mut tampered = prepared.clone();
+        tampered.id = format!("blake3:{}", "0".repeat(64));
+        assert!(s.ledger_external_operation_set(&tampered).is_err());
+        // A prepared row may not carry a remote identity.
+        let mut bogus = prepared.clone();
+        bogus.remote_object_id = Some("pr-1".into());
+        assert!(s.ledger_external_operation_set(&bogus).is_err());
+        // A completed row must carry both remote id and version.
+        let mut incomplete = prepared.clone();
+        incomplete.state = ExternalOperationState::Completed;
+        assert!(s.ledger_external_operation_set(&incomplete).is_err());
+        // reconciled_at may not precede started_at.
+        let mut backwards = prepared.clone();
+        backwards.state = ExternalOperationState::Failed;
+        backwards.reconciled_at = Some(1);
+        assert!(s.ledger_external_operation_set(&backwards).is_err());
+        // Control characters are refused.
+        let mut hostile = prepared.clone();
+        hostile.input.head = "main\n".into();
+        assert!(s.ledger_external_operation_set(&hostile).is_err());
+        // A different head is a DIFFERENT row (the operation key conflict is
+        // resolved by the caller, never by an id collision).
+        let other = external_operation_row(
+            EXTERNAL_OP_KEY,
+            "other-branch",
+            ExternalOperationState::Prepared,
+        );
+        assert_ne!(prepared.id, other.id);
+        // Nothing was journaled by the refusals.
+        assert!(s.ledger_external_operations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn external_operation_rows_survive_compaction() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let prepared =
+            external_operation_row(EXTERNAL_OP_KEY, "main", ExternalOperationState::Prepared);
+        s.ledger_external_operation_set(&prepared).unwrap();
+        // Unpinned rows below the watermark so the compaction has victims.
+        for i in 0..5 {
+            s.ledger_failure_recorded(&format!("failure-{i}")).unwrap();
+        }
+        let mut completed = prepared.clone();
+        completed.state = ExternalOperationState::Completed;
+        completed.remote_object_id = Some("pr-1".into());
+        completed.remote_object_version = Some("v1".into());
+        s.ledger_external_operation_set(&completed).unwrap();
+        let report = s.compact_typed_ledger().unwrap();
+        assert!(report.deleted > 0, "{report:?}");
+        assert_eq!(
+            s.ledger_external_operation_read(EXTERNAL_OP_KEY).valid(),
+            Some(completed),
+            "the reconciliation authority outlives compaction"
+        );
     }
 }

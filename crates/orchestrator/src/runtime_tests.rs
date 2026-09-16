@@ -2771,7 +2771,7 @@ async fn reviewer_spawn_copies_whole_files_under_concurrent_cas_writers_and_surv
     // The reviewer's durable base rows equal the copied content exactly —
     // for the real files; a raced temp artifact may carry its own base row
     // (the base records the copy manifest as-is).
-    let base = merge::read_base_map(
+    let base = merge::read_base_state_map(
         &env.manager,
         env.parent,
         "run-review",
@@ -2783,7 +2783,9 @@ async fn reviewer_spawn_copies_whole_files_under_concurrent_cas_writers_and_surv
     let mut by_path: std::collections::HashMap<std::path::PathBuf, _> = base.into_iter().collect();
     for e in &real_files {
         assert_eq!(
-            by_path.remove(&e.path),
+            by_path
+                .remove(&e.path)
+                .and_then(|state| state.payload_digest()),
             Some(e.hash),
             "base rows must equal the copied manifest for {}",
             e.path.display()

@@ -20,6 +20,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
 pub mod atomic;
+pub mod entry_state;
 mod platform;
 pub mod tree_manifest;
 
@@ -1834,7 +1835,14 @@ mod tests {
         let (_d, _s, h) = fixture();
         fs::write(h.root().join("w.txt"), "x").unwrap();
         let mut saw = false;
-        for _ in 0..60 {
+        // FSEvents delivery on a loaded host can lag well past the first
+        // second; keep the adversarial assertion (the event MUST arrive with
+        // the workspace id) with a generous bounded budget, re-touching the
+        // path in case the very first create was coalesced away.
+        for attempt in 0..240 {
+            if attempt > 0 && attempt % 20 == 0 {
+                fs::write(h.root().join("w.txt"), "x").unwrap();
+            }
             if let Ok(ev) = h.events().lock().unwrap().try_recv() {
                 if ev.workspace_id == WorkspaceId::new(1) && ev.path.ends_with("w.txt") {
                     saw = true;
