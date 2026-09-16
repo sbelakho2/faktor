@@ -826,6 +826,24 @@ pub enum LedgerPayload {
     },
 }
 
+/// Decode one durable ledger row strictly: an unknown kind, an unknown
+/// schema version or a shape violation is a loud `Malformed`, never a silent
+/// drop. Additive public seam (the retention reference scanner walks durable
+/// rows without a live [`SessionHandle`]); `SessionHandle::decode_row`
+/// delegates here so both paths share ONE decoder.
+pub fn decode_ledger_entry_row(
+    row: &faktor_store::LedgerEntryRow,
+) -> Result<TypedLedgerEntry, SessionError> {
+    let payload = decode_payload(&row.entry_type, row.schema_ver, &row.payload)?;
+    Ok(TypedLedgerEntry {
+        seq: row.seq,
+        entry_type: row.entry_type.clone(),
+        schema_ver: row.schema_ver,
+        payload,
+        created_ms: row.created_ms,
+    })
+}
+
 /// One decoded ledger row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedLedgerEntry {
@@ -3363,14 +3381,7 @@ impl SessionHandle {
         &self,
         row: &faktor_store::LedgerEntryRow,
     ) -> Result<TypedLedgerEntry, SessionError> {
-        let payload = decode_payload(&row.entry_type, row.schema_ver, &row.payload)?;
-        Ok(TypedLedgerEntry {
-            seq: row.seq,
-            entry_type: row.entry_type.clone(),
-            schema_ver: row.schema_ver,
-            payload,
-            created_ms: row.created_ms,
-        })
+        decode_ledger_entry_row(row)
     }
 
     /// Read the session's typed ledger from durable rows, ascending by seq

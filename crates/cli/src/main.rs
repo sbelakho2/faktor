@@ -88,11 +88,180 @@ enum Command {
         #[arg(long, default_value = "~/.faktor")]
         data_dir: String,
     },
+    /// Signed updater lifecycle (local parity with the control-plane
+    /// routes): status, check, stage, apply, rollback, recover. The
+    /// `[updater]` section must be enabled; manifests are verified against
+    /// its operator key allowlist and downloads ride the checked transport.
+    Updater {
+        #[command(subcommand)]
+        action: UpdaterAction,
+        /// The daemon data dir (default `~/.faktor`).
+        #[arg(long, default_value = "~/.faktor", global = true)]
+        data_dir: String,
+        #[arg(long, global = true)]
+        config: Option<String>,
+    },
+    /// Enterprise retention/audit/admin plane (local parity with the
+    /// `/native/enterprise/*` routes): status, audit export, guarded GC,
+    /// deletion jobs, artifacts, settings and effective config. The
+    /// `[enterprise]` section must be enabled; the local operator acts as
+    /// an owner principal of the configured organization.
+    Enterprise {
+        #[command(subcommand)]
+        action: EnterpriseAction,
+        /// The daemon data dir (default `~/.faktor`).
+        #[arg(long, default_value = "~/.faktor", global = true)]
+        data_dir: String,
+        #[arg(long, global = true)]
+        config: Option<String>,
+    },
     /// List sessions.
     Sessions {
         #[arg(long, default_value = "~/.faktor")]
         data_dir: String,
     },
+}
+
+/// The enterprise local-parity subcommands (`faktor enterprise <action>`).
+#[derive(Subcommand)]
+enum EnterpriseAction {
+    /// Retention class table, audit head seq, artifact/job counts.
+    Status,
+    /// Export one cursor page of the enterprise audit ledger.
+    Audit {
+        /// Resume after this seq (exclusive).
+        #[arg(long)]
+        after: Option<i64>,
+        #[arg(long, default_value_t = 50)]
+        limit: u64,
+    },
+    /// Run one guarded GC pass over the organization's artifacts (protected
+    /// digests are refused at the scanner AND at the CAS).
+    Gc {
+        #[arg(long, default_value_t = 100)]
+        limit: u64,
+    },
+    /// Retention artifact operations.
+    Artifact {
+        #[command(subcommand)]
+        action: EnterpriseArtifactAction,
+    },
+    /// Deletion-job operations.
+    Deletion {
+        #[command(subcommand)]
+        action: EnterpriseDeletionAction,
+    },
+    /// Show the organization's admin settings.
+    Settings,
+    /// Resolve the configured layered configuration and print its
+    /// attributable digest.
+    Config,
+}
+
+/// Retention artifact subcommands.
+#[derive(Subcommand)]
+enum EnterpriseArtifactAction {
+    /// List one cursor page of artifacts.
+    List {
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u64,
+    },
+    /// Register one artifact row.
+    Register {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        size: u64,
+        #[arg(long)]
+        retention_class: String,
+        #[arg(long)]
+        ttl_ms: Option<i64>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        task: Option<u64>,
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Promote one expired artifact to the eligible state.
+    Eligible {
+        #[arg(long)]
+        id: String,
+    },
+}
+
+/// Deletion-job subcommands.
+#[derive(Subcommand)]
+enum EnterpriseDeletionAction {
+    /// Start (or return) the deterministic deletion job for a scope.
+    Start {
+        #[arg(long, default_value = "organization")]
+        scope: String,
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Show one deletion job.
+    Show {
+        #[arg(long)]
+        id: String,
+    },
+    /// Advance the job by exactly one durable step.
+    Advance {
+        #[arg(long)]
+        id: String,
+    },
+}
+
+/// The local updater subcommands (`faktor updater <action>`).
+#[derive(Subcommand)]
+enum UpdaterAction {
+    /// Show the installed version, the staged operation and the durable
+    /// operation history.
+    Status,
+    /// Verify a signed manifest and check it against the running components.
+    Check {
+        /// Path to the `faktor-update/v1` manifest JSON.
+        #[arg(long)]
+        manifest: String,
+        /// The running VS Code panel version (omit when not attached).
+        #[arg(long)]
+        vscode: Option<String>,
+        /// The running JetBrains panel version (omit when not attached).
+        #[arg(long)]
+        jetbrains: Option<String>,
+    },
+    /// Download, verify and publish the host's artifact (the install is not
+    /// touched).
+    Stage {
+        #[arg(long)]
+        manifest: String,
+        /// Idempotency key for a replayable stage.
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long)]
+        vscode: Option<String>,
+        #[arg(long)]
+        jetbrains: Option<String>,
+    },
+    /// Swap the staged artifact in and run the doctor-style health probe;
+    /// a probe failure rolls back automatically.
+    Apply {
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Explicitly roll back to the artifact the last applied update replaced.
+    Rollback {
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Resolve crash residue: resume a swapped install or roll it back.
+    Recover,
 }
 
 fn expand(p: &str) -> PathBuf {
@@ -146,6 +315,20 @@ async fn main() {
         }
         Command::Acp { data_dir } => {
             acp(expand(&data_dir)).await;
+        }
+        Command::Updater {
+            action,
+            data_dir,
+            config,
+        } => {
+            updater_command(action, expand(&data_dir), config.map(|c| expand(&c))).await;
+        }
+        Command::Enterprise {
+            action,
+            data_dir,
+            config,
+        } => {
+            enterprise_command(action, expand(&data_dir), config.map(|c| expand(&c))).await;
         }
         Command::Sessions { data_dir } => {
             sessions(expand(&data_dir)).await;
@@ -1404,6 +1587,20 @@ async fn serve_impl(
     // nor opened, and the local daemon stays byte-identical. When enabled,
     // the control plane and the durable SCM rows are opened here (their
     // files live under the data dir; a hostile path is refused at startup).
+    // The additive `[billing]` section (Wave 3) is captured BEFORE the
+    // config is consumed by the daemon build: when disabled (the default)
+    // no billing database is created and every billing route answers 409.
+    let config_billing = config.billing.clone();
+    // The additive `[workers]` section (remote/VPC worker plane) is captured
+    // the same way: disabled by default (no worker database, every
+    // /native/workers* route 409 `workers_disabled`, the TaskExecutor
+    // placement seam disabled => local execution unchanged).
+    let config_workers = config.workers.clone();
+    // The additive `[enterprise]` section (retention/audit/admin plane) is
+    // captured the same way: disabled by default (no enterprise database,
+    // every /native/enterprise/* route 409 `enterprise_disabled`, the local
+    // daemon otherwise untouched).
+    let config_enterprise = config.enterprise.clone();
     let cloud_databases = if config.cloud.enabled {
         let control_plane_path = config
             .cloud
@@ -1414,6 +1611,59 @@ async fn serve_impl(
             .scm_path(&data_dir)
             .map_err(|e| format!("cloud config: {e}"))?;
         Some((control_plane_path, scm_path))
+    } else {
+        None
+    };
+    // The `[updater]` section is resolved BEFORE the config is consumed:
+    // when disabled (the default and every pre-updater config) NO operation
+    // database and NO install root are ever created, and the daemon is
+    // byte-identical to the pre-updater daemon. When enabled, the durable
+    // operation store, the content-addressed install layout and the checked
+    // download transport (the `[sandbox]` destination policy) are built
+    // here; artifacts download through the daemon's own egress policy.
+    let updater = if config.updater.enabled {
+        let db = config
+            .updater
+            .database_path(&data_dir)
+            .map_err(|e| format!("updater config: {e}"))?
+            .ok_or("updater config: enabled section resolved no database")?;
+        let install_root = config
+            .updater
+            .install_root_path(&data_dir)
+            .map_err(|e| format!("updater config: {e}"))?
+            .ok_or("updater config: enabled section resolved no install root")?;
+        let policy = config
+            .sandbox_policy()
+            .map_err(|e| format!("sandbox config: {e}"))?
+            .network
+            .installed()
+            .cloned();
+        let store = Arc::new(
+            faktor_updater::SqliteUpdaterStore::open(&db)
+                .map_err(|e| format!("updater store {}: {e}", db.display()))?,
+        );
+        let fetcher = Arc::new(faktor_updater::CheckedHttpFetcher::new(
+            faktor_provider::egress::CheckedHttpClient::with_policy(policy),
+        ));
+        let updater_config = faktor_updater::UpdaterConfig {
+            channel: config
+                .updater
+                .channel()
+                .map_err(|e| format!("updater config: {e}"))?,
+            install_root,
+            keys: config
+                .updater
+                .trusted_keys()
+                .map_err(|e| format!("updater config: {e}"))?,
+            max_artifact_bytes: config.updater.max_artifact_bytes_resolved(),
+            clock_skew_ms: config.updater.clock_skew_ms_resolved(),
+            host_os: std::env::consts::OS.to_string(),
+            host_arch: std::env::consts::ARCH.to_string(),
+            local_version: faktor_core::VERSION.to_string(),
+        };
+        let updater = faktor_updater::Updater::with_default_probe(updater_config, store, fetcher)
+            .map_err(|e| format!("updater init: {e}"))?;
+        Some(Arc::new(updater))
     } else {
         None
     };
@@ -1470,6 +1720,176 @@ async fn serve_impl(
         };
         deps = deps.with_control_plane(control_plane).with_scm_store(scm);
         tracing::info!("cloud control plane enabled");
+    }
+    // The additive `[billing]` section (Wave 3): when disabled (the default)
+    // no billing database is created and every billing route answers 409.
+    // When enabled, the durable usage/credit ledger opens here (its own
+    // `billing.db` through the SAME control-plane store + migration ladder),
+    // the configured account is provisioned idempotently, and the
+    // orchestrator's admission gate is wired to the entitlement service —
+    // the gate is consulted at the three safe boundaries only, so an
+    // entitlement change can never interrupt an in-flight
+    // integration/rollback/completion transaction.
+    let mut billing_gate: Option<Arc<dyn faktor_orchestrator::admission::AdmissionGate>> = None;
+    if config_billing.enabled {
+        let path = config_billing
+            .billing_path(&data_dir)
+            .map_err(|e| format!("billing config: {e}"))?;
+        let organization = config_billing
+            .organization()
+            .map_err(|e| format!("billing config: {e}"))?;
+        let account = config_billing
+            .account_id()
+            .map_err(|e| format!("billing config: {e}"))?;
+        let service_config = config_billing
+            .service_config()
+            .map_err(|e| format!("billing config: {e}"))?
+            .ok_or_else(|| {
+                "billing config: an enabled section carries a service config".to_string()
+            })?;
+        let store = match path {
+            Some(path) => Arc::new(
+                faktor_cloud::SqliteControlPlaneStore::open(&path)
+                    .map_err(|e| format!("billing store {}: {e}", path.display()))?,
+            ) as Arc<dyn faktor_cloud::BillingStore>,
+            None => unreachable!("enabled billing always resolves a database path"),
+        };
+        let service = faktor_cloud::EntitlementService::with_system_clock(store, service_config)
+            .map_err(|e| format!("billing service: {e}"))?;
+        let account_name = config_billing
+            .account_name
+            .clone()
+            .unwrap_or_else(|| "local".to_string());
+        let managed = config_billing.managed.unwrap_or(true);
+        service
+            .ensure_account(&organization, &account, &account_name, managed)
+            .map_err(|e| format!("billing account provisioning: {e}"))?;
+        billing_gate = Some(Arc::new(BillingAdmissionGate::new(
+            service.clone(),
+            organization,
+        )));
+        deps = deps.with_billing(service);
+        tracing::info!("commercial billing enabled");
+    }
+    if let Some(gate) = billing_gate {
+        graph.orchestrator.set_admission_gate(gate);
+    }
+    // The additive `[workers]` section: when disabled (the default) nothing
+    // is built and no worker database is created. When enabled, the durable
+    // plane opens under the data dir, its crash recovery runs BEFORE the
+    // first request (expired leases requeue deterministically; unleased
+    // assignments are re-attempted), the worker routes are wired, and the
+    // TaskExecutor gains the placement seam so a new run is placed on an
+    // eligible registered worker instead of executing locally.
+    if config_workers.enabled {
+        let path = config_workers
+            .workers_path(&data_dir)
+            .map_err(|e| format!("workers config: {e}"))?;
+        let organization = config_workers
+            .organization()
+            .map_err(|e| format!("workers config: {e}"))?;
+        let trust_domain = config_workers
+            .trust_domain()
+            .map_err(|e| format!("workers config: {e}"))?;
+        let requirements = config_workers
+            .requirements()
+            .map_err(|e| format!("workers config: {e}"))?;
+        let store = match path {
+            Some(path) => Arc::new(
+                faktor_worker::SqliteWorkerStore::open(&path)
+                    .map_err(|e| format!("worker store {}: {e}", path.display()))?,
+            ) as Arc<dyn faktor_worker::WorkerStore>,
+            None => unreachable!("enabled workers always resolves a database path"),
+        };
+        let plane = faktor_worker::WorkerPlane::with_system_clock(store);
+        // Crash recovery before the first request: a lease whose heartbeat
+        // window closed while the daemon was down expires (attempt terminal
+        // + bounded requeue), and an assignment committed without its lease
+        // is re-attempted. Idempotent: a clean restart reports nothing.
+        let recovery = plane
+            .recover(&organization)
+            .map_err(|e| format!("worker recovery: {e}"))?;
+        let resumed = plane
+            .resume_assignments(&organization)
+            .map_err(|e| format!("worker assignment recovery: {e}"))?;
+        if !recovery.expired.is_empty() || !resumed.reassigned.is_empty() {
+            tracing::warn!(
+                expired = recovery.expired.len(),
+                requeued = recovery.requeued.len(),
+                exhausted = recovery.exhausted.len(),
+                reassigned = resumed.reassigned.len(),
+                "worker plane recovery resolved interrupted leases/assignments"
+            );
+        }
+        graph
+            .tasks
+            .set_worker_placement(faktor_orchestrator::placement::WorkerPlacement::enabled(
+                Arc::new(WorkerPlaneAdapter {
+                    plane: plane.clone(),
+                    organization,
+                    trust_domain,
+                    requirements,
+                }),
+            ));
+        deps = deps.with_workers(plane);
+        tracing::info!("remote/vpc worker plane enabled");
+    }
+    // The additive `[enterprise]` section: when disabled (the default)
+    // nothing is built and no enterprise database is created. When enabled,
+    // the retention/audit/admin service opens its own `enterprise.db`
+    // (through the SAME control-plane store + migration ladder; the audit
+    // table is append-only) and the GC route is wired to the daemon's REAL
+    // session store + CAS, so protected rollback material is refused at the
+    // scanner and again at the storage layer. An enabled section requires
+    // the cloud section (the principal source); the pair is refused at
+    // config load, so reaching here without it is a bug.
+    if config_enterprise.enabled {
+        if deps.control_plane.is_none() {
+            return Err(
+                "enterprise: an enabled [enterprise] section requires [cloud] enabled".into(),
+            );
+        }
+        let path = config_enterprise
+            .enterprise_path(&data_dir)
+            .map_err(|e| format!("enterprise config: {e}"))?
+            .ok_or_else(|| "enterprise config: enabled without a database path".to_string())?;
+        let store = Arc::new(
+            faktor_cloud::SqliteControlPlaneStore::open(&path)
+                .map_err(|e| format!("enterprise store {}: {e}", path.display()))?,
+        ) as Arc<dyn faktor_cloud::EnterpriseStore>;
+        let service = Arc::new(
+            faktor_cloud::EnterpriseService::with_system_clock(store)
+                .map_err(|e| format!("enterprise service: {e}"))?,
+        );
+        let runtime = Arc::new(faktor_server::native::enterprise::RetentionRuntime::new(
+            deps.session.store(),
+            deps.session.cas(),
+        ));
+        deps = deps.with_enterprise(service, Some(runtime));
+        tracing::info!("enterprise retention/audit plane enabled");
+    }
+    // The signed updater (additive; disabled by default): crash recovery
+    // runs BEFORE the first request — an interrupted apply is resumed or
+    // rolled back, never left half-applied. The daemon probe re-hashes the
+    // swapped artifact (the CLI-local `faktor updater apply` runs the real
+    // doctor quick check instead).
+    if let Some(updater) = &updater {
+        match updater.recover(now_ms()) {
+            Ok(outcomes) if !outcomes.is_empty() => {
+                for outcome in &outcomes {
+                    tracing::warn!(
+                        "updater recovery resolved an interrupted operation: {outcome:?}"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!("updater recovery failed: {e}"),
+        }
+        deps = deps.with_updater(updater.clone());
+        tracing::info!(
+            "signed updater enabled (channel {})",
+            updater.config().channel
+        );
     }
     // The ONE semantic-provider registry: the SAME Arc the graph built and
     // the agent holds — the native introspection endpoints inspect only
@@ -1643,6 +2063,155 @@ fn load_acp_config(data_dir: &std::path::Path) -> config::Config {
         Err(e) => {
             tracing::error!("config error: {e}; using defaults");
             config::Config::default()
+        }
+    }
+}
+
+/// The daemon's worker-plane placement adapter: the orchestrator's seam
+/// consults it BEFORE any local durable write of a new run. It maps the
+/// provider-neutral placement spec onto the worker plane:
+///
+/// - no eligible worker => `Local` (the run executes locally exactly as
+///   before; nothing is written to the worker plane);
+/// - an eligible worker => the plane mints one IMMUTABLE job generation,
+///   CAS-accepts its lease and `Remote` is returned: the local executor
+///   starts NOTHING and the plane's durable job/lease owns the attempt.
+///
+/// A plane failure is returned as a string and becomes the executor's typed
+/// `ExecError::PlacementRefused` — never a silent local run.
+struct WorkerPlaneAdapter {
+    plane: Arc<faktor_worker::WorkerPlane>,
+    organization: faktor_cloud::OrganizationId,
+    trust_domain: String,
+    requirements: faktor_worker::JobRequirements,
+}
+
+impl faktor_orchestrator::placement::WorkerPlacementSeam for WorkerPlaneAdapter {
+    fn place(
+        &self,
+        spec: &faktor_orchestrator::placement::PlacementSpec,
+    ) -> Result<faktor_orchestrator::placement::PlacementDecision, String> {
+        let mut requirements = self.requirements.clone();
+        // The executor's spec carries the run shape; the daemon's `[workers]`
+        // defaults carry the environment requirements. A spec-provided field
+        // wins (the executor currently sends none).
+        if let Some(os) = &spec.os {
+            requirements.os = Some(os.clone());
+        }
+        if let Some(arch) = &spec.arch {
+            requirements.arch = Some(arch.clone());
+        }
+        if !spec.toolchains.is_empty() {
+            requirements.toolchains = spec.toolchains.clone();
+        }
+        if let Some(region) = &spec.region {
+            requirements.region = Some(region.clone());
+        }
+        if spec.min_cpu_cores > 0 {
+            requirements.min_cpu_cores = spec.min_cpu_cores;
+        }
+        if spec.min_memory_mb > 0 {
+            requirements.min_memory_mb = spec.min_memory_mb;
+        }
+        if spec.gpu {
+            requirements.gpu = true;
+        }
+        requirements.trust_domain = self.trust_domain.clone();
+        requirements
+            .normalize()
+            .map_err(|e| format!("placement requirements: {e}"))?;
+        // Only mint a generation when a worker can actually take it: the
+        // local run stays the answer otherwise.
+        match self
+            .plane
+            .find_eligible(&self.organization, &self.trust_domain, &requirements)
+        {
+            Ok(None) => return Ok(faktor_orchestrator::placement::PlacementDecision::Local),
+            Ok(Some(_)) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        let job_key = faktor_worker::JobKey::try_new(spec.job_key.clone())
+            .map_err(|e| format!("placement job key: {e}"))?;
+        let scheduled = self
+            .plane
+            .schedule_job(
+                &self.organization,
+                &self.trust_domain,
+                &job_key,
+                requirements,
+                &spec.payload_digest,
+                faktor_worker::default_requeue(),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        match scheduled.lease {
+            Some(lease) => Ok(faktor_orchestrator::placement::PlacementDecision::Remote {
+                job_id: scheduled.job.job_id.to_string(),
+                worker_id: lease.worker_id.to_string(),
+                generation: scheduled.generation.as_u64(),
+                lease_id: lease.lease_id.to_string(),
+            }),
+            // The CAS lost a race (the worker vanished between the
+            // eligibility read and the accept): execute locally rather than
+            // stranding the run.
+            None => Ok(faktor_orchestrator::placement::PlacementDecision::Local),
+        }
+    }
+}
+
+/// The Wave 3 billing admission gate of the local daemon: it maps the
+/// orchestrator's provider-neutral boundary hook onto the cloud entitlement
+/// service for the daemon's configured tenant organization. The gate is
+/// consulted at the three safe boundaries only (new task, new child spawn,
+/// new provider attempt BEFORE dispatch); a refusal is a typed
+/// `ExecError::AdmissionRefused` naming the exact limit and admits nothing.
+struct BillingAdmissionGate {
+    service: Arc<faktor_cloud::EntitlementService>,
+    organization: faktor_cloud::OrganizationId,
+}
+
+impl BillingAdmissionGate {
+    fn new(
+        service: Arc<faktor_cloud::EntitlementService>,
+        organization: faktor_cloud::OrganizationId,
+    ) -> Self {
+        Self {
+            service,
+            organization,
+        }
+    }
+}
+
+impl faktor_orchestrator::admission::AdmissionGate for BillingAdmissionGate {
+    fn check(
+        &self,
+        request: &faktor_orchestrator::admission::AdmissionRequest,
+    ) -> Result<(), faktor_orchestrator::admission::AdmissionRefusal> {
+        use faktor_orchestrator::admission::AdmissionBoundary as Hook;
+        let hook_boundary = request.boundary;
+        let boundary = match hook_boundary {
+            Hook::NewTask => faktor_cloud::AdmissionBoundary::NewTask,
+            Hook::NewChildSpawn => faktor_cloud::AdmissionBoundary::NewChildSpawn,
+            Hook::NewProviderAttempt => faktor_cloud::AdmissionBoundary::NewProviderAttempt,
+        };
+        let request = faktor_cloud::AdmissionRequest {
+            boundary,
+            task_id: request.task_id,
+            provider: request.provider.clone(),
+            observed: faktor_cloud::ObservedUsage {
+                active_tasks: request.observed.active_tasks,
+                children_of_task: request.observed.children_of_task,
+                provider_attempts_of_task: request.observed.provider_attempts_of_task,
+                estimated_provider_cost_micro: request.observed.estimated_provider_cost_micro,
+            },
+        };
+        match self.service.check_admission(&self.organization, &request) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(faktor_orchestrator::admission::AdmissionRefusal::new(
+                hook_boundary,
+                e.limit.clone(),
+                e.to_string(),
+            )),
         }
     }
 }
@@ -1936,6 +2505,431 @@ impl faktor_acp::TerminalHandle for DaemonTerminalHandle {
 struct DoctorReport {
     lines: Vec<String>,
     issues: usize,
+}
+
+// ------------------------------------------------------------------ updater
+//
+// The local parity surface of the signed updater: the SAME `faktor-updater`
+// service the daemon's `/native/updater/*` routes drive, built from the
+// `[updater]` section (disabled by default). Downloads ride the checked
+// transport with the `[sandbox]` destination policy; `apply` runs the REAL
+// doctor quick check as its post-swap health probe (a doctor failure rolls
+// back to the previous artifact exactly).
+
+/// The local health probe: the doctor-style quick check over the daemon's
+/// data dir. `issues == 0` means healthy; anything else fails the probe and
+/// the updater restores the previous pointer.
+struct CliDoctorProbe {
+    data_dir: PathBuf,
+}
+
+impl faktor_updater::HealthProbe for CliDoctorProbe {
+    fn probe(
+        &self,
+        _layout: &faktor_updater::InstallLayout,
+        pointer: &faktor_updater::InstallPointer,
+    ) -> Result<(), faktor_updater::UpdateError> {
+        let report = doctor_run(&self.data_dir, false);
+        if report.issues == 0 {
+            tracing::info!(
+                "updater: doctor probe passed for {} ({})",
+                pointer.version,
+                pointer.digest
+            );
+            Ok(())
+        } else {
+            Err(faktor_updater::UpdateError::HealthFailed {
+                detail: format!(
+                    "doctor reports {} issue(s) after swapping in {} ({}): {}",
+                    report.issues,
+                    pointer.version,
+                    pointer.digest,
+                    report
+                        .lines
+                        .iter()
+                        .find(|line| line.contains("FAIL"))
+                        .cloned()
+                        .unwrap_or_else(|| "see `faktor doctor`".into())
+                ),
+            })
+        }
+    }
+}
+
+/// Build the local updater from the `[updater]` section. Disabled sections
+/// refuse loudly (never a silent no-op), and the checked transport carries
+/// the daemon's `[sandbox]` destination policy.
+fn build_local_updater(
+    cfg: &config::UpdaterCfg,
+    data_dir: &std::path::Path,
+    policy: Option<faktor_security::destination::DestinationPolicy>,
+    probe: Arc<dyn faktor_updater::HealthProbe>,
+) -> Result<faktor_updater::Updater, String> {
+    if !cfg.enabled {
+        return Err(
+            "updater: the [updater] section is disabled; enable it (and configure the operator \
+             key allowlist) to use the updater"
+                .into(),
+        );
+    }
+    cfg.validate()?;
+    let db = cfg
+        .database_path(data_dir)?
+        .ok_or("updater: enabled section resolved no database")?;
+    let install_root = cfg
+        .install_root_path(data_dir)?
+        .ok_or("updater: enabled section resolved no install root")?;
+    let store = Arc::new(
+        faktor_updater::SqliteUpdaterStore::open(&db)
+            .map_err(|e| format!("updater store {}: {e}", db.display()))?,
+    );
+    let fetcher = Arc::new(faktor_updater::CheckedHttpFetcher::new(
+        faktor_provider::egress::CheckedHttpClient::with_policy(policy),
+    ));
+    let config = faktor_updater::UpdaterConfig {
+        channel: cfg.channel()?,
+        install_root,
+        keys: cfg.trusted_keys()?,
+        max_artifact_bytes: cfg.max_artifact_bytes_resolved(),
+        clock_skew_ms: cfg.clock_skew_ms_resolved(),
+        host_os: std::env::consts::OS.to_string(),
+        host_arch: std::env::consts::ARCH.to_string(),
+        local_version: faktor_core::VERSION.to_string(),
+    };
+    faktor_updater::Updater::new(config, store, fetcher, probe).map_err(|e| e.to_string())
+}
+
+/// Read one manifest file under a bound (a manifest is tiny).
+fn read_manifest_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    const MAX_MANIFEST_FILE_BYTES: u64 = 1024 * 1024;
+    let meta = std::fs::metadata(path).map_err(|e| format!("manifest {}: {e}", path.display()))?;
+    if meta.len() > MAX_MANIFEST_FILE_BYTES {
+        return Err(format!(
+            "manifest {} is {} bytes (bound {MAX_MANIFEST_FILE_BYTES})",
+            path.display(),
+            meta.len()
+        ));
+    }
+    std::fs::read(path).map_err(|e| format!("manifest {}: {e}", path.display()))
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// `faktor updater <action>` — local parity with the control-plane routes.
+async fn updater_command(action: UpdaterAction, data_dir: PathBuf, config_path: Option<PathBuf>) {
+    let (config, _semantic) = match serve_config_and_semantic(config_path) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("faktor updater: config error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let probe: Arc<dyn faktor_updater::HealthProbe> = Arc::new(CliDoctorProbe {
+        data_dir: data_dir.clone(),
+    });
+    let policy = match config.sandbox_policy() {
+        Ok(policy) => policy.network.installed().cloned(),
+        Err(e) => {
+            eprintln!("faktor updater: sandbox config: {e}");
+            std::process::exit(1);
+        }
+    };
+    let updater = match build_local_updater(&config.updater, &data_dir, policy, probe) {
+        Ok(updater) => Arc::new(updater),
+        Err(e) => {
+            eprintln!("faktor updater: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let rendered: Result<Value, String> = async {
+        match action {
+            UpdaterAction::Status => updater
+                .status(now_ms())
+                .map(|status| json!({ "status": status }))
+                .map_err(|e| e.to_string()),
+            UpdaterAction::Check {
+                manifest,
+                vscode,
+                jetbrains,
+            } => {
+                let bytes = read_manifest_file(&PathBuf::from(&manifest))?;
+                let running = updater
+                    .running_components(None, None, vscode.as_deref(), jetbrains.as_deref())
+                    .map_err(|e| e.to_string())?;
+                updater
+                    .check(&bytes, &running, now_ms())
+                    .map(|outcome| json!({ "check": outcome }))
+                    .map_err(|e| e.to_string())
+            }
+            UpdaterAction::Stage {
+                manifest,
+                key,
+                vscode,
+                jetbrains,
+            } => {
+                let bytes = read_manifest_file(&PathBuf::from(&manifest))?;
+                let running = updater
+                    .running_components(None, None, vscode.as_deref(), jetbrains.as_deref())
+                    .map_err(|e| e.to_string())?;
+                updater
+                    .stage(&bytes, &running, key.as_deref(), now_ms())
+                    .await
+                    .map(|outcome| json!({ "stage": outcome }))
+                    .map_err(|e| e.to_string())
+            }
+            UpdaterAction::Apply { confirm } => {
+                if !confirm {
+                    Err("apply requires --confirm: an update is never applied implicitly".into())
+                } else {
+                    updater
+                        .apply(now_ms())
+                        .map(|outcome| json!({ "apply": outcome }))
+                        .map_err(|e| e.to_string())
+                }
+            }
+            UpdaterAction::Rollback { confirm } => {
+                if !confirm {
+                    Err("rollback requires --confirm".into())
+                } else {
+                    updater
+                        .rollback(now_ms())
+                        .map(|outcome| json!({ "apply": outcome }))
+                        .map_err(|e| e.to_string())
+                }
+            }
+            UpdaterAction::Recover => updater
+                .recover(now_ms())
+                .map(|outcomes| json!({ "recovered": outcomes }))
+                .map_err(|e| e.to_string()),
+        }
+    }
+    .await;
+
+    match rendered {
+        Ok(value) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).unwrap_or(value.to_string())
+            );
+        }
+        Err(e) => {
+            eprintln!("faktor updater: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `faktor enterprise <action>` — local parity with the
+/// `/native/enterprise/*` routes. The `[enterprise]` section must be
+/// enabled; the local operator acts as an owner principal of the configured
+/// organization (the daemon password is the local authority boundary, and
+/// the same role matrix is applied). GC and deletion advances scan the
+/// REAL session store and delete through the REAL guarded CAS.
+async fn enterprise_command(
+    action: EnterpriseAction,
+    data_dir: PathBuf,
+    config_path: Option<PathBuf>,
+) {
+    let (config, _semantic) = match serve_config_and_semantic(config_path) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("faktor enterprise: config error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let rendered: Result<Value, String> = (|| {
+        if !config.enterprise.enabled {
+            return Err(
+                "the [enterprise] section is disabled (set `enabled = true` and `organization`)"
+                    .into(),
+            );
+        }
+        let organization = config
+            .enterprise
+            .organization()?
+            .ok_or("enterprise: enabled without an organization")?;
+        let path = config
+            .enterprise
+            .enterprise_path(&data_dir)?
+            .ok_or("enterprise: enabled without a database path")?;
+        let store = Arc::new(
+            faktor_cloud::SqliteControlPlaneStore::open(&path)
+                .map_err(|e| format!("enterprise store {}: {e}", path.display()))?,
+        ) as Arc<dyn faktor_cloud::EnterpriseStore>;
+        let service = faktor_cloud::EnterpriseService::with_system_clock(store)
+            .map_err(|e| format!("enterprise service: {e}"))?;
+        let principal = faktor_cloud::Principal::user(
+            faktor_cloud::UserId::try_new("local-operator").map_err(|e| e.to_string())?,
+            organization.clone(),
+            faktor_cloud::Role::Owner,
+        );
+        let needs_runtime = matches!(
+            action,
+            EnterpriseAction::Gc { .. }
+                | EnterpriseAction::Deletion {
+                    action: EnterpriseDeletionAction::Advance { .. }
+                }
+        );
+        let runtime = if needs_runtime {
+            let session_store = Arc::new(
+                faktor_store::Store::open(data_dir.join("store"), false)
+                    .map_err(|e| format!("session store: {e}"))?,
+            );
+            let cas = Arc::new(
+                faktor_cas::Cas::open(data_dir.join("cas")).map_err(|e| format!("cas: {e}"))?,
+            );
+            Some(Arc::new(
+                faktor_server::native::enterprise::RetentionRuntime::new(session_store, cas),
+            ))
+        } else {
+            None
+        };
+
+        match action {
+            EnterpriseAction::Status => service
+                .status(&principal, &organization)
+                .map(|status| json!({ "status": status }))
+                .map_err(|e| e.to_string()),
+            EnterpriseAction::Audit { after, limit } => service
+                .audit_export(&principal, &organization, after, limit as usize)
+                .map(|export| {
+                    json!({
+                        "items": export.events,
+                        "nextCursor": export.next_cursor,
+                        "headSeq": export.head_seq,
+                    })
+                })
+                .map_err(|e| e.to_string()),
+            EnterpriseAction::Gc { limit } => {
+                let runtime = runtime
+                    .as_ref()
+                    .ok_or("enterprise: the gc runtime is unavailable (internal)")?;
+                runtime
+                    .gc(&service, &principal, limit as usize)
+                    .map(|report| json!({ "report": report }))
+                    .map_err(|e| e.to_string())
+            }
+            EnterpriseAction::Artifact { action } => match action {
+                EnterpriseArtifactAction::List { cursor, limit } => service
+                    .artifacts(&principal, &organization, cursor.as_deref(), limit as usize)
+                    .map(|page| json!({ "items": page.items, "nextCursor": page.next_cursor }))
+                    .map_err(|e| e.to_string()),
+                EnterpriseArtifactAction::Register {
+                    id,
+                    kind,
+                    digest,
+                    size,
+                    retention_class,
+                    ttl_ms,
+                    session,
+                    task,
+                    owner,
+                } => {
+                    let kind = faktor_cloud::ArtifactKind::parse(&kind)
+                        .ok_or_else(|| format!("unknown artifact kind {kind:?}"))?;
+                    let retention_class = faktor_cloud::RetentionClass::parse(&retention_class)
+                        .ok_or_else(|| format!("unknown retention class {retention_class:?}"))?;
+                    let new = faktor_cloud::NewArtifact {
+                        id: faktor_cloud::ArtifactId::try_new(id).map_err(|e| e.to_string())?,
+                        session,
+                        task,
+                        owner,
+                        kind,
+                        digest,
+                        size,
+                        retention_class,
+                        ttl_ms,
+                    };
+                    service
+                        .register_artifact(&principal, new)
+                        .map(|record| json!({ "artifact": record }))
+                        .map_err(|e| e.to_string())
+                }
+                EnterpriseArtifactAction::Eligible { id } => {
+                    let id = faktor_cloud::ArtifactId::try_new(id).map_err(|e| e.to_string())?;
+                    service
+                        .mark_eligible(&principal, &id)
+                        .map(|eligible| json!({ "eligible": eligible }))
+                        .map_err(|e| e.to_string())
+                }
+            },
+            EnterpriseAction::Deletion { action } => match action {
+                EnterpriseDeletionAction::Start { scope, user } => {
+                    let scope = match scope.as_str() {
+                        "organization" => faktor_cloud::DeletionScope::Organization,
+                        "account" => faktor_cloud::DeletionScope::Account {
+                            user: faktor_cloud::UserId::try_new(
+                                user.ok_or("deletion: an account scope requires --user")?,
+                            )
+                            .map_err(|e| e.to_string())?,
+                        },
+                        other => {
+                            return Err(format!(
+                                "deletion: scope {other:?} must be organization|account"
+                            ))
+                        }
+                    };
+                    service
+                        .start_deletion(&principal, scope)
+                        .map(|job| json!({ "job": job }))
+                        .map_err(|e| e.to_string())
+                }
+                EnterpriseDeletionAction::Show { id } => {
+                    let id = faktor_cloud::DeletionJobId::try_new(id).map_err(|e| e.to_string())?;
+                    service
+                        .deletion_job(&principal, &id)
+                        .map(|job| json!({ "job": job }))
+                        .map_err(|e| e.to_string())
+                }
+                EnterpriseDeletionAction::Advance { id } => {
+                    let id = faktor_cloud::DeletionJobId::try_new(id).map_err(|e| e.to_string())?;
+                    let runtime = runtime
+                        .as_ref()
+                        .ok_or("enterprise: the gc runtime is unavailable (internal)")?;
+                    runtime
+                        .advance(&service, &principal, &id)
+                        .map(|job| json!({ "job": job }))
+                        .map_err(|e| e.to_string())
+                }
+            },
+            EnterpriseAction::Settings => service
+                .settings(&principal, &organization)
+                .map(|settings| json!({ "settings": settings }))
+                .map_err(|e| e.to_string()),
+            EnterpriseAction::Config => {
+                let layers = config.enterprise.layers()?;
+                faktor_cloud::resolve_layers(&layers)
+                    .map(|effective| {
+                        json!({
+                            "digest": effective.digest,
+                            "attestation": effective.attestation(),
+                            "policies": effective.policies,
+                            "preferences": effective.preferences,
+                        })
+                    })
+                    .map_err(|e| e.to_string())
+            }
+        }
+    })();
+
+    match rendered {
+        Ok(value) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).unwrap_or(value.to_string())
+            );
+        }
+        Err(e) => {
+            eprintln!("faktor enterprise: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// `faktor-cli doctor [--deep]`: plain mode opens with the bounded quick
@@ -5995,6 +6989,308 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(30), daemon)
                 .await
                 .expect("daemon must stop on shutdown")
+                .expect("serve_impl returns Ok")
+                .unwrap();
+        }
+    }
+
+    /// Updater-disabled parity: a daemon with `[updater] enabled = false`
+    /// (and with an absent section) creates NO `update.db` and NO install
+    /// directory; an enabled daemon creates both under its data dir. The
+    /// operator key is a real ed25519 public key (the section validates key
+    /// material at load time).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn updater_disabled_daemon_creates_nothing_and_enabled_opens_the_store() {
+        const KEY: &str = "PMIf08ao62O4xMR4upvk5ymt++8EcWRtWHWZGLa4TKo=";
+        let enabled_json = format!(
+            r#"{{"model": "m", "updater": {{"enabled": true, "channel": "beta", "keys": [{{"id": "op-test", "public_key": "{KEY}"}}]}}}}"#
+        );
+        for (label, config_json, expect_updater) in [
+            ("absent", r#"{"model": "m"}"#.to_string(), false),
+            (
+                "disabled",
+                r#"{"model": "m", "updater": {"enabled": false}}"#.to_string(),
+                false,
+            ),
+            ("enabled", enabled_json, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("faktor-plus.json");
+            std::fs::write(&config, &config_json).unwrap();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let dir2 = dir.path().to_path_buf();
+            let daemon = tokio::task::spawn(async move {
+                serve_impl(0, dir2, Some(config), Some(ready_tx), Some(shutdown_rx)).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(60), ready_rx)
+                .await
+                .expect("serve must reach the startup line")
+                .expect("ready signal");
+            let update_db = dir.path().join("update.db");
+            let install_root = dir.path().join("install");
+            if expect_updater {
+                assert!(
+                    update_db.exists(),
+                    "{label}: an enabled [updater] section must open its store"
+                );
+                assert!(
+                    install_root.join("artifacts").is_dir()
+                        && install_root.join("staging").is_dir(),
+                    "{label}: an enabled [updater] section must create the install layout"
+                );
+                assert!(
+                    !install_root.join("current").exists(),
+                    "{label}: no artifact is installed before an apply"
+                );
+            } else {
+                assert!(
+                    !update_db.exists(),
+                    "{label}: a disabled [updater] section must create no database"
+                );
+                assert!(
+                    !install_root.exists(),
+                    "{label}: a disabled [updater] section must create no install root"
+                );
+            }
+            let _ = shutdown_tx.send(());
+            tokio::time::timeout(std::time::Duration::from_secs(30), daemon)
+                .await
+                .expect("daemon must stop on shutdown")
+                .expect("serve_impl returns Ok")
+                .unwrap();
+        }
+    }
+
+    /// Billing-disabled parity: a daemon with `[billing] enabled = false`
+    /// (and with an absent section) creates NO `billing.db`; an enabled
+    /// section (which requires `[cloud]`, the tenant principal) opens the
+    /// durable usage/credit ledger under the data dir and provisions the
+    /// configured account idempotently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn billing_disabled_daemon_creates_no_billing_db_and_enabled_provisions_it() {
+        let enabled_json = r#"{
+            "model": "m",
+            "cloud": {"enabled": true, "database": "cp.db", "scm_database": "repos.db"},
+            "billing": {
+                "enabled": true,
+                "database": "metering.db",
+                "organization": "org_local",
+                "account": "acct_local",
+                "managed_providers": ["managed-provider"],
+                "default_plan": "pro",
+                "plans": {"pro": {"plan_id": "pro", "limits": {"max_active_tasks": 1}}}
+            }
+        }"#;
+        for (label, config_json, expect_billing) in [
+            ("absent", r#"{"model": "m"}"#.to_string(), false),
+            (
+                "disabled",
+                r#"{"model": "m", "billing": {"enabled": false}}"#.to_string(),
+                false,
+            ),
+            ("enabled", enabled_json.to_string(), true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("faktor-plus.json");
+            std::fs::write(&config, &config_json).unwrap();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let dir2 = dir.path().to_path_buf();
+            let daemon = tokio::task::spawn(async move {
+                serve_impl(0, dir2, Some(config), Some(ready_tx), Some(shutdown_rx)).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(60), ready_rx)
+                .await
+                .expect("serve must reach the startup line")
+                .expect("ready signal");
+            let billing_db = dir.path().join("metering.db");
+            let default_billing_db = dir.path().join("billing.db");
+            if expect_billing {
+                assert!(
+                    billing_db.exists(),
+                    "{label}: an enabled [billing] section must open its ledger"
+                );
+                // The provisioned account is durable in THAT file: the
+                // wiring created exactly one organization-scoped account.
+                let store = std::sync::Arc::new(
+                    faktor_cloud::SqliteControlPlaneStore::open(&billing_db).unwrap(),
+                ) as std::sync::Arc<dyn faktor_cloud::BillingStore>;
+                let organization = faktor_cloud::OrganizationId::try_new("org_local").unwrap();
+                let accounts = store.billing_accounts(&organization, None, 10).unwrap();
+                assert_eq!(accounts.len(), 1, "{label}: exactly one account");
+                assert_eq!(accounts[0].id.as_str(), "acct_local");
+                assert!(accounts[0].managed, "the default account is managed");
+                assert!(
+                    store
+                        .billing_accounts(
+                            &faktor_cloud::OrganizationId::try_new("org_foreign").unwrap(),
+                            None,
+                            10
+                        )
+                        .unwrap()
+                        .is_empty(),
+                    "{label}: a foreign organization owns no account"
+                );
+            } else {
+                assert!(
+                    !billing_db.exists() && !default_billing_db.exists(),
+                    "{label}: a disabled [billing] section must create no database"
+                );
+            }
+            let _ = shutdown_tx.send(());
+            tokio::time::timeout(std::time::Duration::from_secs(30), daemon)
+                .await
+                .expect("daemon must stop on shutdown")
+                .expect("serve_impl returns Ok")
+                .unwrap();
+        }
+    }
+
+    /// Worker-plane parity: an absent or disabled `[workers]` section
+    /// creates NO worker database (the daemon is byte-identical to the
+    /// pre-worker-plane daemon); an enabled section (which requires
+    /// `[cloud]`) opens the durable plane with its OWN migration ladder and
+    /// wires the placement seam into the daemon's TaskExecutor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workers_disabled_daemon_creates_no_workers_db_and_enabled_opens_the_plane() {
+        let enabled_json = r#"{
+            "model": "m",
+            "cloud": {"enabled": true, "database": "cp.db", "scm_database": "repos.db"},
+            "workers": {
+                "enabled": true,
+                "database": "wp.db",
+                "organization": "org_local",
+                "trust_domain": "org_local",
+                "toolchains": ["rust"]
+            }
+        }"#;
+        for (label, config_json, expect_workers) in [
+            ("absent", r#"{"model": "m"}"#.to_string(), false),
+            (
+                "disabled",
+                r#"{"model": "m", "workers": {"enabled": false}}"#.to_string(),
+                false,
+            ),
+            ("enabled", enabled_json.to_string(), true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("faktor-plus.json");
+            std::fs::write(&config, &config_json).unwrap();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let dir2 = dir.path().to_path_buf();
+            let daemon = tokio::task::spawn(async move {
+                serve_impl(0, dir2, Some(config), Some(ready_tx), Some(shutdown_rx)).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(60), ready_rx)
+                .await
+                .expect("serve must reach the startup line")
+                .expect("ready signal");
+            let workers_db = dir.path().join("wp.db");
+            let default_workers_db = dir.path().join("workers.db");
+            if expect_workers {
+                assert!(
+                    workers_db.exists(),
+                    "{label}: an enabled [workers] section must open its durable plane"
+                );
+                // The plane's OWN migration ladder is applied (v1) — the
+                // commercial control-plane user_version is untouched.
+                let store = faktor_worker::SqliteWorkerStore::open(&workers_db).unwrap();
+                assert_eq!(faktor_worker::schema_version(&store).unwrap(), 1);
+                let plane =
+                    faktor_worker::WorkerPlane::with_system_clock(std::sync::Arc::new(store));
+                let organization = faktor_cloud::OrganizationId::try_new("org_local").unwrap();
+                assert!(plane
+                    .list_workers(&organization, None, 10)
+                    .unwrap()
+                    .items
+                    .is_empty());
+            } else {
+                assert!(
+                    !workers_db.exists() && !default_workers_db.exists(),
+                    "{label}: a disabled [workers] section must create no database"
+                );
+            }
+            let _ = shutdown_tx.send(());
+            tokio::time::timeout(std::time::Duration::from_secs(60), daemon)
+                .await
+                .expect("daemon shutdown")
+                .expect("serve_impl returns Ok")
+                .unwrap();
+        }
+    }
+    /// Enterprise-disabled parity: a daemon with `[enterprise] enabled =
+    /// false` (and with an absent section) creates NO enterprise database;
+    /// an enabled section (which requires `[cloud]`, the principal source)
+    /// opens the durable retention/audit database and creates its
+    /// append-only ledger table.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enterprise_disabled_daemon_creates_no_enterprise_db_and_enabled_opens_it() {
+        let enabled_json = r#"{
+            "model": "m",
+            "cloud": {"enabled": true, "database": "cp.db", "scm_database": "repos.db"},
+            "enterprise": {
+                "enabled": true,
+                "database": "ent.db",
+                "organization": "org_local"
+            }
+        }"#;
+        for (label, config_json, expect_enterprise) in [
+            ("absent", r#"{"model": "m"}"#.to_string(), false),
+            (
+                "disabled",
+                r#"{"model": "m", "enterprise": {"enabled": false}}"#.to_string(),
+                false,
+            ),
+            ("enabled", enabled_json.to_string(), true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("faktor-plus.json");
+            std::fs::write(&config, &config_json).unwrap();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let dir2 = dir.path().to_path_buf();
+            let daemon = tokio::task::spawn(async move {
+                serve_impl(0, dir2, Some(config), Some(ready_tx), Some(shutdown_rx)).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(60), ready_rx)
+                .await
+                .expect("serve must reach the startup line")
+                .expect("ready signal");
+            let enterprise_db = dir.path().join("ent.db");
+            let default_enterprise_db = dir.path().join("enterprise.db");
+            if expect_enterprise {
+                assert!(
+                    enterprise_db.exists(),
+                    "{label}: an enabled [enterprise] section must open its database"
+                );
+                let conn = rusqlite::Connection::open(&enterprise_db).unwrap();
+                let tables: Vec<String> = conn
+                    .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+                    .unwrap()
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert!(
+                    tables.iter().any(|name| name == "ent_audit_event"),
+                    "{label}: the append-only audit ledger table exists"
+                );
+                let audit_rows: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM ent_audit_event", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(audit_rows, 0, "{label}: a clean boot mints no audit rows");
+            } else {
+                assert!(
+                    !enterprise_db.exists() && !default_enterprise_db.exists(),
+                    "{label}: a disabled [enterprise] section must create no database"
+                );
+            }
+            let _ = shutdown_tx.send(());
+            tokio::time::timeout(std::time::Duration::from_secs(60), daemon)
+                .await
+                .expect("daemon shutdown")
                 .expect("serve_impl returns Ok")
                 .unwrap();
         }

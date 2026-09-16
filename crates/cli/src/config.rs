@@ -52,6 +52,30 @@ pub struct Config {
     /// while disabled the local daemon is byte-identical to the pre-cloud
     /// daemon and creates no database file.
     pub cloud: CloudCfg,
+    /// The additive `[billing]` section: the commercial metering service
+    /// (usage ledger + entitlements + credits). Disabled by default; while
+    /// disabled the local daemon is byte-identical to the pre-billing
+    /// daemon and creates no billing database file.
+    pub billing: BillingCfg,
+    /// The additive `[updater]` section: the signed updater/distribution
+    /// lifecycle. Disabled by default; while disabled the local daemon is
+    /// byte-identical to the pre-updater daemon and creates no `update.db`
+    /// and no install directory.
+    pub updater: UpdaterCfg,
+    /// The additive `[workers]` section: the remote/VPC worker plane
+    /// (registration tokens, immutable job generations, leases, heartbeats,
+    /// generation-checked result landing) plus the TaskExecutor placement
+    /// seam. Disabled by default; while disabled the local daemon creates
+    /// no worker database file, every worker route answers a typed 409
+    /// `workers_disabled`, and every task run executes locally exactly as
+    /// before.
+    pub workers: WorkersCfg,
+    /// The additive `[enterprise]` section: retention classes + guarded GC,
+    /// the append-only audit ledger, deletion jobs, admin settings and the
+    /// layered configuration. Disabled by default; while disabled the local
+    /// daemon creates no enterprise database file and every
+    /// `/native/enterprise/*` route answers a typed 409.
+    pub enterprise: EnterpriseCfg,
 }
 
 /// The additive `[completion]` section (P2 follow-up): how a contracted
@@ -554,11 +578,910 @@ impl CloudCfg {
     }
 }
 
+/// The additive `[updater]` section: the signed updater/distribution
+/// lifecycle (stable/beta/dev channels, ed25519 operator keys, staged
+/// content-addressed installs).
+///
+/// Strict and additive:
+///
+/// - `enabled` (default `false`): when false — the default and the ONLY
+///   value for every pre-existing config — the daemon builds NO updater,
+///   creates no `update.db` and no install directory, and every
+///   `/native/updater/*` route answers a typed 409 `updater_disabled`.
+///   The local daemon is byte-identical to the pre-updater daemon;
+/// - `channel` (default `stable`): one of `stable|beta|dev`; only manifests
+///   the configured channel accepts can advance;
+/// - `install_root` (default `install`): the install directory that holds
+///   the content-addressed artifacts and the atomic `current` pointer.
+///   Either an absolute path or a relative path INSIDE the data dir (no
+///   `..`, no control characters, bounded);
+/// - `keys` (required when enabled): the operator ed25519 allowlist, each
+///   `{id, public_key}` with `public_key` = base64 of the raw 32-byte key.
+///   An empty allowlist refuses every manifest (there is no implicit trust
+///   anchor), so an enabled section without keys is a config error;
+/// - `max_artifact_bytes` (default 256 MiB, cap 4 GiB) and `clock_skew_ms`
+///   (default 5 minutes, cap 1 hour) are bounded.
+///
+/// Unknown keys, duplicates, non-object shapes and wrong value types are
+/// parse errors.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default)]
+pub struct UpdaterCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub install_root: Option<String>,
+    #[serde(default)]
+    pub max_artifact_bytes: Option<u64>,
+    #[serde(default)]
+    pub clock_skew_ms: Option<i64>,
+    #[serde(default)]
+    pub keys: Vec<UpdaterKeyCfg>,
+}
+
+/// One allowlisted operator key: an identity and its raw base64 ed25519
+/// public key (32 bytes).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdaterKeyCfg {
+    pub id: String,
+    pub public_key: String,
+}
+
+/// The `[updater]` keys, in stable order (unknown-field errors list them).
+pub const UPDATER_FIELDS: &[&str] = &[
+    "enabled",
+    "channel",
+    "install_root",
+    "max_artifact_bytes",
+    "clock_skew_ms",
+    "keys",
+];
+
+/// The default install directory name under the daemon data dir.
+pub const DEFAULT_UPDATER_INSTALL_ROOT: &str = "install";
+/// The default updater database file name.
+pub const DEFAULT_UPDATER_DATABASE: &str = "update.db";
+/// Bound on the configured install root.
+pub const MAX_UPDATER_INSTALL_ROOT_BYTES: usize = 1024;
+/// Bound on the operator key allowlist.
+pub const MAX_UPDATER_KEYS: usize = 8;
+/// The largest `max_artifact_bytes` an operator may configure (4 GiB).
+pub const MAX_UPDATER_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// The largest accepted clock skew (1 hour).
+pub const MAX_UPDATER_CLOCK_SKEW_MS: i64 = 60 * 60 * 1000;
+
+impl<'de> serde::Deserialize<'de> for UpdaterCfg {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error as _, MapAccess, Visitor};
+
+        struct SectionVisitor;
+
+        impl<'de> Visitor<'de> for SectionVisitor {
+            type Value = UpdaterCfg;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("the [updater] section as a JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<UpdaterCfg, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut out = UpdaterCfg::default();
+                let mut seen: u8 = 0;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "enabled" => {
+                            if seen & 1 != 0 {
+                                return Err(A::Error::duplicate_field("enabled"));
+                            }
+                            seen |= 1;
+                            out.enabled = map.next_value::<bool>()?;
+                        }
+                        "channel" => {
+                            if seen & 2 != 0 {
+                                return Err(A::Error::duplicate_field("channel"));
+                            }
+                            seen |= 2;
+                            out.channel = map.next_value::<Option<String>>()?;
+                        }
+                        "install_root" => {
+                            if seen & 4 != 0 {
+                                return Err(A::Error::duplicate_field("install_root"));
+                            }
+                            seen |= 4;
+                            out.install_root = map.next_value::<Option<String>>()?;
+                        }
+                        "max_artifact_bytes" => {
+                            if seen & 8 != 0 {
+                                return Err(A::Error::duplicate_field("max_artifact_bytes"));
+                            }
+                            seen |= 8;
+                            out.max_artifact_bytes = map.next_value::<Option<u64>>()?;
+                        }
+                        "clock_skew_ms" => {
+                            if seen & 16 != 0 {
+                                return Err(A::Error::duplicate_field("clock_skew_ms"));
+                            }
+                            seen |= 16;
+                            out.clock_skew_ms = map.next_value::<Option<i64>>()?;
+                        }
+                        "keys" => {
+                            if seen & 32 != 0 {
+                                return Err(A::Error::duplicate_field("keys"));
+                            }
+                            seen |= 32;
+                            out.keys = map.next_value::<Vec<UpdaterKeyCfg>>()?;
+                        }
+                        other => return Err(A::Error::unknown_field(other, UPDATER_FIELDS)),
+                    }
+                }
+                Ok(out)
+            }
+        }
+
+        de.deserialize_map(SectionVisitor)
+    }
+}
+
+impl UpdaterCfg {
+    /// The configured channel (default `stable`).
+    pub fn channel(&self) -> Result<faktor_updater::Channel, String> {
+        let raw = self.channel.as_deref().unwrap_or("stable");
+        faktor_updater::Channel::parse(raw)
+            .ok_or_else(|| format!("updater: channel {raw:?} must be stable|beta|dev"))
+    }
+
+    /// Validate one install-root value: bounded ASCII, no control
+    /// characters, no `..` traversal. Absolute paths are allowed; relative
+    /// paths live under the daemon data dir.
+    pub fn validate_install_root(raw: &str) -> Result<(), String> {
+        if raw.is_empty() || raw.len() > MAX_UPDATER_INSTALL_ROOT_BYTES || !raw.is_ascii() {
+            return Err(format!(
+                "updater: install_root must be 1..={MAX_UPDATER_INSTALL_ROOT_BYTES} ASCII bytes"
+            ));
+        }
+        if raw.bytes().any(|b| b.is_ascii_control()) {
+            return Err("updater: install_root contains control characters".into());
+        }
+        if raw.split(['/', '\\']).any(|part| part == "..") {
+            return Err(format!(
+                "updater: install_root {raw:?} must not contain `..` traversal"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate the section (called by [`Config::validate`] on both load
+    /// paths). A disabled section validates nothing beyond its shape.
+    pub fn validate(&self) -> Result<(), String> {
+        self.channel()?;
+        if let Some(install_root) = &self.install_root {
+            Self::validate_install_root(install_root)?;
+        }
+        if let Some(max) = self.max_artifact_bytes {
+            if max == 0 || max > MAX_UPDATER_ARTIFACT_BYTES {
+                return Err(format!(
+                    "updater: max_artifact_bytes must be 1..={MAX_UPDATER_ARTIFACT_BYTES}"
+                ));
+            }
+        }
+        if let Some(skew) = self.clock_skew_ms {
+            if !(0..=MAX_UPDATER_CLOCK_SKEW_MS).contains(&skew) {
+                return Err(format!(
+                    "updater: clock_skew_ms must be 0..={MAX_UPDATER_CLOCK_SKEW_MS}"
+                ));
+            }
+        }
+        if self.keys.len() > MAX_UPDATER_KEYS {
+            return Err(format!(
+                "updater: at most {MAX_UPDATER_KEYS} operator keys may be configured"
+            ));
+        }
+        let mut seen: Vec<&str> = Vec::with_capacity(self.keys.len());
+        for key in &self.keys {
+            if seen.contains(&key.id.as_str()) {
+                return Err(format!("updater: key id {:?} is configured twice", key.id));
+            }
+            seen.push(&key.id);
+        }
+        if self.enabled && self.keys.is_empty() {
+            return Err(
+                "updater: an enabled [updater] section requires at least one operator key \
+                 (an empty allowlist refuses every manifest)"
+                    .into(),
+            );
+        }
+        // Key material is validated whenever it is present, so a bad key is
+        // a startup error BEFORE an operator flips `enabled`.
+        self.trusted_keys()?;
+        Ok(())
+    }
+
+    /// The operator key allowlist as the updater expects it.
+    pub fn trusted_keys(&self) -> Result<faktor_updater::TrustedKeys, String> {
+        let mut keys = Vec::with_capacity(self.keys.len());
+        for key in &self.keys {
+            keys.push(
+                faktor_updater::TrustedKey::from_base64(&key.id, &key.public_key)
+                    .map_err(|e| format!("updater: {e}"))?,
+            );
+        }
+        faktor_updater::TrustedKeys::new(keys).map_err(|e| format!("updater: {e}"))
+    }
+
+    /// The resolved artifact bound.
+    pub fn max_artifact_bytes_resolved(&self) -> u64 {
+        self.max_artifact_bytes
+            .unwrap_or(faktor_updater::DEFAULT_MAX_ARTIFACT_BYTES)
+    }
+
+    /// The resolved clock skew.
+    pub fn clock_skew_ms_resolved(&self) -> i64 {
+        self.clock_skew_ms
+            .unwrap_or(faktor_updater::DEFAULT_CLOCK_SKEW_MS)
+    }
+
+    /// The install root under `data_dir` (`None` when the section is
+    /// disabled — the daemon then never creates it).
+    pub fn install_root_path(&self, data_dir: &Path) -> Result<Option<std::path::PathBuf>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        self.validate()?;
+        let raw = self
+            .install_root
+            .clone()
+            .unwrap_or_else(|| DEFAULT_UPDATER_INSTALL_ROOT.to_string());
+        let path = std::path::PathBuf::from(&raw);
+        Ok(Some(if path.is_absolute() {
+            path
+        } else {
+            data_dir.join(path)
+        }))
+    }
+
+    /// The resolved updater database path under `data_dir` (`None` when the
+    /// section is disabled).
+    pub fn database_path(&self, data_dir: &Path) -> Result<Option<std::path::PathBuf>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        self.validate()?;
+        Ok(Some(data_dir.join(DEFAULT_UPDATER_DATABASE)))
+    }
+}
+
+/// The additive `[billing]` section: the Wave 3 commercial metering service
+/// (usage ledger + entitlements + credits).
+///
+/// Strict and additive:
+///
+/// - `enabled` (default `false`): when false — the default and the only
+///   value for every pre-existing config — the daemon builds NO billing
+///   service, creates no billing database file, and every
+///   `/native/entitlements`, `/native/credits/grant` and
+///   `/native/usage?org=...` request answers a typed 409 `billing_disabled`.
+///   The local daemon is byte-identical to the pre-billing daemon;
+/// - `database`: an optional simple FILE NAME (default `billing.db`) for
+///   the durable usage/credit ledger. It reuses the control-plane store's
+///   migration ladder (its own `user_version` v2 tables);
+/// - `organization`: the organization the local daemon's sessions meter
+///   into (required when enabled: a billing service without a tenant would
+///   admit nothing and account for nothing);
+/// - `account` / `account_name` / `managed`: the local billing account
+///   provisioned idempotently at startup. `managed = true` (default)
+///   permits Faktor-managed provider spend (credits are debited); `false`
+///   restricts the account to BYOK usage (recorded, never debited);
+/// - `default_plan` + `plans` + `managed_providers`: the plan table is the
+///   ONLY source of features/limits and the managed-provider set the ONLY
+///   source of the managed/BYOK decision. Unknown plan/feature/limit names
+///   are refused loudly; an enabled section with no plans (or a default
+///   plan outside the table) is a startup error — the daemon never boots
+///   with a silently empty entitlement surface;
+/// - unknown keys, duplicates, non-object shapes and wrong value types are
+///   parse errors.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default)]
+pub struct BillingCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub database: Option<String>,
+    #[serde(default)]
+    pub organization: Option<String>,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub account_name: Option<String>,
+    /// Whether the provisioned account permits Faktor-managed provider
+    /// spend (default `true`; `false` = a BYOK-only account).
+    #[serde(default)]
+    pub managed: Option<bool>,
+    #[serde(default)]
+    pub default_plan: Option<String>,
+    /// The plan table, keyed by plan id (each `PlanConfig.plan_id` must
+    /// equal its key). Strict shapes come from `faktor_cloud::PlanConfig`.
+    #[serde(default)]
+    pub plans: std::collections::BTreeMap<String, faktor_cloud::PlanConfig>,
+    /// Provider ids whose spend is Faktor-managed; every other provider is
+    /// BYOK. Empty = all providers are BYOK.
+    #[serde(default)]
+    pub managed_providers: Vec<String>,
+}
+
+/// The `[billing]` keys, in stable order (unknown-field errors list them).
+pub const BILLING_FIELDS: &[&str] = &[
+    "enabled",
+    "database",
+    "organization",
+    "account",
+    "account_name",
+    "managed",
+    "default_plan",
+    "plans",
+    "managed_providers",
+];
+
+/// The default billing database file name (relative to the daemon data
+/// dir).
+pub const DEFAULT_BILLING_DATABASE: &str = "billing.db";
+
+impl<'de> serde::Deserialize<'de> for BillingCfg {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error as _, MapAccess, Visitor};
+
+        struct SectionVisitor;
+
+        impl<'de> Visitor<'de> for SectionVisitor {
+            type Value = BillingCfg;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("the [billing] section as a JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<BillingCfg, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut out = BillingCfg::default();
+                let mut seen: u16 = 0;
+                while let Some(key) = map.next_key::<String>()? {
+                    let (bit, name) = match key.as_str() {
+                        "enabled" => (1u16, "enabled"),
+                        "database" => (2, "database"),
+                        "organization" => (4, "organization"),
+                        "account" => (8, "account"),
+                        "account_name" => (16, "account_name"),
+                        "managed" => (32, "managed"),
+                        "default_plan" => (64, "default_plan"),
+                        "plans" => (128, "plans"),
+                        "managed_providers" => (256, "managed_providers"),
+                        other => return Err(A::Error::unknown_field(other, BILLING_FIELDS)),
+                    };
+                    if seen & bit != 0 {
+                        return Err(A::Error::duplicate_field(name));
+                    }
+                    seen |= bit;
+                    match bit {
+                        1 => out.enabled = map.next_value::<bool>()?,
+                        2 => out.database = map.next_value::<Option<String>>()?,
+                        4 => out.organization = map.next_value::<Option<String>>()?,
+                        8 => out.account = map.next_value::<Option<String>>()?,
+                        16 => out.account_name = map.next_value::<Option<String>>()?,
+                        32 => out.managed = map.next_value::<Option<bool>>()?,
+                        64 => out.default_plan = map.next_value::<Option<String>>()?,
+                        128 => {
+                            out.plans = map.next_value::<std::collections::BTreeMap<
+                                String,
+                                faktor_cloud::PlanConfig,
+                            >>()?
+                        }
+                        _ => out.managed_providers = map.next_value::<Vec<String>>()?,
+                    }
+                }
+                Ok(out)
+            }
+        }
+
+        de.deserialize_map(SectionVisitor)
+    }
+}
+
+impl BillingCfg {
+    /// The strict billing configuration handed to the service (`None` while
+    /// disabled). Validated eagerly: a plan table the config cannot honor is
+    /// refused at load, never at first admission.
+    pub fn service_config(&self) -> Result<Option<faktor_cloud::BillingConfig>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        self.validate()?;
+        Ok(Some(self.build_service_config()?))
+    }
+
+    /// Build (and validate) the cloud-side configuration without recursing
+    /// back into [`Self::validate`].
+    fn build_service_config(&self) -> Result<faktor_cloud::BillingConfig, String> {
+        let config = faktor_cloud::BillingConfig {
+            default_plan: self.default_plan.clone(),
+            plans: self.plans.clone(),
+            managed_providers: self.managed_providers.iter().cloned().collect(),
+        };
+        config.validate().map_err(|e| format!("billing: {e}"))?;
+        Ok(config)
+    }
+
+    /// The resolved billing database path under `data_dir` (`None` when the
+    /// section is disabled — the daemon then never creates it).
+    pub fn billing_path(&self, data_dir: &Path) -> Result<Option<std::path::PathBuf>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        self.validate()?;
+        let name = self
+            .database
+            .clone()
+            .unwrap_or_else(|| DEFAULT_BILLING_DATABASE.to_string());
+        Ok(Some(data_dir.join(name)))
+    }
+
+    /// The organization the daemon meters into (required when enabled).
+    pub fn organization(&self) -> Result<faktor_cloud::OrganizationId, String> {
+        let raw = self.organization.clone().ok_or_else(|| {
+            "billing: an enabled [billing] section requires `organization`".to_string()
+        })?;
+        faktor_cloud::OrganizationId::try_new(raw).map_err(|e| format!("billing: {e}"))
+    }
+
+    /// The provisioned billing account id (default `local`).
+    pub fn account_id(&self) -> Result<faktor_cloud::BillingAccountId, String> {
+        let raw = self.account.clone().unwrap_or_else(|| "local".to_string());
+        faktor_cloud::BillingAccountId::try_new(raw).map_err(|e| format!("billing: {e}"))
+    }
+
+    /// Validate the section (called by [`Config::validate`] on both load
+    /// paths). A disabled section validates nothing beyond its shape.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(database) = &self.database {
+            CloudCfg::validate_database_name("billing database", database)?;
+        }
+        if self.enabled {
+            let organization = self.organization()?;
+            let _ = organization;
+            let account = self.account_id()?;
+            let _ = account;
+            if let Some(name) = &self.account_name {
+                if name.is_empty() || name.len() > 128 {
+                    return Err("billing: account_name must be 1..=128 bytes".into());
+                }
+            }
+            if self.plans.is_empty() {
+                return Err(
+                    "billing: an enabled section requires a non-empty `plans` table (the ONLY source of features/limits)"
+                        .into(),
+                );
+            }
+            self.build_service_config()?;
+        }
+        Ok(())
+    }
+}
+
+/// The additive `[workers]` section: the remote/VPC worker plane.
+///
+/// Strict and additive:
+///
+/// - `enabled` (default `false`): when false — the default and the only
+///   value for every pre-existing config — the daemon builds NO worker
+///   plane, creates no worker database file, every `/native/workers*` and
+///   `/native/jobs/*` route answers a typed 409 `workers_disabled`, and the
+///   TaskExecutor's placement seam stays DISABLED (local execution is
+///   byte-identical to the pre-worker-plane daemon);
+/// - `database`: an optional simple FILE NAME (default `workers.db`) for
+///   the durable worker plane. The worker crate owns its OWN migration
+///   ladder (`user_version` v1); the control-plane/billing `user_version`
+///   is never touched;
+/// - `organization`: the organization the plane leases jobs for (required
+///   when enabled);
+/// - `trust_domain`: the trust domain of the plane's jobs (default: the
+///   organization id). Workers register into it and can only ever lease
+///   jobs of their own organization AND trust domain;
+/// - `os` / `arch` / `toolchains` / `network` / `region` / `min_cpu_cores`
+///   / `min_memory_mb` / `gpu`: the placement REQUIREMENTS the daemon
+///   demands of a worker before a task run is placed remotely. Empty
+///   defaults mean "any registered worker of the trust domain".
+///
+/// When enabled AND at least one eligible worker is registered, a new task
+/// run is placed remotely: the plane mints one immutable job generation,
+/// CAS-accepts its lease and the local executor starts NOTHING (the receipt
+/// names the remote job). Without an eligible worker the run executes
+/// locally exactly as before.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default)]
+pub struct WorkersCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub database: Option<String>,
+    #[serde(default)]
+    pub organization: Option<String>,
+    #[serde(default)]
+    pub trust_domain: Option<String>,
+    #[serde(default)]
+    pub os: Option<String>,
+    #[serde(default)]
+    pub arch: Option<String>,
+    #[serde(default)]
+    pub toolchains: Vec<String>,
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub min_cpu_cores: u32,
+    #[serde(default)]
+    pub min_memory_mb: u64,
+    #[serde(default)]
+    pub gpu: bool,
+}
+
+/// The `[workers]` keys, in stable order (unknown-field errors list them).
+pub const WORKERS_FIELDS: &[&str] = &[
+    "enabled",
+    "database",
+    "organization",
+    "trust_domain",
+    "os",
+    "arch",
+    "toolchains",
+    "network",
+    "region",
+    "min_cpu_cores",
+    "min_memory_mb",
+    "gpu",
+];
+
+/// The default worker-plane database file name (relative to the daemon data
+/// dir).
+pub const DEFAULT_WORKERS_DATABASE: &str = "workers.db";
+
+impl<'de> serde::Deserialize<'de> for WorkersCfg {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error as _, MapAccess, Visitor};
+
+        struct SectionVisitor;
+
+        impl<'de> Visitor<'de> for SectionVisitor {
+            type Value = WorkersCfg;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("the [workers] section as a JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<WorkersCfg, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut out = WorkersCfg::default();
+                let mut seen: u16 = 0;
+                while let Some(key) = map.next_key::<String>()? {
+                    let (bit, name) = match key.as_str() {
+                        "enabled" => (1u16, "enabled"),
+                        "database" => (2, "database"),
+                        "organization" => (4, "organization"),
+                        "trust_domain" => (8, "trust_domain"),
+                        "os" => (16, "os"),
+                        "arch" => (32, "arch"),
+                        "toolchains" => (64, "toolchains"),
+                        "network" => (128, "network"),
+                        "region" => (256, "region"),
+                        "min_cpu_cores" => (512, "min_cpu_cores"),
+                        "min_memory_mb" => (1024, "min_memory_mb"),
+                        "gpu" => (2048, "gpu"),
+                        other => return Err(A::Error::unknown_field(other, WORKERS_FIELDS)),
+                    };
+                    if seen & bit != 0 {
+                        return Err(A::Error::duplicate_field(name));
+                    }
+                    seen |= bit;
+                    match bit {
+                        1 => out.enabled = map.next_value::<bool>()?,
+                        2 => out.database = map.next_value::<Option<String>>()?,
+                        4 => out.organization = map.next_value::<Option<String>>()?,
+                        8 => out.trust_domain = map.next_value::<Option<String>>()?,
+                        16 => out.os = map.next_value::<Option<String>>()?,
+                        32 => out.arch = map.next_value::<Option<String>>()?,
+                        64 => out.toolchains = map.next_value::<Vec<String>>()?,
+                        128 => out.network = map.next_value::<Option<String>>()?,
+                        256 => out.region = map.next_value::<Option<String>>()?,
+                        512 => out.min_cpu_cores = map.next_value::<u32>()?,
+                        1024 => out.min_memory_mb = map.next_value::<u64>()?,
+                        _ => out.gpu = map.next_value::<bool>()?,
+                    }
+                }
+                Ok(out)
+            }
+        }
+
+        de.deserialize_map(SectionVisitor)
+    }
+}
+
+impl WorkersCfg {
+    /// The resolved worker-plane database path under `data_dir` (`None`
+    /// when the section is disabled — the daemon then never creates it).
+    pub fn workers_path(&self, data_dir: &Path) -> Result<Option<std::path::PathBuf>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        self.validate()?;
+        let name = self
+            .database
+            .clone()
+            .unwrap_or_else(|| DEFAULT_WORKERS_DATABASE.to_string());
+        Ok(Some(data_dir.join(name)))
+    }
+
+    /// The organization the plane leases jobs for (required when enabled).
+    pub fn organization(&self) -> Result<faktor_cloud::OrganizationId, String> {
+        let raw = self.organization.clone().ok_or_else(|| {
+            "workers: an enabled [workers] section requires `organization`".to_string()
+        })?;
+        faktor_cloud::OrganizationId::try_new(raw).map_err(|e| format!("workers: {e}"))
+    }
+
+    /// The plane's trust domain (default: the organization id).
+    pub fn trust_domain(&self) -> Result<String, String> {
+        let organization = self.organization()?;
+        match &self.trust_domain {
+            None => Ok(organization.as_str().to_string()),
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() || trimmed.len() > 128 {
+                    return Err("workers: trust_domain must be 1..=128 bytes".into());
+                }
+                if !trimmed.bytes().all(|b| b.is_ascii_graphic()) {
+                    return Err(
+                        "workers: trust_domain must be printable ASCII without whitespace".into(),
+                    );
+                }
+                Ok(trimmed.to_ascii_lowercase())
+            }
+        }
+    }
+
+    /// The placement requirement defaults demanded of an eligible worker.
+    pub fn requirements(&self) -> Result<faktor_worker::JobRequirements, String> {
+        let trust_domain = self.trust_domain()?;
+        let network = match self.network.as_deref() {
+            None => None,
+            Some("none") => Some(faktor_worker::NetworkProfile::None),
+            Some("egress_restricted") => Some(faktor_worker::NetworkProfile::EgressRestricted),
+            Some("full") => Some(faktor_worker::NetworkProfile::Full),
+            Some(other) => {
+                return Err(format!(
+                    "workers: network {other:?} must be one of none|egress_restricted|full"
+                ))
+            }
+        };
+        let mut requirements = faktor_worker::JobRequirements {
+            os: self.os.clone(),
+            arch: self.arch.clone(),
+            toolchains: self.toolchains.clone(),
+            sandbox: Vec::new(),
+            network,
+            min_cpu_cores: self.min_cpu_cores,
+            min_memory_mb: self.min_memory_mb,
+            gpu: self.gpu,
+            region: self.region.clone(),
+            trust_domain,
+        };
+        requirements
+            .normalize()
+            .map_err(|e| format!("workers: {e}"))?;
+        Ok(requirements)
+    }
+
+    /// Validate the section (called by [`Config::validate`] on both load
+    /// paths). A disabled section validates nothing beyond its shape.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(database) = &self.database {
+            CloudCfg::validate_database_name("workers database", database)?;
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+        let _ = self.organization()?;
+        let _ = self.trust_domain()?;
+        let _ = self.requirements()?;
+        Ok(())
+    }
+}
+
+/// The additive `[enterprise]` section: the enterprise retention/audit/
+/// admin plane (retention classes + guarded GC, the append-only audit
+/// ledger, deletion jobs, admin settings and the effective-config
+/// attestation). Disabled by default: no database is created, every
+/// `/native/enterprise/*` route answers a typed 409 `enterprise_disabled`,
+/// and the daemon is otherwise byte-identical.
+///
+/// Strict by construction (`deny_unknown_fields`: unknown keys, duplicates
+/// and wrong value types are parse errors on both load paths):
+///
+/// - `enabled` (default `false`);
+/// - `database`: an optional simple FILE NAME relative to the data dir
+///   (default `enterprise.db`); paths/traversal are refused;
+/// - `organization`: the tenant the local operator administers (required
+///   when enabled; also the principal used by the `faktor enterprise`
+///   local-parity subcommands);
+/// - `[enterprise.policy]`: the LOCAL organization policy layer of the
+///   layered configuration (allowed sets; intersect-only);
+/// - `[enterprise.preferences]`: the LOCAL user preference layer (chosen
+///   values; refused when outside the policy).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct EnterpriseCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub database: Option<String>,
+    #[serde(default)]
+    pub organization: Option<String>,
+    #[serde(default)]
+    pub policy: EnterprisePolicyCfg,
+    #[serde(default)]
+    pub preferences: EnterprisePreferenceCfg,
+}
+
+/// The `[enterprise.policy]` keys: allowed sets per configuration key
+/// (intersect-only policy semantics; an empty list is refused by the
+/// resolver, never silently accepted).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct EnterprisePolicyCfg {
+    #[serde(default)]
+    pub network: Option<Vec<String>>,
+    #[serde(default)]
+    pub providers: Option<Vec<String>>,
+    #[serde(default)]
+    pub models: Option<Vec<String>>,
+    #[serde(default)]
+    pub tool_grants: Option<Vec<String>>,
+    #[serde(default)]
+    pub retention: Option<Vec<String>>,
+}
+
+/// The `[enterprise.preferences]` keys: the chosen value per configuration
+/// key (a preference outside the effective policy is refused).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct EnterprisePreferenceCfg {
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub providers: Option<String>,
+    #[serde(default)]
+    pub models: Option<String>,
+    #[serde(default)]
+    pub tool_grants: Option<String>,
+    #[serde(default)]
+    pub retention: Option<String>,
+}
+
+/// The default enterprise-plane database file name (relative to the daemon
+/// data dir).
+pub const DEFAULT_ENTERPRISE_DATABASE: &str = "enterprise.db";
+
+impl EnterpriseCfg {
+    /// The resolved database path (`None` while disabled).
+    pub fn enterprise_path(&self, data_dir: &Path) -> Result<Option<std::path::PathBuf>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let name = self
+            .database
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ENTERPRISE_DATABASE.to_string());
+        CloudCfg::validate_database_name("enterprise database", &name)?;
+        Ok(Some(data_dir.join(name)))
+    }
+
+    /// The tenant the local operator administers.
+    pub fn organization(&self) -> Result<Option<faktor_cloud::OrganizationId>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let raw = self
+            .organization
+            .as_deref()
+            .ok_or("enterprise: an enabled [enterprise] section requires `organization`")?;
+        let trimmed = raw.trim();
+        faktor_cloud::OrganizationId::try_new(trimmed)
+            .map(Some)
+            .map_err(|e| format!("enterprise: organization: {e}"))
+    }
+
+    /// The ordered local layers of the layered configuration: the
+    /// organization POLICY layer (optional) then the user PREFERENCE layer
+    /// (optional). Semantics and ceilings are enforced by
+    /// [`faktor_cloud::resolve_layers`], the ONE resolver both this local
+    /// parity path and the server route use.
+    pub fn layers(&self) -> Result<Vec<faktor_cloud::ConfigLayer>, String> {
+        use faktor_cloud::{ConfigKey, ConfigLayer, ConfigScope, LayerSemantics, LayerValue};
+        let mut layers = Vec::new();
+        let policy_values: Vec<(ConfigKey, LayerValue)> = [
+            (ConfigKey::Network, self.policy.network.as_ref()),
+            (ConfigKey::Providers, self.policy.providers.as_ref()),
+            (ConfigKey::Models, self.policy.models.as_ref()),
+            (ConfigKey::ToolGrants, self.policy.tool_grants.as_ref()),
+            (ConfigKey::Retention, self.policy.retention.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(key, values)| values.map(|values| (key, LayerValue::Policy(values.clone()))))
+        .collect();
+        if !policy_values.is_empty() {
+            layers.push(ConfigLayer {
+                scope: ConfigScope::Organization,
+                semantics: LayerSemantics::Policy,
+                scope_ref: self.organization.clone(),
+                revision: 1,
+                values: policy_values.into_iter().collect(),
+            });
+        }
+        let preference_values: Vec<(ConfigKey, LayerValue)> = [
+            (ConfigKey::Network, self.preferences.network.as_ref()),
+            (ConfigKey::Providers, self.preferences.providers.as_ref()),
+            (ConfigKey::Models, self.preferences.models.as_ref()),
+            (ConfigKey::ToolGrants, self.preferences.tool_grants.as_ref()),
+            (ConfigKey::Retention, self.preferences.retention.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| (key, LayerValue::Preference(value.clone()))))
+        .collect();
+        if !preference_values.is_empty() {
+            layers.push(ConfigLayer {
+                scope: ConfigScope::User,
+                semantics: LayerSemantics::Preference,
+                scope_ref: self.organization.clone(),
+                revision: 1,
+                values: preference_values.into_iter().collect(),
+            });
+        }
+        for layer in &layers {
+            layer.validate().map_err(|e| format!("enterprise: {e}"))?;
+        }
+        Ok(layers)
+    }
+
+    /// Validate the section (called by [`Config::validate`] on both load
+    /// paths). A disabled section validates nothing beyond its shape.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(database) = &self.database {
+            CloudCfg::validate_database_name("enterprise database", database)?;
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+        let _ = self.organization()?;
+        let _ = self.layers()?;
+        Ok(())
+    }
+}
+
 /// The additive `[embeddings]` section: ONE selected semantic embedding
 /// provider. Strict by construction (map-only parsing: unknown keys,
 /// duplicate keys, non-object shapes and wrong value types are parse
-/// errors) and strictly additive (an absent section keeps no embedder):
-///
+/// errors) and strictly additive (an absent section keeps no embedder):///
 /// - `provider` names a REGISTERED provider instance id;
 /// - `model` names the embedding model that instance serves;
 /// - `policy` decides what an unresolvable selection means:
@@ -783,6 +1706,14 @@ impl<'de> serde::Deserialize<'de> for Config {
             embeddings: Option<EmbeddingCfg>,
             #[serde(default)]
             cloud: CloudCfg,
+            #[serde(default)]
+            billing: BillingCfg,
+            #[serde(default)]
+            updater: UpdaterCfg,
+            #[serde(default)]
+            workers: WorkersCfg,
+            #[serde(default)]
+            enterprise: EnterpriseCfg,
         }
         let file = File::deserialize(de)?;
         if file.config_version != 1 {
@@ -806,6 +1737,10 @@ impl<'de> serde::Deserialize<'de> for Config {
             efficiency: file.efficiency,
             embeddings: file.embeddings,
             cloud: file.cloud,
+            billing: file.billing,
+            updater: file.updater,
+            workers: file.workers,
+            enterprise: file.enterprise,
         })
     }
 }
@@ -842,6 +1777,10 @@ impl Default for Config {
             efficiency: EfficiencyCfg::production_defaults(),
             embeddings: None,
             cloud: CloudCfg::default(),
+            billing: BillingCfg::default(),
+            updater: UpdaterCfg::default(),
+            workers: WorkersCfg::default(),
+            enterprise: EnterpriseCfg::default(),
         }
     }
 }
@@ -1515,6 +2454,43 @@ impl Config {
             embeddings.validate()?;
         }
         self.cloud.validate()?;
+        self.billing.validate()?;
+        self.updater.validate()?;
+        self.workers.validate()?;
+        self.enterprise.validate()?;
+        // The billing routes derive their tenant from the control-plane
+        // principal, so an enabled billing section without the cloud section
+        // could never authorize an organization-scoped read. The pair is
+        // refused at load — the daemon never boots with an unauthenticated
+        // billing surface.
+        if self.billing.enabled && !self.cloud.enabled {
+            return Err(
+                "billing: an enabled [billing] section requires [cloud] enabled (the control plane supplies the organization principal)"
+                    .into(),
+            );
+        }
+        // The operator half of the worker surface (token mint, listing,
+        // revocation) authorizes through a control-plane principal, so an
+        // enabled worker plane without the cloud section could never mint a
+        // registration token — refuse the pair at load instead of booting a
+        // plane no operator can provision.
+        if self.workers.enabled && !self.cloud.enabled {
+            return Err(
+                "workers: an enabled [workers] section requires [cloud] enabled (the control plane supplies the organization principal)"
+                    .into(),
+            );
+        }
+        // The enterprise routes derive their tenant from the control-plane
+        // principal (and the audit ledger names principals), so an enabled
+        // enterprise section without the cloud section could never
+        // authorize an organization-scoped operation. Refuse the pair at
+        // load instead of booting an unauthenticated admin surface.
+        if self.enterprise.enabled && !self.cloud.enabled {
+            return Err(
+                "enterprise: an enabled [enterprise] section requires [cloud] enabled (the control plane supplies the organization principal)"
+                    .into(),
+            );
+        }
         Ok(())
     }
 
@@ -3294,5 +4270,492 @@ mod completion_cfg_tests {
         )
         .unwrap();
         assert!(Config::load_strict(&path).is_err());
+    }
+
+    /// The additive `[updater]` section: disabled by default with BYTE-IDENTICAL
+    /// serialization to an absent section, strict parsing on both load paths,
+    /// bounded values, a mandatory non-empty operator allowlist when enabled,
+    /// and no filesystem resolution while disabled.
+    #[test]
+    fn updater_section_is_disabled_by_default_and_strictly_parsed() {
+        const KEY: &str = "PMIf08ao62O4xMR4upvk5ymt++8EcWRtWHWZGLa4TKo=";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updater.json");
+
+        // Absent == explicit disabled: no store, no install root, and
+        // identical serialization (the disabled daemon is byte-identical).
+        let absent = Config::default();
+        assert!(!absent.updater.enabled);
+        assert_eq!(absent.updater.database_path(dir.path()).unwrap(), None);
+        assert_eq!(absent.updater.install_root_path(dir.path()).unwrap(), None);
+        std::fs::write(&path, r#"{"model": "m"}"#).unwrap();
+        let parsed_absent = Config::load_strict(&path).unwrap();
+        std::fs::write(&path, r#"{"model": "m", "updater": {"enabled": false}}"#).unwrap();
+        let parsed_disabled = Config::load_strict(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&parsed_absent).unwrap(),
+            serde_json::to_value(&parsed_disabled).unwrap(),
+            "a disabled [updater] section must serialize exactly like an absent one"
+        );
+        assert_eq!(
+            parsed_disabled.updater.database_path(dir.path()).unwrap(),
+            None
+        );
+        assert_eq!(
+            parsed_disabled
+                .updater
+                .install_root_path(dir.path())
+                .unwrap(),
+            None
+        );
+
+        // Enabled: keys are mandatory, the default paths resolve under the
+        // data dir, and the channel parses.
+        let enabled_json = format!(
+            r#"{{"updater": {{"enabled": true, "channel": "beta", "keys": [{{"id": "op", "public_key": "{KEY}"}}]}}}}"#
+        );
+        std::fs::write(&path, &enabled_json).unwrap();
+        let enabled = Config::load_strict(&path).unwrap();
+        assert!(enabled.updater.enabled);
+        assert_eq!(
+            enabled.updater.channel().unwrap(),
+            faktor_updater::Channel::Beta
+        );
+        assert_eq!(
+            enabled.updater.database_path(dir.path()).unwrap(),
+            Some(dir.path().join("update.db"))
+        );
+        assert_eq!(
+            enabled.updater.install_root_path(dir.path()).unwrap(),
+            Some(dir.path().join("install"))
+        );
+        assert_eq!(enabled.updater.trusted_keys().unwrap().len(), 1);
+        // Relative install roots resolve under the data dir; absolute ones
+        // are honored as written.
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"updater": {{"enabled": true, "install_root": "releases/current", "keys": [{{"id": "op", "public_key": "{KEY}"}}]}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            Config::load_strict(&path)
+                .unwrap()
+                .updater
+                .install_root_path(dir.path())
+                .unwrap(),
+            Some(dir.path().join("releases").join("current"))
+        );
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"updater": {{"enabled": true, "install_root": "/opt/faktor", "keys": [{{"id": "op", "public_key": "{KEY}"}}]}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            Config::load_strict(&path)
+                .unwrap()
+                .updater
+                .install_root_path(dir.path())
+                .unwrap(),
+            Some(std::path::PathBuf::from("/opt/faktor"))
+        );
+
+        // Shape errors are refused by BOTH load paths (unknown/duplicate
+        // keys, wrong types, positional arrays, malformed key material).
+        for bad in [
+            r#"{"updater": {"enabled": "yes"}}"#,
+            r#"{"updater": {"enabled": true, "bogus": 1}}"#,
+            r#"{"updater": {"enabled": true, "enabled": false}}"#,
+            r#"{"updater": {"channel": 1}}"#,
+            r#"{"updater": true}"#,
+            r#"{"updater": ["enabled"]}"#,
+            // Unknown key field / missing key field.
+            format!(
+                r#"{{"updater": {{"keys": [{{"id": "op", "public_key": "{KEY}", "extra": 1}}]}}}}"#
+            )
+            .as_str(),
+            r#"{"updater": {"keys": [{"id": "op"}]}}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(
+                Config::load(&path).is_err(),
+                "hostile [updater] shape must fail: {bad}"
+            );
+            assert!(Config::load_strict(&path).is_err(), "{bad}");
+        }
+        // Semantic errors are refused by the strict path (the daemon never
+        // boots on a section it cannot honor): enabled without an
+        // allowlist, unknown channels, duplicate identities and hostile
+        // bounds.
+        for bad in [
+            r#"{"updater": {"enabled": true}}"#,
+            r#"{"updater": {"enabled": true, "keys": []}}"#,
+            r#"{"updater": {"channel": "nightly"}}"#,
+            // Not base64 / wrong raw length. (A 32-byte string that is not a
+            // curve point is covered by the keys.rs unit test; dalek
+            // accepts reduced non-canonical encodings, so no fixed byte
+            // pattern can be asserted here.)
+            r#"{"updater": {"keys": [{"id": "op", "public_key": "!!!"}]}}"#,
+            r#"{"updater": {"keys": [{"id": "op", "public_key": "AAAA"}]}}"#,
+            format!(
+                r#"{{"updater": {{"keys": [{{"id": "op", "public_key": "{KEY}"}}, {{"id": "op", "public_key": "{KEY}"}}]}}}}"#
+            )
+            .as_str(),
+            r#"{"updater": {"max_artifact_bytes": 0}}"#,
+            r#"{"updater": {"max_artifact_bytes": 99999999999999}}"#,
+            r#"{"updater": {"clock_skew_ms": -1}}"#,
+            r#"{"updater": {"clock_skew_ms": 99999999}}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(
+                Config::load_strict(&path).is_err(),
+                "hostile [updater] value must fail: {bad}"
+            );
+        }
+        // Hostile install roots are refused even while disabled (the file
+        // never says two different things).
+        for hostile in [
+            r#"{"updater": {"enabled": true, "install_root": "../escape", "keys": [{"id": "op", "public_key": "PMIf08ao62O4xMR4upvk5ymt++8EcWRtWHWZGLa4TKo="}]}}"#,
+            r#"{"updater": {"enabled": false, "install_root": "a/../../b"}}"#,
+            r#"{"updater": {"enabled": false, "install_root": ""}}"#,
+        ] {
+            std::fs::write(&path, hostile).unwrap();
+            assert!(
+                Config::load_strict(&path).is_err(),
+                "hostile updater install root must fail: {hostile}"
+            );
+        }
+        // More than the allowlist cap.
+        let many: Vec<String> = (0..(MAX_UPDATER_KEYS + 1))
+            .map(|i| format!(r#"{{"id": "op-{i}", "public_key": "{KEY}"}}"#))
+            .collect();
+        std::fs::write(
+            &path,
+            format!(r#"{{"updater": {{"keys": [{}]}}}}"#, many.join(",")),
+        )
+        .unwrap();
+        assert!(Config::load_strict(&path).is_err());
+    }
+
+    /// The additive `[billing]` section: disabled by default (byte-identical
+    /// to an absent section), strictly parsed, plans/limits config-provided
+    /// only, and refused when enabled without the `[cloud]` principal.
+    #[test]
+    fn billing_section_is_disabled_by_default_strict_and_plan_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("billing.json");
+
+        // Absent section == explicit disabled section.
+        let absent = Config::default();
+        assert!(!absent.billing.enabled);
+        assert_eq!(absent.billing.billing_path(dir.path()).unwrap(), None);
+        assert_eq!(absent.billing.service_config().unwrap(), None);
+        std::fs::write(&path, r#"{"model": "m"}"#).unwrap();
+        let parsed_absent = Config::load_strict(&path).unwrap();
+        std::fs::write(&path, r#"{"model": "m", "billing": {"enabled": false}}"#).unwrap();
+        let parsed_disabled = Config::load_strict(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&parsed_absent).unwrap(),
+            serde_json::to_value(&parsed_disabled).unwrap(),
+            "a disabled [billing] section must serialize exactly like an absent one"
+        );
+        assert_eq!(
+            parsed_disabled.billing.billing_path(dir.path()).unwrap(),
+            None
+        );
+        // Even disabled, a hostile database name is refused.
+        std::fs::write(
+            &path,
+            r#"{"billing": {"enabled": false, "database": "../x.db"}}"#,
+        )
+        .unwrap();
+        assert!(Config::load_strict(&path).is_err());
+
+        // Enabled requires the cloud section (the principal/tenant surface).
+        std::fs::write(
+            &path,
+            r#"{"billing": {"enabled": true, "organization": "org_a", "plans": {"pro": {"plan_id": "pro"}}}}"#,
+        )
+        .unwrap();
+        assert!(
+            Config::load_strict(&path).is_err(),
+            "billing without cloud has no organization principal"
+        );
+
+        // Enabled with cloud: the plan table is the ONLY source of features
+        // and limits (no defaults, no prices in code).
+        std::fs::write(
+            &path,
+            r#"{
+                "cloud": {"enabled": true},
+                "billing": {
+                    "enabled": true,
+                    "organization": "org_a",
+                    "account": "acct_local",
+                    "managed_providers": ["managed-provider"],
+                    "default_plan": "pro",
+                    "plans": {
+                        "pro": {
+                            "plan_id": "pro",
+                            "features": ["managed_providers", "byok"],
+                            "limits": {"max_active_tasks": 2, "max_managed_spend_micro_per_period": 1000000}
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let enabled = Config::load_strict(&path).unwrap();
+        assert_eq!(
+            enabled.billing.billing_path(dir.path()).unwrap(),
+            Some(dir.path().join("billing.db")),
+            "the default billing database resolves inside the data dir"
+        );
+        let service_config = enabled.billing.service_config().unwrap().unwrap();
+        assert_eq!(
+            service_config.category_of("managed-provider"),
+            faktor_cloud::SpendCategory::Managed
+        );
+        assert_eq!(
+            service_config.category_of("other"),
+            faktor_cloud::SpendCategory::Byok
+        );
+        assert_eq!(
+            service_config.plan("pro").and_then(|plan| plan
+                .limits
+                .get(faktor_cloud::LIMIT_MAX_ACTIVE_TASKS)
+                .copied()),
+            Some(2)
+        );
+        assert_eq!(enabled.billing.organization().unwrap().as_str(), "org_a");
+
+        // Strict parsing: unknown/duplicate keys, wrong types, unknown
+        // features/limits and an empty plan table are refused.
+        for bad in [
+            r#"{"billing": true}"#,
+            r#"{"billing": {"enabled": "yes"}}"#,
+            r#"{"billing": {"enabled": true, "bogus": 1}}"#,
+            r#"{"billing": {"enabled": true, "enabled": false}}"#,
+            r#"{"billing": {"database": 1}}"#,
+            r#"{"billing": {"plans": []}}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(
+                Config::load(&path).is_err() && Config::load_strict(&path).is_err(),
+                "hostile [billing] must fail: {bad}"
+            );
+        }
+        for bad in [
+            // Unknown feature tag.
+            r#"{"cloud": {"enabled": true}, "billing": {"enabled": true, "organization": "org_a", "plans": {"pro": {"plan_id": "pro", "features": ["gold"]}}}}"#,
+            // Unknown limit name.
+            r#"{"cloud": {"enabled": true}, "billing": {"enabled": true, "organization": "org_a", "plans": {"pro": {"plan_id": "pro", "limits": {"price": 1}}}}}"#,
+            // Plan key != plan_id.
+            r#"{"cloud": {"enabled": true}, "billing": {"enabled": true, "organization": "org_a", "plans": {"pro": {"plan_id": "team"}}}}"#,
+            // Default plan outside the table.
+            r#"{"cloud": {"enabled": true}, "billing": {"enabled": true, "organization": "org_a", "default_plan": "nope", "plans": {"pro": {"plan_id": "pro"}}}}"#,
+            // Empty plan table while enabled.
+            r#"{"cloud": {"enabled": true}, "billing": {"enabled": true, "organization": "org_a", "plans": {}}}"#,
+            // Missing organization while enabled.
+            r#"{"cloud": {"enabled": true}, "billing": {"enabled": true, "plans": {"pro": {"plan_id": "pro"}}}}"#,
+            // A price-shaped plan field is NOT part of the contract.
+            r#"{"cloud": {"enabled": true}, "billing": {"enabled": true, "organization": "org_a", "plans": {"pro": {"plan_id": "pro", "price_per_token": 1}}}}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(
+                Config::load_strict(&path).is_err(),
+                "the config must refuse: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn workers_section_is_additive_strict_and_disabled_by_default() {
+        // Absent = disabled, no database, no placement seam.
+        let cfg = Config::default();
+        assert!(!cfg.workers.enabled);
+        assert!(cfg
+            .workers
+            .workers_path(std::path::Path::new("/tmp"))
+            .unwrap()
+            .is_none());
+        // Strict shape: unknown keys and duplicates are parse errors.
+        for bad in [
+            r#"{"model": "m", "workers": {"enabled": false, "hostile": 1}}"#,
+            r#"{"model": "m", "workers": {"enabled": true, "enabled": true}}"#,
+            r#"{"model": "m", "workers": {"enabled": "yes"}}"#,
+            r#"{"model": "m", "workers": {"min_cpu_cores": -1}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Config>(bad).is_err(),
+                "the config must refuse: {bad}"
+            );
+        }
+        // A disabled section still validates its database name shape, but
+        // creates no file.
+        let disabled: Config = serde_json::from_str(
+            r#"{"model": "m", "workers": {"enabled": false, "database": "wp.db"}}"#,
+        )
+        .unwrap();
+        assert!(disabled
+            .workers
+            .workers_path(std::path::Path::new("/tmp"))
+            .unwrap()
+            .is_none());
+        let traversal: Config =
+            serde_json::from_str(r#"{"model": "m", "workers": {"database": "../escape.db"}}"#)
+                .unwrap();
+        assert!(traversal.validate().is_err(), "path traversal is refused");
+    }
+
+    #[test]
+    fn workers_enabled_requires_cloud_org_and_maps_requirements() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = WorkersCfg {
+            enabled: true,
+            organization: Some("org_local".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            w.trust_domain().unwrap(),
+            "org_local",
+            "default = organization"
+        );
+        w.trust_domain = Some("Eu-1".into());
+        assert_eq!(w.trust_domain().unwrap(), "eu-1", "normalized");
+        w.toolchains = vec!["Rust".into(), "rust".into(), "Node".into()];
+        w.network = Some("full".into());
+        w.min_cpu_cores = 4;
+        let req = w.requirements().unwrap();
+        assert_eq!(req.toolchains, vec!["node", "rust"], "normalized + deduped");
+        assert_eq!(req.network, Some(faktor_worker::NetworkProfile::Full));
+        assert_eq!(req.trust_domain, "eu-1");
+        w.network = Some("hostile".into());
+        assert!(w.requirements().is_err(), "unknown network profile refused");
+        w.network = None;
+        assert!(w.workers_path(dir.path()).unwrap().is_some());
+        // An enabled section without [cloud] never boots.
+        let cfg: Config = serde_json::from_str(
+            r#"{"model": "m", "workers": {"enabled": true, "organization": "org_local"}}"#,
+        )
+        .unwrap();
+        assert!(cfg.validate().is_err());
+        // With [cloud] enabled the pair validates.
+        let cfg: Config = serde_json::from_str(
+            r#"{"model": "m", "cloud": {"enabled": true}, "workers": {"enabled": true, "organization": "org_local"}}"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn enterprise_section_is_additive_strict_and_disabled_by_default() {
+        // Absent = disabled, no database path, no layers.
+        let cfg = Config::default();
+        assert!(!cfg.enterprise.enabled);
+        assert!(cfg
+            .enterprise
+            .enterprise_path(std::path::Path::new("/tmp"))
+            .unwrap()
+            .is_none());
+        assert!(cfg.enterprise.organization().unwrap().is_none());
+        assert!(cfg.enterprise.layers().unwrap().is_empty());
+
+        // Strict shape: unknown keys, duplicates and wrong types are parse
+        // errors on both load paths.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.json");
+        for bad in [
+            r#"{"model": "m", "enterprise": {"enabled": false, "hostile": 1}}"#,
+            r#"{"model": "m", "enterprise": {"enabled": true, "enabled": true}}"#,
+            r#"{"model": "m", "enterprise": {"enabled": "yes"}}"#,
+            r#"{"model": "m", "enterprise": {"policy": {"hostile": ["x"]}}}"#,
+            r#"{"model": "m", "enterprise": {"policy": {"network": "none"}}}"#,
+            r#"{"model": "m", "enterprise": {"preferences": {"network": ["none"]}}}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(
+                Config::load(&path).is_err(),
+                "the config must refuse: {bad}"
+            );
+            assert!(
+                Config::load_strict(&path).is_err(),
+                "the strict load must refuse: {bad}"
+            );
+        }
+
+        // Path traversal in the database name is refused even while
+        // disabled; an enabled section without [cloud] never boots.
+        let cfg: Config =
+            serde_json::from_str(r#"{"model": "m", "enterprise": {"database": "../e.db"}}"#)
+                .unwrap();
+        assert!(cfg.validate().is_err());
+        let cfg: Config = serde_json::from_str(
+            r#"{"model": "m", "enterprise": {"enabled": true, "organization": "org_local"}}"#,
+        )
+        .unwrap();
+        assert!(cfg.validate().is_err(), "enterprise requires [cloud]");
+        let cfg: Config = serde_json::from_str(
+            r#"{"model": "m", "cloud": {"enabled": true}, "enterprise": {"enabled": true, "organization": "org_local"}}"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let resolved = cfg.enterprise.enterprise_path(dir.path()).unwrap().unwrap();
+        assert!(resolved.ends_with("enterprise.db"));
+    }
+
+    #[test]
+    fn enterprise_layers_are_policy_vs_preference_and_loosening_is_refused() {
+        // A preference outside the configured policy is refused by the ONE
+        // resolver (the same one the server route uses).
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "model": "m",
+                "cloud": {"enabled": true},
+                "enterprise": {
+                    "enabled": true,
+                    "organization": "org_local",
+                    "policy": {"network": ["none"]},
+                    "preferences": {"network": "provider"}
+                }
+            }"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let layers = cfg.enterprise.layers().unwrap();
+        let error = faktor_cloud::resolve_layers(&layers).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                faktor_cloud::LayeredConfigError::PreferenceRefusedByPolicy { .. }
+            ),
+            "{error}"
+        );
+
+        // A satisfied preference resolves with an attributable digest; the
+        // digest changes when any layer changes.
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "model": "m",
+                "cloud": {"enabled": true},
+                "enterprise": {
+                    "enabled": true,
+                    "organization": "org_local",
+                    "policy": {"network": ["none", "provider"], "providers": ["anthropic"]},
+                    "preferences": {"network": "none", "providers": "anthropic"}
+                }
+            }"#,
+        )
+        .unwrap();
+        let effective = faktor_cloud::resolve_layers(&cfg.enterprise.layers().unwrap()).unwrap();
+        assert!(effective.policy_allows(faktor_cloud::ConfigKey::Network, "none"));
+        let digest = effective.digest.clone();
+        let mut changed = cfg.enterprise.clone();
+        changed.policy.providers = Some(vec!["anthropic".into(), "openai".into()]);
+        let changed = faktor_cloud::resolve_layers(&changed.layers().unwrap()).unwrap();
+        assert_ne!(changed.digest, digest);
     }
 }

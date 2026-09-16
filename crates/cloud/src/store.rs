@@ -161,6 +161,10 @@ struct MemInner {
 #[derive(Default)]
 pub struct MemoryControlPlaneStore {
     inner: Mutex<MemInner>,
+    /// The additive enterprise slice (migration v3 domain): audit ledger,
+    /// retention artifacts, deletion jobs, settings, tombstones, config
+    /// layers and admission freezes. One lock, one in-memory authority.
+    enterprise: Mutex<crate::enterprise_store::EnterpriseMem>,
 }
 
 impl MemoryControlPlaneStore {
@@ -171,6 +175,17 @@ impl MemoryControlPlaneStore {
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, MemInner>, CloudStoreError> {
         self.inner.lock().map_err(|_| {
             CloudStoreError::Backend("in-memory control-plane store lock is poisoned".into())
+        })
+    }
+
+    /// The enterprise slice of the in-memory authority (the additive
+    /// enterprise store impl lives in `enterprise_store`).
+    pub(crate) fn lock_enterprise(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, crate::enterprise_store::EnterpriseMem>, CloudStoreError>
+    {
+        self.enterprise.lock().map_err(|_| {
+            CloudStoreError::Backend("in-memory enterprise store lock is poisoned".into())
         })
     }
 }
@@ -503,7 +518,8 @@ pub struct SqliteControlPlaneStore {
     conn: Mutex<Connection>,
 }
 
-const CP_MIGRATIONS: &[&str] = &["CREATE TABLE IF NOT EXISTS cp_user (
+const CP_MIGRATIONS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS cp_user (
         id TEXT PRIMARY KEY,
         email TEXT NOT NULL UNIQUE,
         payload TEXT NOT NULL
@@ -562,7 +578,21 @@ const CP_MIGRATIONS: &[&str] = &["CREATE TABLE IF NOT EXISTS cp_user (
         request_hash TEXT NOT NULL,
         response TEXT NOT NULL,
         created_ms INTEGER NOT NULL
-     );"];
+     );",
+    // v2 — the Wave 3 commercial metering tables (usage ledger, credit
+    // ledger, billing accounts/subscriptions, in-flight transactions). The
+    // billing domain OWNS this next user_version of the shared ladder; the
+    // SQL lives beside its store implementation and is append-only by
+    // construction (no UPDATE/DELETE ever names usage_event/credit_entry).
+    crate::billing_store::BILLING_SCHEMA_V2,
+    // v3 — the enterprise plane tables (audit ledger, retention artifacts,
+    // deletion jobs, admin settings, tombstones, config layers, admission
+    // freezes). Like v2, the domain OWNS this next user_version of the
+    // shared ladder and the SQL lives beside its store implementation; the
+    // audit table is append-only by construction (no UPDATE/DELETE ever
+    // names ent_audit_event).
+    crate::enterprise_store::ENTERPRISE_SCHEMA_V3,
+];
 
 impl SqliteControlPlaneStore {
     /// Open (creating) the control-plane database at `path`.
@@ -592,7 +622,10 @@ impl SqliteControlPlaneStore {
         })
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, CloudStoreError> {
+    /// The shared connection lock. `pub(crate)` so the additive billing
+    /// store (the same SQLite file, its own migration v2 tables) can run its
+    /// append-only transactions through the ONE writer connection.
+    pub(crate) fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, CloudStoreError> {
         self.conn
             .lock()
             .map_err(|_| CloudStoreError::Backend("control-plane store lock is poisoned".into()))

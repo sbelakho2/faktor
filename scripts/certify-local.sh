@@ -25,12 +25,17 @@
 #                   gates; [fault] campaigns at scale; coding-benchmark
 #                   harness smoke; efficiency harness; ACP interop;
 #                   installable artifact packaging (daemon tar.gz + VSIX +
-#                   JetBrains zip) and the installation matrix. The
-#                   packaging section is the only section that may touch
-#                   the npm registry; an unreachable registry is recorded
-#                   as an explicit skip, never silently claimed.
-#                   Provider-key (real-model) runs are ALWAYS recorded as
-#                   skipped: the local certificate is offline by contract.
+#                   JetBrains zip) and the installation matrix; the SIGNED
+#                   update manifest (`faktor-update/v1`) assembled from the
+#                   packaged artifacts + certification evidence by
+#                   scripts/update-manifest.mjs (selftest first; signed when
+#                   FAKTOR_UPDATE_SIGNING_KEY is set, explicitly UNSIGNED
+#                   otherwise — never a silent claim). The packaging section
+#                   is the only section that may touch the npm registry; an
+#                   unreachable registry is recorded as an explicit skip,
+#                   never silently claimed. Provider-key (real-model) runs
+#                   are ALWAYS recorded as skipped: the local certificate is
+#                   offline by contract.
 #
 # Env:
 #   FAST_TESTS_SKIP=1  dry-run aid: records workspace tests as a SKIP with
@@ -56,6 +61,10 @@
 #   target/certification/manifest.json       certificate for this exact commit
 #   target/certification/capabilities.json   derived capability manifest
 #                                            (surfaces probed from files/scripts)
+#   target/certification/update-manifest.json  full profile only: the SIGNED
+#                                            faktor-update/v1 distribution
+#                                            manifest (or explicitly UNSIGNED
+#                                            when no operator key is set)
 #   target/certification/logs/<id>.log       full output per section
 #
 # The manifest schema (documented in docs/certification.md):
@@ -459,6 +468,39 @@ section_install_matrix() {
         node scripts/install-matrix.mjs
 }
 
+# Assemble the SIGNED update manifest (`faktor-update/v1`) from this run's
+# artifacts.json + certification evidence. Additive and offline: the
+# release/update-manifest.mjs selftest runs first, then the manifest is
+# written to $OUT_DIR/update-manifest.json. With FAKTOR_UPDATE_SIGNING_KEY
+# set the manifest is signed by that operator key (and a signing failure
+# fails the section); without it the manifest is written explicitly UNSIGNED
+# (`apply` then refuses it with a typed manifest_unsigned refusal) — the
+# certificate never claims a signature it does not have.
+#   UPDATE_MANIFEST_CHANNEL  stable|beta|dev (default stable)
+#   FAKTOR_UPDATE_URL_BASE   distribution URL base for artifact urls
+section_update_manifest() {
+    if ! command -v node >/dev/null 2>&1; then
+        echo "SKIP: node unavailable; the signed update manifest cannot be assembled" >&2
+        add_skip update-manifest "node unavailable on this host"
+        return 0
+    fi
+    node scripts/update-manifest.mjs selftest || return 1
+    if [ -n "${FAKTOR_UPDATE_SIGNING_KEY:-}" ]; then
+        node scripts/update-manifest.mjs \
+            --artifacts "$OUT_DIR/artifacts.json" \
+            --certification-optional "$MANIFEST" \
+            --out "$OUT_DIR/update-manifest.json" \
+            --channel "${UPDATE_MANIFEST_CHANNEL:-stable}" \
+            --require-signed
+    else
+        node scripts/update-manifest.mjs \
+            --artifacts "$OUT_DIR/artifacts.json" \
+            --certification-optional "$MANIFEST" \
+            --out "$OUT_DIR/update-manifest.json" \
+            --channel "${UPDATE_MANIFEST_CHANNEL:-stable}"
+    fi
+}
+
 section_selftest_fail() {
     printf 'CERTIFY_SELFTEST=force_fail: synthetic section failure\n'
     return 1
@@ -616,6 +658,7 @@ else
         add_section section_acp_interop acp-interop "ACP interop"
         add_section section_package_artifacts package-artifacts "release artifact packaging (daemon + VSIX + JetBrains)"
         add_section section_install_matrix install-matrix "install matrix (clean-prefix extract + doctor + archive structure)"
+        add_section section_update_manifest update-manifest "signed update manifest (faktor-update/v1)"
     else
         add_skip release-perf "fast profile: run the full profile for [perf] release gates"
         add_skip fault-scale "fast profile: run the full profile for [fault] campaigns at scale"
@@ -624,6 +667,7 @@ else
         add_skip acp-interop "fast profile: run the full profile for ACP interop"
         add_skip package-artifacts "fast profile: run the full profile to package release artifacts"
         add_skip install-matrix "fast profile: run the full profile for the installation matrix"
+        add_skip update-manifest "fast profile: run the full profile to assemble the signed update manifest"
     fi
     add_skip coding-benchmark-real-model "provider-key run excluded: local certification is offline by contract (no keys, no network)"
     add_skip windows-lane "no Windows host here; the CI windows lane owns it"

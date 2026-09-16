@@ -8573,3 +8573,205 @@ async fn poisoned_completion_step_policy_refuses_mutations_typed() {
         .unwrap();
     assert_eq!(env.executor.completion_steps_config(), next);
 }
+
+// ------------------------------------------------- worker-plane placement seam
+// Adversarial tests of the ADDITIVE placement seam (crates/orchestrator/src/
+// placement.rs): disabled parity, local decisions, remote decisions that
+// start nothing locally, and a broken seam that refuses typed instead of
+// silently running locally.
+
+use crate::placement::{PlacementDecision, PlacementSpec, WorkerPlacement, WorkerPlacementSeam};
+
+/// One recording seam: answers a scripted decision and counts/captures
+/// every consultation.
+struct RecordingSeam {
+    decision: StdMutex<Result<PlacementDecision, String>>,
+    calls: AtomicUsize,
+    specs: StdMutex<Vec<PlacementSpec>>,
+}
+
+impl RecordingSeam {
+    fn new(decision: Result<PlacementDecision, String>) -> Arc<Self> {
+        Arc::new(Self {
+            decision: StdMutex::new(decision),
+            calls: AtomicUsize::new(0),
+            specs: StdMutex::new(Vec::new()),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl WorkerPlacementSeam for RecordingSeam {
+    fn place(&self, spec: &PlacementSpec) -> Result<PlacementDecision, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.specs.lock().unwrap().push(spec.clone());
+        self.decision.lock().unwrap().clone()
+    }
+}
+
+/// Disabled (the default): the executor never consults any seam, the run
+/// executes locally, and the generated spec is never built.
+#[tokio::test]
+async fn placement_disabled_runs_locally_and_never_consults_a_seam() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(&dir.path().join("a"), done_script());
+    assert!(!env.executor.worker_placement_enabled());
+    let req = request(
+        "disabled parity",
+        vec![wi("a1", WorkKind::Analysis, &[])],
+        &env,
+    );
+    let receipt = env
+        .executor
+        .start_task(env.parent, req)
+        .expect("local start");
+    assert_eq!(receipt.mode, TaskRunMode::InSession);
+    assert!(receipt.op_id.is_some(), "the real local op record exists");
+    wait_until(|| env.provider.count() >= 1, 30).await;
+}
+
+/// Enabled with a LOCAL decision: the seam IS consulted exactly once, the
+/// receipt is a normal local one, and the run executes locally.
+#[tokio::test]
+async fn placement_enabled_local_decision_executes_locally_once() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(&dir.path().join("a"), done_script());
+    let seam = RecordingSeam::new(Ok(PlacementDecision::Local));
+    env.executor
+        .set_worker_placement(WorkerPlacement::enabled(seam.clone()));
+    assert!(env.executor.worker_placement_enabled());
+    let req = request(
+        "local decision",
+        vec![wi("a1", WorkKind::Analysis, &[])],
+        &env,
+    );
+    let receipt = env
+        .executor
+        .start_task(env.parent, req)
+        .expect("local start");
+    assert_eq!(receipt.mode, TaskRunMode::InSession);
+    assert_eq!(seam.calls(), 1, "exactly one placement consultation");
+    let specs = seam.specs.lock().unwrap().clone();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].kind, "in_session");
+    assert_eq!(specs[0].payload_digest.len(), 64, "bound to the exact goal");
+    assert!(specs[0]
+        .job_key
+        .starts_with(&format!("session-{}-goal-", env.parent.raw())));
+    wait_until(|| env.provider.count() >= 1, 30).await;
+}
+
+/// Enabled with a REMOTE decision: the receipt names the remote job/lease
+/// and NOTHING local starts — no provider call, no active run, no task row.
+#[tokio::test]
+async fn placement_enabled_remote_decision_starts_nothing_locally() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(&dir.path().join("a"), done_script());
+    let seam = RecordingSeam::new(Ok(PlacementDecision::Remote {
+        job_id: "job_remote_1".into(),
+        worker_id: "wrk_9".into(),
+        generation: 1,
+        lease_id: "lease_remote_1".into(),
+    }));
+    env.executor
+        .set_worker_placement(WorkerPlacement::enabled(seam.clone()));
+    let task_id = env
+        .manager
+        .get_session(env.parent)
+        .unwrap()
+        .unwrap()
+        .task_id()
+        .unwrap();
+    let req = request(
+        "remote decision",
+        vec![wi("a1", WorkKind::Analysis, &[])],
+        &env,
+    );
+    let receipt = env
+        .executor
+        .start_task(env.parent, req)
+        .expect("remote start");
+    assert_eq!(receipt.mode, TaskRunMode::Remote);
+    assert_eq!(receipt.run_id, "job_remote_1");
+    assert!(receipt.queued, "a remote run is queued for its worker");
+    assert!(receipt.op_id.is_none(), "no local op was minted");
+    assert!(env.executor.active_runs().is_empty());
+    assert!(
+        env.manager
+            .get_session(env.parent)
+            .unwrap()
+            .unwrap()
+            .get_task(task_id)
+            .unwrap()
+            .is_none(),
+        "no local task row exists for a remotely placed run"
+    );
+    // Give any (incorrect) detached drive a chance to reach the provider.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(env.provider.count(), 0, "nothing ran locally");
+}
+
+/// Enabled with a FAILING seam: the refusal is typed and nothing starts —
+/// a broken worker plane never degrades into a silent local run.
+#[tokio::test]
+async fn placement_enabled_failure_refuses_typed_and_starts_nothing() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(&dir.path().join("a"), done_script());
+    let seam = RecordingSeam::new(Err("worker plane store unavailable".into()));
+    env.executor
+        .set_worker_placement(WorkerPlacement::enabled(seam.clone()));
+    let req = request(
+        "broken plane",
+        vec![wi("a1", WorkKind::Analysis, &[])],
+        &env,
+    );
+    let err = env
+        .executor
+        .start_task(env.parent, req)
+        .expect_err("a failed placement must refuse");
+    assert!(
+        matches!(err, ExecError::PlacementRefused(ref m) if m.contains("store unavailable")),
+        "typed refusal expected, got {err:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(env.provider.count(), 0, "nothing ran locally");
+    assert_eq!(seam.calls(), 1);
+}
+
+/// A replayed start consults the seam again (the seam owns idempotency via
+/// the job key) and a second remote decision never touches the local run
+/// machinery either.
+#[tokio::test]
+async fn placement_replay_is_delegated_to_the_seam_job_key() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(&dir.path().join("a"), done_script());
+    let seam = RecordingSeam::new(Ok(PlacementDecision::Remote {
+        job_id: "job_remote_2".into(),
+        worker_id: "wrk_9".into(),
+        generation: 1,
+        lease_id: "lease_remote_2".into(),
+    }));
+    env.executor
+        .set_worker_placement(WorkerPlacement::enabled(seam.clone()));
+    let req_a = request("same goal", vec![wi("a1", WorkKind::Analysis, &[])], &env);
+    let req_b = request("same goal", vec![wi("a1", WorkKind::Analysis, &[])], &env);
+    let first = env.executor.start_task(env.parent, req_a).unwrap();
+    let second = env.executor.start_task(env.parent, req_b).unwrap();
+    assert_eq!(first.mode, TaskRunMode::Remote);
+    assert_eq!(second.mode, TaskRunMode::Remote);
+    let specs = seam.specs.lock().unwrap().clone();
+    assert_eq!(specs.len(), 2);
+    assert_eq!(
+        specs[0].job_key, specs[1].job_key,
+        "the same session+goal maps onto one stable job key"
+    );
+    assert!(specs[0].job_key.contains("goal-"));
+}

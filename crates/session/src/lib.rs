@@ -58,6 +58,7 @@ pub(crate) fn recover_lock<T>(lock: &std::sync::Mutex<T>) -> std::sync::MutexGua
 pub mod actor;
 pub mod artifacts;
 pub mod attachments;
+pub mod billing_read;
 pub mod board;
 pub mod budget;
 pub mod checkpoints;
@@ -74,10 +75,15 @@ pub mod payload;
 pub mod process;
 pub mod read_service;
 pub mod recovery;
+pub mod retention;
 pub mod task;
 pub mod verification_job;
 
 pub use actor::{DbActor, DbActorConfig, DbActorStats, StoreHandle};
+pub use billing_read::{
+    reservation_folded_micro, reservation_provider_reported_micro, DurableSpendRow,
+    MAX_DURABLE_SPEND_CALL_ROWS, MAX_DURABLE_SPEND_ROWS, UNATTRIBUTED_PROVENANCE,
+};
 pub use board::{
     BoardAction, BoardDeliveryView, BoardId, BoardPage, BoardPost, BoardPostId, BoardRead,
     BoardReceipt, BoardReceipts, BoardReset, ChildId, MAX_BOARD_BODY_BYTES, MAX_BOARD_FAMILY_DEPTH,
@@ -135,6 +141,7 @@ pub use read_service::{
     DEFAULT_READ_WORKERS, MAX_READ_WORKERS,
 };
 pub use recovery::{FileHasher, RecoveredOp, RecoveryAction, RecoveryReport, SystemFileHasher};
+pub use retention::{LiveReferenceScanner, LiveReferenceSet, ScanLimits, DEFAULT_SCAN_LIMITS};
 pub use task::{
     CompletionContractGate, Task, TaskBudget, TaskError, TaskPatch, VerificationRecord,
     MAX_TASK_CRITERIA, MAX_TASK_CRITERION_BYTES, MAX_TASK_GOAL_BYTES, MAX_TASK_PLAN_STEPS,

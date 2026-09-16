@@ -41,6 +41,8 @@ members = [
     "crates/verify",
     "crates/scm",
     "crates/cloud",
+    "crates/worker",
+    "crates/updater",
     "crates/cli",
     "crates/acp",
     "tests/integration",
@@ -110,6 +112,8 @@ faktor-security = { path = "crates/security" }
 faktor-sandbox = { path = "crates/sandbox" }
 faktor-scm = { path = "crates/scm" }
 faktor-cloud = { path = "crates/cloud" }
+faktor-worker = { path = "crates/worker" }
+faktor-updater = { path = "crates/updater" }
 faktor-cli = { path = "crates/cli" }
 
 serde = { version = "1", features = ["derive"] }

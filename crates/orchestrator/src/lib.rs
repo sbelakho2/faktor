@@ -25,7 +25,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod admission;
 pub mod caps;
+/// The additive worker-plane placement seam (disabled by default).
+pub mod placement;
 pub mod proof_probe;
 pub mod runtime;
 pub mod tournament;

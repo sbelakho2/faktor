@@ -77,6 +77,7 @@ use super::{
     ASSIGNMENT_ROW_KIND, MAX_RUN_ID_CHARS, PLAN_ROW_KIND, REGISTRY_ROW_KIND,
 };
 use crate::caps::{CapabilityGrant, CapabilitySet, LatticeCap, ScopePattern};
+use crate::placement::{PlacementDecision, PlacementSpec, WorkerPlacement};
 use crate::{ChildState, OwnershipSpec, TaskPlan, WorkItem, WorkKind, MAX_GOAL_CHARS};
 
 /// Durable row kind of the TaskExecutor task-linkage rows (in-session
@@ -249,6 +250,12 @@ pub enum TaskRunMode {
     InSession,
     /// The run spawned real child sessions through `execute_task`.
     Orchestrated,
+    /// The run was placed on a remote worker: one immutable job generation
+    /// was minted and leased in the worker plane and NO local execution was
+    /// started (the worker plane's durable rows own the attempt).
+    /// Only reachable when the worker plane is enabled: with the plane
+    /// disabled (the default) this variant is never produced.
+    Remote,
 }
 
 /// The P0 mutation policy of a MUTATING single-item run. There is exactly
@@ -981,6 +988,11 @@ pub struct TaskExecutor {
     /// [`ExecError::InjectedCrashSeam`] at the FIRST matching boundary,
     /// leaving every durable row exactly as a real crash would. One-shot.
     settlement_seam: Mutex<Option<(CrashSeam, bool)>>,
+    /// The additive worker-plane placement seam. Default
+    /// [`WorkerPlacement::disabled`]: every placement decision is local and
+    /// this executor is byte-identical to the pre-worker-plane executor.
+    /// Enabled by the daemon when the `[workers]` section is configured.
+    placement: Mutex<WorkerPlacement>,
 }
 
 /// The completion-step wiring of one executor: the configured template
@@ -1084,6 +1096,7 @@ impl TaskExecutor {
             run_roots,
             completion_steps: Mutex::new(CompletionStepsWiring::default()),
             settlement_seam: Mutex::new(None),
+            placement: Mutex::new(WorkerPlacement::disabled()),
         })
     }
 
@@ -1092,6 +1105,68 @@ impl TaskExecutor {
     /// is consumed; clearing it lets the recovery pass run.
     pub fn set_settlement_crash_seam(&self, seam: Option<CrashSeam>) {
         *self.lock_settlement_seam() = seam.map(|s| (s, false));
+    }
+
+    /// Install the additive worker-plane placement seam (the daemon does
+    /// this when the `[workers]` section is enabled). Never called in the
+    /// default configuration, where placement stays disabled and local
+    /// execution is unchanged.
+    pub fn set_worker_placement(&self, placement: WorkerPlacement) {
+        *self.lock_placement() = placement;
+    }
+
+    /// Whether the worker-plane placement seam is enabled.
+    pub fn worker_placement_enabled(&self) -> bool {
+        self.lock_placement().is_enabled()
+    }
+
+    /// The placement knob with classified recovery: the seam is a
+    /// configuration value (the durable worker rows it drives remain the
+    /// authority), so a poisoned guard is recovered by clearing the poison
+    /// rather than wedging every task start.
+    fn lock_placement(&self) -> std::sync::MutexGuard<'_, WorkerPlacement> {
+        self.placement.lock().unwrap_or_else(|poisoned| {
+            self.placement.clear_poison();
+            poisoned.into_inner()
+        })
+    }
+
+    /// One placement consultation. A disabled seam answers `Local`; an
+    /// enabled seam's failure is typed ([`ExecError::PlacementRefused`]) and
+    /// nothing local has been written yet.
+    fn place_new_run(&self, spec: &PlacementSpec) -> Result<PlacementDecision, ExecError> {
+        self.lock_placement()
+            .place(spec)
+            .map_err(ExecError::PlacementRefused)
+    }
+
+    /// The provider-neutral placement request of one new run: the job key is
+    /// deterministic for the same session + goal (a replayed start maps onto
+    /// the SAME immutable generation), the payload digest binds the exact
+    /// goal text, and requirements start empty (the daemon's `[workers]`
+    /// adapter overlays its configured requirement defaults).
+    fn placement_spec_for(parent: SessionId, req: &TaskRunRequest) -> PlacementSpec {
+        let digest = blake3::hash(req.goal.as_bytes()).to_hex().to_string();
+        PlacementSpec {
+            job_key: format!("session-{}-goal-{}", parent.raw(), &digest[..16]),
+            organization: String::new(),
+            trust_domain: String::new(),
+            payload_digest: digest,
+            kind: if req.work_items.len() == 1 {
+                "in_session".to_string()
+            } else {
+                "orchestrated".to_string()
+            },
+            os: None,
+            arch: None,
+            toolchains: Vec::new(),
+            sandbox: Vec::new(),
+            network: None,
+            min_cpu_cores: 0,
+            min_memory_mb: 0,
+            gpu: false,
+            region: None,
+        }
     }
 
     /// The settlement crash seam with classified recovery: the seam is a
@@ -1441,6 +1516,39 @@ impl TaskExecutor {
                 "session {parent} has live orchestrated run(s) {} left by an interrupted executor; resume (TaskExecutor::resume_run) or cancel them before starting a new task",
                 blockers.join(", ")
             )));
+        }
+        // Worker-plane placement (additive; DISABLED by default): consult
+        // the seam BEFORE any local durable write of this run. A remote
+        // decision mints/leases one immutable job generation in the worker
+        // plane and starts NOTHING locally; a local decision (or a disabled
+        // seam) falls through to the unchanged path below. A seam failure
+        // is a typed refusal — never a silent local run.
+        if self.worker_placement_enabled() {
+            let spec = Self::placement_spec_for(parent, &req);
+            match self.place_new_run(&spec)? {
+                PlacementDecision::Remote {
+                    job_id,
+                    worker_id,
+                    generation,
+                    lease_id,
+                } => {
+                    tracing::info!(
+                        session = parent.raw(),
+                        job_id = %job_id,
+                        worker_id = %worker_id,
+                        generation,
+                        lease_id = %lease_id,
+                        "task run placed on a remote worker; no local execution started"
+                    );
+                    return Ok(TaskRunReceipt {
+                        run_id: job_id,
+                        mode: TaskRunMode::Remote,
+                        op_id: None,
+                        queued: true,
+                    });
+                }
+                PlacementDecision::Local => {}
+            }
         }
         // A LIVE durable shadow re-points every session file consumer at the
         // shadow root (`resolve_workspace_root`) — settle it deterministically

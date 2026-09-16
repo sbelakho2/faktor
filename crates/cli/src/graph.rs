@@ -1737,8 +1737,17 @@ mod tests {
         let mut out = Vec::new();
         let mut i = 0;
         while i < lines.len() {
-            if lines[i] == "#[cfg(test)]" && lines.get(i + 1).is_some_and(|l| l.starts_with("mod "))
-            {
+            // An inline `#[cfg(test)]` module, however it is declared
+            // (`mod x`, `pub mod x`, `pub(crate) mod x`).
+            let declares_module = lines.get(i + 1).is_some_and(|l| {
+                let l = l.trim_start();
+                let l = l
+                    .strip_prefix("pub(crate) ")
+                    .or_else(|| l.strip_prefix("pub "))
+                    .unwrap_or(l);
+                l.starts_with("mod ")
+            });
+            if lines[i] == "#[cfg(test)]" && declares_module {
                 let end = lines[i + 2..]
                     .iter()
                     .position(|l| *l == "}")
