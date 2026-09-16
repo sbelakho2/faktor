@@ -143,6 +143,11 @@ pub struct ServerDeps {
     /// `retention_runtime_disabled` (the other enterprise routes still work
     /// on durable metadata only).
     pub retention: Option<Arc<crate::native::enterprise::RetentionRuntime>>,
+    /// The SSO login authority (`/native/sso/{start,callback}`) over the
+    /// configured network OIDC adapter. `None` = SSO is disabled (the
+    /// default): both routes answer a typed 409 `sso_disabled` and the daemon
+    /// is otherwise byte-identical.
+    pub sso: Option<Arc<faktor_cloud::SsoLogin>>,
 }
 
 impl ServerDeps {
@@ -218,6 +223,7 @@ impl ServerDeps {
             workers: None,
             enterprise: None,
             retention: None,
+            sso: None,
         }
     }
 
@@ -276,6 +282,14 @@ impl ServerDeps {
     /// every `/native/updater/*` route answers 409 `updater_disabled`.
     pub fn with_updater(mut self, updater: Arc<faktor_updater::Updater>) -> Self {
         self.updater = Some(updater);
+        self
+    }
+
+    /// Wire the SSO login authority (`/native/sso/{start,callback}`) over the
+    /// configured network OIDC adapter. Additive: without it both routes
+    /// answer a typed 409 `sso_disabled`.
+    pub fn with_sso(mut self, sso: Arc<faktor_cloud::SsoLogin>) -> Self {
+        self.sso = Some(sso);
         self
     }
 
@@ -589,8 +603,16 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
             post(native_worker_heartbeat),
         )
         .route("/native/workers/{id}/revoke", post(native_worker_revoke))
+        .route("/native/jobs/claim", post(native_job_claim))
         .route("/native/jobs/{id}", get(native_job_status))
         .route("/native/jobs/{id}/result", post(native_job_result))
+        // SSO login surface (additive; disabled by default): start mints an
+        // authorization URL for the organization's IdP, callback consumes the
+        // single-use state and mints ONE control-plane session. Both routes
+        // ride the daemon password; with no SSO authority wired every route
+        // answers a typed 409 `sso_disabled`.
+        .route("/native/sso/start", post(native_sso_start))
+        .route("/native/sso/callback", post(native_sso_callback))
         // Enterprise plane (additive; disabled by default): retention
         // artifacts + guarded GC, the audit-ledger cursor export, deletion
         // jobs, admin settings and the effective-config attestation. Every
@@ -937,6 +959,7 @@ pub(crate) mod tests {
             workers: None,
             enterprise: None,
             retention: None,
+            sso: None,
         }
     }
 
@@ -3179,6 +3202,7 @@ pub(crate) mod tests {
             workers: None,
             enterprise: None,
             retention: None,
+            sso: None,
         }
     }
 
@@ -5006,6 +5030,7 @@ pub(crate) mod tests {
             workers: None,
             enterprise: None,
             retention: None,
+            sso: None,
         }
     }
 
@@ -6212,6 +6237,7 @@ pub(crate) mod tests {
             workers: None,
             enterprise: None,
             retention: None,
+            sso: None,
         };
         NativeTaskRig {
             deps,

@@ -26,12 +26,14 @@ use faktor_session::SessionManager;
 use faktor_terminal::{ProcessOwner, ProcessSupervisor};
 use serde_json::{json, Value};
 
+mod billing_debits;
 mod config;
 mod embeddings;
 mod evidence;
 mod graph;
 mod mcp_bridge;
 mod tools;
+mod worker_node;
 
 use graph::DaemonGraph;
 
@@ -115,10 +117,35 @@ enum Command {
         #[arg(long, global = true)]
         config: Option<String>,
     },
+    /// Remote worker mode: register, claim, execute and submit remote jobs
+    /// through a control plane. The `[worker_node]` section must be enabled
+    /// (disabled by default: the entry refuses before any effect).
+    Worker {
+        #[command(subcommand)]
+        action: WorkerAction,
+        /// The daemon data dir (default `~/.faktor`).
+        #[arg(long, default_value = "~/.faktor", global = true)]
+        data_dir: String,
+        #[arg(long, global = true)]
+        config: Option<String>,
+    },
     /// List sessions.
     Sessions {
         #[arg(long, default_value = "~/.faktor")]
         data_dir: String,
+    },
+}
+
+/// The worker-node local subcommands (`faktor worker <action>`).
+#[derive(Subcommand)]
+enum WorkerAction {
+    /// Run the bounded worker loop: register once, then claim/execute/submit
+    /// until the iteration budget or the stop condition. Prints one JSON
+    /// tally line on stdout.
+    Run {
+        /// Loop budget (bounded by the worker crate; default 1 = one pass).
+        #[arg(long)]
+        iterations: Option<u32>,
     },
 }
 
@@ -329,6 +356,22 @@ async fn main() {
             config,
         } => {
             enterprise_command(action, expand(&data_dir), config.map(|c| expand(&c))).await;
+        }
+        Command::Worker {
+            action,
+            data_dir,
+            config,
+        } => {
+            let data_dir = expand(&data_dir);
+            let config = config.map(|c| expand(&c));
+            match action {
+                WorkerAction::Run { iterations } => {
+                    if let Err(e) = worker_node::run(iterations, data_dir, config).await {
+                        eprintln!("worker node: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
         }
         Command::Sessions { data_dir } => {
             sessions(expand(&data_dir)).await;
@@ -1764,6 +1807,19 @@ async fn serve_impl(
         service
             .ensure_account(&organization, &account, &account_name, managed)
             .map_err(|e| format!("billing account provisioning: {e}"))?;
+        // Wave 5 residual: install the agent-side debit authority, so a
+        // Faktor-managed provider attempt opens its durable credit hold
+        // BEFORE dispatch (record-before-call) and settles/refunds with the
+        // reservation ledger; BYOK providers are classified and never
+        // debited. Without this install the agent dispatch path is exactly
+        // the pre-billing path (no debit call exists).
+        graph
+            .agent
+            .set_provider_debits(Some(Arc::new(billing_debits::CloudAttemptDebits::new(
+                service.clone(),
+                organization.clone(),
+                account.clone(),
+            ))));
         billing_gate = Some(Arc::new(BillingAdmissionGate::new(
             service.clone(),
             organization,
@@ -7293,6 +7349,240 @@ mod tests {
                 .expect("daemon shutdown")
                 .expect("serve_impl returns Ok")
                 .unwrap();
+        }
+    }
+    /// Worker-mode disabled parity: the default `[worker_node]` section (and
+    /// every pre-existing config) makes `faktor worker run` refuse typed
+    /// before any network, database or workspace effect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_node_disabled_refuses_before_any_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let err = worker_node::run(None, data.clone(), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("disabled"), "{err}");
+        let err = worker_node::run(Some(4), data.clone(), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("disabled"), "{err}");
+        assert!(!data.exists(), "the disabled entry creates nothing at all");
+    }
+
+    /// End-to-end fake-transport round trip: the TaskExecutor places a run
+    /// remotely (real worker plane + placement seam), the worker-side runtime
+    /// claims the scheduler's lease, executes through a scripted (self-
+    /// verified, read-only) executor, submits the digest-bound result and the
+    /// landed result settles the PARENT run through the SAME TaskExecutor
+    /// settlement pipeline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_transport_round_trip_settles_the_parent_run() {
+        struct YieldSleeper;
+        impl faktor_worker::WorkerSleeper for YieldSleeper {
+            fn sleep_ms(&self, _ms: i64) {
+                std::thread::yield_now();
+            }
+        }
+        struct ScriptedExecutor;
+        impl faktor_worker::JobExecutor for ScriptedExecutor {
+            fn execute(
+                &self,
+                _request: faktor_worker::JobExecutionRequest<'_>,
+                _control: &faktor_worker::ExecutionControl,
+            ) -> Result<faktor_worker::JobExecutionResult, String> {
+                Ok(faktor_worker::JobExecutionResult {
+                    succeeded: true,
+                    self_verified: true,
+                    produced_digest: None,
+                    detail: String::new(),
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(data.join("owner")).unwrap();
+        let graph = build_daemon(&data, None).unwrap();
+        let clock = Arc::new(faktor_cloud::ManualClock::new(1_700_000_000_000));
+        let organization = faktor_cloud::OrganizationId::try_new("org_local").unwrap();
+        let plane = faktor_worker::WorkerPlane::new(
+            Arc::new(faktor_worker::MemoryWorkerStore::new()),
+            clock.clone(),
+        );
+        let requirements = faktor_worker::JobRequirements {
+            os: None,
+            arch: None,
+            toolchains: vec!["rust".into()],
+            sandbox: vec![],
+            network: None,
+            min_cpu_cores: 0,
+            min_memory_mb: 0,
+            gpu: false,
+            region: None,
+            trust_domain: "org_local".into(),
+        };
+        graph
+            .tasks
+            .set_worker_placement(faktor_orchestrator::placement::WorkerPlacement::enabled(
+                Arc::new(WorkerPlaneAdapter {
+                    plane: plane.clone(),
+                    organization: organization.clone(),
+                    trust_domain: "org_local".into(),
+                    requirements,
+                }),
+            ));
+
+        let goal = "e2e remote goal";
+        let payload_digest = blake3::hash(goal.as_bytes()).to_hex().to_string();
+        let issued = plane
+            .mint_registration_token(&organization, "org_local", "e2e")
+            .unwrap();
+        let token = faktor_cloud::SecretToken::try_new(issued.token.expose().to_string()).unwrap();
+        let worker_id = faktor_worker::WorkerId::try_new("wrk_e2e").unwrap();
+        let transport = Arc::new(faktor_worker::InProcessTransport::new(
+            plane.clone(),
+            organization.clone(),
+        ));
+        transport.bind_token(&worker_id, token.clone());
+        transport.stage_payload(&payload_digest, "text/plain", goal);
+        let workspace_root = data.join("worker_workspaces");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let runtime = faktor_worker::WorkerRuntime::new(
+            faktor_worker::WorkerRuntimeConfig {
+                enabled: true,
+                worker_id: worker_id.clone(),
+                display_name: "e2e".into(),
+                capabilities: plane
+                    .register(
+                        &organization,
+                        &worker_id,
+                        &token,
+                        faktor_worker::WorkerCapabilities {
+                            os: std::env::consts::OS.into(),
+                            arch: std::env::consts::ARCH.into(),
+                            toolchains: vec!["rust".into()],
+                            sandbox: vec![],
+                            network: faktor_worker::NetworkProfile::None,
+                            cpu_cores: 1,
+                            memory_mb: 1_024,
+                            gpu: None,
+                            region: "local".into(),
+                            trust_domain: "org_local".into(),
+                            protocol_version: faktor_worker::WORKER_PROTOCOL_VERSION,
+                        },
+                        "e2e",
+                    )
+                    .unwrap()
+                    .worker
+                    .capabilities,
+                token: token.clone(),
+                claim_deadline_ms: 0,
+                claim_interval_ms: 10,
+                heartbeat_interval_ms: 1_000,
+                discard_workspace_on_success: true,
+            },
+            transport,
+            Arc::new(ScriptedExecutor),
+            Arc::new(YieldSleeper),
+            clock.clone(),
+            workspace_root,
+        )
+        .unwrap();
+
+        let ws = graph
+            .session
+            .create_workspace(data.join("owner").to_str().unwrap())
+            .unwrap();
+        let parent = graph
+            .session
+            .create_session(ws, "e2e owner", "fake", "default")
+            .unwrap()
+            .id();
+        let receipt = graph
+            .tasks
+            .start_task(
+                parent,
+                faktor_orchestrator::runtime::task_executor::TaskRunRequest {
+                    goal: goal.into(),
+                    work_items: vec![faktor_orchestrator::WorkItem::new(
+                        "w1",
+                        "remote work",
+                        faktor_orchestrator::WorkKind::Analysis,
+                    )],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            receipt.mode,
+            faktor_orchestrator::runtime::task_executor::TaskRunMode::Remote
+        );
+        let job_id = receipt.run_id.clone();
+
+        // claim (adopts the scheduler's placement lease) -> execute -> submit
+        let outcome = runtime.run_once().unwrap();
+        match outcome {
+            faktor_worker::RunOutcome::Completed {
+                job_id: completed,
+                generation,
+                submit,
+                ..
+            } => {
+                assert_eq!(completed, job_id);
+                assert_eq!(generation, 1);
+                assert_eq!(submit, faktor_worker::ResultOutcome::Landed);
+            }
+            other => panic!("expected a landed completion, got {other:?}"),
+        }
+        let job = faktor_worker::ExecutionJobId::try_new(job_id.clone()).unwrap();
+        let status = plane.job_status(&organization, &job).unwrap();
+        assert_eq!(status.job.state, faktor_worker::JobState::Completed);
+        assert!(status.result.is_some());
+
+        // the parent carries a durable task row (the completion-step proof
+        // read requires it); the run itself never executed locally.
+        let handle = graph.session.get_session(parent).unwrap().unwrap();
+        let task_id = handle.task_id().unwrap();
+        let now = handle.now_ms();
+        handle
+            .create_task(faktor_session::Task {
+                task_id,
+                session_id: parent,
+                goal: goal.into(),
+                acceptance_criteria: vec![],
+                plan: vec![],
+                attachments: Vec::new(),
+                budget: faktor_session::TaskBudget::default(),
+                state: faktor_core::state::TaskState::Pending,
+                created_ms: now,
+                updated_ms: now,
+            })
+            .unwrap();
+        let completion = faktor_orchestrator::remote_completion::RemoteRunCompletion {
+            parent,
+            run_id: job_id.clone(),
+            job_id: job_id.clone(),
+            generation: 1,
+            kind: "in_session".into(),
+            digest: payload_digest.clone(),
+            outcome: faktor_orchestrator::remote_completion::RemoteRunOutcome::Succeeded,
+            claim: faktor_orchestrator::remote_completion::RemoteVerificationClaim {
+                self_verified: true,
+                produced_digest: None,
+            },
+        };
+        match graph.tasks.complete_remote_run(completion).await.unwrap() {
+            faktor_orchestrator::remote_completion::RemoteCompletionOutcome::Settled {
+                class,
+                settlement,
+            } => {
+                assert_eq!(
+                    class,
+                    faktor_orchestrator::remote_completion::RemoteCompletionClass::SelfVerifiedReadOnly
+                );
+                assert_eq!(settlement.run_id, job_id);
+            }
+            other => panic!("expected a settlement, got {other:?}"),
         }
     }
 }

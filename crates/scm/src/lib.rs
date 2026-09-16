@@ -29,6 +29,7 @@ pub mod ids;
 pub mod provider;
 pub mod store;
 pub mod sync;
+pub mod token;
 pub mod webhook;
 
 pub use error::ScmError;
@@ -48,6 +49,10 @@ pub use store::{
     ScmStore, ScmStoreError, SqliteScmStore,
 };
 pub use sync::{ScmSync, SyncReport};
+pub use token::{
+    GitHubAppTokenConfig, GitHubAppTokenSource, DEFAULT_JWT_SKEW_SECS, DEFAULT_JWT_TTL_SECS,
+    MAX_APP_KEY_PEM_BYTES, MAX_APP_TOKEN_ATTEMPTS,
+};
 pub use webhook::{
     hmac_sha256_hex, IngestOutcome, VerifiedWebhook, WebhookError, WebhookHeaders, WebhookInbox,
     WebhookVerifier, DEFAULT_REPLAY_WINDOW_MS, MAX_WEBHOOK_BODY_BYTES,

@@ -249,6 +249,16 @@ pub trait BillingStore: Send + Sync {
         after_seq: i64,
         limit: usize,
     ) -> Result<Vec<StoredCreditEntry>, BillingStoreError>;
+    /// One recorded credit entry by its idempotency key (the DURABLE
+    /// identity of a record-before-call consume), `None` when no entry of
+    /// this organization claimed the key. Additive read used by the
+    /// agent-side debit adapter to settle/refund the hold it opened (the
+    /// service's append returns the key's outcome, not the entry id).
+    fn credit_entry_by_idempotency_key(
+        &self,
+        organization: &OrganizationId,
+        key: &str,
+    ) -> Result<Option<StoredCreditEntry>, BillingStoreError>;
     fn credit_balance(
         &self,
         organization: &OrganizationId,
@@ -599,6 +609,22 @@ impl BillingStore for MemoryBillingStore {
             .unwrap_or_default();
         rows.sort_by_key(|row| row.entry_seq);
         Ok(rows)
+    }
+
+    fn credit_entry_by_idempotency_key(
+        &self,
+        organization: &OrganizationId,
+        key: &str,
+    ) -> Result<Option<StoredCreditEntry>, BillingStoreError> {
+        let state = self.lock()?;
+        Ok(state
+            .credits
+            .values()
+            .find(|row| {
+                row.entry.organization == *organization
+                    && row.entry.idempotency_key.as_deref() == Some(key)
+            })
+            .cloned())
     }
 
     fn credit_balance(
@@ -1096,6 +1122,30 @@ impl BillingStore for SqliteControlPlaneStore {
             });
         }
         Ok(out)
+    }
+
+    fn credit_entry_by_idempotency_key(
+        &self,
+        organization: &OrganizationId,
+        key: &str,
+    ) -> Result<Option<StoredCreditEntry>, BillingStoreError> {
+        let conn = self.lock_billing_conn()?;
+        let row = conn
+            .query_row(
+                "SELECT entry_seq, payload FROM credit_entry
+                 WHERE organization_id = ?1 AND idempotency_key = ?2",
+                params![organization.as_str(), key],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(backend)?;
+        match row {
+            Some((entry_seq, payload)) => Ok(Some(StoredCreditEntry {
+                entry_seq,
+                entry: parse(&payload)?,
+            })),
+            None => Ok(None),
+        }
     }
 
     fn credit_balance(

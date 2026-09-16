@@ -2447,6 +2447,84 @@ impl TaskExecutor {
         }
     }
 
+    /// The remote-run completion gate (additive; classification documented in
+    /// [`crate::remote_completion`]).
+    ///
+    /// A landed remote result for a run this executor placed remotely is
+    /// classified:
+    ///
+    /// - a SUCCEEDED, self-verified, read-only result (`produced_digest: None`)
+    ///   settles the parent run through the SAME post-run pass local runs use
+    ///   ([`Self::settle_run`]) — the worker's claim is admissible ONLY for
+    ///   this class;
+    /// - everything else (a produced/mutated tree, a missing self-verification
+    ///   claim, or a failed outcome) returns the typed
+    ///   [`crate::remote_completion::RemoteCompletionOutcome::OriginVerificationRequired`]
+    ///   and settles NOTHING: the origin must verify the produced work through
+    ///   its own verification pipeline before any completion (fail closed).
+    ///
+    /// Lease loss/supersession is owned by the worker plane's bounded requeue
+    /// policy: a result from a lost lease is refused before it ever lands, so
+    /// it can never reach this gate. A malformed completion is a typed
+    /// refusal before any durable read.
+    pub async fn complete_remote_run(
+        self: &Arc<Self>,
+        completion: crate::remote_completion::RemoteRunCompletion,
+    ) -> Result<crate::remote_completion::RemoteCompletionOutcome, ExecError> {
+        use crate::remote_completion::{
+            RemoteCompletionClass, RemoteCompletionOutcome, RemoteRunCompletion,
+        };
+        completion.validate().map_err(ExecError::Malformed)?;
+        let class = completion
+            .classify()
+            .map_err(|reason| ExecError::Malformed(format!("remote completion: {reason}")))?;
+        if class == RemoteCompletionClass::OriginVerificationRequired {
+            tracing::warn!(
+                session = completion.parent.raw(),
+                job_id = %completion.job_id,
+                run_id = %completion.run_id,
+                generation = completion.generation,
+                reason = %completion.origin_reason(),
+                "a landed remote result requires origin verification; nothing is settled from the claim"
+            );
+            return Ok(RemoteCompletionOutcome::OriginVerificationRequired {
+                class,
+                job_id: completion.job_id.clone(),
+                run_id: completion.run_id.clone(),
+                reason: completion.origin_reason(),
+            });
+        }
+        let RemoteRunCompletion {
+            parent,
+            run_id,
+            kind,
+            ..
+        } = completion;
+        let settlement = match kind.as_str() {
+            "in_session" => {
+                self.settle_run(RunSettlement::InSession {
+                    parent,
+                    run_id: run_id.clone(),
+                })
+                .await?
+            }
+            "orchestrated" => {
+                self.settle_run(RunSettlement::Orchestrated {
+                    parent,
+                    run_id: run_id.clone(),
+                })
+                .await?
+            }
+            // `validate` already refused every other kind.
+            other => {
+                return Err(ExecError::Malformed(format!(
+                    "unknown remote run kind {other:?}"
+                )))
+            }
+        };
+        Ok(RemoteCompletionOutcome::Settled { class, settlement })
+    }
+
     /// Re-settle the runs of `parent` whose EXACT root verification attempt
     /// just became terminal (the daemon verification executor calls this
     /// after it resolves jobs). Without it a run parked on a pending attempt

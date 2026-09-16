@@ -187,6 +187,10 @@ pub(crate) struct ResultBody {
     pub(crate) lease_id: String,
     pub(crate) digest: String,
     pub(crate) outcome: faktor_worker::JobResultOutcome,
+    /// The worker's verification claim (additive; absent = the fail-closed
+    /// "not self-verified" default).
+    #[serde(default)]
+    pub(crate) verification: faktor_worker::JobVerificationClaim,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -197,6 +201,20 @@ pub(crate) struct MintTokenBody {
     #[serde(default)]
     pub(crate) trust_domain: Option<String>,
 }
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClaimBody {
+    pub(crate) token: String,
+    pub(crate) protocol_version: u32,
+    /// Advisory long-poll hint (bounded, validated); the worker runtime polls
+    /// at its own cadence, so the server answers one claim pass immediately.
+    #[serde(default)]
+    pub(crate) wait_ms: Option<i64>,
+}
+
+/// Hard bound on the advisory claim wait hint.
+pub(crate) const MAX_CLAIM_WAIT_MS: i64 = 60_000;
 
 // ------------------------------------------------------------------ handlers
 
@@ -297,6 +315,66 @@ pub(crate) async fn native_worker_heartbeat(
         .into_response(),
         Err(e) => wire_status(worker_err(e)),
     }
+}
+
+/// `POST /native/jobs/claim` — one worker claim pass (long-poll contract:
+/// the worker polls at its own cadence and the server answers one pass
+/// immediately). Open generations are claimed through the worker's CAS
+/// accept; a generation the scheduler already leased FOR this worker (the
+/// placement seam's auto-accept) is adopted instead. Capability/trust-domain
+/// mismatches are silent skips: `claimed: null` means no eligible work.
+pub(crate) async fn native_job_claim(
+    State(state): State<AppState>,
+    body: Result<Json<ClaimBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return wire_status(malformed_body("invalid claim body (strict DTO)")),
+    };
+    let plane = match plane(&state) {
+        Ok(plane) => plane,
+        Err(e) => return wire_status(e),
+    };
+    if let Some(wait) = body.wait_ms {
+        if !(0..=MAX_CLAIM_WAIT_MS).contains(&wait) {
+            return wire_status(malformed_body(&format!(
+                "wait_ms must be 0..={MAX_CLAIM_WAIT_MS}"
+            )));
+        }
+    }
+    let token = match worker_token(&body.token) {
+        Ok(token) => token,
+        Err(e) => return wire_status(e),
+    };
+    let worker_id = match plane.worker_for_token(&token) {
+        Ok(worker_id) => worker_id,
+        Err(e) => return wire_status(worker_err(e)),
+    };
+    let organization = match plane.worker_organization(&worker_id) {
+        Ok(org) => org,
+        Err(e) => return wire_status(worker_err(e)),
+    };
+    let claimed = match plane.claim_next(&organization, &worker_id, &token, body.protocol_version) {
+        Ok(claimed) => claimed,
+        Err(e) => return wire_status(worker_err(e)),
+    };
+    let claimed = match claimed {
+        Some(claimed) => Some(claimed),
+        None => {
+            match plane.adoptable_lease(&organization, &worker_id, &token, body.protocol_version) {
+                Ok(claimed) => claimed,
+                Err(e) => return wire_status(worker_err(e)),
+            }
+        }
+    };
+    Json(serde_json::json!({
+        "ok": true,
+        "claimed": claimed.map(|claimed| serde_json::json!({
+            "job": claimed.job,
+            "lease": claimed.lease,
+        })),
+    }))
+    .into_response()
 }
 
 /// `GET /native/workers` — one cursor page of the caller organization's
@@ -498,7 +576,7 @@ pub(crate) async fn native_job_result(
         Ok(org) => org,
         Err(e) => return wire_status(worker_err(e)),
     };
-    match plane.submit_result(
+    match plane.submit_result_with_claim(
         &organization,
         &worker_id,
         &token,
@@ -508,6 +586,7 @@ pub(crate) async fn native_job_result(
         &lease_id,
         &body.digest,
         body.outcome,
+        body.verification,
     ) {
         Ok(outcome) => Json(serde_json::json!({
             "ok": true,

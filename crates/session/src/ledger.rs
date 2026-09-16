@@ -1138,6 +1138,24 @@ pub struct IntegrationRecordRow {
     pub at_ms: i64,
 }
 
+impl IntegrationRecordRow {
+    /// The proof-basis digest this integration was bound to, when recorded.
+    /// It is the SAME digest the root verification record's environment
+    /// fingerprint carries (the basis the record was written under), which
+    /// includes the basis' bound layered effective-configuration digest — a
+    /// configuration layer change therefore invalidates this record's basis
+    /// exactly as it invalidates the verification record's reuse.
+    pub fn proof_basis_digest(&self) -> Option<&str> {
+        self.proof_basis_digest.as_deref()
+    }
+
+    /// Whether this ledger record names exactly `basis_digest` as the reuse
+    /// basis of its run (the completion-time binding check).
+    pub fn is_bound_to_proof_basis(&self, basis_digest: &str) -> bool {
+        self.proof_basis_digest() == Some(basis_digest)
+    }
+}
+
 /// The durable IMMUTABLE run base of one orchestrated run (prepare phase
 /// zero): the snapshot digest of the owner root taken BEFORE the first child
 /// spawn, the copied base root and the manifest digest of the copy. Every
@@ -6699,6 +6717,89 @@ mod tests {
         );
         let txn2 = s2.ledger_integration_txn_for_run("run-identity").unwrap();
         assert_eq!(txn2.unwrap().txn_id(), txn_id, "txn id survives reopen");
+    }
+
+    /// The ledger's recorded proof-basis digest is the SAME config-bound
+    /// digest the root verification record embeds: a layered configuration
+    /// change (a system-layer value) changes the basis digest, and the
+    /// ledger's binding check refuses the stale basis across a real reopen.
+    #[test]
+    fn ledger_proof_basis_binding_carries_the_effective_config_digest() {
+        use faktor_core::id::SessionId as Sid;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let cas = dir.path().join("cas");
+        let m = crate::SessionManager::open(store.clone(), cas.clone(), true).unwrap();
+        let s = session(&m);
+        let sid: Sid = s.id;
+        let hex = |c: char| c.to_string().repeat(64);
+        let config = |system_value: &str| {
+            crate::task::layered_effective_config_digest(&[
+                crate::task::ProofConfigLayer::of_value(
+                    crate::task::ProofConfigScope::System,
+                    7,
+                    system_value,
+                ),
+            ])
+            .unwrap()
+        };
+        let basis_digest = |system_value: &str| {
+            crate::task::ProofBasis {
+                task_id: 1,
+                task_revision: 1,
+                task_contract_digest: hex('1'),
+                candidate_snapshot: hex('2'),
+                integration_sources_digest: hex('3'),
+                changed_files_digest: hex('4'),
+                checks: Vec::new(),
+                verification_impl_version: "faktor-test/0.1".into(),
+                tool_versions: Vec::new(),
+                env_projection: vec![("RUSTFLAGS".into(), "<absent>".into())],
+                instruction_epoch: None,
+                criteria: Vec::new(),
+                reviewer_digest: None,
+                evidence_digests: Vec::new(),
+            }
+            .bind_config_digest(&config(system_value))
+            .unwrap()
+            .digest()
+        };
+        let recorded = basis_digest("network=allow");
+        assert_ne!(recorded, basis_digest("network=deny"));
+        let record = IntegrationRecordRow {
+            run_id: "run-config-basis".into(),
+            task_id: 1,
+            base_revision: None,
+            base_snapshot: Some(hex('1')),
+            run_base_snapshot: Some(hex('1')),
+            candidate_snapshot: Some(hex('2')),
+            landed_snapshot: Some(hex('5')),
+            proof_basis_digest: Some(recorded.clone()),
+            integration_txn_id: None,
+            final_root: "/owner".into(),
+            final_snapshot_hash: hex('5'),
+            integrated_files: Vec::new(),
+            integrated_file_count: 0,
+            integrated_files_digest: String::new(),
+            conflicts: Vec::new(),
+            conflict_count: 0,
+            sources: Vec::new(),
+            source_count: 0,
+            sources_digest: String::new(),
+            at_ms: 7,
+        };
+        s.ledger_integration_record_set(&record).unwrap();
+        drop(s);
+        drop(m);
+        let m2 = crate::SessionManager::open(store, cas, true).unwrap();
+        let s2 = m2.get_session(sid).unwrap().unwrap();
+        let read = s2.ledger_integration_record_for_task(1).unwrap().unwrap();
+        assert_eq!(read.proof_basis_digest(), Some(recorded.as_str()));
+        assert!(read.is_bound_to_proof_basis(&recorded));
+        assert!(
+            !read.is_bound_to_proof_basis(&basis_digest("network=deny")),
+            "a changed system-layer value must not be reusable as the recorded basis"
+        );
     }
 
     /// Hardening: a tampered raw row that disagrees between the deprecated

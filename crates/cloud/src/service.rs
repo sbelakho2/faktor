@@ -100,6 +100,19 @@ pub struct BootstrapRecord {
     pub session: AuthSession,
 }
 
+/// One external (SSO/OIDC) login result: the resolved user, the durable
+/// session and the ONE-SHOT plaintext session token.
+#[derive(Debug, Clone)]
+pub struct ExternalLogin {
+    pub user: User,
+    pub session: AuthSession,
+    /// Visible exactly once, at issuance; only the hash is stored.
+    pub token: SecretToken,
+    /// The membership role in force after the login (an existing membership
+    /// keeps its role).
+    pub role: Role,
+}
+
 /// One membership joined with its user.
 #[derive(Debug, Clone, Serialize)]
 pub struct MemberView {
@@ -359,6 +372,75 @@ impl ControlPlane {
             user,
             session,
             token: Some(token),
+        })
+    }
+
+    /// One SSO/external-identity login: resolve-or-create the user by the
+    /// VERIFIED claims of an IdP, link the external subject, ensure the
+    /// membership and mint ONE control-plane auth session (the plaintext
+    /// token is visible exactly once).
+    ///
+    /// Semantics (documented, fail closed):
+    ///
+    /// - the organization must exist and not be deleted (`NotFound`);
+    /// - the email is normalized by the same rule every user row uses; an
+    ///   existing DISABLED user is refused `Unauthorized`;
+    /// - the external `(provider, subject)` link is idempotent; a subject
+    ///   already linked to another user is refused `Conflict` (never
+    ///   re-linked);
+    /// - an EXISTING membership keeps its role: the IdP mapping authorizes
+    ///   joining, never a privilege change of an existing member (role
+    ///   changes remain an explicit admin action);
+    /// - a new membership is created with the MAPPED role.
+    pub fn login_external(
+        &self,
+        organization: &OrganizationId,
+        provider: &str,
+        subject: &str,
+        email: &str,
+        display_name: &str,
+        mapped_role: Role,
+    ) -> Result<ExternalLogin, ControlPlaneError> {
+        let org = self
+            .store
+            .organization(organization)?
+            .filter(|org| !org.deleted)
+            .ok_or_else(|| ControlPlaneError::NotFound("organization not found".into()))?;
+        let (user, _) = self.create_user(email, display_name)?;
+        if user.disabled {
+            return Err(ControlPlaneError::Unauthorized("user is disabled".into()));
+        }
+        let _identity = self.link_external_identity(&user.id, provider, subject)?;
+        let membership = match self.store.membership(&org.id, &user.id)? {
+            Some(existing) => existing,
+            None => {
+                let membership = Membership {
+                    id: MembershipId::try_new(Self::new_id("mem"))?,
+                    organization: org.id.clone(),
+                    user: user.id.clone(),
+                    role: mapped_role,
+                    created_ms: self.now_ms(),
+                };
+                self.store.put_membership(&membership)?;
+                membership
+            }
+        };
+        let token = Self::new_token()?;
+        let session = AuthSession {
+            id: AuthSessionId::try_new(Self::new_id("ses"))?,
+            organization: org.id.clone(),
+            user: user.id.clone(),
+            token_hash: TokenHash::of(token.expose()),
+            created_ms: self.now_ms(),
+            expires_ms: self.now_ms().saturating_add(DEFAULT_SESSION_TTL_MS),
+            revoked_ms: None,
+        };
+        self.store.put_auth_session(&session)?;
+        Ok(ExternalLogin {
+            user,
+            session,
+            token,
+            role: membership.role,
         })
     }
 

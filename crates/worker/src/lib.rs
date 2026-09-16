@@ -26,6 +26,7 @@
 pub mod error;
 pub mod ids;
 pub mod model;
+pub mod runtime;
 pub mod service;
 pub mod store;
 
@@ -37,11 +38,18 @@ pub use ids::{
 pub use model::{
     clamp_heartbeat_interval, AttemptState, ExecutionJob, GenerationState, GpuCapability,
     JobAttempt, JobGenerationRow, JobRequirements, JobResult, JobResultOutcome, JobState,
-    JobStatus, JournalEntry, LeaseState, NetworkProfile, RequeuePolicy, SandboxCapability,
-    WorkerCapabilities, WorkerLease, WorkerPage, WorkerRegistration, WorkerTokenRow, WorkerView,
-    DEFAULT_MAX_ATTEMPTS, HEARTBEAT_DEFAULT_INTERVAL_MS, HEARTBEAT_MAX_INTERVAL_MS,
-    HEARTBEAT_MIN_INTERVAL_MS, MAX_LIVE_LEASES_PER_WORKER, MAX_REQUEUE_ATTEMPTS,
-    RESULT_DIGEST_BYTES,
+    JobStatus, JobVerificationClaim, JournalEntry, LeaseState, NetworkProfile, RequeuePolicy,
+    SandboxCapability, WorkerCapabilities, WorkerLease, WorkerPage, WorkerRegistration,
+    WorkerTokenRow, WorkerView, DEFAULT_MAX_ATTEMPTS, HEARTBEAT_DEFAULT_INTERVAL_MS,
+    HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS, MAX_LIVE_LEASES_PER_WORKER,
+    MAX_REQUEUE_ATTEMPTS, RESULT_DIGEST_BYTES,
+};
+pub use runtime::{
+    CandidateWorkspace, ClaimedJob, ExecutionControl, InProcessTransport, JobExecutionRequest,
+    JobExecutionResult, JobExecutor, JobPayload, LeaseLoss, LoopReport, RefusingTransport,
+    RunOutcome, SystemSleeper, WorkerRuntime, WorkerRuntimeConfig, WorkerRuntimeError,
+    WorkerSleeper, WorkerTransport, DEFAULT_HEARTBEAT_CADENCE_MS, MAX_CLAIM_DEADLINE_MS,
+    MAX_LOOP_ITERATIONS, MAX_PAYLOAD_BYTES, MIN_CLAIM_INTERVAL_MS,
 };
 pub use service::{
     default_requeue, HeartbeatOutcome, IssuedWorkerToken, RecoveryReport, RegistrationOutcome,

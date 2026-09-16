@@ -34,9 +34,12 @@ pub mod ids;
 pub mod layered_config;
 pub mod model;
 pub mod oidc;
+pub mod oidc_net;
 pub mod rbac;
 pub mod service;
+pub mod sso;
 pub mod store;
+pub mod vendor;
 
 pub use billing::{
     fold_credits, fold_usage, Admission, AdmissionBoundary, AdmissionRequest, BillingAccount,
@@ -87,14 +90,24 @@ pub use oidc::{
     ClaimMapping, CodeExchangeRequest, FakeOidcAdapter, IdTokenExpectations, JwkView, OidcAdapter,
     OidcClaims, OidcDiscovery, OidcError, OidcMembership, OidcTokenSet, ScimProvisioningSeam,
 };
+pub use oidc_net::{
+    AsyncOidcAdapter, CachedJwksView, NetworkOidcAdapter, NetworkOidcConfig,
+    DEFAULT_DISCOVERY_MAX_AGE_MS, DEFAULT_JWKS_MAX_AGE_MS, MAX_JWKS_REFETCHES,
+};
 pub use rbac::{
     authorize, Action, Denied, Principal, PrincipalSubject, Resource, Role, ALL_ACTIONS,
 };
 pub use service::{
-    sha256_hex, BootstrapResult, Clock, ControlPlane, IdentityView, InvitationIssued, ManualClock,
-    MemberView, ServiceAccountIssued, SystemClock, MAX_IDEMPOTENCY_KEY_BYTES, MAX_PAGE,
+    sha256_hex, BootstrapResult, Clock, ControlPlane, ExternalLogin, IdentityView,
+    InvitationIssued, ManualClock, MemberView, ServiceAccountIssued, SystemClock,
+    MAX_IDEMPOTENCY_KEY_BYTES, MAX_PAGE,
 };
+pub use sso::{SsoLogin, SsoLoginOutcome, SsoStart, MAX_PENDING_SSO_LOGINS, SSO_STATE_TTL_MS};
 pub use store::{
     CloudStoreError, ControlPlaneStore, IdempotencyRecord, MemoryControlPlaneStore,
     SqliteControlPlaneStore,
+};
+pub use vendor::{
+    BillingVendorAdapter, BillingVendorConfig, ReportOutcome, DEFAULT_REPORT_PATH,
+    MAX_REPORT_ATTEMPTS, MAX_REPORT_PAGES, MAX_REPORT_TASKS,
 };

@@ -36,6 +36,9 @@ pub(crate) mod models;
 pub mod prompt;
 pub(crate) mod semantic;
 pub(crate) mod session;
+/// The SSO login surface (start/callback; absent unless a network OIDC
+/// adapter is wired through `ServerDeps::with_sso`).
+pub(crate) mod sso;
 pub(crate) mod task;
 pub(crate) mod terminal;
 /// The daemon's session-owned terminal authority as a self-contained public
@@ -61,6 +64,7 @@ pub(crate) use models::*;
 pub use prompt::*;
 pub(crate) use semantic::*;
 pub(crate) use session::*;
+pub(crate) use sso::*;
 pub(crate) use task::*;
 pub(crate) use terminal::*;
 pub(crate) use updater::*;

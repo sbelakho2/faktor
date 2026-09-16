@@ -8775,3 +8775,166 @@ async fn placement_replay_is_delegated_to_the_seam_job_key() {
     );
     assert!(specs[0].job_key.contains("goal-"));
 }
+
+// ---------------------------------------------- remote-run completion gate
+
+use crate::remote_completion::{
+    RemoteCompletionClass, RemoteCompletionOutcome, RemoteRunCompletion, RemoteRunOutcome,
+    RemoteVerificationClaim,
+};
+
+fn remote_completion(
+    env: &Env,
+    digest: String,
+    outcome: RemoteRunOutcome,
+    self_verified: bool,
+    produced_digest: Option<String>,
+) -> RemoteRunCompletion {
+    RemoteRunCompletion {
+        parent: env.parent,
+        run_id: "job_remote_1".into(),
+        job_id: "job_remote_1".into(),
+        generation: 1,
+        kind: "in_session".into(),
+        digest,
+        outcome,
+        claim: RemoteVerificationClaim {
+            self_verified,
+            produced_digest,
+        },
+    }
+}
+
+/// A landed self-verified read-only result settles the parent run through the
+/// SAME post-run pass local runs use — and starts NOTHING locally.
+#[tokio::test]
+async fn remote_completion_settles_a_self_verified_read_only_result() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(&dir.path().join("a"), done_script());
+    // The parent carries a durable task row (the completion-step proof read
+    // requires it); the run itself was placed remotely, so nothing local ran.
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    let now = h.now_ms();
+    h.create_task(faktor_session::Task {
+        task_id,
+        session_id: env.parent,
+        goal: "remote run goal".into(),
+        acceptance_criteria: vec![],
+        plan: vec![],
+        attachments: Vec::new(),
+        budget: faktor_session::TaskBudget::default(),
+        state: TaskState::Pending,
+        created_ms: now,
+        updated_ms: now,
+    })
+    .unwrap();
+    let outcome = env
+        .executor
+        .complete_remote_run(remote_completion(
+            &env,
+            "a".repeat(64),
+            RemoteRunOutcome::Succeeded,
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    match outcome {
+        RemoteCompletionOutcome::Settled { class, settlement } => {
+            assert_eq!(class, RemoteCompletionClass::SelfVerifiedReadOnly);
+            assert_eq!(settlement.run_id, "job_remote_1");
+        }
+        other => panic!("expected a settlement, got {other:?}"),
+    }
+    assert_eq!(
+        env.provider.count(),
+        0,
+        "a remote completion never runs the local pipeline's child drive"
+    );
+}
+
+/// A produced/mutated tree, a missing self-verification claim and a failed
+/// outcome all refuse to settle: the origin must verify (fail closed).
+#[tokio::test]
+async fn remote_completion_requires_origin_verification_for_mutating_and_failed_results() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(&dir.path().join("a"), done_script());
+    let cases = [
+        // The run mutated a tree: the origin must verify it.
+        remote_completion(
+            &env,
+            "b".repeat(64),
+            RemoteRunOutcome::Succeeded,
+            true,
+            Some("c".repeat(64)),
+        ),
+        // No self-verification claim: fail closed.
+        remote_completion(
+            &env,
+            "d".repeat(64),
+            RemoteRunOutcome::Succeeded,
+            false,
+            None,
+        ),
+        // A failed outcome never completes anything.
+        remote_completion(&env, "e".repeat(64), RemoteRunOutcome::Failed, true, None),
+    ];
+    for completion in cases {
+        let outcome = env.executor.complete_remote_run(completion).await.unwrap();
+        match outcome {
+            RemoteCompletionOutcome::OriginVerificationRequired { class, run_id, .. } => {
+                assert_eq!(class, RemoteCompletionClass::OriginVerificationRequired);
+                assert_eq!(run_id, "job_remote_1");
+            }
+            other => panic!("expected the origin-verification requirement, got {other:?}"),
+        }
+    }
+    assert_eq!(env.provider.count(), 0);
+}
+
+/// Malformed completions are refused typed BEFORE any settlement read.
+#[tokio::test]
+async fn remote_completion_refuses_malformed_shapes() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(&dir.path().join("a"), done_script());
+    let mut short_digest =
+        remote_completion(&env, "ff".into(), RemoteRunOutcome::Succeeded, true, None);
+    assert!(matches!(
+        env.executor.complete_remote_run(short_digest.clone()).await,
+        Err(ExecError::Malformed(_))
+    ));
+    short_digest.digest = "f".repeat(64);
+    short_digest.generation = 0;
+    assert!(matches!(
+        env.executor.complete_remote_run(short_digest).await,
+        Err(ExecError::Malformed(_))
+    ));
+    let mut unknown_kind = remote_completion(
+        &env,
+        "f".repeat(64),
+        RemoteRunOutcome::Succeeded,
+        true,
+        None,
+    );
+    unknown_kind.kind = "sideways".into();
+    assert!(matches!(
+        env.executor.complete_remote_run(unknown_kind).await,
+        Err(ExecError::Malformed(_))
+    ));
+    let mut bad_produced = remote_completion(
+        &env,
+        "f".repeat(64),
+        RemoteRunOutcome::Succeeded,
+        true,
+        Some("zz".into()),
+    );
+    bad_produced.kind = "in_session".into();
+    assert!(matches!(
+        env.executor.complete_remote_run(bad_produced).await,
+        Err(ExecError::Malformed(_))
+    ));
+}
