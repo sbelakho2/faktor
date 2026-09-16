@@ -107,7 +107,7 @@ fn resolve_principal(
 }
 
 /// Resolve a REQUIRED principal (every route except the bootstrap).
-fn require_principal(
+pub(crate) fn require_principal(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<faktor_cloud::Principal, ApiError> {
@@ -122,7 +122,7 @@ fn require_principal(
     }
 }
 
-fn require_idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
+pub(crate) fn require_idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
     let Some(key) = header_value(headers, IDEMPOTENCY_KEY_HEADER) else {
         return Err(malformed_body(&format!(
             "missing {IDEMPOTENCY_KEY_HEADER} (required on mutating control-plane requests)"

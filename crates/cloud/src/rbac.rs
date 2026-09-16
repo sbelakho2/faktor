@@ -32,11 +32,24 @@
 //! | secret.write          |        |        |   x   |   x   |
 //! | approval.request      |        |   x    |   x   |   x   |
 //! | approval.decide       |        |        |   x   |   x   |
+//! | worker.read           |   x    |   x    |   x   |   x   |
 //! | worker.manage         |        |        |   x   |   x   |
 //! | member.write          |        |        |   x   |   x   |
 //! | organization.update   |        |        |   x   |   x   |
 //! | organization.delete   |        |        |       |   x   |
 //! | billing.write         |        |        |       |   x   |
+//! | credits_grant         |        |        |   x   |   x   |
+//! | updater.read          |   x    |   x    |   x   |   x   |
+//! | updater.stage         |        |   x    |   x   |   x   |
+//! | updater.apply         |        |        |   x   |   x   |
+//! | retention.read        |        |   x    |   x   |   x   |
+//! | settings.read         |   x    |   x    |   x   |   x   |
+//! | audit.read            |        |        |   x   |   x   |
+//! | audit.write           |        |        |   x   |   x   |
+//! | retention.write       |        |        |   x   |   x   |
+//! | retention.gc          |        |        |   x   |   x   |
+//! | settings.write        |        |        |   x   |   x   |
+//! | deletion.manage       |        |        |       |   x   |
 
 use std::collections::BTreeSet;
 
@@ -105,7 +118,48 @@ pub enum Action {
     ApprovalDecide,
     BillingRead,
     BillingWrite,
+    /// Grant credits to one billing account. Admin-and-above: a grant is a
+    /// commercial operation an administrator performs without owning the
+    /// organization row.
+    CreditsGrant,
+    /// Read the updater status / verify a signed update manifest. Every role
+    /// may look.
+    UpdaterRead,
+    /// Stage (download + verify) a signed update artifact. Member-and-above:
+    /// staging is inert (it never changes the install).
+    UpdaterStage,
+    /// Apply a staged update (the atomic swap + health probe). Admin-and-
+    /// above: applying changes what the daemon runs.
+    UpdaterApply,
     WorkerManage,
+    /// Read one organization's worker plane: registrations and the durable
+    /// state/attempts of its jobs. Every role may look.
+    WorkerRead,
+    /// Read one page of the enterprise audit ledger (separate from
+    /// engineering proof rows). Admin-and-above: the ledger names
+    /// principals, secrets metadata and privileged grants.
+    AuditRead,
+    /// Append one audit row for a mutation performed by another plane
+    /// (member/role, repository installation, provider credential, policy,
+    /// secret, approval, worker, entitlement, privileged tool grant).
+    /// Admin-and-above: audit rows are evidence and may not be minted by
+    /// ordinary members.
+    AuditWrite,
+    /// Read retention artifact metadata and the class policy table.
+    RetentionRead,
+    /// Register retention artifacts and set retention overrides.
+    RetentionWrite,
+    /// Run one garbage-collection pass (protected digests are refused).
+    RetentionGc,
+    /// Read org settings (allowed providers/models, retention overrides,
+    /// SSO config reference).
+    SettingsRead,
+    /// Change org settings. Admin-and-above; every change is audited with
+    /// before/after references.
+    SettingsWrite,
+    /// Start/resume an organization or account deletion job. Owner-only:
+    /// deletion is irreversible and tenant-wide.
+    DeletionManage,
 }
 
 /// The full action list, in stable order (used by the role-matrix test and
@@ -127,7 +181,20 @@ pub const ALL_ACTIONS: &[Action] = &[
     Action::ApprovalDecide,
     Action::BillingRead,
     Action::BillingWrite,
+    Action::CreditsGrant,
+    Action::UpdaterRead,
+    Action::UpdaterStage,
+    Action::UpdaterApply,
     Action::WorkerManage,
+    Action::WorkerRead,
+    Action::AuditRead,
+    Action::AuditWrite,
+    Action::RetentionRead,
+    Action::RetentionWrite,
+    Action::RetentionGc,
+    Action::SettingsRead,
+    Action::SettingsWrite,
+    Action::DeletionManage,
 ];
 
 impl Action {
@@ -149,7 +216,20 @@ impl Action {
             Action::ApprovalDecide => "approval_decide",
             Action::BillingRead => "billing_read",
             Action::BillingWrite => "billing_write",
+            Action::CreditsGrant => "credits_grant",
+            Action::UpdaterRead => "updater_read",
+            Action::UpdaterStage => "updater_stage",
+            Action::UpdaterApply => "updater_apply",
             Action::WorkerManage => "worker_manage",
+            Action::WorkerRead => "worker_read",
+            Action::AuditRead => "audit_read",
+            Action::AuditWrite => "audit_write",
+            Action::RetentionRead => "retention_read",
+            Action::RetentionWrite => "retention_write",
+            Action::RetentionGc => "retention_gc",
+            Action::SettingsRead => "settings_read",
+            Action::SettingsWrite => "settings_write",
+            Action::DeletionManage => "deletion_manage",
         }
     }
 
@@ -170,7 +250,17 @@ impl Action {
             Action::SecretRead | Action::SecretWrite => Resource::Secret,
             Action::ApprovalRequest | Action::ApprovalDecide => Resource::Approval,
             Action::BillingRead | Action::BillingWrite => Resource::Billing,
-            Action::WorkerManage => Resource::Worker,
+            Action::CreditsGrant => Resource::Billing,
+            Action::UpdaterRead | Action::UpdaterStage | Action::UpdaterApply => Resource::Updater,
+            Action::WorkerManage | Action::WorkerRead => Resource::Worker,
+            Action::AuditRead
+            | Action::AuditWrite
+            | Action::RetentionRead
+            | Action::RetentionWrite
+            | Action::RetentionGc
+            | Action::SettingsRead
+            | Action::SettingsWrite
+            | Action::DeletionManage => Resource::Enterprise,
         }
     }
 
@@ -181,18 +271,32 @@ impl Action {
             | Action::MemberRead
             | Action::RepositoryRead
             | Action::ProviderPolicyRead
-            | Action::BillingRead => Role::Viewer,
+            | Action::BillingRead
+            | Action::UpdaterRead
+            | Action::WorkerRead
+            | Action::SettingsRead => Role::Viewer,
             Action::RepositoryWrite
             | Action::RunCreate
             | Action::SecretRead
-            | Action::ApprovalRequest => Role::Member,
+            | Action::ApprovalRequest
+            | Action::UpdaterStage
+            | Action::RetentionRead => Role::Member,
             Action::OrganizationUpdate
             | Action::MemberWrite
             | Action::ProviderPolicyWrite
             | Action::SecretWrite
             | Action::ApprovalDecide
-            | Action::WorkerManage => Role::Admin,
-            Action::OrganizationDelete | Action::BillingWrite => Role::Owner,
+            | Action::CreditsGrant
+            | Action::UpdaterApply
+            | Action::WorkerManage
+            | Action::AuditRead
+            | Action::AuditWrite
+            | Action::RetentionWrite
+            | Action::RetentionGc
+            | Action::SettingsWrite => Role::Admin,
+            Action::OrganizationDelete | Action::BillingWrite | Action::DeletionManage => {
+                Role::Owner
+            }
         }
     }
 }
@@ -210,6 +314,11 @@ pub enum Resource {
     Approval,
     Billing,
     Worker,
+    /// The signed updater surface (status/check/stage/apply).
+    Updater,
+    /// The enterprise plane: audit ledger, retention classes/GC, org
+    /// settings and deletion jobs.
+    Enterprise,
 }
 
 impl Resource {
@@ -224,6 +333,8 @@ impl Resource {
             Resource::Approval => "approval",
             Resource::Billing => "billing",
             Resource::Worker => "worker",
+            Resource::Updater => "updater",
+            Resource::Enterprise => "enterprise",
         }
     }
 }
@@ -395,7 +506,20 @@ mod tests {
             (Action::ApprovalDecide, Role::Admin),
             (Action::BillingRead, Role::Viewer),
             (Action::BillingWrite, Role::Owner),
+            (Action::CreditsGrant, Role::Admin),
+            (Action::UpdaterRead, Role::Viewer),
+            (Action::UpdaterStage, Role::Member),
+            (Action::UpdaterApply, Role::Admin),
             (Action::WorkerManage, Role::Admin),
+            (Action::WorkerRead, Role::Viewer),
+            (Action::AuditRead, Role::Admin),
+            (Action::AuditWrite, Role::Admin),
+            (Action::RetentionRead, Role::Member),
+            (Action::RetentionWrite, Role::Admin),
+            (Action::RetentionGc, Role::Admin),
+            (Action::SettingsRead, Role::Viewer),
+            (Action::SettingsWrite, Role::Admin),
+            (Action::DeletionManage, Role::Owner),
         ];
         assert_eq!(
             rows.len(),

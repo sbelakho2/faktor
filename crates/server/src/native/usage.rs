@@ -1,6 +1,6 @@
 //! Authoritative usage reads: per-session and cross-session aggregates.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -9,7 +9,21 @@ use faktor_core::id::SessionId;
 use super::*;
 use crate::api::AppState;
 
-/// `GET /native/usage` — cross-session usage aggregate.
+/// The strict query of `/native/usage`. Without `org` the route keeps its
+/// frozen pre-billing shape (the durable cross-session aggregate below);
+/// with `org` it answers the Wave 3 per-organization usage fold — see
+/// [`billing_usage`]. Unknown query keys are a 400 (a typo never silently
+/// selects the legacy branch).
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeUsageQuery {
+    org: Option<String>,
+    since: Option<String>,
+    limit: Option<u64>,
+}
+
+/// `GET /native/usage` — cross-session usage aggregate (legacy shape) or,
+/// with `?org=`, the organization's commercial usage fold.
 ///
 /// Two documented layers:
 ///
@@ -30,7 +44,17 @@ use crate::api::AppState;
 ///   are read defensively, and the reservation scan is bounded — when the
 ///   per-task scan cap is hit the response says `truncated: true` instead of
 ///   pretending to be exact.
-pub(crate) async fn native_usage(State(state): State<AppState>, headers: HeaderMap) -> Response {
+///
+/// The `?org=` branch (Wave 3, additive) is org-isolated: the caller's
+/// control-plane principal fixes the organization.
+pub(crate) async fn native_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<NativeUsageQuery>,
+) -> Response {
+    if let Some(org) = query.org {
+        return billing_usage(state, headers, org, query.since, query.limit);
+    }
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }

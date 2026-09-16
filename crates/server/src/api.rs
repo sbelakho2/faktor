@@ -116,6 +116,33 @@ pub struct ServerDeps {
     /// The durable SCM store serving `/native/repositories`. `None` = no
     /// SCM state is wired (the route answers a typed 409 `scm_disabled`).
     pub scm: Option<Arc<dyn faktor_scm::ScmStore>>,
+    /// The Wave 3 commercial metering/entitlement service. `None` = the
+    /// `[billing]` section is disabled (the default): every billing route
+    /// answers a typed 409 `billing_disabled` and the daemon is otherwise
+    /// byte-identical to the pre-billing daemon.
+    pub billing: Option<Arc<faktor_cloud::EntitlementService>>,
+    /// The signed updater service (`[updater]`). `None` = the section is
+    /// disabled (the default): every `/native/updater/*` route answers a
+    /// typed 409 `updater_disabled` and the daemon is otherwise byte-
+    /// identical to the pre-updater daemon.
+    pub updater: Option<Arc<faktor_updater::Updater>>,
+    /// The remote/VPC worker plane (`[workers]`). `None` = the section is
+    /// disabled (the default): every `/native/workers*` and
+    /// `/native/jobs/*` route answers a typed 409 `workers_disabled`, the
+    /// daemon creates no worker database file, and the TaskExecutor's
+    /// placement seam stays disabled (local execution unchanged).
+    pub workers: Option<Arc<faktor_worker::WorkerPlane>>,
+    /// The enterprise plane service (`[enterprise]`): retention classes/GC,
+    /// the audit ledger, admin settings and deletion jobs. `None` = the
+    /// section is disabled (the default): every `/native/enterprise/*` route
+    /// answers a typed 409 `enterprise_disabled` and the daemon is otherwise
+    /// byte-identical to the pre-enterprise daemon.
+    pub enterprise: Option<Arc<faktor_cloud::EnterpriseService>>,
+    /// The daemon-side retention runtime (session store + CAS) the GC route
+    /// scans and deletes through. `None` = the GC route answers a typed 409
+    /// `retention_runtime_disabled` (the other enterprise routes still work
+    /// on durable metadata only).
+    pub retention: Option<Arc<crate::native::enterprise::RetentionRuntime>>,
 }
 
 impl ServerDeps {
@@ -186,6 +213,11 @@ impl ServerDeps {
             simulate_not_ready: false,
             control_plane: None,
             scm: None,
+            billing: None,
+            updater: None,
+            workers: None,
+            enterprise: None,
+            retention: None,
         }
     }
 
@@ -230,6 +262,42 @@ impl ServerDeps {
     /// Wire the durable SCM store serving `/native/repositories`.
     pub fn with_scm_store(mut self, store: Arc<dyn faktor_scm::ScmStore>) -> Self {
         self.scm = Some(store);
+        self
+    }
+
+    /// Wire the Wave 3 commercial metering service (`[billing]`). Additive:
+    /// without it every billing route answers 409 `billing_disabled`.
+    pub fn with_billing(mut self, billing: Arc<faktor_cloud::EntitlementService>) -> Self {
+        self.billing = Some(billing);
+        self
+    }
+
+    /// Wire the signed updater service (`[updater]`). Additive: without it
+    /// every `/native/updater/*` route answers 409 `updater_disabled`.
+    pub fn with_updater(mut self, updater: Arc<faktor_updater::Updater>) -> Self {
+        self.updater = Some(updater);
+        self
+    }
+
+    /// Wire the remote/VPC worker plane (`[workers]`). Additive: without it
+    /// every worker/job route answers 409 `workers_disabled` and the
+    /// TaskExecutor's placement seam stays disabled (local parity).
+    pub fn with_workers(mut self, workers: Arc<faktor_worker::WorkerPlane>) -> Self {
+        self.workers = Some(workers);
+        self
+    }
+
+    /// Wire the enterprise plane (`[enterprise]`) and, optionally, the
+    /// daemon-side retention runtime (session store + CAS) the GC route
+    /// scans and deletes through. Additive: without the service every
+    /// enterprise route answers 409 `enterprise_disabled`.
+    pub fn with_enterprise(
+        mut self,
+        enterprise: Arc<faktor_cloud::EnterpriseService>,
+        retention: Option<Arc<crate::native::enterprise::RetentionRuntime>>,
+    ) -> Self {
+        self.enterprise = Some(enterprise);
+        self.retention = retention;
         self
     }
 
@@ -285,6 +353,12 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
         .route("/native/health", get(native_health))
         .route("/native/ready", get(native_ready))
         .route("/native/usage", get(native_usage))
+        // Wave 3 commercial metering (additive): the per-organization usage
+        // fold + cursor page (the `?org=` branch of /native/usage above),
+        // the derived entitlement snapshot, and the admin-only credit grant.
+        // Without the `[billing]` section every one answers 409.
+        .route("/native/entitlements", get(native_entitlements))
+        .route("/native/credits/grant", post(native_credits_grant))
         // Session bootstrap (native): create one durable session on a
         // workspace root, list the durable sessions, and run ONE ordinary
         // prompt through the daemon's executor entry.
@@ -492,6 +566,75 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
             "/native/approvals/{id}/decide",
             post(native_approvals_decide),
         )
+        // Signed updater surface (additive; disabled by default): status,
+        // check, stage, apply and rollback. Every route needs a control-plane
+        // principal (viewer for status/check, member for stage, ADMIN for
+        // apply/rollback); with no `[updater]` section wired every route
+        // answers a typed 409 `updater_disabled`.
+        .route("/native/updater/status", get(native_updater_status))
+        .route("/native/updater/check", post(native_updater_check))
+        .route("/native/updater/stage", post(native_updater_stage))
+        .route("/native/updater/apply", post(native_updater_apply))
+        .route("/native/updater/rollback", post(native_updater_rollback))
+        // Remote/VPC worker plane (additive; disabled by default). Worker
+        // routes authenticate with a registration token (no daemon
+        // password); operator routes ride the daemon password + a
+        // control-plane principal. Without the `[workers]` section every
+        // route answers 409 `workers_disabled`.
+        .route("/native/workers/register", post(native_worker_register))
+        .route("/native/workers", get(native_workers_list))
+        .route("/native/workers/tokens", post(native_worker_token_mint))
+        .route(
+            "/native/workers/{id}/heartbeat",
+            post(native_worker_heartbeat),
+        )
+        .route("/native/workers/{id}/revoke", post(native_worker_revoke))
+        .route("/native/jobs/{id}", get(native_job_status))
+        .route("/native/jobs/{id}/result", post(native_job_result))
+        // Enterprise plane (additive; disabled by default): retention
+        // artifacts + guarded GC, the audit-ledger cursor export, deletion
+        // jobs, admin settings and the effective-config attestation. Every
+        // route needs a control-plane principal; with no `[enterprise]`
+        // service wired every route answers a typed 409
+        // `enterprise_disabled`.
+        .route("/native/enterprise/status", get(native_enterprise_status))
+        .route("/native/enterprise/audit", get(native_enterprise_audit))
+        .route(
+            "/native/enterprise/settings",
+            get(native_enterprise_settings_get).put(native_enterprise_settings_put),
+        )
+        .route(
+            "/native/enterprise/artifacts",
+            get(native_enterprise_artifacts_list).post(native_enterprise_artifacts_register),
+        )
+        .route(
+            "/native/enterprise/artifacts/{id}/eligible",
+            post(native_enterprise_artifact_eligible),
+        )
+        .route(
+            "/native/enterprise/retention/gc",
+            post(native_enterprise_gc),
+        )
+        .route(
+            "/native/enterprise/deletion-jobs",
+            get(native_enterprise_deletion_jobs_list).post(native_enterprise_deletion_jobs_create),
+        )
+        .route(
+            "/native/enterprise/deletion-jobs/{id}",
+            get(native_enterprise_deletion_job_get),
+        )
+        .route(
+            "/native/enterprise/deletion-jobs/{id}/advance",
+            post(native_enterprise_deletion_job_advance),
+        )
+        .route(
+            "/native/enterprise/tombstones/{scope_key}",
+            get(native_enterprise_tombstone),
+        )
+        .route(
+            "/native/enterprise/effective-config",
+            post(native_enterprise_effective_config),
+        )
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .with_state(AppState {
             deps: Arc::new(deps),
@@ -550,7 +693,15 @@ pub(crate) struct AppState {
 mod control_plane_tests;
 
 #[cfg(test)]
-mod tests {
+#[path = "enterprise_tests.rs"]
+mod enterprise_tests;
+
+#[cfg(test)]
+#[path = "updater_tests.rs"]
+mod updater_tests;
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
     use faktor_core::capability::PermissionDecision;
     use faktor_core::id::{SessionId, WorkspaceId};
@@ -781,6 +932,11 @@ mod tests {
             semantic: None,
             control_plane: None,
             scm: None,
+            billing: None,
+            updater: None,
+            workers: None,
+            enterprise: None,
+            retention: None,
         }
     }
 
@@ -3018,6 +3174,11 @@ mod tests {
             semantic: None,
             control_plane: None,
             scm: None,
+            billing: None,
+            updater: None,
+            workers: None,
+            enterprise: None,
+            retention: None,
         }
     }
 
@@ -4840,6 +5001,11 @@ mod tests {
             semantic: None,
             control_plane: None,
             scm: None,
+            billing: None,
+            updater: None,
+            workers: None,
+            enterprise: None,
+            retention: None,
         }
     }
 
@@ -6041,6 +6207,11 @@ mod tests {
             semantic: None,
             control_plane: None,
             scm: None,
+            billing: None,
+            updater: None,
+            workers: None,
+            enterprise: None,
+            retention: None,
         };
         NativeTaskRig {
             deps,

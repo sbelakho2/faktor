@@ -24,6 +24,10 @@ use std::time::{Instant, SystemTime};
 
 use faktor_core::hash::FileHash;
 
+/// Referential-protection deletion primitives (the retention plane's last
+/// line of defense at the storage layer).
+pub mod retention;
+
 /// Default ceiling for a single blob payload, in bytes (512 MiB). Structural:
 /// the store refuses to compress unbounded data; use `put_bounded` or
 /// `put_reader_bounded` for a smaller cap.

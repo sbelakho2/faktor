@@ -4937,3 +4937,155 @@ fn poisoned_exec_mirror_recovers_and_serves_reads() {
     assert!(matches!(err, ExecError::NotFound(_)), "{err:?}");
     assert!(!env.orchestrator.exec.is_poisoned());
 }
+
+// ------------------------------------------------- commercial admission gate
+// (Wave 3) The ONE gate hook is consulted at exactly three SAFE BOUNDARIES:
+// new task admission, new child spawn, new provider attempt BEFORE
+// dispatch. A refusal admits NOTHING; continuation/control paths (cancel,
+// integration, rollback, completion) never consult it, so an entitlement
+// change can never interrupt an in-flight transaction.
+
+/// A gate that refuses every gated boundary, naming a fixed limit.
+struct RefuseGate;
+
+impl crate::admission::AdmissionGate for RefuseGate {
+    fn check(
+        &self,
+        request: &crate::admission::AdmissionRequest,
+    ) -> Result<(), crate::admission::AdmissionRefusal> {
+        Err(crate::admission::AdmissionRefusal::new(
+            request.boundary,
+            "max_active_tasks",
+            "the test gate refuses every admission",
+        ))
+    }
+}
+
+/// A gate that admits everything and records every consultation.
+#[derive(Default)]
+struct CountingGate {
+    seen: StdMutex<Vec<crate::admission::AdmissionBoundary>>,
+}
+
+impl crate::admission::AdmissionGate for CountingGate {
+    fn check(
+        &self,
+        request: &crate::admission::AdmissionRequest,
+    ) -> Result<(), crate::admission::AdmissionRefusal> {
+        self.seen.lock().unwrap().push(request.boundary);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn admission_gate_refuses_a_new_task_before_any_durable_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 0));
+    env.orchestrator.set_admission_gate(Arc::new(RefuseGate));
+    let err = run_exec(
+        &env,
+        raw_plan(vec![wi("analysis", WorkKind::Analysis, &[])]),
+        base_config(&env, "run-gated"),
+        vec![spec("analysis")],
+    )
+    .await
+    .expect_err("the gate must refuse the new task");
+    match err {
+        ExecError::AdmissionRefused {
+            boundary, limit, ..
+        } => {
+            assert_eq!(boundary, "new_task");
+            assert_eq!(limit, "max_active_tasks", "the refusal names the limit");
+        }
+        other => panic!("expected a typed AdmissionRefused, got {other:?}"),
+    }
+    assert!(
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-gated")
+            .unwrap()
+            .is_empty(),
+        "a refused admission leaves no durable registry row"
+    );
+    // The SAME run is admitted once the gate is cleared: the refusal wrote
+    // nothing that could make the retry fail differently.
+    env.orchestrator.clear_admission_gate();
+    let outcome = run_exec(
+        &env,
+        raw_plan(vec![wi("analysis", WorkKind::Analysis, &[])]),
+        base_config(&env, "run-gated"),
+        vec![spec("analysis")],
+    )
+    .await
+    .expect("the same run is admitted after the gate clears");
+    assert!(outcome.complete, "{outcome:?}");
+}
+
+#[tokio::test]
+async fn admission_gate_is_consulted_at_every_gated_boundary_and_never_on_cancel() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), roundtrip_script(), 0));
+    let gate = Arc::new(CountingGate::default());
+    env.orchestrator.set_admission_gate(gate.clone());
+    let outcome = run_exec(
+        &env,
+        raw_plan(vec![wi("analysis", WorkKind::Analysis, &[])]),
+        base_config(&env, "run-count"),
+        vec![spec("analysis")],
+    )
+    .await
+    .expect("the run succeeds under an admitting gate");
+    assert!(outcome.complete, "{outcome:?}");
+    let seen = gate.seen.lock().unwrap().clone();
+    use crate::admission::AdmissionBoundary as B;
+    assert_eq!(
+        seen.iter().filter(|b| **b == B::NewTask).count(),
+        1,
+        "exactly one new-task boundary: {seen:?}"
+    );
+    assert_eq!(
+        seen.iter().filter(|b| **b == B::NewChildSpawn).count(),
+        1,
+        "exactly one child spawn: {seen:?}"
+    );
+    assert!(
+        seen.iter().filter(|b| **b == B::NewProviderAttempt).count() >= 1,
+        "the drive dispatch is a gated provider-attempt boundary: {seen:?}"
+    );
+    // Control/continuation paths consult NOTHING: steering/control calls on
+    // the same run must not add a consultation (either outcome is acceptable
+    // — the assertion is the gate count).
+    let before = seen.len();
+    let cancelled = env.orchestrator.cancel_child("missing-child");
+    let steered = env.orchestrator.steer_child("missing-child", "note");
+    let paused = env.orchestrator.pause_child("missing-child");
+    let _ = (cancelled, steered, paused); // typed NotFound outcomes are fine
+    assert_eq!(
+        gate.seen.lock().unwrap().len(),
+        before,
+        "control/continuation paths are never gated"
+    );
+    // A poisoned gate lock FAILS CLOSED (typed, never a silent admit).
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = env.orchestrator.admission.lock().unwrap();
+        panic!("poison the admission gate lock (test seam)");
+    }));
+    assert!(poisoned.is_err());
+    let err = env
+        .orchestrator
+        .consult_admission(crate::admission::AdmissionRequest {
+            boundary: B::NewTask,
+            parent_session: env.parent.raw(),
+            task_id: None,
+            run_id: "run-poisoned".into(),
+            provider: None,
+            model: None,
+            observed: Default::default(),
+        })
+        .expect_err("a poisoned gate lock refuses");
+    match err {
+        ExecError::AdmissionRefused { limit, .. } => {
+            assert_eq!(limit, "admission_gate_poisoned")
+        }
+        other => panic!("expected a typed AdmissionRefused, got {other:?}"),
+    }
+}

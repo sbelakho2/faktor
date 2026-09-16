@@ -18,10 +18,17 @@ use crate::api::{AppState, ServerDeps};
 
 pub(crate) mod agents;
 pub(crate) mod attachment;
+/// Wave 3 commercial metering routes (usage fold / entitlements / credits).
+pub(crate) mod billing;
 pub(crate) mod board;
 /// The control-plane surface (identity/orgs/members/repositories/approvals;
 /// absent unless the `[cloud]` section is enabled).
 pub(crate) mod control_plane;
+/// The enterprise plane routes (retention/GC, audit export, deletion jobs,
+/// admin settings, effective-config; absent unless `[enterprise]` is on).
+/// Public: the CLI's local-parity command and daemon wiring build the
+/// retention runtime through it.
+pub mod enterprise;
 pub(crate) mod evidence;
 pub(crate) mod models;
 /// The ONE product execution entry for ordinary prompts + task starts
@@ -34,13 +41,21 @@ pub(crate) mod terminal;
 /// The daemon's session-owned terminal authority as a self-contained public
 /// registry (the ACP host attaches it through `with_terminal_authority`).
 pub mod terminal_authority;
+/// The signed updater surface (status/check/stage/apply; absent unless the
+/// `[updater]` section is enabled).
+pub(crate) mod updater;
 pub(crate) mod usage;
 pub(crate) mod verification;
+/// The remote/VPC worker plane (registration/leases/jobs; absent unless the
+/// `[workers]` section is enabled).
+pub(crate) mod workers;
 
 pub(crate) use agents::*;
 pub(crate) use attachment::*;
+pub(crate) use billing::*;
 pub(crate) use board::*;
 pub(crate) use control_plane::*;
+pub(crate) use enterprise::*;
 pub(crate) use evidence::*;
 pub(crate) use models::*;
 pub use prompt::*;
@@ -48,8 +63,10 @@ pub(crate) use semantic::*;
 pub(crate) use session::*;
 pub(crate) use task::*;
 pub(crate) use terminal::*;
+pub(crate) use updater::*;
 pub(crate) use usage::*;
 pub(crate) use verification::*;
+pub(crate) use workers::*;
 
 pub(crate) fn authed(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
     let authorization = headers

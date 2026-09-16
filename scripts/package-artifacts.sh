@@ -21,10 +21,24 @@
 #   PACKAGE_SKIP_VSIX=1       record the VSIX as skipped without attempting it
 #   PACKAGE_SKIP_JETBRAINS=1  record the JetBrains zip as skipped
 #   PACKAGE_REQUIRE_VSIX=1    a missing/broken VSIX becomes fatal
+#   PACKAGE_SKIP_UPDATE_MANIFEST=1  do not assemble the signed update manifest
+#   FAKTOR_UPDATE_SIGNING_KEY       operator ed25519 key for the update
+#                                   manifest (absent => explicitly UNSIGNED,
+#                                   which `apply` refuses); FAKTOR_UPDATE_KEY_ID
+#                                   names the allowlisted identity
+#   FAKTOR_UPDATE_URL_BASE          distribution URL base for artifact urls
+#
+# Additively (step 5) the script assembles the SIGNED update manifest
+# (`faktor-update/v1`) from THIS run's artifacts.json + certification
+# evidence via scripts/update-manifest.mjs: with FAKTOR_UPDATE_SIGNING_KEY
+# set the manifest is signed (and --require-signed fails the packaging run
+# if signing breaks); without it the manifest is written explicitly UNSIGNED.
+# Node absent => the step is recorded as skipped, never silently claimed.
 #
 # Exit non-zero when the daemon bundle cannot be produced, when a VSIX
-# packaging attempt fails for a non-environmental reason, or when
-# PACKAGE_REQUIRE_VSIX=1 and no VSIX was produced.
+# packaging attempt fails for a non-environmental reason, when
+# PACKAGE_REQUIRE_VSIX=1 and no VSIX was produced, or when the signed update
+# manifest cannot be assembled while a signing key is configured.
 set -u
 set -o pipefail
 export LC_ALL=C
@@ -379,6 +393,40 @@ emit_manifest() {
 
 mkdir -p "$OUT_DIR" || exit 2
 emit_manifest >"$MANIFEST.tmp" && mv "$MANIFEST.tmp" "$MANIFEST" || exit 2
+
+# ---------------------------------------------------------------------------
+# 5. Signed update manifest (additive; assembled from this run).
+# ---------------------------------------------------------------------------
+UPDATE_MANIFEST="$OUT_DIR/update-manifest.json"
+if [ "${PACKAGE_SKIP_UPDATE_MANIFEST:-0}" = "1" ]; then
+    printf '[package] update-manifest: skipped (PACKAGE_SKIP_UPDATE_MANIFEST=1)\n'
+elif ! command -v node >/dev/null 2>&1; then
+    printf '[package] update-manifest: skipped (node unavailable; manifest not assembled)\n'
+else
+    if [ -n "${FAKTOR_UPDATE_SIGNING_KEY:-}" ]; then
+        um() {
+            node "$ROOT/scripts/update-manifest.mjs" --artifacts "$MANIFEST" \
+                --certification-optional "$OUT_DIR/manifest.json" \
+                --out "$UPDATE_MANIFEST" --require-signed
+        }
+    else
+        um() {
+            node "$ROOT/scripts/update-manifest.mjs" --artifacts "$MANIFEST" \
+                --certification-optional "$OUT_DIR/manifest.json" \
+                --out "$UPDATE_MANIFEST"
+        }
+    fi
+    if node "$ROOT/scripts/update-manifest.mjs" selftest \
+        >"$LOG_DIR/package-update-manifest-selftest.log" 2>&1 &&
+        um >>"$LOG_DIR/package-update-manifest.log" 2>&1; then
+        printf '[package] update-manifest: %s\n' "$(rel_path "$UPDATE_MANIFEST")"
+    else
+        detail="$(first_error_line "$LOG_DIR/package-update-manifest.log")"
+        [ -n "$detail" ] || detail="update-manifest assembly failed"
+        printf '[package] update-manifest: FAILED %s\n' "$detail" >&2
+        FATAL=1
+    fi
+fi
 
 printf '\n[package] status=%s artifacts=%s recorded_skips=%s manifest=%s\n' \
     "$STATUS" "${#A_NAME[@]}" "${#S_NAME[@]}" "$(rel_path "$MANIFEST")"

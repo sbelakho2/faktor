@@ -22,6 +22,8 @@ faktor-snapshot.workspace = true
 faktor-store.workspace = true
 faktor-cas.workspace = true
 faktor-cloud.workspace = true
+faktor-worker.workspace = true
+faktor-updater.workspace = true
 faktor-scm.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 tokio.workspace = true
@@ -36,3 +38,9 @@ rand.workspace = true
 base64 = "0.22"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls", "http2"] }
 tempfile.workspace = true
+
+[dev-dependencies]
+# The updater route tests sign manifests with a real ed25519 key and
+# implement the async artifact-fetcher seam.
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
+async-trait = "0.1"

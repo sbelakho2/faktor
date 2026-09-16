@@ -427,6 +427,20 @@ pub(crate) async fn native_task_run_start(
                 "state": "Pending",
             })
         }
+        // Only reachable when the worker plane is enabled: the run was
+        // placed on a remote worker and no local run exists. The receipt
+        // names the remote job; its durable state is served by
+        // `GET /native/jobs/{id}`.
+        faktor_orchestrator::runtime::task_executor::TaskRunMode::Remote => {
+            serde_json::json!({
+                "task_id": handle
+                    .row()
+                    .map(|r| r.task_id.raw())
+                    .unwrap_or(0),
+                "run_id": receipt.run_id,
+                "state": "Remote",
+            })
+        }
     };
     Json(serde_json::json!({
         "task_id": entry.get("task_id").cloned().unwrap_or(serde_json::Value::Null),

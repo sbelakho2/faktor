@@ -215,6 +215,23 @@ pub enum ExecError {
     RetriablePersistence { operation: String, message: String },
     #[error("injected crash seam {0} (test seam; durable state left as-is for re-attach)")]
     InjectedCrashSeam(String),
+    /// The commercial admission gate refused a NEW task/child/attempt at a
+    /// safe boundary, naming the exact limit. Nothing was admitted: no
+    /// durable row, no spawn, no dispatch. An in-flight
+    /// integration/rollback/completion continuation is never gated, so this
+    /// refusal can never interrupt one.
+    #[error("admission refused at {boundary} (limit {limit}): {message}")]
+    AdmissionRefused {
+        boundary: &'static str,
+        limit: String,
+        message: String,
+    },
+    /// The worker-plane placement seam refused (or failed) BEFORE any local
+    /// durable write of the new run: nothing was started locally and nothing
+    /// was placed remotely. Only reachable when the worker plane is enabled
+    /// (`[workers]` configured); the disabled default never produces it.
+    #[error("worker placement refused: {0}")]
+    PlacementRefused(String),
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -781,6 +798,10 @@ pub struct OrchestratorRuntime {
     /// Live execution mirrors by run id (one entry per installed run; a
     /// terminal run's mirror stays readable until its run is replaced).
     exec: Mutex<HashMap<String, ExecState>>,
+    /// The optional commercial admission gate (Wave 3). `None` = the
+    /// pre-billing parity behavior (every boundary admits); a poisoned lock
+    /// fails CLOSED (the refusal is typed and loud, never a silent admit).
+    admission: Mutex<Option<Arc<dyn crate::admission::AdmissionGate>>>,
 }
 
 impl std::fmt::Debug for OrchestratorRuntime {
@@ -796,7 +817,76 @@ impl OrchestratorRuntime {
             manager,
             agent,
             exec: Mutex::new(HashMap::new()),
+            admission: Mutex::new(None),
         })
+    }
+
+    /// Install (or replace) the commercial admission gate. Additive: with no
+    /// gate installed every boundary admits exactly like the pre-billing
+    /// daemon.
+    pub fn set_admission_gate(&self, gate: Arc<dyn crate::admission::AdmissionGate>) {
+        match self.admission.lock() {
+            Ok(mut slot) => *slot = Some(gate),
+            Err(_) => {
+                tracing::error!("admission gate lock is poisoned; keeping the previous gate")
+            }
+        }
+    }
+
+    /// Remove the admission gate (the pre-billing parity state).
+    pub fn clear_admission_gate(&self) {
+        match self.admission.lock() {
+            Ok(mut slot) => *slot = None,
+            Err(_) => tracing::error!("admission gate lock is poisoned; gate unchanged"),
+        }
+    }
+
+    /// Consult the gate at one SAFE BOUNDARY. `None` gate = admit; a poisoned
+    /// gate lock FAILS CLOSED with a typed refusal (never a silent admit).
+    fn consult_admission(
+        &self,
+        request: crate::admission::AdmissionRequest,
+    ) -> Result<(), ExecError> {
+        let gate = match self.admission.lock() {
+            Ok(slot) => slot.clone(),
+            Err(_) => {
+                return Err(ExecError::AdmissionRefused {
+                    boundary: request.boundary.as_str(),
+                    limit: "admission_gate_poisoned".to_string(),
+                    message: "the admission gate lock is poisoned; refusing the boundary"
+                        .to_string(),
+                })
+            }
+        };
+        let Some(gate) = gate else {
+            return Ok(());
+        };
+        gate.check(&request)
+            .map_err(|refusal| ExecError::AdmissionRefused {
+                boundary: refusal.boundary.as_str(),
+                limit: refusal.limit,
+                message: refusal.message,
+            })
+    }
+
+    /// The observed counters of one run at a child/attempt boundary.
+    fn admission_observed(&self, run_id: &str) -> crate::admission::AdmissionObserved {
+        let Ok(guard) = self.exec.lock() else {
+            return crate::admission::AdmissionObserved::default();
+        };
+        let Some(exec) = guard.get(run_id) else {
+            return crate::admission::AdmissionObserved::default();
+        };
+        crate::admission::AdmissionObserved {
+            active_tasks: 1,
+            children_of_task: exec
+                .children
+                .values()
+                .filter(|child| !child.is_terminal())
+                .count() as u64,
+            provider_attempts_of_task: exec.drive_ops.len() as u64,
+            estimated_provider_cost_micro: 0,
+        }
     }
 
     pub fn manager(&self) -> Arc<SessionManager> {
@@ -1465,6 +1555,20 @@ impl OrchestratorRuntime {
             .map_err(|errs| ExecError::InvalidPlan(errs.join("; ")))?;
         check_item_policies(&spec_map, &effective)?;
         check_plan_disjointness_canonical(&plan, &effective, &owner)?;
+        // Wave 3 admission boundary: a NEW task/run is gated BEFORE any
+        // durable row of the run exists. A refusal admits nothing.
+        self.consult_admission(crate::admission::AdmissionRequest {
+            boundary: crate::admission::AdmissionBoundary::NewTask,
+            parent_session: owner.parent_session.raw(),
+            task_id: None,
+            run_id: config.run_id.clone(),
+            provider: Some(config.provider.clone()),
+            model: Some(config.default_model.clone()),
+            observed: crate::admission::AdmissionObserved {
+                active_tasks: 1,
+                ..Default::default()
+            },
+        })?;
         self.put_plan_row(&plan, &owner, &config, specs)?;
         // (wave A3) The item → child bindings of the WHOLE plan are minted
         // here — before anything spawns — in deterministic plan order and
@@ -2675,6 +2779,27 @@ impl OrchestratorRuntime {
         exec: &mut ExecState,
         item: &WorkItem,
     ) -> Result<ChildRuntime, ExecError> {
+        // Wave 3 admission boundary: a NEW child spawn is gated BEFORE the
+        // child session/workspace/registry rows exist. A refusal admits
+        // nothing (no directory, no row, no session).
+        self.consult_admission(crate::admission::AdmissionRequest {
+            boundary: crate::admission::AdmissionBoundary::NewChildSpawn,
+            parent_session: exec.parent_session.raw(),
+            task_id: None,
+            run_id: exec.run_id.clone(),
+            provider: None,
+            model: None,
+            observed: crate::admission::AdmissionObserved {
+                active_tasks: 1,
+                children_of_task: exec
+                    .children
+                    .values()
+                    .filter(|child| !child.is_terminal())
+                    .count() as u64,
+                provider_attempts_of_task: exec.drive_ops.len() as u64,
+                estimated_provider_cost_micro: 0,
+            },
+        })?;
         let spec = exec
             .specs
             .get(&item.id)
@@ -2975,6 +3100,37 @@ impl OrchestratorRuntime {
         scheduler: &Scheduler,
         child: &ChildRuntime,
     ) -> Result<(), ExecError> {
+        // Wave 3 admission boundary: the NEW provider-attempt wave of this
+        // child is gated BEFORE the drive op is registered, so a refusal
+        // dispatches nothing and can never interrupt an in-flight
+        // integration/rollback/completion (those continuations are not
+        // gated at all).
+        let (parent_session, provider, model) = {
+            let guard = recover_lock(&self.exec);
+            let exec = guard
+                .get(run_id)
+                .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
+            (
+                exec.parent_session.raw(),
+                Some(exec.config.provider.clone()),
+                Some(
+                    child
+                        .model_policy
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| exec.config.default_model.clone()),
+                ),
+            )
+        };
+        self.consult_admission(crate::admission::AdmissionRequest {
+            boundary: crate::admission::AdmissionBoundary::NewProviderAttempt,
+            parent_session,
+            task_id: None,
+            run_id: run_id.to_string(),
+            provider,
+            model,
+            observed: self.admission_observed(run_id),
+        })?;
         let op_id = self.manager.next_op_id();
         let meta = OpMeta::new(
             op_id,

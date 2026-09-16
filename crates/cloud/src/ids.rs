@@ -76,6 +76,15 @@ string_id!(AuthSessionId, "auth session");
 string_id!(ExternalIdentityId, "external identity");
 string_id!(ServiceAccountId, "service account");
 string_id!(ApprovalId, "approval");
+// Wave 3 commercial metering identities (billing domain).
+string_id!(BillingAccountId, "billing account");
+string_id!(SubscriptionId, "subscription");
+string_id!(UsageEventId, "usage event");
+string_id!(CreditEntryId, "credit entry");
+string_id!(InFlightTxnId, "in-flight transaction");
+// Enterprise plane identities (retention/deletion domain).
+string_id!(ArtifactId, "artifact");
+string_id!(DeletionJobId, "deletion job");
 
 /// The sha256 hex of one token (the ONLY form a token is stored in).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

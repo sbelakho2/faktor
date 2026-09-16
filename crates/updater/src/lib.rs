@@ -1,0 +1,65 @@
+//! faktor-updater — the signed updater/distribution lifecycle of the
+//! Faktor runtime.
+//!
+//! Layout:
+//!
+//! - [`manifest`]: the `faktor-update/v1` schema (channel, version, commit,
+//!   artifacts with sha256 + url, per-component compatibility ranges,
+//!   validity window, optional certification provenance) and its canonical
+//!   signing payload;
+//! - [`keys`]: the operator ed25519 key allowlist (base64 raw keys, the
+//!   same signature shape the certification evidence uses);
+//! - [`channel`]: stable/beta/dev trust order and deterministic selection;
+//! - [`compat`]: the running-component check with a per-component verdict
+//!   report (no silent skips);
+//! - [`install`]: the install layout (`current` pointer, content-addressed
+//!   artifacts, same-filesystem staging) and the atomic swap discipline;
+//! - [`store`]: durable `UpdateOperation` rows (check/stage/apply/rollback
+//!   with before/after versions and digests; memory + SQLite stores);
+//! - [`transport`]: the download seam plus the checked-HTTP implementation;
+//! - [`service`]: the `check → stage → apply → rollback` state machine with
+//!   automatic rollback on a failed health probe and crash recovery.
+//!
+//! Trust model: a manifest is never acted on unless it carries an ed25519
+//! signature from an allowlisted operator identity, verifies over the
+//! canonical payload, is inside its validity window and matches the
+//! configured channel. Unsigned, unknown-key, key-mismatched, tampered,
+//! malformed and expired manifests are distinct typed refusals — never a
+//! silent skip. Artifacts are downloaded through the daemon's CHECKED
+//! transport, bounded, digest-verified, and published atomically; the
+//! install is switched only by an atomic pointer replacement, and a failed
+//! post-swap probe restores the exact previous artifact.
+
+pub mod channel;
+pub mod compat;
+pub mod error;
+pub mod install;
+pub mod keys;
+pub mod manifest;
+pub mod service;
+pub mod store;
+pub mod transport;
+pub mod version;
+
+pub use channel::{select, Channel, ChannelCandidate};
+pub use compat::{
+    check as check_compatibility, CompatibilityReport, Component, RunningComponents, SchemaRange,
+    Verdict,
+};
+pub use error::{ManifestRefusal, UpdateError};
+pub use install::{DigestProbe, HealthProbe, InstallLayout, InstallPointer};
+pub use keys::{TrustedKey, TrustedKeys};
+pub use manifest::{
+    verify_manifest, Artifact, Compatibility, UpdateManifest, VerifiedManifest,
+    DEFAULT_CLOCK_SKEW_MS, DEFAULT_MAX_ARTIFACT_BYTES, UPDATE_MANIFEST_SCHEMA,
+};
+pub use service::{
+    ApplyOutcome, CheckOutcome, RecoveryOutcome, StageOutcome, StageSummary, StatusView, Updater,
+    UpdaterConfig, NATIVE_SCHEMA_SUPPORTED,
+};
+pub use store::{
+    MemoryUpdaterStore, SqliteUpdaterStore, UpdateOpId, UpdateOpKind, UpdateOpStatus,
+    UpdateOperation, UpdateStoreError, UpdaterStore,
+};
+pub use transport::{ArtifactFetcher, CheckedHttpFetcher};
+pub use version::{Version, VersionRange};
