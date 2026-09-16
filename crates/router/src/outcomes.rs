@@ -33,6 +33,18 @@
 //! needed), never a success.
 
 use std::collections::HashMap;
+
+/// Classified lock recovery for DERIVED state (caches, registries, rings,
+/// process/ownership projections): a poisoned guard is recovered with the
+/// poison flag cleared, so one panicking caller can never wedge later use.
+/// The durable authority (store/journal/OS process state) remains the
+/// source of truth; the recovered value is only ever a projection of it.
+fn recover_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
+}
 use std::sync::Mutex;
 
 use faktor_core::model::{RiskBucket, RouterPhase, TaskClass};
@@ -363,7 +375,7 @@ impl MemoryOutcomeStore {
 
     /// Number of distinct keys currently holding at least one sample.
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        recover_lock(&self.inner).len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -373,13 +385,13 @@ impl MemoryOutcomeStore {
 
 impl OutcomeStore for MemoryOutcomeStore {
     fn append_sample(&self, key: &OutcomeKey, sample: OutcomeSample) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = recover_lock(&self.inner);
         let entry = inner.entry(key.clone()).or_default();
         entry.absorb(sample);
     }
 
     fn stats(&self, key: &OutcomeKey) -> Option<VerifiedOutcomeStats> {
-        self.inner.lock().unwrap().get(key).copied()
+        recover_lock(&self.inner).get(key).copied()
     }
 
     fn phase_stats(
@@ -388,7 +400,7 @@ impl OutcomeStore for MemoryOutcomeStore {
         model: &str,
         phase: RouterPhase,
     ) -> Option<VerifiedOutcomeStats> {
-        let inner = self.inner.lock().unwrap();
+        let inner = recover_lock(&self.inner);
         let mut acc: Option<VerifiedOutcomeStats> = None;
         for (key, stats) in inner.iter() {
             if key.provider == provider && key.model == model && key.phase == phase {
@@ -408,7 +420,7 @@ impl OutcomeStore for MemoryOutcomeStore {
         phase: RouterPhase,
         task_class: TaskClass,
     ) -> Option<VerifiedOutcomeStats> {
-        let inner = self.inner.lock().unwrap();
+        let inner = recover_lock(&self.inner);
         let mut acc: Option<VerifiedOutcomeStats> = None;
         for (key, stats) in inner.iter() {
             if key.provider == provider

@@ -20,18 +20,13 @@ pub(crate) struct ArtifactSizes {
 
 impl ArtifactSizes {
     pub fn record(&self, hash: FileHash, size: usize) {
-        self.inner
-            .lock()
-            .expect("artifact sizes poisoned")
-            .insert(hash, size);
+        // Classified CACHE => RECONCILE: the store row keeps the size, so a
+        // poisoned map is recovered (poison cleared) rather than propagated.
+        crate::recover_lock(&self.inner).insert(hash, size);
     }
 
     pub fn size_of(&self, hash: FileHash) -> Option<usize> {
-        self.inner
-            .lock()
-            .expect("artifact sizes poisoned")
-            .get(&hash)
-            .copied()
+        crate::recover_lock(&self.inner).get(&hash).copied()
     }
 }
 

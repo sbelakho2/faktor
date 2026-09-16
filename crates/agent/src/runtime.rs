@@ -29592,7 +29592,7 @@ mod tests {
         let mut new_lines = String::new();
         for i in 0..900 {
             if i == 899 {
-                new_lines.push_str("pub fn replaced() -> u32 { let base: u32 = 42; base.saturating_mul(2).saturating_add(1) } // KILO_BEYOND_HEAD_900_7B2\n");
+                new_lines.push_str("pub fn replaced() -> u32 { let base: u32 = 42; base.saturating_mul(2).saturating_add(1) } // FAKTOR_BEYOND_HEAD_900_7B2\n");
             } else {
                 new_lines.push_str(&format!("pub fn f{i}() -> u32 {{ 1 }}\n"));
             }
@@ -29625,7 +29625,7 @@ mod tests {
         let o2 = runtime2
             .run_turn(
                 session,
-                "finish the unsafe shim: KILO_REVIEW_ISOLATION_7F2",
+                "finish the unsafe shim: FAKTOR_REVIEW_ISOLATION_7F2",
                 &[],
             )
             .await
@@ -29646,7 +29646,7 @@ mod tests {
         let rendered = rendered_request(&review_requests[0]);
         // The package + criteria ride the request ...
         assert!(
-            rendered.contains("KILO_BEYOND_HEAD_900_7B2"),
+            rendered.contains("FAKTOR_BEYOND_HEAD_900_7B2"),
             "the line-900 change must appear in the diff package: {rendered:?}"
         );
         assert!(rendered.contains("src/unsafe_shim.rs"), "{rendered:?}");
@@ -29661,7 +29661,7 @@ mod tests {
         // ... and NO implementation context does (the marker rode the drive
         // transcript of THIS very turn).
         assert!(
-            !rendered.contains("KILO_REVIEW_ISOLATION_7F2"),
+            !rendered.contains("FAKTOR_REVIEW_ISOLATION_7F2"),
             "the review must never receive the implementation context: {rendered:?}"
         );
         // Positive control: the marker DID ride the drive requests.
@@ -29670,7 +29670,7 @@ mod tests {
         assert!(
             drive_rendered
                 .iter()
-                .any(|r| r.contains("KILO_REVIEW_ISOLATION_7F2")),
+                .any(|r| r.contains("FAKTOR_REVIEW_ISOLATION_7F2")),
             "the drive transcript must carry the marker (control): {drive_rendered:?}"
         );
         // And the OLD head scan alone could not have seen line 900: the

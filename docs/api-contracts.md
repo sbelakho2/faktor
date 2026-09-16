@@ -66,7 +66,7 @@ pub enum NetworkPolicy { DenyAll, AllowProviders{endpoints}, AllowConfigured{end
 
 pub struct FileHash([u8;32]); // ::from([u8;32]), from_hex(&str)->Option<Self>, to_hex(), cas_path(), bytes()
 pub struct WorkspaceIdentity { pub workspace_id: WorkspaceId, pub worktree_id: WorktreeId, pub task_id: TaskId }
-pub const VERSION: &str; pub const PROTOCOL_V756: &str; pub const UX_BASELINE: &str;
+pub const VERSION: &str; pub const UX_BASELINE: &str;
 ```
 
 ## faktor-cas (already implemented)

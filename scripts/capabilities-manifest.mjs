@@ -2,9 +2,9 @@
 // Machine-readable capability manifest (certification truth audit).
 //
 // Every status is DERIVED from repository files and scripts — never from
-// prose. The generator probes the pinned vendored UI tree, the extension
-// sources, the JetBrains backend/frontend sources, the vendored UI tree
-// and the ACP subset, then writes:
+// prose. The generator probes the Faktor-owned VS Code panel sources, the
+// JetBrains backend/frontend sources, the executable parity artifacts and
+// the ACP subset, then writes:
 //
 //   target/certification/capabilities.json
 //
@@ -21,7 +21,7 @@
 //   CAPABILITIES_OUT_DIR  output directory (default target/certification)
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -72,10 +72,12 @@ function statusFromMarkers(present, complete) {
   return present ? 'PARTIAL' : 'ABSENT';
 }
 
-const VENDORED_WEBVIEW_ROOT = 'ui/kilo-v756-webview';
-const JETBRAINS_712_ROOT = 'compat/jetbrains-712';
 const JETBRAINS_PARITY_MATRIX = 'target/certification/jetbrains-parity.json';
-const VSCODE_VISUAL_MATRIX = `${VENDORED_WEBVIEW_ROOT}/dist/visual-report.json`;
+const VSCODE_PANEL_SOURCES = [
+  'apps/vscode/src/webview.ts',
+  'apps/vscode/media/chat.js',
+  'apps/vscode/media/chat.css',
+];
 
 function readJson(rel) {
   try {
@@ -95,22 +97,24 @@ function headCommit() {
 
 const HEAD = headCommit();
 
-// The pinned JetBrains 7.1.2 reference tree: the directory exists AND
-// ui/upstream.json carries the per-file hash manifest for it. A bare
-// directory is not a pin.
-function jetbrainsPin() {
-  if (!dir(JETBRAINS_712_ROOT)) {
-    return null;
+// The Faktor-owned UI migration retired every vendored upstream UI corpus and
+// its pin manifest: ui/ carries only the historical attribution directory and
+// no compat/ corpus may reappear. A reappearing vendored tree is a hard
+// self-check failure, never a label change.
+function retiredVendoredArtifacts() {
+  const problems = [];
+  const uiEntries = dir('ui')
+    ? readdirSync(resolve(ROOT, 'ui')).sort()
+    : [];
+  if (JSON.stringify(uiEntries) !== JSON.stringify(['LICENSES'])) {
+    problems.push(
+      `ui/ must carry only the historical attribution directory (found: ${uiEntries.join(', ') || 'nothing'})`,
+    );
   }
-  const pin = readJson('ui/upstream.json')?.jetbrains_712;
-  if (!pin || typeof pin !== 'object') {
-    return null;
+  if (dir('compat')) {
+    problems.push('compat/ must not carry a pinned upstream corpus');
   }
-  const hashes = pin.file_hashes;
-  if (!hashes || typeof hashes !== 'object' || Object.keys(hashes).length === 0) {
-    return null;
-  }
-  return pin;
+  return problems;
 }
 
 // ------------------------------------------------------------- derivations
@@ -196,43 +200,25 @@ function visualMatrixResult(rel) {
   };
 }
 
-function vscodeVisualResult() {
-  const report = readJson(VSCODE_VISUAL_MATRIX);
-  const render = report && report.render;
-  if (render && render.status === 'passed') {
-    return {
-      status: 'IMPLEMENTED',
-      detail: `VS Code webview visual render passed (${render.states || '?'} states)`,
-    };
-  }
-  return {
-    status: 'PARTIAL',
-    detail: 'VS Code webview visual render not passed (report missing/skipped; the required vscode-visual lane owns it)',
-  };
-}
-
-function vscodeWebviewStatus() {
-  if (!file('apps/vscode/src/webview.ts') || !file('apps/vscode/src/kilo-bridge.ts')) {
-    return 'ABSENT';
+// The Faktor-owned VS Code chat panel: hand-written panel sources, the real
+// extension provider and the executable selftest/VSIX verification markers.
+function vscodePanelStatus() {
+  const present = VSCODE_PANEL_SOURCES.every((rel) => file(rel));
+  if (!present) {
+    return { status: 'ABSENT', detail: 'VS Code Faktor panel sources are absent' };
   }
   const markers =
-    hasText('apps/vscode/src/kilo-bridge.ts', 'mapKiloFiles') &&
-    hasAnyText('apps/vscode/scripts/bridge-selftest.mjs', ['assert', 'throw new Error']);
-  if (
-    file(`${VENDORED_WEBVIEW_ROOT}/dist/webview.js`) &&
-    file(`${VENDORED_WEBVIEW_ROOT}/dist/webview.css`)
-  ) {
-    // The pinned v7.5.6 webview bundle is vendored AND built; the visual
-    // baseline proves the gate ran on this tree.
-    return file(`${VENDORED_WEBVIEW_ROOT}/dist/visual-baseline.json`) && markers
-      ? 'IMPLEMENTED'
-      : 'PARTIAL';
-  }
-  if (dir(VENDORED_WEBVIEW_ROOT)) {
-    return 'PARTIAL';
-  }
-  // Built-in fallback shell only: the upstream assets are absent.
-  return 'BLOCKED_EXTERNAL';
+    hasText('apps/vscode/src/webview.ts', 'class ChatViewProvider') &&
+    hasText('apps/vscode/src/webview.ts', "'chat.js'") &&
+    hasText('apps/vscode/media/chat.js', 'acquireVsCodeApi') &&
+    hasAnyText('apps/vscode/scripts/selftest.mjs', ['packagedLayoutTests', 'SELFTEST OK']) &&
+    hasText('apps/vscode/scripts/verify-vsix.mjs', 'PANEL_MARKERS');
+  return {
+    status: markers ? 'IMPLEMENTED' : 'PARTIAL',
+    detail: markers
+      ? 'Faktor-owned chat panel: provider + media panel + selftest/VSIX verification'
+      : 'Faktor-owned chat panel sources exist but a provider/selftest marker is missing',
+  };
 }
 
 const SURFACES = {
@@ -245,13 +231,13 @@ const SURFACES = {
     evidence: ['apps/vscode/src/nativeClient.ts', 'apps/vscode/scripts/selftest.mjs'],
   }),
   vscode_webview: () => ({
-    status: vscodeWebviewStatus(),
+    ...vscodePanelStatus(),
     evidence: [
       'apps/vscode/src/webview.ts',
-      'apps/vscode/src/kilo-bridge.ts',
-      `${VENDORED_WEBVIEW_ROOT}/dist/webview.js`,
-      `${VENDORED_WEBVIEW_ROOT}/dist/visual-baseline.json`,
-      'ui/upstream.json',
+      'apps/vscode/media/chat.js',
+      'apps/vscode/media/chat.css',
+      'apps/vscode/scripts/selftest.mjs',
+      'apps/vscode/scripts/verify-vsix.mjs',
     ],
   }),
   jetbrains_native_bridge: () => ({
@@ -287,39 +273,23 @@ const SURFACES = {
       ],
     };
   },
-  // The upstream 7.1.2 reference tree with its per-file SHA-256 pin. VENDORED
-  // is a provenance claim, never a parity claim.
-  jetbrains_upstream_assets: () => {
-    const pin = jetbrainsPin();
-    let status = 'ABSENT';
-    if (pin) {
-      status = 'VENDORED';
-    } else if (dir(JETBRAINS_712_ROOT)) {
-      status = 'PARTIAL';
-    }
-    return {
-      status,
-      evidence: [JETBRAINS_712_ROOT, 'ui/upstream.json', 'compat/jetbrains-712/NOTICE.md'],
-    };
-  },
-  // Behavioral/visual parity exist ONLY as executable parity matrices bound
-  // to the exact HEAD. The kotlinc/daemon smokes are regression tests, not
-  // parity results, and never move these labels.
+  // Behavioral/visual matrices exist ONLY as executable results bound to the
+  // exact HEAD. The kotlinc/daemon smokes are regression tests, not matrix
+  // results, and never move these labels.
   jetbrains_behavioral_parity: () => ({
     ...behavioralMatrixResult(JETBRAINS_PARITY_MATRIX),
-    evidence: [JETBRAINS_PARITY_MATRIX, JETBRAINS_712_ROOT, 'ui/upstream.json'],
+    evidence: [JETBRAINS_PARITY_MATRIX, 'apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt'],
   }),
   jetbrains_visual_parity: () => ({
     ...visualMatrixResult(JETBRAINS_PARITY_MATRIX),
-    evidence: [JETBRAINS_PARITY_MATRIX, JETBRAINS_712_ROOT, 'ui/upstream.json'],
+    evidence: [JETBRAINS_PARITY_MATRIX, 'apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt'],
   }),
-  // ui_parity depends on executable parity results (the VS Code visual
-  // render matrix + the frozen-upstream behavioral replay + the JetBrains
-  // parity matrices). Vendored files or pinned directories alone never make
-  // it IMPLEMENTED.
+  // ui_parity: the Faktor-owned UI's executable axes (the VS Code panel
+  // selftest/VSIX gates + the JetBrains behavioral/visual matrices). No
+  // vendored or pinned corpus participates.
   ui_parity: () => {
     const axes = {
-      vscode_visual: vscodeVisualResult(),
+      vscode_panel: vscodePanelStatus(),
       jetbrains_behavioral: behavioralMatrixResult(JETBRAINS_PARITY_MATRIX),
       jetbrains_visual: visualMatrixResult(JETBRAINS_PARITY_MATRIX),
     };
@@ -328,16 +298,15 @@ const SURFACES = {
     if (statuses.every((s) => s === 'IMPLEMENTED')) {
       status = 'IMPLEMENTED';
     } else if (statuses.some((s) => s !== 'ABSENT')) {
-      // At least one executable parity matrix exists; the rest are open.
+      // At least one executable axis exists; the rest are open.
       status = 'PARTIAL';
     }
     return {
       status,
       evidence: [
-        VSCODE_VISUAL_MATRIX,
+        ...VSCODE_PANEL_SOURCES,
         JETBRAINS_PARITY_MATRIX,
-        JETBRAINS_712_ROOT,
-        'ui/upstream.json',
+        'apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt',
       ].filter((rel) => file(rel) || dir(rel)),
       detail: Object.entries(axes)
         .map(([axis, result]) => `${axis}=${result.status}`)
@@ -447,10 +416,10 @@ function buildManifest() {
 // The derivations above are only as honest as their probes. This check
 // fails loudly when:
 //   (a) the file()/dir() probes stop distinguishing files from directories;
-//   (b) a provenance/parity label is claimed without its artifact: the
-//       JetBrains pin present => assets=VENDORED, parity labels require a
-//       real matrix report, and ui_parity=IMPLEMENTED requires every
-//       executable parity axis.
+//   (b) a matrix label is claimed without its artifact: the JetBrains
+//       parity labels require a real HEAD-bound matrix report, the Faktor
+//       panel marker set must exist, and ui_parity=IMPLEMENTED requires
+//       every executable axis. A reappearing vendored corpus fails too.
 function selfCheck(manifest) {
   const problems = [];
   if (dir('scripts') !== true || dir('scripts/capabilities-manifest.mjs') !== false) {
@@ -460,37 +429,22 @@ function selfCheck(manifest) {
   } else if (file('scripts/capabilities-manifest.mjs') !== true) {
     problems.push('file() probe disagrees with the tree for scripts/capabilities-manifest.mjs');
   }
-  const pin = jetbrainsPin();
-  const assets = manifest.surfaces.jetbrains_upstream_assets.status;
+  problems.push(...retiredVendoredArtifacts());
+  const webview = manifest.surfaces.vscode_webview.status;
   const frontend = manifest.surfaces.jetbrains_frontend.status;
   const behavioral = manifest.surfaces.jetbrains_behavioral_parity.status;
   const visual = manifest.surfaces.jetbrains_visual_parity.status;
   const uiParity = manifest.surfaces.ui_parity.status;
 
-  if (pin) {
-    if (assets !== 'VENDORED') {
-      problems.push(
-        `jetbrains_upstream_assets is ${assets} although the pinned 7.1.2 corpus ${JETBRAINS_712_ROOT}/ is present`,
-      );
-    }
-    if (frontend !== 'IMPLEMENTED') {
-      problems.push(
-        `jetbrains_frontend is ${frontend} although the Faktor frontend operates (pin present, markers verified)`,
-      );
-    }
-  } else {
-    if (assets === 'VENDORED') {
-      problems.push(
-        'jetbrains_upstream_assets claims VENDORED but the pinned 7.1.2 corpus is absent/incomplete',
-      );
-    }
-    if (uiParity === 'IMPLEMENTED') {
-      problems.push('ui_parity claims IMPLEMENTED but no pinned JetBrains corpus exists');
-    }
+  if (webview === 'IMPLEMENTED' && !vscodePanelStatus().detail.includes('Faktor-owned')) {
+    problems.push('vscode_webview claims IMPLEMENTED without the Faktor-owned panel markers');
+  }
+  if (frontend === 'IMPLEMENTED' && !hasText('apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt', 'class FaktorChatPanel')) {
+    problems.push('jetbrains_frontend claims IMPLEMENTED without the Faktor panel class');
   }
   if (behavioral === 'IMPLEMENTED' && jetbrainsMatrix(JETBRAINS_PARITY_MATRIX) === null) {
     problems.push(
-      'jetbrains_behavioral_parity claims IMPLEMENTED without an executable parity matrix report',
+      'jetbrains_behavioral_parity claims IMPLEMENTED without an executable matrix report',
     );
   }
   if (visual === 'IMPLEMENTED' && visualMatrixResult(JETBRAINS_PARITY_MATRIX).status !== 'IMPLEMENTED') {
@@ -500,13 +454,13 @@ function selfCheck(manifest) {
   }
   if (uiParity === 'IMPLEMENTED') {
     const axes = [
-      vscodeVisualResult().status,
+      vscodePanelStatus().status,
       behavioralMatrixResult(JETBRAINS_PARITY_MATRIX).status,
       visualMatrixResult(JETBRAINS_PARITY_MATRIX).status,
     ];
     if (axes.some((status) => status !== 'IMPLEMENTED')) {
       problems.push(
-        `ui_parity claims IMPLEMENTED but an executable parity axis is not: ${axes.join(', ')}`,
+        `ui_parity claims IMPLEMENTED but an executable axis is not: ${axes.join(', ')}`,
       );
     }
   }
@@ -516,7 +470,6 @@ function selfCheck(manifest) {
     }
     process.exit(1);
   }
-  return pin;
 }
 
 // ---------------------------------------------------------- docs drift check
@@ -610,7 +563,7 @@ function implementedClaimErrors() {
 // --------------------------------------------------------------------- main
 
 const manifest = buildManifest();
-const jetbrainsPinned = selfCheck(manifest) !== null;
+selfCheck(manifest);
 mkdirSync(resolve(ROOT, OUT_DIR), { recursive: true });
 writeFileSync(MANIFEST_PATH, `${JSON.stringify(manifest, null, 2)}\n`);
 
@@ -624,9 +577,7 @@ const summary = Object.entries(manifest.surfaces)
 console.log(`capabilities manifest: ${MANIFEST_PATH}`);
 console.log(`surfaces: ${summary}`);
 console.log(
-  jetbrainsPinned
-    ? 'capabilities self-check: probes ok; pinned JetBrains 7.1.2 corpus present and every label carries its earned status (parity labels only from executable matrices).'
-    : 'capabilities self-check: probes ok; no pinned JetBrains 7.1.2 corpus (labels stay honest without it).',
+  'capabilities self-check: probes ok; Faktor-owned UI (no vendored corpus) and every label carries its earned status (matrix labels only from executable matrices).',
 );
 if (!GENERATE_ONLY) {
   console.log('docs/certification.md capability table in sync.');

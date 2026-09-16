@@ -215,7 +215,7 @@ impl AcpStreamBackend for FakeBackend {
     }
 }
 
-/// A bounded native v756 history page (newest-first), as the daemon's
+/// A bounded native history page (newest-first), as the daemon's
 /// message service produces it. Replayed chronologically by `session/load`:
 /// user text, then (assistant) thought, tool call, answer text.
 pub fn history_page(session: &str) -> MessagesPage {

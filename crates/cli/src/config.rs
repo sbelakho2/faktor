@@ -1216,15 +1216,23 @@ impl ProviderCfg {
                         }
                         c
                     }
-                    "gateway" => faktor_deepseek::DeepSeekConfig {
-                        profile: faktor_deepseek::DeepSeekProfile::Gateway {
-                            base_url: base_url
-                                .clone()
-                                .unwrap_or_else(|| "https://api.kilo.ai".into()),
-                        },
-                        api_key: self.key(),
-                        model_overrides: Default::default(),
-                    },
+                    // A gateway is BYO endpoint: there is no implicit
+                    // third-party default, so a missing base_url is a loud
+                    // typed refusal instead of a hardcoded vendor.
+                    "gateway" => {
+                        let Some(base_url) = base_url.clone() else {
+                            return Err(
+                                "deepseek profile \"gateway\" requires an explicit base_url \
+                                 (no implicit gateway endpoint is assumed)"
+                                    .into(),
+                            );
+                        };
+                        faktor_deepseek::DeepSeekConfig {
+                            profile: faktor_deepseek::DeepSeekProfile::Gateway { base_url },
+                            api_key: self.key(),
+                            model_overrides: Default::default(),
+                        }
+                    }
                     "openrouter" => faktor_deepseek::DeepSeekConfig {
                         profile: faktor_deepseek::DeepSeekProfile::OpenRouter,
                         api_key: self.key(),
@@ -2181,7 +2189,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"{"providers": [
-                {"kind": "gateway", "id": "kilo-gw", "base_url": "https://api.kilo.ai",
+                {"kind": "gateway", "id": "agg-gw", "base_url": "https://gateway.example.com",
                  "pricing": {"pricing_ceiling_micro_usd_per_million_tokens": 60000000}}
             ]}"#,
         )
@@ -2290,6 +2298,20 @@ mod tests {
             pricing: None,
         };
         assert!(cfg.build(open_transport()).is_err());
+        // A gateway without an explicit endpoint is refused: the config
+        // never silently assumes a third-party gateway URL.
+        let cfg = ProviderCfg::DeepSeek {
+            id: "gw-missing".into(),
+            profile: "gateway".into(),
+            base_url: None,
+            api_key_env: None,
+            pricing: None,
+        };
+        let err = cfg
+            .build(open_transport())
+            .err()
+            .expect("gateway without base_url must be refused");
+        assert!(err.contains("base_url"), "{err}");
     }
 
     #[test]
@@ -2383,7 +2405,7 @@ mod tests {
         assert_eq!(
             ProviderCfg::Gateway {
                 id: "gw".into(),
-                base_url: "https://api.kilo.ai".into(),
+                base_url: "https://gateway.example.com".into(),
                 api_key_env: None,
                 pricing: None,
             }

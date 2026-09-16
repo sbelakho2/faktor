@@ -3,10 +3,9 @@
 // Zero external dependencies on purpose: no kotlinx.serialization, no okhttp,
 // no org.json. The daemon's HTTP surface is Faktor Native Protocol v1 and is
 // parsed by NativeProtocol.kt; this file keeps only the startup line the
-// process manager reads from stdout and the Basic auth header form.
+// process manager reads from stdout and the Faktor-native bearer auth form.
 package dev.faktor.shared
 
-import java.util.Base64
 import java.util.regex.Pattern
 
 /** Thrown when a daemon stdout line violates the startup-line contract. */
@@ -33,19 +32,17 @@ data class StartupLine(val port: Int) {
 }
 
 /**
- * Basic auth for every daemon request:
- * `Authorization: Basic base64("kilo:" + FAKTOR_SERVER_PASSWORD)`. The daemon
- * splits the decoded payload at the FIRST colon; username must be exactly
- * `kilo`; the password is compared constant-time.
+ * Faktor-native auth for every daemon request:
+ * `Authorization: Bearer <FAKTOR_SERVER_PASSWORD>`. The daemon compares the
+ * claim constant-time against its own password; revoked pre-cutover clients
+ * migrate from the retired Basic compatibility form to this one, and there is
+ * no downgrade path.
  */
-class BasicAuth(val password: String) {
+class BearerAuth(val password: String) {
     val headerValue: String
-        get() = "Basic " + Base64.getEncoder()
-            .encodeToString((BasicAuth.USERNAME + ":" + password).toByteArray(Charsets.UTF_8))
+        get() = "Bearer $password"
 
     companion object {
         const val HEADER_NAME: String = "Authorization"
-        const val USERNAME: String = "kilo"
     }
 }
-

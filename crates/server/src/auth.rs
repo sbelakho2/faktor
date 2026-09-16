@@ -1,13 +1,28 @@
 //! Local auth: the frontend generates a 64-hex `FAKTOR_SERVER_PASSWORD` and
-//! passes it to the daemon via env; the daemon never prints it. The frozen
-//! v7.5.6 extension authenticates every request (including `/global/health`)
-//! with `Authorization: Basic base64("kilo:" + FAKTOR_SERVER_PASSWORD)`
-//! (`ServerPassword::check_authorization`). The Faktor-native forms
-//! (`Authorization: Bearer <password>` and `x-faktor-server-password:
-//! <password>`) remain accepted, and the legacy per-start `AuthToken` keeps
-//! the old tests working.
+//! passes it to the daemon via env; the daemon never prints it. Every request
+//! carries one of the Faktor-native claims:
+//!
+//! - `Authorization: Bearer <FAKTOR_SERVER_PASSWORD>`, or
+//! - `x-faktor-server-password: <FAKTOR_SERVER_PASSWORD>`, or
+//! - `Authorization: Bearer <per-start AuthToken>` — the legacy per-start
+//!   token mechanism, retained (never persisted; a restart invalidates stale
+//!   UI connections, which is the point of local auth).
+//!
+//! There is no product-compat auth arm: no `Basic` form is parsed, no fixed
+//! username is special-cased, and no header is silently upgraded or
+//! downgraded between schemes.
+//!
+//! # Migration note for pre-cutover clients
+//!
+//! Releases before the Faktor-native auth cutover accepted
+//! `Authorization: Basic <base64(username:password)>` with one fixed,
+//! product-derived username. That compatibility arm was removed: a `Basic`
+//! header is now rejected exactly like any other unknown scheme (this module
+//! has no Basic parser at all), so existing clients MUST migrate to the
+//! `Bearer` form — `Authorization: Bearer <FAKTOR_SERVER_PASSWORD>` — or to
+//! the `x-faktor-server-password` header. There is deliberately no downgrade
+//! path: a rejected claim is a loud 401, never a fallback to a weaker scheme.
 
-use base64::Engine as _;
 use rand::Rng;
 
 /// The server password: read from `FAKTOR_SERVER_PASSWORD` or generated.
@@ -50,17 +65,11 @@ impl ServerPassword {
         &self.0
     }
 
-    /// Check one `Authorization` header value. Accepted, in order:
-    ///
-    /// 1. `Basic <base64>` — the frozen v7.5.6 form. The payload must decode
-    ///    (headers longer than [`MAX_AUTH_HEADER_BYTES`] are rejected before
-    ///    decoding), split at the *first* `:`, the username must be exactly
-    ///    `kilo`, and the password is compared constant-time against the
-    ///    secret. Trailing junk is rejected: the whole payload must decode.
-    /// 2. `Bearer <password>` — Faktor-native, retained.
-    ///
-    /// Anything else (missing header, garbage scheme, malformed base64,
-    /// wrong username/password) is rejected.
+    /// Check one `Authorization` header value against the password.
+    /// Accepted: `Bearer <password>` only. Anything else (missing header,
+    /// `Basic`, any other scheme, malformed/oversized value, wrong password)
+    /// is rejected. `Basic` is not parsed at all — the pre-cutover
+    /// compatibility arm is gone (see the module migration note).
     pub fn check_authorization(&self, header: Option<&str>) -> bool {
         let Some(header) = header else {
             return false;
@@ -68,27 +77,15 @@ impl ServerPassword {
         if header.len() > MAX_AUTH_HEADER_BYTES {
             return false;
         }
-        if let Some(encoded) = header.strip_prefix("Basic ") {
-            let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
-                return false;
-            };
-            let Some(sep) = decoded.iter().position(|&b| b == b':') else {
-                return false;
-            };
-            if &decoded[..sep] != b"kilo" {
-                return false;
-            }
-            return ct_eq(self.as_str().as_bytes(), &decoded[sep + 1..]);
-        }
-        if let Some(bearer) = header.strip_prefix("Bearer ") {
-            return ct_eq(self.as_str().as_bytes(), bearer.as_bytes());
-        }
-        false
+        let Some(bearer) = header.strip_prefix("Bearer ") else {
+            return false;
+        };
+        ct_eq(self.as_str().as_bytes(), bearer.as_bytes())
     }
 }
 
 /// The bound on one `Authorization` header value (bounded everything): a
-/// header larger than this is rejected without even attempting a decode.
+/// header larger than this is rejected without any comparison.
 pub const MAX_AUTH_HEADER_BYTES: usize = 4096;
 
 /// Constant-time comparison of two fixed-length byte strings.
@@ -111,12 +108,20 @@ pub fn check_password(
     x_faktor_server_password: Option<&str>,
 ) -> bool {
     let expected = password.as_str().as_bytes();
-    if let Some(bearer) = authorization.and_then(|h| h.strip_prefix("Bearer ")) {
-        if ct_eq(expected, bearer.as_bytes()) {
-            return true;
+    if let Some(authorization) = authorization {
+        if authorization.len() > MAX_AUTH_HEADER_BYTES {
+            return false;
+        }
+        if let Some(bearer) = authorization.strip_prefix("Bearer ") {
+            if ct_eq(expected, bearer.as_bytes()) {
+                return true;
+            }
         }
     }
     if let Some(header) = x_faktor_server_password {
+        if header.len() > MAX_AUTH_HEADER_BYTES {
+            return false;
+        }
         if ct_eq(expected, header.as_bytes()) {
             return true;
         }
@@ -274,7 +279,7 @@ mod tests {
             Some(&format!("Bearer {} extra", pw.as_str())),
             None
         ));
-        // Wrong x-kilo form.
+        // Wrong x-faktor-server-password value.
         assert!(!check_password(&pw, None, Some("wrong")));
         // Header containing the password with surrounding whitespace is
         // rejected (headers are exact).
@@ -287,7 +292,8 @@ mod tests {
 
     #[test]
     fn password_and_legacy_token_are_independent() {
-        // The old token flow must keep working alongside the password flow.
+        // The per-start token flow must keep working alongside the password
+        // flow.
         let token = AuthToken::generate();
         let pw = ServerPassword::generate();
         assert!(check_bearer(
@@ -305,56 +311,38 @@ mod tests {
         ));
     }
 
-    fn basic(username: &str, password: &str) -> String {
+    fn base64(value: &str) -> String {
         use base64::Engine as _;
-        format!(
-            "Basic {}",
-            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
-        )
+        base64::engine::general_purpose::STANDARD.encode(value)
     }
 
     #[test]
-    fn basic_auth_valid_credentials_accepted() {
+    fn basic_auth_is_rejected_entirely() {
+        // The retired compatibility arm must be GONE: even a Basic header
+        // carrying the correct password is rejected (unknown scheme, no
+        // parser). This is the regression lock for the migration.
         let pw = ServerPassword::generate();
-        let header = basic("kilo", pw.as_str());
-        assert!(pw.check_authorization(Some(&header)), "{header}");
-        // The password may itself contain a colon: only the FIRST colon
-        // splits the credentials.
-        let tricky = ServerPassword("kilo:with:colons".into());
-        let header = basic("kilo", tricky.as_str());
-        assert!(tricky.check_authorization(Some(&header)));
-    }
-
-    #[test]
-    fn basic_auth_wrong_password_rejected() {
-        let pw = ServerPassword::generate();
-        let wrong = ServerPassword::generate();
-        let header = basic("kilo", wrong.as_str());
-        assert!(!pw.check_authorization(Some(&header)));
-        // A prefix of the real password must not match.
-        let header = basic("kilo", &pw.as_str()[..32]);
-        assert!(!pw.check_authorization(Some(&header)));
-        // Empty password credential.
-        let header = basic("kilo", "");
-        assert!(!pw.check_authorization(Some(&header)));
-    }
-
-    #[test]
-    fn basic_auth_wrong_username_rejected() {
-        let pw = ServerPassword::generate();
-        for user in ["admin", "root", "kil", "kilo-", "Kilo", "faktor", ""] {
-            let header = basic(user, pw.as_str());
+        for header in [
+            format!("Basic {}", base64(&format!("legacy:{}", pw.as_str()))),
+            format!("Basic {}", base64(&format!("admin:{}", pw.as_str()))),
+            format!("Basic {}", base64(pw.as_str())),
+            format!("basic {}", base64(pw.as_str())),
+            format!("Basic {}", base64(&format!("legacy:{}", "wrong"))),
+        ] {
             assert!(
                 !pw.check_authorization(Some(&header)),
-                "username {user:?} must be rejected"
+                "{header:?} must be rejected (Basic is not an accepted scheme)"
             );
+            assert!(!check_password(&pw, Some(&header), None));
         }
-        // No colon at all: nothing to split, rejected.
-        let header = format!(
-            "Basic {}",
-            base64::engine::general_purpose::STANDARD.encode(pw.as_str())
-        );
-        assert!(!pw.check_authorization(Some(&header)));
+        // The same credentials in the native Bearer form ARE accepted, so
+        // the rejection above is about the scheme, not the secret.
+        assert!(pw.check_authorization(Some(&format!("Bearer {}", pw.as_str()))));
+        assert!(check_password(
+            &pw,
+            Some(&format!("Bearer {}", pw.as_str())),
+            None
+        ));
     }
 
     #[test]
@@ -362,8 +350,8 @@ mod tests {
         let pw = ServerPassword::generate();
         for bad in [
             "Basic !!!not-base64!!!",
-            "Basic a2lsbzpwYXNz",  // truncated (missing padding)
-            "Basic a2lsbzpwYXNz=", // wrong padding
+            "Basic YTpi",  // truncated (missing padding)
+            "Basic YTpi=", // wrong padding
             "Basic \u{00a0}\u{00a0}",
             "Basic -----",
         ] {
@@ -375,71 +363,56 @@ mod tests {
     }
 
     #[test]
-    fn basic_auth_garbage_and_missing_headers_rejected() {
+    fn auth_garbage_and_missing_headers_rejected() {
         let pw = ServerPassword::generate();
         assert!(!pw.check_authorization(None));
         assert!(!pw.check_authorization(Some("")));
         assert!(!pw.check_authorization(Some("Basic")));
-        assert!(!pw.check_authorization(Some("basic a2lsbzp4")));
-        assert!(!pw.check_authorization(Some("Digest a2lsbzp4")));
+        assert!(!pw.check_authorization(Some("Digest YTpi")));
         assert!(!pw.check_authorization(Some(pw.as_str())));
         assert!(!pw.check_authorization(Some("Token 12345")));
         assert!(!pw.check_authorization(Some("Bearer ")));
     }
 
     #[test]
-    fn basic_auth_huge_header_rejected() {
+    fn oversized_header_rejected_before_any_comparison() {
         let pw = ServerPassword::generate();
-        let huge = format!("Basic {}", "A".repeat(MAX_AUTH_HEADER_BYTES));
+        let huge = format!("Bearer {}", "A".repeat(MAX_AUTH_HEADER_BYTES));
         assert!(!pw.check_authorization(Some(&huge)));
+        assert!(!check_password(&pw, Some(&huge), None));
+        assert!(!check_password(&pw, None, Some(&huge)));
         // Exactly at the bound is still rejected only when the payload is
         // invalid; a legitimately sized header is fine.
-        let ok = basic("kilo", pw.as_str());
+        let ok = format!("Bearer {}", pw.as_str());
         assert!(ok.len() < MAX_AUTH_HEADER_BYTES);
         assert!(pw.check_authorization(Some(&ok)));
     }
 
     #[test]
-    fn basic_auth_trailing_junk_rejected() {
-        let pw = ServerPassword::generate();
-        let good = basic("kilo", pw.as_str());
-        let good_encoded = good.strip_prefix("Basic ").unwrap();
-        for junk in [" extra", "==", "!!", " x", "\n", "\t"] {
-            let header = format!("Basic {good_encoded}{junk}");
-            assert!(
-                !pw.check_authorization(Some(&header)),
-                "trailing junk {junk:?} must be rejected"
-            );
-        }
-        // Whitespace INSIDE the base64 (not trailing junk) also fails.
-        let header = format!("Basic {} {}", &good_encoded[..10], &good_encoded[10..]);
-        assert!(!pw.check_authorization(Some(&header)));
-    }
-
-    #[test]
-    fn bearer_and_x_kilo_forms_still_work() {
+    fn bearer_and_x_faktor_forms_still_work() {
         let pw = ServerPassword::generate();
         // Bearer through the same entry point.
         let header = format!("Bearer {}", pw.as_str());
         assert!(pw.check_authorization(Some(&header)));
         assert!(!pw.check_authorization(Some("Bearer wrong")));
         // x-faktor-server-password is a separate header; check_password covers
-        // it (the Authorization entry point must NOT accept it as Basic).
+        // it (the Authorization entry point must NOT accept it).
         assert!(check_password(&pw, None, Some(pw.as_str())));
         assert!(!pw.check_authorization(Some(pw.as_str())));
     }
 
     #[test]
-    fn basic_and_bearer_and_legacy_token_are_independent() {
+    fn legacy_token_is_not_the_password_in_any_scheme() {
         let pw = ServerPassword::generate();
         let token = AuthToken::generate();
-        // A legacy token is NOT the password: it fails every password path.
         let header = format!("Bearer {}", token.as_str());
         assert!(!pw.check_authorization(Some(&header)));
-        let header = basic("kilo", token.as_str());
-        assert!(!pw.check_authorization(Some(&header)));
+        assert!(!check_password(&pw, Some(&header), None));
+        assert!(!pw.check_authorization(Some(&format!(
+            "Basic {}",
+            base64(&format!("legacy:{}", token.as_str()))
+        ))));
         // And the token path still accepts its own bearer.
-        let header = format!("Bearer {}", token.as_str());
         assert!(check_bearer(&token, Some(&header)));
     }
 }

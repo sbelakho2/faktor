@@ -32,13 +32,12 @@ export interface PendingBinaryAttachment {
 }
 
 /**
- * The host-side PENDING SUBMISSION ENVELOPE. It is built from the frozen
- * UI's `sendMessage` (text + session/draft/message identity + the ORIGINAL
+ * The host-side PENDING SUBMISSION ENVELOPE. It is built from the composer
+ * submission (text + optional session/draft/message identity + the original
  * `files` payload) and retained until the daemon durably accepts the task.
- * On ANY admission failure the host sends the Kilo-compatible
- * `sendMessageFailed` with exactly these fields, which restores the draft
- * text and image attachments in the vendored composer. The envelope is
- * never cleared before acceptance and never emptied on failure.
+ * On ANY admission failure the host restores the draft from these exact
+ * fields, so the user's text and attachments are never silently lost. The
+ * envelope is never cleared before acceptance and never emptied on failure.
  */
 export interface PendingSubmission {
   readonly text: string;
@@ -547,9 +546,9 @@ function uploadFailureOf(error: unknown, sessionId: string): AdmitFailure {
  * durable typed ids. The pending envelope is retained by the caller for the
  * entire call; `restore` is invoked EXACTLY ONCE on any failure (upload,
  * image refusal, validation/model/conflict/transport start failure) and
- * never on success — the draft is restored through the Kilo-compatible
- * `sendMessageFailed`, never silently lost. A failure before the start
- * request leaves no daemon-side admission at all.
+ * never on success — the draft is restored through the composer contract,
+ * never silently lost. A failure before the start request leaves no
+ * daemon-side admission at all.
  */
 export async function admitPendingSubmission(input: {
   readonly client: StartRunClient & AttachmentUploadClient;

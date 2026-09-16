@@ -4,7 +4,6 @@ target/
 *.db-wal
 *.db-shm
 *.log
-.kilo/
 
 # cargo-fuzz workspace (detached from the main workspace; generated state)
 fuzz/target/

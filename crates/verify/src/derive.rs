@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::exec::{CheckCategory, CheckKind, CheckSpec, BUILD_DIR};
+use crate::inventory::{
+    probe_manifest_text, CandidateGeneration, ManifestProbe, ManifestProbeRefusal,
+};
 use crate::{
     compileall_token, is_test_related, rust_test_filter, under_dir, MAX_CHECKS,
     MAX_SIMULTANEOUS_JOBS, MAX_TOTAL_WALL_BUDGET,
@@ -120,10 +123,15 @@ pub struct ProjectComponent {
     pub test_frameworks: Vec<TestFramework>,
 }
 
-/// Every project component of a repository, most-specific root first.
+/// Every project component of a repository, most-specific root first, plus
+/// the typed refusals of every content-deciding manifest probe that could
+/// not certify its content (unreadable/oversized/unstable). A refusal NEVER
+/// acts as absence: [`derive_checks`] refuses a profile carrying one, so a
+/// `Passed` verdict can never rest on silently-dropped manifest content.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProjectProfile {
     pub components: Vec<ProjectComponent>,
+    pub manifest_refusals: Vec<ManifestProbeRefusal>,
 }
 
 impl ProjectProfile {
@@ -150,10 +158,28 @@ impl ProjectProfile {
 /// truncation of required semantic coverage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationDerivationError {
-    TooManyChecks { count: usize, max: usize },
-    TotalWallBudgetExceeded { estimated: Duration, max: Duration },
-    TooManySimultaneousJobs { jobs: usize, max: usize },
-    ConflictingCheckId { id: String },
+    TooManyChecks {
+        count: usize,
+        max: usize,
+    },
+    TotalWallBudgetExceeded {
+        estimated: Duration,
+        max: Duration,
+    },
+    TooManySimultaneousJobs {
+        jobs: usize,
+        max: usize,
+    },
+    ConflictingCheckId {
+        id: String,
+    },
+    /// A content-deciding manifest probe could not certify its content
+    /// (unreadable/oversized/unstable): the derived check set would be
+    /// silently incomplete, so derivation refuses typed.
+    ManifestProbeRefused {
+        path: String,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for VerificationDerivationError {
@@ -174,6 +200,12 @@ impl std::fmt::Display for VerificationDerivationError {
             ),
             Self::ConflictingCheckId { id } => {
                 write!(f, "two different checks claim the id {id:?}")
+            }
+            Self::ManifestProbeRefused { path, detail } => {
+                write!(
+                    f,
+                    "manifest {path:?} could not certify its content: {detail}"
+                )
             }
         }
     }
@@ -282,18 +314,38 @@ fn component_id(component: &ProjectComponent, base: &str) -> String {
     format!("{sanitized}:{base}")
 }
 
-fn read_bounded(root: &Path, rel: &str) -> Option<String> {
-    let path = root.join(rel);
-    let meta = std::fs::metadata(&path).ok()?;
-    if meta.len() > MAX_PROBE_BYTES {
-        return None;
+/// Read one manifest's content through the generation-bound
+/// [`probe_manifest_text`]. A content-deciding manifest that is not
+/// `Present` records its typed refusal (never a silent absence); `Absent`
+/// records nothing (there is genuinely no manifest to read).
+fn read_manifest(
+    root: &Path,
+    generation: &CandidateGeneration,
+    rel: &str,
+    refusals: &mut Vec<ManifestProbeRefusal>,
+) -> Option<String> {
+    match probe_manifest_text(root, generation, rel) {
+        ManifestProbe::Present(text) => Some(text),
+        ManifestProbe::Absent => None,
+        refusal => {
+            if let Some(refusal) = refusal.refusal() {
+                if !refusals.iter().any(|seen| seen.path == refusal.path) {
+                    refusals.push(refusal);
+                }
+            }
+            None
+        }
     }
-    let bytes = std::fs::read(&path).ok()?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn probe_any(root: &Path, rel: &str, needles: &[&str]) -> bool {
-    read_bounded(root, rel).is_some_and(|text| {
+fn probe_any(
+    root: &Path,
+    generation: &CandidateGeneration,
+    rel: &str,
+    needles: &[&str],
+    refusals: &mut Vec<ManifestProbeRefusal>,
+) -> bool {
+    read_manifest(root, generation, rel, refusals).is_some_and(|text| {
         let text = text.to_ascii_lowercase();
         needles.iter().any(|needle| text.contains(needle))
     })
@@ -353,7 +405,13 @@ fn add_test_framework(component: &mut ProjectComponent, framework: TestFramework
     }
 }
 
-fn probe_make_targets(root: &Path, dir: &str, files: &[String]) -> (bool, bool) {
+fn probe_make_targets(
+    root: &Path,
+    generation: &CandidateGeneration,
+    dir: &str,
+    files: &[String],
+    refusals: &mut Vec<ManifestProbeRefusal>,
+) -> (bool, bool) {
     let Some(rel) = ["Makefile", "makefile", "GNUmakefile"]
         .iter()
         .map(|name| join_rel(dir, name))
@@ -361,7 +419,7 @@ fn probe_make_targets(root: &Path, dir: &str, files: &[String]) -> (bool, bool) 
     else {
         return (false, false);
     };
-    let Some(text) = read_bounded(root, &rel) else {
+    let Some(text) = read_manifest(root, generation, &rel, refusals) else {
         return (false, false);
     };
     let (mut test, mut check) = (false, false);
@@ -383,9 +441,11 @@ fn probe_make_targets(root: &Path, dir: &str, files: &[String]) -> (bool, bool) 
 
 fn detect_marker(
     root: &Path,
+    generation: &CandidateGeneration,
     components: &mut BTreeMap<String, ProjectComponent>,
     files: &[String],
     rel: &str,
+    refusals: &mut Vec<ManifestProbeRefusal>,
 ) {
     let dir = dir_of(rel).to_string();
     let name = basename(rel);
@@ -401,7 +461,7 @@ fn detect_marker(
         add_language(component, LanguageFamily::Node);
         add_build_system(component, BuildSystem::Npm);
         add_toolchain(component, Toolchain::Node);
-        let text = read_bounded(root, rel).unwrap_or_default();
+        let text = read_manifest(root, generation, rel, refusals).unwrap_or_default();
         let lower = text.to_ascii_lowercase();
         if lower.contains("\"jest\"") {
             add_test_framework(component, TestFramework::Jest);
@@ -419,7 +479,7 @@ fn detect_marker(
         let component = component_at(components, &dir);
         add_language(component, LanguageFamily::Python);
         add_toolchain(component, Toolchain::Python);
-        if name == "pyproject.toml" && probe_any(root, rel, &["pytest"]) {
+        if name == "pyproject.toml" && probe_any(root, generation, rel, &["pytest"], refusals) {
             add_test_framework(component, TestFramework::Pytest);
         }
     } else if name == "go.mod" {
@@ -447,7 +507,7 @@ fn detect_marker(
             add_toolchain(component, Toolchain::Gradle);
         }
     } else if name == "CMakeLists.txt" {
-        let idf_component = probe_any(root, rel, &["idf_component_register"]);
+        let idf_component = probe_any(root, generation, rel, &["idf_component_register"], refusals);
         let target = if idf_component {
             nearest_key(components, &dir)
                 .filter(|key| key != &dir)
@@ -460,28 +520,42 @@ fn detect_marker(
         add_language(component, LanguageFamily::Cpp);
         add_build_system(component, BuildSystem::CMake);
         add_toolchain(component, Toolchain::CMake);
-        if probe_any(root, rel, &["find_package(zephyr", "zephyr/cmake"]) {
+        if probe_any(
+            root,
+            generation,
+            rel,
+            &["find_package(zephyr", "zephyr/cmake"],
+            refusals,
+        ) {
             add_toolchain(component, Toolchain::ZephyrSdk);
             add_target(component, TargetProfile::Zephyr);
         }
         if idf_component
             || probe_any(
                 root,
+                generation,
                 rel,
                 &["idf_component_register", "esp-idf", "idf_path"],
+                refusals,
             )
         {
             add_build_system(component, BuildSystem::EspIdf);
             add_toolchain(component, Toolchain::EspXtensa);
             add_target(component, TargetProfile::Esp32);
         }
-        if probe_any(root, rel, &["include(ctest", "enable_testing", "add_test("]) {
+        if probe_any(
+            root,
+            generation,
+            rel,
+            &["include(ctest", "enable_testing", "add_test("],
+            refusals,
+        ) {
             add_test_framework(component, TestFramework::CTest);
         }
-        if probe_any(root, rel, &["gtest", "googletest"]) {
+        if probe_any(root, generation, rel, &["gtest", "googletest"], refusals) {
             add_test_framework(component, TestFramework::GoogleTest);
         }
-        if probe_any(root, rel, &["arm-none-eabi"]) {
+        if probe_any(root, generation, rel, &["arm-none-eabi"], refusals) {
             add_toolchain(component, Toolchain::ArmNoneEabi);
             add_target(component, TargetProfile::ArmNoneEabi);
         }
@@ -491,7 +565,7 @@ fn detect_marker(
         add_language(component, LanguageFamily::Cpp);
         add_build_system(component, BuildSystem::Make);
         add_toolchain(component, Toolchain::Make);
-        let (test, check) = probe_make_targets(root, &dir, files);
+        let (test, check) = probe_make_targets(root, generation, &dir, files, refusals);
         if test {
             add_test_framework(component, TestFramework::MakeTest);
         }
@@ -520,7 +594,7 @@ fn detect_marker(
         add_language(component, LanguageFamily::Cpp);
         add_build_system(component, BuildSystem::PlatformIO);
         add_toolchain(component, Toolchain::PlatformIO);
-        let text = read_bounded(root, rel).unwrap_or_default();
+        let text = read_manifest(root, generation, rel, refusals).unwrap_or_default();
         let lower = text.to_ascii_lowercase();
         if lower.contains("espressif32") || lower.contains("esp32") {
             add_toolchain(component, Toolchain::EspXtensa);
@@ -561,7 +635,7 @@ fn detect_marker(
             add_test_framework(component, TestFramework::DotNetTest);
         }
         if name.ends_with(".csproj") {
-            let text = read_bounded(root, rel).unwrap_or_default();
+            let text = read_manifest(root, generation, rel, refusals).unwrap_or_default();
             let lower = text.to_ascii_lowercase();
             if lower.contains("xunit") {
                 add_test_framework(component, TestFramework::XUnit);
@@ -578,8 +652,10 @@ fn detect_marker(
 
 fn detect_evidence(
     root: &Path,
+    generation: &CandidateGeneration,
     components: &mut BTreeMap<String, ProjectComponent>,
     files: &[String],
+    refusals: &mut Vec<ManifestProbeRefusal>,
 ) {
     for rel in files {
         let dir = dir_of(rel).to_string();
@@ -595,7 +671,7 @@ fn detect_evidence(
             let component = component_at(components, &key);
             add_build_system(component, BuildSystem::CMake);
             add_toolchain(component, Toolchain::CMake);
-            let text = read_bounded(root, rel).unwrap_or_default();
+            let text = read_manifest(root, generation, rel, refusals).unwrap_or_default();
             if text.to_ascii_lowercase().contains("arm-none-eabi") {
                 add_toolchain(component, Toolchain::ArmNoneEabi);
                 add_target(component, TargetProfile::ArmNoneEabi);
@@ -605,7 +681,7 @@ fn detect_evidence(
                 continue;
             };
             let component = component_at(components, &key);
-            let text = read_bounded(root, rel)
+            let text = read_manifest(root, generation, rel, refusals)
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             if text.contains("arm-none-eabi") {
@@ -623,7 +699,7 @@ fn detect_evidence(
                 continue;
             };
             let component = component_at(components, &key);
-            let text = read_bounded(root, rel)
+            let text = read_manifest(root, generation, rel, refusals)
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             if text.contains("arm-none-eabi") {
@@ -747,16 +823,48 @@ fn seal(mut component: ProjectComponent) -> ProjectComponent {
 /// Detect EVERY project component of a repository from its bounded file map
 /// plus bounded content probes under `root`. Components are ordered
 /// most-specific root first, ties broken by path; every fact vector is
-/// sorted and deduped, so detection is deterministic.
+/// sorted and deduped, so detection is deterministic. Content probes are
+/// admitted under a fresh [`CandidateGeneration`] over `root`; every probe
+/// that cannot certify its content (unreadable/oversized/unstable) is
+/// surfaced on [`ProjectProfile::manifest_refusals`] — never silently
+/// treated as an absent manifest.
 pub fn detect_project_profile(root: &Path, files: &[String]) -> ProjectProfile {
+    let generation = CandidateGeneration::admit(root);
+    detect_project_profile_at_generation(root, files, &generation)
+}
+
+/// [`detect_project_profile`] under an EXPLICITLY admitted candidate
+/// generation (the caller ties the detection to the generation its root was
+/// admitted under). A generation that no longer matches `root` refuses
+/// every content probe typed (`unstable`), so content can never be certified
+/// across generations.
+pub fn detect_project_profile_at_generation(
+    root: &Path,
+    files: &[String],
+    generation: &CandidateGeneration,
+) -> ProjectProfile {
     let mut files_norm: Vec<String> = files.iter().filter_map(|f| normalize_rel(f)).collect();
     files_norm.sort();
     files_norm.dedup();
     let mut components: BTreeMap<String, ProjectComponent> = BTreeMap::new();
+    let mut refusals: Vec<ManifestProbeRefusal> = Vec::new();
     for rel in &files_norm {
-        detect_marker(root, &mut components, &files_norm, rel);
+        detect_marker(
+            root,
+            generation,
+            &mut components,
+            &files_norm,
+            rel,
+            &mut refusals,
+        );
     }
-    detect_evidence(root, &mut components, &files_norm);
+    detect_evidence(
+        root,
+        generation,
+        &mut components,
+        &files_norm,
+        &mut refusals,
+    );
     detect_languages(&mut components, &files_norm);
     detect_ctest(&mut components, &files_norm);
     let depth = |path: &Path| path.components().count();
@@ -766,8 +874,11 @@ pub fn detect_project_profile(root: &Path, files: &[String]) -> ProjectProfile {
             .cmp(&depth(&a.root))
             .then_with(|| a.root.cmp(&b.root))
     });
+    refusals.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.kind.cmp(b.kind)));
+    refusals.dedup();
     ProjectProfile {
         components: profile,
+        manifest_refusals: refusals,
     }
 }
 
@@ -870,6 +981,7 @@ impl From<crate::ProjectType> for ProjectProfile {
                 targets,
                 test_frameworks,
             }],
+            manifest_refusals: Vec::new(),
         }
     }
 }
@@ -1582,6 +1694,15 @@ pub fn derive_checks_with_limits(
     changed: &[PathBuf],
     limits: DerivationLimits,
 ) -> Result<Vec<CheckSpec>, VerificationDerivationError> {
+    // A content-deciding manifest probe that could not certify its content
+    // (unreadable/oversized/unstable) means the derived check set would be
+    // silently incomplete: refuse typed instead of deriving a smaller suite.
+    if let Some(refusal) = profile.manifest_refusals.first() {
+        return Err(VerificationDerivationError::ManifestProbeRefused {
+            path: refusal.path.clone(),
+            detail: refusal.detail.clone(),
+        });
+    }
     let mut changed_norm: Vec<String> = changed
         .iter()
         .filter_map(|path| normalize_rel(&path.to_string_lossy()))
@@ -1985,6 +2106,7 @@ mod tests {
         };
         let profile = ProjectProfile {
             components: vec![component.clone(), component.clone()],
+            manifest_refusals: Vec::new(),
         };
         let checks = derive_checks(&profile, &[PathBuf::from("x/main.c")]).unwrap();
         assert_eq!(
@@ -1999,6 +2121,7 @@ mod tests {
         other.root = PathBuf::from("a_b");
         let profile = ProjectProfile {
             components: vec![conflicting, other],
+            manifest_refusals: Vec::new(),
         };
         assert!(matches!(
             derive_checks(
@@ -2119,6 +2242,114 @@ mod tests {
             .components
             .iter()
             .any(|c| c.toolchains.contains(&Toolchain::ArmNoneEabi)));
+    }
+
+    // --------------------------------------- manifest probe refusals (C)
+
+    #[test]
+    fn unreadable_package_json_refuses_instead_of_dropping_jest() {
+        // A directory named `package.json` can never be read as a manifest;
+        // the probe must surface that typed instead of silently acting as if
+        // the manifest were absent (which would drop Jest detection).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("package.json")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/app.test.ts"), "test('x', () => {});\n").unwrap();
+        let files = vec!["package.json".to_string(), "src/app.test.ts".to_string()];
+        let profile = detect_project_profile(dir.path(), &files);
+        let refusal = profile
+            .manifest_refusals
+            .first()
+            .unwrap_or_else(|| panic!("the unreadable manifest must surface: {profile:?}"));
+        assert_eq!(refusal.path, "package.json");
+        assert_eq!(refusal.kind, "unreadable");
+        // The Node marker facts still land, but the CONTENT-derived check set
+        // cannot be certified: derivation refuses typed, never a smaller set.
+        assert!(component_for(&profile, "")
+            .build_systems
+            .contains(&BuildSystem::Npm));
+        let refused = derive_checks(&profile, &[PathBuf::from("src/app.test.ts")]);
+        match refused {
+            Err(VerificationDerivationError::ManifestProbeRefused { path, .. }) => {
+                assert_eq!(path, "package.json");
+            }
+            other => panic!("unreadable content-deciding manifest must refuse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_package_json_refuses_instead_of_dropping_jest() {
+        let (dir, mut files) = fixture(&[("src/app.test.ts", "test('x', () => {});\n")]);
+        let oversized = format!(
+            r#"{{"devDependencies":{{"jest":"30","pad":"{}"}}}}"#,
+            "x".repeat(300 * 1024)
+        );
+        std::fs::write(dir.path().join("package.json"), oversized).unwrap();
+        files.push("package.json".into());
+        let profile = detect_project_profile(dir.path(), &files);
+        assert_eq!(profile.manifest_refusals.len(), 1, "{profile:?}");
+        assert_eq!(profile.manifest_refusals[0].kind, "oversized");
+        assert!(
+            !component_for(&profile, "")
+                .test_frameworks
+                .contains(&TestFramework::Jest),
+            "oversized content is never read, so no framework may be claimed"
+        );
+        assert!(matches!(
+            derive_checks(&profile, &[PathBuf::from("src/app.test.ts")]),
+            Err(VerificationDerivationError::ManifestProbeRefused { .. })
+        ));
+    }
+
+    #[test]
+    fn unstable_generation_refuses_and_the_own_generation_detects_jest() {
+        let (a, _files_a) = fixture(&[
+            ("package.json", r#"{"devDependencies":{"jest":"30"}}"#),
+            ("src/app.test.ts", "test('x', () => {});\n"),
+        ]);
+        let (b, files_b) = fixture(&[
+            ("package.json", r#"{"devDependencies":{"jest":"30"}}"#),
+            ("src/app.test.ts", "test('x', () => {});\n"),
+        ]);
+        // A generation admitted on A can never certify content under B: every
+        // content probe refuses `unstable`, never absent.
+        let foreign = CandidateGeneration::admit(a.path());
+        let profile = detect_project_profile_at_generation(b.path(), &files_b, &foreign);
+        assert!(
+            !profile.manifest_refusals.is_empty(),
+            "a mismatched generation must surface refusals: {profile:?}"
+        );
+        assert!(profile
+            .manifest_refusals
+            .iter()
+            .any(|refusal| refusal.kind == "unstable"));
+        assert!(matches!(
+            derive_checks(&profile, &[PathBuf::from("src/app.test.ts")]),
+            Err(VerificationDerivationError::ManifestProbeRefused { .. })
+        ));
+
+        // The own generation certifies the same tree: refusals stay empty and
+        // the content-derived Jest detection lands.
+        let own = CandidateGeneration::admit(b.path());
+        let profile = detect_project_profile_at_generation(b.path(), &files_b, &own);
+        assert!(profile.manifest_refusals.is_empty(), "{profile:?}");
+        assert!(component_for(&profile, "")
+            .test_frameworks
+            .contains(&TestFramework::Jest));
+        let checks = derive_checks(&profile, &[PathBuf::from("src/app.test.ts")]).unwrap();
+        assert!(ids(&checks).contains(&"node_tsc".to_string()), "{checks:?}");
+    }
+
+    #[test]
+    fn absent_manifest_stays_absent_without_a_refusal() {
+        let (dir, mut files) = fixture(&[("src/index.ts", "export const x = 1;\n")]);
+        // Listed by the inventory but genuinely absent on disk: no refusal,
+        // and detection proceeds on the remaining evidence.
+        files.push("package.json".into());
+        let profile = detect_project_profile(dir.path(), &files);
+        assert!(profile.manifest_refusals.is_empty(), "{profile:?}");
+        let checks = derive_checks(&profile, &[PathBuf::from("src/index.ts")]).unwrap();
+        assert!(ids(&checks).contains(&"node_tsc".to_string()), "{checks:?}");
     }
 
     #[test]

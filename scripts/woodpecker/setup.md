@@ -40,7 +40,7 @@ pipeline path.
 
 | File (workflow) | Project | Event filter | Storage | Contents |
 | --- | --- | --- | --- | --- |
-| `.woodpecker/untrusted/pr.yaml` (`pr`) | untrusted | `pull_request` | **no volumes at all** | reduced lane set: `storage-policy`, `linux`, `static`, `docs`, `vscode`, `vscode-visual`, `vscode-visual-with-skip`, `jetbrains-build`, `jetbrains-smoke`, then the aggregate `certificate` |
+| `.woodpecker/untrusted/pr.yaml` (`pr`) | untrusted | `pull_request` | **no volumes at all** | reduced lane set: `storage-policy`, `linux`, `static`, `docs`, `vscode`, `jetbrains-build`, `jetbrains-smoke`, then the aggregate `certificate` |
 | `.woodpecker/trusted/trusted.yaml` (`trusted`) | trusted | `push` (any branch) + `tag` (linux); `push` to `main` for darwin/windows | trusted named volumes `faktor-trusted-*` | full linux lane set incl. release `[perf]` + `certificate`; darwin/windows matrix combos + per-platform certificates |
 | `.woodpecker/trusted/nightly.yaml` (`nightly`) | trusted | `cron` job `nightly` | own `faktor-nightly-*` volumes | `[fault]` at scale, longrun, efficiency, economy, coding-benchmark smoke, provider-key real-model run (recorded skip by default), supply-chain, then `certificate-nightly` |
 
@@ -190,7 +190,7 @@ fields.
 
 **None are required for the default pipelines.** All gates are deterministic
 and offline-capable apart from image/package downloads (Rust crates, npm
-packages, Gradle distribution/toolchain downloads, playwright browsers).
+packages, Gradle distribution/toolchain downloads).
 Provider-key (real-model) runs are deliberately not part of the PR/trusted
 pipelines; the nightly `coding-benchmark-real-model` lane records an explicit
 skip marker unless `FAKTOR_BENCH_PROVIDER`, `FAKTOR_BENCH_MODEL` and
@@ -248,9 +248,9 @@ Defense-in-depth (not the boundary):
   bootstraps Rust from the pinned rustup-init binary after verifying its
   published SHA-256, and the toolchain comes from pinned image tags
   (`rust:1.98`, `node:24`, `ubuntu:24.04`). The remaining PR fetches are
-  package-manager downloads (`npx @vscode/vsce`; `npm install playwright` +
-  `playwright install chromium`); they never pipe to a shell, and their
-  output is gated by the VSIX verifier and the pinned visual baselines.
+  package-manager downloads (`npx @vscode/vsce`); they never pipe to a
+  shell, and their output is gated by the VSIX panel-surface verifier and
+  the packaged selftest.
   Audit with `rg -n '\|[[:space:]]*(bash|sh)([[:space:]]|$)' .woodpecker/`.
 
 **Residual risks (must stay documented):**

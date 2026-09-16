@@ -46,7 +46,19 @@
 //! candidate can reject it.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+
+/// Classified lock recovery for DERIVED state (caches, registries, rings,
+/// process/ownership projections): a poisoned guard is recovered with the
+/// poison flag cleared, so one panicking caller can never wedge later use.
+/// The durable authority (store/journal/OS process state) remains the
+/// source of truth; the recovered value is only ever a projection of it.
+fn recover_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
+}
+use std::sync::{Arc, Mutex};
 
 use faktor_core::model::{
     unix_now_ms, EffectivePriceState, ModelDescriptor, ModelEconomics, ModelPerformance,
@@ -1370,7 +1382,7 @@ impl RouterTelemetry {
         rate_limited: bool,
         latency_ms: u64,
     ) {
-        let mut m = self.inner.lock().unwrap();
+        let mut m = recover_lock(&self.inner);
         let e = m.entry((provider.into(), model.into(), phase)).or_default();
         e.update(success);
         let t = if retried { 1.0 } else { 0.0 };
@@ -1387,16 +1399,14 @@ impl RouterTelemetry {
 
     /// Rate-limit cooldown: providers stay Hard-excluded until `secs` pass.
     pub fn record_rate_limit(&self, provider: &str, secs: u64) {
-        self.cooldown.lock().unwrap().insert(
+        recover_lock(&self.cooldown).insert(
             provider.to_string(),
             std::time::Instant::now() + std::time::Duration::from_secs(secs),
         );
     }
 
     pub fn cooldown_active(&self, provider: &str) -> bool {
-        self.cooldown
-            .lock()
-            .unwrap()
+        recover_lock(&self.cooldown)
             .get(provider)
             .map(|t| *t > std::time::Instant::now())
             .unwrap_or(false)
@@ -1404,7 +1414,7 @@ impl RouterTelemetry {
 
     /// Blended success prior for (provider, model, phase).
     pub fn success_estimate(&self, provider: &str, model: &str, phase: RouterPhase) -> f64 {
-        let m = self.inner.lock().unwrap();
+        let m = recover_lock(&self.inner);
         match m.get(&(provider.into(), model.into(), phase)) {
             Some(e) => {
                 // Prior blend: pull toward PRIOR_SUCCESS as n is small.
@@ -1418,7 +1428,7 @@ impl RouterTelemetry {
     /// EWMA of the recorded settled-call latencies (0.0 when nothing was
     /// recorded through [`RouterTelemetry::record_outcome`] yet).
     pub fn avg_latency_ms(&self, provider: &str, model: &str, phase: RouterPhase) -> f64 {
-        let m = self.inner.lock().unwrap();
+        let m = recover_lock(&self.inner);
         m.get(&(provider.into(), model.into(), phase))
             .map(|e| e.latency_ms)
             .unwrap_or(0.0)
@@ -1430,15 +1440,12 @@ impl RouterTelemetry {
     /// once, here, so a single decision is deterministic.
     pub fn snapshot(&self) -> LiveHealth {
         let now = std::time::Instant::now();
-        let cooldown = self
-            .cooldown
-            .lock()
-            .unwrap()
+        let cooldown = recover_lock(&self.cooldown)
             .iter()
             .filter(|(_, until)| **until > now)
             .map(|(p, _)| p.clone())
             .collect();
-        let inner = self.inner.lock().unwrap();
+        let inner = recover_lock(&self.inner);
         let success_ppm = inner
             .iter()
             .map(|((p, m, phase), e)| {
@@ -2861,6 +2868,28 @@ mod tests {
             legacy_decision,
             "rows without the v19 column route byte-identically"
         );
+    }
+
+    #[test]
+    fn poisoned_telemetry_caches_are_recovered_not_propagated() {
+        let svc = RouterService::new(vec![
+            desc("a", "am", true, 100_000, 4096, econ(5, 15, 95, 95)),
+            desc("b", "bm", true, 100_000, 4096, econ(5, 15, 95, 95)),
+        ]);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = svc.telemetry.inner.lock().unwrap();
+            panic!("holder poisoned the outcome cache");
+        }));
+        assert!(svc.telemetry.inner.is_poisoned());
+        // Cache => recover: advisory EWMA stats keep serving and rate-limit
+        // cooldowns keep recording instead of panicking the routing path.
+        svc.telemetry
+            .record_outcome("a", "am", RouterPhase::Implement, true, false, false, 12);
+        svc.telemetry.record_rate_limit("b", 30);
+        assert!(svc.telemetry.cooldown_active("b"));
+        let health = svc.telemetry.snapshot();
+        assert!(health.success_ppm("a", "am", RouterPhase::Implement) > 0);
+        assert!(!svc.telemetry.inner.is_poisoned());
     }
 
     #[test]

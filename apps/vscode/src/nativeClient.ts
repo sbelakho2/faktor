@@ -786,6 +786,10 @@ export interface NativeCandidateProof {
   readonly candidateSnapshot: string | null;
   readonly sourcesDigest: string | null;
   readonly changedFilesDigest: string | null;
+  /** The published commit OID, served when the candidate was committed. */
+  readonly publishedCommit: string | null;
+  /** The remote PR head, served when a PR was opened for the candidate. */
+  readonly remotePrHead: string | null;
 }
 
 /**
@@ -2155,6 +2159,8 @@ export function parseCandidateProof(object: JsonObject | null): NativeCandidateP
     candidateSnapshot: looseString(object, 'candidateSnapshot'),
     sourcesDigest: looseString(object, 'sourcesDigest'),
     changedFilesDigest: looseString(object, 'changedFilesDigest'),
+    publishedCommit: looseString(object, 'publishedCommit'),
+    remotePrHead: looseString(object, 'remotePrHead'),
   };
 }
 

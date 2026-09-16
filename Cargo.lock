@@ -1326,6 +1326,7 @@ dependencies = [
  "faktor-protocol",
  "faktor-provider",
  "faktor-pty",
+ "faktor-sandbox",
  "faktor-semantic",
  "faktor-session",
  "faktor-snapshot",

@@ -15,6 +15,18 @@ use faktor_core::error::{Error, ErrorKind};
 use faktor_core::id::{SessionId, WorktreeId};
 use faktor_terminal::{ProcessOwner, ProcessSupervisor, SpawnConfig};
 
+/// Classified lock recovery for DERIVED state (caches, registries, rings,
+/// process/ownership projections): a poisoned guard is recovered with the
+/// poison flag cleared, so one panicking caller can never wedge later use.
+/// The durable authority (store/journal/OS process state) remains the
+/// source of truth; the recovered value is only ever a projection of it.
+fn recover_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
 mod guard;
 pub use guard::{
     pid_start_marker, process_alive, DiskLease, LeaseRecord, DEFAULT_LEASE_BUDGET, LEASE_FILE,
@@ -395,7 +407,11 @@ impl WorktreeManager {
     }
 
     fn lock_for(&self, repo: &Path) -> Arc<tokio::sync::RwLock<()>> {
-        let mut locks = self.locks.lock().unwrap();
+        // Classified: the per-repo lock map is a DERIVED ownership cache
+        // (each entry is a live tokio RwLock guard object). A poisoned guard
+        // is recovered with the poison flag cleared (reconciled against the
+        // repository mutation guard, which remains the authority).
+        let mut locks = recover_lock(&self.locks);
         locks
             .entry(repo.to_path_buf())
             .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
@@ -1800,9 +1816,9 @@ mod tests {
                 cmd: "git".into(),
                 args: vec![
                     "-c".into(),
-                    "user.email=test@kilo.local".into(),
+                    "user.email=test@faktor.local".into(),
                     "-c".into(),
-                    "user.name=Kilo Test".into(),
+                    "user.name=Faktor Test".into(),
                     "add".into(),
                     ".".into(),
                 ],
@@ -1820,9 +1836,9 @@ mod tests {
                 cmd: "git".into(),
                 args: vec![
                     "-c".into(),
-                    "user.email=test@kilo.local".into(),
+                    "user.email=test@faktor.local".into(),
                     "-c".into(),
-                    "user.name=Kilo Test".into(),
+                    "user.name=Faktor Test".into(),
                     "commit".into(),
                     "-m".into(),
                     "init".into(),

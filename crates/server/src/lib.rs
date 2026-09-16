@@ -3,9 +3,10 @@
 //! detached from any connection and resume from the journal.
 //!
 //! Auth: the frontend generates `FAKTOR_SERVER_PASSWORD` and passes it via env;
-//! every endpoint requires it, in the `Authorization: Basic
-//! base64("kilo:"+password)` form, with the `Authorization: Bearer` and
-//! `x-faktor-server-password` header forms retained.
+//! every endpoint requires it as `Authorization: Bearer <password>` or
+//! `x-faktor-server-password: <password>`, plus the legacy per-start token as
+//! a Bearer. The pre-cutover Basic compatibility arm is gone — see
+//! [`auth`]'s migration note.
 
 pub mod api;
 pub mod auth;

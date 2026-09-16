@@ -94,7 +94,7 @@ impl AgentState {
             ReadyForNextTurn => &[Preparing, Completed, Cancelled, Suspended, NeedsUserInput],
             Completed => &[],
             // A cancelled TURN does not end the session: the chat stays
-            // usable (Stop in Kilo cancels the turn, not the session).
+            // usable (Stop in the IDE cancels the turn, not the session).
             Cancelled => &[Preparing, ReadyForNextTurn, Suspended],
             FailedPermanent => &[],
             FailedRecoverable => &[Preparing, Idle, Cancelled, Suspended, NeedsUserInput],
@@ -2219,7 +2219,7 @@ mod tests {
 
     #[test]
     fn cancelled_turn_keeps_session_usable() {
-        // Stop in Kilo cancels the turn; the chat must accept the next
+        // Stop in the IDE cancels the turn; the chat must accept the next
         // prompt. Cancelled → Preparing is legal; Cancelled → ReadyForNextTurn
         // is legal (abort lands the session ready).
         let mut m = StateMachine::new(AgentState::Cancelled);

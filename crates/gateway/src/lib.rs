@@ -1,4 +1,4 @@
-//! faktor-gateway — Kilo/OpenRouter-style gateway adapters (spec §12, §36).
+//! faktor-gateway — OpenRouter-style gateway adapters (spec §12, §36).
 //!
 //! A gateway is an OpenAI-compatible endpoint with model routing and extra
 //! headers. BYOK is preserved: the gateway key is configured per provider
@@ -242,7 +242,7 @@ mod tests {
             api_key: Some("sk".into()),
             extra_headers: vec![
                 ("X-Title".into(), "Faktor".into()),
-                ("X-Referer".into(), "https://kilo.ai".into()),
+                ("X-Referer".into(), "https://gateway.example.com".into()),
                 ("authorization".into(), "sk-extra-override".into()),
             ],
             route_prefixes: vec![],
@@ -265,7 +265,10 @@ mod tests {
                 .map(|(_, v)| v.clone())
         };
         assert_eq!(get("x-title").as_deref(), Some("Faktor"));
-        assert_eq!(get("x-referer").as_deref(), Some("https://kilo.ai"));
+        assert_eq!(
+            get("x-referer").as_deref(),
+            Some("https://gateway.example.com")
+        );
         // Forwarded verbatim: an explicit authorization extra replaces the
         // gateway key (reqwest .headers() overwrites per name).
         assert_eq!(get("authorization").as_deref(), Some("sk-extra-override"));
@@ -433,7 +436,7 @@ mod tests {
     // ------------------------------------------------- canonical usage
 
     /// Shared canonical-usage conformance for the gateway wire (audit
-    /// Phase-1 item C). A Kilo/OpenRouter-style gateway is an
+    /// Phase-1 item C). An OpenRouter-style gateway is an
     /// OpenAI-compatible endpoint: its usage envelope is the Chat
     /// Completions shape (`prompt_tokens` total INCLUDING the cached
     /// portion with `prompt_tokens_details.cached_tokens` splitting it,

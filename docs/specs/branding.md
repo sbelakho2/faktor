@@ -4,14 +4,14 @@ Product name: Faktor. The native surface carries zero legacy-brand
 tokens: crates faktor-*, env FAKTOR_*, headers x-faktor-*, data dir
 .faktor, handshake "faktor server listening on http://127.0.0.1:<port>".
 
-Exceptions: upstream historical identifiers inside pinned upstream
-sources and attribution/license notices. The vendored trees that must
-keep old forms are isolated under `compat/`, `vendor/`, `third-party/`
-and the vendored webview bundle under `apps/vscode/media/` (upstream
-mirrors may not exist yet; both the scan and the CI tolerate absence).
-Attribution references to the upstream product in prose (e.g. "the
-upstream shell", gateway profiles) are permitted; wordmark strings are
-not.
+Exceptions: historical identifiers confined to the attribution/license
+notices under `ui/LICENSES/` and to the scan tooling itself. No vendored
+UI bundle, pinned corpus or `compat/`/`vendor/`/`third-party/` tree exists
+in this repository; the static source scan
+(`tests/static-authority`, `faktor-tests-static-authority`) forbids the
+retired product name everywhere else, so a reappearing vendored tree or
+compatibility artifact is a red build. Attribution references to retired
+upstream code in prose are permitted; the product name is not.
 
 CI enforces the wordmark allowlist (token list and path allowlist in
 `scripts/branding-scan.sh`) in two modes:

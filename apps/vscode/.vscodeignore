@@ -8,7 +8,8 @@ tsconfig.json
 **/*.js.map
 node_modules/**
 .vscodeignore
-# The pinned vendored webview closure is staged at media/kilo-v756-webview by
-# `npm run prepackage:vsix`. Everything under media/ ships; this explicit
-# re-include survives any future widening of the ignore list above.
-!media/kilo-v756-webview/**
+# The Faktor-owned chat panel lives under media/ (chat.js, chat.css,
+# composer-state.js, faktor.svg) and ships verbatim; no vendored closure and
+# no staging step exist. This explicit re-include survives any future
+# widening of the ignore list above.
+!media/**

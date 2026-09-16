@@ -819,8 +819,6 @@ emit_manifest() {
         printf '      "overall": "%s",\n' "$(capability_status ui_parity)"
         printf '      "manifest": "capabilities.json"\n'
         printf '    },\n'
-        printf '    "compat_fixtures": {"jetbrains712": %s},\n' \
-            "$(if [ -d compat/jetbrains-712 ]; then printf true; else printf false; fi)"
         printf '    "surfaces": {\n'
         printf '      "workspace_tests": %s,\n' "$(section_passed workspace-tests)"
         printf '      "fault_smoke": %s,\n' "$(section_passed fault-smoke)"

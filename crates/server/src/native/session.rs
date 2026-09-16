@@ -21,8 +21,8 @@ pub(crate) fn lifecycle_tag(l: SessionLifecycle) -> String {
 
 /// One native projection snapshot (docs/native-protocol.md, GET
 /// /session/{id}/projection). Every field maps to what the server can
-/// read durably: state/session come from the session row (same source as
-/// the v7.5.6 state handler); activeModel is the effective provider/model
+/// read durably: state/session come from the session row; activeModel is
+/// the effective provider/model
 /// envelope of the current or most recent logical turn (durable turn
 /// records); activeTool is the newest still-running durable tool-run row;
 /// filesChanged comes from the durable task ledger (`changed_files`);

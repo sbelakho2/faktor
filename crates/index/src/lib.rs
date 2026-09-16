@@ -925,7 +925,7 @@ export function App() {
   );
 }
 
-const Header = () => <header>Kilo</header>;
+const Header = () => <header>Faktor</header>;
 "#;
 
     const JS_SRC: &str = r#"

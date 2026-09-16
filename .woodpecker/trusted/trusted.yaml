@@ -16,8 +16,7 @@
 # Job graph (one workflow per matrix platform; all mandatory linux lanes run
 # as parallel steps of a single workflow so they share one workspace):
 #
-#   stage 1 (parallel): linux · static · docs · vscode · vscode-visual
-#                       · vscode-visual-with-skip · jetbrains-build
+#   stage 1 (parallel): linux · static · docs · vscode · jetbrains-build
 #                       · jetbrains-smoke
 #   stage 2:            perf (after linux, static, docs)
 #   stage 3:            certificate (after every linux lane)
@@ -209,9 +208,8 @@ steps:
       - npm ci
       - npm run build
       - node scripts/selftest.mjs
-      - npm run prepackage:vsix
       - npx --yes @vscode/vsce package --out faktor-ci.vsix
-      - node scripts/verify-vsix.mjs faktor-ci.vsix --min-webview-files 25
+      - node scripts/verify-vsix.mjs faktor-ci.vsix --min-media-files 4
       - rm -rf /tmp/faktor-vsix && mkdir -p /tmp/faktor-vsix && unzip -q faktor-ci.vsix -d /tmp/faktor-vsix
       - node scripts/verify-vsix.mjs faktor-ci.vsix --extract-dir /tmp/faktor-vsix/extension
       - node scripts/selftest.mjs --packaged /tmp/faktor-vsix/extension
@@ -226,9 +224,8 @@ steps:
         npm ci
         npm run build
         node scripts/selftest.mjs
-        npm run prepackage:vsix
         npx --yes @vscode/vsce package --out faktor-ci.vsix
-        node scripts/verify-vsix.mjs faktor-ci.vsix --min-webview-files 25
+        node scripts/verify-vsix.mjs faktor-ci.vsix --min-media-files 4
         rm -rf /tmp/faktor-vsix && mkdir -p /tmp/faktor-vsix && unzip -q faktor-ci.vsix -d /tmp/faktor-vsix
         node scripts/verify-vsix.mjs faktor-ci.vsix --extract-dir /tmp/faktor-vsix/extension
         node scripts/selftest.mjs --packaged /tmp/faktor-vsix/extension
@@ -248,100 +245,6 @@ steps:
         artifact_digest="$(printf 'sha256:%s\t%s\n' "$artifact_sha" "$artifact_path" | sha256sum | cut -d' ' -f1)"
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"vscode","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/vscode.json
-  - name: vscode-visual
-    image: node:24
-    when:
-      matrix:
-        platform: linux/amd64
-    volumes:
-      - faktor-trusted-playwright-browsers:/woodpecker-cache/playwright
-    commands:
-      - export FAKTOR_PLAYWRIGHT="$CI_WORKSPACE/target/visual-playwright/node_modules/playwright"
-      - export PLAYWRIGHT_BROWSERS_PATH=/woodpecker-cache/playwright
-      - node scripts/webview-visual-check.mjs --self-test
-      - npm install --prefix target/visual-playwright --no-save playwright
-      - target/visual-playwright/node_modules/.bin/playwright install --with-deps chromium
-      - node scripts/webview-visual-check.mjs
-      - |
-        node -e '
-          const fs = require("node:fs");
-          const report = JSON.parse(
-            fs.readFileSync("ui/kilo-v756-webview/dist/visual-report.json", "utf8"),
-          );
-          const status = report.render && report.render.status;
-          if (status !== "passed") {
-            console.error("REQUIRED render gate did not pass (render.status=" + status + ")");
-            process.exit(1);
-          }
-          console.log("render gate passed (" + (report.render.states || "?") + " states)");
-        '
-      - |
-        set -eu
-        mkdir -p target/certification/lanes
-        CMDS="$(cat <<'CMDS'
-        export FAKTOR_PLAYWRIGHT="$CI_WORKSPACE/target/visual-playwright/node_modules/playwright"
-        export PLAYWRIGHT_BROWSERS_PATH=/woodpecker-cache/playwright
-        node scripts/webview-visual-check.mjs --self-test
-        npm install --prefix target/visual-playwright --no-save playwright
-        target/visual-playwright/node_modules/.bin/playwright install --with-deps chromium
-        node scripts/webview-visual-check.mjs
-        node -e '
-        const fs = require("node:fs");
-        const report = JSON.parse(
-        fs.readFileSync("ui/kilo-v756-webview/dist/visual-report.json", "utf8"),
-        );
-        const status = report.render && report.render.status;
-        if (status !== "passed") {
-        console.error("REQUIRED render gate did not pass (render.status=" + status + ")");
-        process.exit(1);
-        }
-        console.log("render gate passed (" + (report.render.states || "?") + " states)");
-        '
-        CMDS
-        )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
-        artifacts="[]"
-        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"vscode-visual","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/vscode-visual.json
-  - name: vscode-visual-with-skip
-    image: node:24
-    # Serialized after the required render gate: both lanes write
-    # ui/kilo-v756-webview/dist/visual-report.json in the shared workspace.
-    # Runs on failure too so the diagnostics still land.
-    depends_on: [vscode-visual]
-    when:
-      matrix:
-        platform: linux/amd64
-      status: [success, failure]
-    environment:
-      # Distinct prefix: the required vscode-visual step installs into
-      # target/visual-playwright in the same shared workspace.
-      VISUAL_PLAYWRIGHT_DIR: target/visual-playwright-diagnostics
-    commands:
-      - bash scripts/ci-vscode-visual.sh
-      - |
-        set -eu
-        mkdir -p target/certification/lanes
-        CMDS="$(cat <<'CMDS'
-        bash scripts/ci-vscode-visual.sh
-        CMDS
-        )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
-        artifacts="[]"
-        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"vscode-visual-with-skip","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/vscode-visual-with-skip.json
   - name: jetbrains-build
     image: eclipse-temurin:17-jdk
     when:
@@ -600,8 +503,6 @@ steps:
       - static
       - docs
       - vscode
-      - vscode-visual
-      - vscode-visual-with-skip
       - jetbrains-build
       - jetbrains-smoke
       - perf

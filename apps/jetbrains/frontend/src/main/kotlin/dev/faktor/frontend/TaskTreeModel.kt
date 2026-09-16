@@ -119,6 +119,10 @@ object EvidenceRefs {
     }
 }
 
+/** Bounded digest label so proof facts survive the panel clamp. */
+internal fun shortDigest(digest: String): String =
+    if (digest.length <= 16) digest else digest.substring(0, 12) + "..."
+
 /** One blocked child with the actions that apply to its blocker kind. */
 data class BlockerRow(
     val childId: String,
@@ -180,8 +184,37 @@ data class VerificationSummary(
     val criteriaTotal: Int,
     val failedChecks: Int,
     val owed: Int,
-    val recordStatus: String?
-)
+    val recordStatus: String?,
+    /**
+     * True only when a served record proves the FULL criterion set with no
+     * failed check: the top-level summary may then render VERIFIED. A
+     * missing record is never verified.
+     */
+    val verified: Boolean = false,
+    val reviewer: String? = null,
+    val tree: String? = null,
+    val publishedCommit: String? = null,
+    val remotePrHead: String? = null
+) {
+    /**
+     * The bounded top-level summary line: VERIFIED plus the proof facts the
+     * daemon serves (criteria/checks/review/tree/published commit/remote PR
+     * head); otherwise the plain status. Cost is appended by the panel from
+     * the durable spend block.
+     */
+    fun summaryText(): String {
+        if (!verified) return status
+        val bits = ArrayList<String>()
+        bits.add("VERIFIED")
+        bits.add("criteria " + criteriaPassed + "/" + criteriaTotal)
+        bits.add("checks failed " + failedChecks)
+        reviewer?.takeIf { it.isNotEmpty() }?.let { bits.add("review " + it) }
+        tree?.takeIf { it.isNotEmpty() }?.let { bits.add("tree " + shortDigest(it)) }
+        publishedCommit?.takeIf { it.isNotEmpty() }?.let { bits.add("commit " + shortDigest(it)) }
+        remotePrHead?.takeIf { it.isNotEmpty() }?.let { bits.add("head " + shortDigest(it)) }
+        return bits.joinToString(" · ")
+    }
+}
 
 /** One completion-contract step as the tree renders it. */
 data class CompletionStepView(
@@ -578,13 +611,13 @@ object TaskTree {
     // --------------------------------------------------- criterion proof
 
     private const val REQUIREMENT_UNAVAILABLE =
-        "unavailable (the payload serves no criterion requirement member)"
+        "unavailable (this row carries no criterion requirement member)"
     private const val ORIGIN_UNAVAILABLE =
-        "unavailable (the payload serves no criterion origin member)"
+        "unavailable (this row carries no criterion origin member)"
     private const val SNAPSHOT_UNAVAILABLE =
-        "unavailable (the record serves no candidateProof/verifiedSnapshot/basedOnSnapshot/landedSnapshot/sourceCount)"
+        "unavailable (this record carries no candidate/verified/based-on/landed snapshot or source count)"
     private const val TIMESTAMP_UNAVAILABLE =
-        "unavailable (the record serves no startedMs/completedMs)"
+        "unavailable (this record carries no startedMs/completedMs)"
 
     private val EVIDENCE_ID_PATTERN = Regex("^evidence:[0-9]+$")
 
@@ -682,9 +715,9 @@ object TaskTree {
                 bindingDetail = if (criterion == null) {
                     "no durable verification record covers this criterion"
                 } else if (refs.isEmpty()) {
-                    "the payload serves no criterion binding and no typed evidence ref identifies one"
+                    "this row carries no criterion binding and no typed evidence ref identifies one"
                 } else {
-                    "the payload serves no criterion binding and the evidence refs do not identify one kind"
+                    "this row carries no criterion binding and the evidence refs do not identify one kind"
                 }
                 unavailable.add("binding")
             }
@@ -703,7 +736,7 @@ object TaskTree {
         } else {
             verdict = "fail"
             verdictReason =
-                "recorded as not passed; this payload serves no three-way verdict, so failed and unavailable cannot be distinguished here"
+                "recorded as not passed; this row carries no three-way verdict, so failed and unavailable cannot be distinguished here"
         }
 
         val snapshot = snapshotText(record)
@@ -788,6 +821,9 @@ object TaskTree {
         record.basedOnSnapshot?.let { bits.add("base " + digestLabel(it)) }
         record.landedSnapshot?.let { bits.add("land " + digestLabel(it)) }
         record.sourceCount?.let { bits.add("src " + it) }
+        proof?.publishedCommit?.let { bits.add("commit " + digestLabel(it)) }
+        proof?.remotePrHead?.let { bits.add("head " + digestLabel(it)) }
+        record.reviewer?.takeIf { it.isNotEmpty() }?.let { bits.add("review " + it) }
         return if (bits.isEmpty()) null else bits.joinToString(" · ")
     }
 
@@ -801,8 +837,7 @@ object TaskTree {
     }
 
     /** Bounded digest label so the proof facts survive the panel clamp. */
-    private fun digestLabel(digest: String): String =
-        if (digest.length <= 16) digest else digest.substring(0, 12) + "..."
+    private fun digestLabel(digest: String): String = shortDigest(digest)
 
     /** Split the record's evidence string into its typed refs (bounded). */
     private fun evidenceRefs(raw: String?): List<EvidenceRef> {
@@ -891,8 +926,10 @@ object TaskTree {
         var passed = 0
         var total = 0
         var recordStatus: String? = null
+        var topRecord: NativeVerificationRecord? = null
         for (record in taskVerification?.records ?: emptyList()) {
             recordStatus = record.status
+            topRecord = record
             passed += record.criteriaPassed
             total += record.criteriaTotal
         }
@@ -904,7 +941,24 @@ object TaskTree {
             owed > 0 -> "pending"
             else -> task?.state ?: "unknown"
         }
-        return VerificationSummary(status, passed, total, failed, owed, recordStatus)
+        val verified = topRecord != null &&
+            topRecord.status.equals("passed", ignoreCase = true) &&
+            total > 0 &&
+            passed == total &&
+            failed == 0
+        return VerificationSummary(
+            status = status,
+            criteriaPassed = passed,
+            criteriaTotal = total,
+            failedChecks = failed,
+            owed = owed,
+            recordStatus = recordStatus,
+            verified = verified,
+            reviewer = topRecord?.reviewer?.takeIf { it.isNotEmpty() },
+            tree = topRecord?.verifiedSnapshot?.takeIf { it.isNotEmpty() },
+            publishedCommit = topRecord?.candidateProof?.publishedCommit?.takeIf { it.isNotEmpty() },
+            remotePrHead = topRecord?.candidateProof?.remotePrHead?.takeIf { it.isNotEmpty() }
+        )
     }
 
     // ---------------------------------------------------------------- spend

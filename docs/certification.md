@@ -109,9 +109,7 @@ when CI migrated (historical note only, no workflow files remain under
 | `linux` | linux/amd64 | fmt; clippy `--workspace --all-targets --all-features -D warnings`; `check` + tests `--workspace --all-features` (protocol/stream codecs ride this run); `doctor` smoke |
 | `static` | linux/amd64 | static-authority scans; security suite; seeded fuzz; supply-chain SBOM/checksums/advisories with recorded skips |
 | `docs` | linux/amd64 | `cargo doc --workspace --all-features --no-deps`; branding scan; docs-sync guard |
-| `vscode` | linux/amd64 | `npm ci` + build; offline extension/bridge selftest; vendored webview staging; `vsce` VSIX; unzip + pinned-hash verify + packaged selftest; IDE-load record (recorded skip when no `code` CLI exists) |
-| `vscode-visual` | linux/amd64 | REQUIRED render gate: playwright + chromium installed explicitly, then fails unless `dist/visual-report.json` records `render.status == "passed"` (a skip is not a pass) |
-| `vscode-visual-with-skip` | linux/amd64 | diagnostics twin: offline structural/manifest gate + render attempt; records an explicit skip when chromium cannot be installed (never required) |
+| `vscode` | linux/amd64 | `npm ci` + build; offline Faktor panel selftest; `vsce` VSIX; unzip + panel-surface verify + packaged selftest; IDE-load record (recorded skip when no `code` CLI exists) |
 | `jetbrains-build` | linux/amd64 | `./gradlew :frontend:buildPlugin --no-daemon --stacktrace` |
 | `jetbrains-smoke` | linux/amd64 | kotlinc split-mode compile + wire/native smokes against a real daemon |
 | `perf` | linux/amd64 | release `[perf]` gates; serialized after the other Rust lanes so budgets do not race a loaded agent |
@@ -146,8 +144,8 @@ and the free cloud tier (linux runners only).
 The table above is the **trusted** lane set (`.woodpecker/trusted/trusted.yaml`:
 `push`/`tag`, with the named-volume caches and the release `[perf]` budgets).
 PRs run the reduced, **volume-free** `.woodpecker/untrusted/pr.yaml` copy of
-the correctness lanes (`linux`, `static`, `docs`, `vscode`, `vscode-visual`,
-`vscode-visual-with-skip`, `jetbrains-build`, `jetbrains-smoke`) plus its own
+the correctness lanes (`linux`, `static`, `docs`, `vscode`,
+`jetbrains-build`, `jetbrains-smoke`) plus its own
 certificate; branch protection requires the resulting
 `ci/woodpecker/pr/pr` workflow status. The
 `.woodpecker/trusted/nightly.yaml` cron workflow owns the campaigns that are
@@ -169,21 +167,20 @@ matrix) runnable offline.
 
 ### 2.2 UI builds and parity
 
-- **VS Code** (`apps/vscode`): `npm ci && npm run build` green in CI,
-  with the extension selftests green. The derived client shell is
-  **IMPLEMENTED**; the pinned v7.5.6
-  webview bundle is **vendored** (`ui/kilo-v756-webview`, hashed by
-  `ui/upstream.json`) and built (`dist/webview.js` + `dist/webview.css`),
-  with the visual gate baseline recorded
-  (`dist/visual-baseline.json`). The `vscode-visual` job installs
-  playwright + chromium explicitly and is required to record
-  `render.status == "passed"` for the built bundle; the
-  `vscode-visual-with-skip` twin is diagnostics only. A real-IDE screenshot
-  comparison against a launched VS Code remains a host/CI capability not
-  claimed by the offline certificate.
+- **VS Code** (`apps/vscode`): `npm ci && npm run build` green in CI, with
+  the extension selftests green. The client is the **Faktor-owned panel**:
+  `apps/vscode/src/webview.ts` (provider, strict CSP, nonce, text-only
+  rendering) + the hand-written `media/chat.js`, `media/chat.css`,
+  `media/composer-state.js` and `media/faktor.svg`. No vendored webview
+  bundle, no message-ABI bridge and no staging step exist; the VSIX
+  verification (`apps/vscode/scripts/verify-vsix.mjs`) asserts the panel
+  surface exactly (an extra `media/`/`out/` artifact is a failure), and
+  `node scripts/selftest.mjs --packaged` asserts the extracted layout.
+  A real-IDE screenshot comparison against a launched VS Code remains a
+  host/CI capability not claimed by the offline certificate.
 - **JetBrains** (`apps/jetbrains`): `bash apps/jetbrains/compile-and-smoke.sh`
   green (`:shared` + `:backend` + `:frontend` Swing panel, real kotlinc,
-  real daemon: v7.5.6 wire smoke plus native-protocol fake-server unit
+  real daemon: daemon-lifecycle smoke plus native-protocol fake-server unit
   suite, end-to-end native smoke, and the `JetBrainsParitySmoke` fixture/
   interaction suite), and the real Gradle lane green:
   `./gradlew buildPlugin`, `./gradlew build`,
@@ -192,48 +189,43 @@ matrix) runnable offline.
   pinned IntelliJ IDEA Community 2024.1.7 distribution
   (`IC-241.19416.15`) with verdict `Compatible` and zero reported API
   problems (report under `frontend/build/reports/pluginVerifier/`).
-  The upstream **JetBrains 7.1.2** source is vendored at
-  `compat/jetbrains-712/kilo-jetbrains` (1043 files, tag `jetbrains/v7.1.2`,
-  commit `436ff09e649bd0866c84bd9f98933a74cad2d25c`, MIT, per-file SHA-256 in
-  `ui/upstream.json` → `jetbrains_712`, offline-verified by
-  `JetBrainsParitySmoke` `UPSTREAM PIN PASS`). Upstream 7.1.2 is Kotlin/Swing,
-  not a web UI, so the Faktor-owned Swing panels are the **one** rendering
-  implementation (`native-swing-single-implementation`), and the parity
-  surfaces (task mode, agent tree with blockers/presentation/pixel identity,
-  permissions, terminal over the native PTY routes, review/tournament,
-  evidence navigation, settings, provider selection, history,
-  restart/reconnect) are covered by `JetBrainsParitySmoke` against canned
-  frames, a fake daemon and the real daemon, and driven as an executable
-  parity matrix (`apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt`)
+  The tree is Faktor-owned end to end: the Swing panels are the **one**
+  rendering implementation, with no vendored upstream IDE source, corpus
+  or lockstep pin in the repository. The `JetBrainsParitySmoke` step
+  `FAKTOR-OWNED TREE PASS` asserts offline that no vendored corpus
+  reappears, and the parity surfaces (task mode, agent tree with
+  blockers/presentation/pixel identity, permissions, terminal over the
+  native PTY routes, review/tournament, evidence navigation, settings,
+  provider selection, history, restart/reconnect) are covered by
+  `JetBrainsParitySmoke` against canned frames, a fake daemon and the real
+  daemon, and driven as an executable matrix
+  (`apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt`)
   that writes `target/certification/jetbrains-parity.json`: 11 behavioral
   rows (each run against canned frames AND the fake daemon) and 8 rendered
   Swing panels compared against pinned baselines. The derived capability
   labels carry `jetbrains_frontend` **IMPLEMENTED** (the Faktor-owned
-  frontend operates), `jetbrains_upstream_assets` **VENDORED** (the pin is
-  present) and `jetbrains_behavioral_parity`/`jetbrains_visual_parity`
+  frontend operates) and `jetbrains_behavioral_parity`/`jetbrains_visual_parity`
   derived from that HEAD-bound artifact only (§2.10, §3). Only the 2024.1.7
   distribution was verified; `until-build` stays unbounded, so
   newer-platform compatibility is not claimed.
 
 100% requires the builds and smokes green **and the derived capability
 manifest labels honest**. It does not require byte-for-byte parity where
-no executable parity matrix exists, but no certificate may claim parity
-that the tree cannot substantiate: `target/certification/capabilities.json`
+no executable matrix exists, but no certificate may claim parity that the
+tree cannot substantiate: `target/certification/capabilities.json`
 (§2.10) carries the derived labels, and `ui_parity` is IMPLEMENTED only
-when every executable parity axis (VS Code visual render, JetBrains
-behavioral/visual matrices) passes.
+when every executable axis (the Faktor-owned VS Code panel
+selftest/VSIX gates, JetBrains behavioral/visual matrices) passes.
 
 ### 2.3 Vendored reference corpora
 
-- `compat/jetbrains-712/` is the **pinned** upstream JetBrains 7.1.2 corpus
-  (MIT; 1043 files; per-file SHA-256 in `ui/upstream.json` →
-  `jetbrains_712`; `NOTICE.md` records the pin, fetch protocol and the
-  single-renderer decision). Existence is recorded per-run in the manifest
-  (`compat_fixtures.jetbrains712: true`); the pin's hashes are re-verified
-  offline by `JetBrainsParitySmoke` and by
-  `scripts/vendor-upstream.sh --check`.
+None. The Faktor-owned-UI migration removed every vendored upstream UI
+source tree and its pin manifest; `ui/` carries only `ui/LICENSES/`
+(the retained historical attribution for the removed code), and the
+source scan (`tests/static-authority` + `scripts/branding-scan.sh`) fails
+if a vendored corpus, bridge or bundle reappears.
 
-100% requires the pinned corpus hashes stable (re-verified offline).
+100% requires the tree to contain no vendored corpus (checked every run).
 
 ### 2.4 ACP interop
 
@@ -389,9 +381,8 @@ succeeding — a failure is recorded as a skip with the exact error.
 
 `node scripts/capabilities-manifest.mjs` derives every surface status from
 **hard markers** in the tree — code symbols, test names, files, and
-**HEAD-bound executable reports** (the
-`ui/kilo-v756-webview/dist/visual-report.json` render report and the
-`jetbrains-*-parity.json` matrices for `ui_parity`) — never
+**HEAD-bound executable reports** (the `jetbrains-parity.json` matrices for
+`ui_parity`) — never
 from prose or a bare file name — and writes
 `target/certification/capabilities.json`. Its default mode (also invoked by
 `bash scripts/certify-local.sh fast`) is the drift test: it exits non-zero
@@ -407,13 +398,12 @@ commit.
 | Capability | Status | Derived from |
 | --- | --- | --- |
 | `vscode_native_client` | IMPLEMENTED | `apps/vscode/src/nativeClient.ts` (`export class`, typed validators) + adversarial `apps/vscode/scripts/selftest.mjs` assertions |
-| `vscode_webview` | IMPLEMENTED | `apps/vscode/src/webview.ts` + `kilo-bridge.ts` (`mapKiloFiles`) + pinned `ui/kilo-v756-webview/dist` bundle (`webview.js`, `webview.css`) + `dist/visual-baseline.json` |
+| `vscode_webview` | IMPLEMENTED | Faktor-owned panel: `apps/vscode/src/webview.ts` (`class ChatViewProvider`) + hand-written `apps/vscode/media/chat.js` (local-resource-only CSP, nonce, text-only rendering) + adversarial `apps/vscode/scripts/selftest.mjs` / `apps/vscode/scripts/verify-vsix.mjs` gates |
 | `jetbrains_native_bridge` | IMPLEMENTED | `apps/jetbrains/backend/src/main/kotlin/dev/faktor/backend/NativeClient.kt` (`class NativeClient`), `apps/jetbrains/backend/src/main/kotlin/dev/faktor/backend/NativeEventStream.kt` (`class NativeEventStream`), `apps/jetbrains/backend/src/test/kotlin/dev/faktor/backend/NativeClientTest.kt` (`NATIVE SMOKE PASS`) |
-| `jetbrains_frontend` | IMPLEMENTED | Faktor-owned Swing frontend operates: `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt`, `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/FrontendSmoke.kt` (`FRONTEND SMOKE PASS`), `plugin.xml`, `build.gradle.kts`. Upstream provenance is the separate `jetbrains_upstream_assets` row |
-| `jetbrains_upstream_assets` | VENDORED | pinned upstream 7.1.2 source in `compat/jetbrains-712` with per-file SHA-256 manifest in `ui/upstream.json` (`jetbrains_712`) + `compat/jetbrains-712/NOTICE.md`; VENDORED is a provenance claim, never a parity claim |
+| `jetbrains_frontend` | IMPLEMENTED | Faktor-owned Swing frontend operates: `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt`, `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/FrontendSmoke.kt` (`FRONTEND SMOKE PASS`), `plugin.xml`, `build.gradle.kts`. No vendored upstream IDE source exists |
 | `jetbrains_behavioral_parity` | IMPLEMENTED | executable parity matrix `target/certification/jetbrains-parity.json` (`faktor-jetbrains-parity/v1`, written by `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt`): 11 behavioral rows (task mode, agent tree, criterion proofs incl. all 7 binding kinds, permissions, terminal, review/tournament, evidence, settings, provider selection, history, restart/reconnect), each run against canned native frames AND the fake daemon, HEAD-bound |
 | `jetbrains_visual_parity` | IMPLEMENTED | the same artifact's visual axis: 8 panels rendered offscreen (`offscreen-swing-render+component-tree-state-digest-vs-pinned-baseline`), component-tree/state digest compared against pinned baselines in `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json`; a missing/mismatching baseline fails the run |
-| `ui_parity` | PARTIAL | executable parity axes only: `ui/kilo-v756-webview/dist/visual-report.json` (VS Code visual), `target/certification/jetbrains-parity.json` (JetBrains behavioral + visual); vendored files or pinned corpora alone never flip it |
+| `ui_parity` | IMPLEMENTED | executable axes only: the Faktor-owned VS Code panel (`apps/vscode/src/webview.ts` + `apps/vscode/media/chat.js`, selftest/VSIX gates), `target/certification/jetbrains-parity.json` (JetBrains behavioral + visual); vendored files never participate |
 | `acp_subset` | IMPLEMENTED | `crates/acp` (`AcpMethod::Initialize`) + `crates/acp/tests/interop.rs` + official `agent-client-protocol` client crate in `tests/acp-official` |
 | `openai_responses` | IMPLEMENTED | `crates/openai/src/lib.rs`: `OpenAiFamily::Responses` dispatch + `responses_body`/`responses_stream` codecs + the adversarial `responses_*` stream tests |
 | `windows_job_containment` | IMPLEMENTED | `crates/winjob/src/lib.rs` (`CreateJobObjectW`, `SetInformationJobObject`, `AssignProcessToJobObject`, `KILL_ON_JOB_CLOSE`) + `crates/pty/src/windows.rs` (`CREATE_SUSPENDED`, `assign_strict`, kill-on-close spawn test) |
@@ -450,9 +440,9 @@ shell: the JetBrains smoke installs the pinned rustup-init binary after
 verifying its published SHA-256
 (`20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c`,
 rustup 1.28.2, `x86_64-unknown-linux-gnu`) and pins the `1.98.0` toolchain;
-the remaining PR fetches are package-manager downloads (`npx @vscode/vsce`,
-`npm install playwright`) whose output is gated by the VSIX verifier and the
-pinned visual baselines.
+the remaining PR fetches are package-manager downloads (`npx @vscode/vsce`)
+whose output is gated by the VSIX panel-surface verifier and the packaged
+selftest.
 
 `scripts/woodpecker/setup.md` documents the two-project layout, the exact
 server-side settings and UI steps, and what a PR diff cannot change.
@@ -463,10 +453,9 @@ server-side settings and UI steps, and what a PR diff cannot change.
 
 Status labels used: **CERTIFIED** (evidence exists at the referenced
 commit), **CI-LANE** (owned and run by CI, not by the local harness),
-**PARTIAL** (implemented subset), **VENDORED** (pinned/attributed source is
-in-tree; a provenance claim, not a parity claim), **BLOCKED_EXTERNAL** (needs
-assets not in this repository), **NOT RUN HERE** (deliberately out of the
-offline local profile).
+**PARTIAL** (implemented subset), **BLOCKED_EXTERNAL** (needs assets not in
+this repository), **NOT RUN HERE** (deliberately out of the offline local
+profile).
 
 | Surface | Gate | Evidence | Status |
 | --- | --- | --- | --- |
@@ -483,12 +472,10 @@ offline local profile).
 | Windows lane | check + workspace tests incl. agent/verify/sandbox/index/cas/snapshot | Woodpecker `windows-*` jobs | CI-LANE |
 | Linux lane | fmt/check/test/clippy/doctor | Woodpecker `linux` job | CI-LANE |
 | VS Code shell build | `npm ci && npm run build` + wire harness | Woodpecker `vscode` job | CI-LANE (shell IMPLEMENTED; `apps/vscode/src/extension.ts`) |
-| VS Code vendored webview | pinned v7.5.6 tree `ui/kilo-v756-webview` + `ui/upstream.json` hashes + built dist + visual baseline | `node scripts/webview-visual-check.mjs` + required Woodpecker `vscode-visual` job (chromium render must pass); §2.10 | PARTIAL (vendored, hashed and render-gated; real-IDE screenshot parity stays a host/CI capability not claimed offline) |
-| JetBrains bridge | kotlinc `apps/jetbrains/compile-and-smoke.sh` (wire + native + parity smokes); Gradle plugin build + verifier vs IC-2024.1.7 | Woodpecker `jetbrains-*` jobs / local script; §3.2 | CI-LANE (native bridge IMPLEMENTED; plugin verifier + parity smokes PASS locally 2026-09-13) |
-| JetBrains 7.1.2 upstream assets | pinned 7.1.2 source (`compat/jetbrains-712/`, per-file SHA-256 manifest) | `compat/jetbrains-712/NOTICE.md`, `ui/upstream.json` (`jetbrains_712`) | VENDORED |
+| VS Code Faktor panel | hand-written panel (`apps/vscode/media/chat.js`, `chat.css`, `composer-state.js`) + provider (`apps/vscode/src/webview.ts`) | `node scripts/selftest.mjs` + `node scripts/verify-vsix.mjs` + Woodpecker `vscode` job; §2.10 | CI-LANE (Faktor-owned, no vendored closure; a real-IDE screenshot comparison stays a host capability not claimed offline) |
+| JetBrains bridge | kotlinc `apps/jetbrains/compile-and-smoke.sh` (lifecycle + native + parity smokes); Gradle plugin build + verifier vs IC-2024.1.7 | Woodpecker `jetbrains-*` jobs / local script; §3.2 | CI-LANE (native bridge IMPLEMENTED; plugin verifier + parity smokes PASS locally 2026-09-13) |
 | JetBrains behavioral parity | executable parity matrix (`target/certification/jetbrains-parity.json`, behavioral axis) | `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt` + `JetBrainsParitySmoke.kt`; 11/11 rows against canned frames AND the fake daemon; emitted by `bash apps/jetbrains/compile-and-smoke.sh` | IMPLEMENTED (HEAD-bound artifact; the smoke alone is not the claim) |
 | JetBrains visual parity | executable parity matrix (`target/certification/jetbrains-parity.json`, visual axis) | offscreen Swing render + component-tree/state digest vs pinned `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json`; 8 panels; regenerated only with `bash apps/jetbrains/compile-and-smoke.sh --write-baselines` | IMPLEMENTED (offline component-tree/state comparison; a real-IDE screenshot comparison stays a host capability not claimed here) |
-| Compat fixtures jetbrains-712 | pinned corpus (1043 files, MIT, sha256) | `compat/jetbrains-712/NOTICE.md`, `ui/upstream.json` (`jetbrains_712`), `JetBrainsParitySmoke` pin step | VENDORED |
 | Fuzz harnesses | seeded pseudo-fuzz | Woodpecker `static` job / manual | CI-LANE |
 | Real-time soak (12–24h) | excluded by owner decision | no release gate and no CI workflow consumes a wall-clock soak; the `[soak]`-ignored longrun suites remain runnable manually | OUT OF SCOPE (by decision) |
 | PR/CI-fix completion contract | native DTO `completion_contract` + `CompletionContractSet`/`CompletionStepStatus` ledger rows + `VerifiedComplete` gate + ordered step executor | gate + durable rows + `crates/orchestrator/src/completion_steps.rs` runner (`crates/session/src/task.rs`, `crates/session/src/ledger.rs`, `crates/orchestrator/src/task_executor.rs`, `crates/agent/src/runtime.rs`); adversarial gate/step tests in-tree; Task-mode controls in both IDEs (§3.3) | IMPLEMENTED (gate + ordered/idempotent commit/push/PR execution) |
@@ -502,15 +489,15 @@ offline local profile).
 | Provider identity on children | the child session's durable `provider` rides the native entry; `(provider, model)` is the only catalog join key in both IDEs (a provider-less entry never guesses by model) | `crates/server/src/native/agents.rs`, `apps/vscode/src/state.ts` (`summarizeAgents`), JetBrains `TaskTreeModel.kt` | IMPLEMENTED (dual-provider smoke pins the join) |
 | Accessibility parity | reduced-motion handling for every pixel/state animation (VS Code CSS + JetBrains `PixelMotion`), static terminal cues, identical deterministic identities | `apps/vscode/media/chat.css`, `apps/vscode/media/chat.js`, JetBrains `PixelAgents.kt` + `FrontendSmoke.kt` reduced-motion matrix | IMPLEMENTED (both IDE smokes adversarial) |
 | Board provenance + delivery view | durable `BoardDeliveryView` folded from posts/reads/receipts/lifecycle; board tools emit `AgentCoordination` provenance so a sibling post never gains instruction authority | `crates/session/src/board.rs`, `crates/evidence/src/provenance.rs`, `crates/agent/src/tool.rs` (`BOARD_TOOL_PROVENANCE`) | IMPLEMENTED (malicious-post E2E green) |
-| Vendored bridge completeness | every frozen inbound message bounded/validated with typed drops; additive `faktor*` frames + companion overlay; durable pages and SSE frames both mapped | `apps/vscode/src/kilo-bridge.ts` + `apps/vscode/scripts/bridge-selftest.mjs`, `apps/vscode/scripts/selftest.mjs` | IMPLEMENTED (adversarial bridge selftests green) |
-| Attachment durability | workspace-relative file paths + content-addressed binary refs; per-message durable `data.files` rows and the run's immutable `files` set persisted before the drive (byte-identical after reopen); malformed entries refused individually (never a whole-message drop) | `crates/session/src/handle.rs` (`submit_prompt` `data.files`), `crates/session/src/task.rs` + `crates/orchestrator/src/task_executor.rs` (run `files`), `apps/vscode/src/kilo-bridge.ts` (`mapKiloFiles`), JetBrains `AttachmentsPanel.kt` | IMPLEMENTED (both IDEs; bridge + native smokes green) |
+| Panel message discipline | every inbound composer/webview message is typed and bounded at the host boundary; malformed values are refused loudly and never coerce a start | `apps/vscode/src/webview.ts`, `apps/vscode/src/taskStart.ts`, `apps/vscode/scripts/selftest.mjs` | IMPLEMENTED (adversarial panel selftests green) |
+| Attachment durability | workspace-relative file paths + content-addressed binary refs; per-message durable `data.files` rows and the run's immutable `files` set persisted before the drive (byte-identical after reopen); malformed entries refused individually (never a whole-message drop) | `crates/session/src/handle.rs` (`submit_prompt` `data.files`), `crates/session/src/task.rs` + `crates/orchestrator/src/task_executor.rs` (run `files`), `apps/vscode/src/taskStart.ts` (`boundedWebviewFiles`), JetBrains `AttachmentsPanel.kt` | IMPLEMENTED (both IDEs; panel + native smokes green) |
 | Unified run settlement | one `settle_run` for both execution shapes (`InSession`/`Orchestrated`), idempotent replay after every step-status write seam | `crates/orchestrator/src/task_executor.rs` (`settle_run`), `crates/orchestrator/src/task_executor_tests.rs` | IMPLEMENTED (fast tests green) |
 | Materialize → verify → land | isolated child candidates materialize through a durable `IntegrationRecord` (`IntegrationRecorded`), land with real final-root verification, snapshot-pinned record/step statuses; owner edits invalidate the record and a wrong synthetic PASS is rejected | `crates/session/src/ledger.rs` (`IntegrationRecordRow`, `final_root`), `crates/orchestrator/src/task_executor.rs` | IMPLEMENTED (fast tests green; the previous synthetic-PASS test was rewritten) |
 | Typed criterion proofs | a mutating no-op disposition default (`NoOpDisposition::RequiresCriterionProof`) completes only through an independent reviewer port's validated criterion proof or an explicit disposition; completion steps refuse execution without a validated proof | `crates/core/src/state.rs` (`NoOpDisposition::RequiresCriterionProof`), `crates/orchestrator/src/task_executor.rs` (`run_completion_steps_against_proof`), `crates/orchestrator/src/task_executor_tests.rs` | IMPLEMENTED (fast tests green) |
 | OpenAI Responses family | first-class Responses dispatch (`OpenAiFamily::Responses`), native item serializer + SSE stream parser, CLI `api=chat\|responses` with the modern endpoint default; strict parsing and adversarial streaming/deadline/retry/terminal tests | `crates/openai/src/lib.rs` (`responses_body`, `responses_stream`, `responses_*` tests), `crates/cli/src/config.rs` (`OpenAiApi`) | IMPLEMENTED (fast tests green) |
 | Windows containment (Job Objects + ConPTY) | `faktor-winjob` creates `KILL_ON_JOB_CLOSE` jobs; the terminal supervisor assigns every child (`JobGuard`) and `faktor-pty` creates ConPTY children `CREATE_SUSPENDED`, assigns them to the job, then resumes before exposure; `taskkill /T` remains the escalation path | `crates/winjob/src/lib.rs`, `crates/terminal/src/lib.rs`, `crates/pty/src/windows.rs` (`spawn_assigns_the_child_to_the_kill_on_close_job_before_returning`) | IMPLEMENTED (Windows-targeted code + spawn-order test; CI `windows-*` lane owns the real host run) |
 | Certification evidence chain | `faktor-cert-evidence/v1` objects + `faktor-woodpecker-lane/v2` markers, verifier rejection matrix, signed release gates; capability labels derive from hard code/test markers | `scripts/certification/evidence.mjs`, `scripts/certification/evidence.schema.json`, `scripts/certify-local.sh` (`evidence_gate`), `.woodpecker/*.yaml` | IMPLEMENTED (verifier selftest proves every rejection; see §6) |
-| VSIX packaging (P0) | pinned vendored closure + companion overlay staged under `media/kilo-v756-webview`; extensionUri-only resolution; package → unzip → hash verify → IDE-load record | `apps/vscode/scripts/prepare-vendored-webview.mjs`, `apps/vscode/scripts/verify-vsix.mjs`, Woodpecker `vscode` job | CLOSED (self-contained VSIX; the IDE-load step records its exact skip when no `code` CLI exists) |
+| VSIX packaging (P0) | Faktor-owned panel surface only (allowlisted `media/` + `out/`); extensionUri-only resolution; package → unzip → surface verify → packaged selftest → IDE-load record | `apps/vscode/scripts/verify-vsix.mjs`, `apps/vscode/scripts/selftest.mjs`, Woodpecker `vscode` job | CLOSED (self-contained VSIX; the IDE-load step records its exact skip when no `code` CLI exists) |
 | Repo rename (faktor) | external GitHub repository name/description | `gh repo rename` performed; in-tree metadata was already Faktor-branded and is unchanged | DONE (external; no in-tree evidence beyond branding scan) |
 
 ### 3.1 Last recorded local fast run
@@ -552,24 +539,21 @@ release certificate):
 - `bash apps/jetbrains/compile-and-smoke.sh` → exit 0, `BackendSmoke` +
   `NativeBridgeSmoke` + `FrontendSmoke` all green (`NATIVE SMOKE PASS` /
   `FRONTEND SMOKE PASS` are printed by the Kotlin smokes).
-- **JetBrains 7.1.2 pin + parity suite (2026-09-13, same host):**
-  `scripts/vendor-upstream.sh --check` verifies the vendored 7.1.2 tree
-  (1043 files, 7,707,650 bytes, per-file sha256); `bash
-  apps/jetbrains/compile-and-smoke.sh` → exit 0 with
-  `JetBrainsParitySmoke` green (`UPSTREAM PIN PASS`, `JETBRAINS PARITY
-  SMOKE PASS`) covering task mode, agent tree, permissions, terminal,
+- **JetBrains Faktor-owned-tree + parity suite (2026-09-13, same host):**
+  `bash apps/jetbrains/compile-and-smoke.sh` → exit 0 with
+  `JetBrainsParitySmoke` green (`FAKTOR-OWNED TREE PASS`, `JETBRAINS
+  PARITY SMOKE PASS`) covering task mode, agent tree, permissions, terminal,
   review/tournament, evidence, settings, provider selection, history and
-  restart/reconnect over canned frames, a fake daemon and the real daemon
-  (a fixture/interaction regression suite — NOT an executable parity
-  matrix; the derived `jetbrains_*_parity` labels therefore stay PARTIAL,
-  §2.10);
+  restart/reconnect over canned frames, a fake daemon and the real daemon,
+  and emitting the executable matrix
+  (`target/certification/jetbrains-parity.json`, 11 behavioral rows + 8
+  rendered panels vs pinned baselines; the derived `jetbrains_*_parity`
+  labels come from that HEAD-bound artifact only, §2.10);
   `./gradlew --offline :frontend:buildPlugin` and `./gradlew build` →
   BUILD SUCCESSFUL (the frontend test sources were made module-self-
   contained so `:frontend:compileTestKotlin` no longer depends on backend
-  test classes). Residual: the vendored upstream tree is not built in this
-  repository (its Gradle build resolves the IntelliJ Platform SDK and a
-  pinned CLI release from the network); the Faktor plugin builds the
-  Faktor-owned Swing frontend instead.
+  test classes). Residual: no vendored upstream IDE source exists to
+  build; the Faktor plugin builds the Faktor-owned Swing frontend.
 
 ### 3.3 PR/CI-fix completion contract (gate + ordered step execution IMPLEMENTED)
 
@@ -637,10 +621,11 @@ Task-mode IDE controls (both IDEs):
   checkboxes and posts a strict `completionContract`; the host builds the
   explicit `main` Implementation work item plus `completion_contract` in
   `apps/vscode/src/taskStart.ts` and forwards composer `files`; the
-  `faktor.newTask` command offers the same multi-select for the vendored UI
-  path; the bridge accepts the contract only as three exact booleans (a
-  malformed contract is a loud drop, never a silently contract-free start)
-  and the cockpit/task card renders the step rows with their provenance.
+  `faktor.newTask` command offers the same multi-select for the command
+  path; the host accepts the contract only as three exact booleans (a
+  malformed contract is a loud refusal, never a silently contract-free
+  start) and the cockpit/task card renders the step rows with their
+  provenance.
 - JetBrains: the Task tab owns the same three checkboxes; the request
   builder emits the explicit work item plus contract; the task tree renders
   the contract and its step statuses.
@@ -706,8 +691,7 @@ surfaces are adversarially tested in `apps/vscode/scripts/selftest.mjs` +
     "schema": "faktor-capability-manifest/v1",
     "platform": {"os": "darwin", "arch": "aarch64"},
     "platform_lanes": {"...": "..."},
-    "ui_parity": {"vscode": "IMPLEMENTED", "jetbrains": "IMPLEMENTED", "overall": "PARTIAL", "manifest": "capabilities.json"},
-    "compat_fixtures": {"jetbrains712": true},
+    "ui_parity": {"vscode": "IMPLEMENTED", "jetbrains": "IMPLEMENTED", "overall": "IMPLEMENTED", "manifest": "capabilities.json"},
     "surfaces": {"workspace_tests": true, "...": false},
     "offline": {"network_required": false, "provider_keys_required": false},
     "release_rule": "a release is certified only for its exact commit with dirty=false AND local_offline_certified AND cross-platform lanes + real-provider evidence"
@@ -730,7 +714,7 @@ Field semantics:
 | `sections[].status` | `pass` or `fail`; failed sections carry the first error line in `detail` |
 | `sections[].duration_ms` | wall time of that section |
 | `skipped[]` | sections not attempted, each with the exact reason (profile, fail-fast, offline contract, platform) |
-| `capabilities` | capability manifest for this host/profile: platform lanes, derived UI parity labels (from `capabilities.json`, §2.10; `unknown` when absent/stale), compat fixture presence, surface pass flags, offline contract, release rule |
+| `capabilities` | capability manifest for this host/profile: platform lanes, derived Faktor-owned UI labels (from `capabilities.json`, §2.10; `unknown` when absent/stale), surface pass flags, offline contract, release rule |
 
 Per-section logs live in `target/certification/logs/<name>.log`; each gate's
 verification transcript is `target/certification/logs/evidence-<kind>.log`.
@@ -783,10 +767,10 @@ Concretely, to ship:
    `"release_certified": true`; any missing/invalid gate keeps both
    `release_certified=false` and the level at `local_offline` (or `none`).
 7. The manifest's `capabilities` labels are honest and derived from
-   artifacts: the JetBrains labels split provenance (`VENDORED`) from
-   executable parity matrices, and `ui_parity` requires every executable
-   parity axis. `BLOCKED_EXTERNAL`/`PARTIAL` surfaces are carried into the
-   release notes; no parity claim is made for unproven assets.
+   artifacts: the JetBrains labels come only from executable matrices, and
+   `ui_parity` requires every executable axis of the Faktor-owned UI.
+   `BLOCKED_EXTERNAL`/`PARTIAL` surfaces are carried into the release
+   notes; no claim is made for unproven assets.
 
 Any new commit — including a docs-only change — invalidates the previous
 certificate and requires a fresh run.

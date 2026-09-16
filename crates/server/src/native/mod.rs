@@ -51,13 +51,14 @@ pub(crate) fn authed(headers: &HeaderMap, state: &AppState) -> Result<(), ApiErr
     let authorization = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    let x_kilo = headers
+    let x_faktor_server_password = headers
         .get("x-faktor-server-password")
         .and_then(|v| v.to_str().ok());
-    // The frozen v7.5.6 extension sends `Basic base64("kilo:"+password)` for
-    // every request; the Faktor-native `x-faktor-server-password` header and the
-    // legacy per-start token keep the old clients and tests working. The
-    // effective password is the `auth.set` override when one is active,
+    // Faktor-native claims only: `Authorization: Bearer <password>`,
+    // `x-faktor-server-password: <password>`, or the legacy per-start token
+    // as a Bearer. The pre-cutover Basic compatibility arm is gone (see
+    // `crate::auth`'s migration note): no Basic header is parsed anywhere.
+    // The effective password is the `auth.set` override when one is active,
     // else the startup env password (`auth.remove` returns to it).
     // A poisoned auth-override lock is an authority failure, not a cache
     // miss: recover nothing and authenticate no one. The typed refusal keeps
@@ -70,8 +71,7 @@ pub(crate) fn authed(headers: &HeaderMap, state: &AppState) -> Result<(), ApiErr
         retryable: false,
     })?;
     let password = auth.as_ref().unwrap_or(&state.deps.server_password);
-    if password.check_authorization(authorization)
-        || check_password(password, None, x_kilo)
+    if check_password(password, authorization, x_faktor_server_password)
         || check_bearer(&state.deps.auth_token, authorization)
     {
         Ok(())

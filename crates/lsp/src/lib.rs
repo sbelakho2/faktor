@@ -45,6 +45,19 @@ const STDERR_RING_CAP: usize = 64 * 1024;
 const SHUTDOWN_REQUEST_MS: u64 = 5_000;
 const EXIT_GRACE_MS: u64 = 2_000;
 
+/// Classified lock recovery for the workspace-scoped LSP state: `conn`
+/// (in-flight request map + child identity) and `clients`/`last_used` are
+/// OWNERSHIP projections. A poisoned guard is recovered with the poison flag
+/// cleared and RECONCILED against the durable process authority (the
+/// supervisor's owner rows; the child pid was captured at spawn), so one
+/// panicking caller can never orphan a server or wedge later calls.
+fn recover_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LspConfig {
     pub name: String,
@@ -212,7 +225,7 @@ impl LspClient {
             ));
         }
         let (id, request) = {
-            let mut conn = self.conn.lock().unwrap();
+            let mut conn = recover_lock(&self.conn);
             if conn.pending.len() >= MAX_INFLIGHT_REQUESTS {
                 return Err(Error::new(
                     ErrorKind::Oversized,
@@ -231,7 +244,7 @@ impl LspClient {
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
-            let mut conn = self.conn.lock().unwrap();
+            let mut conn = recover_lock(&self.conn);
             let wire = format!(
                 "Content-Length: {}\r\n\r\n{}",
                 request.to_string().len(),
@@ -261,7 +274,7 @@ impl LspClient {
             }
             Ok(Err(_)) => Err(Error::new(ErrorKind::Network, "lsp connection dropped")),
             Err(_) => {
-                self.conn.lock().unwrap().pending.remove(&id);
+                recover_lock(&self.conn).pending.remove(&id);
                 Err(Error::timeout(format!(
                     "lsp {method} exceeded {}ms",
                     deadline.as_millis()
@@ -286,7 +299,7 @@ impl LspClient {
             "params": params,
         });
         {
-            let mut conn = self.conn.lock().unwrap();
+            let mut conn = recover_lock(&self.conn);
             let wire = format!(
                 "Content-Length: {}\r\n\r\n{}",
                 notification.to_string().len(),
@@ -394,13 +407,13 @@ impl LspClient {
 
     /// Recent stderr tail (bounded; lossy UTF-8) for diagnostics.
     pub fn stderr_tail(&self) -> String {
-        self.stderr.lock().unwrap().tail_lossy()
+        recover_lock(&self.stderr).tail_lossy()
     }
 
     /// Total stderr bytes drained (never bounded) — proves a flood was
     /// actually drained and never blocked the server.
     pub fn stderr_total_bytes(&self) -> u64 {
-        self.stderr.lock().unwrap().total
+        recover_lock(&self.stderr).total
     }
 }
 
@@ -464,7 +477,7 @@ impl LspManager {
         cfg: LspConfig,
     ) -> Result<Arc<LspClient>, Error> {
         {
-            let clients = self.clients.lock().unwrap();
+            let clients = recover_lock(&self.clients);
             if let Some(c) = clients.get(&workspace) {
                 // Reuse IS use: refresh the idle stamp.
                 self.touch(workspace);
@@ -482,16 +495,13 @@ impl LspManager {
         // (fire-and-forget, before any didOpen).
         client.initialize(&cfg.root).await?;
         client.notify_initialized()?;
-        self.clients
-            .lock()
-            .unwrap()
-            .insert(workspace, client.clone());
+        recover_lock(&self.clients).insert(workspace, client.clone());
         self.touch(workspace);
         Ok(client)
     }
 
     pub async fn client(&self, workspace: WorkspaceId) -> Result<Arc<LspClient>, Error> {
-        let clients = self.clients.lock().unwrap();
+        let clients = recover_lock(&self.clients);
         clients
             .get(&workspace)
             .cloned()
@@ -501,16 +511,16 @@ impl LspManager {
     /// Graceful teardown: shutdown request → exit notification → bounded
     /// exit wait (kill only as the fallback).
     pub async fn shutdown(&self, workspace: WorkspaceId) -> Result<(), Error> {
-        let client = self.clients.lock().unwrap().remove(&workspace);
+        let client = recover_lock(&self.clients).remove(&workspace);
         if let Some(c) = client {
             c.shutdown().await?;
         }
-        self.last_used.lock().unwrap().remove(&workspace);
+        recover_lock(&self.last_used).remove(&workspace);
         Ok(())
     }
 
     pub fn active(&self) -> Vec<WorkspaceId> {
-        let mut v: Vec<WorkspaceId> = self.clients.lock().unwrap().keys().copied().collect();
+        let mut v: Vec<WorkspaceId> = recover_lock(&self.clients).keys().copied().collect();
         v.sort_by_key(|w| w.raw());
         v
     }
@@ -527,22 +537,19 @@ impl LspManager {
     /// interactive teardown path, not the idle sweep's.
     pub fn unload_idle(&self, idle_ms: i64) -> Vec<WorkspaceId> {
         let now = now_ms();
-        let stale: Vec<WorkspaceId> = self
-            .last_used
-            .lock()
-            .unwrap()
+        let stale: Vec<WorkspaceId> = recover_lock(&self.last_used)
             .iter()
             .filter(|(_, t)| now - **t > idle_ms)
             .map(|(w, _)| *w)
             .collect();
         for w in &stale {
-            if let Some(c) = self.clients.lock().unwrap().remove(w) {
+            if let Some(c) = recover_lock(&self.clients).remove(w) {
                 let pid = c.conn.lock().map(|c| c.child_pid).unwrap_or(0);
                 if pid != 0 {
                     let _ = self.supervisor.kill_child_pid(pid, 200);
                 }
             }
-            self.last_used.lock().unwrap().remove(w);
+            recover_lock(&self.last_used).remove(w);
         }
         stale
     }
@@ -587,7 +594,7 @@ fn read_loop(
                         .and_then(|i| i.as_u64())
                         .map(|i| i.to_string());
                     if let Some(id) = id {
-                        let mut guard = conn.lock().unwrap();
+                        let mut guard = recover_lock(&conn);
                         if let Some(tx) = guard.pending.remove(&id) {
                             let _ = tx.send(value);
                         }
@@ -595,7 +602,7 @@ fn read_loop(
                 }
                 Ok(None) => break,
                 Err(_) => {
-                    let mut guard = conn.lock().unwrap();
+                    let mut guard = recover_lock(&conn);
                     for (_, tx) in guard.pending.drain() {
                         let _ = tx.send(serde_json::json!({"error": {"code": -32700, "message": "parse error"}}));
                     }
@@ -606,7 +613,7 @@ fn read_loop(
         }
     }
     exited.store(true, Ordering::SeqCst);
-    let mut guard = conn.lock().unwrap();
+    let mut guard = recover_lock(&conn);
     for (_, tx) in guard.pending.drain() {
         let _ = tx.send(serde_json::json!({"error": {"code": -32000, "message": "server closed"}}));
     }
@@ -621,7 +628,7 @@ fn stderr_drain(mut stderr: std::process::ChildStderr, ring: Arc<Mutex<StderrRin
     loop {
         match stderr.read(&mut buf) {
             Ok(0) | Err(_) => break,
-            Ok(n) => ring.lock().unwrap().push(&buf[..n]),
+            Ok(n) => recover_lock(&ring).push(&buf[..n]),
         }
     }
 }

@@ -1554,7 +1554,7 @@ pub enum BillingOrigin {
     /// A user-configured / self-hosted OpenAI-compatible endpoint: prices
     /// stay Unknown unless the user supplies an exact quote or ceiling.
     CustomEndpoint,
-    /// A gateway/aggregator endpoint (e.g. the Kilo gateway): prices stay
+    /// A gateway/aggregator endpoint (e.g. an aggregator gateway): prices stay
     /// Unknown unless the user supplies an exact quote or ceiling.
     Gateway,
     /// A local runtime (Ollama): an authoritative zero price.

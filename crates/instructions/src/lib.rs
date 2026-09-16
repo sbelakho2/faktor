@@ -34,7 +34,7 @@ pub const PRECEDENCE: [(RuleSourceKind, u8); 9] = [
     (RuleSourceKind::CursorRules, 50),
     (RuleSourceKind::WindsurfRules, 40),
     (RuleSourceKind::ContinueRules, 30),
-    (RuleSourceKind::LegacyKiloRules, 10),
+    (RuleSourceKind::LegacyRules, 10),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -48,7 +48,7 @@ pub enum RuleSourceKind {
     WindsurfRules,
     ContinueRules,
     FaktorNative,
-    LegacyKiloRules,
+    LegacyRules,
 }
 
 impl RuleSourceKind {
@@ -202,7 +202,7 @@ fn convention_root_for(kind: RuleSourceKind) -> &'static str {
         RuleSourceKind::WindsurfRules => ".windsurf/rules",
         RuleSourceKind::ContinueRules => ".continue/rules",
         RuleSourceKind::FaktorNative => ".faktor/rules",
-        RuleSourceKind::LegacyKiloRules => ".faktor/legacy",
+        RuleSourceKind::LegacyRules => ".faktor/legacy",
         _ => "",
     }
 }
@@ -322,7 +322,7 @@ fn dir_candidates(root: &Path) -> Vec<(RuleSourceKind, PathBuf)> {
         (RuleSourceKind::WindsurfRules, ".windsurf/rules"),
         (RuleSourceKind::ContinueRules, ".continue/rules"),
         (RuleSourceKind::FaktorNative, ".faktor/rules"),
-        (RuleSourceKind::LegacyKiloRules, ".faktor/legacy"),
+        (RuleSourceKind::LegacyRules, ".faktor/legacy"),
     ] {
         let dir = root.join(rel);
         if !dir.is_dir() {
@@ -992,7 +992,7 @@ pub fn kind_for_rel_path(rel: &Path) -> Option<RuleSourceKind> {
             (RuleSourceKind::WindsurfRules, ".windsurf/rules"),
             (RuleSourceKind::ContinueRules, ".continue/rules"),
             (RuleSourceKind::FaktorNative, ".faktor/rules"),
-            (RuleSourceKind::LegacyKiloRules, ".faktor/legacy"),
+            (RuleSourceKind::LegacyRules, ".faktor/legacy"),
         ] {
             if normalized == dir || normalized.starts_with(&format!("{dir}/")) {
                 return Some(kind);
@@ -1545,7 +1545,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         write(
             d.path(),
-            ".faktor/legacy/kilo.md",
+            ".faktor/legacy/import.md",
             "# Scope: import\nlegacy content\n",
         );
         let ins = Instructions::load(d.path()).unwrap();
@@ -1556,7 +1556,7 @@ mod tests {
         let a = ins.active_for("import config", &[]);
         assert!(a
             .iter()
-            .any(|i| i.source == RuleSourceKind::LegacyKiloRules && i.priority == 10));
+            .any(|i| i.source == RuleSourceKind::LegacyRules && i.priority == 10));
     }
 
     #[test]

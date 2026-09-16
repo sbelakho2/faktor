@@ -1,6 +1,6 @@
 //! Static source-authority certification (audit 31/107-109).
 //!
-//! Six structural invariants are locked by scanning the repository's
+//! Seven structural invariants are locked by scanning the repository's
 //! *production* Rust sources (`crates/*/src`, test modules and out-of-line
 //! `#[cfg(test)] mod` bodies excluded):
 //!
@@ -43,6 +43,12 @@
 //!    `ProcessSupervisor::new` additionally have documented production
 //!    sites with exact per-file occurrence counts: a new (or stale)
 //!    construction site anywhere is a red test, never a review nit.
+//! 7. **Retired product-name authority** — the retired product name and its
+//!    version tokens appear ONLY in the historical attribution directory
+//!    (`ui/LICENSES/`). The scan covers every regular file (source AND
+//!    artifact: stale bundles, VSIX archives, jars count) outside the
+//!    standard build/cache skip trees; the token literals are assembled at
+//!    runtime so the scanner source cannot exempt itself.
 //!
 //! Scanning methodology: per file, comments and string literals are masked
 //! out and every `#[cfg(...)]`-gated item that can never compile in a
@@ -1044,6 +1050,29 @@ mod scans {
         // crates/git: worktree metadata save (spec §33) — best-effort
         // .git-internal writer with its own unique-temp discipline.
         ("crates/git/src/lib.rs", "std::fs::rename(&tmp, &path)?;"),
+        // crates/git: the stale-lease reconcile claim — GIT-INTERNAL
+        // metadata (the mutation lease under the common git dir), renamed
+        // to a unique tombstone (pid + uuid) so exactly one stealer wins;
+        // it never touches workspace content and is followed by the
+        // tombstone removal.
+        (
+            "crates/git/src/guard.rs",
+            "match std::fs::rename(&path, &tombstone) {",
+        ),
+        // crates/fs: entry-state transactional landing (canonical
+        // kind/mode/literal-target triple). The landing primitive stages
+        // its own uniquely-named temp beside the destination, fsyncs it,
+        // renames and fsyncs the parent through `crate::atomic::fsync_parent`
+        // — the generic in-memory content-replace helper cannot express the
+        // symlink-aware replacement this primitive owns.
+        (
+            "crates/fs/src/entry_state.rs",
+            "let mut file = fs::File::create(tmp).map_err(|e| io_failure(\"create\", tmp, e))?;",
+        ),
+        (
+            "crates/fs/src/entry_state.rs",
+            "fs::rename(&tmp, dst).map_err(|e| {",
+        ),
     ];
 
     /// The temp-write half of scan 3, independent of any fsync: a
@@ -1313,6 +1342,191 @@ mod scans {
     }
 
     // ------------------------------------------------------------------
+    // scan 6: retired product-name tokens (source + artifact)
+    // ------------------------------------------------------------------
+
+    /// The retired product-name tokens. Each is assembled at runtime from
+    /// split literals so THIS scanner's own source cannot exempt itself: the
+    /// only permitted location anywhere in the tree is the historical
+    /// attribution directory (`ui/LICENSES/`).
+    fn retired_tokens() -> Vec<String> {
+        vec![
+            concat!("ki", "lo").to_string(),
+            concat!("v7", "56").to_string(),
+            concat!("v7", ".5.6").to_string(),
+        ]
+    }
+
+    const RETIRED_TOKEN_SKIP_DIRS: &[&str] =
+        &[".git", "target", "node_modules", "build", ".gradle"];
+
+    /// The ONE permitted location: the retained historical attribution for
+    /// the removed vendored UI code. Reported by the test summary.
+    const RETIRED_TOKEN_ATTRIBUTION_PREFIX: &str = "ui/LICENSES/";
+
+    fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+        if needle.is_empty() || haystack.len() < needle.len() {
+            return false;
+        }
+        haystack.windows(needle.len()).any(|window| {
+            window
+                .iter()
+                .zip(needle.iter())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        })
+    }
+
+    /// Stream a file in bounded chunks (1 MiB + token-length overlap) so a
+    /// huge artifact is scanned without being materialized in RAM.
+    fn file_contains_any_token(path: &Path, tokens: &[Vec<u8>]) -> bool {
+        use std::io::Read;
+        let overlap = tokens.iter().map(|token| token.len()).max().unwrap_or(1);
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return false;
+        };
+        let chunk_size = 1024 * 1024;
+        let mut carry: Vec<u8> = Vec::new();
+        let mut buffer = vec![0u8; chunk_size];
+        loop {
+            let Ok(read) = file.read(&mut buffer) else {
+                return false;
+            };
+            if read == 0 {
+                return false;
+            }
+            let mut window = Vec::with_capacity(carry.len() + read);
+            window.extend_from_slice(&carry);
+            window.extend_from_slice(&buffer[..read]);
+            if tokens
+                .iter()
+                .any(|token| contains_ascii_case_insensitive(&window, token))
+            {
+                return true;
+            }
+            let keep = overlap.saturating_sub(1).min(window.len());
+            carry = window[window.len() - keep..].to_vec();
+        }
+    }
+
+    /// Every regular file under the repo root except the skip trees, as a
+    /// `/`-normalized repository-relative path.
+    fn walk_repo_files() -> Vec<String> {
+        let root = repo_root();
+        let mut out = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy().to_string();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    if RETIRED_TOKEN_SKIP_DIRS.contains(&name.as_str()) {
+                        continue;
+                    }
+                    stack.push(entry.path());
+                } else if file_type.is_file() {
+                    let rel = entry
+                        .path()
+                        .strip_prefix(&root)
+                        .unwrap_or(&entry.path())
+                        .display()
+                        .to_string();
+                    out.push(normalize_rel(&rel));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Retired-token offenders of one repository-relative path (empty when
+    /// the path is the attribution location).
+    fn retired_token_offenders(rel: &str) -> Vec<String> {
+        let rel = normalize_rel(rel);
+        if rel.starts_with(RETIRED_TOKEN_ATTRIBUTION_PREFIX) {
+            return Vec::new();
+        }
+        let tokens: Vec<Vec<u8>> = retired_tokens()
+            .into_iter()
+            .map(|token| token.into_bytes())
+            .collect();
+        let path = repo_root().join(&rel);
+        if !file_contains_any_token(&path, &tokens) {
+            return Vec::new();
+        }
+        vec![format!("{rel}: retired product-name token")]
+    }
+
+    /// The retired product name (and its version tokens) must appear ONLY in
+    /// the historical attribution directory. This is the source AND artifact
+    /// scan: every regular file outside the skip trees is read as bytes (a
+    /// stale compiled bridge, bundle, VSIX or jar counts), and the scan is
+    /// asserted non-vacuous against a synthetic offender which is itself
+    /// assembled at runtime.
+    #[test]
+    fn retired_product_name_tokens_appear_only_in_the_attribution_location() {
+        // The attribution exception must be real, not vacuous.
+        let attribution = repo_root().join("ui/LICENSES");
+        assert!(
+            attribution.join("NOTICE.md").is_file(),
+            "the historical attribution (ui/LICENSES/NOTICE.md) must exist; \
+             it is the ONE permitted location for the retired product name"
+        );
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        let mut attribution_files = 0usize;
+        for rel in walk_repo_files() {
+            if rel.starts_with(RETIRED_TOKEN_ATTRIBUTION_PREFIX) {
+                attribution_files += 1;
+                continue;
+            }
+            offenders.extend(retired_token_offenders(&rel));
+            scanned += 1;
+        }
+        assert_no_offenders(
+            "retired-token scan: the retired product name (and its version tokens) may appear \
+             ONLY under ui/LICENSES/; delete, rename or re-author the source (never re-vendor it)",
+            &offenders,
+            scanned,
+            100,
+        );
+        assert!(
+            attribution_files >= 1,
+            "the attribution location must exist and be walked"
+        );
+        // The scanner is not vacuous: a synthetic file carrying the retired
+        // token at runtime is flagged (composed here so this source stays
+        // clean).
+        let synthetic = repo_root()
+            .join("target/certification")
+            .join(format!("retired-token-selfcheck-{}", std::process::id()));
+        if std::fs::create_dir_all(synthetic.parent().unwrap_or(Path::new("."))).is_ok() {
+            let probe = retired_tokens()
+                .into_iter()
+                .next()
+                .expect("at least one token");
+            if std::fs::write(&synthetic, format!("prefix {probe} suffix")).is_ok() {
+                let rel = synthetic
+                    .strip_prefix(repo_root())
+                    .unwrap_or(&synthetic)
+                    .display()
+                    .to_string();
+                let hits = retired_token_offenders(&normalize_rel(&rel));
+                assert!(
+                    !hits.is_empty(),
+                    "a synthetic file carrying the retired token must be flagged"
+                );
+                let _ = std::fs::remove_file(&synthetic);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // adversarial tests of the machinery itself
     // ------------------------------------------------------------------
 
@@ -1412,12 +1626,18 @@ fn prod_only() {}
         // files).
         //
         // The ONLY documented grandfathers left are the CAS store, the fs
-        // crate's internal stream copy and the git worktree metadata save;
-        // a new file appearing here is a red test, never a review nit.
+        // crate's internal stream copy, the git worktree metadata save, the
+        // git stale-lease reconcile claim (git-internal metadata, never
+        // workspace content) and the fs crate's canonical entry-state
+        // landing primitive (symlink/mode-aware, parent-fsync via
+        // crate::atomic); a new file appearing here is a red test, never a
+        // review nit.
         const DOCUMENTED_GRANDFATHERS: &[&str] = &[
             "crates/cas/src/lib.rs",
             "crates/fs/src/lib.rs",
+            "crates/fs/src/entry_state.rs",
             "crates/git/src/lib.rs",
+            "crates/git/src/guard.rs",
         ];
         for (rel, text) in ATOMIC_ALLOWLIST {
             assert!(
@@ -1795,5 +2015,126 @@ fn prod_only() {}
             "fn spawn(cmd: ResolvedCommand) { let _ = std::process::Command::new(cmd.program); }\n",
         );
         assert!(!indirect_resolved_spawn_offenders(&f).is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // scan: authority-path lock poison discipline
+    // ------------------------------------------------------------------
+
+    /// Production files whose locks sit on the authority path (fs registries,
+    /// session ownership registries, permissions-adjacent caches, MCP/LSP
+    /// process ownership, search/router caches, PTY rings, hooks, git lock
+    /// maps). Raw `.lock().unwrap()` / `.lock().expect(..)` is forbidden on
+    /// every one: each lock carries a classified disposition
+    /// (cache/ring => rebuild; authority/policy => typed refusal;
+    /// ownership/process => reconcile against the durable authority).
+    const AUTHORITY_LOCK_FILES: &[&str] = &[
+        "crates/fs/src/lib.rs",
+        "crates/fs/src/atomic.rs",
+        "crates/fs/src/platform/unix.rs",
+        "crates/fs/src/platform/windows.rs",
+        "crates/session/src/manager.rs",
+        "crates/session/src/ops.rs",
+        "crates/session/src/process.rs",
+        "crates/session/src/artifacts.rs",
+        "crates/mcp/src/lib.rs",
+        "crates/lsp/src/lib.rs",
+        "crates/search/src/lib.rs",
+        "crates/router/src/lib.rs",
+        "crates/router/src/outcomes.rs",
+        "crates/pty/src/ring.rs",
+        "crates/pty/src/unix.rs",
+        "crates/pty/src/windows.rs",
+        "crates/hooks/src/lib.rs",
+        "crates/git/src/lib.rs",
+    ];
+
+    /// The TIGHT allowlist: `(rel, exact trimmed line prefix)` pairs that may
+    /// remain raw. Deliberately EMPTY — every scanned site is classified.
+    const AUTHORITY_LOCK_ALLOWLIST: &[(&str, &str)] = &[];
+
+    /// Raw `unwrap`/`expect` offenders at one file's `.lock()` call sites,
+    /// restricted to production (kept) code. `.unwrap_or_else(...)` /
+    /// `.unwrap_or(...)` never match: the needle requires the exact call
+    /// paren. Multi-line chains (`.lock()` newline `.expect(..)`) are seen
+    /// through comments/whitespace.
+    fn authority_lock_offenders(rel: &str, f: &File<'_>) -> Vec<String> {
+        let mut offenders = Vec::new();
+        for at in find_marker_offsets(f, ".lock()") {
+            let mut i = at + ".lock()".len();
+            let n = f.src.len();
+            while i < n && (!f.code[i] || f.src.as_bytes()[i].is_ascii_whitespace()) {
+                i += 1;
+            }
+            for needle in [".unwrap(", ".expect("] {
+                if f.src[i..].starts_with(needle) {
+                    let line = line_of(f.src, at);
+                    let text = trim_line(f.src, at);
+                    if AUTHORITY_LOCK_ALLOWLIST
+                        .iter()
+                        .any(|(r, l)| *r == rel && text.starts_with(l))
+                    {
+                        continue;
+                    }
+                    offenders.push(format!(
+                        "{rel}:{line}: {text}  [raw {} on an authority-path lock; classify \
+                         the site (cache/ring => rebuild, authority/policy => typed \
+                         refusal, ownership/process => reconcile)]",
+                        needle.trim_start_matches('.').trim_end_matches('(')
+                    ));
+                }
+            }
+        }
+        offenders.sort();
+        offenders.dedup();
+        offenders
+    }
+
+    #[test]
+    fn authority_path_locks_never_raw_unwrap_or_expect() {
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for rel in AUTHORITY_LOCK_FILES {
+            let f = load(rel).unwrap_or_else(|| panic!("authority lock file missing: {rel}"));
+            scanned += 1;
+            offenders.extend(authority_lock_offenders(rel, &f));
+        }
+        assert_no_offenders(
+            "authority lock poison discipline",
+            &offenders,
+            scanned,
+            AUTHORITY_LOCK_FILES.len(),
+        );
+    }
+
+    #[test]
+    fn authority_lock_scan_detects_raw_and_exempts_classified_shapes() {
+        let raw = synthetic_file(
+            "crates/fs/src/atomic.rs",
+            "fn f(lock: &Mutex<()>) { let _ = lock.lock().unwrap(); }\n",
+        );
+        assert_eq!(
+            authority_lock_offenders("crates/fs/src/atomic.rs", &raw).len(),
+            1
+        );
+        let expect = synthetic_file(
+            "crates/fs/src/atomic.rs",
+            "fn f(lock: &Mutex<()>) {\n  let _ =\n    lock\n      .lock()\n      .expect(\"poisoned\");\n}\n",
+        );
+        assert_eq!(
+            authority_lock_offenders("crates/fs/src/atomic.rs", &expect).len(),
+            1
+        );
+        let recovered = synthetic_file(
+            "crates/fs/src/atomic.rs",
+            "fn f(lock: &Mutex<()>) { let _ = lock.lock().unwrap_or_else(|p| p.into_inner()); }\n",
+        );
+        assert!(authority_lock_offenders("crates/fs/src/atomic.rs", &recovered).is_empty());
+        // A raw site inside a #[cfg(test)] module is test code.
+        let test_only = synthetic_file(
+            "crates/fs/src/atomic.rs",
+            "#[cfg(test)] mod tests {\n  fn t(lock: &Mutex<()>) { let _ = lock.lock().unwrap(); }\n}\n",
+        );
+        assert!(authority_lock_offenders("crates/fs/src/atomic.rs", &test_only).is_empty());
     }
 }

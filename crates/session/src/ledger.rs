@@ -148,6 +148,9 @@ pub const MAX_TERMINAL_ID_BYTES: usize = 64;
 /// Hard bound on one terminal audit detail (lost reason / kill reason /
 /// reconcile disposition note).
 pub const MAX_TERMINAL_DETAIL_BYTES: usize = MAX_LEDGER_TEXT;
+/// Hard bound on one terminal's effective execution profile (the bounded
+/// JSON evidence the execution authority admitted the spawn under).
+pub const MAX_TERMINAL_PROFILE_BYTES: usize = 4096;
 /// The only legal reconcile disposition tags.
 pub const TERMINAL_RECONCILE_KILLED: &str = "killed";
 pub const TERMINAL_RECONCILE_COLLECTED: &str = "collected";
@@ -349,7 +352,10 @@ pub struct LedgerCheckRun {
 /// `session_id`/`task_id`/`agent_id`/`operation_id` the ownership, and
 /// `pid`+`start_time_ms` the process identity (an OS start time of 0 means
 /// the process was never observed — such a row is NEVER adopted by pid
-/// alone).
+/// alone). `execution_profile` is the EFFECTIVE profile the execution
+/// authority admitted the spawn under (candidate root, cwd, capabilities,
+/// filesystem/network projections, budgets) — the row records the profile,
+/// not merely the owner.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalDurableRow {
     pub terminal_id: String,
@@ -367,6 +373,12 @@ pub struct TerminalDurableRow {
     pub start_time_ms: i64,
     /// The journal time of THIS row (ms since the Unix epoch).
     pub at_ms: i64,
+    /// The effective execution profile the spawn was authorized under,
+    /// bounded JSON evidence. Empty on rows written before the execution
+    /// authority existed (legacy rows stay readable; new spawns always
+    /// record the profile).
+    #[serde(default)]
+    pub execution_profile: String,
 }
 
 /// The six durable terminal lifecycle kinds, in the order a healthy terminal
@@ -2022,6 +2034,24 @@ fn validate_terminal_row(row: &TerminalDurableRow, what: &str) -> Result<(), Ses
                 "ledger {what} agent_id must be printable ASCII"
             )));
         }
+    }
+    // The effective execution profile is bounded audit evidence: empty means
+    // a legacy row (readable), a set value must never be hostile.
+    if row.execution_profile.len() > MAX_TERMINAL_PROFILE_BYTES {
+        return Err(SessionError::Oversized(format!(
+            "ledger {what} execution_profile of {} bytes exceeds {MAX_TERMINAL_PROFILE_BYTES}",
+            row.execution_profile.len()
+        )));
+    }
+    if row.execution_profile.contains('\0')
+        || row
+            .execution_profile
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return Err(SessionError::Malformed(format!(
+            "ledger {what} execution_profile contains control/NUL characters"
+        )));
     }
     Ok(())
 }
@@ -6750,6 +6780,7 @@ mod tests {
             pid: 4242,
             start_time_ms: 1_700_000_000_000,
             at_ms: 1_700_000_000_100,
+            execution_profile: String::new(),
         }
     }
 
@@ -6795,6 +6826,23 @@ mod tests {
     }
 
     #[test]
+    fn terminal_execution_profile_round_trips_durably() {
+        // The effective execution profile is a durable row fact: it survives
+        // the round trip byte-for-byte (a legacy empty profile stays legal).
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let mut profiled = terminal_row("7f1a2b3c-0000-4000-8000-00000000000f");
+        profiled.execution_profile = "{\"cwd\":\"/tmp\",\"capabilities\":\"*\"}".into();
+        s.ledger_terminal_created(&profiled).unwrap();
+        let records = s.ledger_terminal_rows(None).unwrap();
+        let stored = records
+            .iter()
+            .find(|record| record.row.terminal_id == profiled.terminal_id)
+            .expect("profiled row");
+        assert_eq!(stored.row.execution_profile, profiled.execution_profile);
+    }
+
+    #[test]
     fn terminal_row_shape_violations_are_loud_and_never_parse() {
         let (_d, m) = test_manager();
         let s = session(&m);
@@ -6807,6 +6855,12 @@ mod tests {
         let mut slash = terminal_row("bad/id");
         slash.terminal_id = "bad/id".into();
         assert!(s.ledger_terminal_created(&slash).is_err());
+        let mut oversized_profile = terminal_row("7f1a2b3c-0000-4000-8000-000000000005");
+        oversized_profile.execution_profile = "p".repeat(MAX_TERMINAL_PROFILE_BYTES + 1);
+        assert!(s.ledger_terminal_created(&oversized_profile).is_err());
+        let mut nul_profile = terminal_row("7f1a2b3c-0000-4000-8000-000000000006");
+        nul_profile.execution_profile = "profile\0evil".into();
+        assert!(s.ledger_terminal_created(&nul_profile).is_err());
         // Nothing was journaled by the refusals.
         assert!(s.ledger_terminal_rows(None).unwrap().is_empty());
 

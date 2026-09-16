@@ -7,8 +7,8 @@
 //! evidence, semantic introspection; documented in
 //! `docs/native-protocol.md`) — the daemon's own contract. All endpoints
 //! stay behind password auth (`FAKTOR_SERVER_PASSWORD` via
-//! `Authorization: Basic base64("kilo:"+password)`, with the Bearer and
-//! `x-faktor-server-password` forms retained).
+//! `Authorization: Bearer`, or `x-faktor-server-password`; the legacy
+//! per-start token rides the same Bearer header). No Basic form exists.
 //!
 //! Layout: handler bodies live in [`crate::native`] (Faktor Native
 //! Protocol v1). This module keeps router assembly plus the re-exports the
@@ -74,7 +74,8 @@ pub struct ServerDeps {
     /// graph built. Handlers that touch per-task/per-child caps use this
     /// authority instead of constructing a second ledger per request.
     pub budgets: Arc<faktor_session::DurableBudgetLedger>,
-    /// Legacy per-start token (old tests); the frontend uses the password.
+    /// Per-start bearer token (legacy clients); the frontend uses the
+    /// password. Both ride `Authorization: Bearer`.
     pub auth_token: AuthToken,
     /// The password the frontend generated and passed via `FAKTOR_SERVER_PASSWORD`.
     pub server_password: ServerPassword,
@@ -3685,7 +3686,12 @@ mod tests {
         let handle = serve(deps, 0).await.unwrap();
         let client = reqwest::Client::new();
         let base = format!("http://{}", handle.addr);
-        let ws = manager.create_workspace("/nt-root").unwrap();
+        // The execution authority resolves the default terminal cwd to the
+        // session's candidate root, so this fixture root must be a real
+        // directory.
+        let root = dir.path().join("nt-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = manager.create_workspace(root.to_str().unwrap()).unwrap();
         let a = manager.create_session(ws, "t-pty-a", "fake", "m").unwrap();
         let b = manager.create_session(ws, "t-pty-b", "fake", "m").unwrap();
         let a_sid = a.id().to_string();
@@ -3737,6 +3743,19 @@ mod tests {
         assert!(pty_a["startTimeMs"].as_i64().unwrap_or(0) > 0);
         let op_a = pty_a["operationId"].as_str().unwrap().to_string();
         assert!(!op_a.is_empty());
+        // The durable effective execution profile rides the spawn response:
+        // the cwd is the session's candidate root and the budgets/profiles
+        // are the admitted ones (never just the owner).
+        let profile = &pty_a["executionProfile"];
+        assert!(profile.is_object(), "{pty_a}");
+        assert_eq!(profile["sessionId"], a.id().raw());
+        assert_eq!(
+            profile["cwd"],
+            root.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
+        assert_eq!(profile["filesystem"], "workspace+external:ask-ask");
+        assert_eq!(profile["network"], "none");
+        assert!(profile["budgets"]["maxProcesses"].as_u64().unwrap_or(0) > 0);
 
         let Some(pty_b) =
             native_spawn_terminal(&client, &base, &token, &b_sid, "/bin/sleep", &["60"]).await

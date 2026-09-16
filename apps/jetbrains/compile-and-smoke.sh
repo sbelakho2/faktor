@@ -2,11 +2,12 @@
 # JetBrains split-mode smoke (no Gradle, no network):
 #   1. build faktor-cli if missing
 #   2. compile shared + backend + test + frontend (Swing panel) with kotlinc
-#   3. run BackendSmoke (v7.5.6 wire), NativeBridgeSmoke (native protocol v1 +
-#      fake-server unit suite), FrontendSmoke (panels + canned frames) and
-#      JetBrainsParitySmoke (upstream 7.1.2 pin hashes + fake daemon + parity
-#      families + the executable behavioral/visual parity matrix artifact +
-#      real daemon restart/reconnect) against the real daemon; exit 0/1
+#   3. run BackendSmoke (daemon lifecycle), NativeBridgeSmoke (native protocol
+#      v1 + fake-server unit suite), FrontendSmoke (panels + canned frames)
+#      and JetBrainsParitySmoke (Faktor-owned tree check + fake daemon +
+#      parity families + the executable behavioral/visual parity matrix
+#      artifact + real daemon restart/reconnect) against the real daemon;
+#      exit 0/1
 #
 # Flags:
 #   --write-baselines  re-pin the visual matrix baselines from this render
@@ -231,7 +232,7 @@ run_smoke() {
   return $rc
 }
 
-echo "[compile-and-smoke] running BackendSmoke (v7.5.6 wire) against $BIN"
+echo "[compile-and-smoke] running BackendSmoke (daemon lifecycle) against $BIN"
 run_smoke BackendSmoke dev.faktor.backend.BackendSmoke || exit $?
 
 echo "[compile-and-smoke] running NativeBridgeSmoke (native protocol v1) against $BIN"

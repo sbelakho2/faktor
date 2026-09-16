@@ -5,18 +5,16 @@ The JetBrains side of the Faktor split-mode design. The daemon is the
 process lifecycle, the auth channel, the protocol clients, and a real
 frontend panel. There is no placeholder code left in this tree.
 
-The upstream JetBrains 7.1.2 Kotlin sources are vendored at
-`compat/jetbrains-712/kilo-jetbrains` as the pinned, hash-verified
-reference corpus (MIT; per-file SHA-256 in `ui/upstream.json` under
-`jetbrains_712`; see `compat/jetbrains-712/NOTICE.md`). Upstream 7.1.2 is
-Kotlin/Swing, so the Faktor-owned Swing panels below remain the ONE
-rendering implementation; the vendored tree is not a second renderer.
+This tree is Faktor-owned end to end: the Swing panels below are the ONE
+rendering implementation, with no vendored upstream IDE source, corpus or
+lockstep pin in the repository (the retired pinned corpus and its manifest
+were removed by the Faktor-owned-UI migration).
 
 ## Modules
 
 | Module | Contents |
 | --- | --- |
-| `:shared` | `dev.faktor.shared` — plain Kotlin data classes with zero dependencies. `Protocol.kt` holds only the daemon stdout startup-line and Basic auth forms; `NativeProtocol.kt` is the native surface: a JSON value model, a recursive-descent reader/writer, typed DTO parsers (incl. providers and terminals), and the strict request bodies. |
+| `:shared` | `dev.faktor.shared` — plain Kotlin data classes with zero dependencies. `Protocol.kt` holds only the daemon stdout startup-line and the Faktor-native bearer auth form; `NativeProtocol.kt` is the native surface: a JSON value model, a recursive-descent reader/writer, typed DTO parsers (incl. providers and terminals), and the strict request bodies. |
 | `:backend` | `dev.faktor.backend` — `BackendProcessManager` (launch, startup line, bounded stdout drainer, SIGTERM-then-forcible stop), `NativeClient` (bearer-authenticated HTTP client of the native endpoints incl. providers/terminals/output), `NativeEventStream` (SSE journal stream with cursor resume and bounded backoff). |
 | `:frontend` | `dev.faktor.frontend` — `FaktorFrontendService` (the UI-free bridge: start/stop/attach/restart, session, task-run/agent/usage/verification/evidence/provider/terminal routing, stream lifecycle and `reconnectStream` cursor resume), `FaktorChatPanel` (native Swing tool-window panel with Status, Task, Task Tree, Agents, Permissions, Tournament, Board, Evidence, Terminal, Settings and History tabs) plus the section panels (`TaskTreePanel`, `BlockersPanel`, `PermissionsPanel`, `TerminalPanel`, `SettingsPanel`, `HistoryPanel`, `TournamentPanel`, `BoardPanel`, `EvidenceNavigatorPanel`, `AttachmentsPanel`) and `FaktorToolWindowFactory` (the IntelliJ tool-window host). `FaktorFrontendApp` launches the panel standalone. `src/main/resources/META-INF/plugin.xml` is the real plugin descriptor (`dev.faktor.jetbrains`, name/vendor `Faktor`, version `0.1.0`, `since-build 241`). |
 
@@ -25,13 +23,14 @@ rendering implementation; the vendored tree is not a second renderer.
 - `BackendProcessManager` generates a 64-hex password with `SecureRandom`
   and passes it to the child only through `FAKTOR_SERVER_PASSWORD`
   (environment = protected channel; never argv, never disk, never logs).
-- The frozen v7.5.6 startup line is the only stdout contract:
+- The Faktor startup line is the only stdout contract:
   `faktor server listening on http://127.0.0.1:<port>`.
 - The native client authenticates every request with
-  `Authorization: Bearer <password>`; the frozen v7.5.6 client keeps
-  `Authorization: Basic base64("kilo:" + password)` for every daemon
-  request (that literal is a retained auth form, not product
-  branding).
+  `Authorization: Bearer <password>` or the equivalent
+  `x-faktor-server-password` header. The retired Basic compatibility form
+  is gone from the daemon (see the auth migration note in
+  `crates/server/src/auth.rs`): there is no downgrade path, and no client
+  in this repository sends it.
 - `stop()` is SIGTERM first, `destroyForcibly()` only after a 3s grace;
   the stdout drainer and the SSE thread stop with the process.
 
@@ -134,10 +133,9 @@ This builds `faktor-cli` if missing and then:
 4. runs `FrontendSmoke <binary>` — canned native frames for every panel
    section plus the real daemon (task-run attachments, permissions,
    tournaments, board round-trip, typed refusals, evidence);
-5. runs `JetBrainsParitySmoke <binary>` — first the upstream pin
-   (`UPSTREAM PIN PASS`: every per-file SHA-256 of
-   `compat/jetbrains-712/kilo-jetbrains` from `ui/upstream.json`, the
-   license hash and the Faktor patch-set paths, all offline), then the
+5. runs `JetBrainsParitySmoke <binary>` — first the Faktor-owned tree
+   check (`FAKTOR-OWNED TREE PASS`: root resolves, no vendored upstream UI
+   corpus exists, the panel sources are present, all offline), then the
    ten parity families over canned frames (`task mode`, `agent tree with
    blockers/presentation/pixel identity`, `permissions`, `terminal`,
    `review/tournament`, `evidence navigation`, `settings`, `provider

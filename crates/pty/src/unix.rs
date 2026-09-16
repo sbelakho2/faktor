@@ -47,7 +47,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use faktor_core::error::Error;
 
 use crate::guardian::{GuardianHandle, ProcessIdentity, TerminalLedger};
-use crate::ring::Ring;
+use crate::ring::{lock_ring, Ring};
 use crate::validation::validate_spawn_config;
 use crate::PtyConfig;
 
@@ -333,24 +333,24 @@ impl Pty {
 
     /// Drain all currently available output.
     pub fn read_available(&self) -> Vec<u8> {
-        self.shared.0.lock().unwrap().drain()
+        lock_ring(&self.shared.0).drain()
     }
 
     /// Snapshot the current output WITHOUT draining.
     pub fn snapshot(&self) -> Vec<u8> {
-        self.shared.0.lock().unwrap().snapshot()
+        lock_ring(&self.shared.0).snapshot()
     }
 
     /// Total bytes ever read from the master.
     pub fn total_bytes(&self) -> u64 {
-        self.shared.0.lock().unwrap().total()
+        lock_ring(&self.shared.0).total()
     }
 
     /// Block until `needle` appears in the accumulated output or `timeout`
     /// elapses (test/consumer helper).
     pub fn wait_for_contains(&self, needle: &str, timeout: std::time::Duration) -> bool {
         let (ring, cv) = &*self.shared;
-        let mut guard = ring.lock().unwrap();
+        let mut guard = lock_ring(ring);
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let snap = guard.snapshot();
@@ -578,7 +578,7 @@ fn reader_loop(
         let n = unsafe { libc::read(mfd_raw, buf.as_mut_ptr().cast(), buf.len()) };
         if n > 0 {
             let (ring, cv) = &*shared;
-            ring.lock().unwrap().push(&buf[..n as usize]);
+            lock_ring(ring).push(&buf[..n as usize]);
             cv.notify_all();
         } else if n == 0 {
             break; // EOF: every slave fd closed

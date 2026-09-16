@@ -10,31 +10,26 @@ sections below.
 
 ## 1. Product definition
 
-Faktor is a native Rust engine whose compatibility target is the **Kilo
-Code v7.5.6 UI experience — visual/behavioral, not wire-level**: the old
-UI must look and behave the same against the Faktor daemon, but the daemon
-does NOT speak the old backend's protocol as its architecture. Backend
-wire compatibility is not a release objective; it was retired by explicit
-owner decision, and the daemon's own surface is the **Faktor Native
-Protocol v1** (§16, `docs/native-protocol.md`). **Client-parity status:
-PARTIAL** — the blanket byte-for-byte claim is retired; each client
-feature below carries an explicit status label (IMPLEMENTED / PARTIAL /
-BLOCKED_EXTERNAL / UNIMPLEMENTED / CERTIFIED). The derived client shells
-below are compatibility fixtures; the engine under them is a durable,
-journaled, bounded runtime. The LLM is used only where
-reasoning is actually needed — indexing, retrieval, compaction of
-historical turns, and deterministic bookkeeping are local.
+Faktor is a native Rust engine with **Faktor-owned IDE UIs**: every
+rendering surface is authored in this repository, and the daemon speaks
+its own **Faktor Native Protocol v1** (§16, `docs/native-protocol.md`).
+There is no foreign wire-compatibility surface and no vendored UI source
+dependency; the retired compatibility corpora and bundles were removed by
+explicit owner decision (only the historical attribution under
+`ui/LICENSES/` remains). Each client feature below carries an explicit
+status label (IMPLEMENTED / PARTIAL / BLOCKED_EXTERNAL / UNIMPLEMENTED /
+CERTIFIED). The engine is a durable, journaled, bounded runtime. The LLM
+is used only where reasoning is actually needed — indexing, retrieval,
+compaction of historical turns, and deterministic bookkeeping are local.
 
-**Frozen baselines (never merged wholesale from later releases):**
+**Faktor-owned UI surfaces:**
 
-- **VS Code UI:** the v7.5.6 webview/CSS/images/message layout is vendored
-  under `ui/` at commit `fa02955` (SHA-256 manifest `ui/upstream.json`),
-  built into the pinned closure (`ui/kilo-v756-webview/dist`), staged into
-  the VSIX and render-gated (`vscode-visual`); the derived shell in
-  `apps/vscode/` is IMPLEMENTED and CI-tested against the daemon. Client UI
-  parity is **PARTIAL**: the executable parity matrices (VS Code visual
-  render + JetBrains behavioral/visual matrices) are the only evidence
-  `ui_parity` accepts, and the JetBrains matrices exist and pass (§1).
+- **VS Code UI:** the extension ships its own hand-written panel —
+  `apps/vscode/media/chat.js` + `chat.css` + `composer-state.js` behind the
+  strict provider in `apps/vscode/src/webview.ts` (local-resource-only CSP,
+  per-load nonce, text-only rendering). The panel is IMPLEMENTED and
+  CI-tested against the daemon; `apps/vscode/scripts/verify-vsix.mjs`
+  asserts the VSIX carries exactly the panel surface and nothing else.
 - **JetBrains shell:** native Kotlin bridge in `apps/jetbrains/`
   (`:shared` + `:backend` + `:frontend` compile and smoke-test against the
   real daemon). The frontend is a native Swing tool-window panel
@@ -42,30 +37,24 @@ historical turns, and deterministic bookkeeping are local.
   `NativeClient`/`NativeEventStream`: daemon lifecycle, bearer auth over
   the protected env channel, chat/task-run/agent/usage/verification/
   evidence routing and SSE journal streaming with cursor resume.
-  **Status: IMPLEMENTED (native bridge + Faktor frontend).** The upstream
-  7.1.2 sources ARE vendored (`compat/jetbrains-712/`, per-file SHA-256
-  manifest in `ui/upstream.json` → `jetbrains_712`); the derived
-  `jetbrains_upstream_assets` label is **VENDORED**. The executable
-  JetBrains behavioral/visual parity matrices exist
-  (`target/certification/jetbrains-parity.json`, HEAD-bound: 11 behavioral
-  rows + 8 panels rendered against pinned baselines), so the derived
-  `jetbrains_behavioral_parity`/`jetbrains_visual_parity` labels are
-  **IMPLEMENTED**; the kotlinc/daemon smokes are regression tests, not
-  parity results, and the upstream Gradle build is not run offline.
-  The bridge is UI-framework independent and the same panel is the single
-  rendering implementation.
+  **Status: IMPLEMENTED (native bridge + Faktor frontend).** No vendored
+  upstream IDE source exists. The executable JetBrains behavioral/visual
+  matrices exist (`target/certification/jetbrains-parity.json`, HEAD-bound:
+  11 behavioral rows + 8 panels rendered against pinned baselines), so the
+  derived `jetbrains_behavioral_parity`/`jetbrains_visual_parity` labels
+  are **IMPLEMENTED**; the kotlinc/daemon smokes are regression tests, not
+  matrix results. The bridge is UI-framework independent and the same
+  panel is the single rendering implementation.
 - **Protocol:** the daemon's native surface is Faktor Native Protocol v1
   (`docs/native-protocol.md`): durable, cursor-paged HTTP endpoints owned
-  by this runtime. The v7.5.6 wire-compatibility subsystem (frozen routes,
+  by this runtime. The pre-cutover compatibility subsystem (frozen routes,
   DTO mirror, fixture corpus, certification replay) was **retired by
-  explicit owner decision**; no Kilo wire/behavior parity is claimed or
-  measured. The v7.5.6 frontend sources remain vendored as a pinned UI
-  source dependency (`ui/kilo-v756-webview`) only.
+  explicit owner decision**; no foreign wire/behavior parity is claimed or
+  measured.
 
-**Non-goals:** reimplementing the old TypeScript/Bun engine or merging
-newer UI releases wholesale. Improving the v7.5.6 wire protocol is not a
-goal either — it is not ours to improve; it is frozen only as glue. New
-server-side behavior ships through the native protocol instead.
+**Non-goals:** reimplementing any foreign engine or merging foreign UI
+releases wholesale. New server-side behavior ships through the native
+protocol instead.
 
 ---
 
@@ -73,7 +62,7 @@ server-side behavior ships through the native protocol instead.
 
 ```
 ┌────────────────────────── IDE clients (UI targets) ────────────────────────┐
-│  VS Code v7.5.6 webview (apps/vscode)  JetBrains native bridge (apps/jetbrains)│
+│  VS Code Faktor panel (apps/vscode)   JetBrains Faktor bridge (apps/jetbrains)│
 └────────────────────────────────────┬─────────────────────────────────────┘
                                      │ HTTP (Faktor Native Protocol v1)
                                      ▼
@@ -131,29 +120,26 @@ Rules that shape the diagram (Commandments):
    scopes, idle unload).
 5. **Zero orphans.** Every child process has a runtime owner; if the
    session dies, ownership transfers deliberately or the process dies (§10).
-6. **UI compatibility is the target; the wire is owned, not frozen.**
-   Faktor Native Protocol v1 (§16, `docs/native-protocol.md`) is the
-   daemon's own HTTP contract and evolves with the runtime. The retired
-   v7.5.6 wire surface never constrained the runtime and was not an
-   architectural dependency.
+6. **The protocol is owned, and so is the UI.** Faktor Native Protocol v1
+   (§16, `docs/native-protocol.md`) is the daemon's own HTTP contract and
+   evolves with the runtime; the Faktor-owned panels in `apps/` are the
+   only rendering implementations. No foreign wire surface or vendored UI
+   source constrains the runtime.
 
 ---
 
 ## 3. Workspace layout
 
 ```
-apps/        frozen UI compatibility fixtures
-  vscode/       v7.5.6-derived client shell (webview vendored; UI parity: PARTIAL — executable parity matrices incomplete)
-  jetbrains/    native Kotlin bridge + Swing panel (upstream 7.1.2 vendored/pinned; behavioral+visual parity matrices IMPLEMENTED, HEAD-bound)
-compat/      pinned upstream reference corpora
-  jetbrains-712/ pinned upstream JetBrains 7.1.2 source (per-file SHA-256
-                manifest in ui/upstream.json); the reference, never a
-                second renderer
+apps/        Faktor-owned IDE clients
+  vscode/       extension host + hand-written chat panel (Faktor-owned; selftest + VSIX surface verify)
+  jetbrains/    native Kotlin bridge + Swing panel (Faktor-owned; behavioral+visual matrices IMPLEMENTED, HEAD-bound)
 fixtures/    protocol/, providers/, screenshots/, repositories/ test data
 tests/       integration/, soak/, performance/, fault/, visual/ (adversarial-only)
 crates/      the Rust engine workspace
 docs/        architecture.md (this spec), native-protocol.md (Faktor Native
              Protocol v1), api-contracts.md, specs/*.md (frozen sub-specs)
+ui/          historical UI attribution only (LICENSES/ for removed code)
 ```
 
 Crate responsibilities (each crate's module doc is authoritative):
@@ -172,8 +158,8 @@ Crate responsibilities (each crate's module doc is authoritative):
 | `openai` | OpenAI Chat Completions, Responses, and OpenAI-compatible endpoints. Wire serializer produces exactly the frozen OpenAI shapes; internal option names can never leak onto the wire (locked by tests). |
 | `anthropic` | Anthropic Messages adapter (stream events, `tool_use` accumulation, `input_json_delta`). |
 | `google` | Gemini streaming adapter (candidates → parts → functionCall). |
-| `deepseek` | First-class DeepSeek profiles (direct, OpenRouter, Kilo Gateway, arbitrary compatible, local derivatives); capability normalization after discovery. |
-| `gateway` | Kilo/OpenRouter-style gateway adapters: OpenAI-compatible endpoint with model routing and extra headers; BYOK preserved, gateway key never persisted. |
+| `deepseek` | First-class DeepSeek profiles (direct, OpenRouter, aggregator gateway, arbitrary compatible, local derivatives); capability normalization after discovery. |
+| `gateway` | OpenRouter-style gateway adapters: OpenAI-compatible endpoint with model routing and extra headers; BYOK preserved, gateway key never persisted. |
 | `scheduler` | Tool/subagent concurrency as a dependency DAG with resource-class budgets, state-aware retries with jitter, circuit breakers. Independent reads/subagents run concurrently; edits touching overlapping ownership sets do not. |
 | `terminal` | Process supervision: no orphans, process groups (Unix); Windows assigns every supervised child to a `faktor-winjob` Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) with `taskkill /T` as the escalation path, 200-line ring buffer live with CAS-artifact spill, dedicated reader threads. |
 | `pty` | Session-owned pseudo-terminal authority (unix PTY + Windows ConPTY): bounded drop-oldest output ring, pre-spawn config validation, and Windows children spawned `CREATE_SUSPENDED`, assigned to a `KILL_ON_JOB_CLOSE` job, then resumed before exposure — no taskkill-based guarantee. |
@@ -239,7 +225,7 @@ Contract rules:
   events must not fail.
 - **Skipping states is rejected** (e.g. `Streaming → UpdatingMemory`
   without `Validating` is illegal).
-- **`Cancelled` is a turn outcome, not a session outcome.** Stop in Kilo
+- **`Cancelled` is a turn outcome, not a session outcome.** Stop in the IDE
   cancels the turn; the chat stays promptable (`Cancelled → Preparing` and
   `Cancelled → ReadyForNextTurn` are legal). `is_terminal()` is true only
   for `Completed` and `FailedPermanent`.
@@ -576,7 +562,7 @@ hard-coded lists.
 | `anthropic` | Messages API | Owns stream events, `tool_use` accumulation, `input_json_delta`. |
 | `google` | Gemini | candidates → parts → functionCall normalization. |
 | `deepseek` | OpenAI-shaped | First-class profiles: `Direct` (api.deepseek.com), `OpenRouter`, `Gateway`, `Compatible` (arbitrary endpoint), `LocalDerivative`. Capability normalization after discovery; all profiles produce capability-driven behavior (test-locked matrix). |
-| `gateway` | OpenAI-compatible | Kilo/OpenRouter-style model routing + extra headers; BYOK preserved, gateway key configured per provider and never persisted by the runtime. |
+| `gateway` | OpenAI-compatible | OpenRouter-style model routing + extra headers; BYOK preserved, gateway key configured per provider and never persisted by the runtime. |
 
 ### 9.4 Registry and test matrix
 
@@ -852,7 +838,7 @@ the product never regresses:
 
 | Stage | Deliverable |
 |---|---|
-| A. Freeze | lock the v7.5.6 UI baselines (visual/behavioral) and the pinned frontend source (`ui/kilo-v756-webview`) for old-UI shells |
+| A. Freeze | lock the Faktor-owned UI baselines (the VS Code panel selftest/VSIX gates and the JetBrains behavioral/visual matrices) |
 | C. Persistence | `faktor-store` + `faktor-cas` + the durable session state machine (journal, tool-run ledger, recovery) |
 | D. Providers | `faktor-provider` hub + adapter families + registry + capability normalization |
 | E. Tools | transactional edit, native snapshots, fs/git, terminal supervision, MCP/LSP, sandbox |
@@ -861,7 +847,7 @@ the product never regresses:
 | H. Indexing | hybrid index + rank-fused retrieval + structured memory |
 | I. Snapshots | CAS checkpoints with rollback verification wired into edits |
 | J. Agent manager | daemon-owned background agents (Agent Manager cards) |
-| K. Compat retirement (DONE) | the optional v7.5.6 wire-compatibility surface + fixtures were removed by explicit owner decision — nothing in the runtime depended on them; the native protocol is the daemon's own surface |
+| K. Compat retirement (DONE) | the optional pre-cutover wire-compatibility surface + fixtures were removed by explicit owner decision — nothing in the runtime depended on them; the native protocol is the daemon's own surface. The Faktor-owned-UI migration then removed every vendored UI corpus/bundle and the message-ABI bridge. |
 
 ---
 
@@ -873,25 +859,24 @@ cursor-based paging, and the native endpoints under `/native/...` plus the
 projection/catalog surfaces. It is not a compatibility artifact — it
 evolves with the runtime, and its tests are ordinary crate tests.
 
-The **v7.5.6 wire-compatibility subsystem was retired by explicit owner
-decision**: the frozen routes, the mirrored DTOs, the fixture corpus
-(`compat/kilo-v756/`), the fixture generators/replayers and the
-`kilo-compat` certification lane no longer exist. No Kilo wire/behavior
-parity is claimed or measured. The v7.5.6 frontend sources remain vendored
-as a pinned UI source dependency (`ui/kilo-v756-webview`) and are served
-by the IDE shells through the native bridge.
+The **pre-cutover wire-compatibility subsystem was retired by explicit
+owner decision**: the frozen routes, the mirrored DTOs, the fixture corpus,
+the fixture generators/replayers and the compatibility certification lane
+no longer exist. No foreign wire/behavior parity is claimed or measured.
+The vendored UI sources were removed as well; the Faktor-owned panels are
+the only rendering implementations.
 
-- **Startup line:** `kilo serve --port 0` prints exactly
+- **Startup line:** `faktor-cli serve --port 0` prints exactly
   `faktor server listening on http://127.0.0.1:<port>` and **nothing else**
   to stdout (logging goes to stderr). The client parses stdout for this
   line; there is no JSON handshake. The password never appears on stdout.
 - **Auth:** the frontend generates a 64-hex `FAKTOR_SERVER_PASSWORD` and
   passes it via the environment. Every endpoint is authenticated with
-  `Authorization: Basic base64("kilo:" + password)`; the Faktor-native
-  forms `Authorization: Bearer <password>` and `x-faktor-server-password:
-  <password>` remain accepted, and the legacy per-start `AuthToken` keeps
-  old clients/tests working. `Bearer <password>` is **not** the only
-  accepted claim; wrong/missing credentials → 401.
+  `Authorization: Bearer <password>` or `x-faktor-server-password:
+  <password>`; the legacy per-start `AuthToken` rides the same Bearer
+  header. The pre-cutover `Basic` compatibility form is **gone** (a Basic
+  header is rejected like any other unknown scheme; see the migration note
+  in `crates/server/src/auth.rs`); wrong/missing credentials → 401.
 - **Native surface:** `/session/{id}/projection`, `/models`,
   `/capabilities`, and the `/native/...` mounts (health/ready, usage,
   session listings, task runs, tournaments, terminals, attachments,

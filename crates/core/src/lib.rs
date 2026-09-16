@@ -63,8 +63,8 @@ pub use time::{Clock, Deadline, SystemClock, TestClock};
 
 /// The Faktor daemon version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// The vendored baseline UX this build ships as its frontend.
-pub const UX_BASELINE: &str = "kilo-v7.5.6";
+/// The Faktor-owned UI baseline this build ships as its frontend.
+pub const UX_BASELINE: &str = "faktor-native-ui-1";
 
 /// Every file/tool call explicitly carries its workspace identity.
 /// There is no global mutable "current directory" in the runtime.
@@ -88,7 +88,10 @@ impl WorkspaceIdentity {
 /// Zero is never a valid identifier; ID newtype constructors assert on 0.
 #[allow(dead_code)]
 pub(crate) fn reject_zero(raw: u64, what: &str) -> u64 {
-    assert!(raw != 0, "kilo-core invariant violated: {what} cannot be 0");
+    assert!(
+        raw != 0,
+        "faktor-core invariant violated: {what} cannot be 0"
+    );
     raw
 }
 
