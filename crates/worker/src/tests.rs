@@ -1166,6 +1166,7 @@ fn duplicate_landing_is_impossible_at_the_store_layer() {
         digest: digest("a"),
         outcome: JobResultOutcome::Succeeded,
         accepted_ms: 1,
+        verification: Default::default(),
     };
     // The job/lease rows are absent, so landing refuses; the point is that
     // the store never invents a result row from a refusal.

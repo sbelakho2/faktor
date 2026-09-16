@@ -10,13 +10,18 @@ faktor-provider.workspace = true
 async-trait = "0.1"
 hmac = "0.12"
 sha2 = "0.10"
+base64 = "0.22"
+ring = "0.17"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tokio.workspace = true
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 [dev-dependencies]
 tokio.workspace = true
 axum = "0.8"
+http = "1"
 tempfile.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls", "http2"] }

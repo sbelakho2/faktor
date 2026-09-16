@@ -20,6 +20,7 @@ use faktor_core::id::SessionId;
 use faktor_router::stability::TurnPrefix;
 use faktor_verify::exec::{BudgetDecision, CheckOutcome, CheckRunStatus};
 
+pub mod credits;
 pub mod loop_detect;
 pub mod runtime;
 pub mod stall;
@@ -27,6 +28,10 @@ pub mod tool;
 pub mod tool_json;
 pub mod wire_plan;
 
+pub use credits::{
+    AttemptDebits, DebitDecision, DebitError, DebitHold, ProviderAttemptDebit,
+    ProviderAttemptDebits, MAX_DEBIT_TEXT_BYTES,
+};
 pub use faktor_core::model::{RiskBucket, RouteDecision, RouterPhase, RoutingMode, TaskClass};
 pub use faktor_core::state::{
     CheckExecution, CriterionVerification, FileStateEvidence, OutcomeReason, ReasonCode, TaskState,

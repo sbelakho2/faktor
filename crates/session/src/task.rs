@@ -1241,6 +1241,215 @@ impl ProofBasis {
         let bytes = serde_json::to_vec(self).unwrap_or_default();
         format!("blake3:{}", blake3::hash(&bytes).to_hex())
     }
+
+    /// The reserved `env_projection` key carrying the layered effective
+    /// configuration digest of this basis.
+    pub const CONFIG_DIGEST_KEY: &'static str = "faktor.config.effective_digest";
+
+    /// The layered effective-configuration digest bound into this basis,
+    /// when one was bound. A record's reuse is refused whenever the current
+    /// effective configuration (any layer: system/organization/repository/
+    /// user/session/task) no longer digests to the same value, because the
+    /// binding rides the basis digest the record was written under.
+    pub fn config_digest(&self) -> Option<&str> {
+        self.env_projection
+            .iter()
+            .rev()
+            .find(|(key, _)| key == Self::CONFIG_DIGEST_KEY)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// Bind the layered effective-configuration digest into this basis.
+    /// Bounded and strict: an empty/oversized/whitespace-bearing digest is
+    /// refused, and a second bind replaces the previous value (one binding
+    /// per basis). Any layer change yields a different digest, so the basis
+    /// digest — and with it the record's reuse key — changes.
+    pub fn bind_config_digest(mut self, digest: &str) -> Result<Self, TaskError> {
+        validate_proof_config_digest(digest)?;
+        self.env_projection
+            .retain(|(key, _)| key != Self::CONFIG_DIGEST_KEY);
+        self.env_projection
+            .push((Self::CONFIG_DIGEST_KEY.to_string(), digest.to_string()));
+        Ok(self)
+    }
+
+    /// Fail closed: whether this basis names the layered effective
+    /// configuration it was produced under. A basis without a binding can
+    /// never certify a completion proof that must be attributable to a
+    /// configuration (the caller refuses before writing the record).
+    pub fn require_config_digest(&self) -> Result<&str, TaskError> {
+        self.config_digest().ok_or_else(|| {
+            TaskError::Malformed(
+                "proof basis carries no layered effective-configuration digest; a \
+                 configuration-attributable proof must bind one (bind_config_digest)"
+                    .into(),
+            )
+        })
+    }
+}
+
+/// Hard bound on one layered effective-configuration digest string.
+pub const MAX_PROOF_CONFIG_DIGEST_BYTES: usize = 256;
+/// Hard bound on the ordered layers of one layered configuration binding.
+pub const MAX_PROOF_CONFIG_LAYERS: usize = 6;
+
+/// One configuration layer scope, outermost to innermost (the same order the
+/// effective configuration is resolved in). The vocabulary is the proof
+/// binding's own; the DIGEST of a layer's effective value is supplied by the
+/// configuration authority (never re-derived here).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofConfigScope {
+    System,
+    Organization,
+    Repository,
+    User,
+    Session,
+    Task,
+}
+
+impl ProofConfigScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ProofConfigScope::System => "system",
+            ProofConfigScope::Organization => "organization",
+            ProofConfigScope::Repository => "repository",
+            ProofConfigScope::User => "user",
+            ProofConfigScope::Session => "session",
+            ProofConfigScope::Task => "task",
+        }
+    }
+
+    /// Scope order rank (outermost = 0).
+    pub const fn rank(self) -> u8 {
+        match self {
+            ProofConfigScope::System => 0,
+            ProofConfigScope::Organization => 1,
+            ProofConfigScope::Repository => 2,
+            ProofConfigScope::User => 3,
+            ProofConfigScope::Session => 4,
+            ProofConfigScope::Task => 5,
+        }
+    }
+}
+
+/// One ordered stamp of the layered effective configuration as bound into a
+/// proof basis: the scope, the layer's monotonic revision, and the digest of
+/// the layer's effective values. Any of the three changing is a different
+/// layer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProofConfigLayer {
+    pub scope: ProofConfigScope,
+    pub revision: u64,
+    pub digest: String,
+}
+
+impl ProofConfigLayer {
+    /// Build one layer stamp from an opaque effective-value digest supplied
+    /// by the configuration authority. The digest is validated (bounded,
+    /// printable, non-empty) — never trusted blindly into a durable row.
+    pub fn new(
+        scope: ProofConfigScope,
+        revision: u64,
+        digest: impl Into<String>,
+    ) -> Result<Self, TaskError> {
+        let digest = digest.into();
+        validate_proof_config_digest(&digest)?;
+        Ok(Self {
+            scope,
+            revision,
+            digest,
+        })
+    }
+
+    /// Build one layer stamp from a layer VALUE by digesting it under the
+    /// proof-config domain. Deterministic: the same scope/revision/value is
+    /// the same stamp; changing the value changes the digest.
+    pub fn of_value(scope: ProofConfigScope, revision: u64, value: &str) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"faktor-proof-config-layer:v1\0");
+        hasher.update(scope.as_str().as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&revision.to_le_bytes());
+        hasher.update(&[0]);
+        hasher.update(value.as_bytes());
+        Self {
+            scope,
+            revision,
+            digest: format!("blake3:{}", hasher.finalize().to_hex()),
+        }
+    }
+}
+
+/// The layered effective-configuration digest: domain-separated over the
+/// ordered (outermost-to-innermost) layer stamps, so ANY layer change — a
+/// system-layer value, an organization policy revision — yields a different
+/// digest and every proof basis bound to the previous digest stops being
+/// reusable. The list must be strictly ordered by scope rank (a duplicated
+/// or out-of-order layer is refused, never silently sorted).
+pub fn layered_effective_config_digest(layers: &[ProofConfigLayer]) -> Result<String, TaskError> {
+    if layers.len() > MAX_PROOF_CONFIG_LAYERS {
+        return Err(TaskError::Malformed(format!(
+            "layered configuration binding carries {} layers (max {MAX_PROOF_CONFIG_LAYERS})",
+            layers.len()
+        )));
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"faktor-effective-config:v1\0");
+    let mut previous: Option<ProofConfigScope> = None;
+    for layer in layers {
+        if let Some(previous) = previous {
+            if layer.scope.rank() <= previous.rank() {
+                return Err(TaskError::Malformed(format!(
+                    "layered configuration binding is out of order: {} after {} (strict scope order required)",
+                    layer.scope.as_str(),
+                    previous.as_str()
+                )));
+            }
+        }
+        validate_proof_config_digest(&layer.digest)?;
+        hasher.update(&[layer.scope.rank()]);
+        hasher.update(layer.scope.as_str().as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&layer.revision.to_le_bytes());
+        hasher.update(&[0]);
+        hasher.update(layer.digest.as_bytes());
+        hasher.update(&[0]);
+        previous = Some(layer.scope);
+    }
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+/// Deterministic digest of one verification record's check-command basis
+/// (the fingerprint's `check_argv_cwd_env_hash`), domain-separated and
+/// length-prefixed so entry boundaries can never be forged by concatenation.
+/// The fingerprint schema requires BARE hex text, so the `blake3:` label
+/// stays out of this value.
+fn check_basis_digest(entries: &[String]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"faktor-check-basis:v1\0");
+    for entry in entries {
+        hasher.update(&(entry.len() as u64).to_le_bytes());
+        hasher.update(entry.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn validate_proof_config_digest(digest: &str) -> Result<(), TaskError> {
+    if digest.is_empty() || digest.len() > MAX_PROOF_CONFIG_DIGEST_BYTES {
+        return Err(TaskError::Malformed(format!(
+            "configuration digest must be 1..={MAX_PROOF_CONFIG_DIGEST_BYTES} bytes"
+        )));
+    }
+    if !digest.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(TaskError::Malformed(
+            "configuration digest must be printable ASCII without whitespace".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The result of asking whether an existing proof record may be reused under
@@ -2454,6 +2663,68 @@ impl SessionHandle {
             fingerprint_json.as_deref(),
             candidate_json.as_deref(),
         )?)
+    }
+
+    /// Create one verification record whose environment fingerprint EMBEDS
+    /// the supplied proof basis (schema v20 twin, additive): the row's
+    /// `proof_basis_digest` is `basis.digest()`, which includes the basis'
+    /// bound layered effective-configuration digest — so any layer change
+    /// alters the recorded digest and the record stops being reusable
+    /// ([`SessionHandle::verification_record_reusable`]). Fail closed: a
+    /// basis without a configuration binding is refused
+    /// ([`ProofBasis::require_config_digest`]), never silently written.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_verification_record_bound_to_basis(
+        &self,
+        task_id: TaskId,
+        tree_hash: Option<String>,
+        criteria: Vec<CriterionVerification>,
+        checks: Vec<CheckExecution>,
+        changed_files: Vec<FileStateEvidence>,
+        unrelated_changes: Vec<String>,
+        reviewer: Option<serde_json::Value>,
+        status: VerificationStatus,
+        started_ms: i64,
+        basis: &ProofBasis,
+        candidate_proof_ref: Option<CandidateProofRef>,
+    ) -> Result<VerificationRecordId, TaskError> {
+        // Fail closed: the proof must name the configuration it verified
+        // under; an unbound basis can never produce a configuration-
+        // attributable record.
+        basis.require_config_digest()?;
+        let check_basis: Vec<String> = checks
+            .iter()
+            .map(|c| format!("{}|{}|{}", c.check, c.program, c.args.join(" ")))
+            .collect();
+        let fingerprint = EnvironmentFingerprint {
+            platform: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            toolchain_versions: Vec::new(),
+            manifest_hashes: Vec::new(),
+            lockfile_hashes: Vec::new(),
+            instruction_epoch: basis.instruction_epoch,
+            // The verified tree is the record's own `tree_hash`; the
+            // fingerprint's base-tree field stays an honest absence (the
+            // session layer cannot re-derive a hex tree digest here).
+            base_tree_hash: None,
+            task_contract_hash: basis.task_contract_digest.clone(),
+            check_argv_cwd_env_hash: check_basis_digest(&check_basis),
+            verification_impl_version: basis.verification_impl_version.clone(),
+            proof_basis_digest: Some(basis.digest()),
+        };
+        self.create_verification_record_with_evidence(
+            task_id,
+            tree_hash,
+            criteria,
+            checks,
+            changed_files,
+            unrelated_changes,
+            reviewer,
+            status,
+            started_ms,
+            Some(fingerprint),
+            candidate_proof_ref,
+        )
     }
 
     /// One verification record by id, or `None`.
@@ -6388,6 +6659,130 @@ mod tests {
             .verification_record_reusable(record, &basis)
             .unwrap()
             .is_allowed());
+    }
+
+    #[test]
+    fn proof_record_cannot_be_reused_after_system_layer_config_change() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let t = s
+            .create_task(criteria_task(&s, s.task_id().unwrap(), vec!["c1".into()]))
+            .unwrap();
+        let rev = s.task_revision(t.task_id).unwrap();
+        let config = |system_value: &str| {
+            layered_effective_config_digest(&[
+                ProofConfigLayer::of_value(ProofConfigScope::System, 4, system_value),
+                ProofConfigLayer::of_value(ProofConfigScope::Task, 1, "task-overrides"),
+            ])
+            .unwrap()
+        };
+        let basis = proof_basis_fixture(t.task_id.raw(), rev.raw(), "check-basis-a")
+            .bind_config_digest(&config("network=allow"))
+            .unwrap();
+        let record = s
+            .create_verification_record_bound_to_basis(
+                t.task_id,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Passed,
+                1,
+                &basis,
+                None,
+            )
+            .unwrap();
+        // The row EMBEDS the configuration-bound basis digest.
+        let row = s.get_verification_record(record).unwrap().unwrap();
+        assert_eq!(
+            row.environment_fingerprint
+                .as_ref()
+                .and_then(|f| f.proof_basis_digest.as_deref()),
+            Some(basis.digest().as_str())
+        );
+        assert!(s
+            .verification_record_reusable(record, &basis)
+            .unwrap()
+            .is_allowed());
+
+        // A SYSTEM-layer value change yields a different layered digest, so
+        // the basis digest differs and the recorded proof is refused.
+        let changed = proof_basis_fixture(t.task_id.raw(), rev.raw(), "check-basis-a")
+            .bind_config_digest(&config("network=deny"))
+            .unwrap();
+        assert_ne!(basis.digest(), changed.digest());
+        match s.verification_record_reusable(record, &changed).unwrap() {
+            ProofReuse::Refused { reason } => {
+                assert!(reason.contains("identical basis"), "{reason}")
+            }
+            ProofReuse::Allowed => panic!("a changed system-layer value must refuse reuse"),
+        }
+    }
+
+    #[test]
+    fn unbound_basis_cannot_write_a_configuration_attributable_record() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let t = s
+            .create_task(criteria_task(&s, s.task_id().unwrap(), vec!["c1".into()]))
+            .unwrap();
+        let rev = s.task_revision(t.task_id).unwrap();
+        let unbound = proof_basis_fixture(t.task_id.raw(), rev.raw(), "check-basis-a");
+        assert!(unbound.require_config_digest().is_err());
+        let err = s
+            .create_verification_record_bound_to_basis(
+                t.task_id,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Passed,
+                1,
+                &unbound,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, TaskError::Malformed(_)), "{err:?}");
+        assert!(s.list_verification_records(t.task_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn layered_config_digest_is_order_sensitive_bounded_and_strict() {
+        let system = ProofConfigLayer::of_value(ProofConfigScope::System, 1, "a");
+        let task = ProofConfigLayer::of_value(ProofConfigScope::Task, 1, "b");
+        let digest = layered_effective_config_digest(&[system.clone(), task.clone()]).unwrap();
+        assert!(digest.starts_with("blake3:"));
+        assert!(layered_effective_config_digest(&[task.clone(), system.clone()]).is_err());
+        assert!(
+            layered_effective_config_digest(&[system.clone(), system.clone()]).is_err(),
+            "a duplicated layer is never silently deduplicated"
+        );
+        assert!(ProofConfigLayer::new(ProofConfigScope::System, 1, "").is_err());
+        assert!(ProofConfigLayer::new(ProofConfigScope::System, 1, "has space").is_err());
+
+        // Binding replaces a previous value (one binding per basis) and the
+        // basis digest covers it.
+        let basis = proof_basis_fixture(1, 1, "c");
+        let bound = basis.clone().bind_config_digest(&digest).unwrap();
+        assert_eq!(bound.config_digest(), Some(digest.as_str()));
+        assert_eq!(
+            bound
+                .env_projection
+                .iter()
+                .filter(|(k, _)| k == ProofBasis::CONFIG_DIGEST_KEY)
+                .count(),
+            1
+        );
+        assert_ne!(basis.digest(), bound.digest());
+        assert!(basis.clone().bind_config_digest("").is_err());
+        assert!(basis
+            .clone()
+            .bind_config_digest("x".repeat(1024).as_str())
+            .is_err());
     }
 
     fn proof_basis_fixture(task_id: u64, revision: u64, check: &str) -> ProofBasis {

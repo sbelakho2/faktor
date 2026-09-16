@@ -76,6 +76,11 @@ pub struct Config {
     /// daemon creates no enterprise database file and every
     /// `/native/enterprise/*` route answers a typed 409.
     pub enterprise: EnterpriseCfg,
+    /// The additive `[worker_node]` section: this host as a REMOTE worker of
+    /// a control plane. Disabled by default; while disabled the
+    /// `faktor worker run` entry refuses before any network or filesystem
+    /// effect and the daemon is byte-identical.
+    pub worker_node: WorkerNodeCfg,
 }
 
 /// The additive `[completion]` section (P2 follow-up): how a contracted
@@ -1308,6 +1313,219 @@ impl WorkersCfg {
     }
 }
 
+/// The additive `[worker_node]` section: THIS host acting as a remote worker
+/// node of a control plane (the client half of the `[workers]` plane).
+///
+/// Strict and additive:
+///
+/// - `enabled` (default `false`): while disabled `faktor worker run` refuses
+///   typed before any network or filesystem effect — the disabled-parity
+///   state of every pre-existing config;
+/// - `worker_id`, `token` XOR `token_file`, `control_plane_url`: the
+///   registration identity, credential and daemon base URL (required when
+///   enabled; the token never rides the config log line);
+/// - `trust_domain` (required) and the capability advertisement (`os`,
+///   `arch`, `toolchains`, `sandbox`, `network`, `region`, `cpu_cores`,
+///   `memory_mb`, `gpu`): the advertisement the plane reconciles. Only jobs
+///   whose required toolchains/sandbox/network profile the worker advertises
+///   are ever claimed;
+/// - `claim_deadline_ms` / `claim_interval_ms` / `heartbeat_interval_ms`:
+///   the bounded long-poll/heartbeat cadence (clamped by the worker crate);
+/// - `payload_dir`: the local directory the job payloads are staged in
+///   (`<payload_dir>/<digest>`); a missing payload is fail-closed
+///   (`PayloadUnavailable`: nothing executes, nothing submits);
+/// - `discard_workspace_on_success` (default `true`): bounded disk;
+/// - `iterations`: the bounded loop budget of one `worker run` invocation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerNodeCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub worker_id: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub token_file: Option<String>,
+    #[serde(default)]
+    pub control_plane_url: Option<String>,
+    #[serde(default)]
+    pub trust_domain: Option<String>,
+    #[serde(default)]
+    pub os: Option<String>,
+    #[serde(default)]
+    pub arch: Option<String>,
+    #[serde(default)]
+    pub toolchains: Vec<String>,
+    #[serde(default)]
+    pub sandbox: Vec<String>,
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub cpu_cores: u32,
+    #[serde(default)]
+    pub memory_mb: u64,
+    #[serde(default)]
+    pub gpu: bool,
+    #[serde(default)]
+    pub claim_deadline_ms: Option<i64>,
+    #[serde(default)]
+    pub claim_interval_ms: Option<i64>,
+    #[serde(default)]
+    pub heartbeat_interval_ms: Option<i64>,
+    #[serde(default)]
+    pub payload_dir: Option<String>,
+    #[serde(default)]
+    pub discard_workspace_on_success: Option<bool>,
+    #[serde(default)]
+    pub iterations: Option<u32>,
+}
+
+impl WorkerNodeCfg {
+    /// Validate the section (called by [`Config::validate`] on both load
+    /// paths). A disabled section validates nothing beyond its shape.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let _ = self.worker_id()?;
+        let _ = self.control_plane_url()?;
+        let _ = self.trust_domain()?;
+        match (&self.token, &self.token_file) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "worker_node: `token` and `token_file` are mutually exclusive; set exactly one"
+                        .into(),
+                )
+            }
+            (None, None) => return Err(
+                "worker_node: an enabled [worker_node] section requires `token` or `token_file`"
+                    .into(),
+            ),
+            _ => {}
+        }
+        let _ = self.capabilities()?;
+        if let Some(deadline) = self.claim_deadline_ms {
+            if !(0..=faktor_worker::MAX_CLAIM_DEADLINE_MS).contains(&deadline) {
+                return Err(format!(
+                    "worker_node: claim_deadline_ms must be 0..={}",
+                    faktor_worker::MAX_CLAIM_DEADLINE_MS
+                ));
+            }
+        }
+        if let Some(interval) = self.claim_interval_ms {
+            if interval < faktor_worker::MIN_CLAIM_INTERVAL_MS {
+                return Err(format!(
+                    "worker_node: claim_interval_ms must be >= {}",
+                    faktor_worker::MIN_CLAIM_INTERVAL_MS
+                ));
+            }
+        }
+        if let Some(iterations) = self.iterations {
+            if iterations == 0 || iterations > faktor_worker::MAX_LOOP_ITERATIONS {
+                return Err(format!(
+                    "worker_node: iterations must be 1..={}",
+                    faktor_worker::MAX_LOOP_ITERATIONS
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn worker_id(&self) -> Result<faktor_worker::WorkerId, String> {
+        let raw = self.worker_id.clone().ok_or_else(|| {
+            "worker_node: an enabled [worker_node] section requires `worker_id`".to_string()
+        })?;
+        faktor_worker::WorkerId::try_new(raw).map_err(|e| format!("worker_node: {e}"))
+    }
+
+    /// The daemon base URL (http(s), no trailing slash).
+    pub fn control_plane_url(&self) -> Result<String, String> {
+        let raw = self.control_plane_url.clone().ok_or_else(|| {
+            "worker_node: an enabled [worker_node] section requires `control_plane_url`".to_string()
+        })?;
+        let raw = raw.trim_end_matches('/').to_string();
+        if !(raw.starts_with("https://") || raw.starts_with("http://")) || raw.len() > 2048 {
+            return Err("worker_node: control_plane_url must be an http(s) URL".into());
+        }
+        Ok(raw)
+    }
+
+    pub fn trust_domain(&self) -> Result<String, String> {
+        let raw = self.trust_domain.clone().ok_or_else(|| {
+            "worker_node: an enabled [worker_node] section requires `trust_domain`".to_string()
+        })?;
+        let raw = raw.trim().to_ascii_lowercase();
+        if raw.is_empty() || raw.len() > 128 || !raw.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err("worker_node: trust_domain must be 1..=128 printable ASCII bytes".into());
+        }
+        Ok(raw)
+    }
+
+    /// The versioned capability advertisement this node registers.
+    pub fn capabilities(&self) -> Result<faktor_worker::WorkerCapabilities, String> {
+        let network = match self.network.as_deref() {
+            None | Some("none") => faktor_worker::NetworkProfile::None,
+            Some("egress_restricted") => faktor_worker::NetworkProfile::EgressRestricted,
+            Some("full") => faktor_worker::NetworkProfile::Full,
+            Some(other) => {
+                return Err(format!(
+                    "worker_node: network {other:?} must be one of none|egress_restricted|full"
+                ))
+            }
+        };
+        let cpu_cores = if self.cpu_cores > 0 {
+            self.cpu_cores
+        } else {
+            std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(1)
+        };
+        let memory_mb = if self.memory_mb > 0 {
+            self.memory_mb
+        } else {
+            4_096
+        };
+        let sandbox = self
+            .sandbox
+            .iter()
+            .map(|tag| faktor_worker::SandboxCapability::try_new(tag.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("worker_node: {e}"))?;
+        let mut capabilities = faktor_worker::WorkerCapabilities {
+            os: self
+                .os
+                .clone()
+                .unwrap_or_else(|| std::env::consts::OS.to_string()),
+            arch: self
+                .arch
+                .clone()
+                .unwrap_or_else(|| std::env::consts::ARCH.to_string()),
+            toolchains: self.toolchains.clone(),
+            sandbox,
+            network,
+            cpu_cores,
+            memory_mb,
+            gpu: self.gpu.then(|| faktor_worker::GpuCapability {
+                model: "unknown".into(),
+                count: 1,
+                memory_mb: 0,
+            }),
+            region: self.region.clone().unwrap_or_else(|| "local".to_string()),
+            trust_domain: self.trust_domain()?,
+            protocol_version: faktor_worker::WORKER_PROTOCOL_VERSION,
+        };
+        capabilities
+            .normalize()
+            .map_err(|e| format!("worker_node: {e}"))?;
+        Ok(capabilities)
+    }
+}
+
 /// The additive `[enterprise]` section: the enterprise retention/audit/
 /// admin plane (retention classes + guarded GC, the append-only audit
 /// ledger, deletion jobs, admin settings and the effective-config
@@ -1714,6 +1932,8 @@ impl<'de> serde::Deserialize<'de> for Config {
             workers: WorkersCfg,
             #[serde(default)]
             enterprise: EnterpriseCfg,
+            #[serde(default)]
+            worker_node: WorkerNodeCfg,
         }
         let file = File::deserialize(de)?;
         if file.config_version != 1 {
@@ -1741,6 +1961,7 @@ impl<'de> serde::Deserialize<'de> for Config {
             updater: file.updater,
             workers: file.workers,
             enterprise: file.enterprise,
+            worker_node: file.worker_node,
         })
     }
 }
@@ -1781,6 +2002,7 @@ impl Default for Config {
             updater: UpdaterCfg::default(),
             workers: WorkersCfg::default(),
             enterprise: EnterpriseCfg::default(),
+            worker_node: WorkerNodeCfg::default(),
         }
     }
 }
@@ -2458,6 +2680,7 @@ impl Config {
         self.updater.validate()?;
         self.workers.validate()?;
         self.enterprise.validate()?;
+        self.worker_node.validate()?;
         // The billing routes derive their tenant from the control-plane
         // principal, so an enabled billing section without the cloud section
         // could never authorize an organization-scoped read. The pair is
@@ -4609,6 +4832,63 @@ mod completion_cfg_tests {
             serde_json::from_str(r#"{"model": "m", "workers": {"database": "../escape.db"}}"#)
                 .unwrap();
         assert!(traversal.validate().is_err(), "path traversal is refused");
+    }
+
+    #[test]
+    fn worker_node_section_is_additive_strict_and_disabled_by_default() {
+        // Absent = disabled: the entry refuses before any effect.
+        let cfg = Config::default();
+        assert!(!cfg.worker_node.enabled);
+        assert!(cfg.worker_node.validate().is_ok());
+        // Strict shape: unknown keys, duplicates and wrong types are parse
+        // errors; a disabled section imposes nothing else.
+        for bad in [
+            r#"{"model": "m", "worker_node": {"enabled": false, "hostile": 1}}"#,
+            r#"{"model": "m", "worker_node": {"enabled": true, "enabled": true}}"#,
+            r#"{"model": "m", "worker_node": {"enabled": "yes"}}"#,
+            r#"{"model": "m", "worker_node": {"cpu_cores": -1}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Config>(bad).is_err(),
+                "the config must refuse: {bad}"
+            );
+        }
+        // An enabled section requires identity, credential, base URL and
+        // trust domain; token XOR token_file is enforced at validation.
+        let mut node = WorkerNodeCfg {
+            enabled: true,
+            worker_id: Some("wrk_local".into()),
+            control_plane_url: Some("http://127.0.0.1:8787/".into()),
+            trust_domain: Some("org_local".into()),
+            ..Default::default()
+        };
+        assert!(
+            node.validate().is_err(),
+            "an enabled node without a credential is refused"
+        );
+        node.token = Some("wkr_abc".into());
+        node.validate().expect("a complete node validates");
+        assert_eq!(
+            node.control_plane_url().unwrap(),
+            "http://127.0.0.1:8787",
+            "the trailing slash is normalized away"
+        );
+        node.token_file = Some("/tmp/token".into());
+        assert!(
+            node.validate().is_err(),
+            "token and token_file are mutually exclusive"
+        );
+        // The advertisement is normalized and protocol-pinned.
+        let capabilities = node.capabilities().unwrap();
+        assert_eq!(capabilities.trust_domain, "org_local");
+        assert_eq!(
+            capabilities.protocol_version,
+            faktor_worker::WORKER_PROTOCOL_VERSION
+        );
+        assert!(
+            capabilities.toolchains.is_empty(),
+            "an empty advertisement claims no toolchain"
+        );
     }
 
     #[test]

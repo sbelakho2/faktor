@@ -35,8 +35,8 @@ use crate::ids::{JobGeneration, JobKey, WorkerId, WorkerLeaseId};
 use crate::model::{
     clamp_heartbeat_interval, AttemptState, ExecutionJob, GenerationState, JobAttempt,
     JobGenerationRow, JobRequirements, JobResult, JobResultOutcome, JobState, JobStatus,
-    JournalEntry, LeaseState, RequeuePolicy, WorkerCapabilities, WorkerLease, WorkerPage,
-    WorkerRegistration, WorkerTokenRow, WorkerView, DEFAULT_MAX_ATTEMPTS,
+    JobVerificationClaim, JournalEntry, LeaseState, RequeuePolicy, WorkerCapabilities, WorkerLease,
+    WorkerPage, WorkerRegistration, WorkerTokenRow, WorkerView, DEFAULT_MAX_ATTEMPTS,
     HEARTBEAT_DEFAULT_INTERVAL_MS, MAX_LIVE_LEASES_PER_WORKER, MAX_WORKER_NAME_BYTES,
     RESULT_DIGEST_BYTES,
 };
@@ -46,6 +46,8 @@ use crate::store::{ResultAppend, WorkerStore};
 pub const MAX_WORKER_PAGE: usize = 200;
 /// Bound on one journal page.
 pub const MAX_JOURNAL_PAGE: usize = 500;
+/// Bound on the jobs one `claim_next` long-poll scan examines.
+pub const MAX_CLAIM_SCAN_JOBS: usize = 512;
 
 /// One minted registration token: the plaintext is exposed exactly once and
 /// never stored (only its SHA-256 hash is durable).
@@ -98,6 +100,17 @@ pub enum ResultOutcome {
     Landed,
     /// The identical result was already landed (idempotent replay).
     Duplicate,
+}
+
+/// One claimed job: the immutable job root plus the live lease this worker
+/// CAS-accepted for its current generation. Returned by
+/// [`WorkerPlane::claim_next`] — the worker-side runtime's transport
+/// long-polls/claims through the same method the wire adapter calls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimedLease {
+    pub job: ExecutionJob,
+    pub lease: WorkerLease,
 }
 
 /// A deterministic recovery sweep report.
@@ -575,6 +588,183 @@ impl WorkerPlane {
         self.accept_lease_inner(&worker, organization, &job, generation, now)
     }
 
+    /// Claim the next eligible job of one worker: scan the organization's
+    /// scheduled/requeued job index (the journal is the durable index of
+    /// every job the scheduler minted) for an un-leased `assigned`
+    /// generation this worker may take — its trust domain AND capability
+    /// advertisement must satisfy the job's immutable requirements, and an
+    /// assignment to another worker is skipped — then CAS-accept the lease
+    /// through the SAME atomic path every other accept uses. Exactly one
+    /// worker wins a generation; a lost CAS race skips to the next job and
+    /// is never retried blindly. `Ok(None)` = no eligible work right now
+    /// (the caller long-polls). Bounded: at most
+    /// [`MAX_CLAIM_SCAN_JOBS`] jobs are examined per call.
+    pub fn claim_next(
+        &self,
+        organization: &OrganizationId,
+        worker_id: &WorkerId,
+        token: &SecretToken,
+        protocol_version: u32,
+    ) -> Result<Option<ClaimedLease>, WorkerError> {
+        check_protocol(protocol_version)?;
+        let worker = self.authenticate(worker_id, token)?;
+        if worker.organization_id != organization.as_str() {
+            return Err(WorkerError::UnknownWorker(worker_id.clone()));
+        }
+        let now = self.now_ms();
+        let mut after: Option<i64> = None;
+        let mut scanned: usize = 0;
+        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        loop {
+            let page = self
+                .store
+                .journal(organization.as_str(), after, MAX_JOURNAL_PAGE)?;
+            if page.is_empty() {
+                return Ok(None);
+            }
+            after = page.last().map(|e| e.seq);
+            let short_page = page.len() < MAX_JOURNAL_PAGE;
+            for entry in &page {
+                if entry.kind != "job_scheduled" && entry.kind != "job_requeued" {
+                    continue;
+                }
+                let Some(job_id_raw) = &entry.job_id else {
+                    continue;
+                };
+                if !seen.insert(job_id_raw.clone()) {
+                    continue;
+                }
+                scanned += 1;
+                if scanned > MAX_CLAIM_SCAN_JOBS {
+                    return Ok(None);
+                }
+                let Ok(job_id) = crate::ids::ExecutionJobId::try_new(job_id_raw.clone()) else {
+                    continue;
+                };
+                let Some(job) = self.store.job(&job_id)? else {
+                    continue;
+                };
+                if job.organization_id != organization.as_str() || job.state.is_terminal() {
+                    continue;
+                }
+                if worker.trust_domain != job.trust_domain {
+                    continue;
+                }
+                // Capability matching: a worker only ever receives jobs whose
+                // toolchains/sandbox/network profile it advertises. A
+                // mismatch is a SILENT skip (the job is not for this worker),
+                // never a refused claim that would surface as an error.
+                if worker.capabilities.satisfies(&job.requirements).is_err() {
+                    continue;
+                }
+                if let Some(assigned) = &job.assigned_worker {
+                    if assigned != &worker.worker_id {
+                        continue;
+                    }
+                }
+                let generation = job.current_generation;
+                if self
+                    .store
+                    .lease_for_generation(&job_id, generation)?
+                    .is_some()
+                {
+                    continue;
+                }
+                let Some(generation_row) = self.store.generation(&job_id, generation)? else {
+                    continue;
+                };
+                if generation_row.state != GenerationState::Assigned {
+                    continue;
+                }
+                match self.accept_lease_inner(&worker, organization, &job, generation, now) {
+                    Ok(lease) => {
+                        self.journal(
+                            organization.as_str(),
+                            "job_claimed",
+                            now,
+                            Some(&worker.worker_id),
+                            Some(&job.job_id),
+                            Some(generation),
+                            format!("lease={} claimed via long-poll", lease.lease_id),
+                        )?;
+                        return Ok(Some(ClaimedLease { job, lease }));
+                    }
+                    // Someone else moved first (a concurrent claim, a
+                    // requeue, or this worker's own saturation): skip to the
+                    // next candidate, never retry this one blindly.
+                    Err(WorkerError::LeaseAlreadyTaken { .. })
+                    | Err(WorkerError::NotLeasable { .. })
+                    | Err(WorkerError::SupersededLease { .. })
+                    | Err(WorkerError::NotAssignedToWorker { .. })
+                    | Err(WorkerError::CapabilityMismatch { .. })
+                    | Err(WorkerError::WorkerSaturated { .. }) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            if short_page {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Additive worker-side claim support: one LIVE lease this worker already
+    /// holds for a non-terminal current generation. The scheduler's placement
+    /// CAS may have accepted the lease on the worker's behalf (the
+    /// orchestrator's placement adapter leases the generation it mints), so a
+    /// long-polling worker adopts that lease here instead of sitting idle on a
+    /// generation someone already holds for it. The regular heartbeat then
+    /// renews the adopted lease and the result lands through the same
+    /// generation-checked path. `Ok(None)` = nothing to adopt. Bounded: only
+    /// this worker's own live leases are examined.
+    pub fn adoptable_lease(
+        &self,
+        organization: &OrganizationId,
+        worker_id: &WorkerId,
+        token: &SecretToken,
+        protocol_version: u32,
+    ) -> Result<Option<ClaimedLease>, WorkerError> {
+        check_protocol(protocol_version)?;
+        let worker = self.authenticate(worker_id, token)?;
+        if worker.organization_id != organization.as_str() {
+            return Err(WorkerError::UnknownWorker(worker_id.clone()));
+        }
+        let now = self.now_ms();
+        for lease in self.store.live_leases_of_worker(worker_id)? {
+            if lease.organization_id != organization.as_str() {
+                continue;
+            }
+            if lease.is_expired_at(now) {
+                continue;
+            }
+            let Some(job) = self.store.job(&lease.job_id)? else {
+                continue;
+            };
+            if job.state.is_terminal() || job.current_generation != lease.generation {
+                continue;
+            }
+            if worker.trust_domain != job.trust_domain {
+                continue;
+            }
+            if worker.capabilities.satisfies(&job.requirements).is_err() {
+                continue;
+            }
+            self.journal(
+                organization.as_str(),
+                "job_adopted",
+                now,
+                Some(&worker.worker_id),
+                Some(&job.job_id),
+                Some(lease.generation),
+                format!(
+                    "lease={} adopted from the scheduler's placement",
+                    lease.lease_id
+                ),
+            )?;
+            return Ok(Some(ClaimedLease { job, lease }));
+        }
+        Ok(None)
+    }
+
     fn accept_lease_inner(
         &self,
         worker: &WorkerRegistration,
@@ -842,6 +1032,11 @@ impl WorkerPlane {
     /// generation is the job's current generation: a superseded/stale result
     /// is the typed [`WorkerError::SupersededLease`], journaled and never
     /// landed.
+    ///
+    /// This is the legacy entry: it lands the result with the DEFAULT
+    /// (fail-closed) verification claim — "not self-verified". Workers that
+    /// ran their own deterministic verification report it through
+    /// [`Self::submit_result_with_claim`].
     #[allow(clippy::too_many_arguments)]
     pub fn submit_result(
         &self,
@@ -854,6 +1049,40 @@ impl WorkerPlane {
         lease_id: &WorkerLeaseId,
         digest: &str,
         outcome: JobResultOutcome,
+    ) -> Result<ResultOutcome, WorkerError> {
+        self.submit_result_with_claim(
+            organization,
+            worker_id,
+            token,
+            protocol_version,
+            job_id,
+            generation,
+            lease_id,
+            digest,
+            outcome,
+            JobVerificationClaim::default(),
+        )
+    }
+
+    /// Land one worker result together with the worker's verification claim
+    /// (whether the worker-side pipeline ran its own deterministic checks,
+    /// and the digest of the produced tree when it mutated one). The claim is
+    /// durable on the landed [`JobResult`]; the ORIGIN decides whether it is
+    /// sufficient to settle the parent run (documented classification) or
+    /// whether the attempt must be marked for origin verification.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_result_with_claim(
+        &self,
+        organization: &OrganizationId,
+        worker_id: &WorkerId,
+        token: &SecretToken,
+        protocol_version: u32,
+        job_id: &crate::ids::ExecutionJobId,
+        generation: JobGeneration,
+        lease_id: &WorkerLeaseId,
+        digest: &str,
+        outcome: JobResultOutcome,
+        verification: JobVerificationClaim,
     ) -> Result<ResultOutcome, WorkerError> {
         check_protocol(protocol_version)?;
         validate_digest(digest)?;
@@ -991,6 +1220,7 @@ impl WorkerPlane {
             digest: digest.to_string(),
             outcome,
             accepted_ms: now,
+            verification,
         };
         let landed = self.store.land_result(&result)?;
         match landed {

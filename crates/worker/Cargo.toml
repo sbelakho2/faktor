@@ -14,6 +14,7 @@ thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 rand.workspace = true
+blake3.workspace = true
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 [dev-dependencies]

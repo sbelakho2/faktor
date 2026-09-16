@@ -593,6 +593,27 @@ pub enum JobResultOutcome {
     Failed,
 }
 
+/// The verification claim a worker attaches to its result: whether the
+/// worker-side pipeline ran its own DETERMINISTIC verification (compile/
+/// test/lint checks over the produced tree) and the digest of the produced
+/// tree when the run mutated one. The origin never treats the claim as a
+/// proof by itself: it decides, per the documented classification, whether a
+/// claimed self-verification is sufficient to settle the parent run (read-
+/// only runs) or whether the attempt must be marked for origin verification
+/// (fail closed). Additive (serde default): a pre-claim result row decodes
+/// as "not self-verified", the fail-closed value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobVerificationClaim {
+    /// `true` only when the worker's own pipeline verified the produced work.
+    pub self_verified: bool,
+    /// The digest of the produced tree when the run mutated one; `None`
+    /// means the run was read-only (the only class the origin may settle
+    /// from a self-verification claim).
+    #[serde(default)]
+    pub produced_digest: Option<String>,
+}
+
 /// One landed result. `(job_id, generation)` is unique: a duplicate
 /// acceptance is structurally impossible to land twice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -605,6 +626,9 @@ pub struct JobResult {
     pub digest: String,
     pub outcome: JobResultOutcome,
     pub accepted_ms: i64,
+    /// The worker's verification claim (see [`JobVerificationClaim`]).
+    #[serde(default)]
+    pub verification: JobVerificationClaim,
 }
 
 /// The append-only journal of the worker plane: every registration change,

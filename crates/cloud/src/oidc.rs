@@ -131,6 +131,10 @@ pub enum OidcError {
     WrongAudience { expected: String },
     #[error("oidc id token nonce does not match")]
     NonceMismatch,
+    #[error("oidc login state is unknown, expired or already used")]
+    StateInvalid,
+    #[error("oidc login redirect_uri does not match the one the login started with")]
+    RedirectMismatch,
     #[error("oidc membership refused: {0}")]
     MembershipRefused(String),
 }
@@ -295,7 +299,7 @@ impl FakeOidcAdapter {
     }
 }
 
-fn hmac_sha256(secret: &[u8], message: &[u8]) -> Vec<u8> {
+pub(crate) fn hmac_sha256(secret: &[u8], message: &[u8]) -> Vec<u8> {
     const BLOCK: usize = 64;
     let mut key = if secret.len() > BLOCK {
         Sha256::digest(secret).to_vec()
@@ -315,7 +319,7 @@ fn hmac_sha256(secret: &[u8], message: &[u8]) -> Vec<u8> {
     Sha256::digest(&outer).to_vec()
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -521,32 +525,42 @@ impl OidcAdapter for FakeOidcAdapter {
         claims: &OidcClaims,
         mapping: &ClaimMapping,
     ) -> Result<OidcMembership, OidcError> {
-        if mapping.require_verified_email && !claims.email_verified {
-            return Err(OidcError::MembershipRefused(
-                "the id token does not carry a verified email".into(),
-            ));
-        }
-        let email = claims.email.clone().ok_or_else(|| {
-            OidcError::MembershipRefused("the id token carries no email claim".into())
-        })?;
-        let mut matched_groups: Vec<String> = Vec::new();
-        let mut role: Option<Role> = None;
-        for group in &claims.groups {
-            if let Some(mapped) = mapping.group_roles.get(group) {
-                matched_groups.push(group.clone());
-                role = Some(match role {
-                    Some(current) if current.rank() >= mapped.rank() => current,
-                    _ => *mapped,
-                });
-            }
-        }
-        Ok(OidcMembership {
-            subject: claims.subject.clone(),
-            email,
-            role: role.unwrap_or(mapping.default_role),
-            matched_groups,
-        })
+        map_membership_claims(claims, mapping)
     }
+}
+
+/// The ONE claim -> membership mapping shared by every adapter (local fake
+/// and the network adapter): verified email when demanded, highest matched
+/// group wins, the configured default role otherwise. Pure.
+pub(crate) fn map_membership_claims(
+    claims: &OidcClaims,
+    mapping: &ClaimMapping,
+) -> Result<OidcMembership, OidcError> {
+    if mapping.require_verified_email && !claims.email_verified {
+        return Err(OidcError::MembershipRefused(
+            "the id token does not carry a verified email".into(),
+        ));
+    }
+    let email = claims.email.clone().ok_or_else(|| {
+        OidcError::MembershipRefused("the id token carries no email claim".into())
+    })?;
+    let mut matched_groups: Vec<String> = Vec::new();
+    let mut role: Option<Role> = None;
+    for group in &claims.groups {
+        if let Some(mapped) = mapping.group_roles.get(group) {
+            matched_groups.push(group.clone());
+            role = Some(match role {
+                Some(current) if current.rank() >= mapped.rank() => current,
+                _ => *mapped,
+            });
+        }
+    }
+    Ok(OidcMembership {
+        subject: claims.subject.clone(),
+        email,
+        role: role.unwrap_or(mapping.default_role),
+        matched_groups,
+    })
 }
 
 /// SCIM provisioning: PLACEHOLDER interface, documented but NOT implemented.

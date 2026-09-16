@@ -906,6 +906,7 @@ dependencies = [
 name = "faktor-cli"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "clap",
  "faktor-acp",
  "faktor-agent",
@@ -967,13 +968,19 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
+ "faktor-provider",
+ "futures-util",
+ "http",
  "rand",
+ "reqwest",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
  "uuid",
 ]
@@ -1381,8 +1388,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "faktor-provider",
  "hmac",
+ "http",
+ "reqwest",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1856,6 +1867,7 @@ dependencies = [
 name = "faktor-worker"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "faktor-cloud",
  "rand",
  "rusqlite",

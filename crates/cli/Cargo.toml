@@ -58,6 +58,9 @@ rand.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
+# Test-only: the worker-transport round-trip binds the same payload digest
+# the orchestrator's placement spec mints (BLAKE3 hex).
+blake3.workspace = true
 # Test-only: doctor --deep adversarial tests craft durable corruptions
 # (dangling cost reservations, deleted verification records, orphaned
 # orchestrator fact rows, ownerless active turns) by direct SQL against the

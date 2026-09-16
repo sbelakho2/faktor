@@ -30,6 +30,9 @@ pub mod caps;
 /// The additive worker-plane placement seam (disabled by default).
 pub mod placement;
 pub mod proof_probe;
+/// The additive remote-run completion gate (a landed remote result settles
+/// through the SAME post-run pipeline; non-self-verifying results refuse).
+pub mod remote_completion;
 pub mod runtime;
 pub mod tournament;
 

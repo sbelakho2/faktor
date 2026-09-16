@@ -1,0 +1,745 @@
+//! The NETWORK OIDC adapter: the [`OidcAdapter`] contract over the checked
+//! egress transport.
+//!
+//! [`NetworkOidcAdapter`] implements [`AsyncOidcAdapter`] — the asynchronous
+//! sibling of the in-process [`crate::oidc::OidcAdapter`] seam (every sync
+//! adapter, including [`crate::oidc::FakeOidcAdapter`], is usable through it
+//! via a blanket forwarding impl) — over the ONE checked transport
+//! ([`faktor_provider::egress::HttpTransport`]): discovery, authorization-code
+//! exchange, ID-token verification with JWKS rotation and claim -> membership
+//! mapping. No `reqwest` type is named here; every request executes through
+//! [`faktor_provider::egress::execute_raw`], so the transport's request-time
+//! destination gate applies to every call.
+//!
+//! Caching and bounds (all documented):
+//!
+//! - **discovery** is cached for the response's `Cache-Control: max-age`
+//!   (seconds), clamped to the configured ceiling; a missing header uses the
+//!   configured default. A hit never refetches;
+//! - **JWKS** is cached the same way. A token whose `kid` is not in the fresh
+//!   cache triggers at most [`NetworkOidcConfig::max_jwks_refetches`] FORCED
+//!   refetches per verification (bounded rotation response); a kid that stays
+//!   unknown after the bound is the typed [`OidcError::UnknownKey`];
+//! - response bodies are bounded by the transport's own
+//!   [`faktor_provider::egress::MAX_RAW_RESPONSE_BYTES`];
+//! - supported signature algorithms are exactly `HS256` (JWKS `oct`) and
+//!   `RS256` (JWKS `RSA`, RFC 7518 n/e components). Any other `alg` is
+//!   refused typed ([`OidcError::Malformed`]) — never accepted.
+
+use std::sync::{Arc, Mutex};
+
+use base64::Engine as _;
+use serde::Deserialize;
+
+use faktor_provider::egress::{execute_raw, HttpTransport, RawRequest};
+
+use crate::oidc::{
+    constant_time_eq, hmac_sha256, map_membership_claims, ClaimMapping, CodeExchangeRequest,
+    IdTokenExpectations, OidcAdapter, OidcClaims, OidcDiscovery, OidcError, OidcMembership,
+    OidcTokenSet,
+};
+
+/// Default discovery cache TTL when the provider sends no `Cache-Control`.
+pub const DEFAULT_DISCOVERY_MAX_AGE_MS: i64 = 300_000;
+/// Default JWKS cache TTL when the provider sends no `Cache-Control`.
+pub const DEFAULT_JWKS_MAX_AGE_MS: i64 = 300_000;
+/// Hard cap on the configured per-verification JWKS refetches.
+pub const MAX_JWKS_REFETCHES: u32 = 3;
+/// Hard cap on the configured discovery/JWKS max-age ceiling.
+pub const MAX_CACHE_MAX_AGE_MS: i64 = 3_600_000;
+
+/// The strict network-adapter configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkOidcConfig {
+    /// The ONE issuer this adapter serves; discovery of any other issuer is
+    /// refused (a document can never be swapped in).
+    pub issuer: String,
+    pub client_id: String,
+    /// Ceiling for the honored `Cache-Control: max-age` of discovery (and the
+    /// default when the header is absent).
+    pub discovery_max_age_ms: i64,
+    /// Ceiling for the honored `Cache-Control: max-age` of the JWKS.
+    pub jwks_max_age_ms: i64,
+    /// Forced JWKS refetches allowed per verification when the `kid` is
+    /// unknown (bounded rotation response).
+    pub max_jwks_refetches: u32,
+}
+
+impl Default for NetworkOidcConfig {
+    fn default() -> Self {
+        Self {
+            issuer: String::new(),
+            client_id: String::new(),
+            discovery_max_age_ms: DEFAULT_DISCOVERY_MAX_AGE_MS,
+            jwks_max_age_ms: DEFAULT_JWKS_MAX_AGE_MS,
+            max_jwks_refetches: 2,
+        }
+    }
+}
+
+impl NetworkOidcConfig {
+    /// Strict validation; every bound is enforced.
+    pub fn validate(&self) -> Result<(), OidcError> {
+        if !(self.issuer.starts_with("https://") || self.issuer.starts_with("http://")) {
+            return Err(OidcError::DiscoveryUnavailable(
+                "issuer must be an http(s) URL".into(),
+            ));
+        }
+        if self.issuer.ends_with('/') {
+            return Err(OidcError::DiscoveryUnavailable(
+                "issuer must not carry a trailing slash".into(),
+            ));
+        }
+        if self.client_id.trim().is_empty() || self.client_id.len() > 256 {
+            return Err(OidcError::DiscoveryUnavailable(
+                "client_id must be 1..=256 bytes".into(),
+            ));
+        }
+        for (field, value) in [
+            ("discovery_max_age_ms", self.discovery_max_age_ms),
+            ("jwks_max_age_ms", self.jwks_max_age_ms),
+        ] {
+            if value <= 0 || value > MAX_CACHE_MAX_AGE_MS {
+                return Err(OidcError::DiscoveryUnavailable(format!(
+                    "{field} must be 1..={MAX_CACHE_MAX_AGE_MS}"
+                )));
+            }
+        }
+        if self.max_jwks_refetches > MAX_JWKS_REFETCHES {
+            return Err(OidcError::DiscoveryUnavailable(format!(
+                "max_jwks_refetches must be <= {MAX_JWKS_REFETCHES}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The asynchronous OIDC adapter contract the control plane consumes: the
+/// exact [`OidcAdapter`] operations, awaited over the checked transport. A
+/// blanket impl forwards every in-process (sync) adapter.
+#[async_trait::async_trait]
+pub trait AsyncOidcAdapter: Send + Sync {
+    async fn discovery(&self, issuer: &str) -> Result<OidcDiscovery, OidcError>;
+    async fn exchange_code(&self, request: &CodeExchangeRequest)
+        -> Result<OidcTokenSet, OidcError>;
+    async fn verify_id_token(
+        &self,
+        id_token: &str,
+        expected: &IdTokenExpectations,
+    ) -> Result<OidcClaims, OidcError>;
+    fn map_membership(
+        &self,
+        claims: &OidcClaims,
+        mapping: &ClaimMapping,
+    ) -> Result<OidcMembership, OidcError>;
+}
+
+#[async_trait::async_trait]
+impl<T: OidcAdapter + Send + Sync> AsyncOidcAdapter for T {
+    async fn discovery(&self, issuer: &str) -> Result<OidcDiscovery, OidcError> {
+        OidcAdapter::discovery(self, issuer)
+    }
+
+    async fn exchange_code(
+        &self,
+        request: &CodeExchangeRequest,
+    ) -> Result<OidcTokenSet, OidcError> {
+        OidcAdapter::exchange_code(self, request)
+    }
+
+    async fn verify_id_token(
+        &self,
+        id_token: &str,
+        expected: &IdTokenExpectations,
+    ) -> Result<OidcClaims, OidcError> {
+        OidcAdapter::verify_id_token(self, id_token, expected)
+    }
+
+    fn map_membership(
+        &self,
+        claims: &OidcClaims,
+        mapping: &ClaimMapping,
+    ) -> Result<OidcMembership, OidcError> {
+        OidcAdapter::map_membership(self, claims, mapping)
+    }
+}
+
+/// One JWKS key as parsed from the provider document (metadata + the public
+/// or shared-secret material the verification needs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedJwksView {
+    pub kid: String,
+    pub kty: String,
+    pub alg: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct JwkKey {
+    kid: String,
+    kty: String,
+    alg: Option<String>,
+    /// `oct` shared secret (base64url).
+    k: Option<Vec<u8>>,
+    /// `RSA` modulus/exponent (base64url).
+    n: Option<Vec<u8>>,
+    e: Option<Vec<u8>>,
+}
+
+#[derive(Clone)]
+struct CachedDiscovery {
+    doc: OidcDiscovery,
+    fetched_ms: i64,
+    max_age_ms: i64,
+}
+
+struct CachedJwks {
+    keys: Vec<JwkKey>,
+    fetched_ms: i64,
+    max_age_ms: i64,
+}
+
+/// The network adapter over one checked transport + clock.
+pub struct NetworkOidcAdapter {
+    transport: Arc<dyn HttpTransport>,
+    clock: Arc<dyn crate::service::Clock>,
+    config: NetworkOidcConfig,
+    discovery_cache: Mutex<Option<CachedDiscovery>>,
+    jwks_cache: Mutex<Option<CachedJwks>>,
+}
+
+impl std::fmt::Debug for NetworkOidcAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetworkOidcAdapter")
+            .field("issuer", &self.config.issuer)
+            .field("client_id", &self.config.client_id)
+            .field(
+                "jwks_cached",
+                &self.jwks_cache.lock().map(|c| c.is_some()).unwrap_or(false),
+            )
+            .finish()
+    }
+}
+
+impl NetworkOidcAdapter {
+    /// Build + validate the adapter (no network call happens here).
+    pub fn new(
+        transport: Arc<dyn HttpTransport>,
+        clock: Arc<dyn crate::service::Clock>,
+        config: NetworkOidcConfig,
+    ) -> Result<Self, OidcError> {
+        config.validate()?;
+        Ok(Self {
+            transport,
+            clock,
+            config,
+            discovery_cache: Mutex::new(None),
+            jwks_cache: Mutex::new(None),
+        })
+    }
+
+    /// The current JWKS metadata (never key material); fetched when the cache
+    /// is empty or stale.
+    pub async fn jwks_view(&self) -> Result<Vec<CachedJwksView>, OidcError> {
+        let keys = self.jwks_keys(false).await?;
+        Ok(keys
+            .iter()
+            .map(|key| CachedJwksView {
+                kid: key.kid.clone(),
+                kty: key.kty.clone(),
+                alg: key.alg.clone(),
+            })
+            .collect())
+    }
+
+    fn lock_discovery(&self) -> std::sync::MutexGuard<'_, Option<CachedDiscovery>> {
+        self.discovery_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock_jwks(&self) -> std::sync::MutexGuard<'_, Option<CachedJwks>> {
+        self.jwks_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    async fn fetch_discovery(&self) -> Result<CachedDiscovery, OidcError> {
+        let url = format!("{}/.well-known/openid-configuration", self.config.issuer);
+        let response = execute_raw(&*self.transport, RawRequest::new("GET", url))
+            .await
+            .map_err(|e| OidcError::DiscoveryUnavailable(e.to_string()))?;
+        if !(200..300).contains(&response.status) {
+            return Err(OidcError::DiscoveryUnavailable(format!(
+                "discovery endpoint answered {}",
+                response.status
+            )));
+        }
+        let raw: RawDiscovery = serde_json::from_slice(&response.body)
+            .map_err(|e| OidcError::DiscoveryUnavailable(format!("discovery json: {e}")))?;
+        if raw.issuer != self.config.issuer {
+            return Err(OidcError::DiscoveryUnavailable(format!(
+                "discovery document names issuer {:?}, expected {:?}",
+                raw.issuer, self.config.issuer
+            )));
+        }
+        for endpoint in [
+            &raw.authorization_endpoint,
+            &raw.token_endpoint,
+            &raw.jwks_uri,
+        ] {
+            if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
+                return Err(OidcError::DiscoveryUnavailable(format!(
+                    "discovery endpoint {endpoint:?} is not an http(s) URL"
+                )));
+            }
+        }
+        let now = self.clock.now_ms();
+        let max_age = response
+            .header("cache-control")
+            .and_then(parse_cache_control_max_age)
+            .map(|secs| secs.saturating_mul(1000).max(1))
+            .unwrap_or(self.config.discovery_max_age_ms)
+            .min(self.config.discovery_max_age_ms);
+        let cached = CachedDiscovery {
+            doc: OidcDiscovery {
+                issuer: raw.issuer,
+                authorization_endpoint: raw.authorization_endpoint,
+                token_endpoint: raw.token_endpoint,
+                jwks_uri: raw.jwks_uri,
+                supported_algorithms: raw.id_token_signing_alg_values_supported,
+            },
+            fetched_ms: now,
+            max_age_ms: max_age,
+        };
+        *self.lock_discovery() = Some(cached.clone());
+        Ok(cached)
+    }
+
+    async fn fetch_jwks(&self) -> Result<Vec<JwkKey>, OidcError> {
+        let doc = self.discovery(&self.config.issuer).await?;
+        let response = execute_raw(&*self.transport, RawRequest::new("GET", doc.jwks_uri))
+            .await
+            .map_err(|e| OidcError::DiscoveryUnavailable(format!("jwks: {e}")))?;
+        if !(200..300).contains(&response.status) {
+            return Err(OidcError::DiscoveryUnavailable(format!(
+                "jwks endpoint answered {}",
+                response.status
+            )));
+        }
+        let document: RawJwks = serde_json::from_slice(&response.body)
+            .map_err(|e| OidcError::DiscoveryUnavailable(format!("jwks json: {e}")))?;
+        if document.keys.len() > 64 {
+            return Err(OidcError::DiscoveryUnavailable(
+                "jwks document carries more than 64 keys".into(),
+            ));
+        }
+        let now = self.clock.now_ms();
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let mut keys = Vec::with_capacity(document.keys.len());
+        for raw in document.keys {
+            let decode =
+                |value: Option<String>, what: &str| -> Result<Option<Vec<u8>>, OidcError> {
+                    match value {
+                        None => Ok(None),
+                        Some(value) => engine.decode(value.as_bytes()).map(Some).map_err(|e| {
+                            OidcError::DiscoveryUnavailable(format!(
+                                "jwks {what} is not base64url: {e}"
+                            ))
+                        }),
+                    }
+                };
+            keys.push(JwkKey {
+                kid: raw.kid,
+                kty: raw.kty,
+                alg: raw.alg,
+                k: decode(raw.k, "k")?,
+                n: decode(raw.n, "n")?,
+                e: decode(raw.e, "e")?,
+            });
+        }
+        let max_age = response
+            .header("cache-control")
+            .and_then(parse_cache_control_max_age)
+            .map(|secs| secs.saturating_mul(1000).max(1))
+            .unwrap_or(self.config.jwks_max_age_ms)
+            .min(self.config.jwks_max_age_ms);
+        *self.lock_jwks() = Some(CachedJwks {
+            keys: keys.clone(),
+            fetched_ms: now,
+            max_age_ms: max_age,
+        });
+        Ok(keys)
+    }
+
+    /// Resolve one signing key by `kid`: a fresh cache hit wins, otherwise
+    /// the JWKS is (re)fetched. A `kid` missing from the fresh cache is
+    /// answered with at most `max_jwks_refetches` forced refetches.
+    async fn jwks_keys(&self, force: bool) -> Result<Vec<JwkKey>, OidcError> {
+        let now = self.clock.now_ms();
+        if !force {
+            let cache = self.lock_jwks();
+            if let Some(cached) = &*cache {
+                if now.saturating_sub(cached.fetched_ms) < cached.max_age_ms {
+                    return Ok(cached.keys.clone());
+                }
+            }
+        }
+        self.fetch_jwks().await
+    }
+
+    async fn signing_key(&self, kid: &str) -> Result<JwkKey, OidcError> {
+        let now = self.clock.now_ms();
+        {
+            let cache = self.lock_jwks();
+            if let Some(cached) = &*cache {
+                if now.saturating_sub(cached.fetched_ms) < cached.max_age_ms {
+                    if let Some(key) = cached.keys.iter().find(|key| key.kid == kid) {
+                        return Ok(key.clone());
+                    }
+                }
+            }
+        }
+        let mut refetches: u32 = 0;
+        loop {
+            let keys = self.fetch_jwks().await?;
+            if let Some(key) = keys.iter().find(|key| key.kid == kid) {
+                return Ok(key.clone());
+            }
+            refetches += 1;
+            if refetches > self.config.max_jwks_refetches {
+                return Err(OidcError::UnknownKey(kid.to_string()));
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncOidcAdapter for NetworkOidcAdapter {
+    async fn discovery(&self, issuer: &str) -> Result<OidcDiscovery, OidcError> {
+        if issuer != self.config.issuer {
+            return Err(OidcError::DiscoveryUnavailable(format!(
+                "issuer {issuer:?} is not served by this adapter"
+            )));
+        }
+        let now = self.clock.now_ms();
+        {
+            let cache = self.lock_discovery();
+            if let Some(cached) = &*cache {
+                if now.saturating_sub(cached.fetched_ms) < cached.max_age_ms {
+                    return Ok(cached.doc.clone());
+                }
+            }
+        }
+        Ok(self.fetch_discovery().await?.doc)
+    }
+
+    async fn exchange_code(
+        &self,
+        request: &CodeExchangeRequest,
+    ) -> Result<OidcTokenSet, OidcError> {
+        if request.code.is_empty()
+            || request.redirect_uri.is_empty()
+            || request.code_verifier.is_empty()
+        {
+            return Err(OidcError::CodeExchangeRefused(
+                "code, redirect_uri and code_verifier are required".into(),
+            ));
+        }
+        let doc = self.discovery(&self.config.issuer).await?;
+        let form = [
+            ("grant_type", "authorization_code"),
+            ("code", request.code.as_str()),
+            ("redirect_uri", request.redirect_uri.as_str()),
+            ("code_verifier", request.code_verifier.as_str()),
+            ("client_id", self.config.client_id.as_str()),
+        ];
+        let mut body = String::new();
+        for (index, (name, value)) in form.iter().enumerate() {
+            if index > 0 {
+                body.push('&');
+            }
+            body.push_str(name);
+            body.push('=');
+            body.push_str(&urlencode(value));
+        }
+        let raw = execute_raw(
+            &*self.transport,
+            RawRequest::new("POST", doc.token_endpoint)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("accept", "application/json")
+                .bytes_body(body.into_bytes()),
+        )
+        .await
+        .map_err(|e| OidcError::CodeExchangeRefused(e.to_string()))?;
+        if !(200..300).contains(&raw.status) {
+            return Err(OidcError::CodeExchangeRefused(format!(
+                "token endpoint answered {}",
+                raw.status
+            )));
+        }
+        let token: RawTokenResponse = serde_json::from_slice(&raw.body)
+            .map_err(|e| OidcError::CodeExchangeRefused(format!("token json: {e}")))?;
+        if token.id_token.is_empty() {
+            return Err(OidcError::CodeExchangeRefused(
+                "token response carries no id_token".into(),
+            ));
+        }
+        if token.token_type.is_empty() {
+            return Err(OidcError::CodeExchangeRefused(
+                "token response carries no token_type".into(),
+            ));
+        }
+        Ok(OidcTokenSet {
+            access_token: token.access_token.unwrap_or_default(),
+            id_token: token.id_token,
+            token_type: token.token_type,
+            expires_in_s: token.expires_in.unwrap_or(0),
+        })
+    }
+
+    async fn verify_id_token(
+        &self,
+        id_token: &str,
+        expected: &IdTokenExpectations,
+    ) -> Result<OidcClaims, OidcError> {
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let mut segments = id_token.split('.');
+        let (Some(header_b64), Some(payload_b64), Some(signature_b64), None) = (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ) else {
+            return Err(OidcError::Malformed(
+                "a JWT must have exactly three dot-separated segments".into(),
+            ));
+        };
+        let header: serde_json::Value = serde_json::from_slice(
+            &engine
+                .decode(header_b64)
+                .map_err(|e| OidcError::Malformed(format!("header base64: {e}")))?,
+        )
+        .map_err(|e| OidcError::Malformed(format!("header json: {e}")))?;
+        let kid = header
+            .get("kid")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| OidcError::Malformed("header carries no kid".into()))?;
+        let alg = header
+            .get("alg")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| OidcError::Malformed("header carries no alg".into()))?;
+        let signature = engine
+            .decode(signature_b64)
+            .map_err(|e| OidcError::Malformed(format!("signature base64: {e}")))?;
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let key = self.signing_key(kid).await?;
+        match alg {
+            "HS256" => {
+                let secret = key.k.as_deref().ok_or_else(|| {
+                    OidcError::Malformed(format!("kid {kid:?} carries no oct secret for HS256"))
+                })?;
+                let expected_signature = hmac_sha256(secret, signing_input.as_bytes());
+                if !constant_time_eq(&signature, &expected_signature) {
+                    return Err(OidcError::BadSignature);
+                }
+            }
+            "RS256" => {
+                let (n, e) = match (&key.n, &key.e) {
+                    (Some(n), Some(e)) => (n.clone(), e.clone()),
+                    _ => {
+                        return Err(OidcError::Malformed(format!(
+                            "kid {kid:?} carries no RSA n/e components for RS256"
+                        )))
+                    }
+                };
+                let components = ring::signature::RsaPublicKeyComponents {
+                    n: n.as_slice(),
+                    e: e.as_slice(),
+                };
+                components
+                    .verify(
+                        &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+                        signing_input.as_bytes(),
+                        &signature,
+                    )
+                    .map_err(|_| OidcError::BadSignature)?;
+            }
+            other => {
+                return Err(OidcError::Malformed(format!(
+                    "unsupported JWT alg {other:?} (this adapter verifies HS256 and RS256)"
+                )))
+            }
+        }
+        let payload: serde_json::Value = serde_json::from_slice(
+            &engine
+                .decode(payload_b64)
+                .map_err(|e| OidcError::Malformed(format!("payload base64: {e}")))?,
+        )
+        .map_err(|e| OidcError::Malformed(format!("payload json: {e}")))?;
+        let text = |field: &str| -> Result<String, OidcError> {
+            payload
+                .get(field)
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    OidcError::Malformed(format!("claim {field:?} is missing or not text"))
+                })
+        };
+        let number = |field: &str| -> Result<i64, OidcError> {
+            payload
+                .get(field)
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| {
+                    OidcError::Malformed(format!("claim {field:?} is missing or not a number"))
+                })
+        };
+        let issuer = text("iss")?;
+        if issuer != expected.issuer {
+            return Err(OidcError::WrongIssuer {
+                expected: expected.issuer.clone(),
+                actual: issuer,
+            });
+        }
+        let audience = match payload.get("aud") {
+            Some(serde_json::Value::String(single)) => vec![single.clone()],
+            Some(serde_json::Value::Array(list)) => list
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect(),
+            _ => {
+                return Err(OidcError::Malformed(
+                    "claim \"aud\" is missing or malformed".into(),
+                ))
+            }
+        };
+        if !audience.iter().any(|aud| aud == &expected.audience) {
+            return Err(OidcError::WrongAudience {
+                expected: expected.audience.clone(),
+            });
+        }
+        let expires_at_ms = number("exp")?.saturating_mul(1000);
+        let skew = expected.clock_skew_ms.max(0);
+        if expires_at_ms + skew < expected.now_ms {
+            return Err(OidcError::Expired);
+        }
+        let issued_at_ms = number("iat")?.saturating_mul(1000);
+        if issued_at_ms - skew > expected.now_ms {
+            return Err(OidcError::NotYetValid);
+        }
+        let nonce = payload
+            .get("nonce")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        if let Some(expected_nonce) = &expected.nonce {
+            if nonce.as_deref() != Some(expected_nonce.as_str()) {
+                return Err(OidcError::NonceMismatch);
+            }
+        }
+        Ok(OidcClaims {
+            issuer,
+            subject: text("sub")?,
+            audience,
+            email: payload
+                .get("email")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            email_verified: payload
+                .get("email_verified")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+            issued_at_ms,
+            expires_at_ms,
+            nonce,
+            groups: payload
+                .get("groups")
+                .and_then(|value| value.as_array())
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+    }
+
+    fn map_membership(
+        &self,
+        claims: &OidcClaims,
+        mapping: &ClaimMapping,
+    ) -> Result<OidcMembership, OidcError> {
+        map_membership_claims(claims, mapping)
+    }
+}
+
+/// Lenient provider payloads (extra provider fields are ignored; the strict
+/// shape is enforced on the fields the adapter consumes).
+#[derive(Debug, Deserialize)]
+struct RawDiscovery {
+    issuer: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    jwks_uri: String,
+    #[serde(default)]
+    id_token_signing_alg_values_supported: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawJwks {
+    keys: Vec<RawJwk>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawJwk {
+    kid: String,
+    kty: String,
+    #[serde(default)]
+    alg: Option<String>,
+    #[serde(default)]
+    k: Option<String>,
+    #[serde(default)]
+    n: Option<String>,
+    #[serde(default)]
+    e: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTokenResponse {
+    #[serde(default)]
+    access_token: Option<String>,
+    id_token: String,
+    #[serde(default)]
+    token_type: String,
+    #[serde(default)]
+    expires_in: Option<i64>,
+}
+
+/// Parse one `Cache-Control` header's `max-age` (seconds). Pure; garbage or
+/// a missing directive yields `None` (the configured default applies).
+pub fn parse_cache_control_max_age(header: &str) -> Option<i64> {
+    for directive in header.split(',') {
+        let directive = directive.trim();
+        let Some(value) = directive
+            .strip_prefix("max-age=")
+            .or_else(|| directive.strip_prefix("max-age ="))
+        else {
+            continue;
+        };
+        if let Ok(seconds) = value.trim().parse::<i64>() {
+            return Some(seconds);
+        }
+    }
+    None
+}
+
+pub(crate) fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(byte))
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}

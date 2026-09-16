@@ -725,6 +725,24 @@ impl EntitlementService {
         )
     }
 
+    /// The DURABLE id of the credit entry recorded under `idempotency_key`
+    /// (`None` when no entry of this organization claimed it). Additive
+    /// follow-up for record-before-call callers: [`Self::consume_before_call`]
+    /// reports the append outcome, and the agent-side debit adapter names the
+    /// returned id in [`Self::settle_consume`]/[`Self::refund_consume`] to
+    /// close exactly the hold its own key opened.
+    pub fn credit_entry_id_by_idempotency_key(
+        &self,
+        organization: &OrganizationId,
+        idempotency_key: &str,
+    ) -> Result<Option<CreditEntryId>, ControlPlaneError> {
+        crate::service::ControlPlane::validate_idempotency_key(idempotency_key)?;
+        Ok(self
+            .store
+            .credit_entry_by_idempotency_key(organization, idempotency_key)?
+            .map(|row| row.entry.id))
+    }
+
     /// Settle one pending consume at its actual spend. Exactly once: a
     /// second settle is a typed conflict. The delta above the hold must be
     /// covered by the remaining balance (or the settle refuses, leaving the

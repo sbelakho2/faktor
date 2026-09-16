@@ -635,3 +635,161 @@ async fn operator_routes_require_a_principal_and_ids_roundtrip() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 }
+
+/// The claim route: an open generation is CAS-accepted by the worker, a
+/// scheduler-leased generation is ADOPTED, capability mismatches and protocol
+/// skew are refused/skipped, and no eligible work answers `claimed: null`.
+#[tokio::test]
+async fn claim_route_cas_accepts_open_generations_and_adopts_scheduler_leases() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness(dir.path(), true).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", h.handle.addr);
+    let (org, control_token) = bootstrap(&h.control_plane, "acme", "owner@acme.test");
+    let worker_token = mint_token(&client, &base, &h.daemon_token, &control_token).await;
+
+    // Scheduled BEFORE any registration: the generation is open, so the
+    // claim route performs the worker's own CAS accept.
+    let open = schedule(&h.plane, &org, "claim-open-1");
+    assert!(open.lease.is_none());
+    assert_eq!(
+        register(&client, &base, &org, "wrk_1", &worker_token, &["rust"])
+            .await
+            .status(),
+        200
+    );
+    let resp = client
+        .post(format!("{base}/native/jobs/claim"))
+        .json(&serde_json::json!({
+            "token": worker_token,
+            "protocol_version": WORKER_PROTOCOL_VERSION,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["claimed"]["job"]["job_id"],
+        open.job.job_id.to_string()
+    );
+    assert_eq!(body["claimed"]["lease"]["state"], "live");
+    assert_eq!(body["claimed"]["lease"]["generation"], 1);
+    // Complete the claimed job over the result route (digest-bound).
+    let claim_lease = body["claimed"]["lease"]["lease_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = client
+        .post(format!("{base}/native/jobs/{}/result", open.job.job_id))
+        .json(&serde_json::json!({
+            "token": worker_token,
+            "protocol_version": WORKER_PROTOCOL_VERSION,
+            "generation": 1,
+            "lease_id": claim_lease,
+            "digest": "a".repeat(64),
+            "outcome": "succeeded",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the claimed result lands");
+
+    // The scheduler's placement CAS leases FOR the eligible worker; the
+    // claim route adopts exactly that lease.
+    let leased = schedule(&h.plane, &org, "claim-leased-1");
+    let lease = leased.lease.expect("the scheduler leased it");
+    let resp = client
+        .post(format!("{base}/native/jobs/claim"))
+        .json(&serde_json::json!({
+            "token": worker_token,
+            "protocol_version": WORKER_PROTOCOL_VERSION,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["claimed"]["lease"]["lease_id"],
+        lease.lease_id.to_string()
+    );
+    let adopted = body["claimed"]["lease"]["lease_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = client
+        .post(format!("{base}/native/jobs/{}/result", leased.job.job_id))
+        .json(&serde_json::json!({
+            "token": worker_token,
+            "protocol_version": WORKER_PROTOCOL_VERSION,
+            "generation": 1,
+            "lease_id": adopted,
+            "digest": "a".repeat(64),
+            "outcome": "succeeded",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the adopted result lands");
+
+    // A capability mismatch is a silent skip (no eligible work): the job
+    // requires a toolchain the worker does not advertise.
+    let mut mismatched_requirements: JobRequirements =
+        serde_json::from_value(requirements_json(&org)).unwrap();
+    mismatched_requirements.toolchains = vec!["go".into()];
+    let mismatched = h
+        .plane
+        .schedule_job(
+            &faktor_cloud::OrganizationId::try_new(&org).unwrap(),
+            &org,
+            &JobKey::try_new("claim-mismatch-1").unwrap(),
+            mismatched_requirements,
+            &"b".repeat(64),
+            RequeuePolicy { max_attempts: 3 },
+            None,
+        )
+        .unwrap();
+    assert!(
+        mismatched.lease.is_none(),
+        "no worker advertises the toolchain"
+    );
+    let resp = client
+        .post(format!("{base}/native/jobs/claim"))
+        .json(&serde_json::json!({
+            "token": worker_token,
+            "protocol_version": WORKER_PROTOCOL_VERSION,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["claimed"].is_null());
+
+    // Protocol skew is the typed refusal on the same route.
+    let resp = client
+        .post(format!("{base}/native/jobs/claim"))
+        .json(&serde_json::json!({
+            "token": worker_token,
+            "protocol_version": WORKER_PROTOCOL_VERSION + 1,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "protocol_skew");
+
+    // An unknown token is refused before any claim.
+    let resp = client
+        .post(format!("{base}/native/jobs/claim"))
+        .json(&serde_json::json!({
+            "token": "wkr_does_not_exist",
+            "protocol_version": WORKER_PROTOCOL_VERSION,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}

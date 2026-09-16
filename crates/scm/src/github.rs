@@ -177,13 +177,13 @@ impl fmt::Debug for InstallationToken {
 
 /// The seam that mints short-lived installation tokens.
 ///
-/// RESIDUAL (recorded): the production implementation mints an app JWT
-/// (RS256 over the app private key), exchanges it at
-/// `POST /app/installations/{id}/access_tokens`, and reports the granted
-/// permission set. That signing key flow is deliberately NOT implemented
-/// here; this trait is the boundary a real deployment implements (and the
-/// adapter above it — caching, permission enforcement, rate-limit and ETag
-/// behavior — is fully implemented and tested).
+/// The PRODUCTION implementation is [`crate::token::GitHubAppTokenSource`]:
+/// it mints an app JWT (RS256 over the app private key), exchanges it at
+/// `POST /app/installations/{id}/access_tokens` through the injected checked
+/// transport with bounded retries, caches the granted token per installation
+/// with an expiry skew, and reports the granted permission set. This trait
+/// stays the boundary so tests and embedded hosts can substitute a
+/// deterministic source.
 #[async_trait]
 pub trait InstallationTokenSource: Send + Sync {
     /// One token for an installation.
@@ -473,9 +473,12 @@ impl GitHubApp {
         let token = match auth {
             Auth::Installation(installation) => self.installation_token(installation).await?,
             Auth::App => {
-                let token = self.tokens.app_token().await?;
-                require_permissions(&token)?;
-                token
+                // The app credential is a signed JWT identifying the APP
+                // (used by `/app/installations`): it carries no repository
+                // permission grant, so the installation-permission check does
+                // not apply to it. Installation tokens are checked where they
+                // are resolved (and again here before use).
+                self.tokens.app_token().await?
             }
         };
         let url = format!("{}{}{}", self.config.api_base, path, query);
@@ -718,7 +721,7 @@ fn auth_ref(auth: &Auth) -> Auth {
     }
 }
 
-fn require_permissions(token: &InstallationToken) -> Result<(), ScmError> {
+pub(crate) fn require_permissions(token: &InstallationToken) -> Result<(), ScmError> {
     for (name, minimum) in REQUIRED_REPOSITORY_PERMISSIONS {
         let granted = token
             .permissions()
@@ -1367,7 +1370,7 @@ impl GitHubApp {
 
 /// A minimal RFC 3339 → epoch-ms parser for `submitted_at` (no chrono
 /// dependency): `YYYY-MM-DDTHH:MM:SSZ`, days-from-civil arithmetic.
-fn chrono_like_parse_ms(text: &str) -> Option<i64> {
+pub(crate) fn chrono_like_parse_ms(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
     if bytes.len() < 20 {
         return None;

@@ -1414,6 +1414,11 @@ pub struct AgentRuntime {
     /// `<store root>/evidence-cas`, so a daemon restart reopens the same
     /// ids and the same retrievable backing.
     evidence_authority: Arc<DurableEvidenceAuthority>,
+    /// The additive commercial debit authority (Wave 5 residual): `None`
+    /// (the default, and the billing-disabled daemon) keeps every dispatch
+    /// byte-identical to the pre-billing runtime. Installed by the host
+    /// after construction through [`AgentRuntime::set_provider_debits`].
+    provider_debits: std::sync::Mutex<Option<Arc<dyn crate::credits::ProviderAttemptDebits>>>,
 }
 
 /// Completion classification at a genuine turn end (audits 4/6/7): the
@@ -1676,7 +1681,58 @@ impl AgentRuntime {
             quality_mode: std::sync::atomic::AtomicU8::new(0),
             index_service: std::sync::OnceLock::new(),
             evidence_authority,
+            provider_debits: std::sync::Mutex::new(None),
         }))
+    }
+
+    /// Install (or clear) the commercial provider-attempt debit authority
+    /// (Wave 5 residual). Additive: the host wires the cloud billing service
+    /// here AFTER construction, so every existing constructor site stays
+    /// byte-identical. With `None` the runtime never consults any debit
+    /// authority — the pre-billing behavior exactly.
+    pub fn set_provider_debits(
+        &self,
+        debits: Option<Arc<dyn crate::credits::ProviderAttemptDebits>>,
+    ) {
+        if let Ok(mut slot) = self.provider_debits.lock() {
+            *slot = debits;
+        }
+    }
+
+    /// The installed debit authority, when billing is enabled.
+    fn provider_debits(&self) -> Option<Arc<dyn crate::credits::ProviderAttemptDebits>> {
+        self.provider_debits
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    /// Build the per-attempt commercial debit machine for one physical
+    /// provider dispatch (Wave 5 residual). The machine is a strict no-op
+    /// without an installed authority (billing disabled) and classifies
+    /// managed vs BYOK from the AUTHORITY's configured managed-provider set —
+    /// never from a provider-name comparison in the agent. The identity is
+    /// the attempt's fresh op id, so a retry opens its own hold and a replay
+    /// of one attempt can never be double-debited.
+    fn attempt_debits(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        provider: &str,
+        model: &str,
+        attempt: faktor_core::op::ModelCallAttempt,
+        estimate_micro: u64,
+    ) -> Result<crate::credits::AttemptDebits, crate::credits::DebitError> {
+        let debit = crate::credits::ProviderAttemptDebit {
+            attempt_id: attempt.attempt_op_id.to_string(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            session_id: session_id.raw(),
+            task_id: Some(task_id.raw()),
+            estimate_micro,
+            reason: "agent_provider_attempt".to_string(),
+        };
+        crate::credits::AttemptDebits::new(self.provider_debits(), debit)
     }
 
     /// THE durable evidence authority of this runtime (schema v21).
@@ -4601,6 +4657,76 @@ impl AgentRuntime {
                     handle.id(),
                     Some(reservation),
                 );
+                // The additive commercial debit (Wave 5 residual): a
+                // Faktor-managed attempt opens a durable credit hold BEFORE
+                // anything leaves the process (record-before-call); a BYOK
+                // model, or a daemon without an installed authority, takes
+                // the documented no-op path and is byte-identical. A refused
+                // or unavailable debit is a pre-dispatch refusal: the budget
+                // reservation is released and the provider is never called.
+                let mut debits = match self.attempt_debits(
+                    handle.id(),
+                    task_id,
+                    provider.id(),
+                    &model,
+                    attempt_identity,
+                    predicted,
+                ) {
+                    Ok(machine) => machine,
+                    Err(e) => {
+                        if let Err(refund_err) = acct.fail_before_dispatch().await {
+                            tracing::error!(
+                                session = %handle.id(),
+                                "refund of reservation {reservation} after a malformed debit identity failed: {refund_err}"
+                            );
+                        }
+                        outcome.final_state = AgentState::FailedRecoverable;
+                        let message = format!("managed credit debit refused before dispatch: {e}");
+                        outcome.stop_reason.clone_from(&Some(OutcomeReason::new(
+                            ReasonCode::BudgetExceeded,
+                            message.clone(),
+                        )));
+                        let _ = handle
+                            .append_journal_event(
+                                faktor_core::event::EventKind::Failed,
+                                AgentState::FailedRecoverable,
+                                Some(op_id),
+                                Some(serde_json::json!({ "message": message })),
+                            )
+                            .await;
+                        return Ok(outcome);
+                    }
+                };
+                if let Err(e) = debits.begin() {
+                    tracing::warn!(
+                        session = %handle.id(),
+                        attempt = %attempt_identity.attempt_op_id,
+                        "managed credit debit refused before dispatch: {e}"
+                    );
+                    // The provider was provably never contacted: release the
+                    // budget reservation (pre-dispatch refund) and stop.
+                    if let Err(refund_err) = acct.fail_before_dispatch().await {
+                        tracing::error!(
+                            session = %handle.id(),
+                            "refund of reservation {reservation} after a refused debit failed: {refund_err}"
+                        );
+                    }
+                    outcome.final_state = AgentState::FailedRecoverable;
+                    let message = format!("managed credit debit refused before dispatch: {e}");
+                    outcome.stop_reason = Some(OutcomeReason::new(
+                        ReasonCode::BudgetExceeded,
+                        message.clone(),
+                    ));
+                    let _ = handle
+                        .append_journal_event(
+                            faktor_core::event::EventKind::Failed,
+                            AgentState::FailedRecoverable,
+                            Some(op_id),
+                            Some(serde_json::json!({ "message": message })),
+                        )
+                        .await;
+                    return Ok(outcome);
+                }
                 // P0-2: the durable dispatch marker is written immediately
                 // BEFORE the provider request is sent. Crash recovery splits
                 // surviving OPEN rows on it: never-dispatched -> REFUNDED,
@@ -4623,8 +4749,19 @@ impl AgentRuntime {
                             "refund of the never-dispatched reservation {reservation} failed: {refund_err}"
                         );
                     }
+                    // Same pre-dispatch truth for the credit hold: the
+                    // provider was never called, so the hold is refunded.
+                    if let Err(refund_err) = debits.refund("dispatch_marker_failed") {
+                        tracing::error!(
+                            session = %handle.id(),
+                            "refund of the pre-dispatch credit hold failed: {refund_err}"
+                        );
+                    }
                     return Err(e.into());
                 }
+                // The provider request is about to leave the process: from
+                // here the credit hold may only settle or stay uncertain.
+                debits.mark_dispatched();
                 let mut stream = provider.stream(request);
                 // Stall watchdog (spec §28, stall vs progress): while the
                 // stream is awaited, a bounded tick evaluates the session's
@@ -4658,6 +4795,10 @@ impl AgentRuntime {
                                         "cannot mark the cancelled attempt uncertain: {uncertain_err}"
                                     );
                                 }
+                                // The credit hold stays durable: the request
+                                // left the process and the provider may have
+                                // billed (settlement/reconciliation later).
+                                debits.close_uncertain();
                                 let _ = handle.abort(Some(op_id));
                                 outcome.final_state = AgentState::Cancelled;
                                 return Ok(outcome);
@@ -4781,6 +4922,9 @@ impl AgentRuntime {
                                             "cannot mark the failed attempt uncertain: {uncertain_err}"
                                         );
                                     }
+                                    // The credit hold stays durable for the
+                                    // post-dispatch uncertainty window.
+                                    debits.close_uncertain();
                                     // The failed attempt's durable provider-call row is
                                     // ATTEMPT-KEYED like its start row: this physical
                                     // attempt's failure with its own attempt identity
@@ -4880,6 +5024,9 @@ impl AgentRuntime {
                                         "cannot mark the stalled attempt uncertain: {uncertain_err}"
                                     );
                                 }
+                                // Post-dispatch stall: the credit hold stays
+                                // durable (the provider may have billed).
+                                debits.close_uncertain();
                                 return self
                                     .handle_provider_failure(handle, op_id, err, &mut outcome)
                                     .await;
@@ -4899,7 +5046,7 @@ impl AgentRuntime {
                 // cap) leaves the DISPATCHED row — the machine closes it
                 // UNCERTAIN so the attempt keeps consuming until
                 // reconcile/finalize instead of dangling.
-                if let Err(settle_err) = acct
+                let settled_actual = match acct
                     .settle_usage(
                         frame_uncached_input,
                         frame_cache_read,
@@ -4910,19 +5057,44 @@ impl AgentRuntime {
                     )
                     .await
                 {
-                    tracing::warn!(
-                        session = %handle.id(),
-                        "reservation {reservation} settlement refused: {settle_err}; marking the attempt uncertain"
-                    );
-                    if let Err(uncertain_err) =
-                        acct.fail_after_dispatch("settle_refused", None).await
-                    {
-                        tracing::error!(
+                    Ok(settled) => settled,
+                    Err(settle_err) => {
+                        tracing::warn!(
                             session = %handle.id(),
-                            "cannot mark the unsettled attempt uncertain: {uncertain_err}"
+                            "reservation {reservation} settlement refused: {settle_err}; marking the attempt uncertain"
                         );
+                        if let Err(uncertain_err) =
+                            acct.fail_after_dispatch("settle_refused", None).await
+                        {
+                            tracing::error!(
+                                session = %handle.id(),
+                                "cannot mark the unsettled attempt uncertain: {uncertain_err}"
+                            );
+                        }
+                        // The budget side refused the settle, so the credit
+                        // hold must not move either: it stays durable for
+                        // reconciliation (a fabricated actual would be worse
+                        // than a pending hold).
+                        debits.close_uncertain();
+                        return Err(settle_err.into());
                     }
-                    return Err(settle_err.into());
+                };
+                // The commercial credit hold follows the reservation
+                // ledger's OWN settlement truth: a settled actual consumes
+                // the hold at exactly that amount; a documented Unknown
+                // spend (no price authority, no cap) leaves the hold durable
+                // for reconciliation — never a fabricated zero settle.
+                match settled_actual {
+                    Some(actual_micro) => {
+                        if let Err(e) = debits.settle(actual_micro) {
+                            tracing::error!(
+                                session = %handle.id(),
+                                attempt = %attempt_identity.attempt_op_id,
+                                "settlement of the managed credit hold at {actual_micro} micro failed (the hold stays durable for reconciliation): {e}"
+                            );
+                        }
+                    }
+                    None => debits.close_uncertain(),
                 }
                 break 'attempts;
             }
@@ -32523,5 +32695,433 @@ mod tests {
             3,
             "re-archiving identical producer output must not grow the table"
         );
+    }
+
+    // ------------------------------------------------ provider-attempt debits
+    //
+    // The Wave 5 residual's agent-side call site: a managed attempt opens a
+    // durable credit hold BEFORE the provider stream (record-before-call), a
+    // settled call consumes it at the reservation ledger's actual, a
+    // pre-dispatch failure refunds it, a BYOK model never debits, and a
+    // daemon without an installed authority is byte-identical (no calls).
+    // The ordering proof is the shared event log: the provider's own
+    // `stream()` invocation records itself into the SAME recorder the debit
+    // authority writes to.
+
+    use crate::credits::{
+        DebitDecision, DebitError, DebitHold, ProviderAttemptDebit, ProviderAttemptDebits,
+    };
+    use faktor_session::BudgetError;
+    use std::pin::Pin;
+
+    /// Recording debit authority. The event log is the ordering proof:
+    /// `begin:<id>:<estimate>` / `stream` / `settle:<actual>` /
+    /// `refund:<reason>` appear in real call order.
+    struct DebitRecorder {
+        managed: bool,
+        refuse_begin: Option<String>,
+        events: std::sync::Mutex<Vec<String>>,
+        begins: std::sync::atomic::AtomicUsize,
+        settles: std::sync::Mutex<Vec<u64>>,
+        refunds: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl DebitRecorder {
+        fn new(managed: bool) -> Arc<Self> {
+            Arc::new(Self {
+                managed,
+                refuse_begin: None,
+                events: std::sync::Mutex::new(Vec::new()),
+                begins: std::sync::atomic::AtomicUsize::new(0),
+                settles: std::sync::Mutex::new(Vec::new()),
+                refunds: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn refusing(reason: &str) -> Arc<Self> {
+            Arc::new(Self {
+                managed: true,
+                refuse_begin: Some(reason.to_string()),
+                events: std::sync::Mutex::new(Vec::new()),
+                begins: std::sync::atomic::AtomicUsize::new(0),
+                settles: std::sync::Mutex::new(Vec::new()),
+                refunds: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
+
+        fn push(&self, event: impl Into<String>) {
+            self.events.lock().unwrap().push(event.into());
+        }
+    }
+
+    impl ProviderAttemptDebits for DebitRecorder {
+        fn is_managed(&self, _provider: &str) -> bool {
+            self.managed
+        }
+
+        fn begin(&self, attempt: &ProviderAttemptDebit) -> Result<DebitDecision, DebitError> {
+            self.begins
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.push(format!(
+                "begin:{}:{}",
+                attempt.attempt_id, attempt.estimate_micro
+            ));
+            if let Some(reason) = &self.refuse_begin {
+                return Err(DebitError::Refused {
+                    reason: reason.clone(),
+                });
+            }
+            if self.managed {
+                Ok(DebitDecision::Hold(
+                    DebitHold::new(
+                        format!("hold:{}", attempt.attempt_id),
+                        attempt.estimate_micro,
+                    )
+                    .expect("hold id"),
+                ))
+            } else {
+                Ok(DebitDecision::Byok)
+            }
+        }
+
+        fn settle(
+            &self,
+            _attempt: &ProviderAttemptDebit,
+            _hold: &DebitHold,
+            actual_micro: u64,
+        ) -> Result<(), DebitError> {
+            self.push(format!("settle:{actual_micro}"));
+            self.settles.lock().unwrap().push(actual_micro);
+            Ok(())
+        }
+
+        fn refund(
+            &self,
+            _attempt: &ProviderAttemptDebit,
+            _hold: &DebitHold,
+            reason: &str,
+        ) -> Result<(), DebitError> {
+            self.push(format!("refund:{reason}"));
+            self.refunds.lock().unwrap().push(reason.to_string());
+            Ok(())
+        }
+    }
+
+    /// The reservation ledger double: `settle_actual` is the settlement
+    /// truth the debit hold must follow (`None` = documented Unknown spend);
+    /// `fail_dispatch_marker` models a durable dispatch-marker write failure
+    /// (the provider provably never contacted).
+    struct DebitBudget {
+        settle_actual: Option<u64>,
+        fail_dispatch_marker: bool,
+        refunds: std::sync::atomic::AtomicUsize,
+        uncertain: std::sync::atomic::AtomicUsize,
+        settles: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DebitBudget {
+        fn new(settle_actual: Option<u64>) -> Arc<Self> {
+            Arc::new(Self {
+                settle_actual,
+                fail_dispatch_marker: false,
+                refunds: std::sync::atomic::AtomicUsize::new(0),
+                uncertain: std::sync::atomic::AtomicUsize::new(0),
+                settles: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn refusing_dispatch_marker(settle_actual: Option<u64>) -> Arc<Self> {
+            Arc::new(Self {
+                settle_actual,
+                fail_dispatch_marker: true,
+                refunds: std::sync::atomic::AtomicUsize::new(0),
+                uncertain: std::sync::atomic::AtomicUsize::new(0),
+                settles: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+
+    type BudgetFut<T> = Pin<Box<dyn std::future::Future<Output = Result<T, BudgetError>> + Send>>;
+
+    impl BudgetAuthority for DebitBudget {
+        fn reserve(
+            &self,
+            _s: SessionId,
+            _t: TaskId,
+            _op: faktor_core::id::OpId,
+            _pred: u64,
+            _snap: Option<faktor_core::model::PricingSnapshot>,
+        ) -> BudgetFut<faktor_session::ReservationId> {
+            Box::pin(async { Ok(faktor_session::ReservationId::NOOP) })
+        }
+
+        fn reserve_attempt(
+            &self,
+            _s: SessionId,
+            _t: TaskId,
+            _a: faktor_core::op::ModelCallAttempt,
+            _pred: u64,
+            _snap: Option<faktor_core::model::PricingSnapshot>,
+        ) -> BudgetFut<faktor_session::ReservationId> {
+            Box::pin(async { Ok(faktor_session::ReservationId::NOOP) })
+        }
+
+        fn mark_dispatched(
+            &self,
+            _s: SessionId,
+            _r: faktor_session::ReservationId,
+        ) -> BudgetFut<()> {
+            let fail = self.fail_dispatch_marker;
+            Box::pin(async move {
+                if fail {
+                    return Err(BudgetError::Malformed(
+                        "test: dispatch marker write failed".into(),
+                    ));
+                }
+                Ok(())
+            })
+        }
+
+        fn mark_uncertain(
+            &self,
+            _s: SessionId,
+            _r: faktor_session::ReservationId,
+            _reason: String,
+            _request_id: Option<String>,
+        ) -> BudgetFut<()> {
+            self.uncertain
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn settle_usage(
+            &self,
+            _s: SessionId,
+            _r: faktor_session::ReservationId,
+            _a: u64,
+            _b: u64,
+            _c: u64,
+            _d: u64,
+            _e: Option<u64>,
+            _f: Option<String>,
+        ) -> BudgetFut<Option<u64>> {
+            self.settles
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let actual = self.settle_actual;
+            Box::pin(async move { Ok(actual) })
+        }
+
+        fn refund(&self, _s: SessionId, _r: faktor_session::ReservationId) -> BudgetFut<()> {
+            self.refunds
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn session_budget_view(
+            &self,
+            _s: SessionId,
+            _t: TaskId,
+        ) -> Result<faktor_session::BudgetView, BudgetError> {
+            Ok(faktor_session::BudgetView {
+                max_cost_micro: None,
+                spent_cost_micro: 0,
+                open_reserved_micro: 0,
+                open_reservations: 0,
+                uncertain_reserved_micro: 0,
+                uncertain_reservations: 0,
+                settled_count: 0,
+            })
+        }
+
+        fn recover_after_restart(&self) {}
+
+        fn reconcile_uncertain(
+            &self,
+            _s: SessionId,
+            _t: TaskId,
+        ) -> BudgetFut<faktor_store::CostReconcileReport> {
+            Box::pin(async { Ok(Default::default()) })
+        }
+
+        fn finalize_uncertain(
+            &self,
+            _s: SessionId,
+            _t: TaskId,
+        ) -> BudgetFut<faktor_store::CostFinalizeReport> {
+            Box::pin(async { Ok(Default::default()) })
+        }
+    }
+
+    /// The provider's own `stream()` invocation records itself into the
+    /// debit recorder, so the shared log proves the hold exists BEFORE the
+    /// request is built/dispatched.
+    fn debit_aware_provider(recorder: &Arc<DebitRecorder>) -> Arc<dyn faktor_provider::Provider> {
+        let recorder = recorder.clone();
+        Arc::new(InspectingProvider::new(
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    context: 200_000,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
+            )),
+            move |_n: usize, _req: &GenericAgentRequest| -> Result<(), String> {
+                recorder.push("stream");
+                Ok(())
+            },
+        ))
+    }
+
+    async fn run_turn_with_debits(
+        recorder: &Arc<DebitRecorder>,
+        budget: Arc<DebitBudget>,
+    ) -> (TurnOutcome, Arc<AgentRuntime>) {
+        let (mut deps, _dir) = deps_with(debit_aware_provider(recorder), vec![]);
+        deps.budgets = budget;
+        let runtime = AgentRuntime::new(deps).unwrap();
+        runtime.set_provider_debits(Some(recorder.clone() as Arc<dyn ProviderAttemptDebits>));
+        let (manager, session) = shared_session(runtime.deps());
+        let _ = manager;
+        let outcome = runtime
+            .run_turn(session, "do the thing", &[])
+            .await
+            .expect("turn");
+        (outcome, runtime)
+    }
+
+    #[tokio::test]
+    async fn managed_attempt_debits_exactly_once_with_the_hold_visible_pre_dispatch() {
+        let recorder = DebitRecorder::new(true);
+        let budget = DebitBudget::new(Some(260));
+        let (outcome, _runtime) = run_turn_with_debits(&recorder, budget.clone()).await;
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        // Exactly one debit attempt, and its hold was opened BEFORE the
+        // provider request was streamed: begin < stream < settle.
+        assert_eq!(recorder.begins.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let events = recorder.events();
+        let begin_at = events
+            .iter()
+            .position(|e| e.starts_with("begin:"))
+            .expect("a begin event");
+        let stream_at = events
+            .iter()
+            .position(|e| e == "stream")
+            .expect("a stream event");
+        let settle_at = events
+            .iter()
+            .position(|e| e.starts_with("settle:"))
+            .expect("a settle event");
+        assert!(
+            begin_at < stream_at && stream_at < settle_at,
+            "ordering must be begin < stream < settle: {events:?}"
+        );
+        assert_eq!(
+            recorder.settles.lock().unwrap().clone(),
+            vec![260],
+            "the hold settles at the reservation ledger's actual"
+        );
+        assert!(recorder.refunds.lock().unwrap().is_empty());
+        assert_eq!(budget.refunds.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(budget.settles.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pre_dispatch_dispatch_marker_failure_refunds_hold_and_never_streams() {
+        let recorder = DebitRecorder::new(true);
+        let budget = DebitBudget::refusing_dispatch_marker(Some(260));
+        let (mut deps, _dir) = deps_with(debit_aware_provider(&recorder), vec![]);
+        deps.budgets = budget.clone();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        runtime.set_provider_debits(Some(recorder.clone() as Arc<dyn ProviderAttemptDebits>));
+        let (manager, session) = shared_session(runtime.deps());
+        let _ = manager;
+        let err = runtime.run_turn(session, "do the thing", &[]).await;
+        assert!(err.is_err(), "a failed dispatch marker fails the turn");
+        let events = recorder.events();
+        assert!(
+            events.iter().any(|e| e == "refund:dispatch_marker_failed"),
+            "the never-dispatched hold must refund: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e == "stream"),
+            "the provider must never be streamed: {events:?}"
+        );
+        assert!(recorder.settles.lock().unwrap().is_empty());
+        assert_eq!(budget.refunds.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn refused_debit_refuses_the_attempt_before_dispatch() {
+        let recorder = DebitRecorder::refusing("insufficient credits");
+        let budget = DebitBudget::new(Some(260));
+        let (mut deps, _dir) = deps_with(debit_aware_provider(&recorder), vec![]);
+        deps.budgets = budget.clone();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        runtime.set_provider_debits(Some(recorder.clone() as Arc<dyn ProviderAttemptDebits>));
+        let (manager, session) = shared_session(runtime.deps());
+        let _ = manager;
+        let outcome = runtime
+            .run_turn(session, "do the thing", &[])
+            .await
+            .expect("turn");
+        assert_eq!(outcome.final_state, AgentState::FailedRecoverable);
+        let events = recorder.events();
+        assert!(
+            !events.iter().any(|e| e == "stream"),
+            "a refused debit must never dispatch: {events:?}"
+        );
+        assert!(recorder.refunds.lock().unwrap().is_empty());
+        // The budget reservation was released (pre-dispatch refund).
+        assert_eq!(budget.refunds.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn byok_attempt_never_debits_and_disabled_daemon_is_parity() {
+        // BYOK: the authority is consulted (config-derived classification)
+        // but the attempt records usage only — no hold, no settle, no refund.
+        let byok = DebitRecorder::new(false);
+        let budget = DebitBudget::new(Some(260));
+        let (outcome, _runtime) = run_turn_with_debits(&byok, budget).await;
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(byok.begins.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(byok.settles.lock().unwrap().is_empty());
+        assert!(byok.refunds.lock().unwrap().is_empty());
+        let events = byok.events();
+        assert_eq!(
+            events.len(),
+            2,
+            "BYOK: classification + stream only: {events:?}"
+        );
+        assert!(events[0].starts_with("begin:") && events[1] == "stream");
+
+        // Billing disabled (`None` authority): the provider path is the
+        // pre-billing path exactly — no debit call exists at all.
+        let (mut deps, _dir) = deps_with(
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    context: 200_000,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
+            )),
+            vec![],
+        );
+        deps.budgets = DebitBudget::new(Some(260));
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let (manager, session) = shared_session(runtime.deps());
+        let _ = manager;
+        let outcome = runtime
+            .run_turn(session, "do the thing", &[])
+            .await
+            .expect("turn");
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
     }
 }
