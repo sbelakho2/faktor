@@ -27,11 +27,17 @@ use faktor_terminal::{ProcessOwner, ProcessSupervisor};
 use serde_json::{json, Value};
 
 mod billing_debits;
+mod billing_report;
 mod config;
 mod embeddings;
 mod evidence;
 mod graph;
 mod mcp_bridge;
+mod payload;
+mod scm_daemon;
+mod sso_auth;
+#[cfg(test)]
+mod test_http;
 mod tools;
 mod worker_node;
 
@@ -1644,6 +1650,11 @@ async fn serve_impl(
     // every /native/enterprise/* route 409 `enterprise_disabled`, the local
     // daemon otherwise untouched).
     let config_enterprise = config.enterprise.clone();
+    // The `[cloud]` section is captured BEFORE the config is consumed too:
+    // the SSO authority and the GitHub App surface are constructed after the
+    // graph (they ride the graph's checked transport), and both read the
+    // operator-staged payload directory. Disabled sections build nothing.
+    let config_cloud = config.cloud.clone();
     let cloud_databases = if config.cloud.enabled {
         let control_plane_path = config
             .cloud
@@ -1741,6 +1752,9 @@ async fn serve_impl(
         graph.budgets.clone(),
     );
     deps.chunk_rx = Some(chunk_rx);
+    // The additive real GitHub App surface (built only while the section is
+    // enabled; its initial sync is backgrounded after readiness below).
+    let mut scm_daemon: Option<Arc<crate::scm_daemon::ScmDaemon>> = None;
     if let Some((control_plane_path, scm_path)) = cloud_databases {
         let control_plane = match control_plane_path {
             Some(path) => Arc::new(faktor_cloud::ControlPlane::new(
@@ -1761,8 +1775,37 @@ async fn serve_impl(
             }
             None => unreachable!("enabled cloud always resolves an scm path"),
         };
+        let scm_store = scm.clone();
         deps = deps.with_control_plane(control_plane).with_scm_store(scm);
+        // The GitHub App wiring rides the graph's ONE checked transport and
+        // the operator-staged payload directory; a missing/corrupt/
+        // too-permissive payload is a startup refusal (no half-wired SCM).
+        scm_daemon = crate::scm_daemon::build_scm_daemon(
+            &config_cloud,
+            &data_dir,
+            scm_store,
+            graph.transport.clone(),
+        )
+        .map_err(|e| format!("cloud scm wiring: {e}"))?;
+        if let Some(daemon) = &scm_daemon {
+            deps = deps.with_scm_webhook(daemon.clone());
+            tracing::info!("github app scm surface enabled");
+        }
         tracing::info!("cloud control plane enabled");
+    }
+    // The additive `[cloud.sso]` section: the network OIDC adapter over the
+    // daemon's checked transport plus the operator-staged client secret.
+    // Disabled (the default) = no adapter is built and /native/sso/* keeps
+    // its typed 409 parity.
+    if let Some(sso_cfg) = config_cloud.sso.as_ref().filter(|sso| sso.enabled) {
+        let payload_root = config_cloud
+            .payload_root(&data_dir)
+            .map_err(|e| format!("cloud config: {e}"))?;
+        let authority =
+            crate::sso_auth::build_sso_authority(sso_cfg, &payload_root, graph.transport.clone())
+                .map_err(|e| format!("cloud sso wiring: {e}"))?;
+        deps = deps.with_sso(authority);
+        tracing::info!("sso authority enabled");
     }
     // The additive `[billing]` section (Wave 3): when disabled (the default)
     // no billing database is created and every billing route answers 409.
@@ -1774,6 +1817,10 @@ async fn serve_impl(
     // entitlement change can never interrupt an in-flight
     // integration/rollback/completion transaction.
     let mut billing_gate: Option<Arc<dyn faktor_orchestrator::admission::AdmissionGate>> = None;
+    // The additive `[billing.report]` schedule (disabled by default): a
+    // durable period/cursor schedule that reports the folded usage through
+    // the vendor adapter after readiness.
+    let mut billing_report: Option<Arc<crate::billing_report::BillingReportRunner>> = None;
     if config_billing.enabled {
         let path = config_billing
             .billing_path(&data_dir)
@@ -1799,6 +1846,41 @@ async fn serve_impl(
         };
         let service = faktor_cloud::EntitlementService::with_system_clock(store, service_config)
             .map_err(|e| format!("billing service: {e}"))?;
+        // The report schedule (additive; disabled by default): strict vendor
+        // config, the durable billing store and the daemon's checked
+        // transport. A missing vendor credential env var refuses startup —
+        // never a silently unauthenticated report.
+        if let Some(report_cfg) = config_billing
+            .report
+            .as_ref()
+            .filter(|report| report.enabled)
+        {
+            let vendor_config = report_cfg.vendor_config()?;
+            let policy = report_cfg.policy()?;
+            let adapter = if report_cfg.unauthenticated() {
+                faktor_cloud::BillingVendorAdapter::new(
+                    service.clone(),
+                    vendor_config,
+                    graph.transport.clone(),
+                    None,
+                )
+            } else {
+                faktor_cloud::BillingVendorAdapter::from_env(
+                    service.clone(),
+                    vendor_config,
+                    graph.transport.clone(),
+                )
+            }
+            .map_err(|e| format!("billing report config: {e}"))?;
+            billing_report = Some(Arc::new(crate::billing_report::BillingReportRunner::new(
+                service.store().clone(),
+                adapter,
+                organization.clone(),
+                policy,
+                Arc::new(faktor_cloud::SystemClock),
+            )));
+            tracing::info!("billing report schedule enabled");
+        }
         let account_name = config_billing
             .account_name
             .clone()
@@ -2003,6 +2085,13 @@ async fn serve_impl(
     // The daemon verification executor: post-readiness, it claims and
     // resolves durable verification jobs of every session asynchronously.
     let verification_executor = spawn_verification_executor(&graph);
+    // The GitHub App surface (post-readiness, like the backup/index): ONE
+    // bounded initial installation/repository sync, then one idempotent
+    // re-sync per verified webhook delivery through the bounded queue.
+    let scm_task = scm_daemon.map(|daemon| tokio::spawn(daemon.run()));
+    // The billing report schedule (post-readiness): one bounded tick per
+    // configured interval; every period is reported at most once.
+    let billing_report_task = billing_report.map(|runner| tokio::spawn(runner.run()));
     // Keep the daemon alive; when a shutdown is signaled, DRAIN the backup
     // task (bounded) before the daemon returns, aborting only the async
     // wrapper on timeout — a snapshot can never outlive its owning runtime.
@@ -2010,6 +2099,12 @@ async fn serve_impl(
         Some(rx) => {
             let _ = rx.await;
             verification_executor.abort();
+            if let Some(task) = scm_task {
+                task.abort();
+            }
+            if let Some(task) = billing_report_task {
+                task.abort();
+            }
             drain_startup_backup(backup_task).await;
         }
         None => std::future::pending::<()>().await,
@@ -7048,6 +7143,212 @@ mod tests {
                 .expect("serve_impl returns Ok")
                 .unwrap();
         }
+    }
+
+    /// GitHub App end-to-end: a daemon configured with a MOCK GitHub base
+    /// URL builds the real adapter/token source/inbox/sync from the
+    /// operator-staged payloads, runs the bounded initial sync after
+    /// readiness (durable rows under the data dir), and dispatches a signed
+    /// webhook delivery into the wired inbox WITHOUT the daemon password —
+    /// which triggers one idempotent re-sync.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn github_app_daemon_syncs_durably_and_dispatches_signed_webhooks() {
+        use faktor_scm::ScmStore;
+        const WEBHOOK_SECRET: &[u8] = b"hook-secret";
+        let mock = MockServer::new();
+        let (mock_addr, _mock_task) = mock.clone().serve().await;
+        let base = format!("http://{mock_addr}");
+        mock.route(
+            "GET",
+            "/app/installations",
+            MockAction::Respond {
+                status: 200,
+                body: serde_json::json!([{
+                    "id": 7,
+                    "account": {"login": "acme", "type": "Organization"},
+                    "permissions": {"contents": "write"},
+                }])
+                .to_string(),
+            },
+        );
+        mock.route(
+            "POST",
+            "/app/installations/7/access_tokens",
+            MockAction::Respond {
+                status: 200,
+                body: serde_json::json!({
+                    "token": "ghs_test",
+                    "expires_at": "2099-01-01T00:00:00Z",
+                    "permissions": {
+                        "contents": "write",
+                        "pull_requests": "write",
+                        "issues": "write",
+                        "metadata": "read",
+                    },
+                })
+                .to_string(),
+            },
+        );
+        let repositories = serde_json::json!({
+            "total_count": 1,
+            "repositories": [{
+                "id": 11,
+                "name": "widgets",
+                "full_name": "acme/widgets",
+                "default_branch": "main",
+                "private": true,
+                "archived": false,
+                "html_url": "http://example.test/acme/widgets",
+                "owner": {"login": "acme"},
+            }],
+        })
+        .to_string();
+        mock.route(
+            "GET",
+            "/installation/repositories",
+            MockAction::Sequence {
+                actions: vec![
+                    MockAction::Respond {
+                        status: 200,
+                        body: repositories.clone(),
+                    },
+                    MockAction::Respond {
+                        status: 200,
+                        body: repositories,
+                    },
+                ],
+            },
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        // Operator-staged payloads (0600 on unix).
+        let payloads = dir.path().join("payloads");
+        std::fs::create_dir_all(&payloads).unwrap();
+        for (name, body) in [
+            ("app.pem", crate::scm_daemon::TEST_PRIVATE_KEY.as_bytes()),
+            ("hook.secret", WEBHOOK_SECRET),
+        ] {
+            let path = payloads.join(name);
+            std::fs::write(&path, body).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        let config = dir.path().join("faktor-plus.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "model": "m",
+                "cloud": {
+                    "enabled": true,
+                    "database": "cp.db",
+                    "scm_database": "repos.db",
+                    "github_app": {
+                        "enabled": true,
+                        "app_id": 12345,
+                        "private_key": "app.pem",
+                        "webhook_secret": "hook.secret",
+                        "api_base": base,
+                        "organization": "org_acme",
+                    },
+                },
+                "sandbox": {"network": [base]},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // A concrete loopback port for the daemon (the webhook route needs a
+        // known address; the daemon never needs the mock's policy to reach
+        // ITSELF).
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let dir2 = dir.path().to_path_buf();
+        let daemon = tokio::task::spawn(async move {
+            serve_impl(port, dir2, Some(config), Some(ready_tx), Some(shutdown_rx)).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(60), ready_rx)
+            .await
+            .expect("serve must reach the startup line")
+            .expect("ready signal");
+
+        // The initial sync runs post-readiness; poll the DURABLE rows.
+        let scm_path = dir.path().join("repos.db");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let store = faktor_scm::SqliteScmStore::open(&scm_path).unwrap();
+            if !store
+                .repositories_for_organization("org_acme", 0, 10)
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the initial sync never landed durable rows"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // A signed delivery (NO daemon password) is dispatched into the
+        // wired inbox and schedules one idempotent re-sync.
+        let client = reqwest::Client::new();
+        let body = br#"{"installation":{"id":7},"action":"created"}"#;
+        let webhook = client
+            .post(format!("http://127.0.0.1:{port}/native/scm/webhook"))
+            .header("x-github-delivery", "delivery-1")
+            .header("x-github-event", "installation")
+            .header(
+                "x-hub-signature-256",
+                format!(
+                    "sha256={}",
+                    faktor_scm::hmac_sha256_hex(WEBHOOK_SECRET, body)
+                ),
+            )
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(webhook.status(), 200);
+        let webhook: serde_json::Value = webhook.json().await.unwrap();
+        assert_eq!(webhook["status"], "accepted");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let repo_calls = mock
+                .requests()
+                .iter()
+                .filter(|(method, path, _)| method == "GET" && path == "/installation/repositories")
+                .count();
+            if repo_calls >= 2 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the webhook re-sync never ran"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let store = faktor_scm::SqliteScmStore::open(&scm_path).unwrap();
+        assert_eq!(
+            store
+                .repositories_for_organization("org_acme", 0, 10)
+                .unwrap()
+                .len(),
+            1,
+            "the re-sync upserts instead of duplicating"
+        );
+        assert_eq!(store.webhook_deliveries(10).unwrap().len(), 1);
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(30), daemon)
+            .await
+            .expect("daemon must stop on shutdown")
+            .expect("serve_impl returns Ok")
+            .unwrap();
     }
 
     /// Updater-disabled parity: a daemon with `[updater] enabled = false`

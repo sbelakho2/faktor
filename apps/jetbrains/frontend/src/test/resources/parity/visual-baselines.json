@@ -2,7 +2,7 @@
   "schema": "faktor-parity-visual-baselines/v1",
   "method": "offscreen-swing-render+component-tree-state-digest-vs-pinned-baseline",
   "panelDigests": {
-    "task-tree": "821947e1ab5d8e7266403cedefbdd8636cb922790867f1ea25954cb854cdfa57",
+    "task-tree": "19d1bc64873b1cfa71151ffdabc829ba2ab888a4820b33515f74478c84164fb6",
     "blockers": "0a6ba6d1e0fcee4361bec7f6a4f070903b5743f9aee7ca2257468634ac67ca7e",
     "tournament": "821c50021cdcd169de64e3bc7b1b21d8d3d3827574376ec50cb4b4c31f31a6cf",
     "permissions": "8f99988c6225bbf446a24856cd15b599095a59124a36dc6da4b766738cd28886",

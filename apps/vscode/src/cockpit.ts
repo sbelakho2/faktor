@@ -204,6 +204,10 @@ export interface CockpitView {
    * the run carries no contract). Provenance is explicit (`daemon`,
    * `derived` or `unavailable`) and never fabricated. */
   readonly completion: CockpitCompletionView | null;
+  /** The top-level VERIFIED view from `GET /native/tasks/{id}/proof`.
+   * `null` when the proof was never fetched; an explicit `unavailable`
+   * state when the fetch/validation failed (never a stale VERIFIED). */
+  readonly proof: CockpitProofView | null;
 }
 
 /** The completion-contract block as the cockpit renders it. */
@@ -218,6 +222,278 @@ export interface CockpitCompletionView {
   }[];
   readonly source: string;
   readonly reason: string | null;
+}
+
+/** One durable completion step of the proof drill-down. */
+export interface CockpitProofStepView {
+  readonly step: string;
+  readonly status: string;
+  readonly present: boolean;
+  readonly detail: string | null;
+  readonly snapshot: string | null;
+  readonly atMs: number | null;
+}
+
+/**
+ * The top-level VERIFIED view derived from `GET /native/tasks/{id}/proof`.
+ * `state` is the daemon's own three-way verdict, never re-derived here: the
+ * cockpit renders `VERIFIED` ONLY for `verified`. A failed read is an
+ * explicit `unavailable` carrying the refusal text; an `unverified` /
+ * `unavailable` payload can never be presented as verified.
+ */
+export interface CockpitProofView {
+  readonly state: 'verified' | 'unverified' | 'unavailable';
+  readonly reason: string | null;
+  readonly criteria: {
+    readonly passed: number;
+    readonly total: number;
+    readonly failed: number;
+    readonly unavailable: number;
+    readonly certifiesCompletion: boolean;
+  };
+  readonly checks: {
+    readonly passed: number;
+    readonly total: number;
+    readonly requiredPassed: number;
+    readonly requiredTotal: number;
+  };
+  readonly review: {
+    readonly status: string | null;
+    readonly reviewer: string | null;
+    readonly independentVerdict: string;
+  };
+  readonly trees: {
+    readonly verified: string | null;
+    readonly landed: string | null;
+    readonly landedEqualsVerified: boolean | null;
+  };
+  readonly publication: {
+    readonly commitOid: string | null;
+    readonly remoteHeadOid: string | null;
+    readonly pullRequestId: string | null;
+  };
+  readonly cost: {
+    readonly status: string;
+    readonly spentMicro: number | null;
+    readonly maxMicro: number | null;
+    readonly reason: string | null;
+  };
+  readonly completion: {
+    readonly gate: string;
+    readonly gateReason: string | null;
+    readonly steps: readonly CockpitProofStepView[];
+  } | null;
+  readonly unavailable: readonly {
+    readonly component: string;
+    readonly kind: string;
+    readonly reason: string;
+  }[];
+}
+
+/**
+ * The minimal structural shape of the strict proof payload this module
+ * consumes (see `nativeClient.ts`'s `NativeTaskProof` for the full contract;
+ * both are structurally compatible).
+ */
+export interface CockpitNativeProof {
+  readonly proofState: string;
+  readonly proofStateReason: string | null;
+  readonly criteria: {
+    readonly passed: number;
+    readonly total: number;
+    readonly failed: number;
+    readonly unavailable: number;
+    readonly certifiesCompletion: boolean;
+  };
+  readonly checks: {
+    readonly passed: number;
+    readonly total: number;
+    readonly requiredPassed: number;
+    readonly requiredTotal: number;
+  };
+  readonly review: {
+    readonly status: string | null;
+    readonly reviewer: unknown;
+    readonly independentVerdict: string;
+  };
+  readonly trees: {
+    readonly verified: string | null;
+    readonly landed: string | null;
+    readonly landedEqualsVerified: boolean | null;
+  };
+  readonly publication: {
+    readonly commitOid: string | null;
+    readonly remoteHeadOid: string | null;
+    readonly pullRequest: { readonly id: string } | null;
+  };
+  readonly cost: {
+    readonly status: string;
+    readonly spentCostMicro: number | null;
+    readonly maxCostMicro: number | null;
+    readonly reason: string | null;
+  };
+  readonly completion: {
+    readonly gate: { readonly status: string; readonly reason: string | null };
+    readonly steps: readonly {
+      readonly step: string;
+      readonly status: string;
+      readonly present: boolean;
+      readonly detail: string | null;
+      readonly snapshot: string | null;
+      readonly atMs: number | null;
+    }[];
+  };
+  readonly unavailable: readonly {
+    readonly component: string;
+    readonly kind: string;
+    readonly reason: string;
+  }[];
+}
+
+/**
+ * Project the strict proof payload into the cockpit's verified view.
+ * `unavailableReason` (a fetch/validation failure) yields an explicit
+ * `unavailable` view — the caller must pass it instead of a stale proof.
+ */
+export function proofViewOf(
+  proof: CockpitNativeProof | null,
+  unavailableReason: string | null = null,
+): CockpitProofView | null {
+  if (proof === null) {
+    if (unavailableReason === null) {
+      return null;
+    }
+    return {
+      state: 'unavailable',
+      reason: clamp(unavailableReason),
+      criteria: { passed: 0, total: 0, failed: 0, unavailable: 0, certifiesCompletion: false },
+      checks: { passed: 0, total: 0, requiredPassed: 0, requiredTotal: 0 },
+      review: { status: null, reviewer: null, independentVerdict: 'none' },
+      trees: { verified: null, landed: null, landedEqualsVerified: null },
+      publication: { commitOid: null, remoteHeadOid: null, pullRequestId: null },
+      cost: { status: 'unavailable', spentMicro: null, maxMicro: null, reason: 'proof unavailable' },
+      completion: null,
+      unavailable: [
+        { component: 'proof', kind: 'unavailable', reason: clamp(unavailableReason) },
+      ],
+    };
+  }
+  const state =
+    proof.proofState === 'verified'
+      ? 'verified'
+      : proof.proofState === 'unavailable'
+        ? 'unavailable'
+        : 'unverified';
+  return {
+    state,
+    reason: proof.proofStateReason === null ? null : clamp(proof.proofStateReason),
+    criteria: {
+      passed: proof.criteria.passed,
+      total: proof.criteria.total,
+      failed: proof.criteria.failed,
+      unavailable: proof.criteria.unavailable,
+      certifiesCompletion: proof.criteria.certifiesCompletion,
+    },
+    checks: {
+      passed: proof.checks.passed,
+      total: proof.checks.total,
+      requiredPassed: proof.checks.requiredPassed,
+      requiredTotal: proof.checks.requiredTotal,
+    },
+    review: {
+      status: proof.review.status,
+      reviewer: reviewerTextOf(proof.review.reviewer),
+      independentVerdict: proof.review.independentVerdict,
+    },
+    trees: {
+      verified: proof.trees.verified,
+      landed: proof.trees.landed,
+      landedEqualsVerified: proof.trees.landedEqualsVerified,
+    },
+    publication: {
+      commitOid: proof.publication.commitOid,
+      remoteHeadOid: proof.publication.remoteHeadOid,
+      pullRequestId: proof.publication.pullRequest?.id ?? null,
+    },
+    cost: {
+      status: proof.cost.status,
+      spentMicro: proof.cost.spentCostMicro,
+      maxMicro: proof.cost.maxCostMicro,
+      reason: proof.cost.reason === null ? null : clamp(proof.cost.reason),
+    },
+    completion: proof.completion
+      ? {
+          gate: proof.completion.gate.status,
+          gateReason:
+            proof.completion.gate.reason === null ? null : clamp(proof.completion.gate.reason),
+          steps: proof.completion.steps.map((step) => ({
+            step: step.step,
+            status: step.status,
+            present: step.present,
+            detail: step.detail === null ? null : clamp(step.detail),
+            snapshot: step.snapshot,
+            atMs: step.atMs,
+          })),
+        }
+      : null,
+    unavailable: proof.unavailable.map((entry) => ({
+      component: entry.component,
+      kind: entry.kind,
+      reason: clamp(entry.reason),
+    })),
+  };
+}
+
+/** One bounded line of the top-level verification-proof summary. */
+export function proofSummaryLine(proof: CockpitProofView): string {
+  const head =
+    proof.state === 'verified'
+      ? 'VERIFIED'
+      : proof.state === 'unavailable'
+        ? 'VERIFICATION UNAVAILABLE'
+        : 'NOT VERIFIED';
+  const bits = [
+    `criteria ${proof.criteria.passed}/${proof.criteria.total} passed`,
+    `checks ${proof.checks.passed}/${proof.checks.total} passed (required ${proof.checks.requiredPassed}/${proof.checks.requiredTotal})`,
+    `review ${proof.review.status ?? 'none'}`,
+    proof.trees.landedEqualsVerified === null
+      ? 'verified==landed: unknown'
+      : `verified==landed: ${proof.trees.landedEqualsVerified ? 'yes' : 'NO'}`,
+    proof.publication.commitOid === null ? null : `commit ${shortRef(proof.publication.commitOid)}`,
+    proof.publication.remoteHeadOid === null
+      ? null
+      : `remote head ${shortRef(proof.publication.remoteHeadOid)}`,
+    proof.publication.pullRequestId === null ? null : `PR ${proof.publication.pullRequestId}`,
+    proof.cost.status === 'known'
+      ? `spend ${proof.cost.spentMicro ?? 0}\u00b5$${
+          proof.cost.maxMicro === null ? '' : ` of ${proof.cost.maxMicro}\u00b5$`
+        }`
+      : `spend unavailable${proof.cost.reason === null ? '' : ` (${proof.cost.reason})`}`,
+  ].filter((bit): bit is string => bit !== null);
+  return `${head} \u2014 ${bits.join(' \u00b7 ')}`;
+}
+
+function shortRef(value: string): string {
+  return value.length > 12 ? `${value.slice(0, 12)}\u2026` : value;
+}
+
+/** One bounded line per durable completion step (proof drill-down). */
+export function proofStepLines(proof: CockpitProofView): string[] {
+  if (proof.completion === null) {
+    return ['no completion contract recorded'];
+  }
+  const lines = proof.completion.steps.map(
+    (step) =>
+      `[${step.status}] ${step.step}${
+        step.present ? '' : ' (no durable status row)'
+      }${step.detail !== null && step.detail.length > 0 ? ` \u2014 ${step.detail}` : ''}`,
+  );
+  lines.push(
+    `gate: ${proof.completion.gate}${
+      proof.completion.gateReason === null ? '' : ` \u2014 ${proof.completion.gateReason}`
+    }`,
+  );
+  return lines;
 }
 
 /** One state-gated control a cockpit section renders. */
@@ -372,6 +648,13 @@ export interface CockpitInput {
   readonly taskVerification: CockpitTaskVerification | null;
   /** The durable tournament of the session, when one exists. */
   readonly tournament?: CockpitTournamentView | null;
+  /** The strict proof summary for the top-level VERIFIED view. */
+  readonly proof?: CockpitNativeProof | null;
+  /**
+   * A proof fetch/validation refusal. Renders as an explicit
+   * `unavailable` proof state; never silently ignored, never VERIFIED.
+   */
+  readonly proofUnavailable?: string | null;
 }
 
 const MAX_LINES = 64;
@@ -482,6 +765,27 @@ const ORIGIN_VIEWS: Record<string, CriterionOriginView> = {
 
 function textOrNull(value: string | null | undefined): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? clamp(value.trim()) : null;
+}
+
+/**
+ * One bounded reviewer identity out of the durable reviewer JSON: a bare
+ * string, or an object carrying `id`/`name`/`reviewer`. Anything else is an
+ * honest null (never a fabricated identity).
+ */
+function reviewerTextOf(value: unknown): string | null {
+  if (typeof value === 'string') {
+    return textOrNull(value);
+  }
+  if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    for (const key of ['id', 'name', 'reviewer', 'reviewerId', 'reviewer_id']) {
+      const text = textOrNull(typeof record[key] === 'string' ? (record[key] as string) : null);
+      if (text !== null) {
+        return text;
+      }
+    }
+  }
+  return null;
 }
 
 /** A short (still honest) display form of one snapshot digest for lines. */
@@ -1161,6 +1465,7 @@ export function buildCockpit(input: CockpitInput): CockpitView | null {
     spend,
     tournament,
     completion: task?.completion ?? null,
+    proof: proofViewOf(input.proof ?? null, input.proofUnavailable ?? null),
   };
 }
 
@@ -1183,6 +1488,32 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
     lines: acceptanceLines.slice(0, MAX_LINES),
     evidence: [],
     criteria: view.criteriaProof.slice(0, MAX_CRITERIA_PROOF),
+  });
+  sections.push({
+    key: 'proof',
+    title: 'Verification proof (daemon)',
+    present: view.proof !== null,
+    lines:
+      view.proof === null
+        ? ['not fetched']
+        : [
+            proofSummaryLine(view.proof),
+            ...(view.proof.reason === null ? [] : [`reason: ${view.proof.reason}`]),
+            ...view.proof.unavailable.map(
+              (entry) => `${entry.component} (${entry.kind}): ${entry.reason}`,
+            ),
+            ...(view.proof.trees.verified === null
+              ? []
+              : [
+                  `verified tree ${shortRef(view.proof.trees.verified)} · landed ${
+                    view.proof.trees.landed === null
+                      ? 'none'
+                      : shortRef(view.proof.trees.landed)
+                  }`,
+                ]),
+            ...proofStepLines(view.proof),
+          ].slice(0, MAX_LINES),
+    evidence: [],
   });
   sections.push({
     key: 'plan',

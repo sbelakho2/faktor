@@ -706,6 +706,82 @@ data class NativeTaskVerification(
     val records: List<NativeVerificationRecord>
 )
 
+// --------------------------------------------- task proof summary (native, v1)
+
+/**
+ * One durable completion step of the strict proof summary (the drill-down
+ * read). `present=false` / `status="missing"` means NO durable row exists;
+ * the UI renders it explicitly and never as a done step.
+ */
+data class NativeProofStep(
+    val step: String,
+    val status: String,
+    val present: Boolean,
+    val detail: String?,
+    val snapshot: String?,
+    val seq: Long?,
+    val atMs: Long?
+)
+
+/** One unavailable proof component (missing / unavailable / corrupt / mismatch). */
+data class NativeProofUnavailable(
+    val component: String,
+    val kind: String,
+    val reason: String
+)
+
+/**
+ * `GET /native/tasks/{id}/proof?session=<sid>`: the full VERIFIED story in
+ * one strict payload (`faktor-task-proof/v1`). `proofState` is the daemon's
+ * own verdict — `verified` only when the whole durable chain backs it,
+ * `unavailable` when a VerifiedComplete claim cannot be re-derived (never
+ * rendered as VERIFIED), `unverified` otherwise.
+ */
+data class NativeTaskProof(
+    val schema: String,
+    val sessionId: String,
+    val taskId: String,
+    val proofState: String,
+    val proofStateReason: String?,
+    val criteriaPassed: Int,
+    val criteriaTotal: Int,
+    val criteriaFailed: Int,
+    val criteriaUnavailable: Int,
+    val certifiesCompletion: Boolean,
+    val checksPassed: Int,
+    val checksTotal: Int,
+    val requiredPassed: Int,
+    val requiredTotal: Int,
+    val reviewStatus: String?,
+    val reviewer: String?,
+    val independentVerdict: String,
+    val verifiedSnapshot: String?,
+    val landedSnapshot: String?,
+    val landedEqualsVerified: Boolean?,
+    val commitOid: String?,
+    val remoteHeadOid: String?,
+    val pullRequestId: String?,
+    val costStatus: String,
+    val costReason: String?,
+    val spentCostMicro: Long?,
+    val maxCostMicro: Long?,
+    val gateStatus: String?,
+    val gateReason: String?,
+    val steps: List<NativeProofStep>,
+    val unavailable: List<NativeProofUnavailable>
+)
+
+/** `GET /native/tasks/{id}/completion-steps?session=<sid>` (drill-down read). */
+data class NativeTaskCompletionSteps(
+    val schema: String,
+    val sessionId: String,
+    val taskId: String,
+    val requestedSteps: List<String>,
+    val steps: List<NativeProofStep>,
+    val gateStatus: String,
+    val gateReason: String?
+)
+
 // ------------------------------------------------ orchestrator graph (native)
 
 data class NativeGraphWorkItem(val itemId: String, val kind: String, val state: String)
@@ -1416,8 +1492,124 @@ fun parseNativeTaskVerification(json: String): NativeTaskVerification {
     )
 }
 
-// ---------------------------------------------------- orchestrator graph parse
+// ------------------------------------------- task proof summary parse (v1)
 
+private fun parseProofStep(v: JsonView): NativeProofStep = NativeProofStep(
+    step = v.field("step").string(),
+    status = v.field("status").string(),
+    present = v.field("present").bool(),
+    detail = v.optionalField("detail")?.let { jsonText(it) },
+    snapshot = v.optionalField("snapshot")?.string(),
+    seq = v.optionalField("seq")?.long(),
+    atMs = v.optionalField("atMs")?.long()
+)
+
+private fun parseProofUnavailable(v: JsonView): NativeProofUnavailable = NativeProofUnavailable(
+    component = v.field("component").string(),
+    kind = v.field("kind").string(),
+    reason = v.field("reason").string()
+)
+
+/**
+ * The reviewer identity out of the durable reviewer JSON: a bare string, or
+ * an object carrying `id`/`name`. Anything else is the bounded raw JSON —
+ * never a fabricated identity.
+ */
+private fun reviewerText(v: JsonView): String? {
+    val value = v.value
+    if (value is JsonValue.Str) return value.value
+    for (key in listOf("id", "name", "reviewer", "reviewerId")) {
+        val candidate = v.optionalField(key)
+        if (candidate != null && candidate.value is JsonValue.Str) {
+            val text = candidate.string()
+            if (text.isNotEmpty()) return text
+        }
+    }
+    return v.rawJson()
+}
+
+private fun parseLandedEquals(v: JsonView): Boolean? =
+    v.optionalField("landedEqualsVerified")?.let { it.bool() }
+
+/**
+ * `GET /native/tasks/{id}/proof?session=<sid>` — strict parse of the
+ * `faktor-task-proof/v1` payload. `proofState` is preserved verbatim (the
+ * model decides what renders); a missing/foreign member fails loudly instead
+ * of fabricating a verdict.
+ */
+fun parseNativeTaskProof(json: String): NativeTaskProof {
+    val v = JsonCodec.parse(json).view("GET /native/tasks/{id}/proof")
+    val schema = v.field("schema").string()
+    if (schema != "faktor-task-proof/v1") {
+        v.fail("unsupported proof schema \"$schema\"")
+    }
+    val criteria = v.field("criteria")
+    val checks = v.field("checks")
+    val review = v.field("review")
+    val trees = v.field("trees")
+    val publication = v.field("publication")
+    val cost = v.field("cost")
+    val completion = v.field("completion")
+    val gate = completion.field("gate")
+    return NativeTaskProof(
+        schema = schema,
+        sessionId = v.field("sessionId").string(),
+        taskId = v.field("taskId").string(),
+        proofState = v.field("proofState").string(),
+        proofStateReason = v.optionalField("proofStateReason")?.let { jsonText(it) },
+        criteriaPassed = criteria.field("passed").int(),
+        criteriaTotal = criteria.field("total").int(),
+        criteriaFailed = criteria.field("failed").int(),
+        criteriaUnavailable = criteria.field("unavailable").int(),
+        certifiesCompletion = criteria.field("certifiesCompletion").bool(),
+        checksPassed = checks.field("passed").int(),
+        checksTotal = checks.field("total").int(),
+        requiredPassed = checks.field("requiredPassed").int(),
+        requiredTotal = checks.field("requiredTotal").int(),
+        reviewStatus = review.optionalField("status")?.string(),
+        reviewer = review.optionalField("reviewer")?.let { reviewerText(it) },
+        independentVerdict = review.field("independentVerdict").string(),
+        verifiedSnapshot = trees.optionalField("verified")?.string(),
+        landedSnapshot = trees.optionalField("landed")?.string(),
+        landedEqualsVerified = parseLandedEquals(trees),
+        commitOid = publication.optionalField("commitOid")?.string(),
+        remoteHeadOid = publication.optionalField("remoteHeadOid")?.string(),
+        pullRequestId = publication.optionalField("pullRequest")?.let { it.field("id").string() },
+        costStatus = cost.field("status").string(),
+        costReason = cost.optionalField("reason")?.let { jsonText(it) },
+        spentCostMicro = cost.optionalField("spentCostMicro")?.long(),
+        maxCostMicro = cost.optionalField("maxCostMicro")?.long(),
+        gateStatus = gate.optionalField("status")?.string(),
+        gateReason = gate.optionalField("reason")?.let { jsonText(it) },
+        steps = completion.field("steps").array().map { parseProofStep(it) },
+        unavailable = v.field("unavailable").array().map { parseProofUnavailable(it) }
+    )
+}
+
+/**
+ * `GET /native/tasks/{id}/completion-steps?session=<sid>` — the durable
+ * per-step status/report drill-down (missing rows stay `present=false`).
+ */
+fun parseNativeTaskCompletionSteps(json: String): NativeTaskCompletionSteps {
+    val v = JsonCodec.parse(json).view("GET /native/tasks/{id}/completion-steps")
+    val schema = v.field("schema").string()
+    if (schema != "faktor-task-completion-steps/v1") {
+        v.fail("unsupported completion-steps schema \"$schema\"")
+    }
+    val contract = v.optionalField("contract")
+    val gate = v.field("gate")
+    return NativeTaskCompletionSteps(
+        schema = schema,
+        sessionId = v.field("sessionId").string(),
+        taskId = v.field("taskId").string(),
+        requestedSteps = contract?.field("requestedSteps")?.stringArray() ?: emptyList(),
+        steps = v.field("steps").array().map { parseProofStep(it) },
+        gateStatus = gate.field("status").string(),
+        gateReason = gate.optionalField("reason")?.let { jsonText(it) }
+    )
+}
+
+// ---------------------------------------------------- orchestrator graph parse
 fun parseNativeOrchestratorGraph(json: String): NativeOrchestratorGraph {
     val v = JsonCodec.parse(json).view("GET /native/orchestrator/graph")
     return NativeOrchestratorGraph(

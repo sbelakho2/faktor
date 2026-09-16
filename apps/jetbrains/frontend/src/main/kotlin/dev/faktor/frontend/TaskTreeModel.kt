@@ -27,6 +27,7 @@ import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.NativeOrchestratorGraph
 import dev.faktor.shared.NativeProjection
 import dev.faktor.shared.NativeSessionUsage
+import dev.faktor.shared.NativeTaskProof
 import dev.faktor.shared.NativeTaskVerification
 import dev.faktor.shared.NativeTaskView
 import dev.faktor.shared.NativeTournament
@@ -242,6 +243,105 @@ data class CompletionView(
     val reason: String?
 )
 
+/** One durable completion step of the proof drill-down. */
+data class ProofStepView(
+    val step: String,
+    val status: String,
+    val present: Boolean,
+    val detail: String?,
+    val snapshot: String?,
+    val atMs: Long?
+)
+
+/** One explicitly unavailable proof component (missing/unavailable/corrupt/mismatch). */
+data class ProofUnavailableView(
+    val component: String,
+    val kind: String,
+    val reason: String
+)
+
+/**
+ * The top-level VERIFIED view derived from `GET /native/tasks/{id}/proof`
+ * (strict payload, daemon verdict preserved verbatim). `verified` is true
+ * ONLY for `state == "verified"`; a failed read is `unavailable` with the
+ * refusal text — a stale or fabricated VERIFIED can never render.
+ */
+data class ProofView(
+    val state: String,
+    val reason: String?,
+    val criteriaPassed: Int,
+    val criteriaTotal: Int,
+    val checksPassed: Int,
+    val checksTotal: Int,
+    val requiredPassed: Int,
+    val requiredTotal: Int,
+    val reviewStatus: String?,
+    val reviewer: String?,
+    val independentVerdict: String,
+    val verifiedSnapshot: String?,
+    val landedSnapshot: String?,
+    val landedEqualsVerified: Boolean?,
+    val commitOid: String?,
+    val remoteHeadOid: String?,
+    val pullRequestId: String?,
+    val costStatus: String,
+    val spentCostMicro: Long?,
+    val maxCostMicro: Long?,
+    val costReason: String?,
+    val gateStatus: String?,
+    val gateReason: String?,
+    val steps: List<ProofStepView>,
+    val unavailable: List<ProofUnavailableView>
+) {
+    val verified: Boolean get() = state == "verified"
+
+    /** The bounded top-level line (VERIFIED only for the verified verdict). */
+    fun summaryText(): String {
+        val head = when (state) {
+            "verified" -> "VERIFIED"
+            "unavailable" -> "VERIFICATION UNAVAILABLE"
+            else -> "NOT VERIFIED"
+        }
+        val bits = ArrayList<String>()
+        bits.add("criteria " + criteriaPassed + "/" + criteriaTotal)
+        bits.add("checks " + checksPassed + "/" + checksTotal + " (required " + requiredPassed + "/" + requiredTotal + ")")
+        bits.add("review " + (reviewStatus ?: "none"))
+        bits.add(
+            "verified==landed: " + when (landedEqualsVerified) {
+                true -> "yes"
+                false -> "NO"
+                null -> "unknown"
+            }
+        )
+        commitOid?.takeIf { it.isNotEmpty() }?.let { bits.add("commit " + shortDigest(it)) }
+        remoteHeadOid?.takeIf { it.isNotEmpty() }?.let { bits.add("remote head " + shortDigest(it)) }
+        pullRequestId?.takeIf { it.isNotEmpty() }?.let { bits.add("PR " + it) }
+        if (costStatus == "known") {
+            bits.add(
+                "spend " + (spentCostMicro ?: 0) + "micro" +
+                    (maxCostMicro?.let { " of " + it + "micro" } ?: "")
+            )
+        } else {
+            bits.add("spend unavailable" + (costReason?.let { " (" + it + ")" } ?: ""))
+        }
+        return head + " — " + bits.joinToString(" · ")
+    }
+
+    /** One line per durable step + the gate verdict (drill-down). */
+    fun stepLines(): List<String> {
+        val lines = ArrayList<String>()
+        for (step in steps) {
+            val detail = step.detail?.takeIf { it.isNotEmpty() }?.let { " — " + it } ?: ""
+            lines.add(
+                "[" + step.status + "] " + step.step +
+                    (if (step.present) "" else " (no durable status row)") + detail
+            )
+        }
+        lines.add("gate: " + (gateStatus ?: "none") + (gateReason?.let { " — " + it } ?: ""))
+        return lines
+    }
+}
+
 /** Durable spend of the session task (tokens + microUSD, remaining computed). */
 data class SpendSummary(
     val spentTokens: Long?,
@@ -313,7 +413,9 @@ data class TaskTreeModel(
     val spend: SpendSummary?,
     val tournament: TournamentView?,
     /** The Task-mode completion contract + durable step statuses. */
-    val completion: CompletionView? = null
+    val completion: CompletionView? = null,
+    /** The top-level VERIFIED view (strict proof summary; null = not fetched). */
+    val proof: ProofView? = null
 )
 
 /** Pure builder over the native DTOs. */
@@ -331,7 +433,9 @@ object TaskTree {
         childUsage: Map<String, NativeSessionUsage> = emptyMap(),
         tournament: NativeTournament? = null,
         submittedCompletion: NativeCompletionContract? = null,
-        runState: String? = null
+        runState: String? = null,
+        proof: NativeTaskProof? = null,
+        proofUnavailable: String? = null
     ): TaskTreeModel {
         val children = agents
             .filter { it.kind == "child" }
@@ -367,7 +471,94 @@ object TaskTree {
             evidence = evidence(task, taskVerification),
             spend = spend(usage, task),
             tournament = tournament?.let { tournamentView(it) },
-            completion = completion(task, submittedCompletion, runState)
+            completion = completion(task, submittedCompletion, runState),
+            proof = proof(proof, proofUnavailable)
+        )
+    }
+
+    // --------------------------------------------------------------- proof
+
+    /**
+     * Project the strict proof DTO into the rendered view. A refusal
+     * (`proofUnavailable`) wins over any cached DTO: the previous proof is
+     * never re-rendered as VERIFIED for a read that can no longer be
+     * confirmed.
+     */
+    private fun proof(
+        proof: NativeTaskProof?,
+        proofUnavailable: String?
+    ): ProofView? {
+        if (proofUnavailable != null) {
+            return ProofView(
+                state = "unavailable",
+                reason = proofUnavailable,
+                criteriaPassed = 0,
+                criteriaTotal = 0,
+                checksPassed = 0,
+                checksTotal = 0,
+                requiredPassed = 0,
+                requiredTotal = 0,
+                reviewStatus = null,
+                reviewer = null,
+                independentVerdict = "none",
+                verifiedSnapshot = null,
+                landedSnapshot = null,
+                landedEqualsVerified = null,
+                commitOid = null,
+                remoteHeadOid = null,
+                pullRequestId = null,
+                costStatus = "unavailable",
+                spentCostMicro = null,
+                maxCostMicro = null,
+                costReason = "proof read failed",
+                gateStatus = null,
+                gateReason = null,
+                steps = emptyList(),
+                unavailable = listOf(
+                    ProofUnavailableView("proof", "unavailable", proofUnavailable)
+                )
+            )
+        }
+        if (proof == null) {
+            return null
+        }
+        return ProofView(
+            state = proof.proofState,
+            reason = proof.proofStateReason,
+            criteriaPassed = proof.criteriaPassed,
+            criteriaTotal = proof.criteriaTotal,
+            checksPassed = proof.checksPassed,
+            checksTotal = proof.checksTotal,
+            requiredPassed = proof.requiredPassed,
+            requiredTotal = proof.requiredTotal,
+            reviewStatus = proof.reviewStatus,
+            reviewer = proof.reviewer,
+            independentVerdict = proof.independentVerdict,
+            verifiedSnapshot = proof.verifiedSnapshot,
+            landedSnapshot = proof.landedSnapshot,
+            landedEqualsVerified = proof.landedEqualsVerified,
+            commitOid = proof.commitOid,
+            remoteHeadOid = proof.remoteHeadOid,
+            pullRequestId = proof.pullRequestId,
+            costStatus = proof.costStatus,
+            spentCostMicro = proof.spentCostMicro,
+            maxCostMicro = proof.maxCostMicro,
+            costReason = proof.costReason,
+            gateStatus = proof.gateStatus,
+            gateReason = proof.gateReason,
+            steps = proof.steps.map {
+                ProofStepView(
+                    step = it.step,
+                    status = it.status,
+                    present = it.present,
+                    detail = it.detail,
+                    snapshot = it.snapshot,
+                    atMs = it.atMs
+                )
+            },
+            unavailable = proof.unavailable.map {
+                ProofUnavailableView(it.component, it.kind, it.reason)
+            }
         )
     }
 

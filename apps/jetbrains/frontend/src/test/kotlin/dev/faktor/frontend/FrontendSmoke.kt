@@ -22,6 +22,8 @@ import dev.faktor.shared.parseNativeOrchestratorGraph
 import dev.faktor.shared.parseNativePermissionList
 import dev.faktor.shared.parseNativePresentationAck
 import dev.faktor.shared.parseNativeSessionUsage
+import dev.faktor.shared.parseNativeTaskCompletionSteps
+import dev.faktor.shared.parseNativeTaskProof
 import dev.faktor.shared.parseNativeTaskVerification
 import dev.faktor.shared.parseNativeTaskViews
 import dev.faktor.shared.parseNativeTournament
@@ -82,6 +84,101 @@ private const val VERIFICATION_JSON = "{" +
     "\"owed\":[{\"opId\":\"op-3\",\"tool\":\"shell\",\"startedMs\":6," +
     "\"status\":\"running\",\"effectStatus\":\"unknown\"}]," +
     "\"failedChecks\":[]}"
+
+// The strict proof summary (`faktor-task-proof/v1`) as `GET
+// /native/tasks/{id}/proof` serves it: a fully VERIFIED story with criteria,
+// required-check totals, review, verified==landed trees, the published commit
+// + remote PR head and the spend fold.
+private const val TASK_PROOF_JSON = "{" +
+    "\"schema\":\"faktor-task-proof/v1\",\"sessionId\":\"1\",\"taskId\":\"3\"," +
+    "\"proofState\":\"verified\",\"proofStateReason\":null," +
+    "\"task\":{\"state\":\"verified_complete\",\"revision\":\"4\",\"goal\":\"ship it\"," +
+    "\"updatedMs\":1,\"acceptanceCriteria\":[\"criterion A\"]}," +
+    "\"criteria\":{\"recordId\":\"1\",\"recordStatus\":\"passed\",\"recordRevision\":\"3\"," +
+    "\"certifiesCompletion\":true,\"total\":2,\"passed\":2,\"failed\":0," +
+    "\"unavailable\":0,\"items\":[],\"truncated\":false}," +
+    "\"checks\":{\"total\":3,\"passed\":3,\"failed\":0,\"other\":0,\"requiredTotal\":2," +
+    "\"requiredPassed\":2,\"requiredFailed\":0,\"requiredAllPassed\":true," +
+    "\"items\":[],\"truncated\":false}," +
+    "\"review\":{\"recordId\":\"1\",\"status\":\"passed\"," +
+    "\"reviewer\":{\"id\":\"review-bot\"},\"independentVerdict\":\"passed\"," +
+    "\"independentCriteria\":[\"c2\"]}," +
+    "\"trees\":{\"runBase\":\"tm1:aaa\",\"verified\":\"tm1:bbb\",\"landed\":\"tm1:bbb\"," +
+    "\"landedEqualsVerified\":true,\"sourceCount\":1}," +
+    "\"publication\":{\"verificationRecord\":\"1\",\"gitTreeOid\":null," +
+    "\"commitOid\":\"2222222222222222222222222222222222222222\"," +
+    "\"localRef\":\"refs/heads/main\"," +
+    "\"remoteRef\":\"origin:refs/heads/main@2222222222222222222222222222222222222222\"," +
+    "\"remoteHeadOid\":\"2222222222222222222222222222222222222222\"," +
+    "\"pullRequest\":{\"provider\":\"github\"," +
+    "\"operationKey\":\"task:3:rev:3:github:pull_request\",\"id\":\"pr-42\"," +
+    "\"version\":\"2222222222222222222222222222222222222222@1\",\"headOid\":null," +
+    "\"state\":\"completed\"}}," +
+    "\"cost\":{\"status\":\"known\",\"reason\":null,\"spentCostMicro\":12," +
+    "\"maxCostMicro\":1000000,\"openReservedMicro\":0,\"openReservations\":0," +
+    "\"uncertainReservedMicro\":0,\"uncertainReservations\":0,\"settledCount\":1}," +
+    "\"completion\":{\"contract\":{\"includeCommit\":false,\"includePush\":true," +
+    "\"includePr\":true,\"revision\":\"3\",\"requestedSteps\":[\"push\",\"pr\"]}," +
+    "\"steps\":[" +
+    "{\"step\":\"push\",\"status\":\"succeeded\",\"present\":true," +
+    "\"detail\":\"pushed to origin\",\"snapshot\":null,\"seq\":2,\"atMs\":1}," +
+    "{\"step\":\"pr\",\"status\":\"succeeded\",\"present\":true," +
+    "\"detail\":\"opened pr-42\",\"snapshot\":null,\"seq\":3,\"atMs\":2}]," +
+    "\"records\":[],\"gate\":{\"status\":\"satisfied\",\"reason\":null}," +
+    "\"truncated\":false}," +
+    "\"integration\":{\"present\":true,\"inFlight\":false,\"runId\":\"run-1\"," +
+    "\"finalSnapshotHash\":\"tm1:bbb\",\"landedSnapshot\":\"tm1:bbb\"," +
+    "\"integratedFileCount\":1,\"conflictCount\":0," +
+    "\"txn\":{\"txnId\":\"blake3:x\",\"phase\":\"landed\"}}," +
+    "\"unavailable\":[]}"
+
+// The same route with a VerifiedComplete task whose chain does not back it:
+// the daemon verdict is `unavailable` and the component names the cause. The
+// UI must render it explicitly and NEVER as VERIFIED.
+private const val TASK_PROOF_UNAVAILABLE_JSON = "{" +
+    "\"schema\":\"faktor-task-proof/v1\",\"sessionId\":\"1\",\"taskId\":\"3\"," +
+    "\"proofState\":\"unavailable\"," +
+    "\"proofStateReason\":\"landed_snapshot mismatch: the landed integration snapshot " +
+    "does not equal the verified snapshot\"," +
+    "\"task\":{\"state\":\"verified_complete\",\"revision\":\"4\",\"goal\":\"ship it\"," +
+    "\"updatedMs\":1,\"acceptanceCriteria\":[\"criterion A\"]}," +
+    "\"criteria\":{\"recordId\":\"1\",\"recordStatus\":\"passed\",\"recordRevision\":\"3\"," +
+    "\"certifiesCompletion\":true,\"total\":2,\"passed\":2,\"failed\":0," +
+    "\"unavailable\":0,\"items\":[],\"truncated\":false}," +
+    "\"checks\":{\"total\":3,\"passed\":3,\"failed\":0,\"other\":0,\"requiredTotal\":2," +
+    "\"requiredPassed\":2,\"requiredFailed\":0,\"requiredAllPassed\":true," +
+    "\"items\":[],\"truncated\":false}," +
+    "\"review\":{\"recordId\":\"1\",\"status\":\"passed\",\"reviewer\":{\"id\":\"review-bot\"}," +
+    "\"independentVerdict\":\"passed\",\"independentCriteria\":[\"c2\"]}," +
+    "\"trees\":{\"runBase\":\"tm1:aaa\",\"verified\":\"tm1:bbb\",\"landed\":\"tm1:ccc\"," +
+    "\"landedEqualsVerified\":false,\"sourceCount\":1}," +
+    "\"publication\":{\"verificationRecord\":\"1\",\"gitTreeOid\":null,\"commitOid\":null," +
+    "\"localRef\":null,\"remoteRef\":null,\"remoteHeadOid\":null,\"pullRequest\":null}," +
+    "\"cost\":{\"status\":\"unavailable\",\"reason\":\"budget read pool\"," +
+    "\"spentCostMicro\":null,\"maxCostMicro\":null,\"openReservations\":null," +
+    "\"settledCount\":null}," +
+    "\"completion\":{\"contract\":null,\"steps\":[],\"records\":[]," +
+    "\"gate\":{\"status\":\"no_contract\",\"reason\":null},\"truncated\":false}," +
+    "\"integration\":{\"present\":true,\"inFlight\":false,\"runId\":\"run-1\"," +
+    "\"finalSnapshotHash\":\"tm1:ccc\",\"landedSnapshot\":\"tm1:ccc\"," +
+    "\"integratedFileCount\":0,\"conflictCount\":0,\"txn\":null}," +
+    "\"unavailable\":[{\"component\":\"landed_snapshot\",\"kind\":\"mismatch\"," +
+    "\"reason\":\"the landed integration snapshot does not equal the verified snapshot\"}]}"
+
+// `GET /native/tasks/{id}/completion-steps`: one succeeded step, one MISSING
+// step (no durable row) and the refused gate naming it.
+private const val COMPLETION_STEPS_JSON = "{" +
+    "\"schema\":\"faktor-task-completion-steps/v1\",\"sessionId\":\"1\",\"taskId\":\"3\"," +
+    "\"contract\":{\"includeCommit\":false,\"includePush\":true,\"includePr\":true," +
+    "\"revision\":\"3\",\"requestedSteps\":[\"push\",\"pr\"]}," +
+    "\"steps\":[" +
+    "{\"step\":\"push\",\"status\":\"succeeded\",\"present\":true," +
+    "\"detail\":\"pushed to origin\",\"snapshot\":null,\"seq\":2,\"atMs\":1}," +
+    "{\"step\":\"pr\",\"status\":\"missing\",\"present\":false," +
+    "\"detail\":null,\"snapshot\":null,\"seq\":null,\"atMs\":null}]," +
+    "\"records\":[]," +
+    "\"gate\":{\"status\":\"refused\",\"reason\":\"step Pr has no durable status row\"}," +
+    "\"truncated\":false}"
 
 private const val TASK_VERIFICATION_JSON = "{" +
     "\"sessionId\":\"1\",\"taskId\":\"3\",\"records\":[{" +
@@ -989,6 +1086,90 @@ object FrontendSmoke {
             assertEquals(null, bare.provider)
             assertEquals(null, bare.reasoning)
             assertEquals(null, bare.tools)
+        }
+
+        step("strict proof summary renders VERIFIED only from the daemon verdict") {
+            val task = parseNativeTaskViews(TASK_JSON)[0]
+            val proof = parseNativeTaskProof(TASK_PROOF_JSON)
+            assertEquals("faktor-task-proof/v1", proof.schema)
+            assertEquals("verified", proof.proofState)
+            assertEquals(2, proof.criteriaPassed)
+            assertEquals(2, proof.criteriaTotal)
+            assertEquals(2, proof.requiredPassed)
+            assertEquals("review-bot", proof.reviewer)
+            assertEquals(true, proof.landedEqualsVerified)
+            assertEquals("pr-42", proof.pullRequestId)
+            assertEquals(12L, proof.spentCostMicro)
+            assertEquals(2, proof.steps.size)
+
+            val model = TaskTree.build(task = task, proof = proof)
+            val view = model.proof ?: fail("a served proof must build the view")
+            assertTrue(view.verified, "the daemon's verified verdict renders verified")
+            val summary = view.summaryText()
+            assertTrue(summary.startsWith("VERIFIED"), summary)
+            assertTrue(summary.contains("criteria 2/2"), summary)
+            assertTrue(summary.contains("checks 3/3 (required 2/2)"), summary)
+            assertTrue(summary.contains("review passed"), summary)
+            assertTrue(summary.contains("verified==landed: yes"), summary)
+            assertTrue(summary.contains("commit 22222222"), summary)
+            assertTrue(summary.contains("remote head 22222222"), summary)
+            assertTrue(summary.contains("PR pr-42"), summary)
+            assertTrue(summary.contains("spend 12micro of 1000000micro"), summary)
+            // Drill-down: each durable step + the gate verdict.
+            val stepLines = view.stepLines()
+            assertTrue(stepLines.any { it == "[succeeded] push — pushed to origin" }, stepLines.toString())
+            assertTrue(stepLines.any { it == "gate: satisfied" }, stepLines.toString())
+            // The panel renders the proof node from the served DTO.
+            val panel = TaskTreePanel()
+            panel.update(model)
+            assertEquals(model, panel.model())
+
+            // An `unavailable` daemon verdict renders explicitly; the summary
+            // NEVER carries the verified verdict.
+            val unavailable =
+                TaskTree.build(task = task, proof = parseNativeTaskProof(TASK_PROOF_UNAVAILABLE_JSON))
+                    .proof ?: fail("unavailable proof view")
+            assertEquals("unavailable", unavailable.state)
+            val unavailableText = unavailable.summaryText()
+            assertTrue(unavailableText.startsWith("VERIFICATION UNAVAILABLE"), unavailableText)
+            assertEquals(1, unavailable.unavailable.size)
+            assertEquals("landed_snapshot", unavailable.unavailable[0].component)
+            assertEquals("mismatch", unavailable.unavailable[0].kind)
+            assertTrue(
+                unavailable.reason?.contains("landed_snapshot mismatch") == true,
+                unavailable.reason ?: "(none)"
+            )
+            assertTrue(!unavailableText.contains("VERIFIED "), unavailableText)
+            assertTrue(!unavailableText.contains("verified==landed: yes"), unavailableText)
+
+            // A failed read (the client refused the payload) is the same
+            // explicit unavailable state: the reason is surfaced verbatim.
+            val refused = TaskTree.build(
+                task = task,
+                proofUnavailable = "proof read failed: corrupt_durable_state"
+            ).proof ?: fail("refused proof view")
+            assertEquals("unavailable", refused.state)
+            assertTrue(
+                refused.summaryText().startsWith("VERIFICATION UNAVAILABLE"),
+                refused.summaryText()
+            )
+            assertTrue(
+                refused.reason?.contains("corrupt_durable_state") == true,
+                refused.reason ?: "(none)"
+            )
+            assertTrue(!refused.summaryText().contains("VERIFIED "), refused.summaryText())
+
+            // The drill-down route parses a missing step honestly.
+            val steps = parseNativeTaskCompletionSteps(COMPLETION_STEPS_JSON)
+            assertEquals("faktor-task-completion-steps/v1", steps.schema)
+            assertEquals(listOf("push", "pr"), steps.requestedSteps)
+            assertEquals(false, steps.steps[1].present)
+            assertEquals("missing", steps.steps[1].status)
+            assertEquals("refused", steps.gateStatus)
+            assertTrue(
+                steps.gateReason?.contains("Pr") == true,
+                steps.gateReason ?: "(none)"
+            )
         }
 
         step("every new UI section is constructible from the mock payload") {

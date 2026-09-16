@@ -39,6 +39,8 @@ import dev.faktor.shared.NativeSessionUsage
 import dev.faktor.shared.NativeTaskRun
 import dev.faktor.shared.NativeTaskRunCancelled
 import dev.faktor.shared.NativeTaskRunStarted
+import dev.faktor.shared.NativeTaskCompletionSteps
+import dev.faktor.shared.NativeTaskProof
 import dev.faktor.shared.NativeTaskVerification
 import dev.faktor.shared.NativeTaskView
 import dev.faktor.shared.NativeTerminalEventPage
@@ -427,6 +429,18 @@ class FaktorFrontendService(
 
     fun taskVerification(taskId: String): NativeTaskVerification =
         clientOrThrow().taskVerification(requireSession(), taskId)
+
+    /**
+     * The strict proof summary for the top-level VERIFIED view. The caller
+     * catches a refusal and renders it as an EXPLICIT unavailable state (a
+     * stale VERIFIED is never shown for an unreadable proof).
+     */
+    fun taskProof(taskId: String): NativeTaskProof =
+        clientOrThrow().taskProof(requireSession(), taskId)
+
+    /** The durable per-step status/report drill-down. */
+    fun taskCompletionSteps(taskId: String): NativeTaskCompletionSteps =
+        clientOrThrow().taskCompletionSteps(requireSession(), taskId)
 
     // ------------------------------------------------------------- evidence
 

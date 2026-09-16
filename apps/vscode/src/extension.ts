@@ -25,6 +25,7 @@ import {
   NativeModelInfo,
   NativeSessionUsage,
   NativeTaskRun,
+  NativeTaskProof,
   NativeTaskVerification,
   NativeTaskView,
   NativeTournament,
@@ -98,6 +99,11 @@ interface ActiveSession {
   /** Reuse the last task-verification read while its inputs are unchanged. */
   taskVerificationKey: string | null;
   taskVerification: NativeTaskVerification | null;
+  /** Reuse the last strict proof read while its inputs are unchanged. */
+  taskProofKey: string | null;
+  taskProof: NativeTaskProof | null;
+  /** Explicit refusal of the last proof read (never a silent stale proof). */
+  taskProofUnavailable: string | null;
   /** The tournament the cockpit auto-loads (tracked id, else newest). */
   tournamentId: string | null;
   /** Persistent deterministic pixel presence per ChildId. */
@@ -121,6 +127,9 @@ const active: ActiveSession = {
   refreshTimer: null,
   taskVerificationKey: null,
   taskVerification: null,
+  taskProofKey: null,
+  taskProof: null,
+  taskProofUnavailable: null,
   tournamentId: null,
   pixelPresence: new Map(),
   completionContract: null,
@@ -361,6 +370,9 @@ function stopServer(): void {
   active.refreshing = false;
   active.taskVerificationKey = null;
   active.taskVerification = null;
+  active.taskProofKey = null;
+  active.taskProof = null;
+  active.taskProofUnavailable = null;
   active.tournamentId = null;
   active.pixelPresence = new Map();
   active.completionContract = null;
@@ -576,6 +588,10 @@ async function refresh(): Promise<void> {
     const taskVerification = cockpitTaskVerificationView(
       await taskVerificationFor(client, sessionId, runs, task, verification),
     );
+    // The strict proof summary feeds the top-level VERIFIED view: a failed
+    // read is an EXPLICIT unavailable state (the cached proof is dropped),
+    // so a stale VERIFIED can never render for an unreadable proof.
+    const proofRead = await taskProofFor(client, sessionId, runs, task);
     // The durable tournament auto-load: the tracked id while it still exists,
     // else the newest summary. A missing listing/state is a null block, never
     // a fabricated tournament.
@@ -587,6 +603,8 @@ async function refresh(): Promise<void> {
       usage: usageView,
       taskVerification,
       tournament,
+      proof: proofRead.proof,
+      proofUnavailable: proofRead.unavailable,
     });
     store.patch({
       sessions,
@@ -665,6 +683,45 @@ async function taskVerificationFor(
     return view;
   } catch {
     return active.taskVerification;
+  }
+}
+
+/**
+ * Fetch the strict proof summary (`GET /native/tasks/{id}/proof`) for the
+ * top-level VERIFIED view, reusing the cached read while its inputs are
+ * unchanged. A refusal (typed 4xx/5xx, protocol violation) drops the cached
+ * proof and returns the error text as an EXPLICIT unavailable reason; a
+ * stale VERIFIED is never rendered for a proof that can no longer be read.
+ */
+async function taskProofFor(
+  client: NativeClient,
+  sessionId: string,
+  runs: readonly NativeTaskRun[],
+  task: TaskSummary | null,
+): Promise<{ proof: NativeTaskProof | null; unavailable: string | null }> {
+  if (task === null || runs.length === 0) {
+    active.taskProofKey = null;
+    active.taskProof = null;
+    active.taskProofUnavailable = null;
+    return { proof: null, unavailable: null };
+  }
+  const taskId = String(runs[0]!.task_id);
+  const key = `${taskId}:${task.state}:${runs[0]!.state}`;
+  if (key === active.taskProofKey) {
+    return { proof: active.taskProof, unavailable: active.taskProofUnavailable };
+  }
+  try {
+    const proof = await client.taskProof(sessionId, taskId);
+    active.taskProofKey = key;
+    active.taskProof = proof;
+    active.taskProofUnavailable = null;
+    return { proof, unavailable: null };
+  } catch (error) {
+    const reason = messageOf(error);
+    active.taskProofKey = key;
+    active.taskProof = null;
+    active.taskProofUnavailable = reason;
+    return { proof: null, unavailable: reason };
   }
 }
 

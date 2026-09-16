@@ -110,6 +110,84 @@ pub struct StoredUsageEvent {
     pub event: UsageEvent,
 }
 
+/// The SQL schema of the durable billing-report schedule (migration v4 of
+/// the control-plane ladder). Append-only in spirit: rows advance through
+/// their open -> reported/failed states, and a REPORTED/FAILED period is
+/// terminal (the runner never re-opens it), so a period can never be
+/// double-reported even across a crash or restart.
+pub const BILLING_REPORT_SCHEMA_V4: &str = "
+     CREATE TABLE IF NOT EXISTS billing_report_period (
+        organization_id TEXT NOT NULL,
+        period TEXT NOT NULL,
+        status TEXT NOT NULL,
+        next_attempt_at_ms INTEGER NOT NULL,
+        first_seen_ms INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        PRIMARY KEY (organization_id, period)
+     );
+     CREATE INDEX IF NOT EXISTS idx_billing_report_period_due
+        ON billing_report_period(organization_id, status, next_attempt_at_ms);
+";
+
+/// The status of one reporting period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportPeriodStatus {
+    /// Open: not reported yet (possibly mid-report with a continuation
+    /// cursor, or waiting for its retry backoff).
+    Open,
+    /// Reported to completion; terminal (never double-reported).
+    Reported,
+    /// Terminally failed (a final vendor refusal or exhausted attempts);
+    /// never retried.
+    Failed,
+}
+
+impl ReportPeriodStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ReportPeriodStatus::Open => "open",
+            ReportPeriodStatus::Reported => "reported",
+            ReportPeriodStatus::Failed => "failed",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "open" => Some(ReportPeriodStatus::Open),
+            "reported" => Some(ReportPeriodStatus::Reported),
+            "failed" => Some(ReportPeriodStatus::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// One durable report period row: the schedule's unit of exactly-once
+/// reporting. `next_cursor` is the vendor continuation cursor INSIDE the
+/// period (recorded before the next page is sent, so a crash replays the
+/// same page key and the vendor de-duplicates).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportPeriodRow {
+    pub organization_id: String,
+    pub period: String,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    pub status: ReportPeriodStatus,
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    pub first_seen_ms: i64,
+    #[serde(default)]
+    pub reported_at_ms: Option<i64>,
+    pub next_attempt_at_ms: i64,
+}
+
+/// Bound on the retained report periods of ONE organization (oldest rows
+/// are pruned on insert; the schedule is bounded over an unbounded lifetime).
+pub const MAX_REPORT_PERIODS_PER_ORG: usize = 512;
+
 /// One stored credit entry with its immutable durable order (`entry_seq`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredCreditEntry {
@@ -275,6 +353,23 @@ pub trait BillingStore: Send + Sync {
         &self,
         organization: &OrganizationId,
     ) -> Result<Vec<InFlightTxn>, BillingStoreError>;
+
+    /// Upsert one report period row (the record-before-send step: it is
+    /// durable before any vendor call). Insertion prunes the organization's
+    /// oldest rows beyond [`MAX_REPORT_PERIODS_PER_ORG`].
+    fn put_report_period(&self, row: &ReportPeriodRow) -> Result<(), BillingStoreError>;
+    /// One report period row (idempotency/restart resolution).
+    fn report_period(
+        &self,
+        organization: &OrganizationId,
+        period: &str,
+    ) -> Result<Option<ReportPeriodRow>, BillingStoreError>;
+    /// One bounded page of the organization's report rows, newest first.
+    fn report_periods(
+        &self,
+        organization: &OrganizationId,
+        limit: usize,
+    ) -> Result<Vec<ReportPeriodRow>, BillingStoreError>;
 }
 
 /// The outcome of one credit append.
@@ -297,6 +392,7 @@ struct MemBilling {
     credits: BTreeMap<String, StoredCreditEntry>,
     credit_order: BTreeMap<String, Vec<String>>,
     in_flight: BTreeMap<String, InFlightTxn>,
+    report_periods: BTreeMap<String, ReportPeriodRow>,
 }
 
 /// In-memory [`BillingStore`] (tests and embedded hosts). Enforces exactly
@@ -684,6 +780,92 @@ impl BillingStore for MemoryBillingStore {
             .filter(|row| row.organization == *organization)
             .cloned()
             .collect())
+    }
+
+    fn put_report_period(&self, row: &ReportPeriodRow) -> Result<(), BillingStoreError> {
+        let mut state = self.lock()?;
+        let key = report_key(&row.organization_id, &row.period);
+        state.report_periods.insert(key, row.clone());
+        prune_report_periods(
+            &mut state.report_periods,
+            row.organization_id.as_str(),
+            MAX_REPORT_PERIODS_PER_ORG,
+        );
+        Ok(())
+    }
+
+    fn report_period(
+        &self,
+        organization: &OrganizationId,
+        period: &str,
+    ) -> Result<Option<ReportPeriodRow>, BillingStoreError> {
+        Ok(self
+            .lock()?
+            .report_periods
+            .get(&report_key(organization.as_str(), period))
+            .cloned())
+    }
+
+    fn report_periods(
+        &self,
+        organization: &OrganizationId,
+        limit: usize,
+    ) -> Result<Vec<ReportPeriodRow>, BillingStoreError> {
+        let state = self.lock()?;
+        let mut rows: Vec<ReportPeriodRow> = state
+            .report_periods
+            .values()
+            .filter(|row| row.organization_id == organization.as_str())
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            b.first_seen_ms
+                .cmp(&a.first_seen_ms)
+                .then_with(|| b.period.cmp(&a.period))
+        });
+        rows.truncate(limit);
+        Ok(rows)
+    }
+}
+
+fn report_key(organization: &str, period: &str) -> String {
+    format!("{organization}\0{period}")
+}
+
+/// Prune one organization's report rows to the newest `bound` (by first
+/// sighting, then period): the schedule stays bounded over an unbounded
+/// lifetime. Terminal (reported/failed) rows are pruned first so an open
+/// period is never silently dropped while an old terminal row survives.
+fn prune_report_periods(
+    rows: &mut BTreeMap<String, ReportPeriodRow>,
+    organization: &str,
+    bound: usize,
+) {
+    let mut mine: Vec<(String, bool, i64, String)> = rows
+        .iter()
+        .filter(|(_, row)| row.organization_id == organization)
+        .map(|(key, row)| {
+            (
+                key.clone(),
+                row.status == ReportPeriodStatus::Open,
+                row.first_seen_ms,
+                row.period.clone(),
+            )
+        })
+        .collect();
+    if mine.len() <= bound {
+        return;
+    }
+    // Oldest first, terminal before open within the same age (an open
+    // period is the more valuable row to keep).
+    mine.sort_by(|a, b| {
+        a.2.cmp(&b.2)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.3.cmp(&b.3))
+    });
+    let excess = mine.len().saturating_sub(bound);
+    for (key, _, _, _) in mine.into_iter().take(excess) {
+        rows.remove(&key);
     }
 }
 
@@ -1206,6 +1388,86 @@ impl BillingStore for SqliteControlPlaneStore {
             .map_err(backend)?;
         let rows = stmt
             .query_map(params![organization.as_str()], |r| r.get::<_, String>(0))
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?;
+        rows.iter().map(|p| parse(p)).collect()
+    }
+
+    fn put_report_period(&self, row: &ReportPeriodRow) -> Result<(), BillingStoreError> {
+        let payload = encode(row)?;
+        let mut conn = self.lock_billing_conn()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        tx.execute(
+            "INSERT INTO billing_report_period
+                (organization_id, period, status, next_attempt_at_ms, first_seen_ms, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(organization_id, period) DO UPDATE SET
+                status = excluded.status,
+                next_attempt_at_ms = excluded.next_attempt_at_ms,
+                first_seen_ms = excluded.first_seen_ms,
+                payload = excluded.payload",
+            params![
+                row.organization_id,
+                row.period,
+                row.status.as_str(),
+                row.next_attempt_at_ms,
+                row.first_seen_ms,
+                payload,
+            ],
+        )
+        .map_err(backend)?;
+        // Bounded schedule: prune the organization's oldest rows beyond the
+        // bound (terminal rows first at the same age).
+        tx.execute(
+            "DELETE FROM billing_report_period WHERE organization_id = ?1 AND period NOT IN (
+                 SELECT period FROM billing_report_period WHERE organization_id = ?1
+                 ORDER BY (status = 'open') DESC, first_seen_ms DESC, period DESC
+                 LIMIT ?2)",
+            params![row.organization_id, MAX_REPORT_PERIODS_PER_ORG as i64],
+        )
+        .map_err(backend)?;
+        tx.commit().map_err(backend)?;
+        Ok(())
+    }
+
+    fn report_period(
+        &self,
+        organization: &OrganizationId,
+        period: &str,
+    ) -> Result<Option<ReportPeriodRow>, BillingStoreError> {
+        let conn = self.lock_billing_conn()?;
+        let payload: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM billing_report_period
+                 WHERE organization_id = ?1 AND period = ?2",
+                params![organization.as_str(), period],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        payload.map(|p| parse(&p)).transpose()
+    }
+
+    fn report_periods(
+        &self,
+        organization: &OrganizationId,
+        limit: usize,
+    ) -> Result<Vec<ReportPeriodRow>, BillingStoreError> {
+        let conn = self.lock_billing_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload FROM billing_report_period
+                 WHERE organization_id = ?1
+                 ORDER BY first_seen_ms DESC, period DESC LIMIT ?2",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map(params![organization.as_str(), limit as i64], |r| {
+                r.get::<_, String>(0)
+            })
             .map_err(backend)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(backend)?;

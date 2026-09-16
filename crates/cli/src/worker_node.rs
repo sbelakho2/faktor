@@ -9,7 +9,9 @@
 //! When enabled the node:
 //!
 //! 1. reads the strict `[worker_node]` configuration and its registration
-//!    token (`token` inline or `token_file`; never logged);
+//!    token (`token` inline or `token_payload`, the latter loaded from the
+//!    operator-staged payload directory through the strict contract; never
+//!    logged);
 //! 2. builds the daemon's OWN graph ([`crate::build_daemon`]) — the SAME
 //!    session store, agent runtime and provider stack the local path uses
 //!    (there is no second engine);
@@ -47,11 +49,10 @@ use faktor_worker::{
 };
 
 use crate::config::{Config, WorkerNodeCfg};
+use crate::payload::PayloadDir;
 
 /// Bound on one staged payload file (the runtime's own payload bound).
 const MAX_STAGED_PAYLOAD_BYTES: usize = faktor_worker::MAX_PAYLOAD_BYTES;
-/// Bound on one registration token read from `token_file`.
-const MAX_TOKEN_FILE_BYTES: u64 = 4_096;
 
 fn load_config(data_dir: &Path, config_path: Option<PathBuf>) -> Result<Config, String> {
     let path = config_path.unwrap_or_else(|| data_dir.join("faktor-plus.json"));
@@ -61,26 +62,20 @@ fn load_config(data_dir: &Path, config_path: Option<PathBuf>) -> Result<Config, 
     Config::load(&path).map_err(|e| format!("config {}: {e}", path.display()))
 }
 
-/// The registration token: inline or read from `token_file` (bounded,
-/// trimmed; the plaintext never reaches a log line).
-fn resolve_token(cfg: &WorkerNodeCfg) -> Result<SecretToken, String> {
-    let raw = match (&cfg.token, &cfg.token_file) {
+/// The registration token: inline or loaded from the operator-staged
+/// payload directory (`token_payload`, under `payload_dir`) through the
+/// strict contract — regular file, 0600-style on unix, bounded, non-empty.
+/// The plaintext never reaches a log line.
+fn resolve_token(cfg: &WorkerNodeCfg, data_dir: &Path) -> Result<SecretToken, String> {
+    let raw = match (&cfg.token, &cfg.token_payload) {
         (Some(token), None) => token.trim().to_string(),
-        (None, Some(path)) => {
-            let path = PathBuf::from(path);
-            let metadata = std::fs::metadata(&path)
-                .map_err(|e| format!("worker_node: token_file {}: {e}", path.display()))?;
-            if metadata.len() == 0 || metadata.len() > MAX_TOKEN_FILE_BYTES {
-                return Err(format!(
-                    "worker_node: token_file must be 1..={MAX_TOKEN_FILE_BYTES} bytes"
-                ));
-            }
-            std::fs::read_to_string(&path)
-                .map_err(|e| format!("worker_node: token_file {}: {e}", path.display()))?
-                .trim()
-                .to_string()
+        (None, Some(name)) => {
+            let root = cfg.payload_root(data_dir)?;
+            PayloadDir::new(root)
+                .load_secret(name)
+                .map_err(|e| format!("worker_node: token_payload {e}"))?
         }
-        _ => return Err("worker_node: set exactly one of `token` or `token_file`".into()),
+        _ => return Err("worker_node: set exactly one of `token` or `token_payload`".into()),
     };
     SecretToken::try_new(raw).map_err(|e| format!("worker_node: {e}"))
 }
@@ -100,7 +95,7 @@ pub async fn run(
         );
     }
     cfg.validate()?;
-    let token = resolve_token(&cfg)?;
+    let token = resolve_token(&cfg, &data_dir)?;
     let worker_id = cfg.worker_id()?;
     let capabilities = cfg.capabilities()?;
     let base = cfg.control_plane_url()?;
@@ -108,11 +103,7 @@ pub async fn run(
         .display_name
         .clone()
         .unwrap_or_else(|| worker_id.as_str().to_string());
-    let payload_dir = cfg
-        .payload_dir
-        .clone()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| data_dir.join("worker_payloads"));
+    let payload_dir = cfg.payload_root(&data_dir)?;
 
     // The EXISTING local execution machinery: the daemon's own graph.
     let model = config.model.clone();
@@ -489,5 +480,117 @@ impl JobExecutor for LocalPipelineExecutor {
                 _ = &mut cancelled => Err("cancelled by lease loss".into()),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod payload_token_tests {
+    //! Adversarial tests of the worker registration-token payload staging:
+    //! missing (exact path), world-readable (unix), corrupt and the inline
+    //! path, plus the disabled-parity construction that reads nothing.
+
+    use super::*;
+
+    fn node(token_payload: &str) -> WorkerNodeCfg {
+        WorkerNodeCfg {
+            enabled: true,
+            token_payload: Some(token_payload.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn stage(root: &Path, name: &str, body: &[u8]) {
+        std::fs::create_dir_all(root).unwrap();
+        let path = root.join(name);
+        std::fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_token_payload_refuses_with_the_exact_expected_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_token(&node("worker.token"), dir.path()).unwrap_err();
+        let expected = dir.path().join("worker_payloads").join("worker.token");
+        assert!(err.contains(&expected.display().to_string()), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn world_readable_token_payload_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("worker_payloads");
+        stage(&root, "worker.token", b"wkr_test-token\n");
+        std::fs::set_permissions(
+            root.join("worker.token"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let err = resolve_token(&node("worker.token"), dir.path()).unwrap_err();
+        assert!(err.contains("0600"), "{err}");
+        assert!(!err.contains("wkr_test-token"), "{err}");
+    }
+
+    #[test]
+    fn corrupt_token_payload_is_refused_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        stage(
+            &dir.path().join("worker_payloads"),
+            "worker.token",
+            b"two words\n",
+        );
+        let err = resolve_token(&node("worker.token"), dir.path()).unwrap_err();
+        assert!(
+            err.contains("whitespace") || err.contains("corrupt"),
+            "{err}"
+        );
+        // A traversal name never reaches the filesystem.
+        let err = resolve_token(&node("../escape"), dir.path()).unwrap_err();
+        assert!(err.contains("plain bounded file name"), "{err}");
+    }
+
+    #[test]
+    fn happy_path_loads_the_staged_worker_token_and_trims_one_line_ending() {
+        let dir = tempfile::tempdir().unwrap();
+        stage(
+            &dir.path().join("worker_payloads"),
+            "worker.token",
+            b"wkr_test-token\n",
+        );
+        let token = resolve_token(&node("worker.token"), dir.path()).unwrap();
+        assert_eq!(token.expose(), "wkr_test-token");
+        // The inline path is unchanged and equally strict.
+        let inline = WorkerNodeCfg {
+            enabled: true,
+            token: Some(" wkr_inline ".into()),
+            ..Default::default()
+        };
+        let token = resolve_token(&inline, dir.path()).unwrap();
+        assert_eq!(token.expose(), "wkr_inline");
+        // Both at once is a refusal (never a silent precedence).
+        let both = WorkerNodeCfg {
+            enabled: true,
+            token: Some("wkr_inline".into()),
+            token_payload: Some("worker.token".into()),
+            ..Default::default()
+        };
+        assert!(resolve_token(&both, dir.path())
+            .unwrap_err()
+            .contains("exactly one"));
+    }
+
+    #[test]
+    fn disabled_worker_node_reads_no_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = WorkerNodeCfg::default();
+        assert!(!cfg.enabled);
+        // resolve_token is only reachable after the enabled check in `run`;
+        // a disabled config still resolves nothing and creates no directory.
+        let _ = cfg.payload_root(dir.path()).unwrap();
+        assert!(!dir.path().join("worker_payloads").exists());
     }
 }

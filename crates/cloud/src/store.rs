@@ -592,6 +592,10 @@ const CP_MIGRATIONS: &[&str] = &[
     // audit table is append-only by construction (no UPDATE/DELETE ever
     // names ent_audit_event).
     crate::enterprise_store::ENTERPRISE_SCHEMA_V3,
+    // v4 — the durable billing-report schedule rows (period + cursor). Like
+    // v2/v3, the billing domain owns this ladder slot; a REPORTED/FAILED
+    // period row is terminal, so the report can never double-send a period.
+    crate::billing_store::BILLING_REPORT_SCHEMA_V4,
 ];
 
 impl SqliteControlPlaneStore {

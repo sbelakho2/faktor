@@ -1058,6 +1058,21 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
                 null
             }
         }
+        // The strict proof summary feeds the top-level VERIFIED view. A
+        // refusal is passed as an EXPLICIT unavailable reason (the cached
+        // proof is dropped), so a stale VERIFIED can never render.
+        var proofUnavailable: String? = null
+        val proof = if (runs.isEmpty()) {
+            null
+        } else {
+            try {
+                service.taskProof(runs[0].taskId.toString())
+            } catch (e: Exception) {
+                proofUnavailable =
+                    "proof read failed: " + (e.message ?: e.javaClass.simpleName)
+                null
+            }
+        }
         val sessionUsage = try {
             service.sessionUsage()
         } catch (e: Exception) {
@@ -1090,7 +1105,9 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
             childUsage = childUsage,
             tournament = tournament,
             submittedCompletion = submittedCompletion,
-            runState = runs.firstOrNull()?.state
+            runState = runs.firstOrNull()?.state,
+            proof = proof,
+            proofUnavailable = proofUnavailable
         )
         onEdt {
             currentTree = model

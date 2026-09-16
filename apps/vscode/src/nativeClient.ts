@@ -857,6 +857,136 @@ export interface NativeTaskVerification {
   readonly records: NativeVerificationRecord[];
 }
 
+/** The three-way verdict of the strict proof summary (never inferred). */
+export type NativeProofState = 'verified' | 'unverified' | 'unavailable';
+
+export interface NativeProofCriterion {
+  readonly criterionKey: string;
+  readonly origin: string | null;
+  readonly requirement: string | null;
+  readonly passed: boolean;
+  readonly verdict: string;
+  readonly bindingKind: string;
+  readonly binding: Json;
+  readonly evidence: string | null;
+}
+
+export interface NativeProofStep {
+  readonly step: string;
+  readonly status: string;
+  readonly present: boolean;
+  readonly detail: string | null;
+  readonly snapshot: string | null;
+  readonly seq: number | null;
+  readonly atMs: number | null;
+}
+
+/**
+ * `GET /native/tasks/{id}/proof?session=<sid>` — the full VERIFIED story in
+ * one strict payload (schema `faktor-task-proof/v1`). `proofState` is the
+ * daemon's own verdict: `verified` only when the whole durable chain backs
+ * it; `unavailable` when a VerifiedComplete claim could not be re-derived
+ * (the UI must never render it as VERIFIED); `unverified` is an honest
+ * not-yet/never. Component-level `unavailable[]` entries distinguish
+ * missing / unavailable / corrupt / mismatch explicitly.
+ */
+export interface NativeTaskProof {
+  readonly schema: string;
+  readonly sessionId: string;
+  readonly taskId: string;
+  readonly proofState: NativeProofState;
+  readonly proofStateReason: string | null;
+  readonly task: {
+    readonly state: string;
+    readonly revision: string | null;
+    readonly goal: string;
+    readonly updatedMs: number;
+  } | null;
+  readonly criteria: {
+    readonly recordId: string | null;
+    readonly recordStatus: string | null;
+    readonly certifiesCompletion: boolean;
+    readonly total: number;
+    readonly passed: number;
+    readonly failed: number;
+    readonly unavailable: number;
+    readonly items: NativeProofCriterion[];
+  };
+  readonly checks: {
+    readonly total: number;
+    readonly passed: number;
+    readonly failed: number;
+    readonly requiredTotal: number;
+    readonly requiredPassed: number;
+    readonly requiredFailed: number;
+    readonly requiredAllPassed: boolean;
+  };
+  readonly review: {
+    readonly recordId: string | null;
+    readonly status: string | null;
+    readonly reviewer: Json | null;
+    readonly independentVerdict: string;
+    readonly independentCriteria: string[];
+  };
+  readonly trees: {
+    readonly runBase: string | null;
+    readonly verified: string | null;
+    readonly landed: string | null;
+    readonly landedEqualsVerified: boolean | null;
+    readonly sourceCount: number | null;
+  };
+  readonly publication: {
+    readonly verificationRecord: string | null;
+    readonly gitTreeOid: string | null;
+    readonly commitOid: string | null;
+    readonly localRef: string | null;
+    readonly remoteRef: string | null;
+    readonly remoteHeadOid: string | null;
+    readonly pullRequest: {
+      readonly provider: string;
+      readonly id: string;
+      readonly version: string;
+      readonly headOid: string | null;
+      readonly state: string;
+    } | null;
+  };
+  readonly cost: {
+    readonly status: string;
+    readonly reason: string | null;
+    readonly spentCostMicro: number | null;
+    readonly maxCostMicro: number | null;
+    readonly openReservations: number | null;
+    readonly settledCount: number | null;
+  };
+  readonly completion: {
+    readonly contract: {
+      readonly includeCommit: boolean;
+      readonly includePush: boolean;
+      readonly includePr: boolean;
+      readonly revision: string | null;
+      readonly requestedSteps: string[];
+    } | null;
+    readonly steps: NativeProofStep[];
+    readonly records: NativeProofStep[];
+    readonly gate: { readonly status: string; readonly reason: string | null };
+  };
+  readonly integration: {
+    readonly present: boolean;
+    readonly inFlight: boolean | null;
+    readonly runId: string | null;
+    readonly finalSnapshotHash: string | null;
+    readonly landedSnapshot: string | null;
+    readonly integratedFileCount: number | null;
+    readonly conflictCount: number | null;
+    readonly txn: { readonly txnId: string; readonly phase: string } | null;
+  };
+  readonly unavailable: ReadonlyArray<{
+    readonly component: string;
+    readonly kind: string;
+    readonly reason: string;
+  }>;
+}
+
 export interface NativeEvidence {
   readonly id: number;
   readonly kind: Json;
@@ -2064,6 +2194,349 @@ export function validateTaskVerification(json: Json): NativeTaskVerification {
   };
 }
 
+/** The frozen proof schema tags (a foreign tag is a loud refusal). */
+export const NATIVE_TASK_PROOF_SCHEMA = 'faktor-task-proof/v1';
+export const NATIVE_TASK_COMPLETION_STEPS_SCHEMA = 'faktor-task-completion-steps/v1';
+
+function validateProofStep(object: JsonObject, path: string): NativeProofStep {
+  checkResponseKeys(object, path, ['step', 'status', 'present', 'detail', 'snapshot', 'seq', 'atMs']);
+  return {
+    step: fString(object, 'step', path),
+    status: fString(object, 'status', path),
+    present: fBool(object, 'present', path),
+    detail: fNullableString(object, 'detail', path),
+    snapshot: fNullableString(object, 'snapshot', path),
+    seq: fNullableInt(object, 'seq', path),
+    atMs: fNullableInt(object, 'atMs', path),
+  };
+}
+
+function validateProofContract(
+  object: JsonObject,
+  path: string,
+): NonNullable<NativeTaskProof['completion']['contract']> {
+  checkResponseKeys(object, path, [
+    'includeCommit',
+    'includePush',
+    'includePr',
+    'revision',
+    'requestedSteps',
+  ]);
+  return {
+    includeCommit: fBool(object, 'includeCommit', path),
+    includePush: fBool(object, 'includePush', path),
+    includePr: fBool(object, 'includePr', path),
+    revision: fNullableString(object, 'revision', path),
+    requestedSteps: fStringArray(object, 'requestedSteps', path),
+  };
+}
+
+function validateProofCompletion(
+  object: JsonObject,
+  path: string,
+): NativeTaskProof['completion'] {
+  checkResponseKeys(object, path, ['contract', 'steps', 'records', 'gate']);
+  const contract = fNullableObject(object, 'contract', path);
+  const gate = asObject(field(object, 'gate', path), `${path}.gate`);
+  checkResponseKeys(gate, `${path}.gate`, ['status', 'reason']);
+  return {
+    contract: contract === null ? null : validateProofContract(contract, `${path}.contract`),
+    steps: fObjectArray(object, 'steps', path).map((entry, index) =>
+      validateProofStep(entry, `${path}.steps[${index}]`),
+    ),
+    records: fObjectArray(object, 'records', path).map((entry, index) =>
+      validateProofStep(entry, `${path}.records[${index}]`),
+    ),
+    gate: {
+      status: fString(gate, 'status', `${path}.gate`),
+      reason: fNullableString(gate, 'reason', `${path}.gate`),
+    },
+  };
+}
+
+function validateProofChecks(object: JsonObject, path: string): NativeTaskProof['checks'] {
+  checkResponseKeys(object, path, [
+    'total',
+    'passed',
+    'failed',
+    'requiredTotal',
+    'requiredPassed',
+    'requiredFailed',
+    'requiredAllPassed',
+  ]);
+  return {
+    total: fInt(object, 'total', path),
+    passed: fInt(object, 'passed', path),
+    failed: fInt(object, 'failed', path),
+    requiredTotal: fInt(object, 'requiredTotal', path),
+    requiredPassed: fInt(object, 'requiredPassed', path),
+    requiredFailed: fInt(object, 'requiredFailed', path),
+    requiredAllPassed: fBool(object, 'requiredAllPassed', path),
+  };
+}
+
+/**
+ * Parse `GET /native/tasks/{id}/proof?session=<sid>` strictly. The schema
+ * tag and `proofState` are REQUIRED and must be known: an unexplained
+ * verdict or a foreign schema is a loud [`NativeProtocolError`], so a
+ * corrupt payload can never be rendered as VERIFIED. Unknown extra members
+ * stay ignored (the additive contract).
+ */
+export function validateTaskProof(json: Json): NativeTaskProof {
+  const path = 'GET /native/tasks/{id}/proof';
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, [
+    'schema',
+    'sessionId',
+    'taskId',
+    'proofState',
+    'proofStateReason',
+    'task',
+    'criteria',
+    'checks',
+    'review',
+    'trees',
+    'publication',
+    'cost',
+    'completion',
+    'integration',
+    'unavailable',
+  ]);
+  const schema = fString(object, 'schema', path);
+  if (schema !== NATIVE_TASK_PROOF_SCHEMA) {
+    fail(path, `unsupported proof schema ${JSON.stringify(schema)}`);
+  }
+  const proofState = fString(object, 'proofState', path);
+  if (proofState !== 'verified' && proofState !== 'unverified' && proofState !== 'unavailable') {
+    fail(`${path}.proofState`, `unknown proof verdict ${JSON.stringify(proofState)}`);
+  }
+  const task = fNullableObject(object, 'task', path);
+  const criteria = asObject(field(object, 'criteria', path), `${path}.criteria`);
+  checkResponseKeys(criteria, `${path}.criteria`, [
+    'recordId',
+    'recordStatus',
+    'certifiesCompletion',
+    'total',
+    'passed',
+    'failed',
+    'unavailable',
+    'items',
+  ]);
+  const checks = asObject(field(object, 'checks', path), `${path}.checks`);
+  const review = asObject(field(object, 'review', path), `${path}.review`);
+  checkResponseKeys(review, `${path}.review`, [
+    'recordId',
+    'status',
+    'reviewer',
+    'independentVerdict',
+    'independentCriteria',
+  ]);
+  const trees = asObject(field(object, 'trees', path), `${path}.trees`);
+  checkResponseKeys(trees, `${path}.trees`, [
+    'runBase',
+    'verified',
+    'landed',
+    'landedEqualsVerified',
+    'sourceCount',
+  ]);
+  const publication = asObject(field(object, 'publication', path), `${path}.publication`);
+  checkResponseKeys(publication, `${path}.publication`, [
+    'verificationRecord',
+    'gitTreeOid',
+    'commitOid',
+    'localRef',
+    'remoteRef',
+    'remoteHeadOid',
+    'pullRequest',
+  ]);
+  const pullRequest = fNullableObject(publication, 'pullRequest', `${path}.publication`);
+  const cost = asObject(field(object, 'cost', path), `${path}.cost`);
+  checkResponseKeys(cost, `${path}.cost`, [
+    'status',
+    'reason',
+    'spentCostMicro',
+    'maxCostMicro',
+    'openReservations',
+    'settledCount',
+  ]);
+  const integration = asObject(field(object, 'integration', path), `${path}.integration`);
+  checkResponseKeys(integration, `${path}.integration`, [
+    'present',
+    'inFlight',
+    'runId',
+    'finalSnapshotHash',
+    'landedSnapshot',
+    'integratedFileCount',
+    'conflictCount',
+    'txn',
+  ]);
+  const txn = fNullableObject(integration, 'txn', `${path}.integration`);
+  return {
+    schema,
+    sessionId: fString(object, 'sessionId', path),
+    taskId: fString(object, 'taskId', path),
+    proofState,
+    proofStateReason: fNullableString(object, 'proofStateReason', path),
+    task:
+      task === null
+        ? null
+        : {
+            state: fString(task, 'state', `${path}.task`),
+            revision: fNullableString(task, 'revision', `${path}.task`),
+            goal: fString(task, 'goal', `${path}.task`),
+            updatedMs: fInt(task, 'updatedMs', `${path}.task`),
+          },
+    criteria: {
+      recordId: fNullableString(criteria, 'recordId', `${path}.criteria`),
+      recordStatus: fNullableString(criteria, 'recordStatus', `${path}.criteria`),
+      certifiesCompletion: fBool(criteria, 'certifiesCompletion', `${path}.criteria`),
+      total: fInt(criteria, 'total', `${path}.criteria`),
+      passed: fInt(criteria, 'passed', `${path}.criteria`),
+      failed: fInt(criteria, 'failed', `${path}.criteria`),
+      unavailable: fInt(criteria, 'unavailable', `${path}.criteria`),
+      items: fObjectArray(criteria, 'items', `${path}.criteria`).map((entry, index) => ({
+        criterionKey: fString(entry, 'criterionKey', `${path}.criteria.items[${index}]`),
+        origin: fNullableString(entry, 'origin', `${path}.criteria.items[${index}]`),
+        requirement: fNullableString(entry, 'requirement', `${path}.criteria.items[${index}]`),
+        passed: fBool(entry, 'passed', `${path}.criteria.items[${index}]`),
+        verdict: fString(entry, 'verdict', `${path}.criteria.items[${index}]`),
+        bindingKind: fString(entry, 'bindingKind', `${path}.criteria.items[${index}]`),
+        binding: field(entry, 'binding', `${path}.criteria.items[${index}]`),
+        evidence: fNullableString(entry, 'evidence', `${path}.criteria.items[${index}]`),
+      })),
+    },
+    checks: validateProofChecks(checks, `${path}.checks`),
+    review: {
+      recordId: fNullableString(review, 'recordId', `${path}.review`),
+      status: fNullableString(review, 'status', `${path}.review`),
+      reviewer: field(review, 'reviewer', `${path}.review`),
+      independentVerdict: fString(review, 'independentVerdict', `${path}.review`),
+      independentCriteria: fStringArray(review, 'independentCriteria', `${path}.review`),
+    },
+    trees: {
+      runBase: fNullableString(trees, 'runBase', `${path}.trees`),
+      verified: fNullableString(trees, 'verified', `${path}.trees`),
+      landed: fNullableString(trees, 'landed', `${path}.trees`),
+      landedEqualsVerified: (() => {
+        const value = field(trees, 'landedEqualsVerified', `${path}.trees`);
+        if (value === null || typeof value === 'boolean') {
+          return value;
+        }
+        return fail(`${path}.trees.landedEqualsVerified`, `expected a boolean or null, got ${describe(value)}`);
+      })(),
+      sourceCount: fNullableInt(trees, 'sourceCount', `${path}.trees`),
+    },
+    publication: {
+      verificationRecord: fNullableString(publication, 'verificationRecord', `${path}.publication`),
+      gitTreeOid: fNullableString(publication, 'gitTreeOid', `${path}.publication`),
+      commitOid: fNullableString(publication, 'commitOid', `${path}.publication`),
+      localRef: fNullableString(publication, 'localRef', `${path}.publication`),
+      remoteRef: fNullableString(publication, 'remoteRef', `${path}.publication`),
+      remoteHeadOid: fNullableString(publication, 'remoteHeadOid', `${path}.publication`),
+      pullRequest:
+        pullRequest === null
+          ? null
+          : {
+              provider: fString(pullRequest, 'provider', `${path}.publication.pullRequest`),
+              id: fString(pullRequest, 'id', `${path}.publication.pullRequest`),
+              version: fString(pullRequest, 'version', `${path}.publication.pullRequest`),
+              headOid: fNullableString(pullRequest, 'headOid', `${path}.publication.pullRequest`),
+              state: fString(pullRequest, 'state', `${path}.publication.pullRequest`),
+            },
+    },
+    cost: {
+      status: fString(cost, 'status', `${path}.cost`),
+      reason: fNullableString(cost, 'reason', `${path}.cost`),
+      spentCostMicro: fNullableInt(cost, 'spentCostMicro', `${path}.cost`),
+      maxCostMicro: fNullableInt(cost, 'maxCostMicro', `${path}.cost`),
+      openReservations: fNullableInt(cost, 'openReservations', `${path}.cost`),
+      settledCount: fNullableInt(cost, 'settledCount', `${path}.cost`),
+    },
+    completion: validateProofCompletion(
+      asObject(field(object, 'completion', path), `${path}.completion`),
+      `${path}.completion`,
+    ),
+    integration: {
+      present: fBool(integration, 'present', `${path}.integration`),
+      inFlight: (() => {
+        const value = field(integration, 'inFlight', `${path}.integration`);
+        if (value === null || typeof value === 'boolean') {
+          return value;
+        }
+        return fail(`${path}.integration.inFlight`, `expected a boolean or null, got ${describe(value)}`);
+      })(),
+      runId: fNullableString(integration, 'runId', `${path}.integration`),
+      finalSnapshotHash: fNullableString(integration, 'finalSnapshotHash', `${path}.integration`),
+      landedSnapshot: fNullableString(integration, 'landedSnapshot', `${path}.integration`),
+      integratedFileCount: fNullableInt(integration, 'integratedFileCount', `${path}.integration`),
+      conflictCount: fNullableInt(integration, 'conflictCount', `${path}.integration`),
+      txn:
+        txn === null
+          ? null
+          : {
+              txnId: fString(txn, 'txnId', `${path}.integration.txn`),
+              phase: fString(txn, 'phase', `${path}.integration.txn`),
+            },
+    },
+    unavailable: fObjectArray(object, 'unavailable', path).map((entry, index) => ({
+      component: fString(entry, 'component', `${path}.unavailable[${index}]`),
+      kind: fString(entry, 'kind', `${path}.unavailable[${index}]`),
+      reason: fString(entry, 'reason', `${path}.unavailable[${index}]`),
+    })),
+  };
+}
+
+/** `GET /native/tasks/{id}/completion-steps?session=<sid>` (drill-down). */
+export interface NativeTaskCompletionSteps {
+  readonly schema: string;
+  readonly sessionId: string;
+  readonly taskId: string;
+  readonly contract: NativeTaskProof['completion']['contract'];
+  readonly steps: NativeProofStep[];
+  readonly records: NativeProofStep[];
+  readonly gate: NativeTaskProof['completion']['gate'];
+  readonly truncated: boolean;
+}
+
+export function validateTaskCompletionSteps(json: Json): NativeTaskCompletionSteps {
+  const path = 'GET /native/tasks/{id}/completion-steps';
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, [
+    'schema',
+    'sessionId',
+    'taskId',
+    'contract',
+    'steps',
+    'records',
+    'gate',
+    'truncated',
+  ]);
+  const schema = fString(object, 'schema', path);
+  if (schema !== NATIVE_TASK_COMPLETION_STEPS_SCHEMA) {
+    fail(path, `unsupported completion-steps schema ${JSON.stringify(schema)}`);
+  }
+  const contract = fNullableObject(object, 'contract', path);
+  const gate = asObject(field(object, 'gate', path), `${path}.gate`);
+  checkResponseKeys(gate, `${path}.gate`, ['status', 'reason']);
+  return {
+    schema,
+    sessionId: fString(object, 'sessionId', path),
+    taskId: fString(object, 'taskId', path),
+    contract: contract === null ? null : validateProofContract(contract, `${path}.contract`),
+    steps: fObjectArray(object, 'steps', path).map((entry, index) =>
+      validateProofStep(entry, `${path}.steps[${index}]`),
+    ),
+    records: fObjectArray(object, 'records', path).map((entry, index) =>
+      validateProofStep(entry, `${path}.records[${index}]`),
+    ),
+    gate: {
+      status: fString(gate, 'status', `${path}.gate`),
+      reason: fNullableString(gate, 'reason', `${path}.gate`),
+    },
+    truncated: fBool(object, 'truncated', path),
+  };
+}
+
 /** The known binding kinds of the proof system (never guessed). */
 export const NATIVE_CRITERION_BINDING_KINDS: readonly NativeCriterionBindingKind[] = [
   'required_check',
@@ -2762,6 +3235,28 @@ export class NativeClient {
       'GET',
       `/native/session/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(taskId)}/verification`,
       { validate: validateTaskVerification },
+    );
+  }
+
+  /**
+   * The full VERIFIED story of one task (`GET /native/tasks/{id}/proof`).
+   * Session-scoped by the REQUIRED `session` query; the route is read-only
+   * and fail-closed, so a corrupt store read is a typed API error (the
+   * caller renders an explicit unavailable state, never VERIFIED).
+   */
+  taskProof(sessionId: string, taskId: string): Promise<NativeTaskProof> {
+    return this.request('GET', `/native/tasks/${encodeURIComponent(taskId)}/proof`, {
+      query: { session: sessionId },
+      validate: validateTaskProof,
+    });
+  }
+
+  /** The durable per-step status/report read (proof drill-down). */
+  taskCompletionSteps(sessionId: string, taskId: string): Promise<NativeTaskCompletionSteps> {
+    return this.request(
+      'GET',
+      `/native/tasks/${encodeURIComponent(taskId)}/completion-steps`,
+      { query: { session: sessionId }, validate: validateTaskCompletionSteps },
     );
   }
 

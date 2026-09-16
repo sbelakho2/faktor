@@ -2524,7 +2524,7 @@ async function cockpitTests() {
     const sections = cp.cockpitSections(view);
     assertDeepEqual(
       sections.map((section) => section.key),
-      ['acceptance', 'plan', 'completion', 'children', 'tournament', 'phase', 'blockers', 'verification', 'evidence', 'spend'],
+      ['acceptance', 'proof', 'plan', 'completion', 'children', 'tournament', 'phase', 'blockers', 'verification', 'evidence', 'spend'],
     );
     const byKey = Object.fromEntries(sections.map((section) => [section.key, section]));
     assert(byKey.acceptance.present && byKey.acceptance.lines.some((line) => line.includes('build passes')));
@@ -3517,6 +3517,299 @@ async function packagedLayoutTests(dir) {
 
 // -------------------------------------------------------------------- main
 
+function taskProofJson(overrides = {}) {
+  const hexOid = (fill) => fill.repeat(40);
+  const step = (name, status, detail) => ({
+    step: name,
+    status,
+    present: status !== 'missing',
+    detail,
+    snapshot: null,
+    seq: 2,
+    atMs: 1700000000000,
+  });
+  return {
+    schema: 'faktor-task-proof/v1',
+    sessionId: '7',
+    taskId: '3',
+    proofState: 'verified',
+    proofStateReason: null,
+    task: {
+      state: 'verified_complete',
+      revision: '4',
+      goal: 'ship it',
+      updatedMs: 1700000000000,
+      acceptanceCriteria: ['build passes'],
+    },
+    criteria: {
+      recordId: '1',
+      recordStatus: 'passed',
+      recordRevision: '3',
+      certifiesCompletion: true,
+      total: 2,
+      passed: 2,
+      failed: 0,
+      unavailable: 0,
+      items: [],
+      truncated: false,
+    },
+    checks: {
+      total: 3,
+      passed: 3,
+      failed: 0,
+      other: 0,
+      requiredTotal: 2,
+      requiredPassed: 2,
+      requiredFailed: 0,
+      requiredAllPassed: true,
+      items: [],
+      truncated: false,
+    },
+    review: {
+      recordId: '1',
+      status: 'passed',
+      reviewer: { id: 'reviewer-1' },
+      independentVerdict: 'passed',
+      independentCriteria: ['c2'],
+    },
+    trees: {
+      runBase: 'tm1:aaa',
+      verified: 'tm1:bbb',
+      landed: 'tm1:bbb',
+      landedEqualsVerified: true,
+      sourceCount: 1,
+    },
+    publication: {
+      verificationRecord: '1',
+      gitTreeOid: hexOid('1'),
+      commitOid: hexOid('2'),
+      localRef: 'refs/heads/main',
+      remoteRef: `origin:refs/heads/main@${hexOid('2')}`,
+      remoteHeadOid: hexOid('2'),
+      pullRequest: {
+        provider: 'github',
+        operationKey: 'task:3:rev:3:github:pull_request',
+        id: 'pr-42',
+        version: `${hexOid('2')}@1700000000`,
+        headOid: hexOid('2'),
+        state: 'completed',
+      },
+    },
+    cost: {
+      status: 'known',
+      reason: null,
+      spentCostMicro: 12,
+      maxCostMicro: 1000000,
+      openReservedMicro: 0,
+      openReservations: 0,
+      uncertainReservedMicro: 0,
+      uncertainReservations: 0,
+      settledCount: 1,
+    },
+    completion: {
+      contract: {
+        includeCommit: false,
+        includePush: true,
+        includePr: true,
+        revision: '3',
+        requestedSteps: ['push', 'pr'],
+      },
+      steps: [step('push', 'succeeded', 'pushed to origin'), step('pr', 'succeeded', 'opened pr-42')],
+      records: [step('push', 'succeeded', 'pushed to origin'), step('pr', 'succeeded', 'opened pr-42')],
+      gate: { status: 'satisfied', reason: null },
+      truncated: false,
+    },
+    integration: {
+      present: true,
+      inFlight: false,
+      runId: 'run-1',
+      finalRoot: '/tmp/root',
+      finalSnapshotHash: 'tm1:bbb',
+      runBaseSnapshot: 'tm1:aaa',
+      candidateSnapshot: 'tm1:bbb',
+      landedSnapshot: 'tm1:bbb',
+      integratedFileCount: 1,
+      conflictCount: 0,
+      sourceCount: 1,
+      proofBasisDigest: null,
+      atMs: 5,
+      txn: {
+        txnId: 'blake3:x',
+        phase: 'landed',
+        ownerRoot: '/tmp/o',
+        candidateRoot: '/tmp/c',
+        pathCount: 0,
+        appliedCount: 0,
+        conflicts: [],
+        atMs: 6,
+      },
+    },
+    unavailable: [],
+    ...overrides,
+  };
+}
+
+function proofCockpitWith(payload, proofUnavailable = null) {
+  const taskView = nc.validateTaskViews([
+    {
+      ...clone(taskViewJson),
+      acceptance_criteria: ['build passes'],
+    },
+  ])[0];
+  return cp.buildCockpit({
+    task: {
+      goal: taskView.goal,
+      state: taskView.state,
+      completed: taskView.milestones.completed,
+      open: taskView.milestones.open,
+      testsRun: taskView.tests.run,
+      testsFailed: taskView.tests.failed,
+      changedFiles: taskView.changedFiles,
+      budget: taskView.budget,
+      acceptanceCriteria: taskView.acceptanceCriteria,
+      plan: taskView.plan,
+      blockers: taskView.blockers.map((blocker) => blocker.detail),
+      evidenceRefs: taskView.evidenceRefs,
+      phase: taskView.phase,
+      progress: taskView.progress,
+    },
+    agents: [],
+    verification: null,
+    usage: null,
+    taskVerification: null,
+    proof: payload,
+    proofUnavailable,
+  });
+}
+
+async function proofSummaryTests() {
+  await test('strict proof validator accepts the served payload and refuses unknown verdicts', () => {
+    const proof = nc.validateTaskProof(taskProofJson());
+    assertEqual(proof.proofState, 'verified');
+    assertEqual(proof.criteria.passed, 2);
+    assertEqual(proof.checks.requiredPassed, 2);
+    assertEqual(proof.publication.pullRequest.id, 'pr-42');
+    assertEqual(proof.publication.remoteHeadOid, '2'.repeat(40));
+    assertEqual(proof.cost.spentCostMicro, 12);
+    assertEqual(proof.completion.steps.length, 2);
+    assertEqual(proof.trees.landedEqualsVerified, true);
+    // A foreign schema or an unexplained verdict is a loud refusal (never a
+    // rendered VERIFIED).
+    assertProtocol(
+      () => nc.validateTaskProof(taskProofJson({ schema: 'faktor-task-proof/v2' })),
+      'unsupported proof schema',
+    );
+    assertProtocol(
+      () => nc.validateTaskProof(taskProofJson({ proofState: 'complete' })),
+      'unknown proof verdict',
+    );
+    assertProtocol(
+      () => nc.validateTaskProof(taskProofJson({ cost: 'cheap' })),
+      'expected an object',
+    );
+    const missing = taskProofJson();
+    delete missing.review;
+    assertProtocol(() => nc.validateTaskProof(missing), 'missing required field review');
+    assertProtocol(
+      () => nc.validateTaskProof(taskProofJson({ checks: { total: 1 } })),
+      'missing required field',
+    );
+  });
+
+  await test('cockpit renders the daemon VERIFIED view with drill-down, never fabricating one', () => {
+    const verified = proofCockpitWith(nc.validateTaskProof(taskProofJson()));
+    assert(verified.proof, 'the cockpit carries the proof view');
+    assertEqual(verified.proof.state, 'verified');
+    const sections = cp.cockpitSections(verified);
+    const proof = sections.find((section) => section.key === 'proof');
+    assert(proof.present, 'the proof section renders');
+    const summary = proof.lines[0];
+    assert(summary.startsWith('VERIFIED'), summary);
+    assert(summary.includes('criteria 2/2 passed'), summary);
+    assert(summary.includes('checks 3/3 passed (required 2/2)'), summary);
+    assert(summary.includes('review passed'), summary);
+    assert(summary.includes('verified==landed: yes'), summary);
+    assert(summary.includes('commit 222222222222'), summary);
+    assert(summary.includes('remote head 222222222222'), summary);
+    assert(summary.includes('PR pr-42'), summary);
+    assert(summary.includes('spend 12\u00b5$ of 1000000\u00b5$'), summary);
+    // Drill-down: every durable step + the gate verdict.
+    assert(proof.lines.some((line) => line === '[succeeded] push \u2014 pushed to origin'), JSON.stringify(proof.lines));
+    assert(proof.lines.some((line) => line === '[succeeded] pr \u2014 opened pr-42'), JSON.stringify(proof.lines));
+    assert(proof.lines.some((line) => line === 'gate: satisfied'), JSON.stringify(proof.lines));
+
+    // An `unavailable` daemon verdict renders explicitly unavailable — and the
+    // section NEVER contains the word VERIFIED.
+    const unavailable = proofCockpitWith(
+      nc.validateTaskProof(
+        taskProofJson({
+          proofState: 'unavailable',
+          proofStateReason: 'landed_snapshot mismatch: the landed integration snapshot does not equal the verified snapshot',
+          unavailable: [
+            {
+              component: 'landed_snapshot',
+              kind: 'mismatch',
+              reason: 'the landed integration snapshot does not equal the verified snapshot',
+            },
+          ],
+        }),
+      ),
+    );
+    assertEqual(unavailable.proof.state, 'unavailable');
+    const unavailableLines = cp
+      .cockpitSections(unavailable)
+      .find((section) => section.key === 'proof').lines;
+    assert(unavailableLines[0].startsWith('VERIFICATION UNAVAILABLE'), unavailableLines[0]);
+    assert(
+      unavailableLines.some((line) => line.includes('landed_snapshot (mismatch)')),
+      JSON.stringify(unavailableLines),
+    );
+    assert(
+      !unavailableLines.some((line) => /(^|\W)VERIFIED(\W|$)/.test(line)),
+      `an unavailable proof must never render VERIFIED: ${JSON.stringify(unavailableLines)}`,
+    );
+
+    // A failed fetch (typed protocol refusal) is the same explicit
+    // unavailable state — the extension never shows a stale VERIFIED.
+    const refused = proofCockpitWith(null, 'GET /native/tasks/{id}/proof: corrupt_durable_state');
+    assertEqual(refused.proof.state, 'unavailable');
+    const refusedLines = cp
+      .cockpitSections(refused)
+      .find((section) => section.key === 'proof').lines;
+    assert(refusedLines[0].startsWith('VERIFICATION UNAVAILABLE'), refusedLines[0]);
+    assert(
+      refusedLines.some((line) => line.includes('corrupt_durable_state')),
+      JSON.stringify(refusedLines),
+    );
+    assert(
+      !refusedLines.some((line) => /(^|\W)VERIFIED(\W|$)/.test(line)),
+      JSON.stringify(refusedLines),
+    );
+
+    // An unverified task says NOT VERIFIED; an unavailable cost read is
+    // honest inside a verified story (the proof itself is unaffected).
+    const unverified = proofCockpitWith(
+      nc.validateTaskProof(
+        taskProofJson({
+          proofState: 'unverified',
+          criteria: { ...taskProofJson().criteria, passed: 1, failed: 1 },
+          cost: { ...taskProofJson().cost, status: 'unavailable', reason: 'budget read pool', spentCostMicro: null, maxCostMicro: null },
+        }),
+      ),
+    );
+    const unverifiedLines = cp
+      .cockpitSections(unverified)
+      .find((section) => section.key === 'proof').lines;
+    assert(unverifiedLines[0].startsWith('NOT VERIFIED'), unverifiedLines[0]);
+    assert(unverifiedLines[0].includes('criteria 1/2 passed'), unverifiedLines[0]);
+    assert(unverifiedLines[0].includes('spend unavailable (budget read pool)'), unverifiedLines[0]);
+    assert(
+      !unverifiedLines.some((line) => line.startsWith('VERIFIED')),
+      JSON.stringify(unverifiedLines),
+    );
+  });
+}
+
 async function main() {
   await validatorAccepts();
   await validatorRejects();
@@ -3536,6 +3829,7 @@ async function main() {
   await pixelAgentTests();
   await cockpitTests();
   await acceptanceProofTests();
+  await proofSummaryTests();
   await presentationWebviewTests();
   await tournamentWebviewTests();
   await reducedMotionTests();

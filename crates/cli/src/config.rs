@@ -444,6 +444,20 @@ impl<'de> serde::Deserialize<'de> for EfficiencyCfg {
 ///   the daemon data dir; defaults `control-plane.db` and `scm.db`).
 ///   Absolute paths, separators and `..` traversal are refused: the
 ///   control-plane state lives inside the daemon's own data directory;
+/// - `payload_dir`: the operator-staged payload directory (absolute or
+///   relative to the data dir; default `payloads`). SSO client secrets and
+///   the GitHub App private key/webhook secret are loaded from it under the
+///   strict contract of [`crate::payload`]: plain file names only, regular
+///   files only, 0600-style modes on unix, bounded and strictly parsed —
+///   a referenced-but-missing/corrupt/too-permissive payload refuses
+///   startup (fail closed, never a half-wired cloud surface);
+/// - `[cloud.sso]`: the network OIDC adapter wiring (issuer, client id and
+///   the optional operator-staged client secret);
+/// - `[cloud.github_app]`: the GitHub App wiring (app id, staged private
+///   key and webhook secret, api base, tenant organization). When enabled
+///   the daemon builds the real adapter/token source/webhook inbox/sync,
+///   runs one bounded initial sync after readiness and re-syncs on webhook
+///   delivery; `/native/scm/webhook` dispatches into the wired inbox;
 /// - unknown keys, duplicates, non-object shapes and wrong value types are
 ///   parse errors.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default)]
@@ -454,10 +468,83 @@ pub struct CloudCfg {
     pub database: Option<String>,
     #[serde(default)]
     pub scm_database: Option<String>,
+    #[serde(default)]
+    pub payload_dir: Option<String>,
+    #[serde(default)]
+    pub sso: Option<CloudSsoCfg>,
+    #[serde(default)]
+    pub github_app: Option<CloudGithubAppCfg>,
+}
+
+/// The `[cloud.sso]` section: the daemon-wide network OIDC adapter wiring.
+/// Disabled by default; while disabled (or absent) `/native/sso/*` answers
+/// a typed 409 `sso_disabled` and no adapter is built.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CloudSsoCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// The payload NAME (inside `[cloud] payload_dir`) of the confidential
+    /// client's secret. Optional: absent = the public PKCE client path.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    #[serde(default)]
+    pub discovery_max_age_ms: Option<i64>,
+    #[serde(default)]
+    pub jwks_max_age_ms: Option<i64>,
+    #[serde(default)]
+    pub max_jwks_refetches: Option<u32>,
+}
+
+/// The `[cloud.github_app]` section: the real GitHub App wiring. Disabled by
+/// default; while disabled no adapter/sync/webhook sink is built and the
+/// daemon keeps its pre-existing SCM surface byte-identical.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CloudGithubAppCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub app_id: Option<u64>,
+    /// The payload NAME of the app's PKCS#8 private key PEM.
+    #[serde(default)]
+    pub private_key: Option<String>,
+    /// The payload NAME of the app's webhook HMAC secret.
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
+    /// The REST API base (default `https://api.github.com`; a loopback mock
+    /// in tests).
+    #[serde(default)]
+    pub api_base: Option<String>,
+    /// The tenant organization the synced rows belong to (required).
+    #[serde(default)]
+    pub organization: Option<String>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    #[serde(default)]
+    pub page_size: Option<usize>,
+    #[serde(default)]
+    pub max_pages: Option<usize>,
 }
 
 /// The `[cloud]` keys, in stable order (unknown-field errors list them).
-pub const CLOUD_FIELDS: &[&str] = &["enabled", "database", "scm_database"];
+pub const CLOUD_FIELDS: &[&str] = &[
+    "enabled",
+    "database",
+    "scm_database",
+    "payload_dir",
+    "sso",
+    "github_app",
+];
+
+/// The default payload directory name under the daemon data dir.
+pub const DEFAULT_PAYLOAD_DIR: &str = "payloads";
+/// Bound on one configured payload root.
+pub const MAX_PAYLOAD_ROOT_BYTES: usize = 1024;
 
 /// The default control-plane database file name.
 pub const DEFAULT_CLOUD_DATABASE: &str = "control-plane.db";
@@ -493,6 +580,9 @@ impl<'de> serde::Deserialize<'de> for CloudCfg {
                         "enabled" => (1u8, "enabled"),
                         "database" => (2, "database"),
                         "scm_database" => (4, "scm_database"),
+                        "payload_dir" => (8, "payload_dir"),
+                        "sso" => (16, "sso"),
+                        "github_app" => (32, "github_app"),
                         other => return Err(A::Error::unknown_field(other, CLOUD_FIELDS)),
                     };
                     if seen & bit != 0 {
@@ -502,8 +592,20 @@ impl<'de> serde::Deserialize<'de> for CloudCfg {
                     match bit {
                         1 => out.enabled = map.next_value::<bool>()?,
                         2 => out.database = map.next_value::<Option<String>>()?,
-                        _ => out.scm_database = map.next_value::<Option<String>>()?,
+                        4 => out.scm_database = map.next_value::<Option<String>>()?,
+                        8 => out.payload_dir = map.next_value::<Option<String>>()?,
+                        16 => out.sso = map.next_value::<Option<CloudSsoCfg>>()?,
+                        _ => out.github_app = map.next_value::<Option<CloudGithubAppCfg>>()?,
                     }
+                }
+                // A disabled sub-section is normalized away: the resolved
+                // config of `{enabled: false}` is the resolved config of the
+                // absent section (disabled parity, byte-for-byte).
+                if out.sso.as_ref().is_some_and(|sso| !sso.enabled) {
+                    out.sso = None;
+                }
+                if out.github_app.as_ref().is_some_and(|app| !app.enabled) {
+                    out.github_app = None;
                 }
                 Ok(out)
             }
@@ -539,6 +641,26 @@ impl CloudCfg {
         Ok(())
     }
 
+    /// Validate one configured payload root: bounded ASCII, no control
+    /// characters, no `..` traversal. Absolute paths are allowed; relative
+    /// paths live under the daemon data dir.
+    pub fn validate_payload_root(raw: &str) -> Result<(), String> {
+        if raw.is_empty() || raw.len() > MAX_PAYLOAD_ROOT_BYTES || !raw.is_ascii() {
+            return Err(format!(
+                "cloud: payload_dir must be 1..={MAX_PAYLOAD_ROOT_BYTES} ASCII bytes"
+            ));
+        }
+        if raw.bytes().any(|b| b.is_ascii_control()) {
+            return Err("cloud: payload_dir contains control characters".into());
+        }
+        if raw.split(['/', '\\']).any(|part| part == "..") {
+            return Err(format!(
+                "cloud: payload_dir {raw:?} must not contain `..` traversal"
+            ));
+        }
+        Ok(())
+    }
+
     /// Validate the section (called by [`Config::validate`] on both load
     /// paths). A disabled section validates nothing beyond its shape.
     pub fn validate(&self) -> Result<(), String> {
@@ -548,7 +670,34 @@ impl CloudCfg {
         if let Some(scm_database) = &self.scm_database {
             Self::validate_database_name("scm_database", scm_database)?;
         }
+        if let Some(payload_dir) = &self.payload_dir {
+            Self::validate_payload_root(payload_dir)?;
+        }
+        if let Some(sso) = &self.sso {
+            sso.validate()?;
+        }
+        if let Some(github_app) = &self.github_app {
+            github_app.validate()?;
+        }
         Ok(())
+    }
+
+    /// The resolved operator-staged payload directory under `data_dir`
+    /// (default `<data_dir>/payloads`). Validated: a hostile root is refused
+    /// at resolution, never silently escaped.
+    pub fn payload_root(&self, data_dir: &Path) -> Result<std::path::PathBuf, String> {
+        match &self.payload_dir {
+            None => Ok(data_dir.join(DEFAULT_PAYLOAD_DIR)),
+            Some(raw) => {
+                Self::validate_payload_root(raw)?;
+                let raw_path = Path::new(raw);
+                if raw_path.is_absolute() {
+                    Ok(raw_path.to_path_buf())
+                } else {
+                    Ok(data_dir.join(raw_path))
+                }
+            }
+        }
     }
 
     /// The resolved control-plane database path under `data_dir` (`None`
@@ -580,6 +729,148 @@ impl CloudCfg {
             .clone()
             .unwrap_or_else(|| DEFAULT_SCM_DATABASE.to_string());
         Ok(Some(data_dir.join(name)))
+    }
+}
+
+impl CloudSsoCfg {
+    /// Validate the section. A disabled section validates nothing beyond its
+    /// shape; an enabled one requires an http(s) issuer without a trailing
+    /// slash and a bounded client id, a bounded payload name for the
+    /// optional client secret and the documented cache bounds.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(client_secret) = &self.client_secret {
+            crate::payload::PayloadDir::validate_name(client_secret)
+                .map_err(|e| format!("cloud sso: client_secret {e}"))?;
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+        let _ = self.issuer()?;
+        let _ = self.client_id()?;
+        for (field, value) in [
+            ("discovery_max_age_ms", self.discovery_max_age_ms),
+            ("jwks_max_age_ms", self.jwks_max_age_ms),
+        ] {
+            if let Some(value) = value {
+                if value <= 0 || value > faktor_cloud::MAX_CACHE_MAX_AGE_MS {
+                    return Err(format!(
+                        "cloud sso: {field} must be 1..={}",
+                        faktor_cloud::MAX_CACHE_MAX_AGE_MS
+                    ));
+                }
+            }
+        }
+        if let Some(refetches) = self.max_jwks_refetches {
+            if refetches > faktor_cloud::MAX_JWKS_REFETCHES {
+                return Err(format!(
+                    "cloud sso: max_jwks_refetches must be <= {}",
+                    faktor_cloud::MAX_JWKS_REFETCHES
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The configured issuer (required when enabled).
+    pub fn issuer(&self) -> Result<String, String> {
+        let raw = self
+            .issuer
+            .clone()
+            .ok_or_else(|| "cloud sso: an enabled section requires `issuer`".to_string())?;
+        if !(raw.starts_with("https://") || raw.starts_with("http://")) || raw.ends_with('/') {
+            return Err("cloud sso: issuer must be an http(s) URL without a trailing slash".into());
+        }
+        if raw.len() > 2048 {
+            return Err("cloud sso: issuer must be at most 2048 bytes".into());
+        }
+        Ok(raw)
+    }
+
+    /// The configured client id (required when enabled).
+    pub fn client_id(&self) -> Result<String, String> {
+        let raw = self
+            .client_id
+            .clone()
+            .ok_or_else(|| "cloud sso: an enabled section requires `client_id`".to_string())?;
+        if raw.trim().is_empty() || raw.len() > 256 {
+            return Err("cloud sso: client_id must be 1..=256 bytes".into());
+        }
+        Ok(raw)
+    }
+}
+
+impl CloudGithubAppCfg {
+    /// Validate the section. A disabled section validates nothing beyond its
+    /// shape; an enabled one requires an app id, the two staged payload
+    /// NAMES and the tenant organization, and its api base must validate.
+    pub fn validate(&self) -> Result<(), String> {
+        for (field, name) in [
+            ("private_key", self.private_key.as_deref()),
+            ("webhook_secret", self.webhook_secret.as_deref()),
+        ] {
+            if let Some(name) = name {
+                crate::payload::PayloadDir::validate_name(name)
+                    .map_err(|e| format!("cloud github_app: {field} {e}"))?;
+            }
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.app_id.unwrap_or(0) == 0 {
+            return Err("cloud github_app: an enabled section requires a non-zero `app_id`".into());
+        }
+        if self.private_key.is_none() {
+            return Err(
+                "cloud github_app: an enabled section requires `private_key` (a payload name)"
+                    .into(),
+            );
+        }
+        if self.webhook_secret.is_none() {
+            return Err(
+                "cloud github_app: an enabled section requires `webhook_secret` (a payload name)"
+                    .into(),
+            );
+        }
+        let _ = self.organization()?;
+        let config = self.app_config()?;
+        config
+            .validate()
+            .map_err(|e| format!("cloud github_app: {e}"))?;
+        Ok(())
+    }
+
+    /// The tenant organization the synced rows are linked to.
+    pub fn organization(&self) -> Result<String, String> {
+        let raw = self.organization.clone().ok_or_else(|| {
+            "cloud github_app: an enabled section requires `organization`".to_string()
+        })?;
+        faktor_cloud::OrganizationId::try_new(raw.clone())
+            .map_err(|e| format!("cloud github_app: {e}"))?;
+        Ok(raw)
+    }
+
+    /// The REST adapter configuration.
+    pub fn app_config(&self) -> Result<faktor_scm::GitHubAppConfig, String> {
+        let mut config = faktor_scm::GitHubAppConfig {
+            api_base: self
+                .api_base
+                .clone()
+                .unwrap_or_else(|| "https://api.github.com".to_string()),
+            ..Default::default()
+        };
+        if let Some(user_agent) = &self.user_agent {
+            config.user_agent = user_agent.clone();
+        }
+        if let Some(page_size) = self.page_size {
+            config.page_size = page_size;
+        }
+        if let Some(max_pages) = self.max_pages {
+            config.max_pages = max_pages;
+        }
+        config
+            .validate()
+            .map_err(|e| format!("cloud github_app: {e}"))?;
+        Ok(config)
     }
 }
 
@@ -917,6 +1208,55 @@ pub struct BillingCfg {
     /// BYOK. Empty = all providers are BYOK.
     #[serde(default)]
     pub managed_providers: Vec<String>,
+    /// The additive `[billing.report]` schedule: periodically reports the
+    /// durable usage fold through the vendor adapter. Absent/disabled = no
+    /// schedule rows are written and no vendor call is ever made.
+    #[serde(default)]
+    pub report: Option<BillingReportCfg>,
+}
+
+/// The `[billing.report]` section: the durable report schedule over the
+/// report-only vendor adapter.
+///
+/// Strict and additive:
+///
+/// - `enabled` (default `false`): no schedule row is written, no vendor
+///   call is made and the daemon is otherwise byte-identical;
+/// - `base_url` (required when enabled): the vendor's absolute http(s) base
+///   (a loopback mock in tests);
+/// - `report_path` (default `/v1/usage-reports`), `user_agent`, `auth_env`:
+///   the vendor request shape. `auth_env` defaults to
+///   `FAKTOR_BILLING_VENDOR_TOKEN`; an EMPTY string explicitly selects the
+///   unauthenticated local-mock shape (documented, never silent);
+/// - `interval_ms` (default 60s, 1s..=24h): how often the maintenance loop
+///   checks whether the current period is due;
+/// - `period_ms` (default 24h, 1min..=366d): the reporting period bucket;
+/// - `max_attempts` (default 5, cap 5) and `retry_base_ms` /
+///   `max_backoff_ms`: the retry policy of a failed period (exponential
+///   backoff with deterministic jitter).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BillingReportCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub report_path: Option<String>,
+    #[serde(default)]
+    pub auth_env: Option<String>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    #[serde(default)]
+    pub interval_ms: Option<i64>,
+    #[serde(default)]
+    pub period_ms: Option<i64>,
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    #[serde(default)]
+    pub retry_base_ms: Option<i64>,
+    #[serde(default)]
+    pub max_backoff_ms: Option<i64>,
 }
 
 /// The `[billing]` keys, in stable order (unknown-field errors list them).
@@ -930,6 +1270,7 @@ pub const BILLING_FIELDS: &[&str] = &[
     "default_plan",
     "plans",
     "managed_providers",
+    "report",
 ];
 
 /// The default billing database file name (relative to the daemon data
@@ -969,6 +1310,7 @@ impl<'de> serde::Deserialize<'de> for BillingCfg {
                         "default_plan" => (64, "default_plan"),
                         "plans" => (128, "plans"),
                         "managed_providers" => (256, "managed_providers"),
+                        "report" => (512, "report"),
                         other => return Err(A::Error::unknown_field(other, BILLING_FIELDS)),
                     };
                     if seen & bit != 0 {
@@ -989,8 +1331,14 @@ impl<'de> serde::Deserialize<'de> for BillingCfg {
                                 faktor_cloud::PlanConfig,
                             >>()?
                         }
-                        _ => out.managed_providers = map.next_value::<Vec<String>>()?,
+                        256 => out.managed_providers = map.next_value::<Vec<String>>()?,
+                        _ => out.report = map.next_value::<Option<BillingReportCfg>>()?,
                     }
+                }
+                // Disabled parity: an explicitly disabled report section
+                // resolves exactly like the absent one.
+                if out.report.as_ref().is_some_and(|report| !report.enabled) {
+                    out.report = None;
                 }
                 Ok(out)
             }
@@ -1058,6 +1406,9 @@ impl BillingCfg {
         if let Some(database) = &self.database {
             CloudCfg::validate_database_name("billing database", database)?;
         }
+        if let Some(report) = &self.report {
+            report.validate()?;
+        }
         if self.enabled {
             let organization = self.organization()?;
             let _ = organization;
@@ -1077,6 +1428,124 @@ impl BillingCfg {
             self.build_service_config()?;
         }
         Ok(())
+    }
+}
+
+impl BillingReportCfg {
+    /// Validate the section. A disabled section validates nothing beyond its
+    /// shape; an enabled one requires a vendor base URL and bounded cadence
+    /// bounds.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let _ = self.vendor_config()?;
+        let _ = self.policy()?;
+        Ok(())
+    }
+
+    /// The strict vendor-adapter configuration.
+    pub fn vendor_config(&self) -> Result<faktor_cloud::BillingVendorConfig, String> {
+        let mut config = faktor_cloud::BillingVendorConfig {
+            base_url: self
+                .base_url
+                .clone()
+                .ok_or_else(|| {
+                    "billing report: an enabled section requires `base_url`".to_string()
+                })?
+                .trim_end_matches('/')
+                .to_string(),
+            ..Default::default()
+        };
+        if let Some(report_path) = &self.report_path {
+            config.report_path = report_path.clone();
+        }
+        // An explicitly EMPTY auth_env is the documented unauthenticated
+        // local-mock opt-out: the vendor config keeps its default (valid)
+        // env name and the runner passes no credential.
+        if let Some(auth_env) = self.auth_env.as_deref().filter(|env| !env.is_empty()) {
+            config.auth_env = auth_env.to_string();
+        }
+        if let Some(user_agent) = &self.user_agent {
+            config.user_agent = user_agent.clone();
+        }
+        if let Some(max_attempts) = self.max_attempts {
+            config.max_attempts = max_attempts;
+        }
+        if let Some(retry_base_ms) = self.retry_base_ms {
+            config.retry_base_ms = retry_base_ms;
+        }
+        config
+            .validate()
+            .map_err(|e| format!("billing report: {e}"))?;
+        Ok(config)
+    }
+
+    /// Whether the report calls carry a bearer credential resolved from
+    /// `auth_env` (`false` only for the explicitly empty auth-env opt-out).
+    pub fn unauthenticated(&self) -> bool {
+        matches!(self.auth_env.as_deref(), Some(""))
+    }
+
+    pub fn interval_ms_resolved(&self) -> i64 {
+        self.interval_ms.unwrap_or(60_000)
+    }
+
+    pub fn period_ms_resolved(&self) -> i64 {
+        self.period_ms.unwrap_or(86_400_000)
+    }
+
+    pub fn max_attempts_resolved(&self) -> u32 {
+        self.max_attempts
+            .unwrap_or(faktor_cloud::MAX_REPORT_ATTEMPTS)
+    }
+
+    pub fn retry_base_ms_resolved(&self) -> i64 {
+        self.retry_base_ms.unwrap_or(250)
+    }
+
+    pub fn max_backoff_ms_resolved(&self) -> i64 {
+        self.max_backoff_ms.unwrap_or(3_600_000)
+    }
+
+    /// The schedule policy handed to the maintenance runner.
+    pub fn policy(&self) -> Result<crate::billing_report::ReportPolicy, String> {
+        let interval = self.interval_ms_resolved();
+        if !(crate::billing_report::MIN_REPORT_INTERVAL_MS
+            ..=crate::billing_report::MAX_REPORT_INTERVAL_MS)
+            .contains(&interval)
+        {
+            return Err(format!(
+                "billing report: interval_ms must be {}..={}",
+                crate::billing_report::MIN_REPORT_INTERVAL_MS,
+                crate::billing_report::MAX_REPORT_INTERVAL_MS
+            ));
+        }
+        let period = self.period_ms_resolved();
+        if !(crate::billing_report::MIN_REPORT_PERIOD_MS
+            ..=crate::billing_report::MAX_REPORT_PERIOD_MS)
+            .contains(&period)
+        {
+            return Err(format!(
+                "billing report: period_ms must be {}..={}",
+                crate::billing_report::MIN_REPORT_PERIOD_MS,
+                crate::billing_report::MAX_REPORT_PERIOD_MS
+            ));
+        }
+        let max_backoff = self.max_backoff_ms_resolved();
+        if !(0..=crate::billing_report::MAX_REPORT_MAX_BACKOFF_MS).contains(&max_backoff) {
+            return Err(format!(
+                "billing report: max_backoff_ms must be 0..={}",
+                crate::billing_report::MAX_REPORT_MAX_BACKOFF_MS
+            ));
+        }
+        Ok(crate::billing_report::ReportPolicy {
+            interval_ms: interval,
+            period_ms: period,
+            max_attempts: self.max_attempts_resolved(),
+            retry_base_ms: self.retry_base_ms_resolved(),
+            max_backoff_ms: max_backoff,
+        })
     }
 }
 
@@ -1321,9 +1790,15 @@ impl WorkersCfg {
 /// - `enabled` (default `false`): while disabled `faktor worker run` refuses
 ///   typed before any network or filesystem effect — the disabled-parity
 ///   state of every pre-existing config;
-/// - `worker_id`, `token` XOR `token_file`, `control_plane_url`: the
+/// - `worker_id`, `token` XOR `token_payload`, `control_plane_url`: the
 ///   registration identity, credential and daemon base URL (required when
-///   enabled; the token never rides the config log line);
+///   enabled; the token never rides the config log line). `token_payload`
+///   names a payload inside `payload_dir` (the strict operator-staged
+///   contract: regular file, 0600-style on unix, bounded, non-empty); a
+///   missing/corrupt/too-permissive token payload refuses before any
+///   network or filesystem effect beyond the payload read itself
+///   (`token_file` is accepted as a legacy alias and treated as a payload
+///   NAME — absolute paths are refused);
 /// - `trust_domain` (required) and the capability advertisement (`os`,
 ///   `arch`, `toolchains`, `sandbox`, `network`, `region`, `cpu_cores`,
 ///   `memory_mb`, `gpu`): the advertisement the plane reconciles. Only jobs
@@ -1332,8 +1807,10 @@ impl WorkersCfg {
 /// - `claim_deadline_ms` / `claim_interval_ms` / `heartbeat_interval_ms`:
 ///   the bounded long-poll/heartbeat cadence (clamped by the worker crate);
 /// - `payload_dir`: the local directory the job payloads are staged in
-///   (`<payload_dir>/<digest>`); a missing payload is fail-closed
-///   (`PayloadUnavailable`: nothing executes, nothing submits);
+///   (`<payload_dir>/<digest>`) AND the directory `token_payload` is
+///   resolved from (default `<data_dir>/worker_payloads`); a missing job
+///   payload is fail-closed (`PayloadUnavailable`: nothing executes,
+///   nothing submits);
 /// - `discard_workspace_on_success` (default `true`): bounded disk;
 /// - `iterations`: the bounded loop budget of one `worker run` invocation.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
@@ -1347,8 +1824,10 @@ pub struct WorkerNodeCfg {
     pub display_name: Option<String>,
     #[serde(default)]
     pub token: Option<String>,
-    #[serde(default)]
-    pub token_file: Option<String>,
+    /// The payload NAME (inside `payload_dir`) holding the registration
+    /// token. `token_file` is accepted as a legacy alias.
+    #[serde(default, alias = "token_file")]
+    pub token_payload: Option<String>,
     #[serde(default)]
     pub control_plane_url: Option<String>,
     #[serde(default)]
@@ -1389,21 +1868,26 @@ impl WorkerNodeCfg {
     /// Validate the section (called by [`Config::validate`] on both load
     /// paths). A disabled section validates nothing beyond its shape.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(payload_dir) = &self.payload_dir {
+            WorkerNodeCfg::validate_payload_dir(payload_dir)?;
+        }
+        if let Some(name) = &self.token_payload {
+            crate::payload::PayloadDir::validate_name(name)
+                .map_err(|e| format!("worker_node: token_payload {e}"))?;
+        }
         if !self.enabled {
             return Ok(());
         }
         let _ = self.worker_id()?;
         let _ = self.control_plane_url()?;
         let _ = self.trust_domain()?;
-        match (&self.token, &self.token_file) {
-            (Some(_), Some(_)) => {
-                return Err(
-                    "worker_node: `token` and `token_file` are mutually exclusive; set exactly one"
-                        .into(),
-                )
-            }
+        match (&self.token, &self.token_payload) {
+            (Some(_), Some(_)) => return Err(
+                "worker_node: `token` and `token_payload` are mutually exclusive; set exactly one"
+                    .into(),
+            ),
             (None, None) => return Err(
-                "worker_node: an enabled [worker_node] section requires `token` or `token_file`"
+                "worker_node: an enabled [worker_node] section requires `token` or `token_payload`"
                     .into(),
             ),
             _ => {}
@@ -1441,6 +1925,44 @@ impl WorkerNodeCfg {
             "worker_node: an enabled [worker_node] section requires `worker_id`".to_string()
         })?;
         faktor_worker::WorkerId::try_new(raw).map_err(|e| format!("worker_node: {e}"))
+    }
+
+    /// Validate one configured payload directory: bounded ASCII, no control
+    /// characters, no `..` traversal (absolute paths allowed; relative paths
+    /// live under the data dir).
+    pub fn validate_payload_dir(raw: &str) -> Result<(), String> {
+        if raw.is_empty() || raw.len() > MAX_PAYLOAD_ROOT_BYTES || !raw.is_ascii() {
+            return Err(format!(
+                "worker_node: payload_dir must be 1..={MAX_PAYLOAD_ROOT_BYTES} ASCII bytes"
+            ));
+        }
+        if raw.bytes().any(|b| b.is_ascii_control()) {
+            return Err("worker_node: payload_dir contains control characters".into());
+        }
+        if raw.split(['/', '\\']).any(|part| part == "..") {
+            return Err(format!(
+                "worker_node: payload_dir {raw:?} must not contain `..` traversal"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The resolved staged payload directory (default
+    /// `<data_dir>/worker_payloads`): job payloads AND the registration
+    /// token payload resolve under it.
+    pub fn payload_root(&self, data_dir: &Path) -> Result<std::path::PathBuf, String> {
+        match &self.payload_dir {
+            None => Ok(data_dir.join("worker_payloads")),
+            Some(raw) => {
+                Self::validate_payload_dir(raw)?;
+                let raw_path = Path::new(raw);
+                if raw_path.is_absolute() {
+                    Ok(raw_path.to_path_buf())
+                } else {
+                    Ok(data_dir.join(raw_path))
+                }
+            }
+        }
     }
 
     /// The daemon base URL (http(s), no trailing slash).
@@ -2711,6 +3233,42 @@ impl Config {
         if self.enterprise.enabled && !self.cloud.enabled {
             return Err(
                 "enterprise: an enabled [enterprise] section requires [cloud] enabled (the control plane supplies the organization principal)"
+                    .into(),
+            );
+        }
+        // The SSO routes resolve their organization's SSO reference from the
+        // enterprise settings over the control plane; the GitHub App sync
+        // writes organization-scoped SCM rows and its webhook route serves
+        // the wired inbox. Both sections therefore require [cloud] enabled.
+        if self.cloud.sso.as_ref().is_some_and(|sso| sso.enabled) && !self.cloud.enabled {
+            return Err(
+                "cloud sso: an enabled [cloud.sso] section requires [cloud] enabled".into(),
+            );
+        }
+        if self
+            .cloud
+            .github_app
+            .as_ref()
+            .is_some_and(|app| app.enabled)
+            && !self.cloud.enabled
+        {
+            return Err(
+                "cloud github_app: an enabled [cloud.github_app] section requires [cloud] enabled"
+                    .into(),
+            );
+        }
+        // The report schedule writes durable report rows through the billing
+        // store and reads the entitlement fold; it can only exist over an
+        // enabled billing section.
+        if self
+            .billing
+            .report
+            .as_ref()
+            .is_some_and(|report| report.enabled)
+            && !self.billing.enabled
+        {
+            return Err(
+                "billing report: an enabled [billing.report] section requires [billing] enabled"
                     .into(),
             );
         }
@@ -4495,6 +5053,247 @@ mod completion_cfg_tests {
         assert!(Config::load_strict(&path).is_err());
     }
 
+    /// The additive payload/SSO/GitHub-App cloud surface: absent sections
+    /// stay inert, hostile shapes are refused on both load paths, an enabled
+    /// SSO or GitHub App section requires the cloud section, and the
+    /// payload root resolves under the data dir with traversal refused.
+    #[test]
+    fn cloud_payload_sso_and_github_app_sections_are_strict_and_additive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloud-extra.json");
+
+        let absent = Config::default();
+        assert!(absent.cloud.sso.is_none());
+        assert!(absent.cloud.github_app.is_none());
+        assert_eq!(
+            absent.cloud.payload_root(dir.path()).unwrap(),
+            dir.path().join("payloads"),
+            "the default payload root lives under the data dir"
+        );
+
+        for bad in [
+            r#"{"cloud": {"payload_dir": 1}}"#,
+            r#"{"cloud": {"sso": true}}"#,
+            r#"{"cloud": {"sso": {"enabled": true, "bogus": 1}}}"#,
+            r#"{"cloud": {"sso": {"enabled": true, "enabled": false}}}"#,
+            r#"{"cloud": {"github_app": {"app_id": "x"}}}"#,
+            r#"{"cloud": {"github_app": {"enabled": true, "hostile": 1}}}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(Config::load(&path).is_err(), "hostile shape: {bad}");
+            assert!(Config::load_strict(&path).is_err(), "{bad}");
+        }
+        for hostile_root in [
+            r#"{"cloud": {"payload_dir": "../escape"}}"#,
+            r#"{"cloud": {"payload_dir": "a/../b"}}"#,
+            r#"{"cloud": {"payload_dir": "a\u{5c}b"}}"#,
+        ] {
+            std::fs::write(&path, hostile_root).unwrap();
+            assert!(Config::load_strict(&path).is_err(), "{hostile_root}");
+        }
+
+        // An enabled SSO section requires issuer and client id; the payload
+        // name of the optional secret is validated whenever present.
+        std::fs::write(
+            &path,
+            r#"{"cloud": {"enabled": true, "sso": {"enabled": true}}}"#,
+        )
+        .unwrap();
+        assert!(Config::load_strict(&path).is_err());
+        std::fs::write(
+            &path,
+            r#"{"cloud": {"enabled": true, "sso": {"enabled": true, "issuer": "https://idp.example/", "client_id": "c"}}}"#,
+        )
+        .unwrap();
+        assert!(Config::load_strict(&path).is_err(), "trailing slash");
+        std::fs::write(
+            &path,
+            r#"{"cloud": {"enabled": true, "sso": {"enabled": true, "issuer": "https://idp.example", "client_id": "c", "client_secret": "../x"}}}"#,
+        )
+        .unwrap();
+        assert!(Config::load_strict(&path).is_err(), "traversal name");
+        std::fs::write(
+            &path,
+            r#"{"cloud": {"enabled": true, "sso": {"enabled": true, "issuer": "https://idp.example", "client_id": "client-1", "client_secret": "idp.secret", "discovery_max_age_ms": 1000, "jwks_max_age_ms": 1000, "max_jwks_refetches": 1}}}"#,
+        )
+        .unwrap();
+        let sso = Config::load_strict(&path).unwrap();
+        assert_eq!(
+            sso.cloud.sso.as_ref().unwrap().issuer().unwrap(),
+            "https://idp.example"
+        );
+        assert_eq!(
+            sso.cloud.payload_root(dir.path()).unwrap(),
+            dir.path().join("payloads")
+        );
+
+        // An enabled GitHub App section requires app id, both staged payload
+        // names and the tenant organization.
+        for bad_app in [
+            r#"{"cloud": {"enabled": true, "github_app": {"enabled": true}}}"#,
+            r#"{"cloud": {"enabled": true, "github_app": {"enabled": true, "app_id": 7, "private_key": "k.pem"}}}"#,
+            r#"{"cloud": {"enabled": true, "github_app": {"enabled": true, "app_id": 7, "private_key": "k.pem", "webhook_secret": "s"}}}"#,
+            r#"{"cloud": {"enabled": true, "github_app": {"enabled": true, "app_id": 7, "private_key": "../k.pem", "webhook_secret": "s", "organization": "org_x"}}}"#,
+        ] {
+            std::fs::write(&path, bad_app).unwrap();
+            assert!(Config::load_strict(&path).is_err(), "{bad_app}");
+        }
+        std::fs::write(
+            &path,
+            r#"{"cloud": {"enabled": true, "payload_dir": "/srv/faktor/payloads", "github_app": {"enabled": true, "app_id": 7, "private_key": "app.pem", "webhook_secret": "hook.secret", "api_base": "http://127.0.0.1:9/", "organization": "org_local"}}}"#,
+        )
+        .unwrap();
+        let app = Config::load_strict(&path).unwrap();
+        let github = app.cloud.github_app.as_ref().unwrap();
+        assert_eq!(github.organization().unwrap(), "org_local");
+        assert_eq!(
+            github.app_config().unwrap().api_base,
+            "http://127.0.0.1:9/",
+            "the adapter trims the trailing slash itself"
+        );
+        assert_eq!(
+            app.cloud.payload_root(dir.path()).unwrap(),
+            std::path::PathBuf::from("/srv/faktor/payloads"),
+            "an absolute payload root is honored"
+        );
+
+        // Both new sections require [cloud] enabled (an orphan section is a
+        // startup refusal, never a silently inert wiring).
+        std::fs::write(
+            &path,
+            r#"{"cloud": {"sso": {"enabled": true, "issuer": "https://idp.example", "client_id": "c"}}}"#,
+        )
+        .unwrap();
+        assert!(Config::load_strict(&path).is_err());
+        std::fs::write(
+            &path,
+            r#"{"cloud": {"github_app": {"enabled": true, "app_id": 7, "private_key": "k.pem", "webhook_secret": "s", "organization": "org"}}}"#,
+        )
+        .unwrap();
+        assert!(Config::load_strict(&path).is_err());
+    }
+
+    /// The additive `[billing.report]` schedule: disabled by default with
+    /// byte-identical serialization to an absent section, strict parsing,
+    /// bounded cadence and the billing/enabled pairing.
+    #[test]
+    fn billing_report_section_is_disabled_by_default_strict_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.json");
+        let absent = Config::default();
+        assert!(absent.billing.report.is_none());
+        std::fs::write(&path, r#"{"model": "m"}"#).unwrap();
+        let parsed_absent = Config::load_strict(&path).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"model": "m", "billing": {"report": {"enabled": false}}}"#,
+        )
+        .unwrap();
+        let parsed_disabled = Config::load_strict(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&parsed_absent).unwrap(),
+            serde_json::to_value(&parsed_disabled).unwrap(),
+            "a disabled report section serializes like an absent one"
+        );
+
+        for bad in [
+            r#"{"billing": {"report": true}}"#,
+            r#"{"billing": {"report": {"enabled": true, "bogus": 1}}}"#,
+            r#"{"billing": {"report": {"interval_ms": "soon"}}}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(Config::load(&path).is_err(), "{bad}");
+        }
+        // Enabled report over a disabled billing section is refused.
+        std::fs::write(
+            &path,
+            r#"{"billing": {"enabled": false, "report": {"enabled": true, "base_url": "http://127.0.0.1:9"}}}"#,
+        )
+        .unwrap();
+        assert!(Config::load_strict(&path).is_err());
+        // Enabled report requires a base_url.
+        std::fs::write(
+            &path,
+            r#"{"cloud": {"enabled": true}, "billing": {"enabled": true, "organization": "org", "plans": {"pro": {"plan_id": "pro"}}, "report": {"enabled": true}}}"#,
+        )
+        .unwrap();
+        assert!(Config::load_strict(&path).is_err());
+        // Bounds: interval/period/backoff are all refused outside their range.
+        for (key, value) in [
+            ("interval_ms", "10"),
+            ("interval_ms", "999999999"),
+            ("period_ms", "10"),
+            ("period_ms", "99999999999999"),
+            ("max_backoff_ms", "-1"),
+            ("max_backoff_ms", "999999999"),
+        ] {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"cloud": {{"enabled": true}}, "billing": {{"enabled": true, "organization": "org", "plans": {{"pro": {{"plan_id": "pro"}}}}, "report": {{"enabled": true, "base_url": "http://127.0.0.1:9", "{key}": {value}}}}}}}"#
+                ),
+            )
+            .unwrap();
+            assert!(Config::load_strict(&path).is_err(), "{key}={value}");
+        }
+        // A complete report section resolves the strict policy and vendor
+        // config; an explicitly empty auth_env selects the unauthenticated
+        // local-mock shape.
+        std::fs::write(
+            &path,
+            r#"{"cloud": {"enabled": true}, "billing": {"enabled": true, "organization": "org", "plans": {"pro": {"plan_id": "pro"}}, "report": {"enabled": true, "base_url": "http://127.0.0.1:9/", "auth_env": "", "interval_ms": 5000, "period_ms": 60000, "max_attempts": 2, "retry_base_ms": 0, "max_backoff_ms": 1000}}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_strict(&path).unwrap();
+        let report = cfg.billing.report.as_ref().unwrap();
+        assert!(report.unauthenticated());
+        let policy = report.policy().unwrap();
+        assert_eq!(policy.interval_ms, 5000);
+        assert_eq!(policy.period_ms, 60000);
+        assert_eq!(policy.max_attempts, 2);
+        assert_eq!(policy.retry_base_ms, 0);
+        assert_eq!(policy.max_backoff_ms, 1000);
+        assert_eq!(
+            report.vendor_config().unwrap().base_url,
+            "http://127.0.0.1:9"
+        );
+    }
+
+    /// `[worker_node]` payload staging: the payload dir and the token
+    /// payload name are validated even while disabled; the resolved root
+    /// stays inside its configured base and traversal is refused.
+    #[test]
+    fn worker_node_payload_staging_is_validated_and_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = WorkerNodeCfg::default();
+        assert_eq!(
+            node.payload_root(dir.path()).unwrap(),
+            dir.path().join("worker_payloads")
+        );
+        node.payload_dir = Some("../escape".into());
+        assert!(node.validate().is_err(), "traversal is refused");
+        node.payload_dir = Some("staging/payloads".into());
+        assert_eq!(
+            node.payload_root(dir.path()).unwrap(),
+            dir.path().join("staging/payloads")
+        );
+        assert!(node
+            .payload_root(dir.path())
+            .unwrap()
+            .starts_with(dir.path()));
+        node.payload_dir = Some("with\u{7}control".into());
+        assert!(node.validate().is_err());
+        node.payload_dir = Some("/var/lib/faktor/payloads".into());
+        assert_eq!(
+            node.payload_root(dir.path()).unwrap(),
+            std::path::PathBuf::from("/var/lib/faktor/payloads")
+        );
+        node.token_payload = Some("worker.token".into());
+        assert!(node.validate().is_ok());
+        node.token_payload = Some("../worker.token".into());
+        assert!(node.validate().is_err());
+    }
+
     /// The additive `[updater]` section: disabled by default with BYTE-IDENTICAL
     /// serialization to an absent section, strict parsing on both load paths,
     /// bounded values, a mandatory non-empty operator allowlist when enabled,
@@ -4873,11 +5672,18 @@ mod completion_cfg_tests {
             "http://127.0.0.1:8787",
             "the trailing slash is normalized away"
         );
-        node.token_file = Some("/tmp/token".into());
+        node.token_payload = Some("/tmp/token".into());
         assert!(
             node.validate().is_err(),
-            "token and token_file are mutually exclusive"
+            "an absolute path is not a payload name (and token XOR token_payload is exclusive)"
         );
+        node.token = None;
+        assert!(
+            node.validate().is_err(),
+            "token_payload must be a plain payload name"
+        );
+        node.token_payload = Some("worker.token".into());
+        node.validate().expect("a staged payload name validates");
         // The advertisement is normalized and protocol-pinned.
         let capabilities = node.capabilities().unwrap();
         assert_eq!(capabilities.trust_domain, "org_local");

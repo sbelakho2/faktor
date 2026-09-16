@@ -46,6 +46,7 @@ faktor-cloud.workspace = true
 faktor-worker.workspace = true
 faktor-updater.workspace = true
 faktor-scm.workspace = true
+async-trait = "0.1"
 futures.workspace = true
 clap = { version = "4", features = ["derive"] }
 tokio.workspace = true
@@ -58,6 +59,9 @@ rand.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
+# Test-only: the GitHub App daemon e2e posts signed webhook deliveries to the
+# served webhook route and asserts the wire response.
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls", "http2"] }
 # Test-only: the worker-transport round-trip binds the same payload digest
 # the orchestrator's placement spec mints (BLAKE3 hex).
 blake3.workspace = true
