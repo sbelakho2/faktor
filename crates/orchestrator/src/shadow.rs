@@ -53,13 +53,14 @@ use std::sync::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use faktor_core::hash::FileHash;
 use faktor_core::id::SessionId;
 use faktor_session::{SessionManager, ShadowRow, ShadowRowState};
 
+use faktor_fs::entry_state::EntryState;
+
 use crate::runtime::merge::{
     base_id_of, base_map_digest, compute_change_entries, parent_handle, put_base_map,
-    put_change_set, read_base_map, read_change_set, ChangeSet, MAX_BASE_ENTRIES,
+    put_change_set, read_base_state_map, read_change_set, ChangeSet, MAX_BASE_ENTRIES,
 };
 use crate::runtime::ExecError;
 
@@ -264,7 +265,7 @@ impl ShadowRoots {
         // copied tree digests to the same value; otherwise the whole
         // directory is rebuilt and the owner re-read.
         let mut detail = String::new();
-        let mut accepted: Option<(String, Vec<faktor_fs::SnapshotEntry>)> = None;
+        let mut accepted: Option<(String, Vec<(PathBuf, EntryState)>)> = None;
         for attempt in 1..=SHADOW_COPY_ATTEMPTS {
             if dir.exists() {
                 // Crash residue/previous attempt: the daemon-owned dir is
@@ -302,8 +303,11 @@ impl ShadowRoots {
             let after = digest(&base)?;
             let copied = digest(&dir)?;
             if before == after && after == copied {
-                let snapshot = faktor_fs::snapshot_tree(&dir, MAX_BASE_ENTRIES)
-                    .map_err(|e| ExecError::from_fs("shadow tree snapshot", &dir, e))?;
+                // The staged manifest is the CANONICAL one (kind/mode/payload
+                // with literal symlink targets): exactly the identity the
+                // candidate digest and the entry-state landing decisions use.
+                let snapshot =
+                    crate::runtime::merge::canonical_manifest_rows(&dir, MAX_BASE_ENTRIES)?;
                 accepted = Some((copied, snapshot));
                 break;
             }
@@ -316,8 +320,7 @@ impl ShadowRoots {
                 base.display()
             )));
         };
-        let manifest_rows: Vec<(PathBuf, FileHash)> =
-            manifest.iter().map(|e| (e.path.clone(), e.hash)).collect();
+        let manifest_rows: Vec<(PathBuf, EntryState)> = manifest.clone();
         // Durable base manifest FIRST (crash before later rows leaves a
         // row-less dir removed by reconcile), then the immutable run base,
         // then the durable active row.
@@ -345,7 +348,7 @@ impl ShadowRoots {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(ExecError::Internal(format!("shadow run base write: {e}")));
         }
-        let total: u64 = manifest.iter().map(|e| e.size).sum();
+        let total: u64 = crate::runtime::merge::manifest_total_bytes(&dir, &manifest_rows);
         let row = ShadowRow {
             session_id: session.raw(),
             shadow_id: shadow_id.clone(),
@@ -404,10 +407,7 @@ impl ShadowRoots {
             )));
         };
         let base_map = self.base_manifest(&shadow)?;
-        let now_snap = faktor_fs::snapshot_tree(&shadow.root, MAX_BASE_ENTRIES)
-            .map_err(|e| ExecError::from_fs("shadow tree snapshot", &shadow.root, e))?;
-        let now: Vec<(PathBuf, FileHash)> =
-            now_snap.iter().map(|e| (e.path.clone(), e.hash)).collect();
+        let now = crate::runtime::merge::canonical_manifest_rows(&shadow.root, MAX_BASE_ENTRIES)?;
         let files = compute_change_entries(CHILD_ID, &base_map, &now, &base_map)?;
         let cs = ChangeSet {
             child_id: CHILD_ID.to_string(),
@@ -683,8 +683,8 @@ impl ShadowRoots {
     /// checkout at begin). Missing = a crashed begin: refuse loudly — the
     /// only deterministic paths are discard (then begin again) or, when the
     /// manifest simply never got written, retrying begin after discard.
-    fn base_manifest(&self, shadow: &Shadow) -> Result<Vec<(PathBuf, FileHash)>, ExecError> {
-        match read_base_map(&self.manager, shadow.session_id, &shadow.shadow_id, CHILD_ID, "base")
+    fn base_manifest(&self, shadow: &Shadow) -> Result<Vec<(PathBuf, EntryState)>, ExecError> {
+        match read_base_state_map(&self.manager, shadow.session_id, &shadow.shadow_id, CHILD_ID, "base")
         {
             Ok(Some(map)) => Ok(map),
             Ok(None) => Err(ExecError::InvalidState(format!(

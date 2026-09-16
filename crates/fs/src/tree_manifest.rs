@@ -259,6 +259,14 @@ pub fn tree_manifest(root: &Path, max_entries: usize) -> Result<TreeManifest, Tr
                     "tree manifest entry name {bad:?} is not valid UTF-8; a lossy fold would collide distinct names"
                 ))
             })?;
+            // Internal atomic-write temporaries (an in-flight or crashed CAS
+            // writer's `.{name}.kp-tmp-*`) are daemon bookkeeping, never
+            // working content: they are invisible to the canonical manifest
+            // exactly like `.git` is (a materialized root must digest the
+            // same with or without a crash residue temp).
+            if crate::atomic::is_internal_temp_name(&name) {
+                continue;
+            }
             let rel = join_relative(&prefix, &name);
             if rel.len() > MAX_TREE_MANIFEST_PATH_BYTES {
                 return Err(TreeManifestError::Oversized(format!(

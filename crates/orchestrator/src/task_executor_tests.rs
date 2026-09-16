@@ -2476,6 +2476,25 @@ fn open_real_tool_env_supervised(
     open_real_tool_env_inner(root, scripts, verification, true, true, true)
 }
 
+/// [`open_real_tool_env_inner_with_resolver`] over the fake verification
+/// service with the resolver as the only explicit input: the fail-closed
+/// proof-basis suites inject `NoRoots`, hostile roots and alternating roots
+/// here.
+fn open_real_tool_env_with_resolver(
+    root: &std::path::Path,
+    resolver: Arc<faktor_instructions::InstructionResolver>,
+) -> Arc<RealToolEnv> {
+    open_real_tool_env_inner_with_resolver(
+        root,
+        vec![],
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+        false,
+        Some(resolver),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn open_real_tool_env_inner(
     root: &std::path::Path,
@@ -2484,6 +2503,30 @@ fn open_real_tool_env_inner(
     parked_write: bool,
     service: bool,
     with_supervisor: bool,
+) -> Arc<RealToolEnv> {
+    open_real_tool_env_inner_with_resolver(
+        root,
+        scripts,
+        verification,
+        parked_write,
+        service,
+        with_supervisor,
+        None,
+    )
+}
+
+/// [`open_real_tool_env_inner`] with an explicit instruction resolver (the
+/// fail-closed proof-basis suites inject `NoRoots`, hostile roots and
+/// alternating roots here).
+#[allow(clippy::too_many_arguments)]
+fn open_real_tool_env_inner_with_resolver(
+    root: &std::path::Path,
+    scripts: Vec<Vec<ScriptedResponse>>,
+    verification: Arc<faktor_agent::VerificationService>,
+    parked_write: bool,
+    service: bool,
+    with_supervisor: bool,
+    resolver: Option<Arc<faktor_instructions::InstructionResolver>>,
 ) -> Arc<RealToolEnv> {
     let manager = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
     let caps = ModelCapabilities {
@@ -2503,7 +2546,7 @@ fn open_real_tool_env_inner(
         tools.register(real_write_tool());
     }
     tools.register(parking_tool("pause", gate.clone(), fired.clone()));
-    let resolver = real_resolver(&manager);
+    let resolver = resolver.unwrap_or_else(|| real_resolver(&manager));
     let supervisor = if with_supervisor {
         Some(faktor_terminal::ProcessSupervisor::new(manager.cas()))
     } else {
@@ -4668,15 +4711,23 @@ async fn attachment_free_orchestrated_run_submits_empty_file_sets() {
     );
 }
 
-fn completion_step_runner_with(
+fn completion_step_runner_builder(
     root: &std::path::Path,
     config: crate::runtime::completion_steps::CompletionStepsConfig,
-) -> Arc<crate::runtime::completion_steps::CompletionStepRunner> {
+) -> crate::runtime::completion_steps::CompletionStepRunner {
     use crate::runtime::completion_steps::{CompletionStepRunner, EgressPolicy};
     let cas = Arc::new(faktor_cas::Cas::open(root.join("completion-cas")).unwrap());
     let supervisor = faktor_terminal::ProcessSupervisor::new(cas);
     let egress: Arc<dyn EgressPolicy> = Arc::new(|_url: &str| Ok(()));
-    Arc::new(CompletionStepRunner::new(supervisor, egress, config).unwrap())
+    CompletionStepRunner::new(supervisor, egress, config).unwrap()
+}
+
+#[allow(dead_code)]
+fn completion_step_runner_with(
+    root: &std::path::Path,
+    config: crate::runtime::completion_steps::CompletionStepsConfig,
+) -> Arc<crate::runtime::completion_steps::CompletionStepRunner> {
+    Arc::new(completion_step_runner_builder(root, config))
 }
 
 fn seed_contract_task(
@@ -4904,11 +4955,15 @@ async fn settle_run_converges_after_the_push_status_write_seam() {
     );
 }
 
-/// FIX 2 crash seam: the PR exists but its status row never landed; the
-/// replay's configured command reports the existing PR and records
-/// `Succeeded` (URL parsed), never a second PR gate.
+/// FIX 2 crash seam + typed reconciliation: the PR was created on the
+/// provider but its status row never landed; the replay reconciles through
+/// the RECORDED operation identity and records `Succeeded` (the same PR, no
+/// duplicate), never a second PR gate.
 #[tokio::test]
 async fn settle_run_converges_after_the_pr_status_write_seam() {
+    use crate::runtime::completion_steps::{
+        scm_fake, CompletionStepsConfig, PrOperationCrashPoint,
+    };
     let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = open_real_tool_env_full(
@@ -4918,24 +4973,24 @@ async fn settle_run_converges_after_the_pr_status_write_seam() {
         false,
         false,
     );
-    let mut config = crate::runtime::completion_steps::CompletionStepsConfig::default();
-    // The external PR already exists: the helper reports it and exits
-    // non-zero (the exact crash-replay shape the runner recognizes).
-    let script = dir.path().join("existing-pr.sh");
-    std::fs::write(
-        &script,
-        "#!/bin/sh\necho 'already exists: https://example.test/pr/7'\nexit 1\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    config.pr_command = Some(format!("{} {{branch}}", script.display()));
-    env.executor
-        .set_completion_steps(Some(completion_step_runner_with(dir.path(), config)));
     cs_seed_repo(&env.owner_root);
+    cs_git(
+        &env.owner_root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widgets.git",
+        ],
+    );
+    let config = CompletionStepsConfig::default();
+    let provider = scm_fake::FakeScmProvider::new();
+    // Phase 1: the remote creation succeeds and the durable completion row
+    // (and the step status) never lands — exactly a crash at that boundary.
+    let crashed = completion_step_runner_builder(dir.path(), config.clone())
+        .with_scm_provider(provider.clone())
+        .with_pr_crash_seam(PrOperationCrashPoint::AfterRemoteCallBeforeRecord);
+    env.executor.set_completion_steps(Some(Arc::new(crashed)));
     let goal = "ship the PR feature";
     let task_id = seed_contract_task(
         &env,
@@ -4956,7 +5011,30 @@ async fn settle_run_converges_after_the_pr_status_write_seam() {
         })
         .await
         .unwrap();
+    assert!(
+        outcome.steps.is_none(),
+        "the injected crash aborted the step execution: {outcome:?}"
+    );
+    assert_eq!(provider.remote_creations(), 1, "the PR was created once");
+    // Phase 2: the replay reconciles from the recorded identity: the same PR
+    // is confirmed, no second remote creation, the step certifies.
+    let replay =
+        completion_step_runner_builder(dir.path(), config).with_scm_provider(provider.clone());
+    env.executor.set_completion_steps(Some(Arc::new(replay)));
+    let outcome = env
+        .executor
+        .settle_run(RunSettlement::InSession {
+            parent: env.parent,
+            run_id: "tx-pr-seam".into(),
+        })
+        .await
+        .unwrap();
     assert!(outcome.steps.unwrap().all_succeeded());
+    assert_eq!(
+        provider.remote_creations(),
+        1,
+        "reconciliation must never duplicate the PR"
+    );
     let rows = h
         .ledger_completion_step_statuses(task_id.raw(), contract_rev.raw())
         .unwrap();
@@ -4965,7 +5043,10 @@ async fn settle_run_converges_after_the_pr_status_write_seam() {
         faktor_core::completion::CompletionStepOutcome::Succeeded
     );
     assert!(
-        rows.last().unwrap().detail.contains("already exists"),
+        rows.last()
+            .unwrap()
+            .detail
+            .contains("certified via github reconciliation"),
         "{:?}",
         rows.last()
     );
@@ -6661,6 +6742,66 @@ async fn unrelated_owner_edit_during_children_blocks_before_landing() {
     assert!(env.owner_root.join("child_a.rs").is_file());
 }
 
+/// Wave-0 metadata-only drift: the owner's file content is UNCHANGED but
+/// its canonical mode moved (0644 -> 0755) after the run base was taken.
+/// The per-path entry-state CAS catches it (the base state is
+/// `Regular{{mode: 100644, payload}}`, the live state `100755`): landing is
+/// refused typed, the mode is preserved, and restoring the mode lets the
+/// SAME settlement land.
+#[tokio::test]
+async fn metadata_only_owner_mode_drift_blocks_landing() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        two_child_scripts("pub fn a() -> u64 {\n    let seed: u64 = 1;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n", "pub fn b() -> u64 {\n    let seed: u64 = 2;\n    let factor: u64 = 1;\n    seed.saturating_mul(factor)\n}\n"),
+        faktor_agent::VerificationService::fake_ok(),
+        false,
+        false,
+    );
+    cs_seed_owner(&env);
+    let seeded = env.owner_root.join("src/lib.rs");
+    let bytes_before = std::fs::read(&seeded).unwrap();
+    env.executor
+        .set_settlement_crash_seam(Some(CrashSeam::AfterPreparedVerification));
+    let run_id = start_two_child_run(&env, "metadata-only owner drift");
+    wait_until(|| env.executor.active_runs().is_empty(), 120).await;
+    // METADATA-ONLY: the bytes are identical, only the exec bit moves.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&seeded, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_eq!(std::fs::read(&seeded).unwrap(), bytes_before);
+    env.executor.set_settlement_crash_seam(None);
+    let err = settle_orchestrated(&env, &run_id)
+        .await
+        .expect_err("metadata-only owner drift blocks landing");
+    assert!(matches!(err, ExecError::IntegrationConflict(_)), "{err}");
+    assert!(!env.owner_root.join("child_a.rs").exists());
+    assert!(!env.owner_root.join("child_b.rs").exists());
+    assert_eq!(
+        std::fs::read(&seeded).unwrap(),
+        bytes_before,
+        "the owner's bytes are never overwritten"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&seeded).unwrap().permissions().mode() & 0o111,
+            0o111,
+            "the owner's mode drift is preserved, never silently reverted"
+        );
+        std::fs::set_permissions(&seeded, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let outcome = settle_orchestrated(&env, &run_id)
+        .await
+        .expect("restoring the mode resolves the drift");
+    assert!(outcome.verified && outcome.completed, "{outcome:?}");
+    assert!(env.owner_root.join("child_a.rs").is_file());
+}
+
 /// Point 9: an owner edit AFTER a passing verification but BEFORE the
 /// landing recheck is refused typed; the user's edit survives and is never
 /// overwritten by the landing.
@@ -7332,10 +7473,17 @@ fn unit_entry(
     child_hash: Option<FileHash>,
     base_hash: Option<FileHash>,
 ) -> crate::runtime::merge::ChangeEntry {
+    use faktor_fs::entry_state::EntryState;
+    let state = |hash: FileHash| {
+        EntryState::regular(faktor_fs::tree_manifest::CanonicalMode::RegularFile, hash)
+            .expect("regular state")
+    };
     crate::runtime::merge::ChangeEntry {
         path: std::path::PathBuf::from(path),
         child_hash,
         base_hash,
+        child: child_hash.map(state),
+        base: base_hash.map(state),
     }
 }
 
@@ -7914,4 +8062,471 @@ async fn re_goal_tri_state_preserves_clears_and_replaces() {
     let replaced = h.get_task(task_id).unwrap().unwrap();
     assert_eq!(replaced.acceptance_criteria, vec!["c2".to_string()]);
     assert_eq!(replaced.attachments, vec![a2.clone()]);
+}
+
+// =====================================================================
+// (A) PROOF-BASIS FAIL-CLOSED
+// =====================================================================
+
+/// A workspace whose authority rule file is oversized: the resolver fails
+/// typed and the proof basis (creation AND reuse) is refused — never
+/// collapsed into "no instructions".
+#[tokio::test]
+async fn oversized_instruction_file_refuses_the_proof_basis() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        vec![],
+        faktor_agent::VerificationService::disabled(),
+        false,
+        false,
+    );
+    std::fs::write(
+        env.owner_root.join("AGENTS.md"),
+        vec![b'x'; faktor_instructions::MAX_RULE_BYTES + 1],
+    )
+    .unwrap();
+    let (h, task_id, prepared, criteria) = probe_task_and_prepared(&env, "hostile-tree");
+    let err = env
+        .executor
+        .root_verification_proof_basis(&h, task_id, &prepared, &probe_run("cargo"))
+        .await
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("instruction basis"), "{text}");
+    assert!(text.contains("unreadable"), "{text}");
+    // The find-or-create path refuses too and writes NO record.
+    let snapshot = prepared.candidate_snapshot.clone();
+    let err = env
+        .executor
+        .find_or_create_root_verification_record(
+            &h,
+            task_id,
+            &criteria,
+            &snapshot,
+            &probe_run("cargo"),
+            &prepared,
+            VerificationStatus::Passed,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("instruction basis"), "{err}");
+    assert!(
+        h.list_verification_records(task_id).unwrap().is_empty(),
+        "a refused basis never mints a record"
+    );
+}
+
+/// A session row that cannot be read is a typed store refusal of the basis
+/// (never "no instructions").
+#[tokio::test]
+async fn unreadable_session_row_refuses_the_proof_basis() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        vec![],
+        faktor_agent::VerificationService::disabled(),
+        false,
+        false,
+    );
+    let (h, task_id, prepared, _criteria) = probe_task_and_prepared(&env, "store-down");
+    // Make the session row unreadable at the store level (the FK graph
+    // forbids deleting it): every read of the row now fails typed.
+    env.manager
+        .store()
+        .sql_execute("ALTER TABLE session RENAME TO session_gone")
+        .unwrap();
+    let err = env
+        .executor
+        .root_verification_proof_basis(&h, task_id, &prepared, &probe_run("cargo"))
+        .await
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("instruction basis"), "{text}");
+    assert!(text.contains("store unavailable"), "{text}");
+    env.manager
+        .store()
+        .sql_execute("ALTER TABLE session_gone RENAME TO session")
+        .unwrap();
+}
+
+/// A rule tree that changes between the two reads of ONE basis construction
+/// is unstable: the basis (and therefore proof creation/reuse) is refused.
+struct AlternatingRoots {
+    first: std::path::PathBuf,
+    second: std::path::PathBuf,
+    calls: AtomicUsize,
+}
+
+impl faktor_instructions::WorkspaceRootProvider for AlternatingRoots {
+    fn workspace_root(&self, _workspace_id: u64) -> Option<std::path::PathBuf> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        Some(if call.is_multiple_of(2) {
+            self.first.clone()
+        } else {
+            self.second.clone()
+        })
+    }
+}
+
+#[tokio::test]
+async fn unstable_instruction_tree_refuses_the_proof_basis() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("rules-a");
+    let second = dir.path().join("rules-b");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    std::fs::write(first.join("AGENTS.md"), "rule set alpha\n").unwrap();
+    std::fs::write(second.join("AGENTS.md"), "rule set beta\n").unwrap();
+    let resolver = Arc::new(faktor_instructions::InstructionResolver::new(
+        Arc::new(AlternatingRoots {
+            first,
+            second,
+            calls: AtomicUsize::new(0),
+        }),
+        faktor_instructions::DEFAULT_RESOLVER_CACHE_ENTRIES,
+    ));
+    let env = open_real_tool_env_with_resolver(dir.path(), resolver);
+    let (h, task_id, prepared, _criteria) = probe_task_and_prepared(&env, "moving-tree");
+    let err = env
+        .executor
+        .root_verification_proof_basis(&h, task_id, &prepared, &probe_run("cargo"))
+        .await
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("instruction basis"), "{text}");
+    assert!(text.contains("unstable"), "{text}");
+}
+
+/// A workspace that genuinely resolves to NO instruction tree is a VALID
+/// epoch-less basis: the proof is created (and reused) normally.
+#[tokio::test]
+async fn no_applicable_instructions_is_a_valid_basis() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env =
+        open_real_tool_env_with_resolver(dir.path(), faktor_instructions::no_roots_resolver());
+    let (h, task_id, prepared, criteria) = probe_task_and_prepared(&env, "no-instructions");
+    let snapshot = prepared.candidate_snapshot.clone();
+    let basis = env
+        .executor
+        .root_verification_proof_basis(&h, task_id, &prepared, &probe_run("cargo"))
+        .await
+        .unwrap();
+    assert_eq!(
+        basis.instruction_epoch, None,
+        "no durable root resolves to the epoch-less basis"
+    );
+    let (record, digest) = env
+        .executor
+        .find_or_create_root_verification_record(
+            &h,
+            task_id,
+            &criteria,
+            &snapshot,
+            &probe_run("cargo"),
+            &prepared,
+            VerificationStatus::Passed,
+        )
+        .await
+        .unwrap();
+    assert!(record.raw() > 0);
+    let (reused, reused_digest) = env
+        .executor
+        .find_or_create_root_verification_record(
+            &h,
+            task_id,
+            &criteria,
+            &snapshot,
+            &probe_run("cargo"),
+            &prepared,
+            VerificationStatus::Passed,
+        )
+        .await
+        .unwrap();
+    assert_eq!(record, reused, "the canonical basis is replay-idempotent");
+    assert_eq!(digest, reused_digest);
+}
+
+/// A record minted under the RETIRED serde-bytes digest is never reused: the
+/// canonical domain-separated basis is the only reuse key.
+#[tokio::test]
+async fn a_legacy_digest_record_is_never_reused() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        vec![],
+        faktor_agent::VerificationService::disabled(),
+        false,
+        false,
+    );
+    let (h, task_id, prepared, criteria) = probe_task_and_prepared(&env, "legacy-digest");
+    let snapshot = prepared.candidate_snapshot.clone();
+    let run = probe_run("cargo");
+    let basis = env
+        .executor
+        .root_verification_proof_basis(&h, task_id, &prepared, &run)
+        .await
+        .unwrap();
+    // The exact legacy shape: a PASSED record at the right revision/tree that
+    // covers every criterion, whose fingerprint carries the retired digest.
+    let mut fingerprint = super::root_verification_fingerprint(&h, task_id, &basis).unwrap();
+    fingerprint.proof_basis_digest = Some(basis.digest());
+    let legacy = h
+        .create_verification_record_with_evidence(
+            task_id,
+            Some(snapshot.clone()),
+            run.criteria.clone(),
+            run.checks.clone(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            VerificationStatus::Passed,
+            h.now_ms(),
+            Some(fingerprint),
+            None,
+        )
+        .unwrap();
+    let canonical = super::canonical_proof_basis_digest(&basis);
+    let (found, digest) = env
+        .executor
+        .find_or_create_root_verification_record(
+            &h,
+            task_id,
+            &criteria,
+            &snapshot,
+            &run,
+            &prepared,
+            VerificationStatus::Passed,
+        )
+        .await
+        .unwrap();
+    assert_ne!(found, legacy, "a legacy-digest record is never reused");
+    assert_eq!(digest, canonical);
+    assert_eq!(
+        h.get_verification_record(found)
+            .unwrap()
+            .unwrap()
+            .environment_fingerprint
+            .as_ref()
+            .and_then(|f| f.proof_basis_digest.as_deref()),
+        Some(canonical.as_str())
+    );
+}
+
+/// The golden proof basis: a fixed value vector for the canonical digest.
+fn golden_proof_basis() -> faktor_session::task::ProofBasis {
+    use faktor_session::task::{ProofBasis, ProofBasisCheck, ProofBasisCriterion};
+    ProofBasis {
+        task_id: 7,
+        task_revision: 3,
+        task_contract_digest: "fnv1a64:0123456789abcdef".into(),
+        candidate_snapshot: "aa".repeat(32),
+        integration_sources_digest: "bb".repeat(32),
+        changed_files_digest: "fnv1a64:fedcba9876543210".into(),
+        checks: vec![ProofBasisCheck {
+            check_id: "rust_check".into(),
+            program: "cargo".into(),
+            args: vec!["check".into(), "--workspace".into()],
+        }],
+        verification_impl_version: "faktor-agent/0.1.0".into(),
+        tool_versions: vec![faktor_core::state::ToolVersion {
+            tool: "rustc".into(),
+            version: "1.92.0".into(),
+        }],
+        env_projection: vec![("RUSTFLAGS".into(), "<absent>".into())],
+        instruction_epoch: Some(9),
+        criteria: vec![ProofBasisCriterion {
+            criterion_id: "c1".into(),
+            binding_digest: Some("fnv1a64:0011223344556677".into()),
+        }],
+        reviewer_digest: Some("blake3:reviewer".into()),
+        evidence_digests: vec!["blake3:evidence-1".into()],
+    }
+}
+
+/// The canonical digest is domain/version separated (never incidental serde
+/// bytes), TOTAL (no serialization failure path), stable under value-level
+/// equality and changes under EVERY field.
+#[test]
+fn canonical_proof_basis_digest_is_domain_separated_and_field_sensitive() {
+    use super::{canonical_proof_basis_digest, canonical_proof_basis_payload};
+    let base = golden_proof_basis();
+    let digest = canonical_proof_basis_digest(&base);
+    assert!(digest.starts_with("blake3:"), "{digest}");
+    assert_eq!(digest, canonical_proof_basis_digest(&base.clone()));
+    // The payload starts with the domain separator + the version.
+    let payload = canonical_proof_basis_payload(&base);
+    assert!(
+        payload.starts_with(b"FAKTOR_PROOF_BASIS\0"),
+        "domain separator"
+    );
+    assert_eq!(
+        &payload[b"FAKTOR_PROOF_BASIS\0".len()..b"FAKTOR_PROOF_BASIS\0".len() + 8],
+        &3u64.to_le_bytes(),
+        "encoding version 3"
+    );
+    // Domain separation: the retired serde-bytes digest never coincides.
+    assert_ne!(digest, base.digest());
+    // Every field is load-bearing.
+    let mutations: Vec<(&str, faktor_session::task::ProofBasis)> = vec![
+        ("task_id", {
+            let mut b = base.clone();
+            b.task_id += 1;
+            b
+        }),
+        ("task_revision", {
+            let mut b = base.clone();
+            b.task_revision += 1;
+            b
+        }),
+        ("task_contract_digest", {
+            let mut b = base.clone();
+            b.task_contract_digest.push('x');
+            b
+        }),
+        ("candidate_snapshot", {
+            let mut b = base.clone();
+            b.candidate_snapshot.push('x');
+            b
+        }),
+        ("integration_sources_digest", {
+            let mut b = base.clone();
+            b.integration_sources_digest.push('x');
+            b
+        }),
+        ("changed_files_digest", {
+            let mut b = base.clone();
+            b.changed_files_digest.push('x');
+            b
+        }),
+        ("checks.len", {
+            let mut b = base.clone();
+            b.checks.clear();
+            b
+        }),
+        ("check_id", {
+            let mut b = base.clone();
+            b.checks[0].check_id.push('x');
+            b
+        }),
+        ("check program", {
+            let mut b = base.clone();
+            b.checks[0].program.push('x');
+            b
+        }),
+        ("check args", {
+            let mut b = base.clone();
+            b.checks[0].args.push("x".into());
+            b
+        }),
+        ("verification_impl_version", {
+            let mut b = base.clone();
+            b.verification_impl_version.push('x');
+            b
+        }),
+        ("tool_versions", {
+            let mut b = base.clone();
+            b.tool_versions.clear();
+            b
+        }),
+        ("tool version", {
+            let mut b = base.clone();
+            b.tool_versions[0].version.push('x');
+            b
+        }),
+        ("env_projection", {
+            let mut b = base.clone();
+            b.env_projection.clear();
+            b
+        }),
+        ("env value", {
+            let mut b = base.clone();
+            b.env_projection[0].1.push('x');
+            b
+        }),
+        ("instruction_epoch", {
+            let mut b = base.clone();
+            b.instruction_epoch = None;
+            b
+        }),
+        ("criteria", {
+            let mut b = base.clone();
+            b.criteria.clear();
+            b
+        }),
+        ("criterion id", {
+            let mut b = base.clone();
+            b.criteria[0].criterion_id.push('x');
+            b
+        }),
+        ("binding digest", {
+            let mut b = base.clone();
+            b.criteria[0].binding_digest = None;
+            b
+        }),
+        ("reviewer_digest", {
+            let mut b = base.clone();
+            b.reviewer_digest = None;
+            b
+        }),
+        ("evidence_digests", {
+            let mut b = base.clone();
+            b.evidence_digests.clear();
+            b
+        }),
+    ];
+    for (field, mutated) in mutations {
+        assert_ne!(
+            digest,
+            canonical_proof_basis_digest(&mutated),
+            "changing {field} must change the digest"
+        );
+        assert_eq!(
+            canonical_proof_basis_digest(&mutated),
+            canonical_proof_basis_digest(&mutated.clone()),
+            "{field}: the digest is deterministic"
+        );
+    }
+}
+
+/// The canonical writer is TOTAL: hostile strings (NUL, astral characters,
+/// megabytes of text) always produce a digest, and the length-prefixed legs
+/// make concatenation ambiguities impossible.
+#[test]
+fn canonical_proof_basis_writer_is_total_and_boundary_safe() {
+    use super::canonical_proof_basis_digest;
+    let mut hostile = golden_proof_basis();
+    hostile.task_contract_digest = "nul\0inside\u{1F600}".repeat(64);
+    hostile.candidate_snapshot = "\u{0}\u{0}\u{0}".into();
+    hostile.env_projection = vec![(String::new(), "x".repeat(1_000_000))];
+    hostile.checks[0].args = vec!["\u{1F600}".repeat(1000)];
+    let digest = canonical_proof_basis_digest(&hostile);
+    assert_eq!(digest, canonical_proof_basis_digest(&hostile.clone()));
+    // Length prefixes prevent ab|cd vs a|bcd collisions.
+    let mut split_left = golden_proof_basis();
+    split_left.task_contract_digest = "ab".into();
+    split_left.candidate_snapshot = "c".into();
+    let mut split_right = golden_proof_basis();
+    split_right.task_contract_digest = "a".into();
+    split_right.candidate_snapshot = "bc".into();
+    assert_ne!(
+        canonical_proof_basis_digest(&split_left),
+        canonical_proof_basis_digest(&split_right)
+    );
+}
+
+/// GOLDEN VECTOR: the canonical digest of the fixed basis is frozen. Any
+/// encoding change (including the version bump) must change this value.
+#[test]
+fn canonical_proof_basis_golden_digest_vector() {
+    use super::canonical_proof_basis_digest;
+    assert_eq!(
+        canonical_proof_basis_digest(&golden_proof_basis()),
+        "blake3:e30343f28fac5f34f8ba7dd429650225493f2d07d94ef9d49d12ac87ed989c97"
+    );
 }

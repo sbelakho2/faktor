@@ -35,13 +35,31 @@
 //!   `Failed` with the typed reason; an already-pushed HEAD (local
 //!   remote-tracking ref equal to HEAD, or git's "Everything up-to-date")
 //!   => `Succeeded` with a note, so retries are idempotent.
-//! - **pr**: create the PR ONLY when `pr_command` is configured (strict
-//!   config; templated with `{branch}`/`{base}`/`{remote}`; executed through
-//!   the process supervisor with a sanitized baseline environment and
-//!   bounded captured output — never a direct network call). Unconfigured =>
-//!   `Skipped`; output naming a PR URL => `Succeeded` with the parsed URL; a
-//!   command that reports the PR "already exists" => `Succeeded` (idempotent)
-//!   with the URL when present.
+//! - **pr** (legacy/test path): create the PR ONLY when `pr_command` is
+//!   configured (strict config; templated with `{branch}`/`{base}`/`{remote}`;
+//!   executed through the process supervisor with a sanitized baseline
+//!   environment and bounded captured output — never a direct network call).
+//!   Unconfigured => `Skipped`; output naming a PR URL => `Succeeded` with
+//!   the parsed URL; a command that reports the PR "already exists" =>
+//!   `Succeeded` (idempotent) with the URL when present. This path records
+//!   NO external-operation identity and therefore never certifies the native
+//!   PR step in production; see the typed path above.
+//!
+//! - **pr**: the native PR step is CERTIFIED only through the typed
+//!   [`ScmProvider`] reconciliation protocol: the exact operation identity
+//!   (installation/repository + head/base + a stable Faktor task marker) is
+//!   journaled as a durable [`ExternalOperationRow`] BEFORE the remote call,
+//!   and the remote object id + version are journaled after it. A crash
+//!   mid-operation reconciles from the RECORDED identity through
+//!   `create_or_reconcile_*` — never a blind re-create, never a duplicate
+//!   remote object; a conflicting recorded input identity and a
+//!   remote-object version drift are typed refusals. The generic
+//!   `pr_command`/`pr_program` expert command remains executable on the
+//!   legacy path but carries NO reconciliation protocol, so it can never
+//!   certify the native PR step ([`PR_REQUIRES_TYPED_RECONCILIATION`]).
+//!   The real GitHub-App adapter is the recorded follow-up: no HTTP client
+//!   lives here, only the trait and the deterministic in-process fake tests
+//!   drive.
 //!
 //! Stop rule: only a `Failed` step stops the ordered execution (terminal for
 //! the contract revision). Remaining requested steps are recorded `Skipped`
@@ -54,10 +72,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::runtime::merge::MAX_BASE_ENTRIES;
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::completion::{CompletionStep, CompletionStepOutcome};
 use faktor_core::id::{TaskId, VerificationRecordId};
-use faktor_git::{CommitOutcome, PushOutcome, WorktreeManager};
+use faktor_git::{CommitOutcome, PushOutcome, VerifiedTreeEntry, WorktreeManager};
+use faktor_session::ledger::{
+    DurableRead, ExternalOperationInput, ExternalOperationRow, ExternalOperationState,
+    VerifiedGitArtifact, VerifiedManifestEntry,
+};
 use faktor_session::{SessionHandle, MAX_COMPLETION_STEP_DETAIL};
 use faktor_terminal::{EnvSpec, ProcessOwner, ProcessSupervisor, SpawnConfig};
 
@@ -163,6 +186,217 @@ where
     }
 }
 
+/// The stable machine tag of the native-PR typed gate: a generic
+/// `pr_command`/`pr_program` expert command implements NO typed
+/// reconciliation protocol, so it can never certify the native PR step (the
+/// typed refusal detail always carries this code).
+pub const PR_REQUIRES_TYPED_RECONCILIATION: &str = "pr_requires_typed_reconciliation_protocol";
+
+/// The durable external-operation kind of the native pull-request
+/// certification.
+pub const SCM_PULL_REQUEST_KIND: &str = "pull_request";
+
+// -------------------------------------------------- typed SCM reconciliation
+
+/// The provider-neutral repository identity a reconciliation lookup is
+/// keyed by. GitHub-App-shaped: the organization/repository pair is exact,
+/// the installation id is optional metadata the adapter seam may resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScmRepositoryRef {
+    pub installation_id: Option<String>,
+    pub organization: String,
+    pub repository: String,
+}
+
+/// One idempotent branch reconciliation request: the provider must return
+/// the EXISTING branch object when `branch` already resolves, never fork or
+/// duplicate it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScmBranchSpec {
+    pub repository: ScmRepositoryRef,
+    pub branch: String,
+    /// The exact local head the remote branch must carry.
+    pub head_sha: String,
+    pub marker: String,
+}
+
+/// One idempotent pull-request reconciliation request: the provider MUST
+/// look the PR up by (repository, exact head/base, marker) and return the
+/// EXISTING object when one matches — a create path that always creates
+/// would duplicate the PR after a crash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScmPullRequestSpec {
+    pub repository: ScmRepositoryRef,
+    pub head: String,
+    pub base: String,
+    pub marker: String,
+    pub title: String,
+    pub body: String,
+}
+
+/// The identity of one remote object (branch ref or pull request) as the
+/// provider reports it. `version` is the provider's opaque version token
+/// (for a PR: the head sha + updated-at; for a branch: the head sha): a
+/// recorded version that differs from the observed one is a typed refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScmRemoteObject {
+    pub object_id: String,
+    pub version: String,
+    pub url: String,
+}
+
+/// Typed failure of one SCM provider call.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ScmError {
+    #[error("scm provider refused: {0}")]
+    Provider(String),
+    #[error("scm remote lookup failed: {0}")]
+    Lookup(String),
+}
+
+/// The minimal provider-neutral SCM seam of the native PR step. The real
+/// GitHub-App adapter (installation-token minting, REST/GraphQL calls,
+/// rate-limit handling) is the recorded FOLLOW-UP: no HTTP client is
+/// implemented here, and every reconciliation decision is a pure function
+/// of the caller's durable [`ExternalOperationRow`] identity, so the fake
+/// below and a real adapter are interchangeable.
+pub trait ScmProvider: Send + Sync {
+    /// The stable provider name folded into the durable operation key.
+    fn provider_name(&self) -> &'static str;
+    /// Resolve the provider-side repository identity of one parsed
+    /// organization/repository pair: a GitHub-App adapter overrides this to
+    /// carry its installation id, the neutral default carries none. The
+    /// resolved value is what the durable input identity records and what
+    /// the reconciliation lookup is keyed by.
+    fn repository_ref(&self, organization: &str, repository: &str) -> ScmRepositoryRef {
+        ScmRepositoryRef {
+            installation_id: None,
+            organization: organization.to_string(),
+            repository: repository.to_string(),
+        }
+    }
+    /// Create or reconcile `spec.branch` at `spec.head_sha` (idempotent).
+    fn create_or_reconcile_branch(&self, spec: &ScmBranchSpec)
+        -> Result<ScmRemoteObject, ScmError>;
+    /// Create or reconcile the pull request matching the EXACT
+    /// (repository, head, base, marker) identity (idempotent).
+    fn create_or_reconcile_pull_request(
+        &self,
+        spec: &ScmPullRequestSpec,
+    ) -> Result<ScmRemoteObject, ScmError>;
+    /// Look up one remote ref without creating anything.
+    fn remote_ref(
+        &self,
+        repository: &ScmRepositoryRef,
+        reference: &str,
+    ) -> Result<Option<ScmRemoteObject>, ScmError>;
+}
+
+/// Typed refusal of the durable external-operation protocol. Every variant
+/// carries a stable machine code into the durable step detail, so a refused
+/// PR step is traceable to the exact reconciliation rule it violated.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ExternalOperationError {
+    #[error(
+        "external operation {operation_key} was recorded with a different input identity: {detail}"
+    )]
+    InputIdentityConflict {
+        operation_key: String,
+        detail: String,
+    },
+    #[error("external operation {operation_key} remote object mismatch: {detail}")]
+    RemoteObjectMismatch {
+        operation_key: String,
+        detail: String,
+    },
+    #[error("external operation {operation_key} is terminally failed: {detail}")]
+    RecordedFailure {
+        operation_key: String,
+        detail: String,
+    },
+    #[error("external operation {operation_key} store is unavailable: {detail}")]
+    Store {
+        operation_key: String,
+        detail: String,
+    },
+}
+
+impl ExternalOperationError {
+    /// The stable machine code carried into the durable step detail.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            ExternalOperationError::InputIdentityConflict { .. } => {
+                "external_operation_input_identity_conflict"
+            }
+            ExternalOperationError::RemoteObjectMismatch { .. } => {
+                "external_operation_remote_object_mismatch"
+            }
+            ExternalOperationError::RecordedFailure { .. } => "external_operation_recorded_failure",
+            ExternalOperationError::Store { .. } => "external_operation_store_unavailable",
+        }
+    }
+}
+
+/// The stable Faktor task marker a provider-side reconciliation lookup is
+/// keyed by. Bounded, deterministic and scoped to the contract revision, so
+/// the same task+revision can never mint a second marker.
+pub fn native_pr_marker(task_id: TaskId, revision: u64) -> String {
+    format!("faktor:task:{}:rev:{}", task_id.raw(), revision)
+}
+
+/// The stable durable operation key of one native PR operation: exactly one
+/// operation per (task, contract revision, provider, kind).
+pub fn native_pr_operation_key(task_id: TaskId, revision: u64, provider: &str) -> String {
+    format!(
+        "task:{}:rev:{}:{}:{SCM_PULL_REQUEST_KIND}",
+        task_id.raw(),
+        revision,
+        provider
+    )
+}
+
+/// Parse one git remote URL into a GitHub repository reference (`None` for
+/// anything else — the typed path refuses an unrecognizable remote instead
+/// of guessing an organization/repository pair). Accepts
+/// `https://github.com/org/repo[.git]`, `ssh://git@github.com/org/repo` and
+/// the scp-like `git@github.com:org/repo[.git]`.
+pub fn parse_scm_repository(
+    url: &str,
+    installation_id: Option<String>,
+) -> Option<ScmRepositoryRef> {
+    let url = url.trim().trim_end_matches('/');
+    let (host, path) = if let Some(rest) = url.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        (host.to_string(), path.to_string())
+    } else {
+        let (scheme, rest) = url.split_once("://")?;
+        if !matches!(scheme, "https" | "http" | "ssh" | "git") {
+            return None;
+        }
+        let rest = rest.rsplit_once('@').map(|(_, r)| r).unwrap_or(rest);
+        let (host, path) = rest.split_once('/')?;
+        (host.to_string(), path.to_string())
+    };
+    if !host.eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+    let path = path.split(['?', '#']).next().unwrap_or(path.as_str());
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() != 2 {
+        return None;
+    }
+    let organization = segments[0];
+    let repository = segments[1].strip_suffix(".git").unwrap_or(segments[1]);
+    if organization.is_empty() || repository.is_empty() {
+        return None;
+    }
+    Some(ScmRepositoryRef {
+        installation_id,
+        organization: organization.to_string(),
+        repository: repository.to_string(),
+    })
+}
+
 /// One task-run execution context: where the steps run and what the commit
 /// message / PR template derive from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,6 +480,22 @@ pub enum CompletionStepError {
     Ledger(#[from] faktor_core::Error),
     #[error("completion step config: {0}")]
     Config(String),
+    /// Test-only deterministic crash seam of the typed PR operation: the
+    /// exact boundary a real daemon crash would hit (the durable rows stay
+    /// exactly as they were at that instant).
+    #[cfg(test)]
+    #[error("injected completion-step crash at {0}")]
+    InjectedCrash(&'static str),
+}
+
+/// Deterministic crash seam of the typed PR operation (tests only).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrOperationCrashPoint {
+    /// After the durable `Prepared` row, BEFORE the remote call.
+    BeforeRemoteCall,
+    /// After the remote call returned, BEFORE the durable `Completed` row.
+    AfterRemoteCallBeforeRecord,
 }
 
 /// What one step execution produced.
@@ -288,11 +538,42 @@ pub struct CompletionStepRunner {
     supervisor: Arc<ProcessSupervisor>,
     egress: Arc<dyn EgressPolicy>,
     config: CompletionStepsConfig,
+    /// The wired typed SCM reconciliation seam (`None` = no native PR can be
+    /// certified; the legacy command path stays available to tests only).
+    scm_provider: Option<Arc<dyn ScmProvider>>,
     /// Test-only seam: invoked immediately BEFORE the per-step proof
     /// revalidation, so adversarial tests can inject an edit at the exact
     /// verification/step boundary. Never compiled in production.
     #[cfg(test)]
     pre_step_hook: Option<Arc<dyn Fn(CompletionStep) + Send + Sync>>,
+    /// Test-only seam: invoked UNDER the repository mutation guard, after
+    /// the proof revalidation of the verified commit and BEFORE the exact
+    /// tree is constructed from the manifest (the add/tree/commit window).
+    #[cfg(test)]
+    commit_tree_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Test-only deterministic crash point of the typed PR operation.
+    #[cfg(test)]
+    pr_crash: Option<PrOperationCrashPoint>,
+}
+
+/// The durable identity context of one PR step execution (the production
+/// proof path only): the operator folds it into the external-operation key.
+struct PrOperationContext<'a> {
+    handle: &'a SessionHandle,
+    task_id: TaskId,
+    revision: u64,
+}
+
+/// The production proof context handed to the commit/push/PR steps: the
+/// immutable verification record plus the contract revision, so each step
+/// can build/load the ONE [`VerifiedGitArtifact`] and re-assert it
+/// immediately before its side effect. `None` = the legacy test-only
+/// execution path (no proof, no artifact, no verified publication).
+struct ArtifactContext<'a> {
+    handle: &'a SessionHandle,
+    task_id: TaskId,
+    revision: u64,
+    proof: VerificationRecordId,
 }
 
 impl std::fmt::Debug for CompletionStepRunner {
@@ -317,9 +598,22 @@ impl CompletionStepRunner {
             supervisor,
             egress,
             config,
+            scm_provider: None,
             #[cfg(test)]
             pre_step_hook: None,
+            #[cfg(test)]
+            commit_tree_hook: None,
+            #[cfg(test)]
+            pr_crash: None,
         })
+    }
+
+    /// Wire the typed SCM reconciliation seam of the native PR step. Without
+    /// it no native PR step can ever certify (fail-closed); the real GitHub
+    /// App adapter is the recorded follow-up.
+    pub fn with_scm_provider(mut self, provider: Arc<dyn ScmProvider>) -> Self {
+        self.scm_provider = Some(provider);
+        self
     }
 
     /// Test-only: install a hook invoked before every step's proof
@@ -327,6 +621,21 @@ impl CompletionStepRunner {
     #[cfg(test)]
     pub fn with_pre_step_hook(mut self, hook: Arc<dyn Fn(CompletionStep) + Send + Sync>) -> Self {
         self.pre_step_hook = Some(hook);
+        self
+    }
+
+    /// Test-only: install a hook invoked between the verified commit's proof
+    /// revalidation and its exact tree construction.
+    #[cfg(test)]
+    pub fn with_commit_tree_hook(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.commit_tree_hook = Some(hook);
+        self
+    }
+
+    /// Test-only: install the deterministic PR-operation crash point.
+    #[cfg(test)]
+    pub fn with_pr_crash_seam(mut self, crash: PrOperationCrashPoint) -> Self {
+        self.pr_crash = Some(crash);
         self
     }
 
@@ -431,7 +740,7 @@ impl CompletionStepRunner {
                 Some((CompletionStepOutcome::Failed, _)) => unreachable!("pre-scanned above"),
                 None => {}
             }
-            let execution = self.execute(step, ctx).await;
+            let execution = self.execute(step, ctx, None, None).await?;
             let detail = bounded_detail(execution.detail());
             let seq = handle
                 .set_completion_step_status(task_id, step, execution.status(), &detail)
@@ -574,7 +883,20 @@ impl CompletionStepRunner {
                 Some((CompletionStepOutcome::Failed, _)) => unreachable!("pre-scanned above"),
                 None => {}
             }
-            let execution = self.execute(step, ctx).await;
+            let pr_op = PrOperationContext {
+                handle,
+                task_id,
+                revision: revision.raw(),
+            };
+            let artifact_op = ArtifactContext {
+                handle,
+                task_id,
+                revision: revision.raw(),
+                proof,
+            };
+            let execution = self
+                .execute(step, ctx, Some(&pr_op), Some(&artifact_op))
+                .await?;
             let detail = bounded_detail(execution.detail());
             let seq = handle
                 .set_completion_step_status(task_id, step, execution.status(), &detail)
@@ -693,16 +1015,33 @@ impl CompletionStepRunner {
         })
     }
 
-    async fn execute(&self, step: CompletionStep, ctx: &CompletionStepContext) -> StepExecution {
+    async fn execute(
+        &self,
+        step: CompletionStep,
+        ctx: &CompletionStepContext,
+        pr: Option<&PrOperationContext<'_>>,
+        artifact: Option<&ArtifactContext<'_>>,
+    ) -> Result<StepExecution, CompletionStepError> {
         match step {
-            CompletionStep::Commit => self.execute_commit(ctx).await,
-            CompletionStep::Push => self.execute_push(ctx).await,
-            CompletionStep::Pr => self.execute_pr(ctx).await,
+            CompletionStep::Commit => Ok(self.execute_commit(ctx, artifact).await),
+            CompletionStep::Push => Ok(self.execute_push(ctx, artifact).await),
+            CompletionStep::Pr => self.execute_pr(ctx, pr, artifact).await,
         }
     }
 
-    async fn execute_commit(&self, ctx: &CompletionStepContext) -> StepExecution {
+    async fn execute_commit(
+        &self,
+        ctx: &CompletionStepContext,
+        artifact: Option<&ArtifactContext<'_>>,
+    ) -> StepExecution {
         let message = commit_message(&ctx.goal);
+        if let Some(artifact_ctx) = artifact {
+            return self
+                .execute_verified_commit(ctx, artifact_ctx, &message)
+                .await;
+        }
+        // Legacy test-only path (no immutable proof): the historic
+        // `commit_all`. Production never reaches it.
         match self
             .git
             .commit_all(&ctx.root, &message, ProcessOwner::Daemon)
@@ -740,7 +1079,537 @@ impl CompletionStepRunner {
         }
     }
 
-    async fn execute_push(&self, ctx: &CompletionStepContext) -> StepExecution {
+    /// Build (or reload) the ONE durable publication artifact of this
+    /// contract revision: the canonical manifest of the verified root, whose
+    /// digest must equal the immutable verification record's tree hash. A
+    /// recorded artifact whose manifest has drifted from the record is a
+    /// typed refusal (the artifact is authoritative once written).
+    fn load_or_build_artifact(
+        &self,
+        actx: &ArtifactContext<'_>,
+        root: &std::path::Path,
+    ) -> Result<VerifiedGitArtifact, String> {
+        let record = actx
+            .handle
+            .get_verification_record(actx.proof)
+            .map_err(|e| format!("verified-git artifact record read: {e}"))?
+            .ok_or_else(|| {
+                format!(
+                    "verified-git artifact: verification record {} does not exist",
+                    actx.proof
+                )
+            })?;
+        if record.task_id.raw() != actx.task_id.raw() {
+            return Err(format!(
+                "verified-git artifact: record {} belongs to task {}, not task {}",
+                actx.proof,
+                record.task_id.raw(),
+                actx.task_id.raw()
+            ));
+        }
+        let digest = crate::runtime::task_executor::root_manifest_digest(root)
+            .map_err(|e| format!("verified-git artifact root digest: {e}"))?;
+        // The record's tree hash is the immutable anchor when present. A
+        // legacy record without one still binds through the proof protocol;
+        // the artifact then self-anchors on the digest taken here, and every
+        // later step re-asserts THAT digest.
+        if let Some(record_tree) = record.tree_hash.as_deref() {
+            if digest != record_tree {
+                return Err(format!(
+                    "verified-git artifact: the root digests to {digest} but the verification record certifies {record_tree}"
+                ));
+            }
+        }
+        let rows = crate::runtime::merge::canonical_manifest_rows(root, MAX_BASE_ENTRIES)
+            .map_err(|e| format!("verified-git artifact manifest: {e}"))?;
+        let manifest: Vec<VerifiedManifestEntry> = rows
+            .into_iter()
+            .map(|(path, state)| VerifiedManifestEntry {
+                path: path.to_string_lossy().into_owned(),
+                state,
+            })
+            .collect();
+        let existing = actx
+            .handle
+            .ledger_verified_git_artifact_get(actx.task_id.raw(), actx.revision)
+            .map_err(|e| format!("verified-git artifact ledger read: {e}"))?;
+        if let Some(previous) = existing {
+            if previous.verification_record != actx.proof.raw() {
+                return Err(format!(
+                    "verified-git artifact already certifies record {} but this step runs for record {}",
+                    previous.verification_record,
+                    actx.proof
+                ));
+            }
+            if previous.verified_root_digest != digest || previous.verified_manifest != manifest {
+                return Err(format!(
+                    "verified-git artifact manifest has drifted from the recorded artifact of task {}/revision {}",
+                    actx.task_id.raw(),
+                    actx.revision
+                ));
+            }
+            return Ok(previous);
+        }
+        Ok(VerifiedGitArtifact {
+            task_id: actx.task_id.raw(),
+            revision: actx.revision,
+            verification_record: actx.proof.raw(),
+            verified_root_digest: digest,
+            verified_manifest: manifest,
+            git_tree_oid: None,
+            commit_oid: None,
+            local_ref: None,
+            remote_ref: None,
+            updated_ms: actx.handle.now_ms(),
+        })
+    }
+
+    fn persist_artifact(
+        &self,
+        actx: &ArtifactContext<'_>,
+        artifact: &VerifiedGitArtifact,
+    ) -> Result<(), String> {
+        actx.handle
+            .ledger_verified_git_artifact_set(artifact)
+            .map(|_| ())
+            .map_err(|e| format!("verified-git artifact write: {e}"))
+    }
+
+    /// The PRODUCTION commit step: ONE repository mutation guard is held
+    /// across proof revalidation, the exact tree construction from the
+    /// verified manifest (asserted equal to it), `commit-tree` with that
+    /// tree + parent HEAD, the branch-ref update and the HEAD read-back; the
+    /// commit OID is durably recorded in the artifact. A worktree change
+    /// injected after revalidation is a typed conflict with nothing
+    /// committed; no `git add` ever touches an unverified checkout.
+    async fn execute_verified_commit(
+        &self,
+        ctx: &CompletionStepContext,
+        actx: &ArtifactContext<'_>,
+        message: &str,
+    ) -> StepExecution {
+        let owner = ProcessOwner::Daemon;
+        let root = &ctx.root;
+        let mut artifact = match self.load_or_build_artifact(actx, root) {
+            Ok(artifact) => artifact,
+            Err(detail) => return StepExecution::Failed { detail },
+        };
+        let guard = match self.git.acquire_mutation_guard(root, owner.clone()).await {
+            Ok(guard) => guard,
+            Err(e) => {
+                return StepExecution::Failed {
+                    detail: format!("repository mutation guard: {}", e.message),
+                }
+            }
+        };
+        // Revalidate the immutable proof IMMEDIATELY before the commit, with
+        // the repository mutation guard held.
+        if let Err(e) = actx.handle.verify_completion_proof_binding(
+            actx.task_id,
+            actx.proof,
+            Some(root.as_path()),
+        ) {
+            return StepExecution::Failed {
+                detail: format!("verified root invalidated immediately before the commit: {e}"),
+            };
+        }
+        #[cfg(test)]
+        if let Some(hook) = &self.commit_tree_hook {
+            hook();
+        }
+        let head = match self.git.head_sha_unlocked(root, owner.clone()).await {
+            Ok(head) => head,
+            Err(e) => {
+                return StepExecution::Failed {
+                    detail: format!("git head read failed: {}", e.message),
+                }
+            }
+        };
+        let head_tree = match &head {
+            Some(_) => match self
+                .git
+                .git_unlocked(root, &["rev-parse", "HEAD^{tree}"], owner.clone())
+                .await
+            {
+                Ok(tree) => Some(tree.trim().to_string()),
+                Err(e) => {
+                    return StepExecution::Failed {
+                        detail: format!("git HEAD tree read failed: {}", e.message),
+                    }
+                }
+            },
+            None => None,
+        };
+        // Idempotent replay: the artifact already names the live commit.
+        if let Some(commit) = artifact.commit_oid.clone() {
+            if head.as_deref() == Some(commit.as_str()) {
+                if let Some(tree) = artifact.git_tree_oid.clone() {
+                    if head_tree.as_deref() != Some(tree.as_str()) {
+                        return StepExecution::Failed {
+                            detail: format!(
+                                "the recorded verified commit {commit} is HEAD but its tree is {:?}, not {tree}",
+                                head_tree
+                            ),
+                        };
+                    }
+                }
+                return StepExecution::Succeeded {
+                    detail: format!(
+                        "already committed the verified tree at {} (idempotent replay)",
+                        short_sha(&commit)
+                    ),
+                    pr_url: None,
+                };
+            }
+            return StepExecution::Failed {
+                detail: format!(
+                    "the recorded verified commit {commit} is not HEAD ({:?}); the repository moved after publication",
+                    head
+                ),
+            };
+        }
+        let branch = match self.git.current_branch_unlocked(root, owner.clone()).await {
+            Ok(branch) if !branch.is_empty() => branch,
+            Ok(_) => {
+                return StepExecution::Failed {
+                    detail: "cannot commit: the repository is on a detached HEAD".into(),
+                }
+            }
+            Err(e) => {
+                return StepExecution::Failed {
+                    detail: format!("git branch read failed: {}", e.message),
+                }
+            }
+        };
+        if head.is_none() {
+            return StepExecution::Skipped {
+                detail: "empty repository state (unborn HEAD); refusing an initial commit".into(),
+            };
+        }
+        let entries: Vec<VerifiedTreeEntry> = artifact
+            .verified_manifest
+            .iter()
+            .map(|entry| VerifiedTreeEntry {
+                path: entry.path.clone(),
+                state: entry.state.clone(),
+            })
+            .collect();
+        let tree = match self
+            .git
+            .build_tree_from_manifest(&guard, root, root, &entries, owner.clone())
+            .await
+        {
+            Ok(tree) => tree,
+            Err(e) => {
+                return StepExecution::Failed {
+                    detail: format!("verified tree construction refused: {}", e.message),
+                }
+            }
+        };
+        let local_ref = format!("refs/heads/{branch}");
+        if head_tree.as_deref() == Some(tree.as_str()) {
+            // HEAD already carries the verified tree: record the identity,
+            // mint no redundant commit.
+            artifact.git_tree_oid = Some(tree);
+            artifact.commit_oid = head.clone();
+            artifact.local_ref = Some(local_ref);
+            artifact.updated_ms = actx.handle.now_ms();
+            if let Err(detail) = self.persist_artifact(actx, &artifact) {
+                return StepExecution::Failed { detail };
+            }
+            // Keep git's own index in step with HEAD (a normal commit does).
+            if let Err(e) = self
+                .git
+                .git_unlocked(root, &["read-tree", "HEAD"], owner.clone())
+                .await
+            {
+                return StepExecution::Failed {
+                    detail: format!(
+                        "index refresh after the verified commit failed: {}",
+                        e.message
+                    ),
+                };
+            }
+            return StepExecution::Succeeded {
+                detail: format!(
+                    "already committed: HEAD carries the verified tree ({})",
+                    head.as_deref().map(short_sha).unwrap_or_default()
+                ),
+                pr_url: None,
+            };
+        }
+        match self
+            .git
+            .commit_verified_tree(
+                &guard,
+                root,
+                root,
+                &branch,
+                message,
+                &entries,
+                owner.clone(),
+            )
+            .await
+        {
+            Ok(CommitOutcome::Committed { sha, .. }) => {
+                artifact.git_tree_oid = Some(tree);
+                artifact.commit_oid = Some(sha.clone());
+                artifact.local_ref = Some(local_ref);
+                artifact.updated_ms = actx.handle.now_ms();
+                if let Err(detail) = self.persist_artifact(actx, &artifact) {
+                    return StepExecution::Failed { detail };
+                }
+                StepExecution::Succeeded {
+                    detail: format!(
+                        "committed the verified tree at {} on {branch}: {message}",
+                        short_sha(&sha)
+                    ),
+                    pr_url: None,
+                }
+            }
+            Ok(CommitOutcome::NothingToCommit) => StepExecution::Failed {
+                detail: "the verified commit reported nothing to commit although HEAD's tree                          differs from the verified manifest"
+                    .into(),
+            },
+            Ok(CommitOutcome::EmptyRepository) => StepExecution::Skipped {
+                detail: "empty repository state (unborn HEAD); refusing an initial commit".into(),
+            },
+            Err(e) => StepExecution::Failed {
+                detail: format!("verified commit failed: {}", e.message),
+            },
+        }
+    }
+
+    /// The PRODUCTION push step: the exact durable commit OID is pushed to
+    /// its branch ref (lease against the observed remote state), the live
+    /// remote ref is read back and MUST be the exact OID, and the encoded
+    /// remote ref is recorded in the artifact for the PR step to re-assert.
+    async fn execute_verified_push(
+        &self,
+        ctx: &CompletionStepContext,
+        actx: &ArtifactContext<'_>,
+    ) -> StepExecution {
+        let owner = ProcessOwner::Daemon;
+        let root = &ctx.root;
+        let mut artifact = match self.load_or_build_artifact(actx, root) {
+            Ok(artifact) => artifact,
+            Err(detail) => return StepExecution::Failed { detail },
+        };
+        let branch = match artifact
+            .local_ref
+            .as_deref()
+            .and_then(|r| r.strip_prefix("refs/heads/"))
+            .map(str::to_string)
+        {
+            Some(branch) if !branch.is_empty() => branch,
+            _ => match self.git.current_branch(root, owner.clone()).await {
+                Ok(branch) if !branch.is_empty() => branch,
+                _ => {
+                    return StepExecution::Failed {
+                        detail: "cannot push: no recorded local ref and detached HEAD".into(),
+                    }
+                }
+            },
+        };
+        let remote = self.config.remote.clone();
+        let url = match self.git.remote_url(root, &remote, owner.clone()).await {
+            Ok(None) => {
+                return StepExecution::Skipped {
+                    detail: "no git remote configured (the repository has no remotes)".into(),
+                }
+            }
+            Ok(Some(url)) => url,
+            Err(e) => {
+                return StepExecution::Failed {
+                    detail: format!("git remote read failed: {}", e.message),
+                }
+            }
+        };
+        if is_egress_destination(&url) {
+            if let Err(denied) = self.egress.check(&url) {
+                return StepExecution::Failed {
+                    detail: format!("egress policy denied push to {url}: {denied}"),
+                };
+            }
+        }
+        let guard = match self.git.acquire_mutation_guard(root, owner.clone()).await {
+            Ok(guard) => guard,
+            Err(e) => {
+                return StepExecution::Failed {
+                    detail: format!("repository mutation guard: {}", e.message),
+                }
+            }
+        };
+        // Revalidate the proof and the recorded OIDs immediately before the
+        // push: the live HEAD must still be exactly the verified commit.
+        if let Err(e) = actx.handle.verify_completion_proof_binding(
+            actx.task_id,
+            actx.proof,
+            Some(root.as_path()),
+        ) {
+            return StepExecution::Failed {
+                detail: format!("verified root invalidated immediately before the push: {e}"),
+            };
+        }
+        // Resolve the EXACT commit to publish. A push-only contract (or a
+        // crash before the commit step recorded its OID) publishes the live
+        // HEAD ONLY when HEAD's tree is the verified manifest tree — built
+        // here from the manifest and asserted, never assumed.
+        let commit = match artifact.commit_oid.clone() {
+            Some(commit) => {
+                match self.git.head_sha_unlocked(root, owner.clone()).await {
+                    Ok(Some(head)) if head == commit => {}
+                    Ok(other) => {
+                        return StepExecution::Failed {
+                            detail: format!(
+                                "the recorded verified commit {commit} is not the live HEAD {other:?}; refusing to publish a moved repository"
+                            ),
+                        }
+                    }
+                    Err(e) => {
+                        return StepExecution::Failed {
+                            detail: format!("git head read failed: {}", e.message),
+                        }
+                    }
+                }
+                commit
+            }
+            None => {
+                let head = match self.git.head_sha_unlocked(root, owner.clone()).await {
+                    Ok(Some(head)) => head,
+                    Ok(None) => {
+                        return StepExecution::Failed {
+                            detail: "cannot push: HEAD is unborn".into(),
+                        }
+                    }
+                    Err(e) => {
+                        return StepExecution::Failed {
+                            detail: format!("git head read failed: {}", e.message),
+                        }
+                    }
+                };
+                let entries: Vec<VerifiedTreeEntry> = artifact
+                    .verified_manifest
+                    .iter()
+                    .map(|entry| VerifiedTreeEntry {
+                        path: entry.path.clone(),
+                        state: entry.state.clone(),
+                    })
+                    .collect();
+                let tree = match self
+                    .git
+                    .build_tree_from_manifest(&guard, root, root, &entries, owner.clone())
+                    .await
+                {
+                    Ok(tree) => tree,
+                    Err(e) => {
+                        return StepExecution::Failed {
+                            detail: format!(
+                                "verified tree construction refused before the push: {}",
+                                e.message
+                            ),
+                        }
+                    }
+                };
+                match self
+                    .git
+                    .git_unlocked(root, &["rev-parse", "HEAD^{tree}"], owner.clone())
+                    .await
+                {
+                    Ok(head_tree) if head_tree.trim() == tree => {}
+                    Ok(head_tree) => {
+                        return StepExecution::Failed {
+                            detail: format!(
+                                "cannot publish HEAD {}: its tree {} is not the verified manifest tree {tree}",
+                                head,
+                                head_tree.trim()
+                            ),
+                        }
+                    }
+                    Err(e) => {
+                        return StepExecution::Failed {
+                            detail: format!("git HEAD tree read failed: {}", e.message),
+                        }
+                    }
+                }
+                artifact.git_tree_oid = Some(tree);
+                artifact.commit_oid = Some(head.clone());
+                artifact.local_ref = Some(format!("refs/heads/{branch}"));
+                artifact.updated_ms = actx.handle.now_ms();
+                if let Err(detail) = self.persist_artifact(actx, &artifact) {
+                    return StepExecution::Failed { detail };
+                }
+                head
+            }
+        };
+        // Already published? Read the LIVE remote ref and reconcile it to the
+        // exact OID before deciding.
+        let live = match self
+            .git
+            .remote_branch_oid_unlocked(root, &remote, &branch, owner.clone())
+            .await
+        {
+            Ok(oid) => oid,
+            Err(e) => {
+                return StepExecution::Failed {
+                    detail: format!("remote ref read failed: {}", e.message),
+                }
+            }
+        };
+        let (outcome, remote_oid) = if live.as_deref() == Some(commit.as_str()) {
+            (
+                PushOutcome::AlreadyCurrent {
+                    note: "remote already carries the verified commit".into(),
+                },
+                commit.clone(),
+            )
+        } else {
+            match self
+                .git
+                .push_exact_commit(&guard, root, &remote, &branch, &commit, None, owner.clone())
+                .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    return StepExecution::Failed {
+                        detail: format!("git push failed: {}", e.message),
+                    }
+                }
+            }
+        };
+        artifact.remote_ref = Some(format!("{remote}:refs/heads/{branch}@{remote_oid}"));
+        artifact.updated_ms = actx.handle.now_ms();
+        if let Err(detail) = self.persist_artifact(actx, &artifact) {
+            return StepExecution::Failed { detail };
+        }
+        match outcome {
+            PushOutcome::Pushed { note } => StepExecution::Succeeded {
+                detail: format!(
+                    "pushed the verified commit {} to {remote} ({url}){}",
+                    short_sha(&commit),
+                    note_suffix(&note)
+                ),
+                pr_url: None,
+            },
+            PushOutcome::AlreadyCurrent { note } => StepExecution::Succeeded {
+                detail: format!(
+                    "already pushed the verified commit {} to {remote} ({url}); idempotent replay{}",
+                    short_sha(&commit),
+                    note_suffix(&note)
+                ),
+                pr_url: None,
+            },
+        }
+    }
+
+    async fn execute_push(
+        &self,
+        ctx: &CompletionStepContext,
+        artifact: Option<&ArtifactContext<'_>>,
+    ) -> StepExecution {
+        if let Some(actx) = artifact {
+            return self.execute_verified_push(ctx, actx).await;
+        }
         let owner = ProcessOwner::Daemon;
         let branch = match self.git.current_branch(&ctx.root, owner.clone()).await {
             Ok(branch) if !branch.is_empty() => branch,
@@ -829,7 +1698,13 @@ impl CompletionStepRunner {
         }
     }
 
-    async fn execute_pr(&self, ctx: &CompletionStepContext) -> StepExecution {
+    /// The expert-command PR path: executes the configured
+    /// `pr_command`/`pr_program` through the supervisor. It records NO
+    /// durable external-operation identity and therefore NEVER certifies the
+    /// native PR step — production invocations of the proof path refuse the
+    /// step before this code runs ([`PR_REQUIRES_TYPED_RECONCILIATION`]);
+    /// only the legacy test path reaches it.
+    async fn execute_pr_command(&self, ctx: &CompletionStepContext) -> StepExecution {
         if self.config.pr_command.is_none() && self.config.pr_program.is_none() {
             return StepExecution::Skipped {
                 detail: "[completion] pr_command is not configured; no PR was created".into(),
@@ -931,6 +1806,403 @@ impl CompletionStepRunner {
                 ),
             },
         }
+    }
+
+    /// The PR step dispatcher. The PROOF path (`pr = Some`) certifies the
+    /// native step ONLY through the typed [`ScmProvider`] reconciliation
+    /// protocol; the legacy test path (`pr = None`) keeps the expert-command
+    /// behavior byte-identical.
+    async fn execute_pr(
+        &self,
+        ctx: &CompletionStepContext,
+        pr: Option<&PrOperationContext<'_>>,
+        artifact: Option<&ArtifactContext<'_>>,
+    ) -> Result<StepExecution, CompletionStepError> {
+        match pr {
+            None => Ok(self.execute_pr_command(ctx).await),
+            Some(op) => self.execute_pr_native(ctx, op, artifact).await,
+        }
+    }
+
+    /// The typed native PR step: journal the exact operation identity BEFORE
+    /// the remote call, reconcile from the durable rows after it, and refuse
+    /// typed on any identity drift. The step certifies only when the remote
+    /// object id + version were journaled.
+    async fn execute_pr_native(
+        &self,
+        ctx: &CompletionStepContext,
+        op: &PrOperationContext<'_>,
+        artifact: Option<&ArtifactContext<'_>>,
+    ) -> Result<StepExecution, CompletionStepError> {
+        let Some(provider) = self.scm_provider.clone() else {
+            // Fail-closed: without the typed reconciliation seam nothing can
+            // certify the native PR step. An unconfigured PR is the historic
+            // retryable Skipped; a configured generic command is a TYPED
+            // refusal naming its missing protocol.
+            if self.config.pr_command.is_none() && self.config.pr_program.is_none() {
+                return Ok(StepExecution::Skipped {
+                    detail: "[completion] pr_command is not configured; no PR was created".into(),
+                });
+            }
+            return Ok(StepExecution::Failed {
+                detail: format!(
+                    "native PR refused ({PR_REQUIRES_TYPED_RECONCILIATION}): the configured \
+                     pr_command/pr_program is an expert extension with no typed reconciliation \
+                     protocol, so it can never certify the native PR step"
+                ),
+            });
+        };
+        let owner = ProcessOwner::Daemon;
+        let branch = match self.git.current_branch(&ctx.root, owner.clone()).await {
+            Ok(branch) if !branch.is_empty() => branch,
+            Ok(_) => {
+                return Ok(StepExecution::Failed {
+                    detail: "cannot certify the native PR step from a detached HEAD".into(),
+                })
+            }
+            Err(e) => {
+                return Ok(StepExecution::Failed {
+                    detail: format!("git branch read failed: {}", e.message),
+                })
+            }
+        };
+        let remote_url = match self
+            .git
+            .remote_url(&ctx.root, &self.config.remote, owner.clone())
+            .await
+        {
+            Ok(Some(url)) => url,
+            Ok(None) => {
+                return Ok(StepExecution::Failed {
+                    detail: format!(
+                        "cannot certify the native PR step: git remote {} is not configured",
+                        self.config.remote
+                    ),
+                })
+            }
+            Err(e) => {
+                return Ok(StepExecution::Failed {
+                    detail: format!("git remote read failed: {}", e.message),
+                })
+            }
+        };
+        // Wave-0 exact binding: when the verified-git artifact recorded a
+        // remote ref, the live local HEAD and the LIVE remote head must both
+        // still be the exact verified commit before any PR is created or
+        // updated. A moved remote is a typed refusal, never a PR on top of a
+        // different commit.
+        if let Some(actx) = artifact {
+            let recorded = actx
+                .handle
+                .ledger_verified_git_artifact_get(actx.task_id.raw(), actx.revision)
+                .map_err(|e| CompletionStepError::Config(format!("artifact read: {e}")))?;
+            if let Some(recorded) = recorded {
+                if let (Some(commit), Some(remote_ref)) = (
+                    recorded.commit_oid.as_deref(),
+                    recorded.remote_ref.as_deref(),
+                ) {
+                    let live_head = match self.git.head_sha(&ctx.root, ProcessOwner::Daemon).await {
+                        Ok(Some(head)) => head,
+                        Ok(None) => {
+                            return Ok(StepExecution::Failed {
+                                detail: "native PR refused: HEAD is unborn".into(),
+                            })
+                        }
+                        Err(e) => {
+                            return Ok(StepExecution::Failed {
+                                detail: format!(
+                                    "native PR refused: git head read failed: {}",
+                                    e.message
+                                ),
+                            })
+                        }
+                    };
+                    if commit != live_head {
+                        return Ok(StepExecution::Failed {
+                            detail: format!(
+                                "native PR refused: the artifact records commit {commit} but the live HEAD is {live_head}"
+                            ),
+                        });
+                    }
+                    let Some((remote_name, rest)) = remote_ref.split_once(':') else {
+                        return Ok(StepExecution::Failed {
+                            detail: format!(
+                                "native PR refused: the recorded remote ref {remote_ref:?} is malformed"
+                            ),
+                        });
+                    };
+                    let Some((refname, recorded_oid)) = rest.rsplit_once('@') else {
+                        return Ok(StepExecution::Failed {
+                            detail: format!(
+                                "native PR refused: the recorded remote ref {remote_ref:?} is malformed"
+                            ),
+                        });
+                    };
+                    let branch_name = refname
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(branch.as_str());
+                    let live = self
+                        .git
+                        .remote_branch_oid(
+                            &ctx.root,
+                            remote_name,
+                            branch_name,
+                            ProcessOwner::Daemon,
+                        )
+                        .await
+                        .map_err(|e| {
+                            CompletionStepError::Config(format!("remote ref read: {e}"))
+                        })?;
+                    if recorded_oid != commit || live.as_deref() != Some(commit) {
+                        return Ok(StepExecution::Failed {
+                            detail: format!(
+                                "native PR refused: the recorded remote head {recorded_oid} on {refname}                                  does not match the live remote head {live:?} for commit {commit}"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        let Some(parsed) = parse_scm_repository(&remote_url, None) else {
+            return Ok(StepExecution::Failed {
+                detail: format!(
+                    "cannot certify the native PR step: remote {remote_url} is not a recognizable \
+                     GitHub repository reference (organization/repository)"
+                ),
+            });
+        };
+        let repository = provider.repository_ref(&parsed.organization, &parsed.repository);
+        let head_sha = match self.git.head_sha(&ctx.root, owner).await {
+            Ok(Some(sha)) => sha,
+            Ok(None) => {
+                return Ok(StepExecution::Failed {
+                    detail: "cannot certify the native PR step: HEAD is unborn".into(),
+                })
+            }
+            Err(e) => {
+                return Ok(StepExecution::Failed {
+                    detail: format!("git head read failed: {}", e.message),
+                })
+            }
+        };
+        let marker = native_pr_marker(op.task_id, op.revision);
+        let input = ExternalOperationInput {
+            organization: repository.organization.clone(),
+            repository: repository.repository.clone(),
+            head: branch.clone(),
+            base: self.config.base_branch.clone(),
+            marker: marker.clone(),
+        };
+        let operation_key =
+            native_pr_operation_key(op.task_id, op.revision, provider.provider_name());
+        // Read the durable identity BEFORE any remote call: a conflicting
+        // input identity or a recorded terminal failure refuses WITHOUT
+        // touching the provider (no branch reconciliation, no PR lookup).
+        let recorded = match op.handle.ledger_external_operation_read(&operation_key) {
+            DurableRead::Missing => None,
+            DurableRead::PresentValid(row) => Some(row),
+            DurableRead::PresentMalformed(detail) | DurableRead::StoreFailure(detail) => {
+                let err = ExternalOperationError::Store {
+                    operation_key: operation_key.clone(),
+                    detail,
+                };
+                return Ok(step_refusal(&err));
+            }
+        };
+        if let Some(row) = &recorded {
+            if row.input != input {
+                let err = ExternalOperationError::InputIdentityConflict {
+                    operation_key: operation_key.clone(),
+                    detail: format!(
+                        "recorded (org {org_r}, repo {repo_r}, head {head_r}, base {base_r}, \
+                         marker {marker_r}) vs current (org {org_c}, repo {repo_c}, head {head_c}, \
+                         base {base_c}, marker {marker_c}); the same operation key never silently \
+                         retargets",
+                        org_r = row.input.organization,
+                        repo_r = row.input.repository,
+                        head_r = row.input.head,
+                        base_r = row.input.base,
+                        marker_r = row.input.marker,
+                        org_c = input.organization,
+                        repo_c = input.repository,
+                        head_c = input.head,
+                        base_c = input.base,
+                        marker_c = input.marker,
+                    ),
+                };
+                return Ok(step_refusal(&err));
+            }
+            if row.state == ExternalOperationState::Failed {
+                let err = ExternalOperationError::RecordedFailure {
+                    operation_key: operation_key.clone(),
+                    detail: row
+                        .remote_object_version
+                        .clone()
+                        .unwrap_or_else(|| "recorded failure".into()),
+                };
+                return Ok(step_refusal(&err));
+            }
+        }
+        let reconciling = matches!(
+            recorded.as_ref().map(|row| row.state),
+            Some(ExternalOperationState::Prepared)
+        );
+        // The branch is an idempotent precondition of the PR. Its
+        // reconciliation is part of the same typed protocol and its recorded
+        // head must equal the exact local head (a moved branch is a typed
+        // refusal, never a silently different PR head).
+        let branch_spec = ScmBranchSpec {
+            repository: repository.clone(),
+            branch: branch.clone(),
+            head_sha: head_sha.clone(),
+            marker: marker.clone(),
+        };
+        match provider.create_or_reconcile_branch(&branch_spec) {
+            Ok(remote) if remote.version != head_sha => {
+                return Ok(StepExecution::Failed {
+                    detail: format!(
+                        "native PR refused (external_operation_remote_object_mismatch): branch \
+                         {branch} is at remote version {} but the verified head is {head_sha}",
+                        remote.version
+                    ),
+                })
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Ok(StepExecution::Failed {
+                    detail: format!(
+                        "native PR refused (scm_provider): branch reconciliation failed: {e}"
+                    ),
+                })
+            }
+        }
+        // Write-before-call: the durable Prepared row names the EXACT input
+        // identity the restart will reconcile from. A write failure refuses
+        // the step here — the remote call is never made without it.
+        if recorded.is_none() {
+            let prepared = ExternalOperationRow {
+                id: ExternalOperationRow::content_id(
+                    &operation_key,
+                    provider.provider_name(),
+                    SCM_PULL_REQUEST_KIND,
+                    &input,
+                ),
+                operation_key: operation_key.clone(),
+                provider: provider.provider_name().to_string(),
+                kind: SCM_PULL_REQUEST_KIND.to_string(),
+                input: input.clone(),
+                state: ExternalOperationState::Prepared,
+                remote_object_id: None,
+                remote_object_version: None,
+                started_at: op.handle.now_ms(),
+                reconciled_at: None,
+            };
+            if let Err(e) = op.handle.ledger_external_operation_set(&prepared) {
+                let err = ExternalOperationError::Store {
+                    operation_key: operation_key.clone(),
+                    detail: format!("{e} (no remote call was made)"),
+                };
+                return Ok(step_refusal(&err));
+            }
+        }
+        #[cfg(test)]
+        if self.pr_crash == Some(PrOperationCrashPoint::BeforeRemoteCall) {
+            return Err(CompletionStepError::InjectedCrash("before remote call"));
+        }
+        let spec = ScmPullRequestSpec {
+            repository: repository.clone(),
+            head: branch.clone(),
+            base: self.config.base_branch.clone(),
+            marker: marker.clone(),
+            title: commit_message(&ctx.goal),
+            body: format!(
+                "Created by Faktor task {}. Reconciliation marker: {marker}",
+                op.task_id
+            ),
+        };
+        let remote = match provider.create_or_reconcile_pull_request(&spec) {
+            Ok(remote) => remote,
+            Err(e) => {
+                return Ok(StepExecution::Failed {
+                    detail: format!(
+                        "native PR refused (scm_provider): pull-request reconciliation failed: {e}"
+                    ),
+                })
+            }
+        };
+        // A recorded remote identity may only be CONFIRMED, never silently
+        // replaced: id and version must match exactly.
+        if let Some(row) = &recorded {
+            if let (Some(recorded_id), Some(recorded_version)) = (
+                row.remote_object_id.as_deref(),
+                row.remote_object_version.as_deref(),
+            ) {
+                if recorded_id != remote.object_id || recorded_version != remote.version {
+                    let err = ExternalOperationError::RemoteObjectMismatch {
+                        operation_key: operation_key.clone(),
+                        detail: format!(
+                            "recorded object {recorded_id}@{recorded_version} but the provider \
+                             reports {}@{}",
+                            remote.object_id, remote.version
+                        ),
+                    };
+                    return Ok(step_refusal(&err));
+                }
+            }
+        }
+        #[cfg(test)]
+        if self.pr_crash == Some(PrOperationCrashPoint::AfterRemoteCallBeforeRecord) {
+            return Err(CompletionStepError::InjectedCrash(
+                "after remote call before completion record",
+            ));
+        }
+        let completed = ExternalOperationRow {
+            id: ExternalOperationRow::content_id(
+                &operation_key,
+                provider.provider_name(),
+                SCM_PULL_REQUEST_KIND,
+                &input,
+            ),
+            operation_key: operation_key.clone(),
+            provider: provider.provider_name().to_string(),
+            kind: SCM_PULL_REQUEST_KIND.to_string(),
+            input,
+            state: ExternalOperationState::Completed,
+            remote_object_id: Some(remote.object_id),
+            remote_object_version: Some(remote.version),
+            started_at: recorded
+                .as_ref()
+                .map(|row| row.started_at)
+                .unwrap_or_else(|| op.handle.now_ms()),
+            reconciled_at: reconciling.then(|| op.handle.now_ms()),
+        };
+        if let Err(e) = op.handle.ledger_external_operation_set(&completed) {
+            let err = ExternalOperationError::Store {
+                operation_key: operation_key.clone(),
+                detail: format!("{e} (the remote object identity could not be journaled)"),
+            };
+            return Ok(step_refusal(&err));
+        }
+        Ok(StepExecution::Succeeded {
+            detail: format!(
+                "native PR {}@{} certified via {} reconciliation (marker {marker})",
+                completed.remote_object_id.as_deref().unwrap_or_default(),
+                completed
+                    .remote_object_version
+                    .as_deref()
+                    .unwrap_or_default(),
+                provider.provider_name(),
+            ),
+            pr_url: Some(remote.url),
+        })
+    }
+}
+
+/// One typed external-operation refusal as a durable step outcome: the
+/// stable machine code always rides the bounded detail.
+fn step_refusal(err: &ExternalOperationError) -> StepExecution {
+    StepExecution::Failed {
+        detail: format!("native PR refused ({}): {err}", err.code()),
     }
 }
 
@@ -1232,6 +2504,209 @@ fn truncate_bytes(s: &str, max: usize) -> String {
         end -= 1;
     }
     s[..end].to_string()
+}
+
+/// The deterministic in-process [`ScmProvider`] test double: an idempotent
+/// remote registry keyed by the EXACT (repository, head/base, marker)
+/// identity that counts remote creations, so a duplicate-creation bug is
+/// observable. It is deliberately NOT a production adapter: the real
+/// GitHub-App adapter (installation tokens, REST/GraphQL, rate limits) is
+/// the recorded follow-up — this fake exists so the reconciliation protocol
+/// itself is provable without a network or credentials.
+#[cfg(test)]
+pub(crate) mod scm_fake {
+    use super::{
+        ScmBranchSpec, ScmError, ScmProvider, ScmPullRequestSpec, ScmRemoteObject, ScmRepositoryRef,
+    };
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PrKey {
+        organization: String,
+        repository: String,
+        head: String,
+        base: String,
+        marker: String,
+    }
+
+    #[derive(Debug, Clone)]
+    struct FakePr {
+        key: PrKey,
+        object: ScmRemoteObject,
+    }
+
+    #[derive(Debug, Clone)]
+    struct FakeBranch {
+        organization: String,
+        repository: String,
+        branch: String,
+        object: ScmRemoteObject,
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeState {
+        branch_calls: usize,
+        pr_calls: usize,
+        remote_creations: usize,
+        prs: Vec<FakePr>,
+        branches: Vec<FakeBranch>,
+        pr_version_override: Option<String>,
+        branch_version_override: Option<String>,
+    }
+
+    /// The fake provider handle (share the same `Arc` across "restarts" so
+    /// the remote state survives exactly as a real provider's would).
+    #[derive(Debug, Default)]
+    pub(crate) struct FakeScmProvider {
+        state: Mutex<FakeState>,
+    }
+
+    impl FakeScmProvider {
+        pub(crate) fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        pub(crate) fn pr_calls(&self) -> usize {
+            self.state.lock().expect("fake scm lock").pr_calls
+        }
+
+        pub(crate) fn branch_calls(&self) -> usize {
+            self.state.lock().expect("fake scm lock").branch_calls
+        }
+
+        /// How many pull requests the provider CREATED (a reconciliation
+        /// returning the existing object does not increment this).
+        pub(crate) fn remote_creations(&self) -> usize {
+            self.state.lock().expect("fake scm lock").remote_creations
+        }
+
+        pub(crate) fn pull_request_count(&self) -> usize {
+            self.state.lock().expect("fake scm lock").prs.len()
+        }
+
+        /// Force every future PR reconciliation to report `version` — the
+        /// remote moved under us (force-push/edited PR).
+        pub(crate) fn force_pull_request_version(&self, version: &str) {
+            self.state
+                .lock()
+                .expect("fake scm lock")
+                .pr_version_override = Some(version.to_string());
+        }
+
+        /// Force every future branch reconciliation to report `version`.
+        pub(crate) fn force_branch_version(&self, version: &str) {
+            self.state
+                .lock()
+                .expect("fake scm lock")
+                .branch_version_override = Some(version.to_string());
+        }
+    }
+
+    impl ScmProvider for FakeScmProvider {
+        fn provider_name(&self) -> &'static str {
+            "github"
+        }
+
+        fn create_or_reconcile_branch(
+            &self,
+            spec: &ScmBranchSpec,
+        ) -> Result<ScmRemoteObject, ScmError> {
+            let mut state = self.state.lock().expect("fake scm lock");
+            state.branch_calls += 1;
+            let position = state.branches.iter().position(|b| {
+                b.organization == spec.repository.organization
+                    && b.repository == spec.repository.repository
+                    && b.branch == spec.branch
+            });
+            let override_version = state.branch_version_override.clone();
+            let mut object = match position {
+                Some(index) => {
+                    let branch = &mut state.branches[index];
+                    if let Some(version) = &override_version {
+                        branch.object.version = version.clone();
+                    }
+                    branch.object.clone()
+                }
+                None => {
+                    let object = ScmRemoteObject {
+                        object_id: format!("refs/heads/{}", spec.branch),
+                        version: spec.head_sha.clone(),
+                        url: format!(
+                            "https://github.com/{}/{}/tree/{}",
+                            spec.repository.organization, spec.repository.repository, spec.branch
+                        ),
+                    };
+                    state.branches.push(FakeBranch {
+                        organization: spec.repository.organization.clone(),
+                        repository: spec.repository.repository.clone(),
+                        branch: spec.branch.clone(),
+                        object: object.clone(),
+                    });
+                    object
+                }
+            };
+            if let Some(version) = override_version {
+                object.version = version;
+            }
+            Ok(object)
+        }
+
+        fn create_or_reconcile_pull_request(
+            &self,
+            spec: &ScmPullRequestSpec,
+        ) -> Result<ScmRemoteObject, ScmError> {
+            let mut state = self.state.lock().expect("fake scm lock");
+            state.pr_calls += 1;
+            let key = PrKey {
+                organization: spec.repository.organization.clone(),
+                repository: spec.repository.repository.clone(),
+                head: spec.head.clone(),
+                base: spec.base.clone(),
+                marker: spec.marker.clone(),
+            };
+            let mut object = match state.prs.iter().find(|pr| pr.key == key) {
+                Some(existing) => existing.object.clone(),
+                None => {
+                    state.remote_creations += 1;
+                    let number = state.remote_creations;
+                    let object = ScmRemoteObject {
+                        object_id: format!("pr-{number}"),
+                        version: "v1".to_string(),
+                        url: format!(
+                            "https://github.com/{}/{}/pull/{number}",
+                            spec.repository.organization, spec.repository.repository
+                        ),
+                    };
+                    state.prs.push(FakePr {
+                        key,
+                        object: object.clone(),
+                    });
+                    object
+                }
+            };
+            if let Some(version) = state.pr_version_override.clone() {
+                object.version = version;
+            }
+            Ok(object)
+        }
+
+        fn remote_ref(
+            &self,
+            repository: &ScmRepositoryRef,
+            reference: &str,
+        ) -> Result<Option<ScmRemoteObject>, ScmError> {
+            let state = self.state.lock().expect("fake scm lock");
+            Ok(state
+                .branches
+                .iter()
+                .find(|b| {
+                    b.organization == repository.organization
+                        && b.repository == repository.repository
+                        && b.branch == reference
+                })
+                .map(|b| b.object.clone()))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2397,5 +3872,634 @@ mod tests {
             h.completion_contract_gate(task_id).unwrap(),
             CompletionContractGate::Satisfied
         );
+    }
+
+    /// Wave-0 commit race: a human edit injected AFTER the proof
+    /// revalidation and BEFORE the tree construction is a typed refusal with
+    /// nothing committed — the tree comes from the verified manifest, so a
+    /// diverged worktree can never be committed, and the race window between
+    /// `add` and `commit` does not exist at all.
+    #[tokio::test]
+    async fn edit_between_revalidation_and_tree_build_is_refused_with_nothing_committed() {
+        let (dir, m) = manager();
+        let repo = init_repo(dir.path());
+        let (h, task_id, tree) =
+            session_bound_to_root(&m, &repo, "commit race", Some(contract(true, false, false)));
+        drive_to_verifying(&h, task_id);
+        let proof = passing_record_with_tree(&h, task_id, &tree);
+        let head_before = git_output(&repo, &["rev-parse", "HEAD"]);
+        let hook_repo = repo.clone();
+        let runner = runner(dir.path(), CompletionStepsConfig::default(), allow_all())
+            .with_commit_tree_hook(Arc::new(move || {
+                std::fs::write(hook_repo.join("README.md"), "human edit mid-add\n").unwrap();
+            }));
+        let report = runner
+            .run_completion_steps(&h, task_id, proof, &ctx(&repo, "commit race"))
+            .await
+            .unwrap();
+        assert_eq!(
+            report.outcome_of(CompletionStep::Commit),
+            Some(CompletionStepOutcome::Failed),
+            "{report:?}"
+        );
+        let detail = &report
+            .records
+            .iter()
+            .find(|r| r.step == CompletionStep::Commit)
+            .unwrap()
+            .detail;
+        assert!(detail.contains("divergence"), "{detail}");
+        assert_eq!(
+            git_output(&repo, &["rev-parse", "HEAD"]),
+            head_before,
+            "nothing was committed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("README.md")).unwrap(),
+            "human edit mid-add\n",
+            "the human edit is preserved, never overwritten by a commit"
+        );
+    }
+
+    /// Wave-0 PR binding: an artifact whose recorded remote head no longer
+    /// matches the LIVE remote head refuses the PR step before any provider
+    /// call (no PR on top of a moved commit).
+    #[tokio::test]
+    async fn pr_refuses_when_the_recorded_remote_head_moved() {
+        let (dir, m) = manager();
+        let repo = init_repo(dir.path());
+        let bare = add_bare_remote(dir.path(), &repo);
+        let (h, task_id, tree) = session_bound_to_root(
+            &m,
+            &repo,
+            "pr remote drift",
+            Some(contract(false, false, true)),
+        );
+        let (revision, _) = h.completion_contract(task_id).unwrap().unwrap();
+        drive_to_verifying(&h, task_id);
+        let proof = passing_record_with_tree(&h, task_id, &tree);
+        let head = git_output(&repo, &["rev-parse", "HEAD"]);
+        // The push step published this exact commit earlier: record the
+        // artifact with the encoded remote ref.
+        let manifest = crate::runtime::merge::canonical_manifest_rows(&repo, MAX_BASE_ENTRIES)
+            .unwrap()
+            .into_iter()
+            .map(|(path, state)| VerifiedManifestEntry {
+                path: path.to_string_lossy().into_owned(),
+                state,
+            })
+            .collect();
+        let artifact = VerifiedGitArtifact {
+            task_id: task_id.raw(),
+            revision: revision.raw(),
+            verification_record: proof.raw(),
+            verified_root_digest: tree.clone(),
+            verified_manifest: manifest,
+            git_tree_oid: Some(git_output(&repo, &["rev-parse", "HEAD^{tree}"])),
+            commit_oid: Some(head.clone()),
+            local_ref: Some("refs/heads/main".into()),
+            remote_ref: Some(format!("origin:refs/heads/main@{head}")),
+            updated_ms: h.now_ms(),
+        };
+        h.ledger_verified_git_artifact_set(&artifact).unwrap();
+        // A human/other runtime moves the remote ref to a different commit.
+        std::fs::write(repo.join("other.txt"), "moved on\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "faktor: other"]);
+        let moved = git_output(&repo, &["rev-parse", "HEAD"]);
+        assert_ne!(moved, head);
+        git(
+            &repo,
+            &[
+                "push",
+                "-q",
+                "--force",
+                "origin",
+                &format!("{moved}:refs/heads/main"),
+            ],
+        );
+        assert_eq!(git_output(&bare, &["rev-parse", "main"]), moved);
+        // Keep the local HEAD on the verified commit: only the REMOTE moved.
+        git(&repo, &["reset", "-q", "--hard", &head]);
+        assert_eq!(git_output(&repo, &["rev-parse", "HEAD"]), head);
+        let provider = scm_fake::FakeScmProvider::new();
+        let runner = runner(dir.path(), CompletionStepsConfig::default(), allow_all())
+            .with_scm_provider(provider.clone());
+        let report = runner
+            .run_completion_steps(&h, task_id, proof, &ctx(&repo, "pr remote drift"))
+            .await
+            .unwrap();
+        assert_eq!(
+            report.outcome_of(CompletionStep::Pr),
+            Some(CompletionStepOutcome::Failed),
+            "{report:?}"
+        );
+        let detail = &report
+            .records
+            .iter()
+            .find(|r| r.step == CompletionStep::Pr)
+            .unwrap()
+            .detail;
+        assert!(detail.contains("live remote head"), "{detail}");
+        assert_eq!(
+            provider.pr_calls(),
+            0,
+            "the provider must never be called for a moved remote"
+        );
+    }
+
+    // --------------------------- durable external-operation identity (B)
+
+    /// A repo whose `origin` names a GitHub repository but has no real
+    /// remote: the typed path never touches the network (the provider seam
+    /// does), only the push/idempotency checks read refs.
+    fn init_repo_with_github_remote(root: &Path) -> std::path::PathBuf {
+        let repo = init_repo(root);
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widgets.git",
+            ],
+        );
+        repo
+    }
+
+    fn native_pr_fixture(
+        dir: &Path,
+        goal: &str,
+    ) -> (Arc<SessionManager>, SessionHandle, TaskId, String, PathBuf) {
+        let m = SessionManager::open(dir.join("native-pr-store"), dir.join("native-pr-cas"), true)
+            .unwrap();
+        let repo = init_repo_with_github_remote(dir);
+        let (h, task_id, tree) =
+            session_bound_to_root(&m, &repo, goal, Some(contract(false, false, true)));
+        drive_to_verifying(&h, task_id);
+        (m, h, task_id, tree, repo)
+    }
+
+    fn native_pr_runner(
+        dir: &Path,
+        provider: Arc<scm_fake::FakeScmProvider>,
+    ) -> CompletionStepRunner {
+        runner(dir, CompletionStepsConfig::default(), allow_all()).with_scm_provider(provider)
+    }
+
+    fn pr_operation_rows(h: &SessionHandle) -> Vec<faktor_session::ledger::ExternalOperationRow> {
+        h.ledger_external_operations().unwrap()
+    }
+
+    fn contract_revision(h: &SessionHandle, task_id: TaskId) -> u64 {
+        h.completion_contract(task_id)
+            .unwrap()
+            .expect("contract")
+            .0
+            .raw()
+    }
+
+    /// The create path journals the EXACT operation identity BEFORE the
+    /// remote call and the remote object identity after it: two rows, the
+    /// first `Prepared` (no remote identity), the last `Completed`.
+    #[tokio::test]
+    async fn native_pr_records_the_operation_before_the_remote_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, h, task_id, tree, repo) = native_pr_fixture(dir.path(), "native pr");
+        let provider = scm_fake::FakeScmProvider::new();
+        let runner = native_pr_runner(dir.path(), provider.clone());
+        let report = runner
+            .run_completion_steps(
+                &h,
+                task_id,
+                passing_record_with_tree(&h, task_id, &tree),
+                &ctx(&repo, "native pr"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.outcome_of(CompletionStep::Pr),
+            Some(CompletionStepOutcome::Succeeded),
+            "{report:?}"
+        );
+        assert_eq!(provider.pr_calls(), 1);
+        assert_eq!(provider.remote_creations(), 1);
+        let key = native_pr_operation_key(task_id, contract_revision(&h, task_id), "github");
+        let ops: Vec<_> = pr_operation_rows(&h)
+            .into_iter()
+            .filter(|row| row.operation_key == key)
+            .collect();
+        assert_eq!(ops.len(), 2, "prepared then completed: {ops:?}");
+        assert_eq!(
+            ops[0].state,
+            faktor_session::ledger::ExternalOperationState::Prepared
+        );
+        assert!(ops[0].remote_object_id.is_none());
+        assert_eq!(ops[0].input.head, "main");
+        assert_eq!(
+            ops[1].state,
+            faktor_session::ledger::ExternalOperationState::Completed
+        );
+        assert!(ops[1].remote_object_id.is_some());
+        assert!(ops[1].remote_object_version.is_some());
+        assert!(
+            ops[1].reconciled_at.is_none(),
+            "first create is not a reconciliation"
+        );
+        let _ = m;
+    }
+
+    /// Crash BEFORE the remote call: exactly one `Prepared` row exists and
+    /// the provider was never called. The restart reconciles from the
+    /// recorded identity and creates the PR exactly once.
+    #[tokio::test]
+    async fn native_pr_crash_before_remote_call_retries_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_m, h, task_id, tree, repo) = native_pr_fixture(dir.path(), "crash before call");
+        let provider = scm_fake::FakeScmProvider::new();
+        let key = native_pr_operation_key(task_id, contract_revision(&h, task_id), "github");
+        let crashed = native_pr_runner(dir.path(), provider.clone())
+            .with_pr_crash_seam(PrOperationCrashPoint::BeforeRemoteCall);
+        let err = crashed
+            .run_completion_steps(
+                &h,
+                task_id,
+                passing_record_with_tree(&h, task_id, &tree),
+                &ctx(&repo, "crash before call"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CompletionStepError::InjectedCrash(_)),
+            "{err}"
+        );
+        assert_eq!(provider.pr_calls(), 0, "the remote call never happened");
+        let ops: Vec<_> = pr_operation_rows(&h)
+            .into_iter()
+            .filter(|row| row.operation_key == key)
+            .collect();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(
+            ops[0].state,
+            faktor_session::ledger::ExternalOperationState::Prepared
+        );
+        // The crash left NO step status row: the restart re-executes.
+        assert!(step_rows(&h, task_id).is_empty());
+        let restarted = native_pr_runner(dir.path(), provider.clone());
+        let report = restarted
+            .run_completion_steps(
+                &h,
+                task_id,
+                passing_record_with_tree(&h, task_id, &tree),
+                &ctx(&repo, "crash before call"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.outcome_of(CompletionStep::Pr),
+            Some(CompletionStepOutcome::Succeeded),
+            "{report:?}"
+        );
+        assert_eq!(provider.pr_calls(), 1, "retried exactly once");
+        assert_eq!(provider.remote_creations(), 1);
+        let ops: Vec<_> = pr_operation_rows(&h)
+            .into_iter()
+            .filter(|row| row.operation_key == key)
+            .collect();
+        assert_eq!(ops.len(), 2);
+        assert!(ops[1].reconciled_at.is_some(), "the restart reconciled");
+    }
+
+    /// Crash AFTER the remote creation but BEFORE the completion row: the
+    /// restart reconciles through the marker/head/base lookup, so the
+    /// provider creates exactly ONE PR and the step then certifies.
+    #[tokio::test]
+    async fn native_pr_crash_after_remote_call_reconciles_without_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_m, h, task_id, tree, repo) = native_pr_fixture(dir.path(), "crash after call");
+        let provider = scm_fake::FakeScmProvider::new();
+        let key = native_pr_operation_key(task_id, contract_revision(&h, task_id), "github");
+        let crashed = native_pr_runner(dir.path(), provider.clone())
+            .with_pr_crash_seam(PrOperationCrashPoint::AfterRemoteCallBeforeRecord);
+        let err = crashed
+            .run_completion_steps(
+                &h,
+                task_id,
+                passing_record_with_tree(&h, task_id, &tree),
+                &ctx(&repo, "crash after call"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CompletionStepError::InjectedCrash(_)),
+            "{err}"
+        );
+        assert_eq!(provider.remote_creations(), 1, "the PR was created once");
+        let ops: Vec<_> = pr_operation_rows(&h)
+            .into_iter()
+            .filter(|row| row.operation_key == key)
+            .collect();
+        assert_eq!(ops.len(), 1, "the completion row never landed");
+        assert_eq!(
+            ops[0].state,
+            faktor_session::ledger::ExternalOperationState::Prepared
+        );
+        assert!(step_rows(&h, task_id).is_empty());
+        let restarted = native_pr_runner(dir.path(), provider.clone());
+        let report = restarted
+            .run_completion_steps(
+                &h,
+                task_id,
+                passing_record_with_tree(&h, task_id, &tree),
+                &ctx(&repo, "crash after call"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.outcome_of(CompletionStep::Pr),
+            Some(CompletionStepOutcome::Succeeded),
+            "{report:?}"
+        );
+        assert_eq!(
+            provider.remote_creations(),
+            1,
+            "reconciliation must NOT create a duplicate PR"
+        );
+        assert_eq!(provider.pull_request_count(), 1);
+        let ops: Vec<_> = pr_operation_rows(&h)
+            .into_iter()
+            .filter(|row| row.operation_key == key)
+            .collect();
+        assert_eq!(ops.len(), 2);
+        assert!(ops[1].reconciled_at.is_some());
+        assert_eq!(ops[1].remote_object_id.as_deref(), Some("pr-1"));
+    }
+
+    /// A durable row under the SAME operation key with a DIFFERENT input
+    /// identity (a different head) is a typed refusal: the runtime never
+    /// retargets an external operation and never touches the provider.
+    #[tokio::test]
+    async fn native_pr_input_identity_conflict_is_a_typed_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_m, h, task_id, tree, repo) = native_pr_fixture(dir.path(), "conflict");
+        let revision = contract_revision(&h, task_id);
+        let key = native_pr_operation_key(task_id, revision, "github");
+        let input = ExternalOperationInput {
+            organization: "acme".into(),
+            repository: "widgets".into(),
+            head: "someone-elses-branch".into(),
+            base: "main".into(),
+            marker: native_pr_marker(task_id, revision),
+        };
+        let conflicting = ExternalOperationRow {
+            id: ExternalOperationRow::content_id(&key, "github", SCM_PULL_REQUEST_KIND, &input),
+            operation_key: key.clone(),
+            provider: "github".into(),
+            kind: SCM_PULL_REQUEST_KIND.into(),
+            input,
+            state: faktor_session::ledger::ExternalOperationState::Prepared,
+            remote_object_id: None,
+            remote_object_version: None,
+            started_at: h.now_ms(),
+            reconciled_at: None,
+        };
+        h.ledger_external_operation_set(&conflicting).unwrap();
+        let provider = scm_fake::FakeScmProvider::new();
+        let runner = native_pr_runner(dir.path(), provider.clone());
+        let report = runner
+            .run_completion_steps(
+                &h,
+                task_id,
+                passing_record_with_tree(&h, task_id, &tree),
+                &ctx(&repo, "conflict"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.outcome_of(CompletionStep::Pr),
+            Some(CompletionStepOutcome::Failed),
+            "{report:?}"
+        );
+        let detail = &report
+            .records
+            .iter()
+            .find(|r| r.step == CompletionStep::Pr)
+            .unwrap()
+            .detail;
+        assert!(
+            detail.contains("external_operation_input_identity_conflict"),
+            "{detail}"
+        );
+        assert_eq!(provider.pr_calls(), 0, "no remote call on a conflict");
+        assert_eq!(provider.branch_calls(), 0);
+    }
+
+    /// A recorded remote-object VERSION that the provider no longer reports
+    /// is a typed refusal: the run never silently certifies a moved object.
+    #[tokio::test]
+    async fn native_pr_remote_object_version_mismatch_is_a_typed_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_m, h, task_id, tree, repo) = native_pr_fixture(dir.path(), "version mismatch");
+        let revision = contract_revision(&h, task_id);
+        let key = native_pr_operation_key(task_id, revision, "github");
+        let input = ExternalOperationInput {
+            organization: "acme".into(),
+            repository: "widgets".into(),
+            head: "main".into(),
+            base: "main".into(),
+            marker: native_pr_marker(task_id, revision),
+        };
+        let completed = ExternalOperationRow {
+            id: ExternalOperationRow::content_id(&key, "github", SCM_PULL_REQUEST_KIND, &input),
+            operation_key: key.clone(),
+            provider: "github".into(),
+            kind: SCM_PULL_REQUEST_KIND.into(),
+            input,
+            state: faktor_session::ledger::ExternalOperationState::Completed,
+            remote_object_id: Some("pr-1".into()),
+            // The recorded version; the provider has moved on.
+            remote_object_version: Some("v1".into()),
+            started_at: h.now_ms(),
+            reconciled_at: None,
+        };
+        h.ledger_external_operation_set(&completed).unwrap();
+        let provider = scm_fake::FakeScmProvider::new();
+        provider.force_pull_request_version("moved-v9");
+        let runner = native_pr_runner(dir.path(), provider.clone());
+        let report = runner
+            .run_completion_steps(
+                &h,
+                task_id,
+                passing_record_with_tree(&h, task_id, &tree),
+                &ctx(&repo, "version mismatch"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.outcome_of(CompletionStep::Pr),
+            Some(CompletionStepOutcome::Failed),
+            "{report:?}"
+        );
+        let detail = &report
+            .records
+            .iter()
+            .find(|r| r.step == CompletionStep::Pr)
+            .unwrap()
+            .detail;
+        assert!(
+            detail.contains("external_operation_remote_object_mismatch"),
+            "{detail}"
+        );
+        assert!(detail.contains("moved-v9"), "{detail}");
+    }
+
+    /// A branch that moved away from the exact verified head is a typed
+    /// refusal BEFORE any PR operation is journaled.
+    #[tokio::test]
+    async fn native_pr_branch_version_drift_is_a_typed_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_m, h, task_id, tree, repo) = native_pr_fixture(dir.path(), "branch drift");
+        let provider = scm_fake::FakeScmProvider::new();
+        provider.force_branch_version("someone-elses-sha");
+        let runner = native_pr_runner(dir.path(), provider.clone());
+        let report = runner
+            .run_completion_steps(
+                &h,
+                task_id,
+                passing_record_with_tree(&h, task_id, &tree),
+                &ctx(&repo, "branch drift"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.outcome_of(CompletionStep::Pr),
+            Some(CompletionStepOutcome::Failed),
+            "{report:?}"
+        );
+        let detail = &report
+            .records
+            .iter()
+            .find(|r| r.step == CompletionStep::Pr)
+            .unwrap()
+            .detail;
+        assert!(
+            detail.contains("external_operation_remote_object_mismatch"),
+            "{detail}"
+        );
+        assert_eq!(provider.pr_calls(), 0, "no PR operation after branch drift");
+        assert!(pr_operation_rows(&h).is_empty());
+    }
+
+    /// The generic `pr_program` expert command implements NO typed
+    /// reconciliation protocol: on the production proof path it is a typed
+    /// terminal refusal, never a certification — and it never even runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pr_program_without_reconciliation_cannot_certify_the_native_pr_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo_with_github_remote(dir.path());
+        let marker = dir.path().join("pr-program-ran.marker");
+        let script = fake_pr_script(
+            dir.path(),
+            &format!(
+                "echo ran > {}\necho https://example.test/pr/1",
+                marker.display()
+            ),
+        );
+        let config = CompletionStepsConfig {
+            pr_program: Some(script.display().to_string()),
+            pr_args: vec!["{branch}".into()],
+            ..Default::default()
+        };
+        let m = SessionManager::open(
+            dir.path().join("expert-store"),
+            dir.path().join("expert-cas"),
+            true,
+        )
+        .unwrap();
+        let (h, task_id, tree) =
+            session_bound_to_root(&m, &repo, "expert pr", Some(contract(false, false, true)));
+        drive_to_verifying(&h, task_id);
+        let proof = passing_record_with_tree(&h, task_id, &tree);
+        let runner = runner(dir.path(), config, allow_all());
+        let report = runner
+            .run_completion_steps(&h, task_id, proof, &ctx(&repo, "expert pr"))
+            .await
+            .unwrap();
+        assert_eq!(
+            report.outcome_of(CompletionStep::Pr),
+            Some(CompletionStepOutcome::Failed),
+            "{report:?}"
+        );
+        let detail = &report
+            .records
+            .iter()
+            .find(|r| r.step == CompletionStep::Pr)
+            .unwrap()
+            .detail;
+        assert!(
+            detail.contains(PR_REQUIRES_TYPED_RECONCILIATION),
+            "{detail}"
+        );
+        assert!(!marker.exists(), "the expert command must not run");
+        assert!(pr_operation_rows(&h)
+            .iter()
+            .all(|row| row.kind != SCM_PULL_REQUEST_KIND));
+        // The gate refuses terminally: the native PR step is never satisfied.
+        assert!(matches!(
+            h.completion_contract_gate(task_id).unwrap(),
+            CompletionContractGate::Refused(TaskError::CompletionStepFailed { .. })
+        ));
+    }
+
+    /// An UNCONFIGURED PR on the production path stays the historic
+    /// retryable `Skipped` (no provider, no command => nothing to certify).
+    #[tokio::test]
+    async fn unconfigured_native_pr_is_still_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_m, h, task_id, tree, repo) = native_pr_fixture(dir.path(), "no pr config");
+        let runner = runner(dir.path(), CompletionStepsConfig::default(), allow_all());
+        let report = runner
+            .run_completion_steps(
+                &h,
+                task_id,
+                passing_record_with_tree(&h, task_id, &tree),
+                &ctx(&repo, "no pr config"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.outcome_of(CompletionStep::Pr),
+            Some(CompletionStepOutcome::Skipped),
+            "{report:?}"
+        );
+        assert!(pr_operation_rows(&h).is_empty());
+    }
+
+    /// The repository parser is exact: only a two-segment GitHub reference
+    /// is accepted, and the installation identity rides the parsed value.
+    #[test]
+    fn scm_repository_parsing_is_exact() {
+        let parsed = parse_scm_repository("https://github.com/acme/widgets.git", Some("42".into()))
+            .expect("https url");
+        assert_eq!(parsed.organization, "acme");
+        assert_eq!(parsed.repository, "widgets");
+        assert_eq!(parsed.installation_id.as_deref(), Some("42"));
+        let parsed = parse_scm_repository("git@github.com:acme/widgets.git", None).expect("scp");
+        assert_eq!(parsed.organization, "acme");
+        assert_eq!(parsed.repository, "widgets");
+        for rejected in [
+            "",
+            "https://gitlab.com/acme/widgets.git",
+            "https://github.com/acme",
+            "https://github.com/acme/widgets/extra",
+            "/tmp/remote.git",
+            "https://github.com/acme/widgets.git/../../evil",
+        ] {
+            assert!(
+                parse_scm_repository(rejected, None).is_none(),
+                "{rejected:?} must be refused"
+            );
+        }
     }
 }

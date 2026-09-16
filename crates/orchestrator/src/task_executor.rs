@@ -175,6 +175,70 @@ fn classify_session_read(what: &str, e: faktor_core::Error) -> DurableStateError
     }
 }
 
+// ------------------------------------------- instruction proof basis (fail-closed)
+
+/// The resolved instruction basis of one proof-basis construction. Exactly
+/// TWO success shapes exist; every failure is a typed
+/// [`InstructionBasisError`] that PREVENTS proof creation/reuse. The retired
+/// `handle.row().ok().and_then(|row| resolver.resolve(..).ok())` collapse
+/// turned an unreadable store / hostile tree / resolver failure into "no
+/// instructions" — i.e. into a WEAKER basis that silently authorized proof
+/// reuse. That path is gone: an unresolved tree is never an absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionBasis {
+    /// The session's durable workspace resolves to NO instruction tree (no
+    /// durable root): a valid basis carrying no epoch.
+    NoApplicableInstructions,
+    /// The workspace's live instruction tree resolved and was STABLE across
+    /// the double read; the epoch is the resolved rule-tree digest.
+    Resolved { epoch: u64 },
+}
+
+impl InstructionBasis {
+    /// The basis's instruction epoch (`None` only for
+    /// [`InstructionBasis::NoApplicableInstructions`]).
+    pub fn epoch(self) -> Option<u64> {
+        match self {
+            InstructionBasis::NoApplicableInstructions => None,
+            InstructionBasis::Resolved { epoch } => Some(epoch),
+        }
+    }
+}
+
+/// Typed failure of one instruction-basis resolution. EVERY variant prevents
+/// proof creation and proof reuse (the basis is a fail-closed input, never a
+/// best-effort one).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InstructionBasisError {
+    /// The session row could not be read (store failure / missing row).
+    #[error("instruction basis store unavailable ({what}): {detail}")]
+    StoreUnavailable { what: String, detail: String },
+    /// The session row is present but its workspace relation is corrupt.
+    #[error("instruction basis corrupt workspace relation ({what}): {detail}")]
+    CorruptWorkspaceRelation { what: String, detail: String },
+    /// An authority instruction file is unreadable/oversized.
+    #[error("instruction basis file unreadable: {0}")]
+    UnreadableInstructionFile(String),
+    /// The instruction tree moved between the two reads of one basis
+    /// construction: a moving tree can never be a stable proof basis.
+    #[error("instruction basis tree is unstable: {0}")]
+    UnstableInstructionTree(String),
+    /// Any other resolver failure (never collapsed into an absence).
+    #[error("instruction resolver internal error: {0}")]
+    ResolverInternal(String),
+}
+
+/// Classify one resolver error into the typed basis failure.
+fn classify_rules_load_error(e: faktor_instructions::RulesLoadError) -> InstructionBasisError {
+    use faktor_instructions::RulesLoadError as E;
+    match &e {
+        E::Oversized(message) | E::Unreadable(message) => {
+            InstructionBasisError::UnreadableInstructionFile(message.clone())
+        }
+        E::EpochMismatch { .. } => InstructionBasisError::ResolverInternal(e.to_string()),
+    }
+}
+
 /// How one [`TaskRunRequest`] executes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -3166,8 +3230,8 @@ impl TaskExecutor {
         staged: &[PreparedChildChangeSet],
         change: &crate::runtime::merge::ComposedPathChange,
     ) -> Result<(), ExecError> {
-        match change.child_hash {
-            Some(hash) => {
+        match &change.child {
+            Some(candidate) => {
                 let source = staged
                     .iter()
                     .filter(|s| change.sources.contains(&s.child_id))
@@ -3178,13 +3242,13 @@ impl TaskExecutor {
                             change.path
                         ))
                     })?;
-                faktor_fs::merge_apply_content(
+                crate::runtime::merge::apply_manifest_entry(
                     candidate_root,
                     &change.path,
                     &source.child_root,
                     &change.path,
-                    hash,
-                    change.base_hash,
+                    candidate,
+                    change.base.as_ref(),
                 )
                 .map_err(|e| {
                     ExecError::from_fs(
@@ -3195,19 +3259,20 @@ impl TaskExecutor {
                 })?;
             }
             None => {
-                let base = change.base_hash.ok_or_else(|| {
+                let base = change.base.as_ref().ok_or_else(|| {
                     ExecError::Internal(format!(
                         "composed deletion {:?} has no base anchor",
                         change.path
                     ))
                 })?;
-                faktor_fs::merge_delete(candidate_root, &change.path, base).map_err(|e| {
-                    ExecError::from_fs(
-                        &format!("candidate composition of {:?}", change.path),
-                        candidate_root,
-                        e,
-                    )
-                })?;
+                crate::runtime::merge::delete_manifest_entry(candidate_root, &change.path, base)
+                    .map_err(|e| {
+                        ExecError::from_fs(
+                            &format!("candidate composition of {:?}", change.path),
+                            candidate_root,
+                            e,
+                        )
+                    })?;
             }
         }
         Ok(())
@@ -3725,108 +3790,98 @@ impl TaskExecutor {
         })
     }
 
-    /// Apply ONE per-path landing decision to the owner through the shared
-    /// CAS primitives. The candidate bytes are re-verified against the
-    /// decision's candidate hash before the write; the owner's expected
-    /// state is the recorded base hash.
+    /// Apply ONE per-path landing decision to the owner through the canonical
+    /// entry-state CAS primitive: the owner's live `(kind, mode, payload /
+    /// literal target)` must still equal the recorded base state, the
+    /// candidate bytes are re-verified against the recorded candidate state,
+    /// and the whole kind/mode/content/target transition is atomic. A legacy
+    /// (byte-only) decision row is a typed refusal — never landed from.
     fn apply_landing_path(
         &self,
         owner_root: &std::path::Path,
         candidate_root: &std::path::Path,
         path_txn: &faktor_session::ledger::IntegrationPathTxn,
     ) -> Result<(), String> {
-        match &path_txn.candidate_hash {
-            Some(hex) => {
-                let expected = FileHash::from_hex(hex).ok_or_else(|| {
-                    format!("hostile candidate hash {hex:?} in the landing transaction")
-                })?;
-                let source = candidate_root.join(&path_txn.path);
-                let meta = std::fs::metadata(&source)
-                    .map_err(|e| format!("candidate source {}: {e}", source.display()))?;
-                if meta.len() > faktor_fs::MAX_MERGE_FILE_BYTES {
-                    return Err(format!(
-                        "candidate source {} is {} bytes (cap {})",
-                        source.display(),
-                        meta.len(),
-                        faktor_fs::MAX_MERGE_FILE_BYTES
-                    ));
-                }
-                let bytes = std::fs::read(&source)
-                    .map_err(|e| format!("candidate source {}: {e}", source.display()))?;
-                let stored = self
-                    .session
-                    .cas()
-                    .put_bounded(&bytes, faktor_fs::MAX_MERGE_FILE_BYTES as usize)
-                    .map_err(|e| format!("candidate content CAS: {e}"))?;
-                if stored != expected {
-                    return Err(format!(
-                        "candidate {} drifted since staging (expected {}, found {})",
-                        path_txn.path,
-                        expected.to_hex(),
-                        stored.to_hex()
-                    ));
-                }
-                let base = match &path_txn.base_hash {
-                    Some(hex) => Some(FileHash::from_hex(hex).ok_or_else(|| {
-                        format!("hostile base hash {hex:?} in the landing transaction")
-                    })?),
-                    None => None,
-                };
-                faktor_fs::cas_write_content(
-                    owner_root,
-                    std::path::Path::new(&path_txn.path),
-                    &bytes,
-                    base,
-                )
+        use faktor_fs::entry_state::EntryState;
+        if !path_txn.canonical_ready() {
+            return Err(format!(
+                "landing decision of {:?} is not a canonical entry-state row (legacy byte-only material); refusing to land it",
+                path_txn.path
+            ));
+        }
+        let rel = std::path::Path::new(&path_txn.path);
+        if path_txn.candidate_state == EntryState::Absent {
+            crate::runtime::merge::delete_manifest_entry(owner_root, rel, &path_txn.base_state)
                 .map(|_| ())
                 .map_err(|e| e.message)
+        } else {
+            let payload = crate::runtime::merge::read_literal_payload(
+                candidate_root,
+                rel,
+                &path_txn.candidate_state,
+            )
+            .map_err(|e| e.message)?;
+            if !path_txn.candidate_state.material_matches(&payload) {
+                return Err(format!(
+                    "candidate {} drifted since staging; nothing was landed",
+                    path_txn.path
+                ));
             }
-            None => {
-                let base = path_txn.base_hash.as_deref().and_then(FileHash::from_hex);
-                let base = base.ok_or_else(|| {
-                    format!(
-                        "deletion decision of {:?} has no base anchor",
-                        path_txn.path
-                    )
-                })?;
-                faktor_fs::merge_delete(owner_root, std::path::Path::new(&path_txn.path), base)
-                    .map(|_| ())
-                    .map_err(|e| e.message)
-            }
+            faktor_fs::entry_state::apply_tree_entry_cas(
+                owner_root,
+                rel,
+                &path_txn.base_state,
+                &path_txn.candidate_state,
+                &payload,
+            )
+            .map(|_| ())
+            .map_err(|e| e.message)
         }
     }
 
-    /// Build the record-first per-path decisions of a fresh landing: base
-    /// hash + CAS base blob (the rollback authority) and the verified
-    /// candidate hash (`None` = deletion).
+    /// Build the record-first per-path decisions of a fresh landing in the
+    /// CANONICAL entry-state vocabulary: `base_state` + `candidate_state`
+    /// (kind/mode/payload / literal target) and the rollback CAS material
+    /// (the base regular payload blob in the CAS, the base symlink literal
+    /// target inline). A base path that is a special file the canonical
+    /// vocabulary cannot represent is a typed refusal before anything is
+    /// recorded.
     fn build_path_decisions(
         &self,
         prepared: &PreparedRunIntegration,
     ) -> Result<Vec<faktor_session::ledger::IntegrationPathTxn>, ExecError> {
-        let base_map: std::collections::HashMap<PathBuf, FileHash> =
-            faktor_fs::snapshot_tree(&prepared.base_root, MAX_RUN_BASE_ENTRIES)
-                .map_err(|e| ExecError::from_fs("run base snapshot", &prepared.base_root, e))?
-                .into_iter()
-                .map(|e| (e.path, e.hash))
-                .collect();
-        let candidate_map: std::collections::HashMap<PathBuf, FileHash> =
-            faktor_fs::snapshot_tree(&prepared.candidate_root, MAX_RUN_BASE_ENTRIES)
-                .map_err(|e| ExecError::from_fs("candidate snapshot", &prepared.candidate_root, e))?
-                .into_iter()
-                .map(|e| (e.path, e.hash))
-                .collect();
+        use faktor_fs::entry_state::EntryState;
+        let base_rows = crate::runtime::merge::canonical_manifest_rows(
+            &prepared.base_root,
+            MAX_RUN_BASE_ENTRIES,
+        )?;
+        let candidate_rows = crate::runtime::merge::canonical_manifest_rows(
+            &prepared.candidate_root,
+            MAX_RUN_BASE_ENTRIES,
+        )?;
+        let base_map: std::collections::HashMap<PathBuf, EntryState> =
+            base_rows.into_iter().collect();
+        let candidate_map: std::collections::HashMap<PathBuf, EntryState> =
+            candidate_rows.into_iter().collect();
         let mut decisions = Vec::with_capacity(prepared.changed.len());
         for rel in &prepared.changed {
             let path = PathBuf::from(rel);
-            let base_hash = base_map.get(&path).copied();
-            let candidate_hash = candidate_map.get(&path).copied();
-            let base_blob = match base_hash {
-                Some(expected) => {
-                    let source = prepared.base_root.join(&path);
-                    let bytes = std::fs::read(&source).map_err(|e| {
+            let base_state = base_map.get(&path).cloned().unwrap_or(EntryState::Absent);
+            let candidate_state = candidate_map
+                .get(&path)
+                .cloned()
+                .unwrap_or(EntryState::Absent);
+            let (rollback_blob, rollback_link_target) = match &base_state {
+                EntryState::Absent => (None, None),
+                EntryState::Regular { payload, .. } => {
+                    let bytes = crate::runtime::merge::read_literal_payload(
+                        &prepared.base_root,
+                        &path,
+                        &base_state,
+                    )
+                    .map_err(|e| {
                         ExecError::WorkspaceDrift(format!(
-                            "run base content {}: {e}",
-                            source.display()
+                            "run base content of {rel} no longer matches its recorded state: {e}"
                         ))
                     })?;
                     let stored = self
@@ -3834,29 +3889,35 @@ impl TaskExecutor {
                         .cas()
                         .put_bounded(&bytes, faktor_fs::MAX_MERGE_FILE_BYTES as usize)
                         .map_err(|e| ExecError::Internal(format!("run base blob of {rel}: {e}")))?;
-                    // The materialized base (the shadow path reuses the
-                    // owner under the whole-root equality check) must still
-                    // match the recorded anchor: a drifted generation is a
-                    // typed refusal, never a rollback blob for the wrong
-                    // content.
-                    if stored != expected {
+                    // The materialized base must still match the recorded
+                    // anchor: a drifted generation is a typed refusal, never
+                    // a rollback blob for the wrong content.
+                    if stored != *payload {
                         return Err(ExecError::WorkspaceDrift(format!(
                             "run base content of {rel} no longer matches its recorded anchor (expected {}, found {}); the generation moved",
-                            expected.to_hex(),
+                            payload.to_hex(),
                             stored.to_hex()
                         )));
                     }
-                    Some(stored.to_hex())
+                    (Some(stored.to_hex()), None)
                 }
-                None => None,
+                EntryState::Symlink { target, .. } => (None, Some(target.clone())),
             };
-            decisions.push(faktor_session::ledger::IntegrationPathTxn {
+            let decision = faktor_session::ledger::IntegrationPathTxn {
                 path: rel.clone(),
-                base_hash: base_hash.map(|h| h.to_hex()),
-                candidate_hash: candidate_hash.map(|h| h.to_hex()),
-                base_blob,
+                base_state,
+                candidate_state,
+                rollback_blob,
+                rollback_link_target,
+                canonical: true,
                 state: faktor_session::ledger::IntegrationPathTxnState::Pending,
-            });
+            };
+            if !decision.canonical_ready() {
+                return Err(ExecError::Internal(format!(
+                    "landing decision of {rel} is not canonical-ready after construction"
+                )));
+            }
+            decisions.push(decision);
         }
         Ok(decisions)
     }
@@ -3906,101 +3967,55 @@ impl TaskExecutor {
         Ok(())
     }
 
-    /// Restore ONE applied path to its base state, refusing to clobber a
-    /// post-landing user edit.
+    /// Restore ONE applied path to its exact base state through the
+    /// canonical restore CAS: the live state must still be the transaction's
+    /// written candidate state (a later user edit is a typed Conflict and is
+    /// preserved), and the exact kind/mode/target is restored from the
+    /// recorded rollback material.
     fn restore_base_path(
         &self,
         owner_root: &std::path::Path,
         path_txn: &faktor_session::ledger::IntegrationPathTxn,
     ) -> Result<(), String> {
-        let target = owner_root.join(&path_txn.path);
-        let current = match std::fs::metadata(&target) {
-            Ok(meta) if meta.is_file() => {
-                let bytes = std::fs::read(&target)
-                    .map_err(|e| format!("rollback probe {}: {e}", target.display()))?;
-                let stored = self
-                    .session
-                    .cas()
-                    .put_bounded(&bytes, faktor_fs::MAX_MERGE_FILE_BYTES as usize)
-                    .map_err(|e| format!("rollback probe CAS: {e}"))?;
-                Some(stored.to_hex())
-            }
-            _ => None,
-        };
-        match &path_txn.candidate_hash {
-            Some(candidate) => {
-                if current.as_deref() == Some(candidate.as_str()) {
-                    match (&path_txn.base_hash, &path_txn.base_blob) {
-                        (Some(_), Some(blob)) => {
-                            let hash = FileHash::from_hex(blob)
-                                .ok_or_else(|| format!("hostile rollback blob {blob:?}"))?;
-                            let bytes = self
-                                .session
-                                .cas()
-                                .get_bounded(hash, faktor_fs::MAX_MERGE_FILE_BYTES as usize)
-                                .map_err(|e| format!("rollback blob read: {e}"))?
-                                .ok_or_else(|| "rollback blob missing from the CAS".to_string())?;
-                            let expected = FileHash::from_hex(candidate)
-                                .ok_or_else(|| format!("hostile candidate hash {candidate:?}"))?;
-                            faktor_fs::cas_write_content(
-                                owner_root,
-                                std::path::Path::new(&path_txn.path),
-                                &bytes,
-                                Some(expected),
-                            )
-                            .map(|_| ())
-                            .map_err(|e| e.message)
-                        }
-                        _ => {
-                            // The base had no such file: our landing CREATED
-                            // it; remove it while it is still ours.
-                            let expected = FileHash::from_hex(candidate)
-                                .ok_or_else(|| format!("hostile candidate hash {candidate:?}"))?;
-                            faktor_fs::merge_delete(
-                                owner_root,
-                                std::path::Path::new(&path_txn.path),
-                                expected,
-                            )
-                            .map(|_| ())
-                            .map_err(|e| e.message)
-                        }
-                    }
-                } else if current.as_deref() == path_txn.base_hash.as_deref() {
-                    // Already restored (a replay) — nothing to do.
-                    Ok(())
-                } else {
-                    Err("a post-landing user edit was preserved (never overwritten)".into())
-                }
-            }
-            None => {
-                if current.is_none() {
-                    // We deleted the file; restore the base content with an
-                    // exclusive create (any concurrent creation is preserved).
-                    let blob = path_txn
-                        .base_blob
-                        .as_deref()
-                        .ok_or_else(|| "deletion rollback has no base blob".to_string())?;
-                    let hash = FileHash::from_hex(blob)
-                        .ok_or_else(|| format!("hostile rollback blob {blob:?}"))?;
-                    let bytes = self
-                        .session
-                        .cas()
-                        .get_bounded(hash, faktor_fs::MAX_MERGE_FILE_BYTES as usize)
-                        .map_err(|e| format!("rollback blob read: {e}"))?
-                        .ok_or_else(|| "rollback blob missing from the CAS".to_string())?;
-                    faktor_fs::cas_write_content(
-                        owner_root,
-                        std::path::Path::new(&path_txn.path),
-                        &bytes,
-                        None,
-                    )
-                    .map(|_| ())
-                    .map_err(|e| e.message)
-                } else {
-                    Err("a post-landing user edit was preserved (never overwritten)".into())
-                }
-            }
+        use faktor_fs::entry_state::EntryState;
+        if !path_txn.canonical_ready() {
+            return Err(format!(
+                "rollback decision of {:?} is not a canonical entry-state row; refusing to restore from it",
+                path_txn.path
+            ));
         }
+        let rel = std::path::Path::new(&path_txn.path);
+        let material = match &path_txn.base_state {
+            EntryState::Absent => Vec::new(),
+            EntryState::Regular { payload, .. } => {
+                let blob = path_txn
+                    .rollback_blob
+                    .as_deref()
+                    .ok_or_else(|| "regular rollback has no base blob".to_string())?;
+                let hash = FileHash::from_hex(blob)
+                    .ok_or_else(|| format!("hostile rollback blob {blob:?}"))?;
+                if hash != *payload {
+                    return Err(
+                        "rollback blob digest does not match the recorded base state".to_string(),
+                    );
+                }
+                self.session
+                    .cas()
+                    .get_bounded(hash, faktor_fs::MAX_MERGE_FILE_BYTES as usize)
+                    .map_err(|e| format!("rollback blob read: {e}"))?
+                    .ok_or_else(|| "rollback blob missing from the CAS".to_string())?
+            }
+            EntryState::Symlink { target, .. } => target.clone(),
+        };
+        faktor_fs::entry_state::restore_tree_entry_cas(
+            owner_root,
+            rel,
+            &path_txn.candidate_state,
+            &path_txn.base_state,
+            &material,
+        )
+        .map(|_| ())
+        .map_err(|e| e.message)
     }
 
     /// Record a Blocked landing attempt (owner drift before the first
@@ -4192,7 +4207,7 @@ impl TaskExecutor {
         let basis = self
             .root_verification_proof_basis(handle, task_id, prepared, run)
             .await?;
-        let basis_digest = basis.digest();
+        let basis_digest = canonical_proof_basis_digest(&basis);
         let mut candidates: Vec<faktor_session::VerificationRecord> = handle
             .list_verification_records(task_id)
             .map_err(|e| ExecError::Internal(format!("verification record list: {e}")))?
@@ -4208,10 +4223,7 @@ impl TaskExecutor {
         // divergent older record can never shadow it.
         candidates.sort_by_key(|r| std::cmp::Reverse(r.record_id));
         for existing in &candidates {
-            match handle
-                .verification_record_reusable(existing.record_id, &basis)
-                .map_err(|e| ExecError::Internal(format!("proof reuse consult: {e}")))?
-            {
+            match canonical_proof_reuse(handle, existing.record_id, &basis_digest)? {
                 ProofReuse::Allowed => return Ok((existing.record_id, basis_digest)),
                 ProofReuse::Refused { reason } => {
                     eprintln!(
@@ -4246,6 +4258,73 @@ impl TaskExecutor {
             )
             .map_err(|e| ExecError::Internal(format!("root verification record write: {e}")))?;
         Ok((record, basis_digest))
+    }
+
+    /// Resolve the CURRENT instruction basis of the session's durable
+    /// workspace for the proof basis (A fail-closed). The tree is read
+    /// TWICE through the resolver's (root, epoch) cache: a changed epoch
+    /// between the reads is an unstable tree, and EVERY store/resolver
+    /// failure is typed — never collapsed into "no applicable instructions".
+    fn resolve_instruction_basis(
+        &self,
+        handle: &faktor_session::SessionHandle,
+    ) -> Result<InstructionBasis, InstructionBasisError> {
+        let row = handle.row().map_err(|e| match e.kind {
+            faktor_core::ErrorKind::Malformed => InstructionBasisError::CorruptWorkspaceRelation {
+                what: "session row".into(),
+                detail: e.message,
+            },
+            _ => InstructionBasisError::StoreUnavailable {
+                what: "session row".into(),
+                detail: e.message,
+            },
+        })?;
+        if row.workspace_id.raw() == 0 {
+            return Err(InstructionBasisError::CorruptWorkspaceRelation {
+                what: "session row".into(),
+                detail: "workspace id 0 can never own an instruction tree".into(),
+            });
+        }
+        let resolver = &self.agent.deps().instructions_resolver;
+        let read = |pinned: Option<faktor_instructions::InstructionEpoch>| {
+            resolver
+                .resolve(row.workspace_id.raw(), pinned)
+                .map_err(classify_rules_load_error)
+        };
+        match read(None)? {
+            faktor_instructions::LoadedInstructions::Empty => {
+                // The absence is only a valid basis while it is STABLE: a
+                // second read that suddenly resolves a tree is a moving
+                // world, not a no-instructions workspace.
+                match read(None)? {
+                    faktor_instructions::LoadedInstructions::Empty => {
+                        Ok(InstructionBasis::NoApplicableInstructions)
+                    }
+                    faktor_instructions::LoadedInstructions::Loaded(_) => {
+                        Err(InstructionBasisError::UnstableInstructionTree(
+                            "the first read resolved no tree but the second resolved one".into(),
+                        ))
+                    }
+                }
+            }
+            faktor_instructions::LoadedInstructions::Loaded(first) => {
+                let faktor_instructions::LoadedInstructions::Loaded(second) = read(None)? else {
+                    return Err(InstructionBasisError::UnstableInstructionTree(
+                        "the first read resolved a tree but the second resolved none".into(),
+                    ));
+                };
+                if first.epoch() != second.epoch() {
+                    return Err(InstructionBasisError::UnstableInstructionTree(format!(
+                        "the rule-tree epoch moved from {} to {} between the two reads of one basis",
+                        first.epoch(),
+                        second.epoch()
+                    )));
+                }
+                Ok(InstructionBasis::Resolved {
+                    epoch: first.epoch().as_u64(),
+                })
+            }
+        }
     }
 
     /// The canonical proof basis of one orchestrated root verification: the
@@ -4314,16 +4393,16 @@ impl TaskExecutor {
         )
         .await;
         // The CURRENT resolved instruction generation (the epoch IS the
-        // resolved rule-tree digest); a workspace without a durable root or
-        // an unreadable tree is an honest None, never a guessed epoch.
-        let instruction_epoch = handle.row().ok().and_then(|row| {
-            self.agent
-                .deps()
-                .instructions_resolver
-                .resolve(row.workspace_id.raw(), None)
-                .ok()
-                .and_then(|loaded| loaded.epoch().map(|epoch| epoch.as_u64()))
-        });
+        // resolved rule-tree digest). FIX (A): the basis is FAIL-CLOSED —
+        // a store failure, a corrupt workspace relation, an unreadable rule
+        // file, an unstable tree or a resolver error REFUSES the proof
+        // (creation AND reuse); only a stable read that genuinely resolves
+        // no tree yields the epoch-less NoApplicableInstructions basis.
+        let instruction_basis = self.resolve_instruction_basis(handle).map_err(|e| {
+            ExecError::Internal(format!(
+                "root verification proof basis refused: instruction basis: {e}"
+            ))
+        })?;
         let reviewer_digest = reviewer_proof_basis_digest(run);
         let evidence_digests = criterion_pass_evidence_digests(prepared, run);
         Ok(ProofBasis {
@@ -4337,7 +4416,7 @@ impl TaskExecutor {
             verification_impl_version: faktor_agent::runtime::VERIFICATION_IMPL_VERSION.to_string(),
             tool_versions: report.tools,
             env_projection: report.env_projection,
-            instruction_epoch,
+            instruction_epoch: instruction_basis.epoch(),
             criteria,
             reviewer_digest,
             evidence_digests,
@@ -5530,6 +5609,132 @@ fn verification_status_tag(status: VerificationStatus) -> &'static str {
     }
 }
 
+/// The domain separator of the canonical proof-basis digest (version 3):
+/// the digest can never collide with an incidental serde/JCS encoding of the
+/// same value, and the version is folded in so a future encoding change
+/// invalidates every older digest instead of silently reusing it.
+pub const PROOF_BASIS_DIGEST_DOMAIN: &[u8] = b"FAKTOR_PROOF_BASIS\0";
+/// The canonical proof-basis encoding version.
+pub const PROOF_BASIS_DIGEST_VERSION: u64 = 3;
+
+/// The canonical, TOTAL proof-basis payload: `FAKTOR_PROOF_BASIS\0` + the
+/// version + every basis field in a fixed order with length-prefixed legs.
+/// Total by construction (no serde, no `Result`, no `unwrap_or_default`):
+/// every `String`/`u64`/`Vec` has exactly one encoding, so a serialization
+/// failure is impossible and the digest is stable under value-level equality.
+pub fn canonical_proof_basis_payload(basis: &ProofBasis) -> Vec<u8> {
+    fn put_u64(out: &mut Vec<u8>, value: u64) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    fn put_str(out: &mut Vec<u8>, value: &str) {
+        put_u64(out, value.len() as u64);
+        out.extend_from_slice(value.as_bytes());
+    }
+    fn put_opt_str(out: &mut Vec<u8>, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                out.push(1);
+                put_str(out, value);
+            }
+            None => out.push(0),
+        }
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(PROOF_BASIS_DIGEST_DOMAIN);
+    put_u64(&mut out, PROOF_BASIS_DIGEST_VERSION);
+    put_u64(&mut out, basis.task_id);
+    put_u64(&mut out, basis.task_revision);
+    put_str(&mut out, &basis.task_contract_digest);
+    put_str(&mut out, &basis.candidate_snapshot);
+    put_str(&mut out, &basis.integration_sources_digest);
+    put_str(&mut out, &basis.changed_files_digest);
+    put_u64(&mut out, basis.checks.len() as u64);
+    for check in &basis.checks {
+        put_str(&mut out, &check.check_id);
+        put_str(&mut out, &check.program);
+        put_u64(&mut out, check.args.len() as u64);
+        for arg in &check.args {
+            put_str(&mut out, arg);
+        }
+    }
+    put_str(&mut out, &basis.verification_impl_version);
+    put_u64(&mut out, basis.tool_versions.len() as u64);
+    for tool in &basis.tool_versions {
+        put_str(&mut out, &tool.tool);
+        put_str(&mut out, &tool.version);
+    }
+    put_u64(&mut out, basis.env_projection.len() as u64);
+    for (key, value) in &basis.env_projection {
+        put_str(&mut out, key);
+        put_str(&mut out, value);
+    }
+    match basis.instruction_epoch {
+        Some(epoch) => {
+            out.push(1);
+            put_u64(&mut out, epoch);
+        }
+        None => out.push(0),
+    }
+    put_u64(&mut out, basis.criteria.len() as u64);
+    for criterion in &basis.criteria {
+        put_str(&mut out, &criterion.criterion_id);
+        put_opt_str(&mut out, criterion.binding_digest.as_deref());
+    }
+    put_opt_str(&mut out, basis.reviewer_digest.as_deref());
+    put_u64(&mut out, basis.evidence_digests.len() as u64);
+    for digest in &basis.evidence_digests {
+        put_str(&mut out, digest);
+    }
+    out
+}
+
+/// The canonical domain/version-separated proof-basis digest — the ONLY
+/// digest the orchestrator writes into a record fingerprint or compares for
+/// reuse. A fingerprint carrying the retired serde-bytes digest (or no
+/// digest at all) is never reusable.
+pub fn canonical_proof_basis_digest(basis: &ProofBasis) -> String {
+    let payload = canonical_proof_basis_payload(basis);
+    format!("blake3:{}", blake3::hash(&payload).to_hex())
+}
+
+/// The canonical-basis reuse consult: a candidate record is reusable ONLY
+/// when its persisted proof-basis digest equals the canonical digest of the
+/// current basis. Refusals carry the recorded vs current digests, and an
+/// absent/legacy digest is an honest unknown — never a license.
+fn canonical_proof_reuse(
+    handle: &faktor_session::SessionHandle,
+    record_id: VerificationRecordId,
+    basis_digest: &str,
+) -> Result<ProofReuse, ExecError> {
+    let Some(record) = handle
+        .get_verification_record(record_id)
+        .map_err(|e| ExecError::Internal(format!("proof reuse record read: {e}")))?
+    else {
+        return Ok(ProofReuse::Refused {
+            reason: format!("record {record_id} does not exist"),
+        });
+    };
+    let Some(recorded) = record
+        .environment_fingerprint
+        .as_ref()
+        .and_then(|f| f.proof_basis_digest.as_deref())
+    else {
+        return Ok(ProofReuse::Refused {
+            reason: format!("record {record_id} carries no proof basis; it is never reusable"),
+        });
+    };
+    if recorded == basis_digest {
+        Ok(ProofReuse::Allowed)
+    } else {
+        Ok(ProofReuse::Refused {
+            reason: format!(
+                "record {record_id} is bound to proof basis {recorded}, but the current \
+                 canonical basis is {basis_digest}; reuse requires an identical basis"
+            ),
+        })
+    }
+}
+
 /// The bounded v20 environment fingerprint of one orchestrated ROOT record:
 /// the proof-basis digest (the reuse key), the task-contract digest and the
 /// check-basis digest, all deterministic for identical inputs. Empty tool/
@@ -5560,7 +5765,7 @@ fn root_verification_fingerprint(
         task_contract_hash: stable_list_digest(&task.acceptance_criteria),
         check_argv_cwd_env_hash: stable_list_digest(&check_basis),
         verification_impl_version: faktor_agent::runtime::VERIFICATION_IMPL_VERSION.to_string(),
-        proof_basis_digest: Some(basis.digest()),
+        proof_basis_digest: Some(canonical_proof_basis_digest(basis)),
     })
 }
 
