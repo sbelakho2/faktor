@@ -877,13 +877,24 @@ pub(crate) async fn native_permission_reply(
         "deny" => faktor_core::capability::PermissionDecision::Deny,
         other => return wire_status(malformed_body(&format!("invalid decision {other:?}"))),
     };
-    if !state.deps.permissions.resolve(pid, decision) {
-        return wire_status(ApiError {
-            code: "conflict",
-            message: format!("permission {pid} unknown or already resolved"),
-            http_status: 409,
-            retryable: false,
-        });
+    match state.deps.permissions.resolve(pid, decision) {
+        Ok(true) => {}
+        Ok(false) => {
+            return wire_status(ApiError {
+                code: "conflict",
+                message: format!("permission {pid} unknown or already resolved"),
+                http_status: 409,
+                retryable: false,
+            })
+        }
+        Err(poisoned) => {
+            return wire_status(ApiError {
+                code: "authority_poisoned",
+                message: poisoned.to_string(),
+                http_status: 503,
+                retryable: true,
+            })
+        }
     }
     Json(serde_json::json!({ "ok": true })).into_response()
 }

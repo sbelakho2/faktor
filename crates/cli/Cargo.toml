@@ -42,6 +42,8 @@ faktor-instructions.workspace = true
 faktor-router.workspace = true
 faktor-security.workspace = true
 faktor-semantic.workspace = true
+faktor-cloud.workspace = true
+faktor-scm.workspace = true
 futures.workspace = true
 clap = { version = "4", features = ["derive"] }
 tokio.workspace = true

@@ -108,6 +108,14 @@ pub struct ServerDeps {
     /// false after serve() setup, so `GET /native/ready` keeps answering
     /// 503 `{"ready":false}`. Production callers never set it.
     pub simulate_not_ready: bool,
+    /// The control-plane service (identity/organizations/RBAC). `None` = the
+    /// `[cloud]` section is disabled (the default): every control-plane
+    /// route answers a typed 409 `cloud_disabled` and nothing else in the
+    /// daemon changes.
+    pub control_plane: Option<Arc<faktor_cloud::ControlPlane>>,
+    /// The durable SCM store serving `/native/repositories`. `None` = no
+    /// SCM state is wired (the route answers a typed 409 `scm_disabled`).
+    pub scm: Option<Arc<dyn faktor_scm::ScmStore>>,
 }
 
 impl ServerDeps {
@@ -176,6 +184,8 @@ impl ServerDeps {
             semantic: None,
             chunk_rx: None,
             simulate_not_ready: false,
+            control_plane: None,
+            scm: None,
         }
     }
 
@@ -207,6 +217,19 @@ impl ServerDeps {
         registry: Arc<faktor_semantic::registry::SemanticProviderRegistry>,
     ) -> Self {
         self.semantic = Some(registry);
+        self
+    }
+
+    /// Wire the control-plane service (the `[cloud]` section). Additive:
+    /// without it every control-plane route answers 409 `cloud_disabled`.
+    pub fn with_control_plane(mut self, control_plane: Arc<faktor_cloud::ControlPlane>) -> Self {
+        self.control_plane = Some(control_plane);
+        self
+    }
+
+    /// Wire the durable SCM store serving `/native/repositories`.
+    pub fn with_scm_store(mut self, store: Arc<dyn faktor_scm::ScmStore>) -> Self {
+        self.scm = Some(store);
         self
     }
 
@@ -446,6 +469,29 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
             "/native/semantic/capabilities",
             get(native_semantic_capabilities),
         )
+        // Control-plane surface (additive; disabled by default): identity,
+        // organizations, members, synced repositories and approvals. Strict
+        // DTOs, cursor pagination, idempotency keys and tenant isolation are
+        // enforced in `native::control_plane`; with no control plane wired
+        // every route answers a typed 409 `cloud_disabled`.
+        .route("/native/identity", get(native_identity))
+        .route(
+            "/native/orgs",
+            get(native_orgs_list).post(native_orgs_create),
+        )
+        .route(
+            "/native/orgs/{id}/members",
+            get(native_org_members_list).post(native_org_members_invite),
+        )
+        .route("/native/repositories", get(native_repositories))
+        .route(
+            "/native/approvals",
+            get(native_approvals_list).post(native_approvals_create),
+        )
+        .route(
+            "/native/approvals/{id}/decide",
+            post(native_approvals_decide),
+        )
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .with_state(AppState {
             deps: Arc::new(deps),
@@ -498,6 +544,10 @@ pub(crate) struct AppState {
 }
 
 // ------------------------------------------------------------------ handlers
+
+#[cfg(test)]
+#[path = "control_plane_tests.rs"]
+mod control_plane_tests;
 
 #[cfg(test)]
 mod tests {
@@ -653,11 +703,11 @@ mod tests {
         (deps, snapshots, fs)
     }
 
-    fn test_deps(root: &std::path::Path) -> ServerDeps {
+    pub(crate) fn test_deps(root: &std::path::Path) -> ServerDeps {
         test_deps_with(root, vec![])
     }
 
-    fn test_deps_with(
+    pub(crate) fn test_deps_with(
         root: &std::path::Path,
         extra_providers: Vec<Arc<dyn faktor_provider::Provider>>,
     ) -> ServerDeps {
@@ -729,6 +779,8 @@ mod tests {
             simulate_not_ready: false,
             evidence: None,
             semantic: None,
+            control_plane: None,
+            scm: None,
         }
     }
 
@@ -1128,7 +1180,9 @@ mod tests {
             for _ in 0..100 {
                 if let Some(pid) = permissions.pending_ids().first().copied() {
                     assert!(
-                        permissions.resolve(pid, PermissionDecision::Allow),
+                        permissions
+                            .resolve(pid, PermissionDecision::Allow)
+                            .expect("permission authority is not poisoned"),
                         "the permission hop resolves once"
                     );
                     return;
@@ -2962,6 +3016,8 @@ mod tests {
             simulate_not_ready: false,
             evidence: None,
             semantic: None,
+            control_plane: None,
+            scm: None,
         }
     }
 
@@ -4782,6 +4838,8 @@ mod tests {
             simulate_not_ready: false,
             evidence: None,
             semantic: None,
+            control_plane: None,
+            scm: None,
         }
     }
 
@@ -5981,6 +6039,8 @@ mod tests {
             simulate_not_ready: false,
             evidence: None,
             semantic: None,
+            control_plane: None,
+            scm: None,
         };
         NativeTaskRig {
             deps,

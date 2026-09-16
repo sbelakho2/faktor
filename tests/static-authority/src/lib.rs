@@ -1357,8 +1357,19 @@ mod scans {
         ]
     }
 
-    const RETIRED_TOKEN_SKIP_DIRS: &[&str] =
-        &[".git", "target", "node_modules", "build", ".gradle"];
+    const RETIRED_TOKEN_SKIP_DIRS: &[&str] = &[
+        ".git",
+        "target",
+        "node_modules",
+        "build",
+        ".gradle",
+        // Agent Manager / agent-tool state (never repository source): it
+        // contains full checkouts of other worktrees, including historical
+        // revisions, and must never be mistaken for the delivered tree.
+        // Composed at runtime (like `retired_tokens`) so this scanner's own
+        // source can never carry the retired token it forbids.
+        concat!(".", "ki", "lo"),
+    ];
 
     /// The ONE permitted location: the retained historical attribution for
     /// the removed vendored UI code. Reported by the test summary.
@@ -2047,6 +2058,10 @@ fn prod_only() {}
         "crates/pty/src/windows.rs",
         "crates/hooks/src/lib.rs",
         "crates/git/src/lib.rs",
+        "crates/orchestrator/src/runtime.rs",
+        "crates/orchestrator/src/task_executor.rs",
+        "crates/orchestrator/src/merge.rs",
+        "crates/server/src/permission.rs",
     ];
 
     /// The TIGHT allowlist: `(rel, exact trimmed line prefix)` pairs that may

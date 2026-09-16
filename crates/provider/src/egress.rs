@@ -260,6 +260,133 @@ pub async fn execute_post_json_with_extras(
     transport.execute(request).await
 }
 
+/// Hard bound on one materialized [`RawResponse`] body: an adapter that
+/// needs a verb/header shape beyond the JSON helpers still must not buffer
+/// an unbounded remote body in RAM (bounded everything). The read aborts
+/// with a typed [`EgressError::ResponseTooLarge`] at the bound.
+pub const MAX_RAW_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// One neutral request description for adapters (e.g. the SCM GitHub-App
+/// adapter) that need verbs, headers and bodies beyond the JSON POST
+/// helpers. Building and the raw execution happen ONLY here, so a
+/// non-provider adapter never names a `reqwest` type and every send still
+/// passes the request-time destination gate of the transport it is handed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+}
+
+impl RawRequest {
+    pub fn new(method: &str, url: impl Into<String>) -> Self {
+        Self {
+            method: method.to_string(),
+            url: url.into(),
+            headers: Vec::new(),
+            body: None,
+        }
+    }
+
+    /// Add one header (invalid names/values are a typed build refusal when
+    /// the request executes).
+    pub fn header(mut self, name: &str, value: impl Into<String>) -> Self {
+        self.headers.push((name.to_string(), value.into()));
+        self
+    }
+
+    /// Attach an application/json body.
+    pub fn json_body(mut self, body: &serde_json::Value) -> Self {
+        self.headers
+            .push(("content-type".to_string(), "application/json".to_string()));
+        self.body = Some(serde_json::to_vec(body).unwrap_or_default());
+        self
+    }
+
+    /// Attach raw bytes.
+    pub fn bytes_body(mut self, body: Vec<u8>) -> Self {
+        self.body = Some(body);
+        self
+    }
+}
+
+/// One materialized response: status, headers (lossy-ASCII names/values
+/// only, others dropped), bounded body bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl RawResponse {
+    /// The first header value with this (case-insensitive) name.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The body decoded as UTF-8 (lossy) — for error excerpts only.
+    pub fn body_text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+/// Execute one [`RawRequest`] through the injected transport and materialize
+/// the response under [`MAX_RAW_RESPONSE_BYTES`]. Adapter code never touches
+/// `reqwest` directly; this is the ONLY execution site for
+/// non-JSON-POST shapes.
+pub async fn execute_raw(
+    transport: &dyn HttpTransport,
+    request: RawRequest,
+) -> Result<RawResponse, EgressError> {
+    let method = Method::from_bytes(request.method.as_bytes())
+        .map_err(|e| EgressError::Build(format!("invalid method {:?}: {e}", request.method)))?;
+    let url = Url::parse(&request.url).map_err(|e| EgressError::UnparseableUrl(e.to_string()))?;
+    let mut built = Request::new(method, url);
+    for (name, value) in &request.headers {
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| EgressError::Build(format!("invalid header name: {e}")))?;
+        let value = HeaderValue::from_str(value)
+            .map_err(|e| EgressError::Build(format!("invalid header value: {e}")))?;
+        built.headers_mut().insert(name, value);
+    }
+    if let Some(body) = request.body {
+        *built.body_mut() = Some(Body::from(body));
+    }
+    let response = transport.execute(built).await?;
+    let status = response.status().as_u16();
+    let headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect();
+    let mut stream = response.bytes_stream();
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        let chunk = chunk.map_err(|e| EgressError::Transport(e.to_string()))?;
+        if body.len().saturating_add(chunk.len()) > MAX_RAW_RESPONSE_BYTES {
+            return Err(EgressError::ResponseTooLarge {
+                limit_bytes: MAX_RAW_RESPONSE_BYTES as u64,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(RawResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
 /// Test-seam transport: never touches the network. Returns a canned
 /// response body (status + text) for every executed request and records the
 /// executed (method, url) pairs, so an adapter's parser can be driven
@@ -360,6 +487,10 @@ pub enum EgressError {
     /// The transport itself failed (connect/io); the request was allowed
     /// by the policy.
     Transport(String),
+    /// A materialized response exceeded [`MAX_RAW_RESPONSE_BYTES`]; the
+    /// adapter refuses to buffer it (bounded everything), and the partial
+    /// body is discarded rather than parsed.
+    ResponseTooLarge { limit_bytes: u64 },
 }
 
 impl std::fmt::Display for EgressError {
@@ -400,6 +531,10 @@ impl std::fmt::Display for EgressError {
             EgressError::UnparseableUrl(s) => write!(f, "not a parseable http(s) URL: {s}"),
             EgressError::Build(s) => write!(f, "request build failed: {s}"),
             EgressError::Transport(s) => write!(f, "transport error: {s}"),
+            EgressError::ResponseTooLarge { limit_bytes } => write!(
+                f,
+                "response body exceeds the adapter materialization bound of {limit_bytes} bytes"
+            ),
         }
     }
 }

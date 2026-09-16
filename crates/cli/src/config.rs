@@ -47,6 +47,11 @@ pub struct Config {
     /// Absent = no embedder: retrieval stays lexical/symbol-only and
     /// degrades honestly, never a fabricated vector.
     pub embeddings: Option<EmbeddingCfg>,
+    /// The additive `[cloud]` section: the commercial control plane
+    /// (identity/org/RBAC) and the durable SCM store. Disabled by default;
+    /// while disabled the local daemon is byte-identical to the pre-cloud
+    /// daemon and creates no database file.
+    pub cloud: CloudCfg,
 }
 
 /// The additive `[completion]` section (P2 follow-up): how a contracted
@@ -395,6 +400,160 @@ impl<'de> serde::Deserialize<'de> for EfficiencyCfg {
     }
 }
 
+/// The additive `[cloud]` section: the commercial control plane (identity,
+/// organizations, RBAC, synced SCM repositories).
+///
+/// Strict and additive:
+///
+/// - `enabled` (default `false`): when false — the default and the ONLY
+///   value for every pre-existing config — the daemon builds NO control
+///   plane and NO SCM store, creates no database file, and every
+///   `/native/identity`, `/native/orgs`, `/native/repositories` and
+///   `/native/approvals` request answers a typed 409 `cloud_disabled`.
+///   The local daemon is byte-identical to the pre-cloud daemon;
+/// - `database` / `scm_database`: optional simple FILE NAMES (relative to
+///   the daemon data dir; defaults `control-plane.db` and `scm.db`).
+///   Absolute paths, separators and `..` traversal are refused: the
+///   control-plane state lives inside the daemon's own data directory;
+/// - unknown keys, duplicates, non-object shapes and wrong value types are
+///   parse errors.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default)]
+pub struct CloudCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub database: Option<String>,
+    #[serde(default)]
+    pub scm_database: Option<String>,
+}
+
+/// The `[cloud]` keys, in stable order (unknown-field errors list them).
+pub const CLOUD_FIELDS: &[&str] = &["enabled", "database", "scm_database"];
+
+/// The default control-plane database file name.
+pub const DEFAULT_CLOUD_DATABASE: &str = "control-plane.db";
+/// The default SCM database file name.
+pub const DEFAULT_SCM_DATABASE: &str = "scm.db";
+/// Bound on one configured database file name.
+pub const MAX_CLOUD_DATABASE_BYTES: usize = 128;
+
+impl<'de> serde::Deserialize<'de> for CloudCfg {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error as _, MapAccess, Visitor};
+
+        struct SectionVisitor;
+
+        impl<'de> Visitor<'de> for SectionVisitor {
+            type Value = CloudCfg;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("the [cloud] section as a JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<CloudCfg, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut out = CloudCfg::default();
+                let mut seen: u8 = 0;
+                while let Some(key) = map.next_key::<String>()? {
+                    let (bit, name) = match key.as_str() {
+                        "enabled" => (1u8, "enabled"),
+                        "database" => (2, "database"),
+                        "scm_database" => (4, "scm_database"),
+                        other => return Err(A::Error::unknown_field(other, CLOUD_FIELDS)),
+                    };
+                    if seen & bit != 0 {
+                        return Err(A::Error::duplicate_field(name));
+                    }
+                    seen |= bit;
+                    match bit {
+                        1 => out.enabled = map.next_value::<bool>()?,
+                        2 => out.database = map.next_value::<Option<String>>()?,
+                        _ => out.scm_database = map.next_value::<Option<String>>()?,
+                    }
+                }
+                Ok(out)
+            }
+        }
+
+        de.deserialize_map(SectionVisitor)
+    }
+}
+
+impl CloudCfg {
+    /// Validate one configured database file name: a bounded simple file
+    /// name (no directory separators, no `..`, not absolute, no control
+    /// characters). The control-plane state never escapes the data dir.
+    pub fn validate_database_name(kind: &str, name: &str) -> Result<(), String> {
+        if name.is_empty() || name.len() > MAX_CLOUD_DATABASE_BYTES {
+            return Err(format!(
+                "cloud: {kind} must be 1..={MAX_CLOUD_DATABASE_BYTES} bytes"
+            ));
+        }
+        if name.contains('/') || name.contains('\\') || name.contains("..") || name.contains(':') {
+            return Err(format!(
+                "cloud: {kind} {name:?} must be a plain file name (no paths, no traversal)"
+            ));
+        }
+        if name.bytes().any(|b| b.is_ascii_control()) {
+            return Err(format!(
+                "cloud: {kind} {name:?} contains control characters"
+            ));
+        }
+        if name == "." || name == ".." {
+            return Err(format!("cloud: {kind} {name:?} is not a file name"));
+        }
+        Ok(())
+    }
+
+    /// Validate the section (called by [`Config::validate`] on both load
+    /// paths). A disabled section validates nothing beyond its shape.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(database) = &self.database {
+            Self::validate_database_name("database", database)?;
+        }
+        if let Some(scm_database) = &self.scm_database {
+            Self::validate_database_name("scm_database", scm_database)?;
+        }
+        Ok(())
+    }
+
+    /// The resolved control-plane database path under `data_dir` (`None`
+    /// when the section is disabled — the daemon then never creates it).
+    pub fn control_plane_path(
+        &self,
+        data_dir: &Path,
+    ) -> Result<Option<std::path::PathBuf>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        self.validate()?;
+        let name = self
+            .database
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CLOUD_DATABASE.to_string());
+        Ok(Some(data_dir.join(name)))
+    }
+
+    /// The resolved SCM database path under `data_dir` (`None` when the
+    /// section is disabled).
+    pub fn scm_path(&self, data_dir: &Path) -> Result<Option<std::path::PathBuf>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        self.validate()?;
+        let name = self
+            .scm_database
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SCM_DATABASE.to_string());
+        Ok(Some(data_dir.join(name)))
+    }
+}
+
 /// The additive `[embeddings]` section: ONE selected semantic embedding
 /// provider. Strict by construction (map-only parsing: unknown keys,
 /// duplicate keys, non-object shapes and wrong value types are parse
@@ -622,6 +781,8 @@ impl<'de> serde::Deserialize<'de> for Config {
             efficiency: EfficiencyCfg,
             #[serde(default)]
             embeddings: Option<EmbeddingCfg>,
+            #[serde(default)]
+            cloud: CloudCfg,
         }
         let file = File::deserialize(de)?;
         if file.config_version != 1 {
@@ -644,6 +805,7 @@ impl<'de> serde::Deserialize<'de> for Config {
             completion: file.completion,
             efficiency: file.efficiency,
             embeddings: file.embeddings,
+            cloud: file.cloud,
         })
     }
 }
@@ -679,6 +841,7 @@ impl Default for Config {
             completion: CompletionCfg::default(),
             efficiency: EfficiencyCfg::production_defaults(),
             embeddings: None,
+            cloud: CloudCfg::default(),
         }
     }
 }
@@ -1351,6 +1514,7 @@ impl Config {
         if let Some(embeddings) = &self.embeddings {
             embeddings.validate()?;
         }
+        self.cloud.validate()?;
         Ok(())
     }
 
@@ -3031,5 +3195,104 @@ mod completion_cfg_tests {
             .unwrap();
             assert!(cfg.completion.steps_config().is_err(), "{name}");
         }
+    }
+
+    /// The additive `[cloud]` section: disabled by default, byte-identical
+    /// to an absent section while disabled, strictly parsed, and its
+    /// databases resolve INSIDE the data dir with options off-by-default.
+    #[test]
+    fn cloud_section_is_disabled_by_default_and_strictly_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloud.json");
+
+        // Absent section == explicit disabled section: same resolved
+        // databases (none) and the same serialized config.
+        let absent = Config::default();
+        assert!(!absent.cloud.enabled);
+        assert_eq!(absent.cloud.control_plane_path(dir.path()).unwrap(), None);
+        assert_eq!(absent.cloud.scm_path(dir.path()).unwrap(), None);
+        std::fs::write(&path, r#"{"model": "m"}"#).unwrap();
+        let parsed_absent = Config::load_strict(&path).unwrap();
+        std::fs::write(&path, r#"{"model": "m", "cloud": {"enabled": false}}"#).unwrap();
+        let parsed_disabled = Config::load_strict(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&parsed_absent).unwrap(),
+            serde_json::to_value(&parsed_disabled).unwrap(),
+            "a disabled [cloud] section must serialize exactly like an absent one"
+        );
+        assert_eq!(
+            parsed_disabled
+                .cloud
+                .control_plane_path(dir.path())
+                .unwrap(),
+            None
+        );
+        assert_eq!(parsed_disabled.cloud.scm_path(dir.path()).unwrap(), None);
+
+        // Enabled: the default file names resolve under the data dir.
+        std::fs::write(&path, r#"{"cloud": {"enabled": true}}"#).unwrap();
+        let enabled = Config::load_strict(&path).unwrap();
+        assert_eq!(
+            enabled.cloud.control_plane_path(dir.path()).unwrap(),
+            Some(dir.path().join("control-plane.db"))
+        );
+        assert_eq!(
+            enabled.cloud.scm_path(dir.path()).unwrap(),
+            Some(dir.path().join("scm.db"))
+        );
+        // Explicit simple file names resolve too.
+        std::fs::write(
+            &path,
+            r#"{"cloud": {"enabled": true, "database": "cp.db", "scm_database": "repos.db"}}"#,
+        )
+        .unwrap();
+        let named = Config::load_strict(&path).unwrap();
+        assert_eq!(
+            named.cloud.control_plane_path(dir.path()).unwrap(),
+            Some(dir.path().join("cp.db"))
+        );
+        assert_eq!(
+            named.cloud.scm_path(dir.path()).unwrap(),
+            Some(dir.path().join("repos.db"))
+        );
+
+        // Strict parsing: unknown/duplicate keys, wrong types, positional
+        // arrays and hostile paths are refused by BOTH load paths.
+        for bad in [
+            r#"{"cloud": {"enabled": "yes"}}"#,
+            r#"{"cloud": {"enabled": true, "bogus": 1}}"#,
+            r#"{"cloud": {"enabled": true, "enabled": false}}"#,
+            r#"{"cloud": {"database": 1}}"#,
+            r#"{"cloud": true}"#,
+            r#"{"cloud": ["enabled"]}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(
+                Config::load(&path).is_err(),
+                "hostile [cloud] must fail: {bad}"
+            );
+            assert!(Config::load_strict(&path).is_err(), "{bad}");
+        }
+        for hostile in [
+            r#"{"cloud": {"enabled": true, "database": "../escape.db"}}"#,
+            r#"{"cloud": {"enabled": true, "database": "/etc/passwd"}}"#,
+            r#"{"cloud": {"enabled": true, "database": "sub/dir.db"}}"#,
+            r#"{"cloud": {"enabled": true, "database": "a\u{5c}b"}}"#,
+            r#"{"cloud": {"enabled": true, "scm_database": ".."}}"#,
+        ] {
+            std::fs::write(&path, hostile).unwrap();
+            assert!(
+                Config::load_strict(&path).is_err(),
+                "hostile cloud path must fail: {hostile}"
+            );
+        }
+        // A disabled section with a hostile name is still refused (the file
+        // never says two different things).
+        std::fs::write(
+            &path,
+            r#"{"cloud": {"enabled": false, "database": "../x"}}"#,
+        )
+        .unwrap();
+        assert!(Config::load_strict(&path).is_err());
     }
 }

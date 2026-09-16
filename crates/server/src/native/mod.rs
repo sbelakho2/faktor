@@ -19,6 +19,9 @@ use crate::api::{AppState, ServerDeps};
 pub(crate) mod agents;
 pub(crate) mod attachment;
 pub(crate) mod board;
+/// The control-plane surface (identity/orgs/members/repositories/approvals;
+/// absent unless the `[cloud]` section is enabled).
+pub(crate) mod control_plane;
 pub(crate) mod evidence;
 pub(crate) mod models;
 /// The ONE product execution entry for ordinary prompts + task starts
@@ -37,6 +40,7 @@ pub(crate) mod verification;
 pub(crate) use agents::*;
 pub(crate) use attachment::*;
 pub(crate) use board::*;
+pub(crate) use control_plane::*;
 pub(crate) use evidence::*;
 pub(crate) use models::*;
 pub use prompt::*;

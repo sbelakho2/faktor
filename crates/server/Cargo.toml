@@ -21,6 +21,8 @@ faktor-fs.workspace = true
 faktor-snapshot.workspace = true
 faktor-store.workspace = true
 faktor-cas.workspace = true
+faktor-cloud.workspace = true
+faktor-scm.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 tokio.workspace = true
 tower.workspace = true

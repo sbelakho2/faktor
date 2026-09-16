@@ -8530,3 +8530,46 @@ fn canonical_proof_basis_golden_digest_vector() {
         "blake3:e30343f28fac5f34f8ba7dd429650225493f2d07d94ef9d49d12ac87ed989c97"
     );
 }
+
+/// A poisoned completion-step POLICY lock refuses configuration with the
+/// typed [`PoisonedAuthority`] error — it never half-applies a new
+/// commit/push/PR policy — while the derived read paths recover (poison
+/// cleared, cached runner dropped) instead of wedging later runs.
+#[tokio::test]
+async fn poisoned_completion_step_policy_refuses_mutations_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(dir.path(), done_script());
+    let before = env.executor.completion_steps_config();
+    // Poison exactly as a panicking writer would.
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = env.executor.completion_steps.lock().unwrap();
+        panic!("poison the completion-step policy (test seam)");
+    }));
+    assert!(poisoned.is_err(), "the poisoner must unwind");
+    assert!(env.executor.completion_steps.is_poisoned());
+
+    // AUTHORITY/POLICY state => typed refusal: the policy mutation is
+    // refused and the stored config is untouched.
+    let mut changed = before.clone();
+    changed.remote = "hostile-origin".into();
+    let err = env
+        .executor
+        .configure_completion_steps(changed)
+        .expect_err("a poisoned policy lock must refuse the configuration typed");
+    assert!(
+        matches!(&err, ExecError::Internal(m)
+            if m.contains("poisoned authority") && m.contains("completion-step policy lock")),
+        "the refusal must name the poisoned authority: {err:?}"
+    );
+    assert_eq!(env.executor.completion_steps_config(), before);
+
+    // The recovery path clears the poison (planning reads keep serving) and
+    // a later configuration is applied whole.
+    assert!(!env.executor.completion_steps.is_poisoned());
+    let mut next = before.clone();
+    next.remote = "origin-2".into();
+    env.executor
+        .configure_completion_steps(next.clone())
+        .unwrap();
+    assert_eq!(env.executor.completion_steps_config(), next);
+}
