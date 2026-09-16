@@ -289,7 +289,14 @@ fn path_lock(path: &Path) -> Arc<Mutex<()>> {
     static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
     let key = path.to_path_buf();
-    let mut guard = registry.lock().expect("fs path-lock registry poisoned");
+    // Classified: the path-lock registry is a DERIVED cache. A poisoned
+    // guard is recovered with the poison flag cleared so one panicking
+    // writer can never wedge every later mutation; the on-disk CAS recheck
+    // below stays the authority.
+    let mut guard = registry.lock().unwrap_or_else(|poisoned| {
+        registry.clear_poison();
+        poisoned.into_inner()
+    });
     guard
         .entry(key)
         .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -322,7 +329,14 @@ pub fn atomic_replace_cas_guarded(
     verify: &dyn Fn(&Path) -> Result<(), Error>,
 ) -> Result<FileHash, Error> {
     let lock = path_lock(path);
-    let _guard = lock.lock().expect("fs path lock poisoned");
+    // Classified: the per-path lock is cooperative mutual exclusion over a
+    // DERIVED registry; a poisoned guard is recovered (poison cleared,
+    // reconciled) because the file state is re-verified from disk under the
+    // lock — the CAS recheck, never the lock, is the authority.
+    let _guard = lock.lock().unwrap_or_else(|poisoned| {
+        lock.clear_poison();
+        poisoned.into_inner()
+    });
     // Cheap rejection before staging anything.
     let quick = FileState::now(path)?;
     if !expected.satisfied_by(&quick) {
@@ -371,6 +385,27 @@ fn mismatch(path: &Path, expected: &FileState, actual: &FileState) -> Error {
 mod tests {
     use super::*;
     use faktor_core::error::ErrorKind;
+
+    #[test]
+    fn poisoned_path_lock_registry_is_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("locked.bin");
+        atomic_replace(&target, b"one").unwrap();
+        // Poison the per-path lock exactly like a panicking writer that held
+        // it mid-replace.
+        let lock = path_lock(&target);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock.lock().unwrap();
+            panic!("writer poisoned the path lock");
+        }));
+        assert!(lock.is_poisoned());
+        // Derived cache => recover (poison cleared): the same per-path lock
+        // keeps working and the CAS recheck stays the authority.
+        let expected = FileState::now(&target).unwrap();
+        atomic_replace_cas(&target, &expected, b"two").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"two");
+        assert!(!lock.is_poisoned());
+    }
 
     #[test]
     fn repeated_replaces_leave_no_temp_and_content_is_final() {

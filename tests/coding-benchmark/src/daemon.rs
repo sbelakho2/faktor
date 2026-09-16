@@ -1042,7 +1042,7 @@ pub fn write_config_file(data_dir: &Path, cfg: &DaemonBenchConfig) -> Result<Pat
         ProviderKind::Gateway => json!([{
             "kind": "gateway",
             "id": "bench",
-            "base_url": cfg.base_url.as_deref().unwrap_or("https://api.kilo.ai"),
+            "base_url": cfg.base_url.as_deref().unwrap_or("https://gateway.example.com"),
             "api_key_env": cfg.api_key_env,
         }]),
         ProviderKind::Ollama => json!([{

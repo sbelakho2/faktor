@@ -752,19 +752,19 @@ internal object ParityPath {
         if (!prop.isNullOrEmpty()) {
             val root = File(prop).absoluteFile
             assertTrue(
-                File(root, "ui/upstream.json").isFile,
-                "faktor.repo.root has no ui/upstream.json: $root"
+                File(root, "Cargo.toml").isFile && File(root, "crates").isDirectory,
+                "faktor.repo.root is not a Faktor repository root: $root"
             )
             return root
         }
         var dir: File? = File(".").absoluteFile
         var guard = 0
         while (dir != null && guard < 8) {
-            if (File(dir, "ui/upstream.json").isFile) return dir
+            if (File(dir, "Cargo.toml").isFile && File(dir, "crates").isDirectory) return dir
             dir = dir.parentFile
             guard++
         }
-        fail("cannot locate the repository root (ui/upstream.json); pass -Dfaktor.repo.root")
+        fail("cannot locate the repository root (Cargo.toml + crates/); pass -Dfaktor.repo.root")
     }
 
     fun headCommit(): String? {

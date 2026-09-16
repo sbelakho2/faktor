@@ -11,6 +11,18 @@ use faktor_core::error::{Error, ErrorKind};
 use faktor_core::id::WorkspaceId;
 use faktor_index::{Symbol, SymbolKind, WorkspaceIndex};
 
+/// Classified lock recovery for DERIVED state (caches, registries, rings,
+/// process/ownership projections): a poisoned guard is recovered with the
+/// poison flag cleared, so one panicking caller can never wedge later use.
+/// The durable authority (store/journal/OS process state) remains the
+/// source of truth; the recovered value is only ever a projection of it.
+fn recover_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
 const MAX_QUERY_BYTES: usize = 4096;
 const MAX_SNIPPET_CHARS: usize = 400;
 /// Exact-cosine retrieval over PERSISTED index vectors is bounded to this
@@ -87,7 +99,7 @@ impl SearchService {
             return vec![];
         }
         let needle_l = needle.to_lowercase();
-        let index = self.index.lock().unwrap();
+        let index = recover_lock(&self.index);
         let mut out = Vec::new();
         // Path substring matches.
         if let Some(files) = index_files(&index, ws) {
@@ -130,7 +142,7 @@ impl SearchService {
             return vec![];
         }
         let tokens = faktor_index::tokenize(query);
-        let index = self.index.lock().unwrap();
+        let index = recover_lock(&self.index);
         let mut scores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
         for token in tokens {
             for hit in index.files_for_token(ws, &token, limit * 4) {
@@ -163,7 +175,7 @@ impl SearchService {
         if self.check_query(name).is_err() {
             return vec![];
         }
-        let index = self.index.lock().unwrap();
+        let index = recover_lock(&self.index);
         let mut out = Vec::new();
         for (path, sym) in index.symbol_lookup(ws, name, limit) {
             out.push(Hit {
@@ -185,7 +197,7 @@ impl SearchService {
                 "no embedding provider configured",
             ));
         };
-        let index = self.index.lock().unwrap();
+        let index = recover_lock(&self.index);
         // Persisted-vector retrieval (index builds with a configured
         // embedding source persist chunk vectors keyed by content hash): the
         // QUERY is embedded, the corpus is served from the durable vectors —
@@ -539,6 +551,26 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    #[test]
+    fn poisoned_index_is_recovered_for_reads() {
+        let (idx, ws) = corpus();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let idx = idx.clone();
+            move || {
+                let _guard = idx.lock().unwrap();
+                panic!("holder poisoned the derived index");
+            }
+        }));
+        assert!(idx.is_poisoned());
+        // Derived cache => recover: reads reconcile against the durable
+        // index generations (the recovered guard is still served) and never
+        // panic the search path.
+        let svc = SearchService::new(idx.clone(), None);
+        let hits = svc.exact(ws, "parse", 5);
+        assert!(!hits.is_empty());
+        assert!(!idx.is_poisoned());
     }
 
     #[test]

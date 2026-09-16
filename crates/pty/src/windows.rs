@@ -64,7 +64,7 @@ use windows_sys::Win32::System::Threading::{
 
 use faktor_winjob::JobGuard;
 
-use crate::ring::Ring;
+use crate::ring::{lock_ring, Ring};
 use crate::validation::validate_spawn_config;
 use crate::win_common;
 use crate::PtyConfig;
@@ -766,24 +766,24 @@ impl Pty {
 
     /// Drain all currently available output.
     pub fn read_available(&self) -> Vec<u8> {
-        self.shared.0.lock().unwrap().drain()
+        lock_ring(&self.shared.0).drain()
     }
 
     /// Snapshot the current output WITHOUT draining.
     pub fn snapshot(&self) -> Vec<u8> {
-        self.shared.0.lock().unwrap().snapshot()
+        lock_ring(&self.shared.0).snapshot()
     }
 
     /// Total bytes ever read from the ConPTY output pipe.
     pub fn total_bytes(&self) -> u64 {
-        self.shared.0.lock().unwrap().total()
+        lock_ring(&self.shared.0).total()
     }
 
     /// Block until `needle` appears in the accumulated output or `timeout`
     /// elapses (test/consumer helper).
     pub fn wait_for_contains(&self, needle: &str, timeout: std::time::Duration) -> bool {
         let (ring, cv) = &*self.shared;
-        let mut guard = ring.lock().unwrap();
+        let mut guard = lock_ring(ring);
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let snap = guard.snapshot();
@@ -946,7 +946,7 @@ fn conpty_reader(
             break; // EOF: the pseudoconsole closed its write end
         }
         let (ring, cv) = &*shared;
-        ring.lock().unwrap().push(&buf[..n as usize]);
+        lock_ring(ring).push(&buf[..n as usize]);
         cv.notify_all();
     }
     unsafe {

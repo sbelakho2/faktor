@@ -1,25 +1,22 @@
 # Faktor
 
-**Same Kilo Code UX. A substantially better native engine.**
+**A native Rust engineering runtime with Faktor-owned IDE UIs.**
 
-Faktor replaces the Kilo Code engine (TypeScript/Bun) with a native Rust
-runtime. The v7.5.6 VS Code webview sources are vendored under `ui/` as a
-frontend source dependency (pinned at commit `fa02955` with a SHA-256
-manifest) and served through `apps/vscode`; the pinned closure plus the
-Faktor companion overlay are staged into the extension's `media/` and
-ship inside the VSIX. Wire/behavior parity with Kilo is not a release
-objective: the daemon speaks its own native protocol. The JetBrains 7.1.2
-sources are vendored at
-`compat/jetbrains-712/` (tag `jetbrains/v7.1.2`, commit
-`436ff09e649bd0866c84bd9f98933a74cad2d25c`, also SHA-256-pinned in
-`ui/upstream.json`); `apps/jetbrains` carries the real Faktor-owned
-frontend/backend panels (task tree, blockers, tournament, board, evidence,
-attachments) that talk to the native daemon.
+Faktor is an independent implementation: the daemon speaks the Faktor
+Native Protocol v1 and every UI surface is Faktor-authored. The VS Code
+extension ships its own hand-written chat panel
+(`apps/vscode/media/chat.js` + `apps/vscode/src/webview.ts`), and
+`apps/jetbrains` carries the Faktor-owned Swing frontend/backend panels
+(task tree, blockers, tournament, board, evidence, attachments). There is
+no vendored upstream UI source tree, no compatibility bundle and no
+foreign wire/behavior parity objective; the retired corpora and their
+manifest were removed (only the historical attribution under
+`ui/LICENSES/` remains).
 
 ```
-same UI
+Faktor-owned IDE panels
    ↓
-Faktor native protocol bridge
+Faktor Native Protocol v1
    ↓
 native Rust engineering runtime
    ↓
@@ -64,34 +61,29 @@ LLM used only where reasoning is actually needed
 ## Layout
 
 ```
-apps/        (real Faktor IDE panels: the VS Code extension host/chat/cockpit and the JetBrains split-mode frontend/backend — task tree, blockers, tournament, board, evidence; no upstream JetBrains sources)
+apps/        (Faktor-owned IDE panels: the VS Code extension host/chat/cockpit and the JetBrains split-mode frontend/backend — task tree, blockers, tournament, board, evidence)
 crates/      (the Rust engine workspace, incl. winjob/pty/agent/verify/sandbox/index/cas/snapshot)
-compat/      (pinned JetBrains 7.1.2 upstream corpus: jetbrains-712/)
 fixtures/    (protocol, providers, screenshots, repositories)
 tests/       (integration, soak, fault, visual, performance — adversarial only)
-ui/          (vendored frozen upstream UI: kilo-v756-webview/ + kilo-ui/, pinned manifest)
+ui/          (historical UI attribution only: LICENSES/ for the removed vendored code)
 ```
 
-## Frozen baselines
+## Faktor-owned UIs
 
-- **VS Code:** Kilo Code v7.5.6 UI (webview, CSS, images, message layout) —
-  byte-for-byte fixture; the upstream trees are vendored under `ui/` at
-  commit `fa02955` with a SHA-256 manifest (`ui/upstream.json`,
-  `scripts/verify-upstream.mjs`), and `apps/vscode/src/kilo-bridge.ts`
-  translates native state onto the frozen message ABI. `npm run
-  prepackage:vsix` stages the verified pinned closure plus the additive
-  Faktor companion overlay at `media/kilo-v756-webview/`, so the packaged
-  VSIX ships the vendored UI self-contained (hash-asserted at package
-  time); without a staged bundle the built-in Faktor chat panel is the
-  fallback. Later releases are never merged wholesale.
-- **JetBrains:** pinned upstream JetBrains 7.1.2 sources
-  (`compat/jetbrains-712/`, SHA-256 in `ui/upstream.json`) with the
-  Faktor-owned Swing frontend; the process manager launches the Faktor
-  binary.
+- **VS Code:** the extension ships ONE hand-written chat panel
+  (`apps/vscode/media/chat.js`, `chat.css`, `composer-state.js`, plus the
+  strict provider in `apps/vscode/src/webview.ts`): local-resource-only CSP,
+  a per-load script nonce, text-only rendering and bounded message
+  handling. The VSIX contains exactly the panel surface
+  (`apps/vscode/scripts/verify-vsix.mjs` allowlists `media/` + `out/`;
+  any extra artifact fails the package verification).
+- **JetBrains:** Faktor-owned Swing panels under `apps/jetbrains` (task
+  tree, blockers, tournament, board, evidence, attachments, settings,
+  history); the process manager launches the Faktor binary.
 - **Protocol:** the daemon speaks the Faktor Native Protocol v1
   (`docs/native-protocol.md`) — its own durable, cursor-paged HTTP surface.
-  The v7.5.6 wire-compatibility surface was retired by owner decision; no
-  Kilo wire/behavior parity is claimed.
+  The pre-cutover compatibility surface was retired by owner decision; no
+  foreign wire/behavior parity is claimed.
 
 ## Building
 
@@ -117,8 +109,7 @@ precedence over a root `.woodpecker.yml`, and this repository has none):
 - **`pr.yaml`** (`pull_request`, reduced lane set, **no named volumes at
   all**) — `linux` (fmt, clippy `-D warnings`, `check`/`test --workspace
   --all-features`, doctor), `static`, `docs`, `vscode` (npm build + offline
-  selftest + self-contained VSIX verify), `vscode-visual` (required chromium
-  render gate) with its diagnostics twin, `jetbrains-build` and
+  panel selftest + self-contained VSIX verify), `jetbrains-build` and
   `jetbrains-smoke`, then the aggregate `certificate`. A `storage-policy`
   step fails closed if the PR workflow ever declares volumes.
 - **`trusted.yaml`** (`push`/`tag`, darwin/windows on `push` to `main`) — the
@@ -162,13 +153,14 @@ verifying signed evidence file fails the run.
 
 ## Branding
 
-All user-visible metadata in this repository uses Faktor branding; legacy
-wordmark tokens survive only inside the vendored/pinned upstream trees and
-attribution prose (enforced by `scripts/branding-scan.sh`). The external
-GitHub repository name and description are not tracked in-tree; they were set
-with `gh repo rename` (name `faktor`) and
+All user-visible metadata in this repository uses Faktor branding; the
+retired product name survives only in the historical attribution under
+`ui/LICENSES/` (enforced by `scripts/branding-scan.sh` and the static
+source scan in `tests/static-authority`). The external GitHub repository
+name and description are not tracked in-tree; they were set with
+`gh repo rename` (name `faktor`) and
 `gh repo edit --description "Faktor — native Rust coding-agent runtime with
-Kilo-compatible IDE UX"`. In-tree package/manifest metadata remains the
+Faktor-owned IDE UIs"`. In-tree package/manifest metadata remains the
 authoritative surface and is scan-enforced.
 
 ## Status notes
@@ -200,8 +192,8 @@ authoritative surface and is scan-enforced.
 | OpenAI Responses family | IMPLEMENTED | native `OpenAiFamily::Responses` dispatch + `responses_body`/`responses_stream` (`crates/openai/src/lib.rs`), CLI `api=chat\|responses` (`crates/cli/src/config.rs` `OpenAiApi`) |
 | Windows containment (Job Objects + ConPTY) | IMPLEMENTED | `crates/winjob/src/lib.rs`, `crates/terminal/src/lib.rs` (`JobGuard`), `crates/pty/src/windows.rs` (spawn suspended → assign → resume; no taskkill guarantee) |
 | Certification evidence chain | IMPLEMENTED | `scripts/certification/evidence.mjs` (`faktor-cert-evidence/v1`, `verify-markers`), `scripts/certification/evidence.schema.json`, `scripts/certify-local.sh` (`evidence_gate`), v2 lane markers in `.woodpecker/untrusted/pr.yaml` |
-| JetBrains 7.1.2 upstream assets | VENDORED (provenance only, never a parity claim) | pinned source `compat/jetbrains-712/` + per-file SHA-256 manifest `ui/upstream.json` (`jetbrains_712`) |
+| VS Code Faktor panel | IMPLEMENTED | `apps/vscode/src/webview.ts` + `apps/vscode/media/chat.js` (`apps/vscode/scripts/selftest.mjs`, `apps/vscode/scripts/verify-vsix.mjs`) |
 | JetBrains behavioral parity | IMPLEMENTED (HEAD-bound executable matrix) | `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt` writes `target/certification/jetbrains-parity.json`: 11/11 rows against canned frames and the fake daemon |
 | JetBrains visual parity | IMPLEMENTED (offscreen render vs pinned baselines) | same matrix: 8 rendered panels against `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json` |
-| UI parity (`ui_parity`) | PARTIAL (derived in `target/certification/capabilities.json`) | JetBrains behavioral/visual + VS Code render axes; vendored files alone never flip it |
+| UI parity (`ui_parity`) | IMPLEMENTED (derived in `target/certification/capabilities.json`) | Faktor-owned VS Code panel + JetBrains behavioral/visual axes |
 | Repo rename (faktor) | DONE (external) | `gh repo rename`; in-tree branding was already Faktor and is unchanged |

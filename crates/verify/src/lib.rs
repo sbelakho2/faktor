@@ -45,8 +45,9 @@ pub mod inventory;
 pub mod review;
 
 pub use inventory::{
-    discover_repo_inventory, discover_repo_inventory_with_budget, InventoryBudget,
-    InventoryCompleteness, InventorySource, RepoInventory, MAX_INVENTORY_DEPTH,
+    discover_repo_inventory, discover_repo_inventory_with_budget, probe_manifest_text,
+    CandidateGeneration, InventoryBudget, InventoryCompleteness, InventorySource, ManifestProbe,
+    ManifestProbeRefusal, RepoInventory, MAX_INVENTORY_DEPTH,
 };
 
 /// Hard cap on the checks one derivation may return. The legacy

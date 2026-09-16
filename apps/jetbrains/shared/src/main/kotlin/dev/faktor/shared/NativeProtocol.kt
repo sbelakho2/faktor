@@ -1,8 +1,7 @@
 // Faktor Native Protocol v1 (docs/native-protocol.md) as plain Kotlin data
-// classes. This is the daemon's OWN HTTP/SSE surface, not the frozen
-// v7.5.6 wire contract in Protocol.kt: the IDE shells post typed native
-// requests and render native projections, never fabricated v7.5.6 frames
-// (docs/native-protocol.md, "UI-adaptation principle").
+// classes. This is the daemon's OWN HTTP/SSE surface: the IDE shells post
+// typed native requests and render native projections, never fabricated
+// compatibility frames (docs/native-protocol.md, "UI-adaptation principle").
 //
 // Zero external dependencies on purpose: a small JSON value model with a
 // recursive-descent reader and a writer, plus typed accessors that fail
@@ -673,7 +672,11 @@ data class NativeCandidateProof(
     val runBaseSnapshot: String?,
     val candidateSnapshot: String?,
     val sourcesDigest: String?,
-    val changedFilesDigest: String?
+    val changedFilesDigest: String?,
+    /** The published commit OID, when the daemon serves one. */
+    val publishedCommit: String? = null,
+    /** The remote PR head, when the daemon serves one. */
+    val remotePrHead: String? = null
 )
 
 data class NativeVerificationRecord(
@@ -692,7 +695,9 @@ data class NativeVerificationRecord(
     val sourceCount: Long? = null,
     val landedSnapshot: String? = null,
     val startedMs: Long? = null,
-    val completedMs: Long? = null
+    val completedMs: Long? = null,
+    /** The independent reviewer identity, when one judged the record. */
+    val reviewer: String? = null
 )
 
 data class NativeTaskVerification(
@@ -1358,7 +1363,9 @@ private fun parseCandidateProof(v: JsonView): NativeCandidateProof = NativeCandi
     runBaseSnapshot = v.optionalField("runBaseSnapshot")?.string(),
     candidateSnapshot = v.optionalField("candidateSnapshot")?.string(),
     sourcesDigest = v.optionalField("sourcesDigest")?.string(),
-    changedFilesDigest = v.optionalField("changedFilesDigest")?.string()
+    changedFilesDigest = v.optionalField("changedFilesDigest")?.string(),
+    publishedCommit = v.optionalField("publishedCommit")?.string(),
+    remotePrHead = v.optionalField("remotePrHead")?.string()
 )
 
 fun parseNativeTaskVerification(json: String): NativeTaskVerification {
@@ -1402,7 +1409,8 @@ fun parseNativeTaskVerification(json: String): NativeTaskVerification {
                 sourceCount = record.optionalField("sourceCount")?.long(),
                 landedSnapshot = record.optionalField("landedSnapshot")?.string(),
                 startedMs = record.optionalField("startedMs")?.long(),
-                completedMs = record.optionalField("completedMs")?.long()
+                completedMs = record.optionalField("completedMs")?.long(),
+                reviewer = record.optionalField("reviewer")?.string()
             )
         }
     )

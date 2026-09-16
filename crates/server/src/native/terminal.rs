@@ -214,6 +214,12 @@ pub(crate) async fn native_terminals(
                 "startTimeMs": view.start_time_ms,
                 "exitCode": view.exit_code,
                 "detail": view.detail,
+                "executionProfile": if view.execution_profile.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_str::<serde_json::Value>(&view.execution_profile)
+                        .unwrap_or(serde_json::Value::Null)
+                },
             })
         })
         .collect();
@@ -382,6 +388,12 @@ pub(crate) async fn native_terminal_spawn(
         "state": view.state_tag(),
         "startTimeMs": view.start_time_ms,
         "spawnedMs": view.spawned_ms,
+        "executionProfile": if view.execution_profile.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str::<serde_json::Value>(&view.execution_profile)
+                .unwrap_or(serde_json::Value::Null)
+        },
     }))
     .into_response()
 }
@@ -627,5 +639,14 @@ fn terminal_error_response(error: TerminalServiceError) -> Response {
             .into_response(),
         TerminalServiceError::Unavailable(message) => wire_refused(&message),
         TerminalServiceError::Refused(message) => wire_refused(&message),
+        TerminalServiceError::Denied(message) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "ok": false,
+                "code": "execution_denied",
+                "message": message,
+            })),
+        )
+            .into_response(),
     }
 }

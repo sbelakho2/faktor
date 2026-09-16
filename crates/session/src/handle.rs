@@ -726,7 +726,7 @@ impl SessionHandle {
             )?);
         }
         // A cancelled turn leaves the session READY for the next prompt
-        // (Stop in Kilo cancels the turn, never the session).
+        // (Stop in the IDE cancels the turn, never the session).
         if let Some(seq) = event_seq {
             event_seq = Some(self.transition_locked(
                 EventKind::TurnCompleted,

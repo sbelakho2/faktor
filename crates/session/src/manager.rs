@@ -438,7 +438,16 @@ impl SessionManager {
     /// or the wall clock jumped backwards. Zero is contractually never
     /// returned.
     pub fn next_op_id(&self) -> OpId {
-        let mut cache = self.op_ids.lock().expect("op id cache poisoned");
+        // Classified CACHE => REBUILD: the durable op-id sequence is the
+        // authority. A poisoned reservation is dropped (remaining = 0) and
+        // refilled from the durable sequence below, so a torn in-memory
+        // range can never mint colliding ids.
+        let mut cache = self.op_ids.lock().unwrap_or_else(|poisoned| {
+            self.op_ids.clear_poison();
+            let mut guard = poisoned.into_inner();
+            guard.remaining = 0;
+            guard
+        });
         if cache.remaining == 0 {
             // The sequence is GLOBAL (one store row shared by every
             // session), so no session id is semantically meaningful here;
@@ -474,7 +483,7 @@ impl SessionManager {
     }
 
     fn resources(&self, id: SessionId) -> Arc<SessionResources> {
-        let mut map = self.resources.lock().expect("session resources poisoned");
+        let mut map = crate::recover_lock(&self.resources);
         map.entry(id)
             .or_insert_with(|| {
                 Arc::new(SessionResources {
@@ -1014,10 +1023,7 @@ impl SessionManager {
         handle.end_session()?;
         // Close handles: drop the per-session registries (ops/processes/
         // locks) so nothing references the session in-process any more.
-        self.resources
-            .lock()
-            .expect("session resources poisoned")
-            .remove(&id);
+        crate::recover_lock(&self.resources).remove(&id);
         Ok(())
     }
 }

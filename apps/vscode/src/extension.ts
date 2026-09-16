@@ -70,7 +70,6 @@ import {
   boundedWebviewFiles,
   hasCompletionSteps,
   parseCompletionContract,
-  parsePendingSubmission,
 } from './taskStart';
 import {
   SessionBindings,
@@ -79,7 +78,7 @@ import {
   pruneBindings,
   withBinding,
 } from './workspaceBinding';
-import { BRIDGE_LIMITS, normalizeSteerText } from './kilo-bridge';
+import { MAX_STEER_CHARS, normalizeSteerText } from './steer';
 import { ChatMessage, ChatViewProvider } from './webview';
 
 const HISTORY_PAGE_LIMIT = 100;
@@ -937,8 +936,8 @@ async function startTask(
 ): Promise<void> {
   const restore = (failure: AdmitFailure): void => {
     reportError(new Error(failure.message));
-    // NEVER clear before acceptance: the Kilo-compatible sendMessageFailed
-    // carries the original identity + attachments and rebuilds the draft.
+    // NEVER clear before acceptance: the restore callback carries the
+    // original text back to the composer and rebuilds the draft.
     chatProvider?.postSendMessageFailed(pending, failure.message);
   };
   try {
@@ -1004,10 +1003,10 @@ async function startTask(
 }
 
 /**
- * Task-mode completion controls for the command path (the vendored UI owns
- * its own composer and never grows Faktor-only checkboxes): a multi-select
- * list of the three conditional steps. An empty selection = today's
- * default path (no contract, no work item).
+ * Task-mode completion controls for the command path (the chat composer
+ * carries the same three checkboxes): a multi-select list of the three
+ * conditional steps. An empty selection = today's default path (no
+ * contract, no work item).
  */
 async function promptCompletionContract(): Promise<NativeCompletionContract | null> {
   const picks = await vscode.window.showQuickPick(
@@ -1148,7 +1147,7 @@ async function controlAgent(message: ChatMessage): Promise<void> {
       } else {
         const entered = await vscode.window.showInputBox({
           title: `Faktor: steer ${agentId}`,
-          prompt: `Instruction delivered at the agent’s next safe boundary (max ${BRIDGE_LIMITS.maxSteerChars} chars)`,
+          prompt: `Instruction delivered at the agent’s next safe boundary (max ${MAX_STEER_CHARS} chars)`,
           ignoreFocusOut: true,
           validateInput: (value) => {
             const guard = normalizeSteerText(value);
@@ -1286,7 +1285,7 @@ async function handleWebviewMessage(
       if (goal.length === 0) {
         return;
       }
-      // Files ride the SAME attachment vocabulary the frozen bridge maps
+      // Files ride the workspace-relative attachment vocabulary
       // (`sendGoal.files`); malformed entries are refused individually (with
       // their exact reason) and never discard the goal. The completion
       // contract is Task-mode only: a malformed contract refuses the START
@@ -1309,22 +1308,9 @@ async function handleWebviewMessage(
         chatProvider?.postStartResult(goal, false);
         return;
       }
-      // Vendored pending submission: the Kilo identity + original files
-      // payload + binary attachments are re-validated by the host and kept
-      // for restore until durable acceptance. The built-in composer never
-      // sends `pending` and keeps its path-only behavior.
-      if (message.pending !== undefined && message.pending !== null) {
-        const pending = parsePendingSubmission(message.pending);
-        if (pending === null) {
-          const reason = 'task start refused: malformed pending submission envelope; the draft was kept';
-          chatProvider?.postNotice('error', reason);
-          return;
-        }
-        await startTask(goal, files, contract.contract, context, pending);
-        return;
-      }
-      // Legacy built-in composer: binary refs cannot ride this path (the
-      // built-in surface maps workspace-relative paths only).
+      // The composer carries no binary refs: only workspace-relative file
+      // paths reach the native run. Unknown binary-shaped members are noted
+      // (never forwarded, never silently dropped).
       const binaryRefs = Array.isArray(message.attachments) ? message.attachments.length : 0;
       if (binaryRefs > 0) {
         chatProvider?.postNotice(

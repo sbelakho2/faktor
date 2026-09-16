@@ -111,6 +111,17 @@ impl ContentDigest {
     }
 }
 
+/// Classified lock recovery for the workspace registry: the map is a
+/// DERIVED cache of live watcher handles. A poisoned guard is recovered with
+/// the poison flag cleared (reconciled against the durable workspace rows)
+/// so one panicking caller can never wedge workspace resolution.
+fn recover_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
 /// Registry of open workspaces; `open` is idempotent per root.
 #[derive(Debug, Default)]
 pub struct WorkspaceFileService {
@@ -128,7 +139,7 @@ impl WorkspaceFileService {
             .canonicalize()
             .map_err(|e| Error::not_found(format!("workspace root {}: {e}", root.display())))?;
         {
-            let map = self.workspaces.lock().unwrap();
+            let map = recover_lock(&self.workspaces);
             if let Some(h) = map.get(&workspace_id) {
                 if h.root == root {
                     return Ok(h.clone());
@@ -181,20 +192,17 @@ impl WorkspaceFileService {
             _watcher: Arc::new(Mutex::new(watcher)),
             events: Arc::new(Mutex::new(rx)),
         };
-        self.workspaces
-            .lock()
-            .unwrap()
-            .insert(workspace_id, handle.clone());
+        recover_lock(&self.workspaces).insert(workspace_id, handle.clone());
         Ok(handle)
     }
 
     /// Idle unload (spec §21): drops the watcher and cached handles.
     pub fn close(&self, workspace_id: WorkspaceId) {
-        self.workspaces.lock().unwrap().remove(&workspace_id);
+        recover_lock(&self.workspaces).remove(&workspace_id);
     }
 
     pub fn open_count(&self) -> usize {
-        self.workspaces.lock().unwrap().len()
+        recover_lock(&self.workspaces).len()
     }
 }
 
@@ -1737,6 +1745,26 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_workspace_registry_is_recovered_not_propagated() {
+        let (_d, service, _handle) = fixture();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = service.workspaces.lock().unwrap();
+            panic!("holder poisoned the workspace registry");
+        }));
+        assert!(service.workspaces.is_poisoned());
+        // Derived cache => recover (poison cleared, reconciled against the
+        // durable workspace rows): later open/close/open_count never panic.
+        let dir = tempfile::tempdir().unwrap();
+        let extra = dir.path().join("extra");
+        fs::create_dir_all(&extra).unwrap();
+        service.open(WorkspaceId::new(2), extra.clone()).unwrap();
+        assert_eq!(service.open_count(), 2);
+        service.close(WorkspaceId::new(2));
+        assert_eq!(service.open_count(), 1);
+        assert!(!service.workspaces.is_poisoned());
+    }
+
+    #[test]
     fn traversal_escape_rejected() {
         let (_d, _s, h) = fixture();
         for evil in ["../x", "a/../../b", "/etc/passwd", "..", "a/.."] {
@@ -1835,19 +1863,26 @@ mod tests {
         let (_d, _s, h) = fixture();
         fs::write(h.root().join("w.txt"), "x").unwrap();
         let mut saw = false;
-        // FSEvents delivery on a loaded host can lag well past the first
-        // second; keep the adversarial assertion (the event MUST arrive with
-        // the workspace id) with a generous bounded budget, re-touching the
-        // path in case the very first create was coalesced away.
-        for attempt in 0..240 {
-            if attempt > 0 && attempt % 20 == 0 {
-                fs::write(h.root().join("w.txt"), "x").unwrap();
-            }
+        // FSEvents delivery on a loaded host can lag well past any fixed
+        // iteration count; the adversarial assertion (the event MUST arrive
+        // with the workspace id) is unchanged, while the bound is a
+        // deadline and the path is re-touched while waiting so a coalesced
+        // first create can never strand the wait.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+        let mut last_touch = std::time::Instant::now();
+        loop {
             if let Ok(ev) = h.events().lock().unwrap().try_recv() {
                 if ev.workspace_id == WorkspaceId::new(1) && ev.path.ends_with("w.txt") {
                     saw = true;
                     break;
                 }
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            if last_touch.elapsed() >= std::time::Duration::from_secs(1) {
+                fs::write(h.root().join("w.txt"), "x").unwrap();
+                last_touch = std::time::Instant::now();
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }

@@ -104,9 +104,19 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         currentModel = model
         stateLabel.text = "state: ${model.state}"
         phaseLabel.text = "phase: ${model.phase}"
-        verificationLabel.text = "verification: " + model.verification.status +
-            " (criteria ${model.verification.criteriaPassed}/${model.verification.criteriaTotal}" +
-            ", failed ${model.verification.failedChecks}, owed ${model.verification.owed})"
+        val verification = model.verification
+        // The top-level summary: a served record that proves the full
+        // criterion set with no failed check renders VERIFIED plus the served
+        // criteria/checks/review/tree/commit/remote-head facts and the
+        // durable spend's cost; otherwise the honest status counters stay.
+        val costSuffix = model.spend?.let { " cost=${it.spentCostMicro}micro" } ?: ""
+        verificationLabel.text = if (verification.verified) {
+            "verification: " + verification.summaryText() + costSuffix
+        } else {
+            "verification: " + verification.summaryText() +
+                " (criteria ${verification.criteriaPassed}/${verification.criteriaTotal}" +
+                ", failed ${verification.failedChecks}, owed ${verification.owed})"
+        }
         completionLabel.text = completionText(model.completion)
         spendLabel.text = spendText(model.spend)
 

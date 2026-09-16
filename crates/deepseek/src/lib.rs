@@ -1,8 +1,8 @@
 //! faktor-deepseek — first-class DeepSeek profiles (spec §11).
 //!
 //! DeepSeek is a first-class test matrix, not an accident of OpenAI
-//! compatibility: separate profiles for direct, OpenRouter, Kilo Gateway,
-//! arbitrary OpenAI-compatible endpoints, and local derivatives. Capability
+//! compatibility: separate profiles for direct, OpenRouter, an aggregator
+//! gateway, arbitrary OpenAI-compatible endpoints, and local derivatives. Capability
 //! normalization happens after discovery; the agent never branches on the
 //! provider name.
 //!
@@ -25,7 +25,7 @@ pub enum DeepSeekProfile {
     Direct,
     /// DeepSeek models via OpenRouter.
     OpenRouter,
-    /// DeepSeek models via the Kilo Gateway.
+    /// DeepSeek models via an aggregator gateway.
     Gateway { base_url: String },
     /// Any OpenAI-compatible endpoint.
     Compatible { base_url: String },
@@ -108,7 +108,7 @@ fn v4_family_defaults() -> ModelCapabilities {
 }
 
 /// Wire quirks per profile. Native DeepSeek API shapes (direct, OpenRouter,
-/// the Kilo Gateway, and DeepSeek-compatible endpoints) replay the prior
+/// an aggregator gateway, and DeepSeek-compatible endpoints) replay the prior
 /// assistant reasoning (`reasoning_content`) and always send a content field
 /// next to tool calls — without the replay the V4 API 400s on later tool
 /// iterations. Local derivatives (vLLM serving foreign models) get none.
@@ -318,7 +318,7 @@ mod tests {
             DeepSeekProfile::Direct,
             DeepSeekProfile::OpenRouter,
             DeepSeekProfile::Gateway {
-                base_url: "https://api.kilo.ai".into(),
+                base_url: "https://gateway.example.com".into(),
             },
             DeepSeekProfile::Compatible {
                 base_url: "http://127.0.0.1:8000".into(),

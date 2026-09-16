@@ -1,45 +1,19 @@
-// The Faktor chat webview. Two render modes over one message transport:
-//
-//   - vendored (preferred): when the pinned Kilo v7.5.6 closure was staged
-//     inside the installed extension by `npm run prepackage:vsix` at
-//     <extensionUri>/media/kilo-v756-webview/dist (built `dist/index.html`
-//     entry when present, else the upstream esbuild pair dist/webview.js +
-//     dist/webview.css), its HTML shell is served with a strict CSP + script
-//     nonce, and the kilo-bridge translates between the frozen UI message ABI
-//     and the native snapshot. Resolution NEVER leaves extensionUri, so a
-//     checkout-relative path cannot be picked up by an installed VSIX.
-//   - built-in (fallback): the hand-written HTML surface over native state
-//     (`media/chat.js`), used when the vendored bundle is absent; the missing
-//     bundle is recorded once via vendoredFallbackNotice().
-//
-// Repo development only: FAKTOR_UI_BUNDLE is an explicit opt-in env override
-// that points the vendored lookup at a local bundle checkout (typically
-// <repo>/ui/kilo-v756-webview). It is never inferred from the directory
-// layout; packaged installs must ship the bundle under media/.
+// The Faktor chat webview: ONE Faktor-owned surface (`media/chat.js` +
+// `media/chat.css` + `media/composer-state.js`, all hand-written and
+// dependency-free). There is no vendored upstream bundle, no message-ABI
+// bridge and no checkout-relative lookup: the panel ships inside the VSIX
+// and every message is a bounded, Faktor-native `ChatMessage` the extension
+// host routes itself.
 //
 // This module owns ONLY VS Code webview plumbing — HTML generation, CSP,
-// message transport and bridge routing — and delegates every daemon action to
-// an injected host (extension.ts). No remote scripts, no eval, no inline
-// handlers; the bundled media/chat.js or the vendored bundle is the only
-// script, and every daemon-derived string is rendered as text.
+// message transport — and delegates every daemon action to an injected host
+// (extension.ts). No remote scripts, no eval, no inline handlers;
+// `media/chat.js` is the only script, and every daemon-derived string is
+// rendered as text.
 
 import * as vscode from 'vscode';
 import { randomBytes } from 'node:crypto';
-import { join } from 'node:path';
-import {
-  buildVendoredWebviewHtml,
-  bridgeCommandToHostMessage,
-  faktorEvidenceExpandedMessage,
-  ingestWebviewMessage,
-  locateVendoredBundle,
-  readyMessage,
-  sendMessageFailedMessage,
-  snapshotToWebviewMessages,
-  vendoredFallbackNotice,
-  VendoredBundle,
-  type RestorableSubmission,
-} from './kilo-bridge';
-import { FaktorSnapshot } from './state';
+import type { FaktorSnapshot } from './state';
 
 /** Messages the webview sends to the extension host. */
 export interface ChatMessage {
@@ -52,39 +26,11 @@ export interface ChatHost {
   handle(message: ChatMessage): void | Promise<void>;
 }
 
-const MAX_LOUD_DROPS = 20;
-
-/**
- * Bundle root resolution. The packaged layout is always
- * <extensionUri>/media/kilo-v756-webview; no checkout-relative path is ever
- * consulted. FAKTOR_UI_BUNDLE is the only escape hatch and exists for repo
- * development only.
- */
-function vendoredRoot(extensionUri: vscode.Uri): string {
-  const override = process.env.FAKTOR_UI_BUNDLE;
-  if (override !== undefined && override.trim().length > 0) {
-    return override.trim();
-  }
-  return join(extensionUri.fsPath, 'media', 'kilo-v756-webview');
-}
-
-function locateVendoredUi(extensionUri: vscode.Uri): VendoredBundle | null {
-  const root = vendoredRoot(extensionUri);
-  const bundle = locateVendoredBundle(root);
-  if (bundle === null) {
-    // Recorded once per webview resolution; the built-in fallback serves.
-    console.warn(vendoredFallbackNotice(root));
-  }
-  return bundle;
-}
-
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'faktor.chat';
 
   private view: vscode.WebviewView | null = null;
   private snapshot: FaktorSnapshot | null = null;
-  private vendored: VendoredBundle | null = null;
-  private dropCount = 0;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -93,26 +39,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
-    this.vendored = locateVendoredUi(this.extensionUri);
-    const roots: vscode.Uri[] = [vscode.Uri.joinPath(this.extensionUri, 'media')];
-    if (this.vendored !== null) {
-      roots.push(vscode.Uri.file(this.vendored.root));
-    }
     view.webview.options = {
       enableScripts: true,
-      localResourceRoots: roots,
+      localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'media')],
     };
-    view.webview.html =
-      this.vendored !== null
-        ? this.renderVendored(view.webview, this.vendored)
-        : this.render(view.webview);
+    view.webview.html = this.render(view.webview);
     view.webview.onDidReceiveMessage((message: ChatMessage) => {
-      this.route(message);
+      void this.host.handle(message);
     });
     view.onDidDispose(() => {
       this.view = null;
     });
-    if (this.snapshot !== null && this.vendored === null) {
+    if (this.snapshot !== null) {
       this.post({ type: 'snapshot', snapshot: this.snapshot });
     }
   }
@@ -120,76 +58,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Push a full state snapshot; the webview re-renders from it. */
   postSnapshot(snapshot: FaktorSnapshot): void {
     this.snapshot = snapshot;
-    if (this.vendored !== null) {
-      for (const message of snapshotToWebviewMessages(snapshot)) {
-        this.post(message);
-      }
-      return;
-    }
     this.post({ type: 'snapshot', snapshot });
   }
 
   /** Deliver the decoded bytes of one expanded evidence artifact. */
   postEvidence(id: number, text: string, truncated: boolean): void {
-    if (this.vendored !== null) {
-      // Additive Faktor mapping: the companion panel renders the expansion
-      // (the frozen Kilo UI keeps its own messages untouched).
-      this.post(
-        faktorEvidenceExpandedMessage(
-          this.snapshot?.session?.id ?? null,
-          id,
-          text,
-          truncated,
-        ),
-      );
-      return;
-    }
     this.post({ type: 'evidence', id, text, truncated });
   }
 
   /**
    * The result of one `sendGoal`: the built-in composer clears its draft
    * ONLY when `ok` is true and the textarea still holds the submitted goal
-   * (see media/composer-state.js). The vendored UI owns its own composer;
-   * failures are still surfaced as an error message.
+   * (see media/composer-state.js).
    */
   postStartResult(goal: string, ok: boolean): void {
-    if (this.vendored !== null) {
-      if (!ok) {
-        this.post({ type: 'error', message: `task start failed; the draft was kept: ${goal}` });
-      } else {
-        console.log(`[faktor-bridge] task start accepted: ${goal}`);
-      }
-      return;
-    }
     this.post({ type: 'startResult', goal, ok });
   }
 
   /**
-   * Restore one failed pending submission in the vendored composer through
-   * the Kilo-compatible `sendMessageFailed` message: the ORIGINAL text,
-   * session/draft/message identity and attachment payload travel verbatim,
-   * so the frozen `restoreFailed` handler rebuilds the draft and images.
-   * The built-in fallback keeps its existing `startResult` contract.
+   * Restore one failed pending submission in the composer: the original
+   * text travels back verbatim through `startResult` with `ok: false`, so
+   * the draft (and its completion contract) is kept for the retry and never
+   * silently lost. The failure message itself was already surfaced through
+   * `postNotice`.
    */
-  postSendMessageFailed(pending: RestorableSubmission, error: string): void {
-    if (this.vendored !== null) {
-      this.post(sendMessageFailedMessage(pending, error));
-      return;
-    }
+  postSendMessageFailed(pending: { readonly text: string }, error: string): void {
+    console.error(`[faktor-chat] task start failed; the draft was kept: ${error}`);
     this.post({ type: 'startResult', goal: pending.text, ok: false });
   }
 
   /** One transient notice line (last error, control ack, ...). */
   postNotice(level: 'info' | 'error', message: string): void {
-    if (this.vendored !== null) {
-      if (level === 'error') {
-        this.post({ type: 'error', message });
-      } else {
-        console.log(`[faktor-bridge] notice: ${message}`);
-      }
-      return;
-    }
     this.post({ type: 'notice', level, message });
   }
 
@@ -197,120 +96,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     void vscode.commands.executeCommand('faktor.chat.focus');
   }
 
-  /** True when the pinned vendored bundle is being served in this session. */
-  usingVendoredUi(): boolean {
-    return this.vendored !== null;
-  }
-
-  private route(message: ChatMessage): void {
-    if (this.vendored === null) {
-      void this.host.handle(message);
-      return;
-    }
-    const result = ingestWebviewMessage(message, {
-      workspaceDirectory: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null,
-    });
-    if ('dropped' in result) {
-      this.dropCount += 1;
-      console.error(
-        `[faktor-bridge] dropped ${result.type ?? 'unnamed'} message: ${result.reason} (${result.bytes} bytes)`,
-      );
-      if (this.dropCount <= MAX_LOUD_DROPS) {
-        this.postNotice('error', `frozen UI message dropped: ${result.reason}`);
-      }
-      return;
-    }
-    if (result.kind === 'sendMessage' && result.refusedAttachments.length > 0) {
-      // Per-entry refusals are loud but never discard the message (or the
-      // goal) itself; the accepted subset still maps to sendGoal.
-      const reasons = result.refusedAttachments
-        .slice(0, 5)
-        .map((refusal) => `#${refusal.index}: ${refusal.reason}`)
-        .join('; ');
-      console.error(
-        `[faktor-bridge] ${result.refusedAttachments.length} attachment(s) refused: ${reasons}`,
-      );
-      this.postNotice(
-        'error',
-        `${result.refusedAttachments.length} attachment(s) refused: ${reasons}`,
-      );
-    }
-    if (result.kind === 'openExternal') {
-      void vscode.env.openExternal(vscode.Uri.parse(result.url));
-      return;
-    }
-    if (result.kind === 'ready') {
-      this.post(readyMessage(this.bridgeContext()));
-    }
-    const hostMessage = bridgeCommandToHostMessage(result);
-    if (hostMessage !== null) {
-      void this.host.handle(hostMessage);
-    }
-  }
-
-  private bridgeContext(): {
-    extensionVersion: string;
-    workspaceDirectory: string;
-    daemonVersion: string | null;
-    port: number | null;
-  } {
-    const self = vscode.extensions.all.find(
-      (extension) => extension.extensionUri.fsPath === this.extensionUri.fsPath,
-    );
-    const version = self?.packageJSON?.version;
-    const snapshot = this.snapshot;
-    let port: number | null = null;
-    if (snapshot?.baseUrl) {
-      try {
-        const parsed = new URL(snapshot.baseUrl);
-        const candidate = Number(parsed.port);
-        if (Number.isInteger(candidate) && candidate > 0) {
-          port = candidate;
-        }
-      } catch {
-        port = null;
-      }
-    }
-    const detail = snapshot?.daemonDetail ?? '';
-    const daemonVersion = detail.match(/^(\S+)\s+on\s+port/)?.[1] ?? null;
-    return {
-      extensionVersion: typeof version === 'string' ? version : '0.0.0',
-      workspaceDirectory: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '',
-      daemonVersion,
-      port,
-    };
-  }
-
   private post(message: unknown): void {
     void this.view?.webview.postMessage(message);
-  }
-
-  private renderVendored(webview: vscode.Webview, ui: VendoredBundle): string {
-    const nonce = randomBytes(16).toString('hex');
-    const resource = (path: string): string =>
-      webview.asWebviewUri(vscode.Uri.file(path)).toString();
-    return buildVendoredWebviewHtml({
-      cspSource: webview.cspSource,
-      nonce,
-      scriptUri: resource(ui.script),
-      styleUri: resource(ui.style),
-      // Icons live under dist/assets/icons in the built bundle; the shell
-      // falls back to the bundle root only for layout purposes (the icon
-      // lookup itself is a webview-relative URL, never a filesystem read).
-      iconsBaseUri: resource(ui.icons ?? ui.root),
-      workerUri: ui.worker !== null ? resource(ui.worker) : '',
-      title: 'Faktor',
-      sidebar: '',
-      topBar: false,
-      // The additive companion overlay loads only when the staged bundle
-      // shipped it; without it the shell is the frozen bootstrap.
-      ...(ui.companion !== null
-        ? {
-            companionScriptUri: resource(ui.companion.script),
-            companionStyleUri: resource(ui.companion.style),
-          }
-        : {}),
-    });
   }
 
   private render(webview: vscode.Webview): string {

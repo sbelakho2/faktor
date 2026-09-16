@@ -30,7 +30,10 @@ impl ProcessRegistry {
                 "pid 0 is not a child".into(),
             ));
         }
-        let mut map = self.inner.lock().expect("process registry poisoned");
+        // Classified OWNERSHIP/PROCESS => RECONCILE: a poisoned registry
+        // is recovered (poison cleared) against the durable supervisor
+        // owner rows; one panicking caller never wedges ownership.
+        let mut map = crate::recover_lock(&self.inner);
         if map.contains_key(&proc.pid) {
             return Err(crate::SessionError::Conflict(format!(
                 "pid {} is already owned by this session",
@@ -42,21 +45,14 @@ impl ProcessRegistry {
     }
 
     pub fn release(&self, pid: u32) -> Result<OwnedProcess, crate::SessionError> {
-        self.inner
-            .lock()
-            .expect("process registry poisoned")
+        crate::recover_lock(&self.inner)
             .remove(&pid)
             .ok_or_else(|| crate::SessionError::NotFound(format!("pid {pid} is not owned")))
     }
 
     pub fn all(&self) -> Vec<OwnedProcess> {
-        let mut out: Vec<OwnedProcess> = self
-            .inner
-            .lock()
-            .expect("process registry poisoned")
-            .values()
-            .cloned()
-            .collect();
+        let mut out: Vec<OwnedProcess> =
+            crate::recover_lock(&self.inner).values().cloned().collect();
         out.sort_by_key(|p| p.pid);
         out
     }
@@ -65,7 +61,7 @@ impl ProcessRegistry {
     /// presumed dead or re-parented; the runtime must not pretend to own
     /// zombies).
     pub fn drain(&self) -> Vec<OwnedProcess> {
-        let mut map = self.inner.lock().expect("process registry poisoned");
+        let mut map = crate::recover_lock(&self.inner);
         let out: Vec<OwnedProcess> = map.values().cloned().collect();
         map.clear();
         out
@@ -103,6 +99,36 @@ impl crate::handle::SessionHandle {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_process_registry_is_reconciled_not_propagated() {
+        let reg = ProcessRegistry::default();
+        reg.register(OwnedProcess {
+            pid: 42,
+            op_id: OpId::new(7),
+            started_ms: 1,
+        })
+        .unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = reg.inner.lock().unwrap();
+            panic!("holder poisoned the process ownership registry");
+        }));
+        assert!(reg.inner.is_poisoned());
+        // Ownership/process => reconcile: ownership facts keep serving (the
+        // durable supervisor rows remain the authority) and later
+        // register/release calls never panic.
+        assert_eq!(reg.all().len(), 1);
+        assert_eq!(reg.release(42).unwrap().pid, 42);
+        reg.register(OwnedProcess {
+            pid: 43,
+            op_id: OpId::new(8),
+            started_ms: 2,
+        })
+        .unwrap();
+        assert_eq!(reg.all().len(), 1);
+        assert!(!reg.inner.is_poisoned());
+    }
     use crate::handle::tests::{session, test_manager};
 
     #[test]

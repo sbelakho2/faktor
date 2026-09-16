@@ -66,6 +66,63 @@ pub enum SandboxGuarantee {
 /// closed typed when the demand cannot be met.
 pub use faktor_core::command::NetworkIsolationRequirement;
 
+/// The descriptive spawn projection of one [`SandboxPolicy`]: the effective
+/// filesystem and network profile a spawn admitted under the policy carries.
+/// This is evidence, never a decision — [`PermissionEngine::evaluate`] and
+/// [`PermissionEngine::spawn_network_requirement`] stay the decision
+/// authorities; the projection exists so an execution authority can record
+/// the exact profile a child was admitted under.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SpawnProfile {
+    /// `workspace` when both external rules are `Deny`, else
+    /// `workspace+external:<read>-<write>` with the rule tags.
+    pub filesystem: String,
+    /// The typed network guarantee tag of the policy
+    /// (`none|best_effort|required`).
+    pub network: String,
+}
+
+impl SandboxGuarantee {
+    /// The stable snake_case tag of this guarantee (also its serde tag).
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            SandboxGuarantee::Required => "required",
+            SandboxGuarantee::BestEffort => "best_effort",
+            SandboxGuarantee::None => "none",
+        }
+    }
+}
+
+impl SandboxPolicy {
+    /// Project the policy's filesystem/network profile for one admitted
+    /// spawn. Deterministic and side-effect free: the same policy always
+    /// yields the same profile.
+    pub fn spawn_profile(&self) -> SpawnProfile {
+        let external_denied = self.read_external == Rule::Deny && self.write_external == Rule::Deny;
+        let filesystem = if external_denied {
+            "workspace".to_string()
+        } else {
+            format!(
+                "workspace+external:{}-{}",
+                rule_tag(self.read_external),
+                rule_tag(self.write_external)
+            )
+        };
+        SpawnProfile {
+            filesystem,
+            network: self.network_guarantee.as_tag().to_string(),
+        }
+    }
+}
+
+fn rule_tag(rule: Rule) -> &'static str {
+    match rule {
+        Rule::Allow => "allow",
+        Rule::Ask => "ask",
+        Rule::Deny => "deny",
+    }
+}
+
 impl SandboxGuarantee {
     /// The one mapping from policy to spawn requirement: `Required` demands
     /// `DenyAll`; `BestEffort`/`None` inherit the daemon network namespace.
@@ -922,6 +979,45 @@ mod tests {
         Capability::ExecuteShell {
             command: "curl http://evil.example".into(),
         }
+    }
+
+    #[test]
+    fn spawn_profile_projects_the_policy_deterministically() {
+        // The default: external reads/writes Ask ⇒ the profile names them and
+        // the network guarantee tag is the policy's own.
+        let profile = SandboxPolicy::default().spawn_profile();
+        assert_eq!(profile.filesystem, "workspace+external:ask-ask");
+        assert_eq!(profile.network, "none");
+        // Deny-everything external ⇒ workspace-only.
+        let locked = SandboxPolicy {
+            read_external: Rule::Deny,
+            write_external: Rule::Deny,
+            network_guarantee: SandboxGuarantee::Required,
+            ..Default::default()
+        };
+        assert_eq!(
+            locked.spawn_profile(),
+            SpawnProfile {
+                filesystem: "workspace".into(),
+                network: "required".into(),
+            }
+        );
+        // Deterministic: the same policy projects the same profile, and the
+        // profile round-trips through serde (it is recorded as evidence).
+        assert_eq!(locked.spawn_profile(), locked.spawn_profile());
+        let json = serde_json::to_value(locked.spawn_profile()).unwrap();
+        let back: SpawnProfile = serde_json::from_value(json).unwrap();
+        assert_eq!(back, locked.spawn_profile());
+        // One allowed external direction still names both rules.
+        let mixed = SandboxPolicy {
+            read_external: Rule::Allow,
+            write_external: Rule::Deny,
+            ..Default::default()
+        };
+        assert_eq!(
+            "workspace+external:allow-deny",
+            mixed.spawn_profile().filesystem
+        );
     }
 
     #[test]

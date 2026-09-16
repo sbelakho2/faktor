@@ -20,6 +20,18 @@ use std::time::Duration;
 use faktor_core::error::{Error, ErrorKind};
 use faktor_terminal::{EnvSpec, ProcessOwner, ProcessSupervisor, SpawnConfig};
 
+/// Classified lock recovery for DERIVED state (caches, registries, rings,
+/// process/ownership projections): a poisoned guard is recovered with the
+/// poison flag cleared, so one panicking caller can never wedge later use.
+/// The durable authority (store/journal/OS process state) remains the
+/// source of truth; the recovered value is only ever a projection of it.
+fn recover_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 #[allow(dead_code)]
 const MAX_INITIAL_BYTES: usize = 64 * 1024;
@@ -114,7 +126,7 @@ impl McpServer {
     }
 
     fn next_request(&self, method: &str, params: serde_json::Value) -> (String, serde_json::Value) {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = recover_lock(&self.conn);
         let id = conn.next_id;
         conn.next_id += 1;
         (
@@ -138,7 +150,7 @@ impl McpServer {
         let (id, request) = self.next_request(method, params);
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
-            let mut conn = self.conn.lock().unwrap();
+            let mut conn = recover_lock(&self.conn);
             if conn.pending.len() > 256 {
                 return Err(Error::new(
                     ErrorKind::Oversized,
@@ -179,7 +191,7 @@ impl McpServer {
             )),
             Err(_elapsed) => {
                 // Clean up the pending entry.
-                self.conn.lock().unwrap().pending.remove(&id);
+                recover_lock(&self.conn).pending.remove(&id);
                 Err(Error::timeout(format!(
                     "mcp {method} exceeded {}ms",
                     deadline.as_millis()
@@ -271,7 +283,7 @@ impl McpServer {
 
     pub async fn close(&self) -> Result<(), Error> {
         let pid = {
-            let mut conn = self.conn.lock().unwrap();
+            let mut conn = recover_lock(&self.conn);
             let _ = conn.stdin.write_all(b"Content-Length: 0\r\n\r\n");
             let _ = conn.stdin.flush();
             conn.child_pid
@@ -286,7 +298,7 @@ impl McpServer {
     }
 
     pub fn is_alive(&self) -> bool {
-        let pid = self.conn.lock().unwrap().child_pid;
+        let pid = recover_lock(&self.conn).child_pid;
         self.supervisor.pid_alive(pid)
     }
 }
@@ -344,7 +356,7 @@ fn read_loop(conn: Arc<Mutex<Conn>>, stdout: std::process::ChildStdout) {
                     let is_notification =
                         value.get("method").is_some() && value.get("id").is_none();
                     if let Some(id) = id {
-                        let mut guard = conn.lock().unwrap();
+                        let mut guard = recover_lock(&conn);
                         if let Some(tx) = guard.pending.remove(&id) {
                             let _ = tx.send(value);
                         }
@@ -356,7 +368,7 @@ fn read_loop(conn: Arc<Mutex<Conn>>, stdout: std::process::ChildStdout) {
                 Err(_) => {
                     // Garbage on the wire: drop everything pending (the
                     // server is broken) and stop reading.
-                    let mut guard = conn.lock().unwrap();
+                    let mut guard = recover_lock(&conn);
                     for (_, tx) in guard.pending.drain() {
                         let _ = tx.send(serde_json::json!({"error": {"code": -32700, "message": "parse error"}}));
                     }
@@ -366,7 +378,7 @@ fn read_loop(conn: Arc<Mutex<Conn>>, stdout: std::process::ChildStdout) {
         }
     }
     // EOF: fail all pending requests.
-    let mut guard = conn.lock().unwrap();
+    let mut guard = recover_lock(&conn);
     for (_, tx) in guard.pending.drain() {
         let _ = tx.send(serde_json::json!({"error": {"code": -32000, "message": "server closed"}}));
     }

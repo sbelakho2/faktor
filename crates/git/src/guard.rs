@@ -8,8 +8,9 @@
 //!    process) serialize on the SAME lease.
 //!
 //! The lease records a pid-reuse-safe process identity: the pid, a process
-//! start marker (`/proc/<pid>/stat` starttime on Linux, `ps -o lstart=` on
-//! other unixes) and a random owner token. A lease whose owner is provably
+//! start marker (`/proc/<pid>/stat` starttime on Linux, kernel
+//! `proc_pidinfo` on macOS — never a child process) and a random owner
+//! token. A lease whose owner is provably
 //! dead, or alive but with a DIFFERENT start marker (the pid was reused), is
 //! reconciled by an atomic rename-away — exactly one stale generation can be
 //! stolen, and a live lease is never taken. Git's own index/ref locks stay
@@ -59,6 +60,37 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// macOS: the process start time from `proc_pidinfo(PROC_PIDTBSDINFO)` —
+/// a direct kernel query, never a child process (process identity must not
+/// add a spawn site to a production crate; the static spawn authority scan
+/// enforces that).
+#[cfg(target_os = "macos")]
+fn unix_pid_start_marker(pid: u32) -> String {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut libc::proc_bsdinfo as *mut libc::c_void,
+            size,
+        )
+    };
+    if rc == size {
+        format!("bsd:{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec)
+    } else {
+        String::new()
+    }
+}
+
+/// Other unixes: no start marker is reported (the lease then proves
+/// staleness by death only, exactly like the documented unavailable case).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn unix_pid_start_marker(_pid: u32) -> String {
+    String::new()
+}
+
 /// The process start marker of `pid`: a stable string that differs when the
 /// pid is reused by a different process. Empty when unavailable.
 #[cfg(unix)]
@@ -73,21 +105,7 @@ pub fn pid_start_marker(pid: u32) -> String {
             }
         }
     }
-    // macOS + fallback: `ps -o lstart= -p <pid>` prints the exact start time.
-    match std::process::Command::new("ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .output()
-    {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if text.is_empty() {
-                String::new()
-            } else {
-                format!("ps:{text}")
-            }
-        }
-        _ => String::new(),
-    }
+    unix_pid_start_marker(pid)
 }
 
 #[cfg(not(unix))]

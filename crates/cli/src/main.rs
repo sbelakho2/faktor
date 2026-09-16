@@ -2,7 +2,7 @@
 //! §43, and the ACP agent server over the daemon).
 //!
 //! `serve --port 0` prints the exact frozen startup line
-//! `faktor server listening on http://127.0.0.1:<port>` so the frozen v7.5.6
+//! `faktor server listening on http://127.0.0.1:<port>` so the
 //! extension connects exactly as it did to the old CLI. Nothing else goes to
 //! stdout. Auth comes from the frontend-generated `FAKTOR_SERVER_PASSWORD`
 //! environment variable; the daemon never prints it.
@@ -48,7 +48,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the daemon; prints the frozen v7.5.6 startup line on stdout.
+    /// Start the daemon; prints the Faktor startup line on stdout.
     Serve {
         #[arg(long, default_value_t = 0)]
         port: u16,

@@ -34,8 +34,13 @@ This workspace is a Rust implementation of the Faktor architecture spec
    dies, ownership transfers deliberately or the process dies.
 9. **The native protocol is the daemon's own contract.** Faktor Native
    Protocol v1 (`docs/native-protocol.md`) evolves with the runtime; there is
-   no foreign wire-compatibility surface. The retired v7.5.6 compatibility
-   subsystem must not be reintroduced as a release objective.
+   no foreign wire-compatibility surface and no foreign UI/bundle/parity
+   dependency. The Faktor-owned IDE panels (`apps/vscode`, `apps/jetbrains`)
+   are the only rendering implementations; no vendored UI source tree or
+   compatibility corpus may be reintroduced as a release objective, and the
+   static source scan (`tests/static-authority`) plus
+   `scripts/branding-scan.sh` enforce it (sole exception: the historical
+   attribution under `ui/LICENSES/`).
 
 ## Verification
 

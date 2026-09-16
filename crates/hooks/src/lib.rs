@@ -277,7 +277,11 @@ impl HookRegistry {
         if spec.deadline_ms == 0 || spec.deadline_ms > 300_000 {
             return Err("hook deadline must be in (0, 300000] ms".into());
         }
-        let mut specs = self.inner.specs.lock().unwrap();
+        // Classified AUTHORITY/POLICY state: a poisoned spec registry
+        // refuses the mutation typed — it never half-applies a policy change.
+        let mut specs = self.inner.specs.lock().map_err(|_| {
+            "hook registry poisoned: refusing to mutate the hook policy set".to_string()
+        })?;
         if specs.iter().any(|s| s.id == spec.id) {
             return Err(format!("duplicate hook id {}", spec.id));
         }
@@ -289,7 +293,13 @@ impl HookRegistry {
         self.inner
             .specs
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| {
+                // Read-only projection of the policy set: recover (poison
+                // cleared) rather than wedge event dispatch; the poisoned
+                // register above keeps a torn policy from ever being written.
+                self.inner.specs.clear_poison();
+                poisoned.into_inner()
+            })
             .iter()
             .filter(|s| s.events.contains(&event))
             .cloned()
@@ -297,7 +307,14 @@ impl HookRegistry {
     }
 
     fn audit_push(&self, rec: HookAuditRecord) {
-        let mut a = self.inner.audit.lock().unwrap();
+        // Classified: the audit trail is a bounded RING; a poisoned guard
+        // is recovered with the poison flag cleared (rebuilt in place).
+        let mut a = self.inner.audit.lock().unwrap_or_else(|poisoned| {
+            self.inner.audit.clear_poison();
+            let mut guard = poisoned.into_inner();
+            guard.clear();
+            guard
+        });
         a.push_back(rec);
         while a.len() > 4096 {
             a.pop_front();
@@ -479,7 +496,16 @@ impl HookRegistry {
     }
 
     pub fn audit(&self) -> Vec<HookAuditRecord> {
-        self.inner.audit.lock().unwrap().iter().cloned().collect()
+        self.inner
+            .audit
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                self.inner.audit.clear_poison();
+                poisoned.into_inner()
+            })
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
@@ -506,6 +532,38 @@ fn process_owner(input: &HookInput) -> ProcessOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poisoned_hook_policy_refuses_mutations_and_recovers_reads() {
+        let r = HookRegistry::new();
+        r.register(HookSpec {
+            id: "first".into(),
+            command: "true".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = r.inner.specs.lock().unwrap();
+            panic!("holder poisoned the hook policy set");
+        }));
+        // Authority/policy state => typed refusal: the mutation is refused
+        // and never half-applies a policy change.
+        let err = r
+            .register(HookSpec {
+                id: "second".into(),
+                command: "true".into(),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.contains("poisoned"), "{err}");
+        // Read-only projections recover (poison cleared) and keep serving
+        // the pre-poison policy set instead of wedging event dispatch.
+        assert!(r
+            .matching(HookEvent::PreTool)
+            .iter()
+            .all(|spec| spec.id != "second"));
+        assert!(!r.inner.specs.is_poisoned());
+    }
 
     #[test]
     fn allow_path_via_json_stdout() {

@@ -2808,8 +2808,8 @@ mod tests {
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);
-        git(&repo, &["config", "user.email", "test@kilo.local"]);
-        git(&repo, &["config", "user.name", "Kilo Test"]);
+        git(&repo, &["config", "user.email", "test@faktor.local"]);
+        git(&repo, &["config", "user.name", "Faktor Test"]);
         std::fs::write(repo.join("README.md"), "base\n").unwrap();
         git(&repo, &["add", "-A"]);
         git(&repo, &["commit", "-q", "-m", "init"]);

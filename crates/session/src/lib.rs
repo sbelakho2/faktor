@@ -42,6 +42,19 @@
 //! map failures with `faktor_protocol::error::from_core` without a second error
 //! surface.
 
+/// Classified lock recovery for the session's in-memory registries:
+/// operation ownership, child-process ownership and the per-session resource
+/// map are RECONCILED projections of the durable journal/store. A poisoned
+/// guard is recovered with the poison flag cleared, so one panicking caller
+/// can never wedge session ownership; the durable rows remain the authority
+/// (`SessionHandle::recover_all` re-derives from them after a crash).
+pub(crate) fn recover_lock<T>(lock: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
 pub mod actor;
 pub mod artifacts;
 pub mod attachments;

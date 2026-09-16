@@ -7,10 +7,9 @@
 //     `faktor-cli serve --port 0` with it in the environment.
 //  3. Read stdout line-by-line until the EXACT frozen startup line
 //     `/faktor server listening on http:\/\/127\.0\.0\.1:(\d+)/`, resolve
-//     the port, and build both accepted auth forms:
-//       - the frozen v7.5.6 Basic header
-//         (`Basic base64("kilo:" + password)`), and
-//       - the native bearer form (`Bearer <password>`).
+//     the port, and build the Faktor-native bearer claim
+//     (`Authorization: Bearer <password>`). Basic/compat auth forms were
+//     removed with the auth cutover; there is no downgrade path.
 //  4. Expose health() against GET /global/health.
 //
 // Deliberately dependency-free (node:http only; no axios, no vscode
@@ -52,9 +51,7 @@ export interface DaemonHandle {
   readonly port: number;
   readonly password: string;
   readonly baseUrl: string;
-  /** Frozen v7.5.6 wire form: `Basic base64("kilo:" + password)`. */
-  readonly authHeader: string;
-  /** Native form: `Bearer <password>`. */
+  /** The password sent as `Authorization: Bearer <password>`. */
   readonly bearerToken: string;
   readonly pid: number | undefined;
   health(): Promise<DaemonHealth>;
@@ -121,15 +118,13 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   child.stderr?.setEncoding('utf8');
   child.stderr?.on('data', (chunk: string) => stderr.push(chunk));
   const port = await readStartupPort(child, options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS);
-  const authHeader = 'Basic ' + Buffer.from(`kilo:${password}`).toString('base64');
   const handle: DaemonHandle = {
     port,
     password,
     baseUrl: `http://127.0.0.1:${port}`,
-    authHeader,
     bearerToken: password,
     pid: child.pid,
-    health: () => health(port, authHeader),
+    health: () => health(port, password),
     stderrTail: () => stderr.text(),
     alive: () => child.exitCode === null && child.signalCode === null,
     stop: () => stopChild(child),
@@ -240,7 +235,7 @@ function readStartupPort(child: ChildProcess, timeoutMs: number): Promise<number
   });
 }
 
-function health(port: number, authHeader: string): Promise<DaemonHealth> {
+function health(port: number, password: string): Promise<DaemonHealth> {
   return new Promise<DaemonHealth>((resolveHealth, reject) => {
     const req = http.request(
       {
@@ -248,7 +243,7 @@ function health(port: number, authHeader: string): Promise<DaemonHealth> {
         port,
         path: '/global/health',
         method: 'GET',
-        headers: { Authorization: authHeader },
+        headers: { Authorization: `Bearer ${password}` },
         timeout: HEALTH_TIMEOUT_MS,
       },
       (res) => {

@@ -1035,7 +1035,7 @@ async fn client_eof_is_a_clean_exit_without_shutdown() {
 // Wave: advertised-surface mapping over the native services
 // ---------------------------------------------------------------------------
 
-/// Sync backend with a bounded native v756 history for one owned session.
+/// Sync backend with a bounded native history page for one owned session.
 #[derive(Clone)]
 struct HistoryBackend {
     session: String,
@@ -3101,6 +3101,9 @@ fn map_durable_error(
             terminal_id, state, ..
         } => TerminalError::Refused(format!("terminal {terminal_id:?} is {state}")),
         ServiceError::Refused(message) => TerminalError::Refused(message),
+        // The execution authority's typed denial is a refusal at the ACP
+        // boundary too: no PTY was created, nothing was journaled.
+        ServiceError::Denied(message) => TerminalError::Refused(message),
         ServiceError::Unavailable(message) => TerminalError::Unavailable(message),
     }
 }

@@ -34,15 +34,19 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
+use faktor_core::capability::{Capability, CapabilityKind, CapabilitySet, PermissionDecision};
 use faktor_core::id::{OpId, SessionId, TaskId};
 use faktor_pty::{EnvSpec, Pty, PtyConfig};
+use faktor_sandbox::{PermissionEngine, Rule, SandboxPolicy};
 use faktor_session::{
     SessionHandle, SessionManager, TerminalDurableRow, TerminalEventKind, TerminalLedgerRecord,
     TERMINAL_RECONCILE_COLLECTED, TERMINAL_RECONCILE_KILLED,
 };
+use serde::{Deserialize, Serialize};
 
 /// Bound of one terminal command / arg / cwd (bytes; mirrors the ACP param
 /// bounds and the native terminal spawn body).
@@ -132,6 +136,9 @@ pub enum TerminalServiceError {
     },
     /// The spawn/pty operation was refused.
     Refused(String),
+    /// The execution authority denied the spawn (typed; no PTY was created
+    /// and nothing was journaled).
+    Denied(String),
     /// No capacity, or the resource is gone.
     Unavailable(String),
 }
@@ -177,6 +184,9 @@ impl fmt::Display for TerminalServiceError {
                  pid is never adopted)"
             ),
             TerminalServiceError::Refused(message) => write!(f, "terminal refused: {message}"),
+            TerminalServiceError::Denied(message) => {
+                write!(f, "terminal execution denied: {message}")
+            }
             TerminalServiceError::Unavailable(message) => {
                 write!(f, "terminal unavailable: {message}")
             }
@@ -185,6 +195,12 @@ impl fmt::Display for TerminalServiceError {
 }
 
 impl std::error::Error for TerminalServiceError {}
+
+impl From<ExecutionDenial> for TerminalServiceError {
+    fn from(denial: ExecutionDenial) -> Self {
+        TerminalServiceError::Denied(denial.to_string())
+    }
+}
 
 impl From<TerminalServiceError> for TerminalRegistryError {
     fn from(error: TerminalServiceError) -> Self {
@@ -217,6 +233,533 @@ pub struct TerminalSpawnRequest {
     pub env: Vec<String>,
     pub rows: u16,
     pub cols: u16,
+}
+
+// ------------------------------------------------------- execution authority
+
+/// The durable spawn principal: the session/task (and optional child agent)
+/// identity a caller proved ownership of. The authority denies a principal
+/// that is not the requested session's own durable identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalPrincipal {
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub agent_id: Option<String>,
+}
+
+impl TerminalPrincipal {
+    /// The owner principal of one durable session row.
+    pub fn owner(session_id: SessionId, task_id: TaskId, agent_id: Option<String>) -> Self {
+        Self {
+            session_id,
+            task_id,
+            agent_id,
+        }
+    }
+}
+
+/// The CPU / memory / process-count / wall-time budgets one authorized
+/// terminal carries. Recorded as the spawn's effective profile evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalBudgets {
+    /// Max CPU time of the process tree in milliseconds.
+    pub cpu_millis: u64,
+    /// Max resident memory of the process tree in bytes.
+    pub memory_bytes: u64,
+    /// Max live processes of the tree.
+    pub max_processes: u32,
+    /// Max wall-clock lifetime in milliseconds.
+    pub wall_time_ms: u64,
+}
+
+impl Default for TerminalBudgets {
+    fn default() -> Self {
+        Self {
+            cpu_millis: 30 * 60 * 1000,
+            memory_bytes: 2 * 1024 * 1024 * 1024,
+            max_processes: 256,
+            wall_time_ms: 24 * 60 * 60 * 1000,
+        }
+    }
+}
+
+/// The EFFECTIVE execution profile admitted for one terminal spawn — the
+/// durable row records THIS, not merely the owner: which candidate root the
+/// session resolved to, the authorized cwd, the granted capabilities, the
+/// filesystem/network projections and the budgets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionProfile {
+    pub session_id: u64,
+    pub task_id: u64,
+    pub workspace_id: u64,
+    pub agent_id: Option<String>,
+    /// The canonical candidate root the session resolved to (its live
+    /// candidate/shadow root, else its workspace root).
+    pub candidate_root: String,
+    /// The canonical cwd the child is admitted to run in.
+    pub cwd: String,
+    /// The granted capability set (`*` | `read,write` | empty).
+    pub capabilities: String,
+    /// The filesystem projection tag (`workspace` |
+    /// `workspace+external:<read>-<write>`).
+    pub filesystem: String,
+    /// The network guarantee tag (`none` | `best_effort` | `required`).
+    pub network: String,
+    pub budgets: TerminalBudgets,
+    /// The env NAMES (never values) the child is admitted to copy.
+    pub env_names: Vec<String>,
+    /// True when the cwd was admitted through an explicit external grant
+    /// rather than the candidate root itself.
+    pub external_cwd_granted: bool,
+}
+
+impl ExecutionProfile {
+    /// The bounded JSON evidence recorded on the durable terminal row. A
+    /// serialization failure can only be a programming error; it degrades to
+    /// the empty (legacy) profile, never a panic on the authority path.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// Parse a durable profile back. `None` for the empty (legacy) profile or
+    /// a corrupt value: the profile is evidence, never a gate.
+    pub fn parse(json: &str) -> Option<Self> {
+        if json.is_empty() {
+            return None;
+        }
+        serde_json::from_str(json).ok()
+    }
+}
+
+/// A spawn admitted by an [`ExecutionAuthority`]: the resolved command, the
+/// authorized cwd and env-name projection, and the effective profile. A PTY
+/// is created ONLY from this value.
+#[derive(Debug, Clone)]
+pub struct AuthorizedTerminalSpawn {
+    command: String,
+    args: Vec<String>,
+    cwd: String,
+    env: Vec<String>,
+    rows: u16,
+    cols: u16,
+    profile: ExecutionProfile,
+}
+
+impl AuthorizedTerminalSpawn {
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    /// The authorized canonical cwd (never `None`: the authority resolves
+    /// the default to the candidate root).
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
+    pub fn env(&self) -> &[String] {
+        &self.env
+    }
+
+    pub fn rows(&self) -> u16 {
+        self.rows
+    }
+
+    pub fn cols(&self) -> u16 {
+        self.cols
+    }
+
+    pub fn profile(&self) -> &ExecutionProfile {
+        &self.profile
+    }
+
+    /// The PtyConfig of this admitted spawn. The env authority is the ONE
+    /// [`EnvSpec`] allowlist (names only; the deny-set applies at resolve).
+    pub fn to_pty_config(&self) -> PtyConfig {
+        let env = if self.env.is_empty() {
+            EnvSpec::default_baseline()
+        } else {
+            EnvSpec::Allowlisted(self.env.clone())
+        };
+        PtyConfig {
+            command: self.command.clone(),
+            args: self.args.clone(),
+            cwd: Some(self.cwd.clone()),
+            env,
+            rows: self.rows.max(1),
+            cols: self.cols.max(1),
+        }
+    }
+}
+
+/// Why one spawn was denied by the execution authority. Every variant is
+/// typed and maps to a typed refusal, never to a silent spawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionDenial {
+    /// The session id does not parse as a durable session id.
+    InvalidSession { session: String, reason: String },
+    /// No durable session row exists for the requested session.
+    UnknownSession { session: String },
+    /// The principal is not the requested session's own durable identity.
+    ForeignPrincipal { session: String, principal: String },
+    /// The session resolved to no usable candidate root.
+    RootUnavailable {
+        session: String,
+        root: String,
+        reason: String,
+    },
+    /// The requested cwd is outside the candidate root and no explicit
+    /// external grant covers it.
+    CwdOutsideCandidate { cwd: String, candidate_root: String },
+    /// The requested cwd cannot be resolved (missing/unreadable).
+    CwdUnavailable { cwd: String, reason: String },
+    /// The granted capability set does not include executing a shell.
+    CapabilityDenied { capability: String, reason: String },
+    /// One env name is not eligible for projection (empty/hostile).
+    EnvDenied { name: String, reason: String },
+    /// The budgets of the spawn could not be resolved.
+    BudgetUnavailable { resource: String, reason: String },
+}
+
+impl fmt::Display for ExecutionDenial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExecutionDenial::InvalidSession { session, reason } => {
+                write!(f, "invalid session {session:?}: {reason}")
+            }
+            ExecutionDenial::UnknownSession { session } => {
+                write!(f, "unknown session {session:?}")
+            }
+            ExecutionDenial::ForeignPrincipal { session, principal } => write!(
+                f,
+                "principal {principal:?} is not the owner of session {session:?}"
+            ),
+            ExecutionDenial::RootUnavailable {
+                session,
+                root,
+                reason,
+            } => write!(
+                f,
+                "session {session:?} resolved to no candidate root ({root:?}): {reason}"
+            ),
+            ExecutionDenial::CwdOutsideCandidate { cwd, candidate_root } => write!(
+                f,
+                "cwd {cwd:?} is outside the candidate root {candidate_root:?} and no explicit grant covers it"
+            ),
+            ExecutionDenial::CwdUnavailable { cwd, reason } => {
+                write!(f, "cwd {cwd:?} is unavailable: {reason}")
+            }
+            ExecutionDenial::CapabilityDenied {
+                capability,
+                reason,
+            } => write!(
+                f,
+                "capability {capability:?} denied for this spawn: {reason}"
+            ),
+            ExecutionDenial::EnvDenied { name, reason } => {
+                write!(f, "env name {name:?} denied: {reason}")
+            }
+            ExecutionDenial::BudgetUnavailable { resource, reason } => {
+                write!(f, "budget {resource:?} unavailable: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ExecutionDenial {}
+
+/// The ONE admission gate before any terminal PTY exists: resolves session →
+/// task/run → workspace/candidate root → granted capabilities → cwd
+/// authority → env projection → filesystem/network profiles → CPU/memory/
+/// process/time budgets, and returns the admitted spawn (or a typed denial).
+pub trait ExecutionAuthority: Send + Sync {
+    fn authorize_terminal_spawn(
+        &self,
+        principal: &TerminalPrincipal,
+        session: &str,
+        request: &TerminalSpawnRequest,
+    ) -> Result<AuthorizedTerminalSpawn, ExecutionDenial>;
+}
+
+/// The resolvable execution policy of one session: its granted capability
+/// set, its explicit external-cwd grants, the sandbox policy that projects
+/// the filesystem/network profile, and its budgets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalAuthorityPolicy {
+    pub granted: CapabilitySet,
+    /// Explicitly granted external cwd roots: a cwd under one of these is
+    /// admitted even though it is outside the candidate root. Empty by
+    /// default — external cwd authority is never implicit.
+    pub external_cwd_grants: Vec<PathBuf>,
+    pub sandbox: SandboxPolicy,
+    pub budgets: TerminalBudgets,
+}
+
+impl Default for TerminalAuthorityPolicy {
+    fn default() -> Self {
+        Self {
+            granted: CapabilitySet::ALL,
+            external_cwd_grants: Vec::new(),
+            // A daemon terminal is an interactive shell authority: the
+            // policy allows ExecuteShell by default (the interactive `Ask`
+            // rule of the tool path does not apply to an already-proven
+            // session-owned terminal).
+            sandbox: SandboxPolicy {
+                execute_shell: Rule::Allow,
+                ..SandboxPolicy::default()
+            },
+            budgets: TerminalBudgets::default(),
+        }
+    }
+}
+
+/// The production execution authority: resolves a session's durable rows
+/// (the session manager is the ONE authority) against a
+/// [`TerminalAuthorityPolicy`]. Every read is fail-closed: unknown sessions,
+/// unowned principals, missing candidate roots and out-of-candidate cwds are
+/// typed denials, never guessed values.
+pub struct SessionExecutionAuthority {
+    session: Arc<SessionManager>,
+    policy: TerminalAuthorityPolicy,
+}
+
+impl SessionExecutionAuthority {
+    /// The authority over `session` with the default policy.
+    pub fn new(session: Arc<SessionManager>) -> Self {
+        Self::with_policy(session, TerminalAuthorityPolicy::default())
+    }
+
+    /// The authority over `session` with an explicit policy (test seam and
+    /// hosts with a stricter grant story).
+    pub fn with_policy(session: Arc<SessionManager>, policy: TerminalAuthorityPolicy) -> Self {
+        Self { session, policy }
+    }
+
+    /// Resolve the authorized cwd: the candidate root by default, a path
+    /// inside it, or an explicitly granted external root; anything else is
+    /// denied. Canonicalization follows symlinks, so a link inside the
+    /// candidate that points outside is denied too.
+    fn resolve_cwd(
+        &self,
+        candidate_root: &Path,
+        requested: Option<&str>,
+    ) -> Result<(String, bool), ExecutionDenial> {
+        let candidate = |reason: String| ExecutionDenial::CwdUnavailable {
+            cwd: requested.unwrap_or_default().to_string(),
+            reason,
+        };
+        let join = |raw: &str| {
+            let path = Path::new(raw);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                candidate_root.join(path)
+            }
+        };
+        let (path, external) = match requested {
+            None | Some("") => (candidate_root.to_path_buf(), false),
+            Some(raw) => (join(raw), true),
+        };
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| candidate(format!("cannot resolve the cwd: {e}")))?;
+        if !canonical.is_dir() {
+            return Err(candidate(format!(
+                "the cwd {} is not a directory",
+                canonical.display()
+            )));
+        }
+        if canonical.starts_with(candidate_root) {
+            return Ok((canonical.to_string_lossy().into_owned(), false));
+        }
+        for grant in &self.policy.external_cwd_grants {
+            let grant_root = grant.canonicalize().unwrap_or_else(|_| grant.to_path_buf());
+            if canonical.starts_with(&grant_root) {
+                return Ok((canonical.to_string_lossy().into_owned(), external));
+            }
+        }
+        Err(ExecutionDenial::CwdOutsideCandidate {
+            cwd: canonical.to_string_lossy().into_owned(),
+            candidate_root: candidate_root.to_string_lossy().into_owned(),
+        })
+    }
+}
+
+impl ExecutionAuthority for SessionExecutionAuthority {
+    fn authorize_terminal_spawn(
+        &self,
+        principal: &TerminalPrincipal,
+        session: &str,
+        request: &TerminalSpawnRequest,
+    ) -> Result<AuthorizedTerminalSpawn, ExecutionDenial> {
+        let raw: u64 = session
+            .parse()
+            .map_err(|_| ExecutionDenial::InvalidSession {
+                session: session.to_string(),
+                reason: "not a decimal session id".into(),
+            })?;
+        if raw == 0 {
+            return Err(ExecutionDenial::InvalidSession {
+                session: session.to_string(),
+                reason: "session id cannot be 0".into(),
+            });
+        }
+        let sid = SessionId::new(raw);
+        // The principal must be the requested session's OWN durable owner.
+        if principal.session_id != sid {
+            return Err(ExecutionDenial::ForeignPrincipal {
+                session: session.to_string(),
+                principal: principal.session_id.to_string(),
+            });
+        }
+        let row = self
+            .session
+            .store()
+            .get_session(sid)
+            .map_err(|e| ExecutionDenial::RootUnavailable {
+                session: session.to_string(),
+                root: String::new(),
+                reason: format!("session read failed: {e}"),
+            })?
+            .ok_or_else(|| ExecutionDenial::UnknownSession {
+                session: session.to_string(),
+            })?;
+        if principal.task_id != row.task_id {
+            return Err(ExecutionDenial::ForeignPrincipal {
+                session: session.to_string(),
+                principal: principal.task_id.to_string(),
+            });
+        }
+        // session → task/run → workspace/candidate root: the live shadow
+        // (candidate) root while one is active, else the durable workspace
+        // root. Both come from durable rows; neither is guessed.
+        let root = self
+            .session
+            .resolve_workspace_root(sid)
+            .map_err(|e| ExecutionDenial::RootUnavailable {
+                session: session.to_string(),
+                root: String::new(),
+                reason: format!("root resolution failed: {e}"),
+            })?
+            .ok_or_else(|| ExecutionDenial::RootUnavailable {
+                session: session.to_string(),
+                root: String::new(),
+                reason: "the session's workspace row carries no root".into(),
+            })?;
+        let candidate_root = root
+            .canonicalize()
+            .map_err(|e| ExecutionDenial::RootUnavailable {
+                session: session.to_string(),
+                root: root.to_string_lossy().into_owned(),
+                reason: format!("candidate root is not resolvable: {e}"),
+            })?;
+        let meta = std::fs::symlink_metadata(&candidate_root).map_err(|e| {
+            ExecutionDenial::RootUnavailable {
+                session: session.to_string(),
+                root: candidate_root.to_string_lossy().into_owned(),
+                reason: format!("candidate root metadata failed: {e}"),
+            }
+        })?;
+        if !meta.file_type().is_dir() {
+            return Err(ExecutionDenial::RootUnavailable {
+                session: session.to_string(),
+                root: candidate_root.to_string_lossy().into_owned(),
+                reason: "the candidate root is not a directory".into(),
+            });
+        }
+        // Granted capabilities: the class gate first, then the sandbox
+        // policy's own rule (an Ask rule cannot be satisfied silently by a
+        // non-interactive authority, so it is a typed denial).
+        if !self.policy.granted.contains(CapabilityKind::Execute) {
+            return Err(ExecutionDenial::CapabilityDenied {
+                capability: "execute".into(),
+                reason: format!(
+                    "the session's granted capability set ({}) does not include execute",
+                    self.policy.granted
+                ),
+            });
+        }
+        let capability = Capability::ExecuteShell {
+            command: request.command.clone(),
+        };
+        let engine =
+            PermissionEngine::new(self.policy.sandbox.clone(), Some(candidate_root.clone()));
+        match engine.evaluate(&capability) {
+            PermissionDecision::Allow => {}
+            PermissionDecision::Deny => {
+                return Err(ExecutionDenial::CapabilityDenied {
+                    capability: "execute_shell".into(),
+                    reason: "the sandbox policy denies ExecuteShell".into(),
+                })
+            }
+            PermissionDecision::Ask => {
+                return Err(ExecutionDenial::CapabilityDenied {
+                    capability: "execute_shell".into(),
+                    reason: "the sandbox policy requires interactive approval the terminal \
+                             authority cannot obtain"
+                        .into(),
+                })
+            }
+        }
+        // cwd authority: candidate root by default, external only with an
+        // explicit grant.
+        let (cwd, external_cwd_granted) =
+            self.resolve_cwd(&candidate_root, request.cwd.as_deref())?;
+        // env projection: names only, bounded and NUL-free (values never
+        // cross here; the ONE EnvSpec allowlist resolves them at spawn).
+        let mut env_names: Vec<String> = Vec::new();
+        for name in &request.env {
+            if name.is_empty() || name.len() > MAX_TERMINAL_ENV_NAME_BYTES || name.contains('\0') {
+                return Err(ExecutionDenial::EnvDenied {
+                    name: name.clone(),
+                    reason: format!(
+                        "env names must be 1..={MAX_TERMINAL_ENV_NAME_BYTES} bytes without NUL"
+                    ),
+                });
+            }
+            if !env_names.contains(name) {
+                env_names.push(name.clone());
+            }
+        }
+        // Budgets: the policy's resolved budgets. An unresolvable budget is
+        // a typed denial (bounded everything), never an implicit unlimited.
+        let budgets = self.policy.budgets;
+        if budgets.wall_time_ms == 0 || budgets.max_processes == 0 {
+            return Err(ExecutionDenial::BudgetUnavailable {
+                resource: "wall_time_ms/max_processes".into(),
+                reason: "the resolved budgets must be non-zero".into(),
+            });
+        }
+        let spawn_profile = self.policy.sandbox.spawn_profile();
+        let profile = ExecutionProfile {
+            session_id: sid.raw(),
+            task_id: row.task_id.raw(),
+            workspace_id: row.workspace_id.raw(),
+            agent_id: principal.agent_id.clone(),
+            candidate_root: candidate_root.to_string_lossy().into_owned(),
+            cwd,
+            capabilities: self.policy.granted.to_string(),
+            filesystem: spawn_profile.filesystem,
+            network: spawn_profile.network,
+            budgets,
+            env_names: env_names.clone(),
+            external_cwd_granted,
+        };
+        Ok(AuthorizedTerminalSpawn {
+            command: request.command.clone(),
+            args: request.args.clone(),
+            cwd: profile.cwd.clone(),
+            env: env_names,
+            rows: request.rows,
+            cols: request.cols,
+            profile,
+        })
+    }
 }
 
 /// The OS-level identity of one terminal's child process: the pid plus the
@@ -256,6 +799,9 @@ pub struct TerminalView {
     pub detail: String,
     /// The numeric daemon-level pty id of a live row (legacy cache key).
     pub pty_id: Option<u64>,
+    /// The durable EFFECTIVE execution profile JSON the spawn was admitted
+    /// under (empty = a legacy row written before the authority existed).
+    pub execution_profile: String,
 }
 
 impl TerminalView {
@@ -340,6 +886,7 @@ impl DurableTerminal {
             exit_code: self.exit_code,
             detail: self.detail.clone(),
             pty_id: live.map(|row| row.pty_id),
+            execution_profile: self.row.execution_profile.clone(),
         }
     }
 
@@ -438,6 +985,9 @@ impl fmt::Debug for LiveRow {
 pub struct TerminalService {
     session: Arc<SessionManager>,
     probe: IdentityProbe,
+    /// The ONE execution authority: no PTY is created without an
+    /// [`AuthorizedTerminalSpawn`] it admitted.
+    authority: Arc<dyn ExecutionAuthority>,
     next_pty_id: AtomicU64,
     /// Live pty handles of THIS boot, keyed by terminal UUID.
     live: Mutex<HashMap<String, Arc<LiveRow>>>,
@@ -523,10 +1073,30 @@ impl TerminalService {
         Arc::new(Self::with_probe(session, probe))
     }
 
+    /// An unregistered service over an explicit execution authority (the
+    /// adversarial/test seam: a stricter grant story than the default).
+    pub fn with_execution_authority(
+        session: Arc<SessionManager>,
+        probe: IdentityProbe,
+        authority: Arc<dyn ExecutionAuthority>,
+    ) -> Arc<Self> {
+        Arc::new(Self::with_probe_and_authority(session, probe, authority))
+    }
+
     fn with_probe(session: Arc<SessionManager>, probe: IdentityProbe) -> Self {
+        let authority = Arc::new(SessionExecutionAuthority::new(session.clone()));
+        Self::with_probe_and_authority(session, probe, authority)
+    }
+
+    fn with_probe_and_authority(
+        session: Arc<SessionManager>,
+        probe: IdentityProbe,
+        authority: Arc<dyn ExecutionAuthority>,
+    ) -> Self {
         Self {
             session,
             probe,
+            authority,
             next_pty_id: AtomicU64::new(1),
             live: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashSet::new()),
@@ -892,10 +1462,13 @@ impl TerminalService {
 
     // ----------------------------------------------------------- the surface
 
-    /// Spawn one session-owned terminal. The durable `terminal_created` row
-    /// is journaled before the row is exposed; the `terminal_running` row
-    /// follows once the child identity is known. A spawn/store failure kills
-    /// the just-spawned pty before returning, so no child is ever orphaned.
+    /// Spawn one session-owned terminal. The spawn is admitted by the ONE
+    /// [`ExecutionAuthority`] FIRST (a denial journals nothing and creates no
+    /// PTY); the durable `terminal_created` row — carrying the effective
+    /// execution profile — is journaled before the row is exposed, then the
+    /// `terminal_running` row once the child identity is known. A spawn/store
+    /// failure kills the just-spawned pty before returning, so no child is
+    /// ever orphaned.
     pub fn spawn(
         self: &Arc<Self>,
         session_id: &str,
@@ -907,6 +1480,14 @@ impl TerminalService {
             .map_err(|e| TerminalServiceError::Refused(e.message))?;
         validate_spawn_request(request)?;
         let sid = handle.id();
+        // The principal is the session's own durable identity: every caller
+        // of this surface already proved session ownership, and the
+        // authority re-verifies it against the durable row.
+        let principal = TerminalPrincipal::owner(sid, row.task_id, None);
+        let authorized = self
+            .authority
+            .authorize_terminal_spawn(&principal, session_id, request)
+            .map_err(|denial| TerminalServiceError::Denied(denial.to_string()))?;
         self.ensure_recovered(&handle, sid.raw())?;
         self.sweep_live();
 
@@ -916,36 +1497,25 @@ impl TerminalService {
             )));
         }
 
-        let env = if request.env.is_empty() {
-            EnvSpec::default_baseline()
-        } else {
-            // The name allowlist rides the ONE env authority: values never
-            // cross, and the secret deny-set applies inside `resolve()`.
-            EnvSpec::Allowlisted(request.env.clone())
-        };
-        let cfg = PtyConfig {
-            command: request.command.clone(),
-            args: request.args.clone(),
-            cwd: request.cwd.clone(),
-            env,
-            rows: request.rows.max(1),
-            cols: request.cols.max(1),
-        };
-
         let terminal_id = new_terminal_id();
         self.lock_inflight().insert(terminal_id.clone());
-        let prepared = self.prepare_spawn(&handle, row.task_id, &terminal_id, cfg);
+        let prepared = self.prepare_spawn(&handle, &terminal_id, authorized);
         self.lock_inflight().remove(&terminal_id);
         prepared
     }
 
+    /// Create the PTY of one ADMITTED spawn. This is the only place a
+    /// session-owned PTY is created: the effective profile is journaled on
+    /// the durable row before any caller can observe the terminal.
     fn prepare_spawn(
         self: &Arc<Self>,
         handle: &SessionHandle,
-        task_id: TaskId,
         terminal_id: &str,
-        cfg: PtyConfig,
+        authorized: AuthorizedTerminalSpawn,
     ) -> Result<TerminalCreation, TerminalServiceError> {
+        let profile = authorized.profile().clone();
+        let task_id = TaskId::new(profile.task_id);
+        let cfg = authorized.to_pty_config();
         let pty = Pty::spawn(&cfg).map_err(|e| TerminalServiceError::Refused(e.message))?;
         let pid = pty.pid();
         let start_time_ms = (self.probe)(pid).unwrap_or(0);
@@ -954,11 +1524,12 @@ impl TerminalService {
             terminal_id: terminal_id.to_string(),
             session_id: handle.id().raw(),
             task_id: task_id.raw(),
-            agent_id: None,
+            agent_id: profile.agent_id.clone(),
             operation_id: self.session.next_op_id().raw(),
             pid,
             start_time_ms,
             at_ms: self.session.now_ms(),
+            execution_profile: profile.to_json(),
         };
 
         let created_row = durable.clone();
@@ -1839,6 +2410,287 @@ mod tests {
             }
             Err(other) => panic!("unexpected spawn failure: {other}"),
         }
+    }
+
+    // ------------------------------------------------ execution authority
+
+    /// A manager whose workspace root is a REAL directory (`root`), plus one
+    /// session on it.
+    fn manager_at(
+        base: &std::path::Path,
+        root: &std::path::Path,
+        title: &str,
+    ) -> (Arc<SessionManager>, String) {
+        let manager = SessionManager::open(base.join("store"), base.join("cas"), true).unwrap();
+        let ws = manager.create_workspace(root.to_str().unwrap()).unwrap();
+        let sid = manager
+            .create_session(ws, title, "fake", "m")
+            .unwrap()
+            .id()
+            .to_string();
+        (manager, sid)
+    }
+
+    fn principal_of(manager: &Arc<SessionManager>, sid: &str) -> TerminalPrincipal {
+        let row = manager
+            .get_session(SessionId::new(sid.parse().unwrap()))
+            .unwrap()
+            .unwrap()
+            .row()
+            .unwrap();
+        TerminalPrincipal::owner(row.id, row.task_id, None)
+    }
+
+    #[test]
+    fn authority_denies_foreign_and_unknown_principals_before_any_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("candidate");
+        std::fs::create_dir_all(&root).unwrap();
+        let (manager, a) = manager_at(dir.path(), &root, "authority-a");
+        let ws = manager
+            .get_session(SessionId::new(a.parse().unwrap()))
+            .unwrap()
+            .unwrap()
+            .row()
+            .unwrap()
+            .workspace_id;
+        let b = manager
+            .create_session(ws, "authority-b", "fake", "m")
+            .unwrap()
+            .id()
+            .to_string();
+        let authority = SessionExecutionAuthority::new(manager.clone());
+        let request = spawn_request("/bin/sh", &["-c", "true"]);
+
+        // A principal that is not the requested session's owner is denied
+        // typed (the denied spawn creates no PTY and journals nothing).
+        let foreign = principal_of(&manager, &a);
+        match authority.authorize_terminal_spawn(&foreign, &b, &request) {
+            Err(ExecutionDenial::ForeignPrincipal { .. }) => {}
+            other => panic!("foreign principal must be denied: {other:?}"),
+        }
+        // An unknown session id is denied typed, never guessed.
+        let unknown = TerminalPrincipal::owner(SessionId::new(9_999_999), TaskId::new(1), None);
+        match authority.authorize_terminal_spawn(&unknown, "9999999", &request) {
+            Err(ExecutionDenial::UnknownSession { .. }) => {}
+            other => panic!("unknown session must be denied: {other:?}"),
+        }
+        // A hostile session string is denied typed too.
+        match authority.authorize_terminal_spawn(&unknown, "not-a-session", &request) {
+            Err(ExecutionDenial::InvalidSession { .. }) => {}
+            other => panic!("hostile session id must be denied: {other:?}"),
+        }
+
+        // Service level: a denied admission leaves no live row and no
+        // durable terminal row behind, for EITHER session.
+        let denied_policy = TerminalAuthorityPolicy {
+            granted: CapabilitySet::EMPTY,
+            ..TerminalAuthorityPolicy::default()
+        };
+        let (probe, _map) = recording_probe();
+        let service = TerminalService::with_execution_authority(
+            manager.clone(),
+            probe,
+            Arc::new(SessionExecutionAuthority::with_policy(
+                manager.clone(),
+                denied_policy,
+            )),
+        );
+        // An unknown session is the service's own typed refusal.
+        match service.spawn("424242", &request) {
+            Err(TerminalServiceError::Invalid(_)) => {}
+            other => panic!("unknown session spawn must be refused: {:?}", other.err()),
+        }
+        // A real session whose grant denies Execute is denied typed and
+        // journals nothing, on both sessions.
+        for target in [&a, &b] {
+            match service.spawn(target, &request) {
+                Err(TerminalServiceError::Denied(_)) => {}
+                other => panic!("capability denial must be typed: {:?}", other.err()),
+            }
+        }
+        assert_eq!(service.live_rows(), 0);
+        for target in [&a, &b] {
+            let handle = manager
+                .get_session(SessionId::new(target.parse().unwrap()))
+                .unwrap()
+                .unwrap();
+            assert!(handle.ledger_terminal_rows(None).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn authority_denies_external_cwd_without_grant_and_admits_it_with_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("candidate");
+        let inside = root.join("sub");
+        std::fs::create_dir_all(&inside).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let (manager, sid) = manager_at(dir.path(), &root, "authority-cwd");
+        let principal = principal_of(&manager, &sid);
+        let authority = SessionExecutionAuthority::new(manager.clone());
+
+        // Default cwd = the candidate root itself, admitted with the exact
+        // profile (no external grant).
+        let admitted = authority
+            .authorize_terminal_spawn(&principal, &sid, &spawn_request("/bin/sh", &["-c", "true"]))
+            .unwrap();
+        assert_eq!(
+            admitted.cwd(),
+            root.canonicalize().unwrap().to_string_lossy()
+        );
+        assert!(!admitted.profile().external_cwd_granted);
+        assert_eq!(
+            admitted.profile().candidate_root,
+            root.canonicalize().unwrap().to_string_lossy()
+        );
+
+        // A cwd inside the candidate (relative or absolute) is admitted.
+        let mut inside_request = spawn_request("/bin/sh", &["-c", "true"]);
+        inside_request.cwd = Some("sub".into());
+        let admitted = authority
+            .authorize_terminal_spawn(&principal, &sid, &inside_request)
+            .unwrap();
+        assert_eq!(
+            admitted.cwd(),
+            inside.canonicalize().unwrap().to_string_lossy()
+        );
+        assert!(!admitted.profile().external_cwd_granted);
+
+        // A path outside the candidate is denied unless THIs authority
+        // carries an explicit grant; traversal out is denied too.
+        for escape in [
+            outside.path().to_string_lossy().into_owned(),
+            format!("{}", outside.path().join("..").display()),
+            "../..".to_string(),
+        ] {
+            let mut request = spawn_request("/bin/sh", &["-c", "true"]);
+            request.cwd = Some(escape.clone());
+            match authority.authorize_terminal_spawn(&principal, &sid, &request) {
+                Err(ExecutionDenial::CwdOutsideCandidate { .. }) => {}
+                other => panic!("external cwd {escape:?} must be denied: {other:?}"),
+            }
+        }
+
+        // A nonexistent cwd is a typed denial, never a guessed root.
+        let mut ghost = spawn_request("/bin/sh", &["-c", "true"]);
+        ghost.cwd = Some("does-not-exist".into());
+        match authority.authorize_terminal_spawn(&principal, &sid, &ghost) {
+            Err(ExecutionDenial::CwdUnavailable { .. }) => {}
+            other => panic!("missing cwd must be denied: {other:?}"),
+        }
+
+        // The explicit grant admits the external cwd and the profile says so.
+        let grant = TerminalAuthorityPolicy {
+            external_cwd_grants: vec![outside.path().to_path_buf()],
+            ..TerminalAuthorityPolicy::default()
+        };
+        let granting = SessionExecutionAuthority::with_policy(manager, grant);
+        let mut request = spawn_request("/bin/sh", &["-c", "true"]);
+        request.cwd = Some(outside.path().to_string_lossy().into_owned());
+        let admitted = granting
+            .authorize_terminal_spawn(&principal, &sid, &request)
+            .unwrap();
+        assert_eq!(
+            admitted.cwd(),
+            outside.path().canonicalize().unwrap().to_string_lossy()
+        );
+        assert!(admitted.profile().external_cwd_granted);
+    }
+
+    #[test]
+    fn capability_denied_shell_creates_no_pty_and_no_durable_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("candidate");
+        std::fs::create_dir_all(&root).unwrap();
+        let (manager, sid) = manager_at(dir.path(), &root, "authority-caps");
+        let policy = TerminalAuthorityPolicy {
+            granted: CapabilitySet::from_kinds(&[CapabilityKind::Read]),
+            ..TerminalAuthorityPolicy::default()
+        };
+        let authority = SessionExecutionAuthority::with_policy(manager.clone(), policy);
+        let (probe, _map) = recording_probe();
+        let service =
+            TerminalService::with_execution_authority(manager.clone(), probe, Arc::new(authority));
+        match service.spawn(&sid, &spawn_request("/bin/sleep", &["30"])) {
+            Err(TerminalServiceError::Denied(message)) => {
+                assert!(message.contains("execute"), "{message}");
+            }
+            other => panic!("capability denial must be typed: {:?}", other.err()),
+        }
+        assert_eq!(service.live_rows(), 0);
+        let handle = manager
+            .get_session(SessionId::new(sid.parse().unwrap()))
+            .unwrap()
+            .unwrap();
+        assert!(
+            handle.ledger_terminal_rows(None).unwrap().is_empty(),
+            "a denied spawn journals nothing"
+        );
+    }
+
+    #[test]
+    fn authorized_spawn_records_the_exact_profile_durably_and_it_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("candidate");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let (manager, sid) = manager_at(dir.path(), &root, "authority-profile");
+        let (probe, _map) = recording_probe();
+        let service = TerminalService::with_execution_authority(
+            manager.clone(),
+            probe,
+            Arc::new(SessionExecutionAuthority::new(manager.clone())),
+        );
+        let mut request = spawn_request("/bin/sleep", &["30"]);
+        request.cwd = Some("sub".into());
+        request.env = vec!["PATH".into(), "HOME".into()];
+        let Some(creation) = spawn_or_skip(&service, &sid, &request) else {
+            return;
+        };
+        let view = &creation.view;
+        assert!(
+            !view.execution_profile.is_empty(),
+            "the durable row records the effective profile"
+        );
+        let profile = ExecutionProfile::parse(&view.execution_profile).expect("profile JSON");
+        assert_eq!(profile.session_id, sid.parse::<u64>().unwrap());
+        assert_eq!(profile.task_id, 1);
+        assert_eq!(
+            profile.candidate_root,
+            root.canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(profile.cwd, sub.canonicalize().unwrap().to_string_lossy());
+        assert_eq!(profile.capabilities, "*");
+        assert_eq!(profile.filesystem, "workspace+external:ask-ask");
+        assert_eq!(profile.network, "none");
+        assert_eq!(profile.budgets, TerminalBudgets::default());
+        assert_eq!(
+            profile.env_names,
+            vec!["PATH".to_string(), "HOME".to_string()]
+        );
+        assert!(!profile.external_cwd_granted);
+
+        // The durable Created/Running rows carry the byte-identical profile.
+        let handle = manager
+            .get_session(SessionId::new(sid.parse().unwrap()))
+            .unwrap()
+            .unwrap();
+        let rows = handle.ledger_terminal_rows(None).unwrap();
+        assert_eq!(rows.len(), 2);
+        for record in &rows {
+            assert_eq!(record.row.execution_profile, view.execution_profile);
+        }
+
+        // Reopen: a fresh service over the same durable store projects the
+        // SAME profile (the profile is a durable row fact, not daemon memory).
+        let restarted = TerminalService::detached(manager.clone(), Arc::new(|_pid: u32| None));
+        let views = restarted.list(&sid).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].execution_profile, view.execution_profile);
+        let rebuilt = ExecutionProfile::parse(&views[0].execution_profile).expect("profile JSON");
+        assert_eq!(rebuilt.cwd, profile.cwd);
+        let _ = service.kill(&sid, view.terminal_id.as_str(), "profile cleanup");
     }
 
     #[test]

@@ -25,22 +25,12 @@ import * as wb from '../src/workspaceBinding.ts';
 import * as px from '../src/pixelAgents.ts';
 import * as cp from '../src/cockpit.ts';
 import composerPolicy from '../media/composer-state.js';
-import { createHash } from 'node:crypto';
-import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
-import { bridgeTests } from './bridge-selftest.mjs';
-import {
-  bridgeCommandToHostMessage,
-  ingestWebviewMessage,
-  sendMessageFailedMessage,
-} from '../src/kilo-bridge.ts';
-import { stageBundle, verifyOverlay } from './prepare-vendored-webview.mjs';
-
 // `--packaged <extension-dir>` additionally asserts the extracted VSIX layout
-// (out/ + media/ + the pinned vendored webview closure) without a daemon.
+// (out/ + media/, the Faktor-owned panel) without a daemon.
 const packagedIndex = process.argv.indexOf('--packaged');
 const packagedDir = packagedIndex !== -1 ? process.argv[packagedIndex + 1] : null;
 
@@ -417,7 +407,26 @@ const verificationRecordJson = {
   ],
   changedFiles: [{ path: 'a.ts', digestHex: 'ab', size: 4 }],
   unrelatedChanges: [],
-  reviewer: null,
+  reviewer: 'review-bot',
+  candidateProof: {
+    taskRevision: 'rev1',
+    baseManifestHash: null,
+    candidateManifestHash: null,
+    sourceDiffEvidence: null,
+    riskReportEvidence: null,
+    accountingSnapshotDigest: null,
+    runId: 'run-1',
+    runBaseSnapshot: null,
+    candidateSnapshot: 'cand1234',
+    sourcesDigest: null,
+    changedFilesDigest: null,
+    publishedCommit: 'abcdef12',
+    remotePrHead: 'refs/9',
+  },
+  verifiedSnapshot: 'ver1234',
+  basedOnSnapshot: 'base1234',
+  sourceCount: 2,
+  landedSnapshot: 'land1234',
   status: 'passed',
   startedMs: 1,
   completedMs: 2,
@@ -1736,7 +1745,7 @@ async function pendingSubmissionTests() {
     assertEqual(started.length, 1);
   });
 
-  await test('every start failure restores the Kilo identity and never leaves a partial admission', async () => {
+  await test('every start failure restores the pending identity and never leaves a partial admission', async () => {
     const failures = [
       ['validation', new nc.NativeApiError(400, 'malformed', 'bad body', false)],
       ['unavailable model', new nc.NativeApiError(400, 'unknown_model', 'model "x" is not available', false)],
@@ -1773,16 +1782,14 @@ async function pendingSubmissionTests() {
       assertEqual(outcome.runId, null, `${label}: no durable run id may leak`);
       assertDeepEqual(calls, ['upload', 'start'], `${label}: exactly one attempt each, no retry`);
       assertEqual(restores.length, 1, `${label}: restore exactly once`);
-      // The ORIGINAL envelope identity/files survive verbatim; the Kilo
-      // restore message carries them back to the composer.
+      // The ORIGINAL envelope identity/files survive verbatim, so the host
+      // can restore the exact text and attachments into the draft.
       assertEqual(JSON.stringify(envelope), snapshot, `${label}: envelope untouched`);
-      const failed = sendMessageFailedMessage(envelope, restores[0].message);
-      assertEqual(failed.text, envelope.text);
-      assertEqual(failed.sessionID, '7');
-      assertEqual(failed.draftID, 'draft-1');
-      assertEqual(failed.messageID, 'msg-1');
-      assertEqual(failed.files[0].url, envelope.files[0].url, `${label}: images restored`);
-      assertEqual(failed.files[0].mime, 'image/png');
+      assert(envelope.text.length > 0, `${label}: restorable draft text must survive`);
+      assertEqual(envelope.sessionId, '7');
+      assertEqual(envelope.draftId, 'draft-1');
+      assertEqual(envelope.messageId, 'msg-1');
+      assertEqual(envelope.files[0].mime, 'image/png');
     }
   });
 
@@ -1853,9 +1860,7 @@ async function pendingSubmissionTests() {
       restores[0].message.includes('provider media/content parts are not wired'),
       restores[0].message,
     );
-    const failed = sendMessageFailedMessage(envelope, restores[0].message);
-    assertEqual(failed.text, envelope.text);
-    assertEqual(failed.files[0].url, envelope.files[0].url, 'the image draft payload is restored');
+    assert(envelope.files.length > 0, 'the image draft payload is kept for the restore');
     assertEqual(outcome.attachmentIds.length, 0);
   });
 
@@ -1882,69 +1887,29 @@ async function pendingSubmissionTests() {
     }
   });
 
-  await test('the bridge output feeds the host admission flow end to end', async () => {
-    const image = `data:image/png;base64,${Buffer.from([137, 80, 78, 71]).toString('base64')}`;
-    const raw = {
-      type: 'sendMessage',
-      text: 'inspect these',
-      sessionID: '7',
-      messageID: 'msg-9',
-      draftID: 'draft-9',
-      files: [
-        { url: 'data:application/pdf;base64,JVBERi0xLjQ=', mime: 'application/pdf', filename: 'spec.pdf' },
-        { url: image, mime: 'image/png', filename: 'shot.png' },
+  await test('a host-validated envelope with binary attachments uploads bytes first and starts with the durable ids', async () => {
+    const pending = ts.parsePendingSubmission({
+      text: 'attach spec',
+      sessionId: '7',
+      messageId: 'msg-9',
+      draftId: 'draft-9',
+      files: [],
+      attachments: [
+        {
+          mime: 'application/pdf',
+          filename: 'spec.pdf',
+          bytes: 8,
+          dataBase64: 'JVBERi0xLjQ=',
+          isImage: false,
+        },
       ],
-    };
-    const command = ingestWebviewMessage(raw, { workspaceDirectory: '/w' });
-    assertEqual(command.kind, 'sendMessage');
-    const host = bridgeCommandToHostMessage(command);
-    const pending = ts.parsePendingSubmission(host.pending);
-    assert(pending !== null, 'the host must accept the bridge envelope');
-    assertEqual(pending.attachments.length, 2, 'binary refs ride the pending envelope');
+    });
+    assert(pending !== null, 'the host must accept the envelope');
+    assertEqual(pending.attachments.length, 1, 'binary refs ride the pending envelope');
     assertEqual(pending.attachments[0].mime, 'application/pdf');
     assertEqual(pending.attachments[0].dataBase64, 'JVBERi0xLjQ=');
     assertEqual(pending.attachments[0].isImage, false);
-    assertEqual(pending.attachments[1].isImage, true);
 
-    // An image refuses the WHOLE submission loudly before any upload/start.
-    const calls = [];
-    const restores = [];
-    await ts.admitPendingSubmission({
-      client: {
-        uploadAttachment: async () => {
-          calls.push('upload');
-          throw new Error('images must never upload');
-        },
-        startTaskRun: async () => {
-          calls.push('start');
-          throw new Error('images must never start');
-        },
-      },
-      sessionId: '7',
-      pending,
-      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0 },
-      onStarted: () => {},
-      onFailure: () => {},
-      restore: (failure) => restores.push(failure),
-    });
-    assertDeepEqual(calls, [], 'no daemon calls for an image submission');
-    assertEqual(restores.length, 1);
-    assertEqual(restores[0].kind, 'image_unsupported');
-    const failed = sendMessageFailedMessage(pending, restores[0].message);
-    assertEqual(failed.messageID, 'msg-9');
-    assertEqual(failed.files[1].url, image, 'the image bytes return to the composer');
-
-    // Without the image the same flow uploads the exact bytes and starts
-    // with the durable typed id.
-    const textOnly = ts.parsePendingSubmission(
-      bridgeCommandToHostMessage(
-        ingestWebviewMessage({
-          type: 'sendMessage',
-          text: 'attach spec',
-          files: [{ url: 'data:application/pdf;base64,JVBERi0xLjQ=', mime: 'application/pdf', filename: 'spec.pdf' }],
-        }),
-      ).pending,
-    );
     const calls2 = [];
     let startedRequest = null;
     const outcome = await ts.admitPendingSubmission({
@@ -1960,7 +1925,7 @@ async function pendingSubmissionTests() {
         },
       },
       sessionId: '7',
-      pending: textOnly,
+      pending,
       settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0 },
       onStarted: () => {},
       onFailure: () => {},
@@ -2579,6 +2544,24 @@ async function cockpitTests() {
     assert(byKey.phase.present && byKey.phase.lines[0].includes('implementation'));
     assert(byKey.blockers.present && byKey.blockers.lines[0].includes('waiting on analysis'));
     assert(byKey.verification.present && byKey.verification.lines[0].includes('status passed'));
+    // The top-level summary renders VERIFIED only from a served record that
+    // proves the full criterion set, and carries the served review/tree/
+    // commit/remote-head/cost facts alongside criteria and checks.
+    assert(
+      byKey.verification.lines[1].startsWith('VERIFIED') &&
+        byKey.verification.lines[1].includes('criteria 1/1') &&
+        byKey.verification.lines[1].includes('checks failed 0') &&
+        byKey.verification.lines[1].includes('review review-bot') &&
+        byKey.verification.lines[1].includes('tree ver1234') &&
+        byKey.verification.lines[1].includes('commit abcdef12') &&
+        byKey.verification.lines[1].includes('head refs/9') &&
+        byKey.verification.lines[1].includes('cost 0.0000'),
+      JSON.stringify(byKey.verification.lines),
+    );
+    assert(
+      byKey.acceptance.lines.some((line) => line.includes('commit abcdef12')),
+      JSON.stringify(byKey.acceptance.lines),
+    );
     assert(
       byKey.evidence.present && byKey.evidence.evidence[0].id === 41,
       JSON.stringify(byKey.evidence),
@@ -3473,642 +3456,62 @@ async function reducedMotionTests() {
   });
 }
 
+// ------------------------------------------------------- packaged VSIX layout
 
-// ------------------------------------------- vendored webview packaging (P0)
-
-function sha256File(path) {
-  return createHash('sha256').update(readFileSync(path)).digest('hex');
-}
-
-function walkPackagedFiles(root) {
-  const out = [];
-  const visit = (dir, prefix) => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const rel = prefix.length > 0 ? `${prefix}/${entry.name}` : entry.name;
-      if (entry.isSymbolicLink()) {
-        throw new Error(`symlink not allowed in the packaged webview: ${rel}`);
-      }
-      if (entry.isDirectory()) {
-        visit(join(dir, entry.name), rel);
-      } else if (entry.isFile()) {
-        out.push(rel);
-      }
-    }
-  };
-  visit(root, '');
-  return out;
-}
-
-async function vendoredResolutionTests() {
-  await test('vendored resolution never leaves extensionUri (no checkout escape)', () => {
-    const source = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
-    assert(
-      source.includes("'media', 'kilo-v756-webview'"),
-      'vendoredRoot must join extensionUri with media/kilo-v756-webview',
-    );
-    assert(!/'\.\.',\s*'\.\.'/.test(source), 'checkout-relative ../.. resolution must be gone');
-    assert(source.includes('FAKTOR_UI_BUNDLE'), 'the explicit dev override must stay documented');
-    assert(source.includes('vendoredFallbackNotice'), 'the missing-bundle notice path must stay wired');
-  });
-}
-
+/** Assert the packaged layout is the Faktor-owned panel, self-contained. */
 async function packagedLayoutTests(dir) {
   await test(`packaged VSIX layout is self-contained (${dir})`, () => {
     assert(existsSync(dir), `packaged dir does not exist: ${dir}`);
     for (const rel of [
       'out/extension.js',
       'out/webview.js',
-      'out/kilo-bridge.js',
+      'out/daemon.js',
+      'out/steer.js',
       'media/chat.js',
       'media/chat.css',
       'media/composer-state.js',
       'media/faktor.svg',
-      'media/kilo-v756-webview/dist/webview.js',
-      'media/kilo-v756-webview/dist/webview.css',
-      'media/kilo-v756-webview/dist/shiki-worker.js',
     ]) {
       assert(existsSync(join(dir, ...rel.split('/'))), `packaged extension is missing ${rel}`);
     }
-    const webviewRoot = join(dir, 'media', 'kilo-v756-webview');
-    const files = walkPackagedFiles(webviewRoot);
-    assert(files.length >= 25, `packaged vendored webview must hold >= 25 files, found ${files.length}`);
-
+    // The Faktor-owned panel ships exactly the hand-written media files: an
+    // allowlist makes ANY extra file (a vendored closure included) a failure.
+    const media = readdirSync(join(dir, 'media')).sort();
+    assertDeepEqual(media, ['chat.css', 'chat.js', 'composer-state.js', 'faktor.svg'], 'media/ ships exactly the Faktor-owned panel');
+    // out/ ships exactly one compiled module per src/ module: an extra
+    // bridge/closure artifact is a failure even when nobody names it.
+    const sources = readdirSync(new URL('../src', import.meta.url))
+      .filter((name) => name.endsWith('.ts'))
+      .map((name) => name.replace(/\.ts$/, '.js'))
+      .sort();
+    const compiled = readdirSync(join(dir, 'out'))
+      .filter((name) => name.endsWith('.js'))
+      .sort();
+    assertDeepEqual(compiled, sources, 'out/ ships exactly the compiled src/ modules');
     const built = readFileSync(join(dir, 'out', 'webview.js'), 'utf8');
     assert(
-      built.includes("'media', 'kilo-v756-webview'"),
-      'compiled webview.js must resolve inside extensionUri/media/kilo-v756-webview',
+      built.includes("'media'") && built.includes("'chat.js'"),
+      'compiled webview.js must resolve the Faktor-owned media/chat.js',
     );
-    assert(!/'\.\.',\s*'\.\.'/.test(built), 'compiled webview.js must not escape the extension');
-
-    const manifestPath = fileURLToPath(
-      new URL('../../../ui/kilo-v756-webview/dist/build-manifest.json', import.meta.url),
-    );
-    assert(existsSync(manifestPath), `pinned manifest must exist: ${manifestPath}`);
-    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-    let verified = 0;
-    for (const file of manifest.vendored ?? []) {
-      const packaged = join(webviewRoot, ...file.path.split('/'));
-      assert(existsSync(packaged), `packaged vendored file missing: ${file.path}`);
-      const stat = statSync(packaged);
-      assert(
-        stat.size === file.size && sha256File(packaged) === file.sha256,
-        `packaged vendored file diverges from the pin: ${file.path}`,
-      );
-      verified += 1;
-    }
     assert(
-      verified === (manifest.vendored ?? []).length && verified > 0,
-      `expected the full pinned closure, verified ${verified}`,
+      !built.includes('FAKTOR_UI_BUNDLE') && !/'\.\.',\s*'\.\.'/.test(built),
+      'compiled webview.js must not reference a bundle override or checkout escape',
     );
-
-    // Additive Faktor overlay in the packaged layout: pinned by the overlay
-    // manifest, recorded in the staged build manifest, markers intact.
-    const packagedOverlayManifest = fileURLToPath(
-      new URL('../../../ui/kilo-v756-webview/dist/toolchain/overlay/overlay-manifest.json', import.meta.url),
-    );
-    assert(existsSync(packagedOverlayManifest), 'the overlay manifest must exist for packaged verification');
-    const overlayManifest = JSON.parse(readFileSync(packagedOverlayManifest, 'utf8'));
-    let overlayVerified = 0;
-    for (const file of overlayManifest.files ?? []) {
-      const packaged = join(webviewRoot, 'dist', 'overlay', ...file.path.split('/'));
-      assert(existsSync(packaged), `packaged overlay file missing: ${file.path}`);
-      const stat = statSync(packaged);
-      assert(
-        stat.size === file.size && sha256File(packaged) === file.sha256,
-        `packaged overlay file diverges: ${file.path}`,
-      );
-      overlayVerified += 1;
+    for (const rel of ['media/chat.js', 'media/composer-state.js', 'media/chat.css']) {
+      const text = readFileSync(join(dir, ...rel.split('/')), 'utf8');
+      assert(text.length > 0, `packaged ${rel} must not be empty`);
     }
-    assert(
-      overlayVerified === (overlayManifest.files ?? []).length && overlayVerified > 0,
-      `expected both overlay files, verified ${overlayVerified}`,
-    );
-    const stagedManifestPath = join(webviewRoot, 'dist', 'build-manifest.json');
-    assert(existsSync(stagedManifestPath), 'the staged build manifest must ship with the bundle');
-    const stagedManifest = JSON.parse(readFileSync(stagedManifestPath, 'utf8'));
-    assertEqual(
-      (stagedManifest.faktorOverlay?.files ?? []).length,
-      (overlayManifest.files ?? []).length,
-      'the staged manifest must record every merged overlay hash',
-    );
-    assertDeepEqual(
-      stagedManifest.vendored,
-      manifest.vendored,
-      'the packaged pinned vendored list must stay byte-identical',
-    );
-    const panel = readFileSync(
-      join(webviewRoot, 'dist', 'overlay', 'faktor-companion.js'),
-      'utf8',
-    );
+  });
+  await test(`packaged panel scripts carry a strict nonce-only CSP (${dir})`, () => {
+    const built = readFileSync(join(dir, 'out', 'webview.js'), 'utf8');
     for (const marker of [
-      'faktorTaskState',
-      'faktorAgents',
-      'faktorCockpit',
-      'faktorTournament',
-      'faktorEvidence',
-      'faktorBoardState',
-      'faktorAgentAction',
-      'faktorTournamentAction',
-      'faktorEvidenceExpand',
-      'faktorBoardAction',
+      "default-src 'none'",
+      "script-src 'nonce-",
+      "connect-src 'none'",
     ]) {
-      assert(panel.includes(marker), `packaged companion panel must consume/host ${marker}`);
+      assert(built.includes(marker), `compiled webview.js must keep the CSP marker ${marker}`);
     }
-  });
-}
-
-// ------------------------------------------ Faktor companion overlay build
-
-const OVERLAY_DIR = fileURLToPath(
-  new URL('../../../ui/kilo-v756-webview/dist/toolchain/overlay', import.meta.url),
-);
-const OVERLAY_MANIFEST_PATH = join(OVERLAY_DIR, 'overlay-manifest.json');
-const WEBVIEW_BUILD_MANIFEST = fileURLToPath(
-  new URL('../../../ui/kilo-v756-webview/dist/build-manifest.json', import.meta.url),
-);
-const UPSTREAM_MANIFEST = fileURLToPath(new URL('../../../ui/upstream.json', import.meta.url));
-
-async function overlayBuildTests() {
-  await test('overlay manifest verifies clean and refuses tampered/extra files', () => {
-    const clean = verifyOverlay();
-    assert(clean.ok, `clean overlay must verify: ${clean.errors.join('; ')}`);
-    assertEqual(clean.checked, 2, 'both panel files must be pinned');
-    const dir = mkdtempSync(join(tmpdir(), 'faktor-overlay-tamper-'));
-    try {
-      cpSync(OVERLAY_DIR, dir, { recursive: true });
-      writeFileSync(join(dir, 'faktor-companion.js'), '// tampered panel');
-      const tampered = verifyOverlay(dir);
-      assert(!tampered.ok, 'tampering must fail the overlay verification');
-      assert(
-        tampered.errors.some((error) => error.includes('hash mismatch')),
-        `expected a hash mismatch: ${tampered.errors.join('; ')}`,
-      );
-      writeFileSync(join(dir, 'intruder.js'), '// extra');
-      const extra = verifyOverlay(dir);
-      assert(
-        extra.errors.some((error) => error.includes('unexpected overlay file: intruder.js')),
-        `expected an unexpected-file error: ${extra.errors.join('; ')}`,
-      );
-      rmSync(join(dir, 'intruder.js'));
-      rmSync(join(dir, 'faktor-companion.js'));
-      const missing = verifyOverlay(dir);
-      assert(!missing.ok && missing.errors.some((error) => error.includes('missing')), 'missing file must fail');
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  await test('staging merges the companion panel and keeps upstream bytes pinned', async () => {
-    const manifestBefore = sha256File(WEBVIEW_BUILD_MANIFEST);
-    const pinned = JSON.parse(readFileSync(WEBVIEW_BUILD_MANIFEST, 'utf8'));
-    const overlay = JSON.parse(readFileSync(OVERLAY_MANIFEST_PATH, 'utf8'));
-    const tmp = mkdtempSync(join(tmpdir(), 'faktor-overlay-stage-'));
-    try {
-      const stats = await stageBundle(tmp);
-      assertEqual(stats.files, pinned.vendored.length, 'every pinned file must be staged');
-      assertEqual(stats.overlayFiles, overlay.files.length, 'every overlay file must be merged');
-      let verified = 0;
-      for (const file of pinned.vendored) {
-        const staged = join(tmp, ...file.path.split('/'));
-        assert(existsSync(staged), `staged pinned file missing: ${file.path}`);
-        const stat = statSync(staged);
-        assert(
-          stat.size === file.size && sha256File(staged) === file.sha256,
-          `staged upstream file diverges byte-for-byte: ${file.path}`,
-        );
-        verified += 1;
-      }
-      assert(verified > 0, 'the pinned closure must not be empty');
-      for (const file of overlay.files) {
-        const staged = join(tmp, 'dist', 'overlay', ...file.path.split('/'));
-        assert(existsSync(staged), `staged overlay file missing: ${file.path}`);
-        const stat = statSync(staged);
-        assert(
-          stat.size === file.size && sha256File(staged) === file.sha256,
-          `staged overlay file diverges: ${file.path}`,
-        );
-      }
-      const stagedManifest = JSON.parse(readFileSync(join(tmp, 'dist', 'build-manifest.json'), 'utf8'));
-      assertEqual(stagedManifest.faktorOverlay.files.length, overlay.files.length);
-      assertDeepEqual(
-        stagedManifest.vendored,
-        pinned.vendored,
-        'the staged manifest must keep the pinned vendored list byte-identical',
-      );
-      for (const entry of stagedManifest.faktorOverlay.files) {
-        assert(
-          entry.path.startsWith('dist/overlay/'),
-          `merged overlay must land under dist/overlay: ${entry.path}`,
-        );
-      }
-      assertEqual(
-        sha256File(WEBVIEW_BUILD_MANIFEST),
-        manifestBefore,
-        'staging must never mutate the pinned source manifest',
-      );
-      const upstream = JSON.parse(readFileSync(UPSTREAM_MANIFEST, 'utf8'));
-      const upstreamPaths = Object.keys(upstream.file_hashes ?? {});
-      assert(
-        upstreamPaths.every((path) => !path.includes('overlay/faktor-companion')),
-        'the overlay must never enter the upstream pin',
-      );
-      const panel = readFileSync(join(OVERLAY_DIR, 'faktor-companion.js'), 'utf8');
-      for (const marker of [
-        'faktorTaskState',
-        'faktorAgents',
-        'faktorCockpit',
-        'faktorTournament',
-        'faktorEvidence',
-        'faktorBoardState',
-        'faktor-companion',
-      ]) {
-        assert(panel.includes(marker), `companion panel must consume/host ${marker}`);
-      }
-    } finally {
-      rmSync(tmp, { recursive: true, force: true });
-    }
-  });
-}
-
-// --------------------------------------- companion panel (vm + fake DOM)
-
-function makePanelDom() {
-  function makeNode(tagName) {
-    const node = {
-      tagName,
-      id: '',
-      className: '',
-      textContent: '',
-      value: '',
-      rows: 0,
-      maxLength: 0,
-      type: '',
-      placeholder: '',
-      disabled: false,
-      style: {},
-      children: [],
-      parentNode: null,
-      attributes: {},
-      listeners: {},
-    };
-    node.appendChild = (child) => {
-      node.children.push(child);
-      child.parentNode = node;
-      return child;
-    };
-    node.removeChild = (child) => {
-      const index = node.children.indexOf(child);
-      if (index >= 0) node.children.splice(index, 1);
-      return child;
-    };
-    node.insertBefore = (child, reference) => {
-      const index = node.children.indexOf(reference);
-      if (index < 0) node.children.push(child);
-      else node.children.splice(index, 0, child);
-      child.parentNode = node;
-      return child;
-    };
-    node.setAttribute = (key, value) => {
-      node.attributes[key] = String(value);
-    };
-    node.getAttribute = (key) => (key in node.attributes ? node.attributes[key] : null);
-    node.addEventListener = (type, callback) => {
-      if (!node.listeners[type]) node.listeners[type] = [];
-      node.listeners[type].push(callback);
-    };
-    node.dispatch = (type, event) => {
-      for (const callback of node.listeners[type] || []) {
-        callback(event || { preventDefault() {} });
-      }
-    };
-    node.click = () => node.dispatch('click', {});
-    Object.defineProperty(node, 'firstChild', { get: () => node.children[0] || null });
-    return node;
-  }
-  function walk(root, visit) {
-    visit(root);
-    for (const child of root.children || []) walk(child, visit);
-  }
-  const root = makeNode('div');
-  root.id = 'root';
-  const body = makeNode('body');
-  body.appendChild(root);
-  const document = {
-    readyState: 'complete',
-    body,
-    getElementById(id) {
-      let found = null;
-      walk(body, (node) => {
-        if (found === null && node.id === id) found = node;
-      });
-      return found;
-    },
-    createElement: makeNode,
-    createElementNS: (_namespace, tagName) => makeNode(tagName),
-    addEventListener() {},
-    querySelectorAll: () => [],
-  };
-  return { document, body, walk };
-}
-
-function runCompanionPanel() {
-  const source = readFileSync(join(OVERLAY_DIR, 'faktor-companion.js'), 'utf8');
-  const posted = [];
-  const dom = makePanelDom();
-  const sandbox = {
-    document: dom.document,
-    window: {
-      addEventListener(type, callback) {
-        if (type === 'message') sandbox._message = callback;
-      },
-      __faktorVsCodeApi: () => ({ postMessage: (message) => posted.push(message) }),
-    },
-    console,
-  };
-  vm.createContext(sandbox);
-  vm.runInContext(source, sandbox);
-  const companion = sandbox.window.__faktorCompanion;
-  assert(companion, 'the panel must expose __faktorCompanion for the webview host');
-  assert(sandbox._message, 'the panel must register a window message listener');
-  const panel = dom.document.getElementById('faktor-companion');
-  assert(panel, 'the panel must mount as #faktor-companion next to #root');
-  return { posted, dom, panel, companion };
-}
-
-function findAll(root, predicate, walk) {
-  const out = [];
-  walk(root, (node) => {
-    if (predicate(node)) out.push(node);
-  });
-  return out;
-}
-
-async function companionPanelTests() {
-  await test('companion panel renders Faktor frames and posts state-gated actions', () => {
-    const { posted, dom, panel, companion } = runCompanionPanel();
-    const { walk } = dom;
-
-    companion.handle({
-      type: 'faktorTaskState',
-      present: true,
-      goal: 'ship the cockpit',
-      state: 'running',
-      phase: 'implementation',
-      acceptanceCriteria: ['build passes'],
-      milestones: { completed: [], open: ['main'] },
-      tests: { run: [], failed: ['cargo test'] },
-      blockers: ['waiting on analysis'],
-      verification: { status: 'pending', criteriaPassed: 0, criteriaTotal: 1, checksFailed: 0, owed: 1, failedChecks: 1 },
-      budget: null,
-    });
-    const taskText = findAll(panel, (node) => node.textContent === 'ship the cockpit', walk);
-    assert(taskText.length === 1, 'the task goal must render');
-    assert(
-      findAll(panel, (node) => node.textContent === '! waiting on analysis', walk).length === 1,
-      'blockers must render',
-    );
-
-    companion.handle({
-      type: 'faktorAgents',
-      agents: [
-        {
-          agentId: 'c1',
-          kind: 'child',
-          state: 'Failed',
-          goal: 'implement main',
-          model: 'm',
-          provider: 'p',
-          presentation: 'background',
-          blockers: ['dependency x'],
-          pixel: {
-            childId: 'c1',
-            state: 'failed',
-            animation: 'pixel-failed',
-            avatar: { pixels: new Array(25).fill(1), color: 'red', accent: 'pink', hash: 1, version: 1 },
-          },
-        },
-        {
-          agentId: 'c2',
-          kind: 'child',
-          state: 'Running',
-          goal: 'verify',
-          presentation: 'foreground',
-        },
-      ],
-    });
-    const cards = findAll(panel, (node) => node.tagName === 'article' && node.className === 'faktor-agent', walk);
-    assertEqual(cards.length, 2, 'both agent cards must render');
-    assertEqual(cards[0].getAttribute('data-presentation'), 'background');
-    assertEqual(
-      findAll(cards[0], (node) => String(node.className).includes('faktor-pixel-bit'), walk).length,
-      25,
-      'the 5x5 pixel identity must render',
-    );
-    const retry = findAll(cards[0], (node) => node.tagName === 'button' && node.textContent === 'Retry', walk)[0];
-    assert(retry, 'a failed child must offer Retry');
-    retry.click();
-    assertDeepEqual(posted[posted.length - 1], {
-      type: 'faktorAgentAction',
-      agentId: 'c1',
-      action: 'retry',
-    });
-    const pause = findAll(cards[1], (node) => node.tagName === 'button' && node.textContent === 'Pause', walk)[0];
-    assert(pause, 'a running child must offer Pause');
-    pause.click();
-    assertEqual(posted[posted.length - 1].action, 'pause');
-
-    // Steer (P2 UI parity): a bounded inline textbox plus the button posts
-    // the EXACT faktorAgentAction body; an empty box falls back to the bare
-    // host-prompt request.
-    const steerInput = findAll(
-      cards[1],
-      (node) => node.tagName === 'input' && node.getAttribute('aria-label') === 'steer note',
-      walk,
-    )[0];
-    assert(steerInput, 'a child card must offer the inline steer textbox');
-    assertEqual(steerInput.maxLength, 500, 'the steer textbox must be bounded at 500 chars');
-    const steerButton = findAll(
-      cards[1],
-      (node) => node.tagName === 'button' && node.textContent === 'Steer',
-      walk,
-    )[0];
-    assert(steerButton, 'a child card must offer Steer');
-    steerInput.value = '  focus on the parser  ';
-    steerButton.click();
-    assertDeepEqual(posted[posted.length - 1], {
-      type: 'faktorAgentAction',
-      agentId: 'c2',
-      action: 'steer',
-      text: 'focus on the parser',
-    });
-    steerInput.value = '   ';
-    steerButton.click();
-    assertDeepEqual(posted[posted.length - 1], {
-      type: 'faktorAgentAction',
-      agentId: 'c2',
-      action: 'steer',
-    });
-    const toggle = findAll(
-      cards[0],
-      (node) => node.tagName === 'button' && node.textContent === 'Foreground',
-      walk,
-    )[0];
-    toggle.click();
-    assertDeepEqual(posted[posted.length - 1], {
-      type: 'faktorAgentAction',
-      agentId: 'c1',
-      action: 'presentation',
-      state: 'foreground',
-    });
-
-    // Tournament: Decide gates on canDecide; Abort gates on open.
-    const tournament = (canDecide, open, id = 't-1') => ({
-      type: 'faktorTournament',
-      present: true,
-      tournament: { id, state: open ? 'open' : 'decided', open, canDecide, winner: null, criteria: ['tests pass'], candidates: [] },
-    });
-    companion.handle(tournament(false, true));
-    let decide = findAll(
-      panel,
-      (node) => node.tagName === 'button' && node.textContent === 'Decide winner',
-      walk,
-    )[0];
-    assert(decide && decide.disabled === true, 'decide must be disabled until every candidate settled');
-    companion.handle(tournament(true, true));
-    decide = findAll(panel, (node) => node.tagName === 'button' && node.textContent === 'Decide winner', walk)[0];
-    assert(decide && decide.disabled === false, 'decide must enable when canDecide');
-    decide.click();
-    assertDeepEqual(posted[posted.length - 1], {
-      type: 'faktorTournamentAction',
-      tournamentId: 't-1',
-      action: 'decide',
-    });
-    companion.handle(tournament(true, false));
-    const abort = findAll(panel, (node) => node.tagName === 'button' && node.textContent === 'Abort', walk)[0];
-    assert(abort && abort.disabled === true, 'abort must be disabled on a terminal tournament');
-
-    // Acceptance-criterion proof: the bridge forwards cockpit lines only, so
-    // each `[verdict]`-led line renders as a distinct proof row and every
-    // evidence:<n> token stays a typed retrieval button. Unavailable never
-    // shares the pass styling.
-    companion.handle({
-      type: 'faktorCockpit',
-      present: true,
-      sections: [
-        {
-          key: 'acceptance',
-          title: 'Acceptance criteria · proof',
-          present: true,
-          lines: [
-            '[pass] build passes · requirement required · origin user · binding required_check ref check:rust_check:digest-check · snapshot verified 22ab · verified at completed 2023-11-14T22:13:22.000Z',
-            '[fail] tests pass · requirement required · origin user · binding required_check (derived) ref check:rust_check:digest-check · snapshot unavailable · verification timestamp unavailable',
-            '[unavailable] review · requirement unavailable · origin unavailable · binding unavailable · evidence evidence:42',
-          ],
-          evidence: [],
-          actions: [],
-        },
-      ],
-    });
-    const proofRows = findAll(
-      panel,
-      (node) => node.getAttribute && node.getAttribute('data-verdict') !== null,
-      walk,
-    );
-    assertEqual(proofRows.length, 3, 'one proof row per criterion line');
-    const rowText = (row) =>
-      findAll(row, (node) => true, walk)
-        .map((node) => node.textContent)
-        .join(' ');
-    const passProof = proofRows.find((row) => row.getAttribute('data-verdict') === 'pass');
-    const failProof = proofRows.find((row) => row.getAttribute('data-verdict') === 'fail');
-    const unavailableProof = proofRows.find(
-      (row) => row.getAttribute('data-verdict') === 'unavailable',
-    );
-    assert(passProof && failProof && unavailableProof, 'pass/fail/unavailable are distinct rows');
-    assert(String(passProof.className).includes('faktor-criterion-pass'), passProof.className);
-    assert(String(failProof.className).includes('faktor-criterion-fail'), failProof.className);
-    assert(
-      String(unavailableProof.className).includes('faktor-criterion-unavailable'),
-      unavailableProof.className,
-    );
-    assert(rowText(unavailableProof).includes('UNAVAILABLE'), rowText(unavailableProof));
-    assert(rowText(passProof).includes('binding required_check'), rowText(passProof));
-    assert(rowText(passProof).includes('2023-11-14T22:13:22.000Z'), rowText(passProof));
-    const proofEvidence = findAll(
-      unavailableProof,
-      (node) => node.tagName === 'button' && node.textContent === 'evidence:42',
-      walk,
-    )[0];
-    assert(proofEvidence, 'a criterion evidence ref must render a retrieval button');
-    proofEvidence.click();
-    assertDeepEqual(posted[posted.length - 1], { type: 'faktorEvidenceExpand', evidenceId: 42 });
-
-    // Evidence: refs open an expansion; the expansion renders as text.
-    companion.handle({ type: 'faktorEvidence', mode: 'refs', refs: [{ id: 41, label: 'evidence:41' }] });
-    const ref = findAll(panel, (node) => node.tagName === 'button' && node.textContent === 'evidence:41', walk)[0];
-    assert(ref, 'an evidence ref must be a button');
-    ref.click();
-    assertDeepEqual(posted[posted.length - 1], { type: 'faktorEvidenceExpand', evidenceId: 41 });
-    companion.handle({
-      type: 'faktorEvidence',
-      mode: 'expanded',
-      evidence: { id: 41, text: 'artifact text', truncated: false },
-    });
-    const pre = findAll(panel, (node) => node.tagName === 'pre', walk)[0];
-    assert(pre && pre.textContent === 'artifact text', 'the expanded artifact must render as text');
-
-    // Board: explicit unavailable, then posts + composer.
-    companion.handle({
-      type: 'faktorBoardState',
-      available: false,
-      source: 'none',
-      revision: null,
-      unread: null,
-      posts: [],
-      reason: 'no board route',
-    });
-    assert(
-      findAll(panel, (node) => node.textContent === 'no board route', walk).length === 1,
-      'an unavailable board must render its explicit reason',
-    );
-    companion.handle({
-      type: 'faktorBoardState',
-      available: true,
-      source: 'transcript',
-      revision: 3,
-      unread: 2,
-      posts: [{ id: 'p1', author: 'parent', subject: 'handoff', body: 'ready', refs: [] }],
-      reason: null,
-    });
-    assert(
-      findAll(panel, (node) => node.textContent === '2 unread', walk).length === 1,
-      'unread count must render',
-    );
-    const subject = findAll(
-      panel,
-      (node) => node.tagName === 'input' && node.getAttribute('aria-label') === 'board subject',
-      walk,
-    )[0];
-    const body = findAll(
-      panel,
-      (node) => node.tagName === 'textarea' && node.getAttribute('aria-label') === 'board body',
-      walk,
-    )[0];
-    assert(subject && body, 'the board composer must render when available');
-    subject.value = 'status';
-    body.value = 'all green';
-    const postButton = findAll(
-      panel,
-      (node) => node.tagName === 'button' && node.textContent === 'Post',
-      walk,
-    )[0];
-    postButton.click();
-    assertDeepEqual(posted[posted.length - 1], {
-      type: 'faktorBoardAction',
-      action: 'post',
-      subject: 'status',
-      body: 'all green',
-    });
+    assert(!/https?:\/\//.test(built.replace(/http:\/\/127\.0\.0\.1/g, '')), 'no remote script sources');
   });
 }
 
@@ -4136,14 +3539,8 @@ async function main() {
   await presentationWebviewTests();
   await tournamentWebviewTests();
   await reducedMotionTests();
-  await overlayBuildTests();
-  await companionPanelTests();
-  await vendoredResolutionTests();
   if (packagedDir !== null && packagedDir !== undefined) {
     await packagedLayoutTests(packagedDir);
-  }
-  for (const { label, fn } of bridgeTests) {
-    await test(`bridge: ${label}`, fn);
   }
 
   console.log(`\n${passed} passed, ${failed} failed`);

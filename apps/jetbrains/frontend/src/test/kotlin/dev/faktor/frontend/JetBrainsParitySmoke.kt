@@ -4,8 +4,8 @@
 // end, and the real daemon is used where only it can answer (restart /
 // terminal spawn). Families:
 //
-//   1. upstream pin: every per-file SHA-256 of the vendored JetBrains 7.1.2
-//      tree in ui/upstream.json (offline, no network)
+//   1. Faktor-owned tree: the repository root resolves and no vendored
+//      upstream UI corpus exists (offline, no network)
 //   2. task mode (criteria, mutation mode, completion contract, attachments)
 //   3. agent tree (blockers, presentation, pixel identity)
 //   4. permissions (pending list, allow/deny replies, unavailable state)
@@ -20,8 +20,6 @@ package dev.faktor.frontend
 
 import dev.faktor.backend.BackendConnection
 import dev.faktor.backend.StdoutSink
-import dev.faktor.shared.JsonCodec
-import dev.faktor.shared.JsonValue
 import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeRequests
@@ -44,7 +42,6 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.nio.file.Files
 import java.nio.file.Paths
-import java.security.MessageDigest
 import java.util.Collections
 
 object JetBrainsParitySmoke {
@@ -56,8 +53,8 @@ object JetBrainsParitySmoke {
 
     @JvmStatic
     fun main(args: Array<String>) {
-        step("pin: upstream JetBrains 7.1.2 tree matches ui/upstream.json") {
-            verifyUpstreamPin()
+        step("tree: Faktor-owned repository root, no vendored upstream UI corpus") {
+            verifyFaktorOwnedTree()
         }
         step("task mode: composer contract + strict request bodies") {
             taskModeCanned()
@@ -133,114 +130,57 @@ object JetBrainsParitySmoke {
         kotlin.system.exitProcess(if (failures == 0) 0 else 1)
     }
 
-    // ------------------------------------------------------- 1. upstream pin
+    // ------------------------------------------------- 1. Faktor-owned tree
 
     /**
-     * Re-hashes every vendored JetBrains 7.1.2 file against
-     * `ui/upstream.json.jetbrains_712.file_hashes` (offline). A missing,
-     * modified or unexpected file is a hard failure, and the Faktor patch
-     * set paths must exist. This is the offline twin of
-     * `scripts/vendor-upstream.sh --check` and needs no network.
+     * The Faktor-owned tree contract (offline, no network): the repository
+     * root resolves, the retired vendored UI corpora are GONE, and the
+     * Faktor-owned UI surfaces exist. A reappearing vendored upstream tree
+     * (with or without a manifest) is a hard failure.
      */
-    private fun verifyUpstreamPin() {
+    private fun verifyFaktorOwnedTree() {
         val root = resolveRepoRoot()
-        val manifestFile = File(root, "ui/upstream.json")
-        assertTrue(manifestFile.isFile, "missing ${manifestFile.path}")
-        val manifest = JsonCodec.parse(manifestFile.readText(Charsets.UTF_8)).view("ui/upstream.json")
-        val pin = manifest.field("jetbrains_712")
+        // ui/ carries ONLY the retained historical attribution directory: any
+        // vendored source tree or pin manifest reappearing there fails.
+        val uiEntries = File(root, "ui").listFiles()?.map { it.name }?.sorted() ?: emptyList()
         assertEquals(
-            "436ff09e649bd0866c84bd9f98933a74cad2d25c",
-            pin.field("commit").string(),
-            "pinned JetBrains commit"
+            listOf("LICENSES"), uiEntries,
+            "ui/ must carry only the historical attribution directory"
         )
-        assertEquals("7.1.2", pin.field("version").string(), "pinned JetBrains version")
-        assertEquals("sha256", pin.field("hashAlgorithm").string(), "hash algorithm")
-        val vendoredRoot = pin.field("vendoredRoot").string()
-        val hashedRoot = pin.field("hashedRoot").string()
-        val hashes = (pin.field("file_hashes").value as? JsonValue.Obj)
-            ?: fail("jetbrains_712.file_hashes must be an object")
-        val expected = pin.field("fileCount").long()
-        assertEquals(
-            expected, hashes.fields.size.toLong(),
-            "file_hashes count must equal fileCount"
+        assertTrue(!File(root, "compat").exists(), "no pinned compatibility corpus may exist")
+        assertTrue(
+            !File(root, "ui/upstream.json").exists(),
+            "no vendored-UI pin manifest may exist"
         )
-        var bytes = 0L
-        for ((rel, value) in hashes.fields) {
-            val hash = (value as? JsonValue.Str)?.value ?: fail("hash for $rel must be a string")
-            val file = File(root, "$hashedRoot/$rel")
-            if (!file.isFile) fail("missing pinned file: $hashedRoot/$rel")
-            bytes += file.length()
-            val got = sha256Hex(file.readBytes())
-            if (got != hash) fail("hash mismatch: $hashedRoot/$rel (expected $hash, got $got)")
+        for (owned in listOf(
+            "apps/vscode/media/chat.js",
+            "apps/vscode/src/webview.ts",
+            "apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt"
+        )) {
+            assertTrue(File(root, owned).isFile, "Faktor-owned UI surface must exist: $owned")
         }
-        assertEquals(pin.field("totalBytes").long(), bytes, "totalBytes must match the tree")
-        // The hash keys are `kilo-jetbrains/**` under hashedRoot; walk that
-        // exact subtree so Faktor metadata (NOTICE.md, LICENSES/) is not
-        // mistaken for a vendored upstream file.
-        val treePrefix = pin.field("upstreamPath").string().substringAfterLast('/')
-        val extra = ArrayList<String>()
-        walkFiles(File(root, "$hashedRoot/$treePrefix"), treePrefix, extra)
-        assertEquals(expected, extra.size.toLong(), "vendored tree file count")
-        for (rel in extra) {
-            if (!hashes.fields.containsKey(rel)) fail("unexpected file in pinned tree: $rel")
-        }
-        val licenseObj = pin.field("licenseFiles").value as? JsonValue.Obj
-            ?: fail("jetbrains_712.licenseFiles must be an object")
-        for ((rel, value) in licenseObj.fields) {
-            val hash = (value as? JsonValue.Str)?.value ?: fail("license hash for $rel")
-            val file = File(root, "$vendoredRoot/$rel")
-            if (!file.isFile) fail("missing license file: $vendoredRoot/$rel")
-            if (sha256Hex(file.readBytes()) != hash) fail("license hash mismatch: $rel")
-        }
-        for (patch in pin.field("faktorPatchSet").array()) {
-            val faktor = patch.field("faktor").string()
-            assertTrue(File(root, faktor).isFile, "patch-set path must exist: $faktor")
-        }
-        println("UPSTREAM PIN PASS: commit ${pin.field("commit").string()} " +
-            "${hashes.fields.size} files, $bytes bytes, sha256 verified")
+        println("FAKTOR-OWNED TREE PASS: no vendored upstream UI corpus, panel sources present")
     }
 
     internal fun resolveRepoRoot(): File {
         val prop = System.getProperty("faktor.repo.root")
         if (prop != null && prop.isNotEmpty()) {
             val root = File(prop).absoluteFile
-            assertTrue(File(root, "ui/upstream.json").isFile, "faktor.repo.root has no ui/upstream.json: $root")
+            assertTrue(isRepoRoot(root), "faktor.repo.root is not a Faktor repository root: $root")
             return root
         }
         var dir: File? = File(".").absoluteFile
         var guard = 0
         while (dir != null && guard < 8) {
-            if (File(dir, "ui/upstream.json").isFile) return dir
+            if (isRepoRoot(dir)) return dir
             dir = dir.parentFile
             guard++
         }
-        fail("cannot locate the repository root (ui/upstream.json); pass -Dfaktor.repo.root")
+        fail("cannot locate the repository root (Cargo.toml + crates/); pass -Dfaktor.repo.root")
     }
 
-    private fun walkFiles(dir: File, prefix: String, out: MutableList<String>) {
-        val children = dir.listFiles() ?: return
-        for (child in children) {
-            val rel = if (prefix.isEmpty()) child.name else "$prefix/${child.name}"
-            if (child.isDirectory) {
-                walkFiles(child, rel, out)
-            } else if (child.isFile) {
-                out.add(rel)
-            } else {
-                fail("symlink not allowed in the pinned tree: $rel")
-            }
-        }
-    }
-
-    private fun sha256Hex(bytes: ByteArray): String {
-        val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
-        val sb = StringBuilder(digest.size * 2)
-        for (byte in digest) {
-            val value = byte.toInt() and 0xff
-            sb.append(Character.forDigit(value ushr 4, 16))
-            sb.append(Character.forDigit(value and 0x0f, 16))
-        }
-        return sb.toString()
-    }
+    private fun isRepoRoot(dir: File): Boolean =
+        File(dir, "Cargo.toml").isFile && File(dir, "crates").isDirectory
 
     // --------------------------------------------------------- 2. task mode
 

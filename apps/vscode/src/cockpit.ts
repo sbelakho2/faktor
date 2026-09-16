@@ -72,6 +72,10 @@ export interface CockpitProofSnapshotView {
   readonly accountingSnapshotDigest: string | null;
   readonly sourceDiffEvidence: string | null;
   readonly riskReportEvidence: string | null;
+  /** The published commit OID when the daemon serves one. */
+  readonly publishedCommit: string | null;
+  /** The remote PR head when the daemon serves one. */
+  readonly remotePrHead: string | null;
 }
 
 /** The verification timestamps of the record that judged the criterion. */
@@ -136,6 +140,16 @@ export interface CockpitVerificationView {
   readonly checksFailed: number;
   readonly owed: number;
   readonly failedChecks: number;
+  /**
+   * True only when the served record proves the FULL criterion set with no
+   * failed check: the summary may then render VERIFIED. A missing record is
+   * never verified.
+   */
+  readonly verified: boolean;
+  readonly reviewer: string | null;
+  readonly tree: string | null;
+  readonly publishedCommit: string | null;
+  readonly remotePrHead: string | null;
 }
 
 export interface CockpitSpendView {
@@ -221,8 +235,8 @@ export interface CockpitSection {
   readonly evidence: readonly CockpitEvidenceRef[];
   /**
    * The structured per-criterion proof rows of the acceptance section (the
-   * fallback webview renders these; the vendored companion parses the
-   * `[verdict]`-led lines because the bridge forwards lines only).
+   * chat webview renders these; older snapshots fall back to the
+   * `[verdict]`-led lines).
    */
   readonly criteria?: readonly CockpitCriterionProof[];
   /** State-gated controls (tournament decide/abort), when the section owns any. */
@@ -284,10 +298,12 @@ export function tournamentViewOf(
 /**
  * Minimal structural view of the task-verification wire payload. The
  * required record members are the route's frozen contract; every proof
- * annotation is optional and its absence is an honest `null` (the CURRENT
- * daemon serves no criterion `binding`/`origin`/`requirement` and no
- * per-criterion verdict beyond the `passed` boolean — see the DTO
- * projection in crates/server/src/native/verification.rs).
+ * annotation is optional and its absence is an honest `null`. The CURRENT
+ * daemon serves the per-criterion `binding`/`origin`/`requirement`/`verdict`
+ * annotations, the `candidateProof` family plus the record-level
+ * `verifiedSnapshot`/`basedOnSnapshot`/`landedSnapshot`/`sourceCount`, and
+ * the reviewer; the published commit and the remote PR head render when the
+ * daemon publishes them (see crates/server/src/native/verification.rs).
  */
 export interface CockpitTaskVerification {
   readonly records: readonly {
@@ -296,6 +312,8 @@ export interface CockpitTaskVerification {
     readonly startedMs: number;
     readonly completedMs: number | null;
     readonly treeHash?: string | null;
+    /** The independent reviewer identity, when one judged the record. */
+    readonly reviewer?: string | null;
     readonly criteria: readonly {
       readonly criterionKey: string;
       readonly passed: boolean | null;
@@ -329,6 +347,10 @@ export interface CockpitTaskVerification {
       readonly candidateSnapshot?: string | null;
       readonly sourcesDigest?: string | null;
       readonly changedFilesDigest?: string | null;
+      /** The published commit OID, when the candidate was committed. */
+      readonly publishedCommit?: string | null;
+      /** The remote PR head ref/OID, when a PR was opened for the candidate. */
+      readonly remotePrHead?: string | null;
     } | null;
     readonly verifiedSnapshot?: string | null;
     readonly basedOnSnapshot?: string | null;
@@ -649,7 +671,7 @@ function requirementOf(criterion: {
     requirement: 'unavailable',
     reason:
       raw === null || raw === undefined
-        ? 'the payload serves no criterion requirement (required/advisory) for this row'
+        ? 'this row carries no criterion requirement (required/advisory) member'
         : `unrecognized criterion requirement ${JSON.stringify(raw)} served; no global suite status substitutes`,
   };
 }
@@ -665,7 +687,7 @@ function originOf(criterion: {
     origin: 'unavailable',
     reason:
       raw === null || raw === undefined
-        ? 'the payload serves no criterion origin for this row'
+        ? 'this row carries no criterion origin member'
         : `unrecognized criterion origin ${JSON.stringify(raw)} served`,
   };
 }
@@ -697,7 +719,7 @@ function verdictOf(criterion: {
       verdict: 'fail',
       source: 'recorded',
       reason:
-        'recorded as not passed; this payload serves no three-way verdict, so failed and unavailable cannot be distinguished here',
+        'recorded as not passed; this row carries no three-way verdict, so failed and unavailable cannot be distinguished here',
     };
   }
   return {
@@ -727,6 +749,8 @@ function snapshotOf(record: VerificationRecordInput | null): CockpitProofSnapsho
     accountingSnapshotDigest: textOrNull(proof?.accountingSnapshotDigest),
     sourceDiffEvidence: textOrNull(proof?.sourceDiffEvidence),
     riskReportEvidence: textOrNull(proof?.riskReportEvidence),
+    publishedCommit: textOrNull(proof?.publishedCommit),
+    remotePrHead: textOrNull(proof?.remotePrHead),
   };
 }
 
@@ -780,8 +804,8 @@ export function criterionProofRow(
     } else {
       bindingDetail =
         refs.length > 0
-          ? 'the payload serves no criterion binding and the evidence refs do not identify one kind'
-          : 'the payload serves no criterion binding for this row';
+          ? 'this row carries no criterion binding and the evidence refs do not identify one kind'
+          : 'this row carries no criterion binding';
       unavailable.push('binding');
     }
   }
@@ -797,7 +821,9 @@ export function criterionProofRow(
     snapshot.verified !== null ||
     snapshot.basedOn !== null ||
     snapshot.landed !== null ||
-    snapshot.sourceCount !== null;
+    snapshot.sourceCount !== null ||
+    snapshot.publishedCommit !== null ||
+    snapshot.remotePrHead !== null;
   if (!hasSnapshot) {
     unavailable.push('snapshots');
   }
@@ -900,6 +926,10 @@ export function criterionProofLine(row: CockpitCriterionProof): string {
     row.snapshot.basedOn !== null ? `base ${digestLabel(row.snapshot.basedOn)}` : null,
     row.snapshot.landed !== null ? `land ${digestLabel(row.snapshot.landed)}` : null,
     row.snapshot.sourceCount !== null ? `src ${row.snapshot.sourceCount}` : null,
+    row.snapshot.publishedCommit !== null
+      ? `commit ${digestLabel(row.snapshot.publishedCommit)}`
+      : null,
+    row.snapshot.remotePrHead !== null ? `head ${digestLabel(row.snapshot.remotePrHead)}` : null,
   ].filter((entry): entry is string => entry !== null);
   parts.push(snapshotBits.length > 0 ? snapshotBits.join(' · ') : 'snapshot unavailable');
   const atBits = [
@@ -1007,8 +1037,10 @@ export function buildCockpit(input: CockpitInput): CockpitView | null {
   let criteriaTotal = 0;
   let checksFailed = 0;
   let recordStatus: string | null = null;
+  let topRecord: VerificationRecordInput | null = null;
   for (const record of taskVerification?.records ?? []) {
     recordStatus = record.status;
+    topRecord = record;
     for (const criterion of record.criteria) {
       criteriaTotal += 1;
       if (criterion.passed) {
@@ -1021,6 +1053,7 @@ export function buildCockpit(input: CockpitInput): CockpitView | null {
       }
     }
   }
+  const topSnapshot = snapshotOf(topRecord);
   const owed = verification?.owed.length ?? 0;
   const failedChecks = verification?.failedChecks.length ?? 0;
   const verificationView: CockpitVerificationView = {
@@ -1038,6 +1071,16 @@ export function buildCockpit(input: CockpitInput): CockpitView | null {
     checksFailed,
     owed,
     failedChecks,
+    verified:
+      topRecord !== null &&
+      topRecord.status.toLowerCase() === 'passed' &&
+      criteriaTotal > 0 &&
+      criteriaPassed === criteriaTotal &&
+      checksFailed === 0,
+    reviewer: textOrNull(topRecord?.reviewer),
+    tree: topSnapshot.verified,
+    publishedCommit: topSnapshot.publishedCommit,
+    remotePrHead: topSnapshot.remotePrHead,
   };
 
   // Evidence refs: verification criteria evidence + check summaries + any
@@ -1267,6 +1310,36 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
     present: true,
     lines: [
       `status ${view.verification.status}`,
+      // The top-level summary: only a served record that proves the full
+      // criterion set with no failed check renders VERIFIED; criteria,
+      // checks, review, tree, published commit, remote PR head and cost are
+      // appended when the payload serves them.
+      ...(view.verification.verified
+        ? [
+            [
+              'VERIFIED',
+              `criteria ${view.verification.criteriaPassed}/${view.verification.criteriaTotal}`,
+              `checks failed ${view.verification.checksFailed}`,
+              view.verification.reviewer !== null
+                ? `review ${view.verification.reviewer}`
+                : null,
+              view.verification.tree !== null
+                ? `tree ${digestLabel(view.verification.tree)}`
+                : null,
+              view.verification.publishedCommit !== null
+                ? `commit ${digestLabel(view.verification.publishedCommit)}`
+                : null,
+              view.verification.remotePrHead !== null
+                ? `head ${digestLabel(view.verification.remotePrHead)}`
+                : null,
+              view.spend !== null
+                ? `cost ${(view.spend.spentCostMicro / 1_000_000).toFixed(4)}`
+                : null,
+            ]
+              .filter((bit): bit is string => bit !== null)
+              .join(' · '),
+          ]
+        : []),
       `criteria ${view.verification.criteriaPassed}/${view.verification.criteriaTotal} passed`,
       `checks failed ${view.verification.checksFailed}`,
       `owed ${view.verification.owed} · failed checks ${view.verification.failedChecks}`,

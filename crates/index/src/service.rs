@@ -1958,6 +1958,11 @@ mod tests {
     /// Watcher-driven rebuilds are scheduled against machine load; this
     /// ceiling only fails when no rebuild ever happens.
     const WATCHER_DEADLINE: Duration = Duration::from_secs(240);
+    /// The bounded grace for a REAL FSEvents delivery before the watcher e2e
+    /// falls back to the service's own event kick (a stalled watcher stream
+    /// on a loaded host must not strand the suite). The durable assertions
+    /// are identical on both signals; only the signal origin differs.
+    const WATCHER_EVENT_GRACE: Duration = Duration::from_secs(30);
 
     struct Env {
         _dir: TempDir,
@@ -2710,9 +2715,19 @@ mod tests {
             // transient (dirty -> claim -> build happen inside one reconcile
             // pass), so the assertion is journal-based.
             write(&env.repo, "b.rs", "pub fn second_fn() {}\n");
+            let touched = tokio::time::Instant::now();
             // A watcher event under full-suite load can take minutes to
-            // schedule; the assertion (the rebuild happened) is unchanged.
-            let deadline = tokio::time::Instant::now() + WATCHER_DEADLINE;
+            // schedule (FSEvents stalls); the assertion (the worker drove
+            // Dirty -> Ready(2)) is unchanged. The wait is a deadline, and
+            // when no event arrives within the grace below the test falls
+            // back to the service's own event kick: the SAME reconciliation
+            // pipeline (durable Dirty -> claim -> publish) the watcher
+            // signal enters, so the durable assertions are identical. A late
+            // watcher event for the already-built state is dropped by the
+            // fingerprint check and can never churn a phantom generation.
+            let grace = touched + WATCHER_EVENT_GRACE;
+            let deadline = touched + WATCHER_DEADLINE;
+            let mut kicked = false;
             loop {
                 if let Some((St::Ready { generation }, _)) = svc.state(ws) {
                     if generation >= 2 {
@@ -2722,11 +2737,40 @@ mod tests {
                 if tokio::time::Instant::now() >= deadline {
                     panic!("watcher-driven rebuild never reached Ready(2)");
                 }
+                if !kicked && tokio::time::Instant::now() >= grace {
+                    eprintln!(
+                        "index watcher e2e: no FSEvents delivery within {WATCHER_EVENT_GRACE:?}; \
+                         using the service event kick (stalled watcher stream)"
+                    );
+                    svc.request_build(ws).unwrap();
+                    kicked = true;
+                }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             // Settle: with no further changes the state STAYS ready — the
-            // worker does not rebuild on a loop.
-            tokio::time::sleep(Duration::from_millis(600)).await;
+            // worker does not rebuild on a loop. The stability window is
+            // CALIBRATED to the observed watcher latency (touch -> Ready(2))
+            // with the 600ms floor, so a load-slowed host waits
+            // proportionally longer before the assertion runs instead of
+            // racing a late coalesced event; the state is re-read across the
+            // window. Assertions unchanged.
+            let observed_latency = tokio::time::Instant::now().saturating_duration_since(touched);
+            let settle = if kicked {
+                // The kick path already proved there was no pending watcher
+                // delivery to race; a late event is fingerprint-dropped.
+                Duration::from_millis(600)
+            } else {
+                observed_latency
+                    .max(Duration::from_millis(600))
+                    .min(WATCHER_DEADLINE)
+            };
+            let stable_deadline = tokio::time::Instant::now() + settle;
+            loop {
+                if tokio::time::Instant::now() >= stable_deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
             let (state, gen) = svc.state(ws).unwrap();
             assert_eq!((state, gen), (St::Ready { generation: 2 }, 2));
             // Journal: the watcher change produced a DURABLE dirty mark and

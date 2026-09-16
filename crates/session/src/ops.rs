@@ -40,10 +40,7 @@ pub(crate) struct OpRegistry {
 
 impl OpRegistry {
     pub fn register(&self, op: OpId, kind: OpKind, token: CancellationToken) {
-        self.inner
-            .lock()
-            .expect("op registry poisoned")
-            .insert(op, TrackedOp { kind, token });
+        crate::recover_lock(&self.inner).insert(op, TrackedOp { kind, token });
     }
 
     pub fn register_turn(&self, op: OpId, token: CancellationToken) {
@@ -51,15 +48,11 @@ impl OpRegistry {
     }
 
     pub fn unregister(&self, op: OpId) {
-        self.inner.lock().expect("op registry poisoned").remove(&op);
+        crate::recover_lock(&self.inner).remove(&op);
     }
 
     pub fn tracked(&self, op: OpId) -> Option<TrackedOp> {
-        self.inner
-            .lock()
-            .expect("op registry poisoned")
-            .get(&op)
-            .cloned()
+        crate::recover_lock(&self.inner).get(&op).cloned()
     }
 
     pub fn kind(&self, op: OpId) -> Option<OpKind> {
@@ -73,12 +66,7 @@ impl OpRegistry {
     }
 
     pub fn all(&self) -> Vec<OpId> {
-        self.inner
-            .lock()
-            .expect("op registry poisoned")
-            .keys()
-            .copied()
-            .collect()
+        crate::recover_lock(&self.inner).keys().copied().collect()
     }
 }
 
@@ -799,6 +787,26 @@ fn prefix_pair_stability(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poisoned_op_registry_is_reconciled_not_propagated() {
+        let reg = OpRegistry::default();
+        reg.register(OpId::new(1), OpKind::Tool, CancellationToken::new());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = reg.inner.lock().unwrap();
+            panic!("holder poisoned the ownership registry");
+        }));
+        assert!(reg.inner.is_poisoned());
+        // Ownership/process => reconcile: the registry keeps serving (the
+        // recovered guard, poison cleared) instead of panicking callers;
+        // the durable journal remains the authority.
+        assert_eq!(reg.all(), vec![OpId::new(1)]);
+        assert_eq!(reg.kind(OpId::new(1)), Some(OpKind::Tool));
+        reg.unregister(OpId::new(1));
+        assert!(reg.all().is_empty());
+        assert!(!reg.inner.is_poisoned());
+    }
+
     use crate::handle::tests::{session, test_manager};
     use crate::SessionManager;
     use faktor_core::event::EventKind;

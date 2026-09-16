@@ -109,7 +109,7 @@ pub(crate) async fn native_capabilities(
 // Liveness/readiness and the durable session listings (all auth-gated like
 // every daemon route). Response bodies are native JSON over durable state:
 // session rows, turn records, the task ledger, checkpoint rows, memory
-// facts and live PTYs — never v7.5.6 wire shapes. Hostile ids are 400
+// facts and live PTYs — never foreign wire shapes. Hostile ids are 400
 // (unparseable/0) or 404 (unknown); handlers never panic on them.
 
 /// `GET /native/providers` — the registry view of every registered provider

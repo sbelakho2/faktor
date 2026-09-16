@@ -10,7 +10,7 @@
 // can be re-annotated with kotlin.test.
 package dev.faktor.backend
 
-import dev.faktor.shared.BasicAuth
+import dev.faktor.shared.BearerAuth
 import dev.faktor.shared.NativeRequests
 import dev.faktor.shared.StartupLine
 import dev.faktor.shared.parseNativeHealth
@@ -178,13 +178,13 @@ private fun assertFixtureStartupLine() {
 
 private fun assertFixtureAuthHeader() {
     val password = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-    val auth = BasicAuth(password)
+    val auth = BearerAuth(password)
     assertEquals(
-        "Basic a2lsbzowMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVm",
+        "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         auth.headerValue,
-        "header must equal the frozen fixture (Basic <base64('kilo:'+password)>)"
+        "header must be the Faktor-native Bearer claim (no Basic form exists)"
     )
-    assertEquals("Authorization", BasicAuth.HEADER_NAME)
+    assertEquals("Authorization", BearerAuth.HEADER_NAME)
 }
 
 private fun assertNativeRequestShapes() {

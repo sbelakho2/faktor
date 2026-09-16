@@ -9,11 +9,10 @@
 #         step EXECUTION may not be described as a follow-up / absent;
 #       * crates/winjob uses AssignProcessToJobObject      => Job Objects may
 #         not be called a future/target mechanism;
-#       * ui/upstream.json exists (VS Code webview vendored) => the docs may
-#         not claim the upstream UI is not vendored; once the JetBrains
-#         7.1.2 pin (compat/jetbrains-712 + ui/upstream.json jetbrains_712)
-#         exists the historical JetBrains-7.1.2-scoped exemption is retired
-#         and BLOCKED_EXTERNAL may no longer describe JetBrains/UI parity;
+#       * ui/ carries only the historical attribution directory (no vendored
+#         UI corpus or pin manifest, no bridge, no VSIX staging step) =>
+#         the docs may not claim a vendored/upstream UI or a compatibility
+#         bundle; README.md must state the Faktor-owned panel;
 # Stale/contradicting docs are a review-rejected artifact: drift must be
 # loud, never silent.
 #
@@ -52,11 +51,15 @@ for token in "${STALE_TOKENS[@]}"; do
 done
 
 # Auth drift: 'Bearer <password>' is NOT the only accepted claim. The
-# Basic `Authorization: Basic base64("kilo:" + password)` form is retained
-# alongside the Faktor-native x-faktor-server-password header and the
-# legacy per-start token.
+# Faktor-native x-faktor-server-password header and the legacy per-start
+# token (same Bearer header) are accepted; the pre-cutover Basic form is
+# gone and must not be documented as accepted.
 if ! grep -q "x-faktor-server-password" "$DOC"; then
     echo "STALE: 'Bearer <password>' implied as the only auth form — x-faktor-server-password must be documented" >&2
+    fail=1
+fi
+if grep -q -i 'basic base64' "$DOC" README.md 2>/dev/null; then
+    echo "STALE: docs still describe the retired Basic auth compatibility form as accepted" >&2
     fail=1
 fi
 
@@ -159,53 +162,54 @@ if grep -Rq 'AssignProcessToJobObject' crates/winjob/src 2>/dev/null; then
     fi
 fi
 
-# 3. Vendored VS Code webview: ui/upstream.json means the upstream tree IS
-#    vendored, and the VSIX staging step (prepackage:vsix) ships it under
-#    media/. Generic "not vendored" claims contradict BOTH; the
-#    JetBrains-7.1.2 scope exemption only applies while the 7.1.2 pin is
-#    ABSENT — once compat/jetbrains-712 + ui/upstream.json carry the pin, a
-#    JetBrains-scoped "not vendored" claim is equally stale.
-VSIX_STAGING=apps/vscode/scripts/prepare-vendored-webview.mjs
-JETBRAINS_PIN=0
-if [ -d compat/jetbrains-712 ] && grep -q '"jetbrains_712"' ui/upstream.json 2>/dev/null; then
-    JETBRAINS_PIN=1
+# 3. Faktor-owned UI: ui/ carries ONLY the historical attribution directory,
+#    and there is no vendored pin manifest, no VSIX staging step and no
+#    message-ABI bridge. The docs may not claim a vendored/upstream UI or a
+#    compatibility bundle, and README.md must state the Faktor-owned panel.
+if [ -f ui/upstream.json ] || [ -d compat ]; then
+    echo "CONTRADICTION: a vendored UI pin manifest or compatibility corpus exists in the tree; the tree owns its UI" >&2
+    fail=1
 fi
-if [ -f ui/upstream.json ] && [ -f "$VSIX_STAGING" ]; then
-    for doc in "$DOC" "${TRUTH_DOCS[@]}"; do
-        [ -f "$doc" ] || continue
-        doc_fail=0
-        raw_count=0
-        while IFS= read -r entry; do
-            [ -z "$entry" ] && continue
-            raw_count=$((raw_count + 1))
-            lineno="${entry%%:*}"
-            line="${entry#*:}"
-            case "$line" in
-                *JetBrains*|*jetbrains*|*7.1.2*|*712*)
-                    # The historical JetBrains scope exemption: only while
-                    # the pinned 7.1.2 corpus is genuinely absent.
-                    [ "$JETBRAINS_PIN" -eq 0 ] && continue
-                    ;;
-            esac
-            echo "CONTRADICTION: $doc:$lineno says the UI is not vendored without a JetBrains-7.1.2 scope, but ui/upstream.json exists and prepackage:vsix stages the pinned closure + overlay into media/" >&2
-            echo "  exact line: $line" >&2
-            doc_fail=1
-        done < <(grep -n -i 'not vendored' "$doc" || true)
-        # A wrapped claim ("not\nvendored") evades line matching entirely;
-        # catch it via the normalized view and print the matching fragment.
-        if [ "$raw_count" -eq 0 ] && normalized "$doc" | grep -Eqi 'not[[:space:]]+vendored'; then
-            echo "CONTRADICTION: $doc contains a wrapped 'not vendored' claim that no single line captured; normalized evidence follows" >&2
-            echo "  wrapped claim: $(normalized_fragment "$doc" 'not[[:space:]]+vendored')" >&2
-            doc_fail=1
+if [ -f apps/vscode/scripts/prepare-vendored-webview.mjs ]; then
+    echo "CONTRADICTION: a vendored-webview staging step exists in the tree; the panel is Faktor-owned" >&2
+    fail=1
+fi
+# ui/ is an allowlist: only the historical attribution directory may exist,
+# so ANY extra entry (a vendored corpus reappearing) fails.
+if [ -d ui ]; then
+    while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        if [ "$entry" != "LICENSES" ]; then
+            echo "CONTRADICTION: ui/ carries '$entry'; only LICENSES/ (historical attribution) may exist" >&2
+            fail=1
         fi
-        if [ "$doc_fail" -ne 0 ]; then
+    done < <(ls -1 ui)
+fi
+# Tokens that only stale vendored-UI prose carries (the removed staging
+# step, the removed render report, the removed visual lane, positive
+# vendored claims). Negations never use these forms.
+STALE_UI_TOKENS=(
+    'prepackage:vsix'
+    'visual-report.json'
+    'vscode-visual'
+    'is vendored'
+    'are vendored'
+    'vendored under'
+    'vendored at '
+    'pinned webview'
+)
+for doc in "$DOC" "${TRUTH_DOCS[@]}"; do
+    [ -f "$doc" ] || continue
+    for token in "${STALE_UI_TOKENS[@]}"; do
+        if normalized "$doc" | grep -Fqi "$token"; then
+            echo "CONTRADICTION: $doc still claims a vendored/upstream UI ('$token') although the panel is Faktor-owned" >&2
             fail=1
         fi
     done
-    if ! grep -q 'ui/upstream\.json' README.md; then
-        echo "MISSING: README.md does not reference the vendored-UI manifest (ui/upstream.json)" >&2
-        fail=1
-    fi
+done
+if ! grep -q 'media/chat\.js' README.md; then
+    echo "MISSING: README.md does not reference the Faktor-owned panel (apps/vscode/media/chat.js)" >&2
+    fail=1
 fi
 
 # 4. apps/ real panels: when the rich Faktor panels exist (task tree,
@@ -224,21 +228,15 @@ if [ -f apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/BoardPanel.k
     done
 fi
 
-# 5. Executable results invalidate stale prose labels. The 7.1.2 pin being
-#    vendored means BLOCKED_EXTERNAL can no longer describe the JetBrains/UI
-#    parity surface. These are semantic assertions over the normalized text,
-#    so wrapped claims fail with their exact fragment.
-if [ "$JETBRAINS_PIN" -eq 1 ]; then
-    for doc in "$DOC" "${TRUTH_DOCS[@]}"; do
-        [ -f "$doc" ] || continue
-        assert_no_contradiction "$doc" \
-            '(jetbrains|712|client ui parity|ui parity)[^.]{0,80}blocked[_-]?external' \
-            "describes JetBrains/UI parity as BLOCKED_EXTERNAL although the pinned 7.1.2 corpus is vendored and executable parity results are the only remaining gate"
-        assert_no_contradiction "$doc" \
-            'blocked[_-]?external[^.]{0,80}(jetbrains|712|client ui parity|ui parity)' \
-            "describes JetBrains/UI parity as BLOCKED_EXTERNAL although the pinned 7.1.2 corpus is vendored and executable parity results are the only remaining gate"
-    done
-fi
+# 5. Executable results invalidate stale prose labels: the Faktor-owned UI
+#    axes are executable matrices, so no truth doc may describe the
+#    JetBrains/UI surface as missing assets.
+for doc in "$DOC" "${TRUTH_DOCS[@]}"; do
+    [ -f "$doc" ] || continue
+    assert_no_contradiction "$doc" \
+        '(jetbrains|client ui|ui surface|faktor-owned ui)[^.]{0,80}blocked[_-]?external' \
+        "describes the Faktor-owned UI as BLOCKED_EXTERNAL although its executable axes exist"
+done
 
 if [ "$fail" -ne 0 ]; then
     echo "$DOC / ${TRUTH_DOCS[*]} are out of sync with the code — fix the items listed above before merging." >&2
@@ -246,4 +244,4 @@ if [ "$fail" -ne 0 ]; then
 fi
 
 echo "docs/architecture.md is in sync: no stale identifiers, current API names present."
-echo "${TRUTH_DOCS[*]} pass the semantic truth assertions (completion execution, Windows Job Objects, vendored UI + VSIX staging, real apps/ panels)."
+echo "${TRUTH_DOCS[*]} pass the semantic truth assertions (completion execution, Windows Job Objects, Faktor-owned UI, real apps/ panels)."

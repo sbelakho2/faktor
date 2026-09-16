@@ -1457,7 +1457,7 @@ async fn emit_native_tools(ctx: &PromptCtx) -> Result<(), String> {
     Ok(())
 }
 
-/// A bounded native v756 history page (newest-first), as the daemon's
+/// A bounded native history page (newest-first), as the daemon's
 /// message service produces it.
 fn interop_history_page(session: &str) -> MessagesPage {
     MessagesPage {

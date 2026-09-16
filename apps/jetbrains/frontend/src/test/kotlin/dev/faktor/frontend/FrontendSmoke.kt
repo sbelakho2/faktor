@@ -93,8 +93,16 @@ private const val TASK_VERIFICATION_JSON = "{" +
     "\"category\":\"test\",\"required\":true,\"status\":\"passed\",\"startedMs\":1," +
     "\"finishedMs\":2,\"exit\":0,\"summary\":\"see evidence:43\"}]," +
     "\"changedFiles\":[{\"path\":\"a.rs\",\"digestHex\":\"aa\",\"size\":3}]," +
-    "\"unrelatedChanges\":[],\"reviewer\":null,\"status\":\"passed\"," +
-    "\"startedMs\":1,\"completedMs\":2}]}"
+    "\"unrelatedChanges\":[],\"reviewer\":\"review-bot\",\"status\":\"passed\"," +
+    "\"startedMs\":1,\"completedMs\":2," +
+    "\"candidateProof\":{\"taskRevision\":\"rev\",\"baseManifestHash\":null," +
+    "\"candidateManifestHash\":null,\"sourceDiffEvidence\":null," +
+    "\"riskReportEvidence\":null,\"accountingSnapshotDigest\":null," +
+    "\"runId\":\"run-1\",\"runBaseSnapshot\":null,\"candidateSnapshot\":\"cand1234\"," +
+    "\"sourcesDigest\":null,\"changedFilesDigest\":null," +
+    "\"publishedCommit\":\"abcdef12\",\"remotePrHead\":\"refs/9\"}," +
+    "\"verifiedSnapshot\":\"ver1234\",\"basedOnSnapshot\":\"base1234\"," +
+    "\"sourceCount\":2,\"landedSnapshot\":\"land1234\"}]}"
 
 // Criterion proof coverage: all SEVEN typed binding kinds served on the wire
 // (the typed binding object + origin/requirement + the three-way verdict)
@@ -143,9 +151,11 @@ private const val CRITERION_PROOF_JSON = "{" +
     "\"riskReportEvidence\":null,\"accountingSnapshotDigest\":\"accounting:v1:feed\"," +
     "\"runId\":\"run-proof\",\"runBaseSnapshot\":\"base-snap\"," +
     "\"candidateSnapshot\":\"cand-snap\",\"sourcesDigest\":\"sources-digest\"," +
-    "\"changedFilesDigest\":\"changed-digest\"}," +
+    "\"changedFilesDigest\":\"changed-digest\"," +
+    "\"publishedCommit\":\"abcdef12\",\"remotePrHead\":\"refs/9\"}," +
     "\"verifiedSnapshot\":\"verified-snap\",\"basedOnSnapshot\":\"base-snap\"," +
-    "\"sourceCount\":3,\"landedSnapshot\":\"landed-snap\"" +
+    "\"sourceCount\":3,\"landedSnapshot\":\"landed-snap\"," +
+    "\"reviewer\":\"review-bot\"" +
     "}]}"
 
 private const val MODELS_JSON = "[" +
@@ -289,6 +299,12 @@ object FrontendSmoke {
             assertEquals(1, record.criteria.size)
             assertEquals("evidence:42 tool output", record.criteria[0].evidence)
             assertEquals(listOf("see evidence:43"), record.checkSummaries)
+            // The served proof family (snapshots, reviewer, published commit
+            // and remote PR head) parses straight from the wire.
+            assertEquals("ver1234", record.verifiedSnapshot)
+            assertEquals("review-bot", record.reviewer)
+            assertEquals("abcdef12", record.candidateProof?.publishedCommit)
+            assertEquals("refs/9", record.candidateProof?.remotePrHead)
         }
 
         step("canned native parsing: tournament + tournament start receipt") {
@@ -736,6 +752,17 @@ object FrontendSmoke {
             )
             assertEquals("passed", model.verification.status)
             assertEquals(1, model.verification.owed)
+            // The top-level summary renders VERIFIED with the served
+            // criteria/checks/review/tree/commit/remote-head facts.
+            assertEquals(true, model.verification.verified)
+            val summaryText = model.verification.summaryText()
+            assertTrue(summaryText.startsWith("VERIFIED"), summaryText)
+            assertTrue(summaryText.contains("criteria 1/1"), summaryText)
+            assertTrue(summaryText.contains("checks failed 0"), summaryText)
+            assertTrue(summaryText.contains("review review-bot"), summaryText)
+            assertTrue(summaryText.contains("tree ver1234"), summaryText)
+            assertTrue(summaryText.contains("commit abcdef12"), summaryText)
+            assertTrue(summaryText.contains("head refs/9"), summaryText)
             val evidenceIds = model.evidence.mapNotNull { it.id }.sorted()
             assertEquals(listOf(41L, 42L, 43L), evidenceIds)
             assertEquals(93L, model.spend?.remainingTokens)
@@ -762,6 +789,9 @@ object FrontendSmoke {
             assertEquals("verified-snap", record.verifiedSnapshot)
             assertEquals("base-snap", record.basedOnSnapshot)
             assertEquals("landed-snap", record.landedSnapshot)
+            assertEquals("abcdef12", record.candidateProof?.publishedCommit)
+            assertEquals("refs/9", record.candidateProof?.remotePrHead)
+            assertEquals("review-bot", record.reviewer)
 
             val model = TaskTree.build(task = task, taskVerification = verification)
             val byKey = model.criteriaProof.associateBy { it.criterionKey }
@@ -795,6 +825,20 @@ object FrontendSmoke {
             }
             assertEquals("required", byKey["check criterion"]?.requirement)
             assertEquals("user", byKey["check criterion"]?.origin)
+            // The served published commit / remote PR head / reviewer render
+            // in the snapshot fact line too.
+            assertTrue(
+                byKey["check criterion"]?.snapshot?.contains("commit abcdef12") == true,
+                byKey["check criterion"]?.snapshot ?: ""
+            )
+            assertTrue(
+                byKey["check criterion"]?.snapshot?.contains("head refs/9") == true,
+                byKey["check criterion"]?.snapshot ?: ""
+            )
+            assertTrue(
+                byKey["check criterion"]?.snapshot?.contains("review review-bot") == true,
+                byKey["check criterion"]?.snapshot ?: ""
+            )
             assertEquals("preferred", byKey["review criterion"]?.requirement)
             assertEquals("project_policy", byKey["review criterion"]?.origin)
             assertEquals("semantic_provider", byKey["unavailable criterion"]?.origin)

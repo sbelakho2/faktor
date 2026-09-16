@@ -1,17 +1,21 @@
 # Faktor Native Protocol v1
 
-The daemon's own HTTP surface (architecture spec §16). UI compatibility
-is the target — visual/behavioral, not wire-level — and this protocol is
-optimized around the Faktor runtime. Kilo wire compatibility was retired
-by explicit owner decision; nothing here pretends to be it.
+The daemon's own HTTP surface (architecture spec §16). The Faktor-owned
+IDE panels are the only clients, and this protocol is optimized around the
+Faktor runtime. Foreign wire compatibility was retired by explicit owner
+decision; nothing here pretends to be it.
 
-All endpoints require daemon auth (same `FAKTOR_SERVER_PASSWORD` /
-`Authorization` forms as the rest of the server). JSON field names on the
+All endpoints require daemon auth (`Authorization: Bearer
+<FAKTOR_SERVER_PASSWORD>` or `x-faktor-server-password`; the legacy
+per-start token rides the same Bearer header). The pre-cutover `Basic`
+compatibility form is gone — clients that still send it must migrate to
+the Bearer claim (migration note in `crates/server/src/auth.rs`); there is
+no downgrade path. JSON field names on the
 native surface are camelCase unless noted. Request bodies of the native
 surface are first-class strict DTOs (`deny_unknown_fields`; audit 56):
 an unknown field — a misspelled option such as `hardBudegt` included —
 is a loud 400, never silently ignored. They are strict *native* shapes of
-this runtime, not frozen v7.5.6 wire envelopes.
+this runtime, not frozen compatibility envelopes.
 
 ## Lifetimes
 
@@ -179,17 +183,15 @@ Designed; not yet wired (one-line semantics):
 
 ## UI-adaptation principle
 
-The old UI is a UI, not a protocol peer. Adaptation happens at the
-boundary, in one direction only:
+A UI is a UI, not a protocol peer. Adaptation happens at the boundary, in
+one direction only:
 
-1. **UI posts typed messages** — text, tool parts, file references —
-   never v7.5.6 control envelopes. The IDE shells (`apps/vscode`,
-   `apps/jetbrains`) and any bridge translate UI gestures into typed
-   native requests.
-2. **Bridge → Rust**: the bridge is a thin client of the native
-   protocol; all state lives in the daemon, all validation happens in
-   the daemon.
-3. **Never pretend to be v7.5.6**: the old wire-compatibility surface was
-   retired; native endpoints own their shapes and strictness (unknown
-   fields are loud 400s), and a native client never fabricates v7.5.6
-   frames.
+1. **UI posts typed messages** — text, tool parts, file references — never
+   foreign control envelopes. The Faktor-owned IDE panels (`apps/vscode`,
+   `apps/jetbrains`) translate UI gestures into typed native requests.
+2. **Client → Rust**: the client is a thin native-protocol client; all
+   state lives in the daemon, all validation happens in the daemon.
+3. **Never pretend to be a foreign protocol**: the pre-cutover
+   wire-compatibility surface was retired; native endpoints own their
+   shapes and strictness (unknown fields are loud 400s), and a native
+   client never fabricates foreign frames.
