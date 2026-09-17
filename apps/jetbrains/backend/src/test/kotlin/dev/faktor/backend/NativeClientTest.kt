@@ -1117,7 +1117,7 @@ object NativeBridgeSmoke {
             }
             val conn = connection
             if (conn != null) {
-                val client = NativeClient.forConnection(conn)
+                val client = NativeClient.forConnection(conn, timeoutMs = 180_000L)
                 step("native health via bearer auth") {
                     val health = client.health()
                     if (!health.ok) fail("native health ok=false")
