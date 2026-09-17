@@ -142,12 +142,13 @@ impl PolicyCheckedHttpTransport {
         }
     }
 
-    /// The default production transport with the adapter-standard connect
-    /// timeout and NO installed policy (default-allow). Compat path for
-    /// callers that do not (yet) own a destination policy — the daemon
-    /// config sites listed in the egress audit replace this with
-    /// [`PolicyCheckedHttpTransport::with_policy`] once the sandbox
-    /// `NetworkGate` policy is threaded into provider construction.
+    /// The default-allow transport with the adapter-standard connect
+    /// timeout and NO installed policy. TEST-ONLY: gated behind `cfg(test)`
+    /// or the `test-utils` feature (enabled solely by dependent crates'
+    /// dev-dependencies), so a production build has no default-allow
+    /// constructor to call — the daemon must inject the policy-checked
+    /// transport ([`PolicyCheckedHttpTransport::with_policy`]).
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn permissive() -> Self {
         Self::new(default_timeout_client(), None)
     }
@@ -1839,6 +1840,119 @@ mod tests {
              transport construction belongs in #[cfg(test)] helpers only.",
             offenders.join("\n  ")
         );
+    }
+
+    // ----------------------------- permissive-constructor reference scan
+
+    /// The gated default-allow constructor.
+    const PERMISSIVE_CTOR_MARKER: &str = "PolicyCheckedHttpTransport::permissive";
+
+    /// Offenders of one file: every reference to the permissive constructor
+    /// outside a test-gated item (and outside `/tests/`-layout files).
+    fn permissive_ctor_offenders(rel: &str, source: &str) -> Vec<String> {
+        let masked = mask_noncode(source);
+        let spans = test_gated_spans(&masked);
+        let mut offenders = Vec::new();
+        for (idx, _) in masked.match_indices(PERMISSIVE_CTOR_MARKER) {
+            if spans.iter().any(|(s, e)| idx >= *s && idx < *e) {
+                continue;
+            }
+            let line = source[..idx].matches('\n').count() + 1;
+            let text = source.lines().nth(line - 1).unwrap_or("").trim();
+            offenders.push(format!("{rel}:{line}: {text}"));
+        }
+        offenders
+    }
+
+    /// P2 certification: the permissive (default-allow) transport constructor
+    /// may be referenced ONLY from test-gated code, anywhere in the tree.
+    /// The constructor is also compile-gated behind
+    /// `#[cfg(any(test, feature = "test-utils"))]`; this scan is the belt to
+    /// the manifest's braces — a future edit that removes the gate or leaks
+    /// `test-utils` into a production dependency graph fails here (and the
+    /// production build would fail to resolve the constructor anyway).
+    #[test]
+    fn no_permissive_ctor_reference_outside_test_code() {
+        let workspace = crates_root()
+            .parent()
+            .expect("crates/ has a parent")
+            .to_path_buf();
+        let mut offenders: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
+        let mut hits = 0usize;
+        for (root, skip_rel) in [
+            (
+                workspace.join("crates"),
+                Some("crates/provider/src/egress.rs".to_string()),
+            ),
+            (workspace.join("tests"), None),
+        ] {
+            let mut stack = vec![root];
+            while let Some(dir) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Ok(file_type) = entry.file_type() else {
+                        continue;
+                    };
+                    if file_type.is_dir() {
+                        stack.push(path);
+                        continue;
+                    }
+                    if !(file_type.is_file()
+                        && path.extension().and_then(|e| e.to_str()) == Some("rs"))
+                    {
+                        continue;
+                    }
+                    scanned += 1;
+                    let rel = path
+                        .strip_prefix(&workspace)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string();
+                    let rel = normalize_rel(&rel);
+                    if skip_rel.as_deref() == Some(rel.as_str()) {
+                        continue; // egress.rs owns the definition
+                    }
+                    if rel.starts_with("tests/") || rel.contains("/tests/") {
+                        continue; // test-only layout
+                    }
+                    let Ok(source) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    hits += mask_noncode(&source)
+                        .matches(PERMISSIVE_CTOR_MARKER)
+                        .count();
+                    offenders.extend(permissive_ctor_offenders(&rel, &source));
+                }
+            }
+        }
+        assert!(scanned >= 10, "permissive scan walked nothing: {scanned}");
+        assert!(
+            hits >= 6,
+            "permissive scan saw no constructor reference at all ({hits} hits): \
+             the walk is not covering the test helpers"
+        );
+        assert!(
+            offenders.is_empty(),
+            "the permissive egress constructor is referenced outside test-gated code:\n  {}\n\
+             Production must receive the injected policy-checked Arc<dyn HttpTransport>; \
+             PolicyCheckedHttpTransport::permissive is cfg(test)/test-utils only.",
+            offenders.join("\n  ")
+        );
+
+        // Adversarial self-check: a production reference fires; the same
+        // reference under a test gate (or a string literal) does not.
+        let production =
+            "fn build(c: C) -> P { build(c, Arc::new(PolicyCheckedHttpTransport::permissive())) }";
+        let found = permissive_ctor_offenders("openai/src/lib.rs", production);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let gated = "#[cfg(test)]\nfn helper(c: C) -> P { Arc::new(PolicyCheckedHttpTransport::permissive()) }\n";
+        assert!(permissive_ctor_offenders("openai/src/lib.rs", gated).is_empty());
+        let literal = "const DOC: &str = \"PolicyCheckedHttpTransport::permissive\";";
+        assert!(permissive_ctor_offenders("openai/src/lib.rs", literal).is_empty());
     }
 
     #[test]

@@ -19,3 +19,10 @@ tracing.workspace = true
 tempfile.workspace = true
 base64 = "0.22"
 blake3.workspace = true
+
+[features]
+# Test-only: exposes the default-allow `PolicyCheckedHttpTransport::permissive`
+# constructor to dependent crates' TEST targets (via their dev-dependencies).
+# A production build must never enable this: production code receives the
+# policy-checked transport injected by the daemon.
+test-utils = []

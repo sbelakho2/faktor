@@ -7351,6 +7351,167 @@ mod tests {
             .unwrap();
     }
 
+    /// P1 webhook arithmetic over the REAL HTTP route: attacker-controlled
+    /// timestamps (`i64::MIN`, `i64::MAX`, far-future, stale, zero, and
+    /// malformed strings) are typed 401 refusals — never a panic, never a
+    /// 500 — and a recent timestamp with a good signature is accepted. The
+    /// old `(now_ms - ts).abs()` panicked (debug) / wrapped (release) on
+    /// `i64::MIN` before any signature check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn webhook_timestamp_arithmetic_is_fail_closed_over_http() {
+        use faktor_scm::ScmStore;
+        const WEBHOOK_SECRET: &[u8] = b"hook-secret";
+        let mock = MockServer::new();
+        let (mock_addr, _mock_task) = mock.clone().serve().await;
+        let base = format!("http://{mock_addr}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let payloads = dir.path().join("payloads");
+        std::fs::create_dir_all(&payloads).unwrap();
+        for (name, body) in [
+            ("app.pem", crate::scm_daemon::TEST_PRIVATE_KEY.as_bytes()),
+            ("hook.secret", WEBHOOK_SECRET),
+        ] {
+            let path = payloads.join(name);
+            std::fs::write(&path, body).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        let config = dir.path().join("faktor-plus.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "model": "m",
+                "cloud": {
+                    "enabled": true,
+                    "database": "cp.db",
+                    "scm_database": "repos.db",
+                    "github_app": {
+                        "enabled": true,
+                        "app_id": 12345,
+                        "private_key": "app.pem",
+                        "webhook_secret": "hook.secret",
+                        "api_base": base,
+                        "organization": "org_acme",
+                    },
+                },
+                "sandbox": {"network": [base]},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let dir2 = dir.path().to_path_buf();
+        let daemon = tokio::task::spawn(async move {
+            serve_impl(port, dir2, Some(config), Some(ready_tx), Some(shutdown_rx)).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(60), ready_rx)
+            .await
+            .expect("serve must reach the startup line")
+            .expect("ready signal");
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let body = br#"{"installation":{"id":7},"action":"created"}"#;
+        let client = reqwest::Client::new();
+        let post = |delivery: &str, timestamp: Option<&str>, signed_input: &[u8]| {
+            let signature = format!(
+                "sha256={}",
+                faktor_scm::hmac_sha256_hex(WEBHOOK_SECRET, signed_input)
+            );
+            let mut request = client
+                .post(format!("http://127.0.0.1:{port}/native/scm/webhook"))
+                .header("x-github-delivery", delivery)
+                .header("x-github-event", "installation")
+                .header("x-hub-signature-256", signature);
+            if let Some(ts) = timestamp {
+                request = request.header("x-faktor-timestamp", ts);
+            }
+            request.body(body.to_vec())
+        };
+
+        // Every hostile timestamp is signed over `{ts}.{body}` (a VALID
+        // signature for that timestamp), so the only reason to refuse is the
+        // replay-window arithmetic.
+        let signed_over = |ts: &str| {
+            let mut input = format!("{ts}.").into_bytes();
+            input.extend_from_slice(body);
+            input
+        };
+        let hostile: Vec<(&str, String)> = vec![
+            ("i64::MIN", i64::MIN.to_string()),
+            ("i64::MAX", i64::MAX.to_string()),
+            ("far-future", (now_ms + 3_600_000).to_string()),
+            ("stale", (now_ms - 3_600_000).to_string()),
+            ("zero", "0".to_string()),
+            ("malformed", "not-a-number".to_string()),
+            ("overflowing-number", "99999999999999999999999".to_string()),
+        ];
+        for (label, ts) in &hostile {
+            let response = post(&format!("d-hostile-{label}"), Some(ts), &signed_over(ts))
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("{label}: the route must answer, not reset: {e}"));
+            assert_eq!(
+                response.status(),
+                401,
+                "{label}: hostile timestamp must be a typed refusal"
+            );
+            let refusal: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(
+                refusal["error"]["code"], "scm_webhook_unauthorized",
+                "{label}: {refusal}"
+            );
+        }
+        // A malformed timestamp + a VALID body-only signature (the GitHub
+        // mode shape) must still refuse: the malformed header may not select
+        // a weaker verification mode.
+        let response = post("d-malformed-body-sig", Some("not-a-number"), body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+        let refusal: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(refusal["error"]["code"], "scm_webhook_unauthorized");
+
+        // A recent timestamp with a good signature over `{now}.{body}` is
+        // accepted (and only that one delivery is durably claimed).
+        let now = now_ms.to_string();
+        let accepted = post("d-accepted", Some(&now), &signed_over(&now))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted.status(),
+            200,
+            "a fresh signed delivery is accepted"
+        );
+        let accepted: serde_json::Value = accepted.json().await.unwrap();
+        assert_eq!(accepted["status"], "accepted", "{accepted}");
+
+        let store = faktor_scm::SqliteScmStore::open(&dir.path().join("repos.db")).unwrap();
+        assert_eq!(
+            store.webhook_deliveries(10).unwrap().len(),
+            1,
+            "no hostile delivery may reach the durable inbox"
+        );
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(30), daemon)
+            .await
+            .expect("daemon must stop on shutdown")
+            .expect("serve_impl returns Ok")
+            .unwrap();
+    }
+
     /// Updater-disabled parity: a daemon with `[updater] enabled = false`
     /// (and with an absent section) creates NO `update.db` and NO install
     /// directory; an enabled daemon creates both under its data dir. The

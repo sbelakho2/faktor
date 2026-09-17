@@ -25,7 +25,7 @@
 //!   server can never block itself on a full stderr pipe.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{BufReader, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ChildStdin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,10 +69,12 @@ pub struct LspConfig {
 }
 
 /// Shared connection state; guarded so the reader thread, drain threads and
-/// async request/notify paths never interleave a write.
+/// async request/notify paths never interleave a write. The stdin is
+/// BUFFERED, so the explicit `flush()` is the real pipe write: a broken or
+/// closed child stdin surfaces there (typed) instead of on some later read.
 struct LspConn {
     child_pid: u32,
-    stdin: ChildStdin,
+    stdin: BufWriter<ChildStdin>,
     next_id: u64,
     pending: HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>,
 }
@@ -180,7 +182,7 @@ impl LspClient {
             .map_err(|e| Error::new(ErrorKind::NotFound, format!("lsp spawn: {e}")))?;
         let conn = Arc::new(Mutex::new(LspConn {
             child_pid: spawned.child_pid,
-            stdin: spawned.stdin,
+            stdin: BufWriter::new(spawned.stdin),
             next_id: 1,
             pending: HashMap::new(),
         }));
@@ -253,7 +255,15 @@ impl LspClient {
             conn.stdin
                 .write_all(wire.as_bytes())
                 .map_err(|e| Error::new(ErrorKind::Network, format!("lsp write: {e}")))?;
-            conn.stdin.flush().ok();
+            // Propagate the FLUSH failure BEFORE registering the pending
+            // entry: a closed/broken child stdin is a typed transport error
+            // NOW, never a request that waits out its deadline.
+            conn.stdin.flush().map_err(|e| {
+                Error::new(
+                    ErrorKind::Network,
+                    format!("lsp write {method}: stdin flush failed: {e}"),
+                )
+            })?;
             conn.pending.insert(id.clone(), tx);
         }
         if let Some(a) = &self.activity {
@@ -314,7 +324,15 @@ impl LspClient {
                     format!("lsp notify {method}: {e}"),
                 ));
             }
-            conn.stdin.flush().ok();
+            if let Err(e) = conn.stdin.flush() {
+                if self.exited.load(Ordering::SeqCst) {
+                    return Ok(()); // the server died mid-flush; nothing to notify
+                }
+                return Err(Error::new(
+                    ErrorKind::Network,
+                    format!("lsp notify {method}: stdin flush failed: {e}"),
+                ));
+            }
         }
         if let Some(a) = &self.activity {
             a();
@@ -639,7 +657,7 @@ mod tests {
     use tempfile::tempdir;
 
     const MOCK: &str = r#"
-import json, os, sys, threading
+import json, os, sys, threading, time
 
 def send(obj):
     body = json.dumps(obj).encode("utf-8")
@@ -706,6 +724,14 @@ while True:
         didopen_seen = True
         check(initialized_seen, "didOpen after initialized")
         log("GOT didOpen")
+        if mode == "close-stdin":
+            # Close our read end of the pipe and keep running: the client's
+            # NEXT write/flush must fail typed, not time out. (`os.close` —
+            # closing the sys.stdin wrapper would NOT close the fd.)
+            os.close(sys.stdin.fileno())
+            log("CLOSED stdin")
+            while True:
+                time.sleep(0.05)
     elif m == "textDocument/documentSymbol":
         send({"jsonrpc": "2.0", "id": msg["id"], "result": []})
     elif m == "shutdown":
@@ -968,6 +994,60 @@ log("mock exiting")
         let tail = wait_for_stderr(&client, "GOT didOpen").await;
         assert!(!tail.contains("FAIL didOpen after initialized"), "{tail}");
         mgr.shutdown(WorkspaceId::new(9)).await.unwrap();
+    }
+
+    /// (vi) a child that closes its stdin after a notification: the NEXT
+    /// request must fail with the typed transport error immediately and must
+    /// NOT be registered in the pending map. The old ignored-flush path
+    /// registered it and only surfaced the failure as a deadline timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_stdin_request_fails_typed_and_registers_no_pending() {
+        if !python_available() {
+            eprintln!("python3 missing; skipping");
+            return;
+        }
+        let root_dir = tempdir().unwrap();
+        let root = root_dir.path().to_path_buf();
+        let expected_uri = file_uri(&root);
+        let (_d, sup) = supervisor();
+        let mgr = LspManager::new(sup);
+        let ws = WorkspaceId::new(41);
+        let (cfg, _script) = cfg_with(root.clone(), "close-stdin", &expected_uri);
+        let client = tokio::time::timeout(Duration::from_secs(15), mgr.start(ws, cfg))
+            .await
+            .expect("start timeout")
+            .expect("start failed");
+        // The notification itself succeeds (the child is still reading).
+        client
+            .did_open(&format!("{expected_uri}/a.rs"), "fn a() {}")
+            .unwrap();
+        let tail = wait_for_stderr(&client, "CLOSED stdin").await;
+        assert!(
+            tail.contains("CLOSED stdin"),
+            "the mock must have closed its stdin: {tail}"
+        );
+        // The next REQUEST hits the closed pipe: typed transport error, fast
+        // (never the 10s deadline), with no pending entry left behind.
+        let t0 = std::time::Instant::now();
+        let err = client
+            .document_symbols(&format!("{expected_uri}/a.rs"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Network, "{err:?}");
+        assert!(
+            err.message.contains("flush failed") || err.message.contains("lsp write"),
+            "the typed transport error must name the failed write/flush: {err:?}"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "a closed stdin must fail fast, never time out: {:?}",
+            t0.elapsed()
+        );
+        assert!(
+            client.conn.lock().unwrap().pending.is_empty(),
+            "no pending entry may be registered for a failed write"
+        );
+        mgr.shutdown(ws).await.unwrap();
     }
 
     /// (iii) shutdown REQUEST receives a response, then the exit

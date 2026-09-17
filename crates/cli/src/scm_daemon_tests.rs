@@ -105,6 +105,7 @@ fn signed_webhook(body: &[u8], delivery: &str) -> faktor_scm::WebhookHeaders {
         delivery_id: Some(delivery.to_string()),
         event: Some("installation".to_string()),
         timestamp_ms: None,
+        timestamp_malformed: false,
     }
 }
 
@@ -296,6 +297,7 @@ async fn webhook_delivery_resyncs_idempotently_and_bad_signatures_never_claim() 
             delivery_id: Some("d-forged".into()),
             event: Some("installation".into()),
             timestamp_ms: None,
+            timestamp_malformed: false,
         },
         body,
     );

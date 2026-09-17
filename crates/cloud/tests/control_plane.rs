@@ -130,7 +130,7 @@ fn foreign_approval_and_invitation_ids_are_not_found() {
         ControlPlaneError::NotFound("invitation not found".into())
     );
     assert_eq!(
-        cp.decide_approval(&owner_a, &approval_b.id, true, "")
+        cp.decide_approval(&owner_a, &approval_b.id, true, "", "dec-foreign")
             .unwrap_err(),
         ControlPlaneError::NotFound("approval not found".into())
     );
@@ -144,9 +144,9 @@ fn foreign_approval_and_invitation_ids_are_not_found() {
     );
     let missing_approval = ApprovalId::try_new("apr_00000000000000000000000000000000").unwrap();
     assert_eq!(
-        cp.decide_approval(&owner_a, &missing_approval, true, "")
+        cp.decide_approval(&owner_a, &missing_approval, true, "", "dec-missing")
             .unwrap_err(),
-        cp.decide_approval(&owner_a, &approval_b.id, true, "")
+        cp.decide_approval(&owner_a, &approval_b.id, true, "", "dec-foreign-2")
             .unwrap_err()
     );
 }
@@ -188,11 +188,19 @@ fn invitation_lifecycle_survives_a_restart() {
     }
     // Restart: the invitation token still resolves and accepts exactly once.
     let cp = ControlPlane::new(store.clone(), clock.clone());
-    let membership: Membership = cp.accept_invitation(token.expose(), &invitee_id).unwrap();
+    let membership: Membership = cp
+        .accept_invitation(token.expose(), &invitee_id, "accept-key")
+        .unwrap();
     assert_eq!(membership.organization, org);
     assert_eq!(membership.role, Role::Admin);
+    // A same-key retry replays the recorded membership (crash-retry safe)...
+    let replayed = cp
+        .accept_invitation(token.expose(), &invitee_id, "accept-key")
+        .unwrap();
+    assert_eq!(replayed.id, membership.id);
+    // ...while the same token under a NEW key is a terminal conflict.
     assert!(matches!(
-        cp.accept_invitation(token.expose(), &invitee_id)
+        cp.accept_invitation(token.expose(), &invitee_id, "accept-key-2")
             .unwrap_err(),
         ControlPlaneError::Conflict(_)
     ));
@@ -217,7 +225,7 @@ fn invitation_lifecycle_survives_a_restart() {
     clock.advance(DEFAULT_INVITATION_TTL_MS + 1);
     let (late_user, _) = cp.create_user("late@gamma.test", "Late").unwrap();
     assert!(matches!(
-        cp.accept_invitation(late_token.expose(), &late_user.id)
+        cp.accept_invitation(late_token.expose(), &late_user.id, "late-accept")
             .unwrap_err(),
         ControlPlaneError::Conflict(_)
     ));
@@ -360,7 +368,7 @@ fn sessions_and_approval_decisions_are_exactly_once_across_a_restart() {
         .authenticate(other.token.as_ref().unwrap().expose())
         .unwrap();
     assert!(matches!(
-        cp.decide_approval(&other_owner, &approval_id, true, "")
+        cp.decide_approval(&other_owner, &approval_id, true, "", "dec-other")
             .unwrap_err(),
         ControlPlaneError::NotFound(_)
     ));
@@ -379,11 +387,17 @@ fn sessions_and_approval_decisions_are_exactly_once_across_a_restart() {
         .unwrap();
     let owner = cp.authenticate(token.expose()).unwrap();
     let decided = cp
-        .decide_approval(&owner, &approval_id, true, "ok")
+        .decide_approval(&owner, &approval_id, true, "ok", "dec-restart")
         .unwrap();
     assert_eq!(decided.status, faktor_cloud::ApprovalStatus::Approved);
+    // The same key replays the recorded decision across the restart...
+    let replayed = cp
+        .decide_approval(&owner, &approval_id, true, "ok", "dec-restart")
+        .unwrap();
+    assert_eq!(replayed.decided_ms, decided.decided_ms);
+    // ...and a new key on the terminal approval is a typed conflict.
     assert!(matches!(
-        cp.decide_approval(&owner, &approval_id, false, "")
+        cp.decide_approval(&owner, &approval_id, false, "", "dec-restart-2")
             .unwrap_err(),
         ControlPlaneError::Conflict(_)
     ));

@@ -16,3 +16,6 @@ faktor-ollama.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 futures.workspace = true
+
+[dev-dependencies]
+faktor-provider = { workspace = true, features = ["test-utils"] }

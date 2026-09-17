@@ -321,6 +321,20 @@ async fn members_invitations_and_approvals_flow_with_idempotency_keys() {
     assert_eq!(listed["items"].as_array().unwrap().len(), 1);
     assert!(listed["nextCursor"].is_null());
 
+    // Idempotency key is REQUIRED on decisions too.
+    let missing_decide_key = client
+        .post(url(
+            &base,
+            &format!("/native/approvals/{approval_id}/decide"),
+        ))
+        .bearer_auth(&daemon)
+        .header("x-faktor-control-token", &token)
+        .json(&serde_json::json!({"approved": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_decide_key.status(), 400);
+
     let decide = client
         .post(url(
             &base,
@@ -328,6 +342,7 @@ async fn members_invitations_and_approvals_flow_with_idempotency_keys() {
         ))
         .bearer_auth(&daemon)
         .header("x-faktor-control-token", &token)
+        .header("idempotency-key", "dec-1")
         .json(&serde_json::json!({"approved": true, "note": "ok"}))
         .send()
         .await
@@ -335,7 +350,21 @@ async fn members_invitations_and_approvals_flow_with_idempotency_keys() {
     assert_eq!(decide.status(), 200);
     let decided: serde_json::Value = decide.json().await.unwrap();
     assert_eq!(decided["approval"]["status"], "approved");
-    // A second decision is a typed conflict.
+    // A same-key retry replays the recorded decision.
+    let replay_decide = client
+        .post(url(
+            &base,
+            &format!("/native/approvals/{approval_id}/decide"),
+        ))
+        .bearer_auth(&daemon)
+        .header("x-faktor-control-token", &token)
+        .header("idempotency-key", "dec-1")
+        .json(&serde_json::json!({"approved": true, "note": "ok"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay_decide.status(), 200);
+    // A second decision under a NEW key is a typed conflict.
     let again = client
         .post(url(
             &base,
@@ -343,6 +372,7 @@ async fn members_invitations_and_approvals_flow_with_idempotency_keys() {
         ))
         .bearer_auth(&daemon)
         .header("x-faktor-control-token", &token)
+        .header("idempotency-key", "dec-2")
         .json(&serde_json::json!({"approved": false}))
         .send()
         .await

@@ -602,7 +602,8 @@ pub(crate) async fn native_approvals_create(
     }
 }
 
-/// `POST /native/approvals/{id}/decide` — decide one approval exactly once.
+/// `POST /native/approvals/{id}/decide` — decide one approval exactly once
+/// (idempotency-keyed: a same-key retry replays the recorded decision).
 pub(crate) async fn native_approvals_decide(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -624,6 +625,10 @@ pub(crate) async fn native_approvals_decide(
         Ok(p) => p,
         Err(e) => return wire_status(e),
     };
+    let idempotency_key = match require_idempotency_key(&headers) {
+        Ok(k) => k,
+        Err(e) => return wire_status(e),
+    };
     let approval_id = match faktor_cloud::ApprovalId::try_new(id) {
         Ok(id) => id,
         Err(e) => return wire_status(control_plane_err(e)),
@@ -631,7 +636,13 @@ pub(crate) async fn native_approvals_decide(
     let Some(control_plane) = state.deps.control_plane.as_ref() else {
         return wire_status(cloud_disabled());
     };
-    match control_plane.decide_approval(&principal, &approval_id, body.approved, &body.note) {
+    match control_plane.decide_approval(
+        &principal,
+        &approval_id,
+        body.approved,
+        &body.note,
+        &idempotency_key,
+    ) {
         Ok(approval) => {
             Json(serde_json::json!({ "ok": true, "approval": approval })).into_response()
         }

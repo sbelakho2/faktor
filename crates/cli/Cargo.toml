@@ -59,6 +59,7 @@ rand.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
+faktor-provider = { workspace = true, features = ["test-utils"] }
 # Test-only: the GitHub App daemon e2e posts signed webhook deliveries to the
 # served webhook route and asserts the wire response.
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls", "http2"] }
