@@ -875,6 +875,7 @@ async fn webhook_dedupe_survives_a_restart_and_refuses_bad_signatures() {
         delivery_id: Some(delivery.into()),
         event: Some("installation".into()),
         timestamp_ms: None,
+        timestamp_malformed: false,
     };
 
     {

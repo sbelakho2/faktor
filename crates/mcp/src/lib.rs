@@ -12,7 +12,7 @@
 //! bounded registry with owner rows and the daemon-shutdown kill scope.
 
 use std::collections::HashMap;
-use std::io::{BufReader, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::process::ChildStdin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -59,7 +59,10 @@ pub struct McpResult {
 
 struct Conn {
     child_pid: u32,
-    stdin: ChildStdin,
+    /// Buffered: the explicit `flush()` is the real pipe write, so a closed
+    /// or broken child stdin fails the caller typed instead of leaving a
+    /// pending entry to die on its deadline.
+    stdin: BufWriter<ChildStdin>,
     next_id: u64,
     pending: HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>,
 }
@@ -102,7 +105,7 @@ impl McpServer {
             .map_err(|e| Error::new(ErrorKind::NotFound, format!("mcp spawn: {e}")))?;
         let conn = Arc::new(Mutex::new(Conn {
             child_pid: spawned.child_pid,
-            stdin: spawned.stdin,
+            stdin: BufWriter::new(spawned.stdin),
             next_id: 1,
             pending: HashMap::new(),
         }));
@@ -165,7 +168,15 @@ impl McpServer {
             conn.stdin
                 .write_all(wire.as_bytes())
                 .map_err(|e| Error::new(ErrorKind::Network, format!("mcp write: {e}")))?;
-            conn.stdin.flush().ok();
+            // Propagate the FLUSH failure BEFORE registering the pending
+            // entry: a closed/broken child stdin is a typed transport error
+            // NOW, never a call that waits out its deadline.
+            conn.stdin.flush().map_err(|e| {
+                Error::new(
+                    ErrorKind::Network,
+                    format!("mcp {method}: stdin flush failed: {e}"),
+                )
+            })?;
             conn.pending.insert(id.clone(), tx);
         }
         // Reader loop (see `read_loop`); here we wait with a deadline.
@@ -547,6 +558,80 @@ sys.exit(0)
         let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
         let r = parse_frame(frame.as_bytes());
         assert!(r.is_err());
+    }
+
+    /// A child that answers exactly one frame, then closes its stdin and
+    /// keeps running: the NEXT call must fail with the typed transport
+    /// error BEFORE any pending entry exists. The old ignored-flush path
+    /// registered the request and turned the failure into a deadline
+    /// timeout instead.
+    #[tokio::test]
+    async fn closed_stdin_surfaces_typed_error_without_pending_entry() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("python3 missing; skipping");
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = ProcessSupervisor::new(cas);
+        let script = r#"
+import json, os, sys, time
+
+def read_msg():
+    cl = 0
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        if line.lower().startswith(b"content-length:"):
+            cl = int(line.split(b":")[1])
+    if cl == 0:
+        return {}
+    return json.loads(sys.stdin.buffer.read(cl))
+
+msg = read_msg()
+body = json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {}}).encode("utf-8")
+sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+sys.stdout.buffer.write(body)
+sys.stdout.buffer.flush()
+# Close the read end of the pipe: os.close on the FD — closing the sys.stdin
+# wrapper would NOT close the descriptor.
+os.close(sys.stdin.fileno())
+while True:
+    time.sleep(0.05)
+"#;
+        let cfg = McpConfig {
+            name: "closes-stdin".into(),
+            command: "python3".into(),
+            args: vec!["-c".into(), script.into()],
+            env: vec![],
+        };
+        let server = McpServer::connect(cfg, sup.clone()).await.unwrap();
+        let t0 = std::time::Instant::now();
+        let err = server
+            .call("tools/list", serde_json::json!({}), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Network, "{err:?}");
+        assert!(
+            err.message.contains("flush failed") || err.message.contains("mcp write"),
+            "the typed transport error must name the failed write/flush: {err:?}"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "a closed stdin must fail fast, never wait out the deadline: {:?}",
+            t0.elapsed()
+        );
+        assert!(
+            server.conn.lock().unwrap().pending.is_empty(),
+            "no pending entry may be registered for a failed write"
+        );
     }
 
     /// P0-40 static certification: no production path in this crate

@@ -40,6 +40,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 tempfile.workspace = true
 
 [dev-dependencies]
+faktor-provider = { workspace = true, features = ["test-utils"] }
 # The updater route tests sign manifests with a real ed25519 key and
 # implement the async artifact-fetcher seam.
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }

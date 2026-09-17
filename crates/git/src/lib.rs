@@ -197,12 +197,17 @@ pub const COMMIT_IDENTITY_EMAIL: &str = "faktor@faktor.local";
 /// ownership, so the manager records it next to the repository's own
 /// bookkeeping (inside `.git/` — never user-visible, gitignored by
 /// definition, survives daemon restarts and worktree re-discovery).
-const META_FILE: &str = "faktor-plus-worktrees.json";
+const META_FILE: &str = "faktor-worktrees.json";
+/// The pre-rename metadata name (faktor-plus era). A valid legacy file is
+/// migrated to [`META_FILE`] exactly once through the shared atomic-write
+/// authority, then retired (best effort; a failed retire is retried on the
+/// next load).
+const LEGACY_META_FILE: &str = "faktor-plus-worktrees.json";
 const META_MAX_ENTRIES: usize = 500;
 const META_MAX_PATH_BYTES: usize = 4096;
 const META_MAX_BRANCH_BYTES: usize = 256;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct MetaEntry {
     id: u64,
     path: String,
@@ -214,6 +219,130 @@ struct MetaEntry {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Meta {
     worktrees: Vec<MetaEntry>,
+}
+
+/// One load-time observable event. Metadata loss is recoverable by
+/// re-discovery, but it must never be silent: every anomaly is both
+/// returned to the caller (tests/diagnostics) and logged as a visible
+/// warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MetaDiagnostic {
+    /// A valid legacy file was read and republished under the new name.
+    MigratedLegacy { from: PathBuf, to: PathBuf },
+    /// Publishing the migrated metadata failed; the legacy file is retained
+    /// and the migration is retried on the next load.
+    MigrationWriteFailed { path: PathBuf, detail: String },
+    /// Retiring the legacy file after a successful migration/authority
+    /// switch failed; it is retried on the next load.
+    LegacyRetireFailed { path: PathBuf, detail: String },
+    /// The current metadata file is corrupt; authority stays with the new
+    /// name (the corrupt bytes are never silently replaced by the stale
+    /// legacy copy) and ownership is recovered by re-discovery.
+    CorruptCurrent { path: PathBuf },
+    /// The legacy metadata file is corrupt/oversized; it is retained for
+    /// postmortem and ownership is recovered by re-discovery.
+    CorruptLegacy { path: PathBuf },
+    /// The legacy file exists but could not be read (permissions, I/O).
+    LegacyUnreadable { path: PathBuf, detail: String },
+    /// The current metadata file exists but could not be read (permissions,
+    /// I/O); ownership is recovered by re-discovery.
+    CurrentUnreadable { path: PathBuf, detail: String },
+}
+
+impl MetaDiagnostic {
+    fn message(&self) -> String {
+        match self {
+            MetaDiagnostic::MigratedLegacy { from, to } => format!(
+                "worktree metadata migrated {} -> {}",
+                from.display(),
+                to.display()
+            ),
+            MetaDiagnostic::MigrationWriteFailed { path, detail } => format!(
+                "worktree metadata migration write to {} failed; the legacy file is retained and the migration retried: {detail}",
+                path.display()
+            ),
+            MetaDiagnostic::LegacyRetireFailed { path, detail } => format!(
+                "legacy worktree metadata {} could not be retired (retried next load): {detail}",
+                path.display()
+            ),
+            MetaDiagnostic::CorruptCurrent { path } => format!(
+                "worktree metadata {} is corrupt; ownership is recovered by re-discovery",
+                path.display()
+            ),
+            MetaDiagnostic::CorruptLegacy { path } => format!(
+                "legacy worktree metadata {} is corrupt; it is retained for postmortem and ownership is recovered by re-discovery",
+                path.display()
+            ),
+            MetaDiagnostic::LegacyUnreadable { path, detail } => format!(
+                "legacy worktree metadata {} could not be read (recovered by re-discovery): {detail}",
+                path.display()
+            ),
+            MetaDiagnostic::CurrentUnreadable { path, detail } => format!(
+                "worktree metadata {} could not be read (recovered by re-discovery): {detail}",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// One metadata load: the (possibly empty) metadata plus every load-time
+/// diagnostic. Callers log the diagnostics exactly once per load.
+struct MetaLoad {
+    meta: Meta,
+    diagnostics: Vec<MetaDiagnostic>,
+}
+
+impl MetaLoad {
+    /// Log every diagnostic exactly once (visible, never silent) and return
+    /// the load to the caller. `_manager` anchors the load to its owning
+    /// manager (kept for future structured diagnostics).
+    fn finish(load: MetaLoad, _manager: &WorktreeManager) -> MetaLoad {
+        for diagnostic in &load.diagnostics {
+            tracing::warn!(
+                diagnostic = %diagnostic.message(),
+                "worktree metadata diagnostic"
+            );
+        }
+        load
+    }
+}
+
+fn empty_meta() -> Meta {
+    Meta { worktrees: vec![] }
+}
+
+/// Validated parse: serde + bounded entry count + per-entry bounds. A
+/// hostile or oversized file is `None` (never a partial authority).
+fn parse_meta(bytes: &[u8]) -> Option<Meta> {
+    let parsed = serde_json::from_slice::<Meta>(bytes).ok()?;
+    if parsed.worktrees.len() > META_MAX_ENTRIES {
+        return None;
+    }
+    let mut sane = Vec::new();
+    for e in parsed.worktrees {
+        if e.path.is_empty()
+            || e.path.len() > META_MAX_PATH_BYTES
+            || e.branch.len() > META_MAX_BRANCH_BYTES
+        {
+            continue; // hostile entry: drop it
+        }
+        sane.push(e);
+    }
+    Some(Meta { worktrees: sane })
+}
+
+/// Best-effort retirement of the legacy file after the new name became the
+/// authority. A missing file is already retired; any other failure is a
+/// visible diagnostic and is retried on the next load.
+fn retire_legacy(legacy: &Path, diagnostics: &mut Vec<MetaDiagnostic>) {
+    match std::fs::remove_file(legacy) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => diagnostics.push(MetaDiagnostic::LegacyRetireFailed {
+            path: legacy.to_path_buf(),
+            detail: e.to_string(),
+        }),
+    }
 }
 
 /// Normalize a path for the git command line. Rust keeps Windows verbatim
@@ -275,6 +404,10 @@ fn meta_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".git").join(META_FILE)
 }
 
+fn legacy_meta_path(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(".git").join(LEGACY_META_FILE)
+}
+
 /// A temp sibling of the final metadata file that is unique PER WRITE:
 /// process-wide monotonic nonce + pid + nanosecond timestamp. Concurrent
 /// writers (multiple manager instances over the same repo) each get their
@@ -319,29 +452,118 @@ impl WorktreeManager {
         }
     }
 
-    /// Load the durable metadata; a corrupt or hostile file is treated as
-    /// empty (never an error — the manager repairs by re-recording).
-    fn load_meta(&self, workspace_root: &Path) -> Meta {
-        let Ok(bytes) = std::fs::read(meta_path(workspace_root)) else {
-            return Meta { worktrees: vec![] };
-        };
-        let Ok(parsed) = serde_json::from_slice::<Meta>(&bytes) else {
-            return Meta { worktrees: vec![] };
-        };
-        if parsed.worktrees.len() > META_MAX_ENTRIES {
-            return Meta { worktrees: vec![] };
-        }
-        let mut sane = Vec::new();
-        for e in parsed.worktrees {
-            if e.path.is_empty()
-                || e.path.len() > META_MAX_PATH_BYTES
-                || e.branch.len() > META_MAX_BRANCH_BYTES
-            {
-                continue; // hostile entry: drop it
+    /// Load the durable metadata with the legacy-name migration. The NEW
+    /// name is the sole authority whenever it exists (even corrupt — a
+    /// stale legacy copy is never silently resurrected on top of it).
+    ///
+    /// - a VALID legacy file is parsed, republished under the new name
+    ///   through [`faktor_fs::atomic::atomic_replace`] (unique temp + fsync
+    ///   of the file + rename + fsync of the parent directory) and then
+    ///   retired; a failed publish keeps the legacy file and retries on the
+    ///   next load;
+    /// - a CORRUPT legacy file is retained for postmortem, reported as a
+    ///   visible diagnostic and treated as empty (recovery is re-discovery
+    ///   by the manager — never a silent first boot).
+    fn load_meta_detailed(&self, workspace_root: &Path) -> MetaLoad {
+        let current = meta_path(workspace_root);
+        let legacy = legacy_meta_path(workspace_root);
+        let mut diagnostics = Vec::new();
+        match std::fs::read(&current) {
+            Ok(bytes) => {
+                let Some(meta) = parse_meta(&bytes) else {
+                    diagnostics.push(MetaDiagnostic::CorruptCurrent { path: current });
+                    return MetaLoad::finish(
+                        MetaLoad {
+                            meta: empty_meta(),
+                            diagnostics,
+                        },
+                        self,
+                    );
+                };
+                if legacy.exists() {
+                    retire_legacy(&legacy, &mut diagnostics);
+                }
+                MetaLoad::finish(MetaLoad { meta, diagnostics }, self)
             }
-            sane.push(e);
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match std::fs::read(&legacy) {
+                Ok(bytes) => {
+                    let Some(meta) = parse_meta(&bytes) else {
+                        diagnostics.push(MetaDiagnostic::CorruptLegacy {
+                            path: legacy.clone(),
+                        });
+                        return MetaLoad::finish(
+                            MetaLoad {
+                                meta: empty_meta(),
+                                diagnostics,
+                            },
+                            self,
+                        );
+                    };
+                    match serde_json::to_vec(&meta) {
+                        Ok(serialized) => {
+                            match faktor_fs::atomic::atomic_replace(&current, &serialized) {
+                                Ok(_) => {
+                                    diagnostics.push(MetaDiagnostic::MigratedLegacy {
+                                        from: legacy.clone(),
+                                        to: current.clone(),
+                                    });
+                                    retire_legacy(&legacy, &mut diagnostics);
+                                }
+                                Err(e) => {
+                                    diagnostics.push(MetaDiagnostic::MigrationWriteFailed {
+                                        path: current.clone(),
+                                        detail: e.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        Err(e) => diagnostics.push(MetaDiagnostic::MigrationWriteFailed {
+                            path: current.clone(),
+                            detail: e.to_string(),
+                        }),
+                    }
+                    MetaLoad::finish(MetaLoad { meta, diagnostics }, self)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => MetaLoad::finish(
+                    MetaLoad {
+                        meta: empty_meta(),
+                        diagnostics,
+                    },
+                    self,
+                ),
+                Err(e) => {
+                    diagnostics.push(MetaDiagnostic::LegacyUnreadable {
+                        path: legacy,
+                        detail: e.to_string(),
+                    });
+                    MetaLoad::finish(
+                        MetaLoad {
+                            meta: empty_meta(),
+                            diagnostics,
+                        },
+                        self,
+                    )
+                }
+            },
+            Err(e) => {
+                diagnostics.push(MetaDiagnostic::CurrentUnreadable {
+                    path: current,
+                    detail: e.to_string(),
+                });
+                MetaLoad::finish(
+                    MetaLoad {
+                        meta: empty_meta(),
+                        diagnostics,
+                    },
+                    self,
+                )
+            }
         }
-        Meta { worktrees: sane }
+    }
+
+    /// The metadata only (diagnostics logged once per load).
+    fn load_meta(&self, workspace_root: &Path) -> Meta {
+        self.load_meta_detailed(workspace_root).meta
     }
 
     /// Durable metadata save with CAS discipline (spec §33): a UNIQUE temp
@@ -444,8 +666,13 @@ impl WorktreeManager {
             .await
     }
 
-    /// [`Self::git_unlocked`] for a rev that may legitimately not resolve
-    /// (`None`), e.g. an unborn HEAD.
+    /// [`Self::git_unlocked`] for a ref probe that may legitimately not
+    /// resolve (`None`), e.g. an unborn HEAD. STRICT: only the documented
+    /// absence exit code (`git rev-parse --verify --quiet <ref>` exits 1
+    /// when the ref does not resolve) maps to `None`; every other exit code,
+    /// signal death, stderr or spawn failure stays a typed error — a
+    /// permission-denied directory or a corrupt `.git` can never be
+    /// reported as "absent".
     pub async fn git_probe_unlocked(
         &self,
         repo: &Path,
@@ -453,14 +680,8 @@ impl WorktreeManager {
         owner: ProcessOwner,
     ) -> Result<Option<String>, Error> {
         let args: Vec<OsString> = args.iter().map(|s| OsString::from(*s)).collect();
-        match self
-            .git_with_timeout(repo, &args, owner, std::time::Duration::from_secs(15))
+        self.git_probe_raw(repo, &args, owner, std::time::Duration::from_secs(15))
             .await
-        {
-            Ok(out) => Ok(Some(out)),
-            Err(e) if e.kind == ErrorKind::Internal => Ok(None),
-            Err(e) => Err(e),
-        }
     }
 
     /// The `HEAD` sha under an already-held mutation guard.
@@ -470,7 +691,7 @@ impl WorktreeManager {
         owner: ProcessOwner,
     ) -> Result<Option<String>, Error> {
         Ok(self
-            .git_probe_unlocked(repo, &["rev-parse", "--verify", "HEAD"], owner)
+            .git_probe_unlocked(repo, &["rev-parse", "--verify", "--quiet", "HEAD"], owner)
             .await?
             .map(|s| s.trim().to_string()))
     }
@@ -696,13 +917,17 @@ impl WorktreeManager {
             .await
     }
 
-    async fn git_with_timeout(
+    /// One raw git invocation: the exit code (verbatim — `None` = killed by
+    /// signal) and the trailer-stripped output. Non-zero exits are NOT
+    /// errors here: the probe callers map exit CODES exactly, so a broad
+    /// stderr sniff can never collapse a real failure into "absent".
+    async fn git_run_raw(
         &self,
         repo: &Path,
         args: &[OsString],
         owner: ProcessOwner,
         timeout: std::time::Duration,
-    ) -> Result<String, Error> {
+    ) -> Result<(Option<i32>, String), Error> {
         if !repo.is_dir() {
             return Err(Error::not_found(format!(
                 "repository {} not found",
@@ -723,7 +948,20 @@ impl WorktreeManager {
             .supervisor
             .run(cfg, timeout, CancellationToken::new())
             .await?;
-        if out.exit_code != Some(0) {
+        // The supervisor appends an "[exit code: N]" trailer; strip it so
+        // git output is used verbatim.
+        Ok((out.exit_code, strip_exit_trailer(&out.excerpt)))
+    }
+
+    async fn git_with_timeout(
+        &self,
+        repo: &Path,
+        args: &[OsString],
+        owner: ProcessOwner,
+        timeout: std::time::Duration,
+    ) -> Result<String, Error> {
+        let (code, out) = self.git_run_raw(repo, args, owner, timeout).await?;
+        if code != Some(0) {
             return Err(Error::new(
                 ErrorKind::Internal,
                 format!(
@@ -732,21 +970,47 @@ impl WorktreeManager {
                         .map(|a| a.to_string_lossy())
                         .collect::<Vec<_>>()
                         .join(" "),
-                    out.exit_code.unwrap_or(-1),
-                    truncate(&out.excerpt, 2000)
+                    code.unwrap_or(-1),
+                    truncate(&out, 2000)
                 ),
             ));
         }
-        // The supervisor appends an "[exit code: 0]" trailer; strip it so
-        // git output is used verbatim.
-        let out = strip_exit_trailer(&out.excerpt);
         Ok(out)
     }
 
-    /// A non-zero exit is a TYPED absence (`Ok(None)`) for probes whose
-    /// negative answer is plain state (unborn HEAD, missing remote-tracking
-    /// ref) — but a directory that is not a repository at all is still a
-    /// loud error, never "absent".
+    /// STRICT ref probe: exit 0 = `Some(output)`, exit 1 = the documented
+    /// absence (`None`), ANY other exit code (or signal death) = typed
+    /// error. Used by `rev-parse --verify --quiet <ref>` probes whose only
+    /// legitimate negative answer is "the ref does not resolve".
+    async fn git_probe_raw(
+        &self,
+        repo: &Path,
+        args: &[OsString],
+        owner: ProcessOwner,
+        timeout: std::time::Duration,
+    ) -> Result<Option<String>, Error> {
+        match self.git_run_raw(repo, args, owner, timeout).await? {
+            (Some(0), out) => Ok(Some(out)),
+            (Some(1), _) => Ok(None),
+            (code, out) => Err(Error::new(
+                ErrorKind::Internal,
+                format!(
+                    "git probe {} failed ({}): {}",
+                    args.iter()
+                        .map(|a| a.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    code.unwrap_or(-1),
+                    truncate(&out, 2000)
+                ),
+            )),
+        }
+    }
+
+    /// A non-zero exit is a TYPED absence (`Ok(None)`) ONLY for the
+    /// documented absence code (exit 1 of `rev-parse --verify --quiet`) —
+    /// a directory that is not a repository, a permission denial or a
+    /// corrupt `.git` is always a loud typed error, never "absent".
     async fn git_probe(
         &self,
         repo: &Path,
@@ -754,11 +1018,8 @@ impl WorktreeManager {
         owner: ProcessOwner,
     ) -> Result<Option<String>, Error> {
         let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-        match self.git(repo, &args, owner).await {
-            Ok(out) => Ok(Some(strip_exit_trailer(&out))),
-            Err(e) if e.message.contains("not a git repository") => Err(e),
-            Err(_) => Ok(None),
-        }
+        self.git_probe_raw(repo, &args, owner, std::time::Duration::from_secs(15))
+            .await
     }
 
     // ---------------------------------------------------------------- worktrees
@@ -954,25 +1215,39 @@ impl WorktreeManager {
         owner: ProcessOwner,
     ) -> Result<Option<String>, Error> {
         Ok(self
-            .git_probe(repo, &["rev-parse", "--verify", "HEAD"], owner)
+            .git_probe(repo, &["rev-parse", "--verify", "--quiet", "HEAD"], owner)
             .await?
             .map(|s| s.trim().to_string()))
     }
 
-    /// The full commit message of `HEAD`; `None` on an unborn branch.
+    /// The full commit message of `HEAD`; `None` on an unborn branch. Only
+    /// the DOCUMENTED unborn state (`git log` exits with "does not have any
+    /// commits yet") maps to `None`; every other failure — non-repository,
+    /// permission denial, corrupt `.git` — is a loud typed error.
     pub async fn head_message(
         &self,
         repo: &Path,
         owner: ProcessOwner,
     ) -> Result<Option<String>, Error> {
-        let out = self
-            .git_probe(
-                repo,
-                &["log", "-1", "--pretty=format:%B", "--no-show-signature"],
-                owner,
-            )
-            .await?;
-        Ok(out.map(|s| s.trim_end().to_string()))
+        let args: Vec<OsString> = ["log", "-1", "--pretty=format:%B", "--no-show-signature"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        match self
+            .git_run_raw(repo, &args, owner, std::time::Duration::from_secs(15))
+            .await?
+        {
+            (Some(0), out) => Ok(Some(out.trim_end().to_string())),
+            (_, out) if out.contains("does not have any commits yet") => Ok(None),
+            (code, out) => Err(Error::new(
+                ErrorKind::Internal,
+                format!(
+                    "git log HEAD failed ({}): {}",
+                    code.unwrap_or(-1),
+                    truncate(&out, 2000)
+                ),
+            )),
+        }
     }
 
     /// TRUE when the working tree (including untracked files) is clean.
@@ -1034,7 +1309,7 @@ impl WorktreeManager {
         validate_remote(remote)?;
         let refname = format!("refs/remotes/{remote}/{branch}");
         Ok(self
-            .git_probe(repo, &["rev-parse", "--verify", &refname], owner)
+            .git_probe(repo, &["rev-parse", "--verify", "--quiet", &refname], owner)
             .await?
             .map(|s| s.trim().to_string()))
     }
@@ -3276,6 +3551,247 @@ mod tests {
             assert_eq!(map["README.md"].0, 0o100644);
             assert_eq!(map["link"].0, 0o120000);
             assert!(parse_ls_tree("garbage").is_err());
+        }
+    }
+
+    /// P2: exit-code-exact ref probes and the legacy metadata-name
+    /// migration (faktor-plus-worktrees.json -> faktor-worktrees.json).
+    mod strict_probe_and_meta_tests {
+        use super::*;
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn ref_probes_map_only_exit_one_to_absence() {
+            let (dir, _sup, mgr, repo) = fixture().await;
+            // Existing ref (HEAD of the fixture repo): Some(full sha).
+            let head = mgr.head_sha(&repo, ProcessOwner::Daemon).await.unwrap();
+            assert_eq!(
+                head.as_deref().map(str::len),
+                Some(40),
+                "an existing ref must resolve: {head:?}"
+            );
+            // Unborn HEAD: the documented absence, None — never an error.
+            let empty = dir.path().join("empty-repo");
+            std::fs::create_dir_all(&empty).unwrap();
+            mgr.git_mutate(&empty, &["init", "-q", "-b", "main"], ProcessOwner::Daemon)
+                .await
+                .unwrap();
+            assert_eq!(
+                mgr.head_sha(&empty, ProcessOwner::Daemon).await.unwrap(),
+                None,
+                "an unborn HEAD is documented absence (exit 1)"
+            );
+            // Missing remote-tracking ref: documented absence too.
+            assert_eq!(
+                mgr.pushed_ref_sha(&repo, "origin", "never-pushed", ProcessOwner::Daemon)
+                    .await
+                    .unwrap(),
+                None
+            );
+            // A plain directory that is not a repository: LOUD, never None.
+            let plain = dir.path().join("plain-dir");
+            std::fs::create_dir_all(&plain).unwrap();
+            let err = mgr
+                .head_sha(&plain, ProcessOwner::Daemon)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Internal, "{err:?}");
+            // A corrupt repository (garbage .git): LOUD, never None.
+            let corrupt = dir.path().join("corrupt-repo");
+            std::fs::create_dir_all(corrupt.join(".git")).unwrap();
+            std::fs::write(corrupt.join(".git").join("HEAD"), b"garbage\n").unwrap();
+            let err = mgr
+                .head_sha(&corrupt, ProcessOwner::Daemon)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Internal, "{err:?}");
+            // A permission-denied repository: LOUD, never None. (Running as
+            // root, mode bits cannot deny — the probe then legitimately
+            // behaves like a healthy repo, so the assertion is skipped.)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let denied = dir.path().join("denied-repo");
+                std::fs::create_dir_all(&denied).unwrap();
+                mgr.git_mutate(&denied, &["init", "-q", "-b", "main"], ProcessOwner::Daemon)
+                    .await
+                    .unwrap();
+                std::fs::set_permissions(
+                    denied.join(".git"),
+                    std::fs::Permissions::from_mode(0o000),
+                )
+                .unwrap();
+                let unreadable = std::fs::read_dir(denied.join(".git")).is_err();
+                if unreadable {
+                    let err = mgr
+                        .head_sha(&denied, ProcessOwner::Daemon)
+                        .await
+                        .unwrap_err();
+                    assert_eq!(err.kind, ErrorKind::Internal, "{err:?}");
+                }
+                std::fs::set_permissions(
+                    denied.join(".git"),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+            }
+        }
+
+        fn write_meta_file(path: &Path, entries: Vec<MetaEntry>) {
+            std::fs::write(
+                path,
+                serde_json::to_vec(&Meta { worktrees: entries }).unwrap(),
+            )
+            .unwrap();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn fresh_install_uses_only_the_new_metadata_name() {
+            let (_d, _sup, mgr, repo) = fixture().await;
+            assert!(mgr.load_meta_detailed(&repo).meta.worktrees.is_empty());
+            assert!(!meta_path(&repo).exists() && !legacy_meta_path(&repo).exists());
+            let wt = mgr
+                .create(&repo, "feat/meta", "wt-meta", SessionId::new(5))
+                .await
+                .unwrap();
+            assert!(meta_path(&repo).exists(), "the new name is authoritative");
+            assert!(
+                !legacy_meta_path(&repo).exists(),
+                "a fresh install must never create the legacy name"
+            );
+            let load = mgr.load_meta_detailed(&repo);
+            assert!(load.diagnostics.is_empty(), "{:?}", load.diagnostics);
+            assert!(load.meta.worktrees.iter().any(|e| {
+                e.owner_session == 5 && path_key(Path::new(&e.path)) == path_key(&wt.path)
+            }));
+            // Discovery keeps the recorded owner.
+            let found = mgr.discover(&repo).await.unwrap();
+            assert!(found.iter().any(|w| path_key(&w.path) == path_key(&wt.path)
+                && w.owner_session == Some(SessionId::new(5))));
+            assert!(mgr.load_meta_detailed(&repo).diagnostics.is_empty());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn legacy_metadata_is_validated_migrated_and_retired() {
+            let (_d, _sup, mgr, repo) = fixture().await;
+            // A REAL worktree recorded under the new name, then renamed to
+            // the legacy name: the exact on-disk state of an old install.
+            let wt = mgr
+                .create(&repo, "feat/legacy", "wt-legacy", SessionId::new(77))
+                .await
+                .unwrap();
+            std::fs::rename(meta_path(&repo), legacy_meta_path(&repo)).unwrap();
+            assert!(!meta_path(&repo).exists());
+            let load = mgr.load_meta_detailed(&repo);
+            assert!(
+                load.diagnostics
+                    .iter()
+                    .any(|d| matches!(d, MetaDiagnostic::MigratedLegacy { .. })),
+                "{:?}",
+                load.diagnostics
+            );
+            assert_eq!(load.meta.worktrees.len(), 1);
+            assert_eq!(load.meta.worktrees[0].owner_session, 77);
+            // The new file is the authority and holds exactly the migrated
+            // content; the legacy file is retired.
+            let published = parse_meta(&std::fs::read(meta_path(&repo)).unwrap()).unwrap();
+            assert_eq!(published.worktrees, load.meta.worktrees);
+            assert!(
+                !legacy_meta_path(&repo).exists(),
+                "a successful migration retires the legacy file"
+            );
+            // Discovery sees the migrated owner through the new name.
+            let found = mgr.discover(&repo).await.unwrap();
+            assert!(found.iter().any(|w| path_key(&w.path) == path_key(&wt.path)
+                && w.owner_session == Some(SessionId::new(77))));
+            assert!(mgr.load_meta_detailed(&repo).diagnostics.is_empty());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn corrupt_legacy_metadata_is_visible_and_recovered_by_rediscovery() {
+            let (_d, _sup, mgr, repo) = fixture().await;
+            std::fs::write(legacy_meta_path(&repo), b"{ this is not json").unwrap();
+            let load = mgr.load_meta_detailed(&repo);
+            assert!(load.meta.worktrees.is_empty());
+            assert!(
+                load.diagnostics
+                    .iter()
+                    .any(|d| matches!(d, MetaDiagnostic::CorruptLegacy { .. })),
+                "a corrupt legacy file must be a visible diagnostic: {:?}",
+                load.diagnostics
+            );
+            assert!(
+                legacy_meta_path(&repo).exists(),
+                "the corrupt legacy file is retained for postmortem, never silently deleted"
+            );
+            // Re-discovery recovers: it re-records the worktrees under the
+            // new name (metadata loss is recoverable, just not silent).
+            let found = mgr.discover(&repo).await.unwrap();
+            assert!(!found.is_empty());
+            assert!(meta_path(&repo).exists(), "recovery publishes the new name");
+            // With a valid new authority the diagnostic is gone and the
+            // retained legacy file is retired by the load itself.
+            let after = mgr.load_meta_detailed(&repo);
+            assert!(after.diagnostics.is_empty(), "{:?}", after.diagnostics);
+            assert!(!legacy_meta_path(&repo).exists());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn new_name_wins_when_both_metadata_files_exist() {
+            let (_d, _sup, mgr, repo) = fixture().await;
+            let old = MetaEntry {
+                id: 1,
+                path: "/old".into(),
+                branch: "old".into(),
+                owner_session: 7,
+                created_ms: 0,
+            };
+            let new = MetaEntry {
+                id: 2,
+                path: "/new".into(),
+                branch: "new".into(),
+                owner_session: 9,
+                created_ms: 0,
+            };
+            write_meta_file(&legacy_meta_path(&repo), vec![old]);
+            write_meta_file(&meta_path(&repo), vec![new]);
+            let load = mgr.load_meta_detailed(&repo);
+            assert_eq!(load.meta.worktrees.len(), 1);
+            assert_eq!(
+                load.meta.worktrees[0].owner_session, 9,
+                "the new name is the sole authority when both exist"
+            );
+            assert!(
+                !legacy_meta_path(&repo).exists(),
+                "the stale legacy copy is retired, never consulted"
+            );
+            assert!(load.diagnostics.is_empty(), "{:?}", load.diagnostics);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn corrupt_new_name_never_resurrects_a_valid_legacy_copy() {
+            let (_d, _sup, mgr, repo) = fixture().await;
+            let old = MetaEntry {
+                id: 3,
+                path: "/stale".into(),
+                branch: "stale".into(),
+                owner_session: 7,
+                created_ms: 0,
+            };
+            write_meta_file(&legacy_meta_path(&repo), vec![old]);
+            std::fs::write(meta_path(&repo), b"corrupt").unwrap();
+            let load = mgr.load_meta_detailed(&repo);
+            assert!(load.meta.worktrees.is_empty());
+            assert!(
+                load.diagnostics
+                    .iter()
+                    .any(|d| matches!(d, MetaDiagnostic::CorruptCurrent { .. })),
+                "{:?}",
+                load.diagnostics
+            );
+            assert!(
+                legacy_meta_path(&repo).exists(),
+                "the retained legacy copy is never an automatic fallback"
+            );
         }
     }
 }

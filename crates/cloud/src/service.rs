@@ -21,7 +21,7 @@ use crate::model::{
     MAX_ORG_NAME_BYTES,
 };
 use crate::rbac::{authorize, Action, Principal, Resource, Role};
-use crate::store::{ControlPlaneStore, IdempotencyRecord};
+use crate::store::ControlPlaneStore;
 
 /// Bound on one idempotency key.
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 200;
@@ -182,53 +182,15 @@ impl ControlPlane {
         Ok(key.to_string())
     }
 
-    /// Idempotency precheck: when `(key, operation, request)` was already
-    /// recorded, parse and return the recorded SAFE response (never a
-    /// plaintext token — the recorded shape omits it); the same key with a
-    /// different request is a typed conflict. `None` = first execution.
-    fn idempotency_precheck<T: for<'de> serde::Deserialize<'de>>(
-        &self,
-        key: &str,
-        operation: &str,
-        request: &serde_json::Value,
-    ) -> Result<Option<T>, ControlPlaneError> {
-        let key = Self::validate_idempotency_key(key)?;
-        let request_hash = Self::request_hash(request)?;
-        let Some(record) = self.store.idempotent(&key)? else {
-            return Ok(None);
-        };
-        if record.operation != operation || record.request_hash != request_hash {
-            return Err(ControlPlaneError::Conflict(format!(
-                "idempotency key {key:?} was already used for a different request"
-            )));
-        }
-        let replayed: T = serde_json::from_str(&record.response_json).map_err(|e| {
+    /// Decode one recorded safe response back into its typed shape. A
+    /// response that does not parse is an internal inconsistency, never a
+    /// partial answer.
+    fn decode_idempotent<T: for<'de> serde::Deserialize<'de>>(
+        response: serde_json::Value,
+    ) -> Result<T, ControlPlaneError> {
+        serde_json::from_value(response).map_err(|e| {
             ControlPlaneError::Backend(format!("recorded idempotent response is unreadable: {e}"))
-        })?;
-        Ok(Some(replayed))
-    }
-
-    /// Record the SAFE response of one fresh execution. A lost race (the key
-    /// was claimed concurrently) replays the winner's response instead.
-    fn record_idempotent(
-        &self,
-        key: &str,
-        operation: &str,
-        request: &serde_json::Value,
-        recorded: &serde_json::Value,
-    ) -> Result<(), ControlPlaneError> {
-        let key = Self::validate_idempotency_key(key)?;
-        let claimed = self.store.claim_idempotent(&IdempotencyRecord {
-            key,
-            operation: operation.to_string(),
-            request_hash: Self::request_hash(request)?,
-            response_json: serde_json::to_string(recorded).map_err(|e| {
-                ControlPlaneError::Malformed(format!("recorded response encode: {e}"))
-            })?,
-            created_ms: self.now_ms(),
-        })?;
-        let _ = claimed;
-        Ok(())
+        })
     }
 
     fn request_hash(request: &serde_json::Value) -> Result<String, ControlPlaneError> {
@@ -302,6 +264,12 @@ impl ControlPlane {
 
     /// Bootstrap one organization with its first owner. The returned token
     /// is the owner's first session; it is shown exactly once.
+    ///
+    /// The idempotency claim, the organization/user/membership/session rows
+    /// and the recorded (safe, token-free) response commit in ONE store
+    /// transaction: a crash at any statement rolls all of them back, and a
+    /// retry with the same key either completes the operation or (for a
+    /// lost concurrent race) replays the winner's recorded response.
     pub fn bootstrap_organization(
         &self,
         name: &str,
@@ -314,64 +282,83 @@ impl ControlPlane {
                 "organization name must be 1..={MAX_ORG_NAME_BYTES} bytes"
             )));
         }
-        let email = normalize_email(owner_email)?;
-        let request = serde_json::json!({"name": name, "owner_email": email});
-        // A replay returns the recorded organization/user/session WITHOUT
-        // re-presenting the one-shot token (the plaintext is never stored).
-        if let Some(record) = self.idempotency_precheck::<BootstrapRecord>(
-            idempotency_key,
-            "bootstrap_organization",
-            &request,
-        )? {
-            return Ok(BootstrapResult {
-                organization: record.organization,
-                user: record.user,
-                session: record.session,
-                token: None,
-            });
+        if display_name.len() > MAX_DISPLAY_NAME_BYTES {
+            return Err(ControlPlaneError::Malformed(
+                "display name is oversized".into(),
+            ));
         }
-        let organization = Organization {
-            id: OrganizationId::try_new(Self::new_id("org"))?,
-            name: name.to_string(),
-            created_ms: self.now_ms(),
-            deleted: false,
-        };
-        self.store.put_organization(&organization)?;
-        let (user, _) = self.create_user(&email, display_name)?;
-        let membership = Membership {
-            id: MembershipId::try_new(Self::new_id("mem"))?,
-            organization: organization.id.clone(),
-            user: user.id.clone(),
-            role: Role::Owner,
-            created_ms: self.now_ms(),
-        };
-        self.store.put_membership(&membership)?;
-        let token = Self::new_token()?;
-        let session = AuthSession {
-            id: AuthSessionId::try_new(Self::new_id("ses"))?,
-            organization: organization.id.clone(),
-            user: user.id.clone(),
-            token_hash: TokenHash::of(token.expose()),
-            created_ms: self.now_ms(),
-            expires_ms: self.now_ms().saturating_add(DEFAULT_SESSION_TTL_MS),
-            revoked_ms: None,
-        };
-        self.store.put_auth_session(&session)?;
-        self.record_idempotent(
-            idempotency_key,
+        let email = normalize_email(owner_email)?;
+        let key = Self::validate_idempotency_key(idempotency_key)?;
+        let request = serde_json::json!({
+            "name": name,
+            "owner_email": email,
+            "display_name": display_name,
+        });
+        let digest = Self::request_hash(&request)?;
+        let now = self.now_ms();
+        // Set only by the FIRST execution's closure: a replay never re-runs
+        // it, so a replay never re-presents the one-shot token.
+        let mut issued: Option<SecretToken> = None;
+        let outcome = self.store.execute_idempotent(
+            &key,
             "bootstrap_organization",
-            &request,
-            &serde_json::json!({
-                "organization": organization,
-                "user": user,
-                "session": session,
-            }),
+            &digest,
+            now,
+            &mut |tx| {
+                let organization = Organization {
+                    id: OrganizationId::try_new(Self::new_id("org"))?,
+                    name: name.to_string(),
+                    created_ms: now,
+                    deleted: false,
+                };
+                tx.put_organization(&organization)?;
+                let user = match tx.user_by_email(&email)? {
+                    Some(existing) => existing,
+                    None => {
+                        let user = User {
+                            id: UserId::try_new(Self::new_id("usr"))?,
+                            email: email.clone(),
+                            display_name: display_name.to_string(),
+                            created_ms: now,
+                            disabled: false,
+                        };
+                        tx.put_user(&user)?;
+                        user
+                    }
+                };
+                let membership = Membership {
+                    id: MembershipId::try_new(Self::new_id("mem"))?,
+                    organization: organization.id.clone(),
+                    user: user.id.clone(),
+                    role: Role::Owner,
+                    created_ms: now,
+                };
+                tx.put_membership(&membership)?;
+                let token = Self::new_token()?;
+                let session = AuthSession {
+                    id: AuthSessionId::try_new(Self::new_id("ses"))?,
+                    organization: organization.id.clone(),
+                    user: user.id.clone(),
+                    token_hash: TokenHash::of(token.expose()),
+                    created_ms: now,
+                    expires_ms: now.saturating_add(DEFAULT_SESSION_TTL_MS),
+                    revoked_ms: None,
+                };
+                tx.put_auth_session(&session)?;
+                issued = Some(token);
+                Ok(serde_json::json!({
+                    "organization": organization,
+                    "user": user,
+                    "session": session,
+                }))
+            },
         )?;
+        let record: BootstrapRecord = Self::decode_idempotent(outcome.into_response())?;
         Ok(BootstrapResult {
-            organization,
-            user,
-            session,
-            token: Some(token),
+            organization: record.organization,
+            user: record.user,
+            session: record.session,
+            token: issued,
         })
     }
 
@@ -550,7 +537,10 @@ impl ControlPlane {
 
     // --------------------------------------------------------- membership
 
-    /// Invite one email into an organization (idempotency-keyed).
+    /// Invite one email into an organization (idempotency-keyed). The
+    /// invitation row and its recorded response commit in ONE transaction
+    /// with the key claim; the role/tenant check runs inside that
+    /// transaction too.
     pub fn invite(
         &self,
         principal: &Principal,
@@ -566,28 +556,13 @@ impl ControlPlane {
             Action::MemberWrite,
         )?;
         let email = normalize_email(email)?;
+        let key = Self::validate_idempotency_key(idempotency_key)?;
         let request = serde_json::json!({
             "organization": organization.as_str(),
             "email": email,
             "role": role.as_str(),
         });
-        if let Some(record) =
-            self.idempotency_precheck::<InvitationRecord>(idempotency_key, "invite", &request)?
-        {
-            return Ok(InvitationIssued {
-                invitation: record.invitation,
-                token: None,
-            });
-        }
-        // An email that is already a member is a typed conflict, never a
-        // second membership.
-        if let Some(user) = self.store.user_by_email(&email)? {
-            if self.store.membership(organization, &user.id)?.is_some() {
-                return Err(ControlPlaneError::Conflict(
-                    "this email is already a member of the organization".into(),
-                ));
-            }
-        }
+        let digest = Self::request_hash(&request)?;
         let invited_by = match &principal.subject {
             crate::rbac::PrincipalSubject::User(id) => id.clone(),
             crate::rbac::PrincipalSubject::ServiceAccount(_) => {
@@ -596,93 +571,129 @@ impl ControlPlane {
                 ))
             }
         };
-        let token = Self::new_token()?;
-        let invitation = Invitation {
-            id: InvitationId::try_new(Self::new_id("inv"))?,
-            organization: organization.clone(),
-            email,
-            role,
-            status: InvitationStatus::Pending,
-            invited_by,
-            token_hash: TokenHash::of(token.expose()),
-            created_ms: self.now_ms(),
-            expires_ms: self.now_ms().saturating_add(DEFAULT_INVITATION_TTL_MS),
-            decided_ms: None,
-        };
-        self.store.put_invitation(&invitation)?;
-        self.record_idempotent(
-            idempotency_key,
-            "invite",
-            &request,
-            &serde_json::json!({ "invitation": invitation }),
-        )?;
+        let now = self.now_ms();
+        let mut issued: Option<SecretToken> = None;
+        let outcome = self
+            .store
+            .execute_idempotent(&key, "invite", &digest, now, &mut |tx| {
+                // The same authorization is re-run INSIDE the transaction:
+                // the role/tenant state that guarded the precheck must still
+                // hold at commit time.
+                authorize(
+                    principal,
+                    organization,
+                    Resource::Member,
+                    Action::MemberWrite,
+                )?;
+                // An email that is already a member is a typed conflict,
+                // never a second membership.
+                if let Some(user) = tx.user_by_email(&email)? {
+                    if tx.membership(organization, &user.id)?.is_some() {
+                        return Err(ControlPlaneError::Conflict(
+                            "this email is already a member of the organization".into(),
+                        ));
+                    }
+                }
+                let token = Self::new_token()?;
+                let invitation = Invitation {
+                    id: InvitationId::try_new(Self::new_id("inv"))?,
+                    organization: organization.clone(),
+                    email: email.clone(),
+                    role,
+                    status: InvitationStatus::Pending,
+                    invited_by: invited_by.clone(),
+                    token_hash: TokenHash::of(token.expose()),
+                    created_ms: now,
+                    expires_ms: now.saturating_add(DEFAULT_INVITATION_TTL_MS),
+                    decided_ms: None,
+                };
+                tx.put_invitation(&invitation)?;
+                issued = Some(token);
+                Ok(serde_json::json!({ "invitation": invitation }))
+            })?;
+        let record: InvitationRecord = Self::decode_idempotent(outcome.into_response())?;
         Ok(InvitationIssued {
-            invitation,
-            token: Some(token),
+            invitation: record.invitation,
+            token: issued,
         })
     }
 
     /// Accept one invitation (the accepting user must already exist and
-    /// match the invited email).
+    /// match the invited email). The membership insert and the
+    /// invitation-accepted update commit in ONE transaction with the
+    /// idempotency claim: a crash between them can never persist a member
+    /// without the terminal invitation row (or vice versa), and a retry with
+    /// the same key replays the original membership.
     pub fn accept_invitation(
         &self,
         token: &str,
         user: &UserId,
+        idempotency_key: &str,
     ) -> Result<Membership, ControlPlaneError> {
         if token.is_empty() || token.len() > MAX_TOKEN_BYTES {
             return Err(ControlPlaneError::Unauthorized("unknown invitation".into()));
         }
         let hash = TokenHash::of(token);
-        let invitation = self
-            .store
-            .invitation_by_token_hash(&hash)?
-            .ok_or_else(|| ControlPlaneError::Unauthorized("unknown invitation".into()))?;
+        let key = Self::validate_idempotency_key(idempotency_key)?;
+        let request = serde_json::json!({
+            "invitation_token_hash": hash.as_str(),
+            "user": user.as_str(),
+        });
+        let digest = Self::request_hash(&request)?;
         let now = self.now_ms();
-        match invitation.status_at(now) {
-            InvitationStatus::Accepted => {
-                return Err(ControlPlaneError::Conflict(
-                    "invitation was already accepted".into(),
-                ))
-            }
-            InvitationStatus::Revoked => {
-                return Err(ControlPlaneError::Conflict("invitation was revoked".into()))
-            }
-            InvitationStatus::Expired => {
-                return Err(ControlPlaneError::Conflict("invitation has expired".into()))
-            }
-            InvitationStatus::Pending => {}
-        }
-        let accepting = self
-            .store
-            .user(user)?
-            .ok_or_else(|| ControlPlaneError::Unauthorized("unknown user".into()))?;
-        if accepting.email != invitation.email {
-            return Err(ControlPlaneError::Forbidden(
-                "invitation belongs to a different email".into(),
-            ));
-        }
-        if self
-            .store
-            .membership(&invitation.organization, user)?
-            .is_some()
-        {
-            return Err(ControlPlaneError::Conflict(
-                "this user is already a member of the organization".into(),
-            ));
-        }
-        let membership = Membership {
-            id: MembershipId::try_new(Self::new_id("mem"))?,
-            organization: invitation.organization.clone(),
-            user: user.clone(),
-            role: invitation.role,
-            created_ms: now,
-        };
-        self.store.put_membership(&membership)?;
-        let mut accepted = invitation;
-        accepted.status = InvitationStatus::Accepted;
-        accepted.decided_ms = Some(now);
-        self.store.put_invitation(&accepted)?;
-        Ok(membership)
+        let outcome =
+            self.store
+                .execute_idempotent(&key, "accept_invitation", &digest, now, &mut |tx| {
+                    let invitation = tx.invitation_by_token_hash(&hash)?.ok_or_else(|| {
+                        ControlPlaneError::Unauthorized("unknown invitation".into())
+                    })?;
+                    match invitation.status_at(now) {
+                        InvitationStatus::Accepted => {
+                            return Err(ControlPlaneError::Conflict(
+                                "invitation was already accepted".into(),
+                            ))
+                        }
+                        InvitationStatus::Revoked => {
+                            return Err(ControlPlaneError::Conflict(
+                                "invitation was revoked".into(),
+                            ))
+                        }
+                        InvitationStatus::Expired => {
+                            return Err(ControlPlaneError::Conflict(
+                                "invitation has expired".into(),
+                            ))
+                        }
+                        InvitationStatus::Pending => {}
+                    }
+                    let accepting = tx
+                        .user(user)?
+                        .ok_or_else(|| ControlPlaneError::Unauthorized("unknown user".into()))?;
+                    if accepting.email != invitation.email {
+                        return Err(ControlPlaneError::Forbidden(
+                            "invitation belongs to a different email".into(),
+                        ));
+                    }
+                    if tx.membership(&invitation.organization, user)?.is_some() {
+                        return Err(ControlPlaneError::Conflict(
+                            "this user is already a member of the organization".into(),
+                        ));
+                    }
+                    let membership = Membership {
+                        id: MembershipId::try_new(Self::new_id("mem"))?,
+                        organization: invitation.organization.clone(),
+                        user: user.clone(),
+                        role: invitation.role,
+                        created_ms: now,
+                    };
+                    tx.put_membership(&membership)?;
+                    let mut accepted = invitation;
+                    accepted.status = InvitationStatus::Accepted;
+                    accepted.decided_ms = Some(now);
+                    tx.put_invitation(&accepted)?;
+                    Ok(serde_json::json!({ "membership": membership }))
+                })?;
+        let record: MembershipRecord = Self::decode_idempotent(outcome.into_response())?;
+        Ok(record.membership)
     }
 
     /// Revoke one pending invitation.
@@ -867,7 +878,8 @@ impl ControlPlane {
 
     // ------------------------------------------------------------ approvals
 
-    /// Request one approval (idempotency-keyed).
+    /// Request one approval (idempotency-keyed). The approval row and its
+    /// recorded response commit in ONE transaction with the key claim.
     pub fn request_approval(
         &self,
         principal: &Principal,
@@ -901,75 +913,69 @@ impl ControlPlane {
                 ))
             }
         };
+        let key = Self::validate_idempotency_key(idempotency_key)?;
         let request = serde_json::json!({
             "organization": organization.as_str(),
             "action": action.as_str(),
             "resource": resource,
             "reason": reason,
         });
-        if let Some(approval) = self.idempotency_precheck::<ApprovalRecord>(
-            idempotency_key,
-            "request_approval",
-            &request,
-        )? {
-            return Ok(approval.approval);
-        }
-        let approval = ApprovalRequest {
-            id: ApprovalId::try_new(Self::new_id("apr"))?,
-            organization: organization.clone(),
-            action,
-            resource: resource.to_string(),
-            requested_by,
-            reason: reason.to_string(),
-            status: ApprovalStatus::Open,
-            decided_by: None,
-            note: None,
-            created_ms: self.now_ms(),
-            decided_ms: None,
-        };
-        self.store.put_approval(&approval)?;
-        self.record_idempotent(
-            idempotency_key,
-            "request_approval",
-            &request,
-            &serde_json::json!({ "approval": approval }),
-        )?;
-        Ok(approval)
+        let digest = Self::request_hash(&request)?;
+        let now = self.now_ms();
+        let outcome =
+            self.store
+                .execute_idempotent(&key, "request_approval", &digest, now, &mut |tx| {
+                    authorize(
+                        principal,
+                        organization,
+                        Resource::Approval,
+                        Action::ApprovalRequest,
+                    )?;
+                    let approval = ApprovalRequest {
+                        id: ApprovalId::try_new(Self::new_id("apr"))?,
+                        organization: organization.clone(),
+                        action,
+                        resource: resource.to_string(),
+                        requested_by: requested_by.clone(),
+                        reason: reason.to_string(),
+                        status: ApprovalStatus::Open,
+                        decided_by: None,
+                        note: None,
+                        created_ms: now,
+                        decided_ms: None,
+                    };
+                    tx.put_approval(&approval)?;
+                    Ok(serde_json::json!({ "approval": approval }))
+                })?;
+        let record: ApprovalRecord = Self::decode_idempotent(outcome.into_response())?;
+        Ok(record.approval)
     }
 
     /// Decide one approval (Admin+ only; exactly once). A foreign
-    /// organization's approval is a `NotFound` with no existence leak.
+    /// organization's approval is a `NotFound` with no existence leak. The
+    /// open→decided transition and its recorded response commit in ONE
+    /// transaction with the key claim, so concurrent decisions cannot both
+    /// succeed and a same-key retry replays the recorded decision.
     pub fn decide_approval(
         &self,
         principal: &Principal,
         approval_id: &ApprovalId,
         approved: bool,
         note: &str,
+        idempotency_key: &str,
     ) -> Result<ApprovalRequest, ControlPlaneError> {
         if note.len() > MAX_NOTE_BYTES {
             return Err(ControlPlaneError::Malformed(
                 "decision note is oversized".into(),
             ));
         }
-        let approval = self
-            .store
-            .approval(approval_id)?
-            .ok_or_else(|| ControlPlaneError::NotFound("approval not found".into()))?;
-        entity_authorize(
-            authorize(
-                principal,
-                &approval.organization,
-                Resource::Approval,
-                Action::ApprovalDecide,
-            ),
-            "approval",
-        )?;
-        if approval.status != ApprovalStatus::Open {
-            return Err(ControlPlaneError::Conflict(format!(
-                "approval is already {}",
-                approval.status.as_str()
-            )));
-        }
+        let key = Self::validate_idempotency_key(idempotency_key)?;
+        let request = serde_json::json!({
+            "approval": approval_id.as_str(),
+            "approved": approved,
+            "note": note,
+        });
+        let digest = Self::request_hash(&request)?;
         let decided_by = match &principal.subject {
             crate::rbac::PrincipalSubject::User(id) => id.clone(),
             crate::rbac::PrincipalSubject::ServiceAccount(_) => {
@@ -978,21 +984,49 @@ impl ControlPlane {
                 ))
             }
         };
-        let mut decided = approval;
-        decided.status = if approved {
-            ApprovalStatus::Approved
-        } else {
-            ApprovalStatus::Rejected
-        };
-        decided.decided_by = Some(decided_by);
-        decided.note = if note.is_empty() {
-            None
-        } else {
-            Some(note.to_string())
-        };
-        decided.decided_ms = Some(self.now_ms());
-        self.store.put_approval(&decided)?;
-        Ok(decided)
+        let now = self.now_ms();
+        let outcome =
+            self.store
+                .execute_idempotent(&key, "decide_approval", &digest, now, &mut |tx| {
+                    let approval = tx
+                        .approval(approval_id)?
+                        .ok_or_else(|| ControlPlaneError::NotFound("approval not found".into()))?;
+                    // The tenant check runs INSIDE the transaction, before any
+                    // state is read back or written: a foreign organization's
+                    // approval stays indistinguishable from a missing one.
+                    entity_authorize(
+                        authorize(
+                            principal,
+                            &approval.organization,
+                            Resource::Approval,
+                            Action::ApprovalDecide,
+                        ),
+                        "approval",
+                    )?;
+                    if approval.status != ApprovalStatus::Open {
+                        return Err(ControlPlaneError::Conflict(format!(
+                            "approval is already {}",
+                            approval.status.as_str()
+                        )));
+                    }
+                    let mut decided = approval;
+                    decided.status = if approved {
+                        ApprovalStatus::Approved
+                    } else {
+                        ApprovalStatus::Rejected
+                    };
+                    decided.decided_by = Some(decided_by.clone());
+                    decided.note = if note.is_empty() {
+                        None
+                    } else {
+                        Some(note.to_string())
+                    };
+                    decided.decided_ms = Some(now);
+                    tx.put_approval(&decided)?;
+                    Ok(serde_json::json!({ "approval": decided }))
+                })?;
+        let record: ApprovalRecord = Self::decode_idempotent(outcome.into_response())?;
+        Ok(record.approval)
     }
 
     /// One page of the organization's approvals, optionally filtered by
@@ -1031,6 +1065,13 @@ impl ControlPlane {
 #[serde(deny_unknown_fields)]
 pub struct InvitationRecord {
     pub invitation: Invitation,
+}
+
+/// The recorded (safe) invitation-acceptance response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MembershipRecord {
+    pub membership: Membership,
 }
 
 /// The recorded (safe) approval response.
@@ -1207,16 +1248,26 @@ mod tests {
 
         let (stranger, _) = cp.create_user("stranger@x.test", "S").unwrap();
         assert!(matches!(
-            cp.accept_invitation(&token, &stranger.id).unwrap_err(),
+            cp.accept_invitation(&token, &stranger.id, "accept-stranger")
+                .unwrap_err(),
             ControlPlaneError::Forbidden(_)
         ));
 
         let (invitee, _) = cp.create_user("new@acme.test", "N").unwrap();
-        let membership = cp.accept_invitation(&token, &invitee.id).unwrap();
+        let membership = cp
+            .accept_invitation(&token, &invitee.id, "accept-1")
+            .unwrap();
         assert_eq!(membership.role, Role::Member);
-        // A second accept is a terminal conflict.
+        // A same-key retry replays the recorded membership, never a second
+        // one.
+        let replayed = cp
+            .accept_invitation(&token, &invitee.id, "accept-1")
+            .unwrap();
+        assert_eq!(replayed.id, membership.id);
+        // Under a NEW key the same token is a terminal conflict.
         assert!(matches!(
-            cp.accept_invitation(&token, &invitee.id).unwrap_err(),
+            cp.accept_invitation(&token, &invitee.id, "accept-2")
+                .unwrap_err(),
             ControlPlaneError::Conflict(_)
         ));
         // The new member can authenticate into the same organization.
@@ -1243,8 +1294,12 @@ mod tests {
             .unwrap();
         clock.advance(DEFAULT_INVITATION_TTL_MS + 1);
         assert!(matches!(
-            cp.accept_invitation(expired.token.as_ref().unwrap().expose(), &invitee.id)
-                .unwrap_err(),
+            cp.accept_invitation(
+                expired.token.as_ref().unwrap().expose(),
+                &invitee.id,
+                "e1-accept"
+            )
+            .unwrap_err(),
             ControlPlaneError::Conflict(_)
         ));
 
@@ -1261,7 +1316,8 @@ mod tests {
                 // row's hash is the only record, so acceptance by a new token
                 // can never match.
                 "wrong-token",
-                &invitee.id
+                &invitee.id,
+                "e2-accept",
             )
             .unwrap_err(),
             ControlPlaneError::Unauthorized(_)
@@ -1393,14 +1449,652 @@ mod tests {
             .unwrap();
         assert_eq!(replay.id, approval.id);
         let decided = cp
-            .decide_approval(&owner, &approval.id, true, "ok")
+            .decide_approval(&owner, &approval.id, true, "ok", "dec-key-1")
             .unwrap();
         assert_eq!(decided.status, ApprovalStatus::Approved);
         assert_eq!(decided.decided_by.as_ref(), Some(&boot.user.id));
+        // A same-key retry replays the recorded decision, never a second one.
+        let replayed = cp
+            .decide_approval(&owner, &approval.id, true, "ok", "dec-key-1")
+            .unwrap();
+        assert_eq!(replayed.decided_ms, decided.decided_ms);
+        assert_eq!(replayed.note, decided.note);
+        // Under a new key the approval is already terminal: typed conflict.
         assert!(matches!(
-            cp.decide_approval(&owner, &approval.id, false, "")
+            cp.decide_approval(&owner, &approval.id, false, "", "dec-key-2")
                 .unwrap_err(),
             ControlPlaneError::Conflict(_)
         ));
+    }
+
+    #[test]
+    fn idempotency_digest_mismatch_is_a_typed_conflict_for_every_operation() {
+        let cp = service();
+        let boot = cp
+            .bootstrap_organization("Acme", "owner@acme.test", "Owner", "boot")
+            .unwrap();
+        let owner = cp
+            .authenticate(boot.token.as_ref().unwrap().expose())
+            .unwrap();
+        let org = boot.organization.id.clone();
+
+        // Bootstrap: the same key with a different organization name.
+        assert!(matches!(
+            cp.bootstrap_organization("Other", "owner@acme.test", "Owner", "boot")
+                .unwrap_err(),
+            ControlPlaneError::Conflict(_)
+        ));
+        // Invite: the same key with a different email.
+        cp.invite(&owner, &org, "a@acme.test", Role::Member, "inv")
+            .unwrap();
+        assert!(matches!(
+            cp.invite(&owner, &org, "b@acme.test", Role::Member, "inv")
+                .unwrap_err(),
+            ControlPlaneError::Conflict(_)
+        ));
+        // Request approval: the same key with a different resource.
+        let approval = cp
+            .request_approval(&owner, &org, Action::SecretWrite, "s:1", "r", "apr")
+            .unwrap();
+        assert!(matches!(
+            cp.request_approval(&owner, &org, Action::SecretWrite, "s:2", "r", "apr")
+                .unwrap_err(),
+            ControlPlaneError::Conflict(_)
+        ));
+        // Decide: the same key with a different decision.
+        cp.decide_approval(&owner, &approval.id, true, "", "dec")
+            .unwrap();
+        assert!(matches!(
+            cp.decide_approval(&owner, &approval.id, false, "", "dec")
+                .unwrap_err(),
+            ControlPlaneError::Conflict(_)
+        ));
+        // Accept: the same key for another invitation token.
+        let issued = cp
+            .invite(&owner, &org, "new@acme.test", Role::Member, "inv-2")
+            .unwrap();
+        let token = issued.token.unwrap();
+        let (invitee, _) = cp.create_user("new@acme.test", "N").unwrap();
+        cp.accept_invitation(token.expose(), &invitee.id, "acc")
+            .unwrap();
+        assert!(matches!(
+            cp.accept_invitation("some-other-token", &invitee.id, "acc")
+                .unwrap_err(),
+            ControlPlaneError::Conflict(_)
+        ));
+    }
+
+    #[test]
+    fn foreign_org_and_role_denials_never_consume_the_idempotency_key() {
+        let cp = service();
+        let boot_a = cp
+            .bootstrap_organization("Alpha", "owner@alpha.test", "Owner", "a")
+            .unwrap();
+        let owner_a = cp
+            .authenticate(boot_a.token.as_ref().unwrap().expose())
+            .unwrap();
+        let org_a = boot_a.organization.id.clone();
+        let boot_b = cp
+            .bootstrap_organization("Beta", "owner@beta.test", "Owner", "b")
+            .unwrap();
+        let owner_b = cp
+            .authenticate(boot_b.token.as_ref().unwrap().expose())
+            .unwrap();
+
+        // A foreign organization is a NotFound and burns no key.
+        assert!(matches!(
+            cp.invite(&owner_b, &org_a, "x@y.test", Role::Member, "foreign-inv")
+                .unwrap_err(),
+            ControlPlaneError::NotFound(_)
+        ));
+        assert!(cp.store.idempotent("foreign-inv").unwrap().is_none());
+        // A viewer/member role cannot invite, and burns no key.
+        let (member_user, _) = cp.create_user("member@alpha.test", "M").unwrap();
+        cp.store
+            .put_membership(&Membership {
+                id: MembershipId::try_new("mem_member").unwrap(),
+                organization: org_a.clone(),
+                user: member_user.id.clone(),
+                role: Role::Member,
+                created_ms: 1,
+            })
+            .unwrap();
+        let member_token = SecretToken::try_new("member-token").unwrap();
+        cp.store
+            .put_auth_session(&AuthSession {
+                id: AuthSessionId::try_new("ses_member").unwrap(),
+                organization: org_a.clone(),
+                user: member_user.id,
+                token_hash: TokenHash::of(member_token.expose()),
+                created_ms: 1,
+                expires_ms: cp.now_ms() + DEFAULT_SESSION_TTL_MS,
+                revoked_ms: None,
+            })
+            .unwrap();
+        let member = cp.authenticate(member_token.expose()).unwrap();
+        assert!(matches!(
+            cp.invite(&member, &org_a, "x@y.test", Role::Member, "role-inv")
+                .unwrap_err(),
+            ControlPlaneError::Forbidden(_)
+        ));
+        assert!(cp.store.idempotent("role-inv").unwrap().is_none());
+        // A member cannot decide approvals either.
+        let approval = cp
+            .request_approval(&owner_a, &org_a, Action::SecretWrite, "s:1", "r", "apr")
+            .unwrap();
+        assert!(matches!(
+            cp.decide_approval(&member, &approval.id, true, "", "role-dec")
+                .unwrap_err(),
+            ControlPlaneError::Forbidden(_)
+        ));
+        assert!(cp.store.idempotent("role-dec").unwrap().is_none());
+        // A foreign approval id is a NotFound and burns no key.
+        assert!(matches!(
+            cp.decide_approval(&owner_b, &approval.id, true, "", "foreign-dec")
+                .unwrap_err(),
+            ControlPlaneError::NotFound(_)
+        ));
+        assert!(cp.store.idempotent("foreign-dec").unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod crash_and_race_tests {
+    use std::sync::{Arc, Barrier};
+
+    use super::*;
+    use crate::store::{ControlPlaneStore, SqliteControlPlaneStore};
+
+    const T0: i64 = 1_700_000_000_000;
+
+    fn rows(store: &SqliteControlPlaneStore, table: &str) -> i64 {
+        store
+            .lock()
+            .unwrap()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn open(path: &std::path::Path) -> Arc<SqliteControlPlaneStore> {
+        Arc::new(SqliteControlPlaneStore::open(path).unwrap())
+    }
+
+    /// Bootstrap: for EVERY statement boundary a crash rolls back the claim,
+    /// the organization, the user, the membership and the session; the retry
+    /// with the same key completes exactly one logical operation and a
+    /// further retry replays the original (token-free) response.
+    #[test]
+    fn bootstrap_crash_matrix_is_one_transaction() {
+        let base = tempfile::tempdir().unwrap();
+        let clock = Arc::new(ManualClock::new(T0));
+        let mut reached_full_path = false;
+        for k in 1..=12usize {
+            let path = base.path().join(format!("boot-{k}.db"));
+            let store = open(&path);
+            let cp = ControlPlane::new(store.clone(), clock.clone());
+            store.inject_crash_after(k);
+            let attempt = cp.bootstrap_organization("Acme", "owner@acme.test", "Owner", "boot");
+            store.inject_crash_after(usize::MAX);
+            if let Ok(first) = attempt {
+                assert!(first.token.is_some(), "k={k}");
+                reached_full_path = true;
+                let replay = cp
+                    .bootstrap_organization("Acme", "owner@acme.test", "Owner", "boot")
+                    .unwrap();
+                assert_eq!(replay.organization.id, first.organization.id);
+                assert_eq!(replay.session.id, first.session.id);
+                assert!(replay.token.is_none());
+                assert_eq!(rows(&store, "cp_organization"), 1);
+                assert_eq!(rows(&store, "cp_user"), 1);
+                assert_eq!(rows(&store, "cp_membership"), 1);
+                assert_eq!(rows(&store, "cp_auth_session"), 1);
+                assert_eq!(rows(&store, "cp_idempotency"), 1);
+                break;
+            }
+            let attempt = attempt.unwrap_err();
+            assert!(
+                matches!(attempt, ControlPlaneError::Backend(_)),
+                "k={k}: {attempt:?}"
+            );
+            let store = open(&path);
+            assert_eq!(rows(&store, "cp_organization"), 0, "k={k}: partial org");
+            assert_eq!(rows(&store, "cp_user"), 0, "k={k}: partial user");
+            assert_eq!(
+                rows(&store, "cp_membership"),
+                0,
+                "k={k}: partial membership"
+            );
+            assert_eq!(rows(&store, "cp_auth_session"), 0, "k={k}: partial session");
+            assert!(
+                store.idempotent("boot").unwrap().is_none(),
+                "k={k}: the claim rolled back with the crash"
+            );
+            let cp = ControlPlane::new(store.clone(), clock.clone());
+            let first = cp
+                .bootstrap_organization("Acme", "owner@acme.test", "Owner", "boot")
+                .unwrap();
+            assert!(first.token.is_some(), "k={k}: the retry executes");
+            let replay = cp
+                .bootstrap_organization("Acme", "owner@acme.test", "Owner", "boot")
+                .unwrap();
+            assert_eq!(replay.organization.id, first.organization.id);
+            assert_eq!(replay.session.id, first.session.id);
+            assert!(replay.token.is_none(), "k={k}: no token on replay");
+            assert_eq!(rows(&store, "cp_organization"), 1, "k={k}");
+            assert_eq!(rows(&store, "cp_user"), 1, "k={k}");
+            assert_eq!(rows(&store, "cp_membership"), 1, "k={k}");
+            assert_eq!(rows(&store, "cp_auth_session"), 1, "k={k}");
+            assert_eq!(rows(&store, "cp_idempotency"), 1, "k={k}");
+        }
+        assert!(reached_full_path, "the matrix never reached the full path");
+    }
+
+    /// Invitation creation: a crash at any statement leaves no invitation
+    /// and no claimed key; the retry creates exactly one.
+    #[test]
+    fn invite_crash_matrix_is_one_transaction() {
+        let base = tempfile::tempdir().unwrap();
+        let clock = Arc::new(ManualClock::new(T0));
+        let mut reached_full_path = false;
+        for k in 1..=12usize {
+            let path = base.path().join(format!("invite-{k}.db"));
+            let store = open(&path);
+            let cp = ControlPlane::new(store.clone(), clock.clone());
+            let boot = cp
+                .bootstrap_organization("Acme", "owner@acme.test", "Owner", "boot")
+                .unwrap();
+            let org = boot.organization.id.clone();
+            let owner_token = boot.token.as_ref().unwrap().expose().to_string();
+            let owner = cp.authenticate(&owner_token).unwrap();
+            store.inject_crash_after(k);
+            let attempt = cp.invite(&owner, &org, "new@acme.test", Role::Member, "invite-key");
+            store.inject_crash_after(usize::MAX);
+            if let Ok(issued) = attempt {
+                assert!(issued.token.is_some(), "k={k}");
+                reached_full_path = true;
+                let replay = cp
+                    .invite(&owner, &org, "new@acme.test", Role::Member, "invite-key")
+                    .unwrap();
+                assert_eq!(replay.invitation.id, issued.invitation.id);
+                assert!(replay.token.is_none());
+                assert_eq!(rows(&store, "cp_invitation"), 1);
+                assert_eq!(rows(&store, "cp_idempotency"), 2);
+                break;
+            }
+            let attempt = attempt.unwrap_err();
+            assert!(
+                matches!(attempt, ControlPlaneError::Backend(_)),
+                "k={k}: {attempt:?}"
+            );
+            let store = open(&path);
+            assert_eq!(
+                rows(&store, "cp_invitation"),
+                0,
+                "k={k}: partial invitation"
+            );
+            assert!(
+                store.idempotent("invite-key").unwrap().is_none(),
+                "k={k}: the claim rolled back with the crash"
+            );
+            let cp = ControlPlane::new(store.clone(), clock.clone());
+            let owner = cp.authenticate(&owner_token).unwrap();
+            let issued = cp
+                .invite(&owner, &org, "new@acme.test", Role::Member, "invite-key")
+                .unwrap();
+            assert!(issued.token.is_some(), "k={k}: the retry executes");
+            let replay = cp
+                .invite(&owner, &org, "new@acme.test", Role::Member, "invite-key")
+                .unwrap();
+            assert_eq!(replay.invitation.id, issued.invitation.id);
+            assert!(replay.token.is_none(), "k={k}: no token on replay");
+            assert_eq!(rows(&store, "cp_invitation"), 1, "k={k}");
+            assert_eq!(rows(&store, "cp_idempotency"), 2, "k={k}");
+        }
+        assert!(reached_full_path, "the matrix never reached the full path");
+    }
+
+    /// Acceptance atomicity: at every crash point the membership insert and
+    /// the invitation-accepted update are BOTH absent (or both present); the
+    /// retry commits them together and replays the same membership.
+    #[test]
+    fn acceptance_crash_matrix_keeps_membership_and_invitation_atomic() {
+        let base = tempfile::tempdir().unwrap();
+        let clock = Arc::new(ManualClock::new(T0));
+        let mut reached_full_path = false;
+        for k in 1..=12usize {
+            let path = base.path().join(format!("accept-{k}.db"));
+            let store = open(&path);
+            let cp = ControlPlane::new(store.clone(), clock.clone());
+            let boot = cp
+                .bootstrap_organization("Acme", "owner@acme.test", "Owner", "boot")
+                .unwrap();
+            let org = boot.organization.id.clone();
+            let owner_token = boot.token.as_ref().unwrap().expose().to_string();
+            let owner = cp.authenticate(&owner_token).unwrap();
+            let issued = cp
+                .invite(&owner, &org, "new@acme.test", Role::Member, "invite-key")
+                .unwrap();
+            let invitation_token = issued.token.unwrap().expose().to_string();
+            let (invitee, _) = cp.create_user("new@acme.test", "New").unwrap();
+            let pending = store
+                .invitation_by_token_hash(&TokenHash::of(&invitation_token))
+                .unwrap()
+                .unwrap();
+            assert_eq!(pending.status, InvitationStatus::Pending);
+
+            store.inject_crash_after(k);
+            let attempt = cp.accept_invitation(&invitation_token, &invitee.id, "accept-key");
+            store.inject_crash_after(usize::MAX);
+            if let Ok(membership) = attempt {
+                reached_full_path = true;
+                assert_eq!(membership.role, Role::Member);
+                let replay = cp
+                    .accept_invitation(&invitation_token, &invitee.id, "accept-key")
+                    .unwrap();
+                assert_eq!(replay.id, membership.id);
+                let accepted = store
+                    .invitation_by_token_hash(&TokenHash::of(&invitation_token))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(accepted.status, InvitationStatus::Accepted);
+                assert_eq!(rows(&store, "cp_membership"), 2);
+                assert_eq!(rows(&store, "cp_idempotency"), 3);
+                break;
+            }
+            let attempt = attempt.unwrap_err();
+            assert!(
+                matches!(attempt, ControlPlaneError::Backend(_)),
+                "k={k}: {attempt:?}"
+            );
+            let store = open(&path);
+            // Both halves of the compound mutation are absent together, and
+            // the owner's membership (from bootstrap) is untouched.
+            assert!(
+                store.membership(&org, &invitee.id).unwrap().is_none(),
+                "k={k}: a membership survived without the accepted invitation"
+            );
+            assert_eq!(rows(&store, "cp_membership"), 1, "k={k}");
+            let still = store
+                .invitation_by_token_hash(&TokenHash::of(&invitation_token))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                still.status,
+                InvitationStatus::Pending,
+                "k={k}: the invitation was marked accepted without the membership"
+            );
+            assert!(store.idempotent("accept-key").unwrap().is_none(), "k={k}");
+            let cp = ControlPlane::new(store.clone(), clock.clone());
+            let membership = cp
+                .accept_invitation(&invitation_token, &invitee.id, "accept-key")
+                .unwrap();
+            assert_eq!(membership.role, Role::Member);
+            let accepted = store
+                .invitation_by_token_hash(&TokenHash::of(&invitation_token))
+                .unwrap()
+                .unwrap();
+            assert_eq!(accepted.status, InvitationStatus::Accepted);
+            assert_eq!(accepted.decided_ms, Some(T0));
+            let replay = cp
+                .accept_invitation(&invitation_token, &invitee.id, "accept-key")
+                .unwrap();
+            assert_eq!(replay.id, membership.id, "k={k}");
+            assert_eq!(rows(&store, "cp_membership"), 2, "k={k}");
+            assert_eq!(rows(&store, "cp_idempotency"), 3, "k={k}");
+        }
+        assert!(reached_full_path, "the matrix never reached the full path");
+    }
+
+    /// Approval decisions: a crash at any statement leaves the approval OPEN
+    /// and the key unclaimed; the retry decides exactly once and replays the
+    /// identical decision.
+    #[test]
+    fn approval_decision_crash_matrix_is_one_transaction() {
+        let base = tempfile::tempdir().unwrap();
+        let clock = Arc::new(ManualClock::new(T0));
+        let mut reached_full_path = false;
+        for k in 1..=12usize {
+            let path = base.path().join(format!("decide-{k}.db"));
+            let store = open(&path);
+            let cp = ControlPlane::new(store.clone(), clock.clone());
+            let boot = cp
+                .bootstrap_organization("Acme", "owner@acme.test", "Owner", "boot")
+                .unwrap();
+            let org = boot.organization.id.clone();
+            let owner_token = boot.token.as_ref().unwrap().expose().to_string();
+            let owner = cp.authenticate(&owner_token).unwrap();
+            let approval = cp
+                .request_approval(
+                    &owner,
+                    &org,
+                    Action::SecretWrite,
+                    "s:1",
+                    "rotate",
+                    "apr-key",
+                )
+                .unwrap();
+            store.inject_crash_after(k);
+            let attempt = cp.decide_approval(&owner, &approval.id, true, "ok", "decide-key");
+            store.inject_crash_after(usize::MAX);
+            if let Ok(decided) = attempt {
+                reached_full_path = true;
+                assert_eq!(decided.status, ApprovalStatus::Approved);
+                let replay = cp
+                    .decide_approval(&owner, &approval.id, true, "ok", "decide-key")
+                    .unwrap();
+                assert_eq!(replay.decided_ms, decided.decided_ms);
+                assert_eq!(rows(&store, "cp_approval"), 1);
+                assert_eq!(rows(&store, "cp_idempotency"), 3);
+                break;
+            }
+            let attempt = attempt.unwrap_err();
+            assert!(
+                matches!(attempt, ControlPlaneError::Backend(_)),
+                "k={k}: {attempt:?}"
+            );
+            let store = open(&path);
+            let open = store.approval(&approval.id).unwrap().unwrap();
+            assert_eq!(open.status, ApprovalStatus::Open, "k={k}");
+            assert!(open.decided_ms.is_none(), "k={k}");
+            assert!(store.idempotent("decide-key").unwrap().is_none(), "k={k}");
+            let cp = ControlPlane::new(store.clone(), clock.clone());
+            let owner = cp.authenticate(&owner_token).unwrap();
+            let decided = cp
+                .decide_approval(&owner, &approval.id, true, "ok", "decide-key")
+                .unwrap();
+            assert_eq!(decided.status, ApprovalStatus::Approved);
+            let replay = cp
+                .decide_approval(&owner, &approval.id, true, "ok", "decide-key")
+                .unwrap();
+            assert_eq!(replay.decided_ms, decided.decided_ms, "k={k}");
+            assert_eq!(rows(&store, "cp_approval"), 1, "k={k}");
+            assert_eq!(rows(&store, "cp_idempotency"), 3, "k={k}");
+        }
+        assert!(reached_full_path, "the matrix never reached the full path");
+    }
+
+    /// Approval creation: a crash at any statement leaves no approval row
+    /// and no claimed key; the retry creates exactly one.
+    #[test]
+    fn approval_request_crash_matrix_is_one_transaction() {
+        let base = tempfile::tempdir().unwrap();
+        let clock = Arc::new(ManualClock::new(T0));
+        let mut reached_full_path = false;
+        for k in 1..=12usize {
+            let path = base.path().join(format!("request-{k}.db"));
+            let store = open(&path);
+            let cp = ControlPlane::new(store.clone(), clock.clone());
+            let boot = cp
+                .bootstrap_organization("Acme", "owner@acme.test", "Owner", "boot")
+                .unwrap();
+            let org = boot.organization.id.clone();
+            let owner_token = boot.token.as_ref().unwrap().expose().to_string();
+            let owner = cp.authenticate(&owner_token).unwrap();
+            store.inject_crash_after(k);
+            let attempt = cp.request_approval(
+                &owner,
+                &org,
+                Action::SecretWrite,
+                "s:1",
+                "rotate",
+                "apr-key",
+            );
+            store.inject_crash_after(usize::MAX);
+            if let Ok(approval) = attempt {
+                reached_full_path = true;
+                assert_eq!(approval.status, ApprovalStatus::Open);
+                let replay = cp
+                    .request_approval(
+                        &owner,
+                        &org,
+                        Action::SecretWrite,
+                        "s:1",
+                        "rotate",
+                        "apr-key",
+                    )
+                    .unwrap();
+                assert_eq!(replay.id, approval.id);
+                assert_eq!(rows(&store, "cp_approval"), 1);
+                assert_eq!(rows(&store, "cp_idempotency"), 2);
+                break;
+            }
+            let attempt = attempt.unwrap_err();
+            assert!(
+                matches!(attempt, ControlPlaneError::Backend(_)),
+                "k={k}: {attempt:?}"
+            );
+            let store = open(&path);
+            assert_eq!(rows(&store, "cp_approval"), 0, "k={k}: partial approval");
+            assert!(
+                store.idempotent("apr-key").unwrap().is_none(),
+                "k={k}: the claim rolled back with the crash"
+            );
+            let cp = ControlPlane::new(store.clone(), clock.clone());
+            let owner = cp.authenticate(&owner_token).unwrap();
+            let approval = cp
+                .request_approval(
+                    &owner,
+                    &org,
+                    Action::SecretWrite,
+                    "s:1",
+                    "rotate",
+                    "apr-key",
+                )
+                .unwrap();
+            let replay = cp
+                .request_approval(
+                    &owner,
+                    &org,
+                    Action::SecretWrite,
+                    "s:1",
+                    "rotate",
+                    "apr-key",
+                )
+                .unwrap();
+            assert_eq!(replay.id, approval.id, "k={k}");
+            assert_eq!(rows(&store, "cp_approval"), 1, "k={k}");
+            assert_eq!(rows(&store, "cp_idempotency"), 2, "k={k}");
+        }
+        assert!(reached_full_path, "the matrix never reached the full path");
+    }
+
+    /// 50 callers, one key, one store: exactly one execution and 49 typed
+    /// identical replays, with zero duplicated rows.
+    #[test]
+    fn fifty_concurrent_callers_on_one_key_yield_one_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir.path().join("race.db"));
+        let cp = Arc::new(ControlPlane::new(
+            store.clone(),
+            Arc::new(ManualClock::new(T0)),
+        ));
+        let barrier = Arc::new(Barrier::new(50));
+        let mut handles = Vec::new();
+        for _ in 0..50 {
+            let cp = cp.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                cp.bootstrap_organization("Acme", "owner@acme.test", "Owner", "race-key")
+            }));
+        }
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        let mut fresh = 0usize;
+        let mut replayed = 0usize;
+        let winner = results
+            .iter()
+            .find_map(|result| result.as_ref().ok())
+            .expect("at least one caller succeeds");
+        for result in &results {
+            let boot = result.as_ref().unwrap_or_else(|e| panic!("{e:?}"));
+            assert_eq!(boot.organization.id, winner.organization.id);
+            assert_eq!(boot.user.id, winner.user.id);
+            assert_eq!(boot.session.id, winner.session.id);
+            if boot.token.is_some() {
+                fresh += 1;
+            } else {
+                replayed += 1;
+            }
+        }
+        assert_eq!(fresh, 1, "exactly one caller executed the operation");
+        assert_eq!(replayed, 49, "the other 49 are typed replays");
+        assert_eq!(rows(&store, "cp_organization"), 1);
+        assert_eq!(rows(&store, "cp_user"), 1);
+        assert_eq!(rows(&store, "cp_membership"), 1);
+        assert_eq!(rows(&store, "cp_auth_session"), 1);
+        assert_eq!(rows(&store, "cp_idempotency"), 1);
+    }
+
+    /// The same race across INDEPENDENT SQLite connections on one file: the
+    /// `BEGIN IMMEDIATE` claim serializes the writers, so a loser that raced
+    /// past nothing (there is no precheck to pass) observes the winner's
+    /// committed row and replays it.
+    #[test]
+    fn concurrent_writers_across_connections_claim_one_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race-connections.db");
+        drop(SqliteControlPlaneStore::open(&path).unwrap());
+        let probe = open(&path);
+        let barrier = Arc::new(Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = open(&path);
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                let cp = ControlPlane::new(store, Arc::new(ManualClock::new(T0)));
+                barrier.wait();
+                cp.bootstrap_organization("Acme", "owner@acme.test", "Owner", "race-key")
+            }));
+        }
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        let mut fresh = 0usize;
+        let mut replayed = 0usize;
+        let winner = results
+            .iter()
+            .find_map(|result| result.as_ref().ok())
+            .expect("at least one caller succeeds");
+        for result in &results {
+            let boot = result.as_ref().unwrap_or_else(|e| panic!("{e:?}"));
+            assert_eq!(boot.organization.id, winner.organization.id);
+            assert_eq!(boot.session.id, winner.session.id);
+            if boot.token.is_some() {
+                fresh += 1;
+            } else {
+                replayed += 1;
+            }
+        }
+        assert_eq!(fresh, 1);
+        assert_eq!(replayed, 7);
+        assert_eq!(rows(&probe, "cp_organization"), 1);
+        assert_eq!(rows(&probe, "cp_user"), 1);
+        assert_eq!(rows(&probe, "cp_membership"), 1);
+        assert_eq!(rows(&probe, "cp_auth_session"), 1);
+        assert_eq!(rows(&probe, "cp_idempotency"), 1);
     }
 }

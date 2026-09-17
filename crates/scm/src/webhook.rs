@@ -47,6 +47,10 @@ pub struct WebhookHeaders {
     /// signature is verified over `{timestamp_ms}.{body}` and the replay
     /// window is enforced.
     pub timestamp_ms: Option<i64>,
+    /// A timestamp header arrived but could not be parsed as an i64. Such a
+    /// delivery is refused fail-closed (it can never be proven inside the
+    /// replay window) instead of silently degrading to body-only mode.
+    pub timestamp_malformed: bool,
 }
 
 impl WebhookHeaders {
@@ -66,9 +70,10 @@ impl WebhookHeaders {
                 "x-github-event" | "x-faktor-event" => {
                     out.event = Some(value.to_string());
                 }
-                "x-faktor-timestamp" => {
-                    out.timestamp_ms = value.trim().parse::<i64>().ok();
-                }
+                "x-faktor-timestamp" => match value.trim().parse::<i64>() {
+                    Ok(ts) => out.timestamp_ms = Some(ts),
+                    Err(_) => out.timestamp_malformed = true,
+                },
                 _ => {}
             }
         }
@@ -222,14 +227,26 @@ impl WebhookVerifier {
         let claimed = decode_signature(signature)?;
         let mac_input: Vec<u8> = match headers.timestamp_ms {
             Some(ts) => {
-                if (now_ms - ts).abs() > self.replay_window_ms {
+                // Attacker-controlled i64s: widen to i128 BEFORE the
+                // subtraction so `i64::MIN`/`i64::MAX` can never overflow
+                // (debug panic / release wrap) and every delta is exact.
+                let delta = (i128::from(now_ms) - i128::from(ts)).unsigned_abs();
+                if delta > self.replay_window_ms as u128 {
                     return Err(WebhookError::StaleTimestamp);
                 }
                 let mut input = format!("{ts}.").into_bytes();
                 input.extend_from_slice(body);
                 input
             }
-            None => body.to_vec(),
+            None => {
+                // Present-but-unparseable timestamp: fail closed. There is no
+                // freshness proof, and silently treating it as body-only mode
+                // would let a malformed header select a weaker mode.
+                if headers.timestamp_malformed {
+                    return Err(WebhookError::StaleTimestamp);
+                }
+                body.to_vec()
+            }
         };
         if !constant_time_eq(
             &claimed,
@@ -319,6 +336,7 @@ mod tests {
             delivery_id: Some(delivery.to_string()),
             event: Some("push".into()),
             timestamp_ms: None,
+            timestamp_malformed: false,
         }
     }
 
@@ -449,6 +467,7 @@ mod tests {
                 delivery_id: Some(format!("d-{ts}")),
                 event: Some("push".into()),
                 timestamp_ms: Some(ts),
+                timestamp_malformed: false,
             }
         };
         assert!(inbox.ingest(&make(now), body, now).is_ok());
@@ -487,8 +506,88 @@ mod tests {
         assert_eq!(headers.delivery_id.as_deref(), Some("d1"));
         assert_eq!(headers.event.as_deref(), Some("pull_request"));
         assert_eq!(headers.timestamp_ms, Some(1234));
+        assert!(!headers.timestamp_malformed);
         let headers = WebhookHeaders::from_pairs([("X-Faktor-Timestamp", "not-a-number")]);
         assert_eq!(headers.timestamp_ms, None);
+        assert!(
+            headers.timestamp_malformed,
+            "a present-but-unparseable timestamp must be marked malformed"
+        );
+    }
+
+    #[test]
+    fn timestamp_arithmetic_extremes_are_refused_without_panicking() {
+        let (inbox, store) = inbox();
+        let body = b"{}";
+        let now = 1_000_000i64;
+        let make = |ts: i64| {
+            let mut input = format!("{ts}.").into_bytes();
+            input.extend_from_slice(body);
+            WebhookHeaders {
+                signature_256: Some(format!("sha256={}", hmac_sha256_hex(SECRET, &input))),
+                delivery_id: Some(format!("d-extreme-{ts}")),
+                event: Some("push".into()),
+                timestamp_ms: Some(ts),
+                timestamp_malformed: false,
+            }
+        };
+        // Every extreme is a typed stale refusal: no i64 overflow, no panic,
+        // and nothing durable is claimed. The signatures are VALID for the
+        // claimed timestamp, so the refusal is purely the window arithmetic.
+        for ts in [
+            i64::MIN,
+            i64::MAX,
+            now - DEFAULT_REPLAY_WINDOW_MS - 1,
+            now + DEFAULT_REPLAY_WINDOW_MS + 1,
+            0,
+            -1,
+            now - 1,
+        ] {
+            let headers = make(ts);
+            let verdict = inbox.ingest(&headers, body, now);
+            if ts == now - 1 {
+                assert!(verdict.is_ok(), "a recent timestamp must be accepted");
+            } else {
+                assert_eq!(
+                    verdict.unwrap_err(),
+                    WebhookError::StaleTimestamp,
+                    "timestamp {ts} must be a typed stale refusal"
+                );
+            }
+        }
+        assert_eq!(
+            store.webhook_deliveries(10).unwrap().len(),
+            1,
+            "only the one in-window delivery may reach the durable inbox"
+        );
+    }
+
+    #[test]
+    fn malformed_timestamp_is_refused_even_with_a_valid_body_signature() {
+        let (inbox, store) = inbox();
+        let body = b"{}";
+        let mut headers = signed_headers(body, "d-malformed");
+        // A valid GitHub-style body signature plus an unparseable timestamp
+        // header must NOT be accepted in body-only mode.
+        headers.timestamp_malformed = true;
+        assert_eq!(
+            inbox.ingest(&headers, body, 1_000).unwrap_err(),
+            WebhookError::StaleTimestamp
+        );
+        // The same refusal when the malformed header arrives over the pair
+        // parser (the HTTP path).
+        let signature = format!("sha256={}", hmac_sha256_hex(SECRET, body));
+        let parsed = WebhookHeaders::from_pairs([
+            ("X-Faktor-Timestamp", "9999999999999999999999"),
+            ("X-Faktor-Signature-256", signature.as_str()),
+            ("X-Faktor-Delivery", "d-malformed-2"),
+        ]);
+        assert!(parsed.timestamp_malformed);
+        assert_eq!(
+            inbox.ingest(&parsed, body, 1_000).unwrap_err(),
+            WebhookError::StaleTimestamp
+        );
+        assert!(store.webhook_deliveries(10).unwrap().is_empty());
     }
 
     #[test]
