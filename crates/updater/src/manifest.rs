@@ -8,6 +8,7 @@
 //!   "channel": "stable",
 //!   "version": "0.2.0",
 //!   "commit": "<40-hex git sha>",
+//!   "release_generation": 42,
 //!   "artifacts": [{"name": "...", "os": "darwin", "arch": "arm64",
 //!                  "sha256": "<64-hex>", "url": "https://...",
 //!                  "size": 123}],
@@ -31,6 +32,18 @@
 //! `certification` and `size` are OPTIONAL additive fields; everything else
 //! is required and validated (bounds, digest shape, URL shape, artifact-name
 //! path safety, validity window). Unknown fields are parse errors.
+//!
+//! `release_generation` is the OPTIONAL signed anti-rollback counter: when
+//! present it is folded into the signed payload and never omitted by a new
+//! release. A manifest WITHOUT it is a legacy manifest and is treated as
+//! generation 0 by the service: it is admissible only while the durable
+//! high-water mark of its channel is still 0 AND the operator explicitly
+//! enabled the one-time legacy allowance (`[updater]
+//! allow_legacy_manifests_once`, default false), and admitting one consumes
+//! the allowance durably. Because the field is skipped when absent, the
+//! canonical signing payload of a legacy manifest is byte-identical to the
+//! pre-anti-rollback schema, so old signatures keep verifying (pinned by the
+//! interop vector test).
 //!
 //! The signature payload is the CANONICAL JSON (object keys sorted
 //! recursively, compact separators) of the manifest WITHOUT its `signature`
@@ -121,6 +134,10 @@ pub struct UpdateManifest {
     pub channel: Channel,
     pub version: String,
     pub commit: String,
+    /// The signed anti-rollback release counter. `None` = a legacy manifest
+    /// (treated as generation 0); see the module docs for the admission rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_generation: Option<u64>,
     pub artifacts: Vec<Artifact>,
     pub compatibility: Compatibility,
     pub issued_at: i64,
@@ -148,6 +165,16 @@ impl VerifiedManifest {
     /// The allowlisted identity whose signature was verified.
     pub fn identity(&self) -> &str {
         &self.identity
+    }
+
+    /// The signed anti-rollback generation (0 for a legacy manifest).
+    pub fn release_generation(&self) -> u64 {
+        self.manifest.release_generation()
+    }
+
+    /// True when the manifest carries no signed generation at all (legacy).
+    pub fn is_legacy_generation(&self) -> bool {
+        self.manifest.is_legacy_generation()
     }
 
     pub fn into_manifest(self) -> UpdateManifest {
@@ -281,6 +308,17 @@ impl UpdateManifest {
             .find(|artifact| artifact.os == os && artifact.arch == arch)
     }
 
+    /// The signed anti-rollback generation (0 for a legacy manifest without
+    /// the field; see the module docs for how the service admits it).
+    pub fn release_generation(&self) -> u64 {
+        self.release_generation.unwrap_or(0)
+    }
+
+    /// True when the manifest carries no signed generation at all (legacy).
+    pub fn is_legacy_generation(&self) -> bool {
+        self.release_generation.is_none()
+    }
+
     /// The CANONICAL signing payload: the manifest's JSON object with the
     /// `signature` field removed, keys sorted recursively, compact
     /// separators. Both the signer script and this verifier must agree byte
@@ -375,6 +413,38 @@ pub fn verify_manifest(
     skew_ms: i64,
 ) -> Result<VerifiedManifest, UpdateError> {
     let manifest = UpdateManifest::parse(bytes)?;
+    let identity = authenticate(&manifest, keys)?;
+    if now_ms > manifest.expires_at {
+        return Err(ManifestRefusal::Expired {
+            expires_at: manifest.expires_at,
+            now_ms,
+        }
+        .into());
+    }
+    if now_ms.saturating_add(skew_ms) < manifest.issued_at {
+        return Err(ManifestRefusal::NotYetValid {
+            issued_at: manifest.issued_at,
+            now_ms,
+        }
+        .into());
+    }
+    if !configured.accepts(manifest.channel) {
+        return Err(ManifestRefusal::ChannelMismatch {
+            configured: configured.to_string(),
+            found: manifest.channel.to_string(),
+        }
+        .into());
+    }
+    Ok(VerifiedManifest { manifest, identity })
+}
+
+/// Verify the ed25519 signature block of one manifest against the operator
+/// key allowlist: absent signature → [`ManifestRefusal::Unsigned`]; unknown
+/// identity → [`ManifestRefusal::UnknownKey`]; embedded key != allowlisted
+/// key → [`ManifestRefusal::KeyMismatch`]; signature does not verify over
+/// the canonical payload → [`ManifestRefusal::Tampered`]. Returns the
+/// verified identity.
+fn authenticate(manifest: &UpdateManifest, keys: &TrustedKeys) -> Result<String, UpdateError> {
     let signature = manifest
         .signature
         .clone()
@@ -401,31 +471,24 @@ pub fn verify_manifest(
     trusted
         .verify(&payload, &signature.value)
         .map_err(|_| ManifestRefusal::Tampered)?;
-    if now_ms > manifest.expires_at {
-        return Err(ManifestRefusal::Expired {
-            expires_at: manifest.expires_at,
-            now_ms,
-        }
-        .into());
-    }
-    if now_ms.saturating_add(skew_ms) < manifest.issued_at {
-        return Err(ManifestRefusal::NotYetValid {
-            issued_at: manifest.issued_at,
-            now_ms,
-        }
-        .into());
-    }
-    if !configured.accepts(manifest.channel) {
-        return Err(ManifestRefusal::ChannelMismatch {
-            configured: configured.to_string(),
-            found: manifest.channel.to_string(),
-        }
-        .into());
-    }
-    Ok(VerifiedManifest {
-        manifest,
-        identity: signature.identity,
-    })
+    Ok(signature.identity)
+}
+
+/// Authenticate one RELEASE manifest for launch (the bootstrap launcher
+/// path): strict parse + shape validation + signature verification against
+/// the allowlist. The validity window and the channel pin are deliberately
+/// NOT re-checked here: they govern update SELECTION at check time, and
+/// re-checking them at launch would let an expired manifest brick an install
+/// that is already running. Signature, key allowlist and (at the caller) the
+/// digest binding are always enforced — an unsigned, tampered or
+/// unknown-key manifest is refused with the same typed codes as `check`.
+pub fn verify_manifest_at_launch(
+    bytes: &[u8],
+    keys: &TrustedKeys,
+) -> Result<UpdateManifest, UpdateError> {
+    let manifest = UpdateManifest::parse(bytes)?;
+    authenticate(&manifest, keys)?;
+    Ok(manifest)
 }
 
 /// sha256 hex of arbitrary bytes (digest checks are always over the full
@@ -493,6 +556,7 @@ mod tests {
             channel: Channel::Stable,
             version: "0.2.0".into(),
             commit: "a".repeat(40),
+            release_generation: Some(1),
             artifacts: vec![Artifact {
                 name: "faktor-cli-0.2.0-darwin-arm64.tar.gz".into(),
                 os: "darwin".into(),
@@ -826,5 +890,77 @@ mod tests {
         assert!(manifest.artifact_for_host("darwin", "arm64").is_some());
         assert!(manifest.artifact_for_host("darwin", "x86_64").is_none());
         assert!(manifest.artifact_for_host("linux", "arm64").is_none());
+    }
+
+    #[test]
+    fn legacy_manifests_keep_the_original_payload_and_the_generation_is_signed() {
+        let (keys, key) = test_keys();
+        // A legacy manifest (no `release_generation`) canonicalizes exactly
+        // like the pre-anti-rollback schema, so an old signature keeps
+        // verifying byte for byte.
+        let legacy = UpdateManifest {
+            release_generation: None,
+            ..sample_manifest()
+        };
+        let payload = String::from_utf8(legacy.signing_payload().unwrap()).unwrap();
+        assert!(!payload.contains("release_generation"), "{payload}");
+        assert_eq!(legacy.release_generation(), 0);
+        assert!(legacy.is_legacy_generation());
+        let signed = sign_manifest(&legacy, &key);
+        assert!(verify_manifest(&signed, &keys, Channel::Stable, 1_500, 0).is_ok());
+
+        // An explicit generation is inside the signed payload.
+        let mut explicit = sample_manifest();
+        explicit.release_generation = Some(7);
+        assert_eq!(explicit.release_generation(), 7);
+        assert!(!explicit.is_legacy_generation());
+        let signed_explicit = sign_manifest(&explicit, &key);
+        let value: serde_json::Value = serde_json::from_slice(&signed_explicit).unwrap();
+        assert_eq!(value["release_generation"], 7);
+        assert!(verify_manifest(&signed_explicit, &keys, Channel::Stable, 1_500, 0).is_ok());
+
+        // Tampering the generation after signing breaks the signature.
+        let mut lowered: serde_json::Value = serde_json::from_slice(&signed_explicit).unwrap();
+        lowered["release_generation"] = serde_json::json!(6);
+        let refused = verify_manifest(
+            &serde_json::to_vec(&lowered).unwrap(),
+            &keys,
+            Channel::Stable,
+            1_500,
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(refused.code(), "manifest_tampered");
+
+        // Stripping the field back to "legacy" ALSO breaks the signature: a
+        // signed generation can never be removed to dodge the floor.
+        let mut stripped: serde_json::Value = serde_json::from_slice(&signed_explicit).unwrap();
+        stripped
+            .as_object_mut()
+            .unwrap()
+            .remove("release_generation");
+        let refused = verify_manifest(
+            &serde_json::to_vec(&stripped).unwrap(),
+            &keys,
+            Channel::Stable,
+            1_500,
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(refused.code(), "manifest_tampered");
+
+        // And adding a generation to a manifest signed without one is a
+        // tamper refusal too (a legacy manifest cannot be upgraded in place).
+        let mut upgraded: serde_json::Value = serde_json::from_slice(&signed).unwrap();
+        upgraded["release_generation"] = serde_json::json!(99);
+        let refused = verify_manifest(
+            &serde_json::to_vec(&upgraded).unwrap(),
+            &keys,
+            Channel::Stable,
+            1_500,
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(refused.code(), "manifest_tampered");
     }
 }

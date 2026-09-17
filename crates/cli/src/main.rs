@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 
 mod billing_debits;
 mod billing_report;
+mod bootstrap;
 mod config;
 mod embeddings;
 mod evidence;
@@ -97,7 +98,8 @@ enum Command {
         data_dir: String,
     },
     /// Signed updater lifecycle (local parity with the control-plane
-    /// routes): status, check, stage, apply, rollback, recover. The
+    /// routes): status, check, stage, apply, rollback, recover and the
+    /// explicitly authorized downgrade below the anti-rollback floor. The
     /// `[updater]` section must be enabled; manifests are verified against
     /// its operator key allowlist and downloads ride the checked transport.
     Updater {
@@ -140,6 +142,24 @@ enum Command {
         #[arg(long, default_value = "~/.faktor")]
         data_dir: String,
     },
+    /// Stable bootstrap launcher: resolve the activated release through the
+    /// authenticated install pointer (`versions/<release-id>/faktor`), verify
+    /// its signed manifest and digest, and exec exactly those bytes. Refuses
+    /// (exit 3) on a missing pointer, an unsigned/tampered manifest or a
+    /// digest mismatch; never falls back to another binary.
+    Bootstrap {
+        /// The install root holding `current`, `launcher` and `versions/`.
+        #[arg(long, default_value = "~/.faktor/install")]
+        install_root: String,
+        /// Everything after `--` is forwarded verbatim to the release binary.
+        #[arg(last = true, allow_hyphen_values = true)]
+        exec_args: Vec<String>,
+    },
+    /// Print the running build report as JSON: version, executable path, the
+    /// sha256 of the RUNNING executable, and the release id/digest the
+    /// bootstrap launcher verified (absent when the binary was started
+    /// directly). Supervisors use this to observe which artifact is live.
+    Build,
 }
 
 /// The worker-node local subcommands (`faktor worker <action>`).
@@ -281,6 +301,13 @@ enum UpdaterAction {
         vscode: Option<String>,
         #[arg(long)]
         jetbrains: Option<String>,
+        /// Also materialize the IMMUTABLE release layout
+        /// (`versions/<release-id>/{faktor,manifest}` + `launcher` +
+        /// `trusted-keys.json`): the bootstrap launcher then controls which
+        /// binary runs. Without this flag the legacy content-addressed stage
+        /// is byte-identical.
+        #[arg(long)]
+        release: bool,
     },
     /// Swap the staged artifact in and run the doctor-style health probe;
     /// a probe failure rolls back automatically.
@@ -288,8 +315,56 @@ enum UpdaterAction {
         #[arg(long)]
         confirm: bool,
     },
+    /// Activate a staged RELEASE: record-first atomic pointer swap to
+    /// `versions/<release-id>/faktor`, then the filesystem probe. The apply
+    /// row stays RUNNING until the restarted process's digest is observed:
+    /// this command alone never proves which binary runs (that is exactly
+    /// the defect the immutable layout closes).
+    Activate {
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Finalize a pending release activation: `--digest` is the digest the
+    /// RESTARTED process reported (`faktor build` / the health `version`).
+    /// It must equal the activated digest; then the doctor probe runs and
+    /// the apply row becomes applied. A probe failure restores the previous
+    /// pointer.
+    Finalize {
+        /// The release digest the running process reported.
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Abort a pending release activation: restore the exact previous
+    /// pointer (the caller then restarts the daemon through the launcher,
+    /// which names the previous release again).
+    Abort {
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Explicitly roll back to the artifact the last applied update replaced.
     Rollback {
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// The authorized downgrade below the durable anti-rollback floor: install
+    /// an OLDER signed manifest (it must carry an explicit signed
+    /// `release_generation`). The local operator acts as the admin principal;
+    /// the operation is recorded as a durable `downgrade` row and the
+    /// high-water mark is reset only after the swap + health probe succeed.
+    Downgrade {
+        /// Path to the older `faktor-update/v1` manifest JSON.
+        #[arg(long)]
+        manifest: String,
+        /// Idempotency key for the authorized downgrade.
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long)]
+        vscode: Option<String>,
+        #[arg(long)]
+        jetbrains: Option<String>,
+        /// The downgrade is never applied implicitly.
         #[arg(long)]
         confirm: bool,
     },
@@ -311,6 +386,14 @@ fn expand(p: &str) -> PathBuf {
 
 #[tokio::main]
 async fn main() {
+    // Bootstrap mode is detected BEFORE the CLI: a file named `launcher`
+    // sitting in an install layout (or an explicit
+    // FAKTOR_LAUNCHER_INSTALL_ROOT) resolves, authenticates and execs the
+    // activated release. Without this entry the pointer could never control
+    // which binary runs.
+    if let Some(install_root) = bootstrap::launcher_invocation() {
+        bootstrap::run_launcher(install_root, std::env::args_os().skip(1).collect());
+    }
     // Logging goes to stderr: stdout is the frozen startup-line contract.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -382,7 +465,63 @@ async fn main() {
         Command::Sessions { data_dir } => {
             sessions(expand(&data_dir)).await;
         }
+        Command::Bootstrap {
+            install_root,
+            exec_args,
+        } => {
+            bootstrap::run_launcher(
+                expand(&install_root),
+                exec_args
+                    .into_iter()
+                    .map(std::ffi::OsString::from)
+                    .collect(),
+            );
+        }
+        Command::Build => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&build_report_json(true))
+                    .unwrap_or_else(|_| build_report_json(true).to_string())
+            );
+        }
     }
+}
+
+/// The running-build report: version, executable path, optionally the
+/// sha256 of the RUNNING executable, and the release identity the bootstrap
+/// launcher verified (absent when the binary was started directly). The
+/// daemon logs the same document on startup (without the self-hash: the
+/// launcher already verified those bytes, and daemon startup must not do a
+/// full-binary hash pass) and folds the digest into the health `version`, so
+/// a supervisor can observe WHICH artifact is live.
+fn build_report_json(include_self_digest: bool) -> Value {
+    let self_sha256 = if include_self_digest {
+        faktor_updater::self_digest().ok()
+    } else {
+        None
+    };
+    let release = faktor_updater::running_release();
+    let (release_id, release_digest) = match &release {
+        Some((id, digest)) => (Some(id.clone()), Some(digest.clone())),
+        None => (None, None),
+    };
+    let matches_release = match (&self_sha256, &release_digest) {
+        (Some(actual), Some(expected)) => Some(actual == expected),
+        _ => None,
+    };
+    json!({
+        "schema": "faktor-build-report/v1",
+        "version": faktor_core::VERSION,
+        "exe": std::env::current_exe()
+            .ok()
+            .map(|p| p.display().to_string()),
+        "self_sha256": self_sha256,
+        "release_id": release_id,
+        "release_digest": release_digest,
+        "self_digest_matches_release": matches_release,
+        "install_root": faktor_updater::running_install_root()
+            .map(|p| p.display().to_string()),
+    })
 }
 
 /// Build the full daemon dependency graph (audit 12/17): every lifetime
@@ -1714,6 +1853,7 @@ async fn serve_impl(
             host_os: std::env::consts::OS.to_string(),
             host_arch: std::env::consts::ARCH.to_string(),
             local_version: faktor_core::VERSION.to_string(),
+            allow_legacy_manifests_once: config.updater.allow_legacy_manifests_once_resolved(),
         };
         let updater = faktor_updater::Updater::with_default_probe(updater_config, store, fetcher)
             .map_err(|e| format!("updater init: {e}"))?;
@@ -2010,9 +2150,13 @@ async fn serve_impl(
     // runs BEFORE the first request — an interrupted apply is resumed or
     // rolled back, never left half-applied. The daemon probe re-hashes the
     // swapped artifact (the CLI-local `faktor updater apply` runs the real
-    // doctor quick check instead).
+    // doctor quick check instead). When THIS process was launched through
+    // the bootstrap launcher, its verified release digest is passed to
+    // recovery: a release activation whose pointer is in place is only
+    // resumed as applied when the running process IS the activated release.
     if let Some(updater) = &updater {
-        match updater.recover(now_ms()) {
+        let running_release_digest = faktor_updater::running_release().map(|(_, digest)| digest);
+        match updater.recover_with_running_digest(now_ms(), running_release_digest.as_deref()) {
             Ok(outcomes) if !outcomes.is_empty() => {
                 for outcome in &outcomes {
                     tracing::warn!(
@@ -2028,6 +2172,16 @@ async fn serve_impl(
             "signed updater enabled (channel {})",
             updater.config().channel
         );
+    }
+    // The running-build report (audit: activation must be observable as a
+    // PROCESS fact, not metadata): the daemon logs one bounded JSON line to
+    // stderr and — when the bootstrap launcher verified a release — folds
+    // the release id + digest into `version`, so `/native/health` names the
+    // exact artifact a supervisor is talking to. A directly started binary
+    // reports no release identity (honest absence).
+    tracing::info!("faktor build: {}", build_report_json(false));
+    if let Some((release_id, digest)) = faktor_updater::running_release() {
+        deps.version = format!("{}+release.{release_id}.{digest}", faktor_core::VERSION);
     }
     // The ONE semantic-provider registry: the SAME Arc the graph built and
     // the agent holds — the native introspection endpoints inspect only
@@ -2746,6 +2900,7 @@ fn build_local_updater(
         host_os: std::env::consts::OS.to_string(),
         host_arch: std::env::consts::ARCH.to_string(),
         local_version: faktor_core::VERSION.to_string(),
+        allow_legacy_manifests_once: cfg.allow_legacy_manifests_once_resolved(),
     };
     faktor_updater::Updater::new(config, store, fetcher, probe).map_err(|e| e.to_string())
 }
@@ -2823,16 +2978,25 @@ async fn updater_command(action: UpdaterAction, data_dir: PathBuf, config_path: 
                 key,
                 vscode,
                 jetbrains,
+                release,
             } => {
                 let bytes = read_manifest_file(&PathBuf::from(&manifest))?;
                 let running = updater
                     .running_components(None, None, vscode.as_deref(), jetbrains.as_deref())
                     .map_err(|e| e.to_string())?;
-                updater
-                    .stage(&bytes, &running, key.as_deref(), now_ms())
-                    .await
-                    .map(|outcome| json!({ "stage": outcome }))
-                    .map_err(|e| e.to_string())
+                if release {
+                    updater
+                        .stage_release(&bytes, &running, key.as_deref(), now_ms())
+                        .await
+                        .map(|outcome| json!({ "stage_release": outcome }))
+                        .map_err(|e| e.to_string())
+                } else {
+                    updater
+                        .stage(&bytes, &running, key.as_deref(), now_ms())
+                        .await
+                        .map(|outcome| json!({ "stage": outcome }))
+                        .map_err(|e| e.to_string())
+                }
             }
             UpdaterAction::Apply { confirm } => {
                 if !confirm {
@@ -2844,12 +3008,78 @@ async fn updater_command(action: UpdaterAction, data_dir: PathBuf, config_path: 
                         .map_err(|e| e.to_string())
                 }
             }
+            UpdaterAction::Activate { confirm } => {
+                if !confirm {
+                    Err(
+                        "activate requires --confirm: the pointer is never swapped implicitly"
+                            .into(),
+                    )
+                } else {
+                    updater
+                        .activate_release(now_ms(), None)
+                        .map(|outcome| json!({ "activate": outcome }))
+                        .map_err(|e| e.to_string())
+                }
+            }
+            UpdaterAction::Finalize { digest, confirm } => {
+                if !confirm {
+                    Err(
+                        "finalize requires --confirm: pass the digest the RUNNING process reported"
+                            .into(),
+                    )
+                } else {
+                    updater
+                        .finalize_release(&digest, now_ms())
+                        .map(|outcome| json!({ "finalize": outcome }))
+                        .map_err(|e| e.to_string())
+                }
+            }
+            UpdaterAction::Abort { confirm } => {
+                if !confirm {
+                    Err("abort requires --confirm".into())
+                } else {
+                    updater
+                        .abort_release(now_ms())
+                        .map(|outcome| json!({ "abort": outcome }))
+                        .map_err(|e| e.to_string())
+                }
+            }
             UpdaterAction::Rollback { confirm } => {
                 if !confirm {
                     Err("rollback requires --confirm".into())
                 } else {
                     updater
                         .rollback(now_ms())
+                        .map(|outcome| json!({ "apply": outcome }))
+                        .map_err(|e| e.to_string())
+                }
+            }
+            UpdaterAction::Downgrade {
+                manifest,
+                key,
+                vscode,
+                jetbrains,
+                confirm,
+            } => {
+                if !confirm {
+                    Err(
+                        "downgrade requires --confirm: the floor is never bypassed implicitly"
+                            .into(),
+                    )
+                } else {
+                    let bytes = read_manifest_file(&PathBuf::from(&manifest))?;
+                    let running = updater
+                        .running_components(None, None, vscode.as_deref(), jetbrains.as_deref())
+                        .map_err(|e| e.to_string())?;
+                    updater
+                        .downgrade(
+                            &bytes,
+                            &running,
+                            key.as_deref(),
+                            Some("cli:local-operator"),
+                            now_ms(),
+                        )
+                        .await
                         .map(|outcome| json!({ "apply": outcome }))
                         .map_err(|e| e.to_string())
                 }
@@ -8046,5 +8276,27 @@ mod tests {
             }
             other => panic!("expected a settlement, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_build_report_names_the_running_artifact_honestly() {
+        // Directly started (no bootstrap env): the version is reported, the
+        // self hash is optional and no release identity is claimed.
+        let report = build_report_json(true);
+        assert_eq!(report["schema"], "faktor-build-report/v1");
+        assert_eq!(report["version"], faktor_core::VERSION);
+        assert!(report["exe"].is_string());
+        let self_sha = report["self_sha256"].as_str().unwrap();
+        assert_eq!(self_sha.len(), 64);
+        // No release environment in this test process (no other test sets
+        // it): the release fields are honest absences, and the folded health
+        // version keeps the plain package version.
+        assert!(report["release_id"].is_null());
+        assert!(report["release_digest"].is_null());
+        assert!(report["self_digest_matches_release"].is_null());
+        // The cheap daemon-startup form skips the full-binary hash pass.
+        let cheap = build_report_json(false);
+        assert!(cheap["self_sha256"].is_null());
+        assert_eq!(cheap["version"], faktor_core::VERSION);
     }
 }

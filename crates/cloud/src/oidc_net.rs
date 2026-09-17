@@ -38,9 +38,23 @@
 //!   unknown after the bound is the typed [`OidcError::UnknownKey`];
 //! - response bodies are bounded by the transport's own
 //!   [`faktor_provider::egress::MAX_RAW_RESPONSE_BYTES`];
-//! - supported signature algorithms are exactly `HS256` (JWKS `oct`) and
-//!   `RS256` (JWKS `RSA`, RFC 7518 n/e components). Any other `alg` is
-//!   refused typed ([`OidcError::Malformed`]) — never accepted.
+//! - the accepted signing algorithm is the strict INTERSECTION of three
+//!   independently authoritative sets: the discovery document's
+//!   `id_token_signing_alg_values_supported`, the selected JWK's own
+//!   `alg`/`kty`/`use`/`key_ops` constraints, and the deployment-configured
+//!   [`NetworkOidcConfig::allowed_algorithms`]. The header `alg` must equal
+//!   the algorithm actually used to verify; a mismatch is the typed
+//!   [`OidcError::AlgorithmRefused`] naming each set. `none` is never
+//!   accepted, and symmetric `HS*` is accepted only when the operator lists
+//!   it explicitly AND the JWK is an `oct` key with `use = "sig"` (the
+//!   verifiable implementations are `HS256` and `RS256`);
+//! - `aud`/`azp` follow OpenID Connect: a multi-valued `aud` requires
+//!   `azp == client_id`, and an `azp` that is present must always match —
+//!   a client id merely occurring somewhere in a multi-valued `aud` is
+//!   never sufficient ([`OidcError::WrongAzp`]);
+//! - `exp`/`iat` arithmetic is `i128`-exact over the skew window and every
+//!   millisecond conversion is checked: overflow is a typed
+//!   [`OidcError::TimestampOutOfRange`], never a wrap or a panic.
 
 use std::sync::{Arc, Mutex};
 
@@ -68,6 +82,15 @@ pub const MAX_CACHE_MAX_AGE_MS: i64 = 3_600_000;
 pub const MAX_CLIENT_SECRET_BYTES: usize = 4096;
 /// Hard cap on one authorization-code exchange input field.
 pub const MAX_CODE_EXCHANGE_INPUT_BYTES: usize = 1024 * 1024;
+/// The signing algorithms this adapter can verify at all. `none` is not an
+/// algorithm and is never verifiable; symmetric `HS*` is verifiable here
+/// only under the explicit conditions of
+/// [`NetworkOidcConfig::allowed_algorithms`].
+pub const SUPPORTED_ALGORITHMS: &[&str] = &["HS256", "RS256"];
+/// The default deployment policy: asymmetric signatures only.
+pub const DEFAULT_ALLOWED_ALGORITHMS: &[&str] = &["RS256"];
+/// Hard cap on the configured allowed-algorithm list.
+pub const MAX_ALLOWED_ALGORITHMS: usize = 8;
 
 /// How the adapter authenticates itself at the token endpoint.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -170,6 +193,14 @@ pub struct NetworkOidcConfig {
     /// The confidential client's secret; required iff `client_auth` is not
     /// `none`, refused when configured without a method.
     pub client_secret: Option<ClientSecret>,
+    /// The algorithms this deployment explicitly allows. The JWT header
+    /// `alg` must be in the intersection of this list, the discovery
+    /// document's `id_token_signing_alg_values_supported` and the signing
+    /// JWK's own `alg`/`kty`/`use`/`key_ops` constraints, and must equal the
+    /// algorithm actually used for verification. Defaults to `["RS256"]`:
+    /// symmetric `HS*` is refused unless listed here explicitly AND the JWK
+    /// is an `oct` key with `use = "sig"`. `none` is never accepted.
+    pub allowed_algorithms: Vec<String>,
 }
 
 impl Default for NetworkOidcConfig {
@@ -182,6 +213,10 @@ impl Default for NetworkOidcConfig {
             max_jwks_refetches: 2,
             client_auth: ClientAuthMethod::None,
             client_secret: None,
+            allowed_algorithms: DEFAULT_ALLOWED_ALGORITHMS
+                .iter()
+                .map(|alg| (*alg).to_string())
+                .collect(),
         }
     }
 }
@@ -237,6 +272,32 @@ impl NetworkOidcConfig {
                 )));
             }
             _ => {}
+        }
+        Self::validate_allowed_algorithms(&self.allowed_algorithms)
+    }
+
+    /// The strict algorithm policy validation: a bounded, non-empty list of
+    /// algorithms this adapter can actually verify; `none` is refused with
+    /// its own name (it can never be permitted).
+    pub fn validate_allowed_algorithms(algorithms: &[String]) -> Result<(), OidcError> {
+        if algorithms.is_empty() || algorithms.len() > MAX_ALLOWED_ALGORITHMS {
+            return Err(OidcError::DiscoveryUnavailable(format!(
+                "allowed_algorithms must carry 1..={MAX_ALLOWED_ALGORITHMS} entries"
+            )));
+        }
+        for algorithm in algorithms {
+            if algorithm == "none" {
+                return Err(OidcError::DiscoveryUnavailable(
+                    "\"none\" is never an accepted id-token signing algorithm".into(),
+                ));
+            }
+            if !SUPPORTED_ALGORITHMS.contains(&algorithm.as_str()) {
+                return Err(OidcError::DiscoveryUnavailable(format!(
+                    "allowed_algorithms entry {algorithm:?} is not supported by this adapter \
+                     (supported: {})",
+                    SUPPORTED_ALGORITHMS.join(", ")
+                )));
+            }
         }
         Ok(())
     }
@@ -306,6 +367,10 @@ struct JwkKey {
     kid: String,
     kty: String,
     alg: Option<String>,
+    /// The optional JWK `use` (`sig`/`enc`); only `sig` may verify.
+    use_: Option<String>,
+    /// The optional JWK `key_ops`; when present it must contain `verify`.
+    key_ops: Option<Vec<String>>,
     /// `oct` shared secret (base64url).
     k: Option<Vec<u8>>,
     /// `RSA` modulus/exponent (base64url).
@@ -482,6 +547,8 @@ impl NetworkOidcAdapter {
                 kid: raw.kid,
                 kty: raw.kty,
                 alg: raw.alg,
+                use_: raw.use_,
+                key_ops: raw.key_ops,
                 k: decode(raw.k, "k")?,
                 n: decode(raw.n, "n")?,
                 e: decode(raw.e, "e")?,
@@ -541,6 +608,67 @@ impl NetworkOidcAdapter {
             }
         }
     }
+}
+
+/// The algorithms ONE JWK's own metadata permits (among the algorithms this
+/// adapter supports): the key type + material decide the family, an explicit
+/// `alg` must equal that candidate, `use` must be absent or `sig` (an `oct`
+/// key must declare `use = "sig"` explicitly — a bare shared secret is never
+/// implicitly trusted) and `key_ops`, when present, must contain `verify`.
+fn jwk_permitted_algorithms(key: &JwkKey) -> Vec<String> {
+    let candidate = match key.kty.as_str() {
+        "RSA" if key.n.is_some() && key.e.is_some() => "RS256",
+        "oct" if key.k.is_some() => "HS256",
+        _ => return Vec::new(),
+    };
+    if key.alg.as_deref().is_some_and(|alg| alg != candidate) {
+        return Vec::new();
+    }
+    let use_ok = match key.use_.as_deref() {
+        Some("sig") => true,
+        Some(_) => false,
+        None => candidate != "HS256",
+    };
+    let ops_ok = key
+        .key_ops
+        .as_ref()
+        .is_none_or(|ops| ops.iter().any(|op| op == "verify"));
+    if use_ok && ops_ok {
+        vec![candidate.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The strict algorithm policy: the header `alg` is accepted iff it is
+/// contained in ALL THREE authoritative sets — the discovery document's
+/// advertised algorithms, the selected JWK's own metadata permits, and the
+/// deployment's configured `allowed_algorithms` — and is one of the
+/// algorithms this adapter actually implements. Any mismatch is the typed
+/// [`OidcError::AlgorithmRefused`] naming every set.
+fn check_algorithm_policy(
+    alg: &str,
+    discovery: &OidcDiscovery,
+    key: &JwkKey,
+    configured: &[String],
+) -> Result<(), OidcError> {
+    let jwk = jwk_permitted_algorithms(key);
+    let accepted = SUPPORTED_ALGORITHMS.contains(&alg)
+        && discovery
+            .supported_algorithms
+            .iter()
+            .any(|advertised| advertised == alg)
+        && configured.iter().any(|allowed| allowed == alg)
+        && jwk.iter().any(|allowed| allowed == alg);
+    if accepted {
+        return Ok(());
+    }
+    Err(OidcError::AlgorithmRefused {
+        alg: alg.to_string(),
+        discovery: discovery.supported_algorithms.clone(),
+        jwk,
+        configured: configured.to_vec(),
+    })
 }
 
 #[async_trait::async_trait]
@@ -705,7 +833,15 @@ impl AsyncOidcAdapter for NetworkOidcAdapter {
             .decode(signature_b64)
             .map_err(|e| OidcError::Malformed(format!("signature base64: {e}")))?;
         let signing_input = format!("{header_b64}.{payload_b64}");
+        // The algorithm policy is decided BEFORE any key material is used to
+        // verify: the header `alg` must be in the intersection of the
+        // discovery set, the JWK's own constraints and the configured
+        // allowed algorithms, and the dispatch below is an exact match (no
+        // case folding, no alias). `none`/unknown algorithms never reach a
+        // verifier.
+        let discovery = self.discovery(&self.config.issuer).await?;
         let key = self.signing_key(kid).await?;
+        check_algorithm_policy(alg, &discovery, &key, &self.config.allowed_algorithms)?;
         match alg {
             "HS256" => {
                 let secret = key.k.as_deref().ok_or_else(|| {
@@ -738,9 +874,15 @@ impl AsyncOidcAdapter for NetworkOidcAdapter {
                     .map_err(|_| OidcError::BadSignature)?;
             }
             other => {
-                return Err(OidcError::Malformed(format!(
-                    "unsupported JWT alg {other:?} (this adapter verifies HS256 and RS256)"
-                )))
+                // Unreachable by construction (the policy above only lets
+                // SUPPORTED_ALGORITHMS through); kept as a defensive typed
+                // refusal, never a silent acceptance.
+                return Err(OidcError::AlgorithmRefused {
+                    alg: other.to_string(),
+                    discovery: discovery.supported_algorithms,
+                    jwk: jwk_permitted_algorithms(&key),
+                    configured: self.config.allowed_algorithms.clone(),
+                });
             }
         }
         let payload: serde_json::Value = serde_json::from_slice(
@@ -775,10 +917,21 @@ impl AsyncOidcAdapter for NetworkOidcAdapter {
         }
         let audience = match payload.get("aud") {
             Some(serde_json::Value::String(single)) => vec![single.clone()],
-            Some(serde_json::Value::Array(list)) => list
-                .iter()
-                .filter_map(|value| value.as_str().map(str::to_string))
-                .collect(),
+            Some(serde_json::Value::Array(list)) => {
+                if list.is_empty() {
+                    return Err(OidcError::Malformed("claim \"aud\" is empty".into()));
+                }
+                let mut values = Vec::with_capacity(list.len());
+                for value in list {
+                    let Some(text) = value.as_str() else {
+                        return Err(OidcError::Malformed(
+                            "claim \"aud\" carries a non-text entry".into(),
+                        ));
+                    };
+                    values.push(text.to_string());
+                }
+                values
+            }
             _ => {
                 return Err(OidcError::Malformed(
                     "claim \"aud\" is missing or malformed".into(),
@@ -790,13 +943,55 @@ impl AsyncOidcAdapter for NetworkOidcAdapter {
                 expected: expected.audience.clone(),
             });
         }
-        let expires_at_ms = number("exp")?.saturating_mul(1000);
-        let skew = expected.clock_skew_ms.max(0);
-        if expires_at_ms + skew < expected.now_ms {
+        // OIDC azp rules: a multi-valued `aud` REQUIRES `azp` to equal the
+        // client id (client_id merely occurring somewhere in `aud` is never
+        // sufficient), and an `azp` that is present must match regardless of
+        // the `aud` shape.
+        let azp = match payload.get("azp") {
+            None => None,
+            Some(serde_json::Value::String(value)) => Some(value.clone()),
+            Some(_) => return Err(OidcError::Malformed("claim \"azp\" is not text".into())),
+        };
+        match &azp {
+            Some(value) if value != &expected.audience => {
+                return Err(OidcError::WrongAzp {
+                    expected: expected.audience.clone(),
+                    actual: azp.clone(),
+                });
+            }
+            None if audience.len() > 1 => {
+                return Err(OidcError::WrongAzp {
+                    expected: expected.audience.clone(),
+                    actual: None,
+                });
+            }
+            _ => {}
+        }
+        // Time arithmetic is i128-exact over the skew window; the second ->
+        // millisecond conversion is checked, so i64::MAX/MIN claims are
+        // typed refusals rather than wraps, saturations or panics.
+        let expires_at_s = number("exp")?;
+        let expires_at_ms =
+            expires_at_s
+                .checked_mul(1000)
+                .ok_or_else(|| OidcError::TimestampOutOfRange {
+                    claim: "exp".into(),
+                    value: expires_at_s,
+                })?;
+        let issued_at_s = number("iat")?;
+        let issued_at_ms =
+            issued_at_s
+                .checked_mul(1000)
+                .ok_or_else(|| OidcError::TimestampOutOfRange {
+                    claim: "iat".into(),
+                    value: issued_at_s,
+                })?;
+        let skew = i128::from(expected.clock_skew_ms.max(0));
+        let now_ms = i128::from(expected.now_ms);
+        if i128::from(expires_at_ms) + skew < now_ms {
             return Err(OidcError::Expired);
         }
-        let issued_at_ms = number("iat")?.saturating_mul(1000);
-        if issued_at_ms - skew > expected.now_ms {
+        if i128::from(issued_at_ms) - skew > now_ms {
             return Err(OidcError::NotYetValid);
         }
         let nonce = payload
@@ -867,6 +1062,10 @@ struct RawJwk {
     kty: String,
     #[serde(default)]
     alg: Option<String>,
+    #[serde(default, rename = "use")]
+    use_: Option<String>,
+    #[serde(default)]
+    key_ops: Option<Vec<String>>,
     #[serde(default)]
     k: Option<String>,
     #[serde(default)]

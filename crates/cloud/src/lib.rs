@@ -94,8 +94,9 @@ pub use oidc::{
 };
 pub use oidc_net::{
     AsyncOidcAdapter, CachedJwksView, ClientAuthMethod, ClientSecret, NetworkOidcAdapter,
-    NetworkOidcConfig, DEFAULT_DISCOVERY_MAX_AGE_MS, DEFAULT_JWKS_MAX_AGE_MS, MAX_CACHE_MAX_AGE_MS,
-    MAX_CLIENT_SECRET_BYTES, MAX_CODE_EXCHANGE_INPUT_BYTES, MAX_JWKS_REFETCHES,
+    NetworkOidcConfig, DEFAULT_ALLOWED_ALGORITHMS, DEFAULT_DISCOVERY_MAX_AGE_MS,
+    DEFAULT_JWKS_MAX_AGE_MS, MAX_ALLOWED_ALGORITHMS, MAX_CACHE_MAX_AGE_MS, MAX_CLIENT_SECRET_BYTES,
+    MAX_CODE_EXCHANGE_INPUT_BYTES, MAX_JWKS_REFETCHES, SUPPORTED_ALGORITHMS,
 };
 pub use rbac::{
     authorize, Action, Denied, Principal, PrincipalSubject, Resource, Role, ALL_ACTIONS,

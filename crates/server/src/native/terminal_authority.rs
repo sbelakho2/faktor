@@ -46,6 +46,7 @@ use faktor_session::{
     SessionHandle, SessionManager, TerminalDurableRow, TerminalEventKind, TerminalLedgerRecord,
     TERMINAL_RECONCILE_COLLECTED, TERMINAL_RECONCILE_KILLED,
 };
+use faktor_terminal::{BudgetEnforcement, BudgetPlatform, TreeBudgetGuard};
 use serde::{Deserialize, Serialize};
 
 /// Bound of one terminal command / arg / cwd (bytes; mirrors the ACP param
@@ -259,30 +260,12 @@ impl TerminalPrincipal {
 }
 
 /// The CPU / memory / process-count / wall-time budgets one authorized
-/// terminal carries. Recorded as the spawn's effective profile evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TerminalBudgets {
-    /// Max CPU time of the process tree in milliseconds.
-    pub cpu_millis: u64,
-    /// Max resident memory of the process tree in bytes.
-    pub memory_bytes: u64,
-    /// Max live processes of the tree.
-    pub max_processes: u32,
-    /// Max wall-clock lifetime in milliseconds.
-    pub wall_time_ms: u64,
-}
-
-impl Default for TerminalBudgets {
-    fn default() -> Self {
-        Self {
-            cpu_millis: 30 * 60 * 1000,
-            memory_bytes: 2 * 1024 * 1024 * 1024,
-            max_processes: 256,
-            wall_time_ms: 24 * 60 * 60 * 1000,
-        }
-    }
-}
+/// terminal carries. This is the durable REQUEST (a zero limit was not
+/// requested); the EFFECTIVE enforcement is the sibling
+/// [`ExecutionProfile::budget_enforcement`] report, applied to the process
+/// tree by the `faktor-terminal` budget authority. Recorded as the spawn's
+/// effective profile evidence.
+pub use faktor_terminal::TreeBudgets as TerminalBudgets;
 
 /// The EFFECTIVE execution profile admitted for one terminal spawn — the
 /// durable row records THIS, not merely the owner: which candidate root the
@@ -307,7 +290,20 @@ pub struct ExecutionProfile {
     pub filesystem: String,
     /// The network guarantee tag (`none` | `best_effort` | `required`).
     pub network: String,
+    /// The REQUESTED budgets of the profile.
     pub budgets: TerminalBudgets,
+    /// Whether the profile was enforced STRICTLY: a requested limit the
+    /// platform cannot enforce refuses the spawn typed (never silently
+    /// recorded). Legacy rows default to `false`.
+    #[serde(default)]
+    pub strict_budgets: bool,
+    /// The EFFECTIVE per-limit enforcement actually applied to this
+    /// terminal's process tree (`Enforced` / `Degraded` / `Unsupported` /
+    /// `NotRequested`), with the typed reason for every degraded/unsupported
+    /// limit. `None` only for a legacy row written before enforcement
+    /// existed.
+    #[serde(default)]
+    pub budget_enforcement: Option<BudgetEnforcement>,
     /// The env NAMES (never values) the child is admitted to copy.
     pub env_names: Vec<String>,
     /// True when the cwd was admitted through an explicit external grant
@@ -498,6 +494,16 @@ pub struct TerminalAuthorityPolicy {
     pub external_cwd_grants: Vec<PathBuf>,
     pub sandbox: SandboxPolicy,
     pub budgets: TerminalBudgets,
+    /// STRICT budget policy: a requested limit this platform cannot enforce
+    /// refuses the spawn typed — pre-spawn (via [`Self::budget_platform`])
+    /// and again post-spawn against the EFFECTIVE report — and never gets
+    /// silently recorded as if it were in force.
+    pub strict_budgets: bool,
+    /// The platform's enforceable-limit report the pre-spawn strict gate
+    /// consults. Production uses [`BudgetPlatform::detect`]; the seam exists
+    /// so adversarial tests (and hosts that pre-declare a different
+    /// mechanism set) are deterministic instead of host-dependent.
+    pub budget_platform: BudgetPlatform,
 }
 
 impl Default for TerminalAuthorityPolicy {
@@ -514,6 +520,8 @@ impl Default for TerminalAuthorityPolicy {
                 ..SandboxPolicy::default()
             },
             budgets: TerminalBudgets::default(),
+            strict_budgets: false,
+            budget_platform: BudgetPlatform::detect(),
         }
     }
 }
@@ -726,14 +734,23 @@ impl ExecutionAuthority for SessionExecutionAuthority {
                 env_names.push(name.clone());
             }
         }
-        // Budgets: the policy's resolved budgets. An unresolvable budget is
-        // a typed denial (bounded everything), never an implicit unlimited.
+        // Budgets: the policy's resolved budgets. A zero limit is NOT
+        // REQUESTED (disabled parity), never an implicit unlimited; a STRICT
+        // profile whose requested limit this platform cannot enforce is a
+        // typed denial BEFORE any PTY exists.
         let budgets = self.policy.budgets;
-        if budgets.wall_time_ms == 0 || budgets.max_processes == 0 {
-            return Err(ExecutionDenial::BudgetUnavailable {
-                resource: "wall_time_ms/max_processes".into(),
-                reason: "the resolved budgets must be non-zero".into(),
-            });
+        if self.policy.strict_budgets {
+            let violations = self.policy.budget_platform.unsupported_violations(&budgets);
+            if !violations.is_empty() {
+                return Err(ExecutionDenial::BudgetUnavailable {
+                    resource: violations.join(", "),
+                    reason: format!(
+                        "the strict terminal budget profile requires limits this platform \
+                         cannot enforce ({})",
+                        self.policy.budget_platform.detail
+                    ),
+                });
+            }
         }
         let spawn_profile = self.policy.sandbox.spawn_profile();
         let profile = ExecutionProfile {
@@ -747,6 +764,8 @@ impl ExecutionAuthority for SessionExecutionAuthority {
             filesystem: spawn_profile.filesystem,
             network: spawn_profile.network,
             budgets,
+            strict_budgets: self.policy.strict_budgets,
+            budget_enforcement: None,
             env_names: env_names.clone(),
             external_cwd_granted,
         };
@@ -960,6 +979,13 @@ struct LiveRow {
     pty: Arc<Mutex<Pty>>,
     row: TerminalDurableRow,
     state: Mutex<LiveState>,
+    /// The EFFECTIVE process-tree budget of this live terminal: cgroup/job
+    /// cleanup, the armed wall watchdog (kills the whole guardian-owned tree
+    /// through the terminal authority at the deadline) and the report the
+    /// durable row carries. Dropping the live row cancels the deadline and
+    /// releases the mechanisms — a terminal that ended is never killed
+    /// twice, and a deadline never outlives its tree.
+    _budget_guard: Option<TreeBudgetGuard>,
 }
 
 impl LiveRow {
@@ -1513,11 +1539,70 @@ impl TerminalService {
         terminal_id: &str,
         authorized: AuthorizedTerminalSpawn,
     ) -> Result<TerminalCreation, TerminalServiceError> {
-        let profile = authorized.profile().clone();
+        let mut profile = authorized.profile().clone();
         let task_id = TaskId::new(profile.task_id);
         let cfg = authorized.to_pty_config();
         let pty = Pty::spawn(&cfg).map_err(|e| TerminalServiceError::Refused(e.message))?;
         let pid = pty.pid();
+        // Push the requested budgets into the process tree BEFORE the
+        // terminal is journaled or exposed: the row only becomes usable with
+        // its budget in force. The report is the EFFECTIVE per-limit state
+        // (Enforced / Degraded / Unsupported with the typed reason); a
+        // mechanism that cannot be applied is never silently recorded as if
+        // it were. A STRICT profile whose requested limit ended Unsupported
+        // is refused TYPED here and the just-spawned child is killed (no
+        // durable row, no live row, no orphan).
+        let mut budget_guard =
+            match faktor_terminal::budget::enforce_tree_budgets(pid, &profile.budgets) {
+                Ok(guard) => guard,
+                Err(refusal) => {
+                    let mut pty = pty;
+                    pty.kill();
+                    return Err(TerminalServiceError::Denied(format!(
+                        "terminal budget enforcement refused: {refusal}"
+                    )));
+                }
+            };
+        if profile.strict_budgets {
+            let violations = budget_guard
+                .enforcement()
+                .strict_violations(&profile.budgets);
+            if !violations.is_empty() {
+                let mut pty = pty;
+                pty.kill();
+                return Err(TerminalServiceError::Denied(format!(
+                    "strict terminal budget profile refused: requested limits cannot be \
+                     enforced on this platform: {}",
+                    violations.join(", ")
+                )));
+            }
+        }
+        // Arm the wall deadline through the ONE guardian-compatible kill
+        // path (the pty authority): the watchdog journals `terminal_killed`
+        // exactly once and the whole tree dies with it. The report only says
+        // `Enforced` once the deadline is really armed.
+        let service = Arc::downgrade(self);
+        let wall_terminal_id = terminal_id.to_string();
+        if let Err(refusal) = budget_guard.arm_wall(profile.budgets.wall_time_ms, move || {
+            if let Some(service) = service.upgrade() {
+                if let Some(live) = service.live_row(&wall_terminal_id) {
+                    if live.is_alive() {
+                        let _ = service.terminalize(
+                            &live,
+                            Some("terminal wall-time budget exceeded"),
+                            None,
+                        );
+                    }
+                }
+            }
+        }) {
+            let mut pty = pty;
+            pty.kill();
+            return Err(TerminalServiceError::Denied(format!(
+                "terminal wall budget refused: {refusal}"
+            )));
+        }
+        profile.budget_enforcement = Some(budget_guard.enforcement().clone());
         let start_time_ms = (self.probe)(pid).unwrap_or(0);
         let pty = Arc::new(Mutex::new(pty));
         let mut durable = TerminalDurableRow {
@@ -1580,6 +1665,7 @@ impl TerminalService {
             pty: Arc::clone(&pty),
             row: durable.clone(),
             state: Mutex::new(LiveState::Active),
+            _budget_guard: Some(budget_guard),
         });
         self.lock_live()
             .insert(terminal_id.to_string(), Arc::clone(&live));
@@ -2345,6 +2431,7 @@ fn validate_spawn_request(request: &TerminalSpawnRequest) -> Result<(), Terminal
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faktor_terminal::{LimitState, TreeBudgets};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -2691,6 +2778,346 @@ mod tests {
         let rebuilt = ExecutionProfile::parse(&views[0].execution_profile).expect("profile JSON");
         assert_eq!(rebuilt.cwd, profile.cwd);
         let _ = service.kill(&sid, view.terminal_id.as_str(), "profile cleanup");
+    }
+
+    /// A service over `manager` whose authority carries `policy`.
+    fn service_with_policy(
+        manager: &Arc<SessionManager>,
+        policy: TerminalAuthorityPolicy,
+    ) -> Arc<TerminalService> {
+        let (probe, _map) = recording_probe();
+        TerminalService::with_execution_authority(
+            manager.clone(),
+            probe,
+            Arc::new(SessionExecutionAuthority::with_policy(
+                manager.clone(),
+                policy,
+            )),
+        )
+    }
+
+    #[test]
+    fn budget_enforcement_is_persisted_effective_vs_requested_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("candidate");
+        std::fs::create_dir_all(&root).unwrap();
+        let (manager, sid) = manager_at(dir.path(), &root, "budget-profile");
+        let service = service_with_policy(&manager, TerminalAuthorityPolicy::default());
+        let Some(creation) = spawn_or_skip(&service, &sid, &spawn_request("/bin/sleep", &["30"]))
+        else {
+            return;
+        };
+        let view = &creation.view;
+        let profile = ExecutionProfile::parse(&view.execution_profile).expect("profile JSON");
+
+        // The REQUEST is exactly the policy's budgets; the EFFECTIVE report
+        // is a separate, per-limit statement.
+        assert_eq!(profile.budgets, TerminalBudgets::default());
+        assert!(!profile.strict_budgets);
+        let enforcement = profile
+            .budget_enforcement
+            .clone()
+            .expect("the durable row records the effective enforcement");
+        assert_eq!(enforcement.wall, LimitState::Enforced, "{enforcement:?}");
+        for (name, state) in [
+            ("cpu", enforcement.cpu),
+            ("memory", enforcement.memory),
+            ("processes", enforcement.processes),
+        ] {
+            assert_ne!(
+                state,
+                LimitState::NotRequested,
+                "{name} was requested and must be reported as a real state: {enforcement:?}"
+            );
+        }
+        assert!(
+            view.execution_profile.contains("budgetEnforcement"),
+            "{}",
+            view.execution_profile
+        );
+
+        // The durable rows carry the byte-identical profile.
+        let handle = manager
+            .get_session(SessionId::new(sid.parse().unwrap()))
+            .unwrap()
+            .unwrap();
+        for record in handle.ledger_terminal_rows(None).unwrap() {
+            assert_eq!(record.row.execution_profile, view.execution_profile);
+        }
+
+        // Reopen: a fresh service over the same durable store projects the
+        // SAME requested + effective record (a durable row fact, never
+        // daemon memory).
+        let restarted = TerminalService::detached(manager.clone(), Arc::new(|_pid: u32| None));
+        let views = restarted.list(&sid).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].execution_profile, view.execution_profile);
+        let rebuilt = ExecutionProfile::parse(&views[0].execution_profile).expect("profile JSON");
+        assert_eq!(rebuilt.budgets, profile.budgets);
+        assert_eq!(rebuilt.budget_enforcement, profile.budget_enforcement);
+        let _ = service.kill(&sid, view.terminal_id.as_str(), "budget cleanup");
+    }
+
+    #[test]
+    fn legacy_profile_json_parses_with_no_effective_budget_claim() {
+        // A row written before enforcement existed has neither the strictness
+        // flag nor an effective report. It must parse (the profile is
+        // evidence) and must NOT fabricate an enforcement claim.
+        let legacy = r#"{"sessionId":1,"taskId":1,"workspaceId":1,"agentId":null,
+            "candidateRoot":"/tmp","cwd":"/tmp","capabilities":"*",
+            "filesystem":"workspace","network":"none",
+            "budgets":{"cpuMillis":1000,"memoryBytes":1024,"maxProcesses":2,"wallTimeMs":3000},
+            "envNames":[],"externalCwdGranted":false}"#;
+        let profile = ExecutionProfile::parse(legacy).expect("legacy profile must parse");
+        assert!(profile.budget_enforcement.is_none());
+        assert!(!profile.strict_budgets);
+        assert_eq!(profile.budgets.wall_time_ms, 3000);
+        assert_eq!(profile.budgets.max_processes, 2);
+    }
+
+    #[test]
+    fn disabled_budgets_are_parity_not_requested_and_never_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("candidate");
+        std::fs::create_dir_all(&root).unwrap();
+        let (manager, sid) = manager_at(dir.path(), &root, "budget-disabled");
+        // Even a STRICT profile with NO requested limit must spawn: there is
+        // nothing to enforce, so nothing can be unenforceable.
+        let policy = TerminalAuthorityPolicy {
+            budgets: TerminalBudgets::disabled(),
+            strict_budgets: true,
+            ..TerminalAuthorityPolicy::default()
+        };
+        let service = service_with_policy(&manager, policy);
+        let Some(creation) = spawn_or_skip(&service, &sid, &spawn_request("/bin/sleep", &["30"]))
+        else {
+            return;
+        };
+        let profile = ExecutionProfile::parse(&creation.view.execution_profile).expect("profile");
+        assert_eq!(profile.budgets, TerminalBudgets::disabled());
+        assert!(profile.strict_budgets);
+        assert_eq!(
+            profile.budget_enforcement,
+            Some(BudgetEnforcement::not_requested()),
+            "a disabled budget is NotRequested, never silently 'unlimited'"
+        );
+        // The lifecycle is exactly the pre-budget lifecycle.
+        let handle = manager
+            .get_session(SessionId::new(sid.parse().unwrap()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            terminal_kinds(&handle),
+            vec![TerminalEventKind::Created, TerminalEventKind::Running]
+        );
+        assert!(service
+            .kill(&sid, creation.handle.terminal_id(), "disabled cleanup")
+            .unwrap());
+        assert_eq!(
+            terminal_kinds(&handle),
+            vec![
+                TerminalEventKind::Created,
+                TerminalEventKind::Running,
+                TerminalEventKind::Killed
+            ]
+        );
+    }
+
+    #[test]
+    fn strict_profile_refuses_typed_when_the_platform_cannot_enforce() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("candidate");
+        std::fs::create_dir_all(&root).unwrap();
+        let (manager, sid) = manager_at(dir.path(), &root, "budget-strict-refusal");
+        let policy = TerminalAuthorityPolicy {
+            strict_budgets: true,
+            budget_platform: BudgetPlatform::all_unenforceable(),
+            ..TerminalAuthorityPolicy::default()
+        };
+
+        // Authority level: the pre-spawn gate is a typed denial naming the
+        // limits, and it happens before any PTY exists.
+        let authority = SessionExecutionAuthority::with_policy(manager.clone(), policy.clone());
+        let principal = principal_of(&manager, &sid);
+        match authority.authorize_terminal_spawn(
+            &principal,
+            &sid,
+            &spawn_request("/bin/sleep", &["30"]),
+        ) {
+            Err(ExecutionDenial::BudgetUnavailable { resource, reason }) => {
+                assert!(resource.contains("cpu"), "{resource}");
+                assert!(resource.contains("memory"), "{resource}");
+                assert!(resource.contains("processes"), "{resource}");
+                assert!(reason.contains("strict"), "{reason}");
+            }
+            other => panic!("a strict unsupported budget must be denied: {other:?}"),
+        }
+
+        // Service level: typed refusal, no live row and NOTHING journaled.
+        let service = service_with_policy(&manager, policy);
+        match service.spawn(&sid, &spawn_request("/bin/sleep", &["30"])) {
+            Err(TerminalServiceError::Denied(message)) => {
+                assert!(
+                    message.contains("cpu") || message.contains("memory"),
+                    "{message}"
+                );
+            }
+            other => panic!("the strict spawn must be refused typed: {:?}", other.err()),
+        }
+        assert_eq!(service.live_rows(), 0);
+        let handle = manager
+            .get_session(SessionId::new(sid.parse().unwrap()))
+            .unwrap()
+            .unwrap();
+        assert!(
+            handle.ledger_terminal_rows(None).unwrap().is_empty(),
+            "a refused strict budget journals nothing"
+        );
+    }
+
+    #[test]
+    fn non_strict_unsupported_limits_spawn_and_record_the_typed_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("candidate");
+        std::fs::create_dir_all(&root).unwrap();
+        let (manager, sid) = manager_at(dir.path(), &root, "budget-unenforceable");
+        let policy = TerminalAuthorityPolicy {
+            strict_budgets: false,
+            budget_platform: BudgetPlatform::all_unenforceable(),
+            ..TerminalAuthorityPolicy::default()
+        };
+        let service = service_with_policy(&manager, policy);
+        let Some(creation) = spawn_or_skip(&service, &sid, &spawn_request("/bin/sleep", &["30"]))
+        else {
+            return;
+        };
+        let profile = ExecutionProfile::parse(&creation.view.execution_profile).expect("profile");
+        let enforcement = profile.budget_enforcement.expect("effective report");
+        // Requested limits are never reported as NotRequested (that would be
+        // a lie) and the wall deadline is real everywhere we can kill a tree.
+        assert_ne!(enforcement.cpu, LimitState::NotRequested);
+        assert_ne!(enforcement.memory, LimitState::NotRequested);
+        assert_ne!(enforcement.processes, LimitState::NotRequested);
+        assert_eq!(enforcement.wall, LimitState::Enforced);
+        assert!(
+            !enforcement.details.is_empty(),
+            "an unsupported/degraded limit carries its typed reason: {enforcement:?}"
+        );
+        assert!(!profile.strict_budgets);
+        let _ = service.kill(&sid, creation.handle.terminal_id(), "cleanup");
+    }
+
+    #[test]
+    fn wall_deadline_kills_the_tree_through_the_authority_and_journals_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("candidate");
+        std::fs::create_dir_all(&root).unwrap();
+        let (manager, sid) = manager_at(dir.path(), &root, "budget-wall");
+        // Only the wall limit is requested (and enforced everywhere), so a
+        // STRICT profile is satisfiable and the deadline is the whole story.
+        let policy = TerminalAuthorityPolicy {
+            budgets: TerminalBudgets {
+                wall_time_ms: 300,
+                ..TerminalBudgets::disabled()
+            },
+            strict_budgets: true,
+            ..TerminalAuthorityPolicy::default()
+        };
+        let service = service_with_policy(&manager, policy);
+        // A LEADER WITH DESCENDANTS: the deadline must take the whole
+        // guardian-owned tree, not just the direct child.
+        let Some(creation) = spawn_or_skip(
+            &service,
+            &sid,
+            &spawn_request("/bin/sh", &["-c", "sleep 30 & sleep 30 & wait"]),
+        ) else {
+            return;
+        };
+        let terminal_id = creation.handle.terminal_id().to_string();
+        let leader_pid = creation.view.pid;
+        let profile = ExecutionProfile::parse(&creation.view.execution_profile).expect("profile");
+        assert_eq!(
+            profile.budget_enforcement.expect("report").wall,
+            LimitState::Enforced
+        );
+        let handle = manager
+            .get_session(SessionId::new(sid.parse().unwrap()))
+            .unwrap()
+            .unwrap();
+
+        // The watchdog kills the WHOLE guardian-owned tree at the deadline:
+        // the row transitions to killed exactly once, with the reason.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let rows = service.list(&sid).unwrap();
+            if rows[0].state_tag() == "killed" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the wall deadline never killed the terminal: {rows:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!creation.handle.is_alive());
+        let rows = service.list(&sid).unwrap();
+        assert!(rows[0].detail.contains("wall"), "{}", rows[0].detail);
+        assert_eq!(
+            terminal_kinds(&handle),
+            vec![
+                TerminalEventKind::Created,
+                TerminalEventKind::Running,
+                TerminalEventKind::Killed
+            ],
+            "exactly one kill transition for the wall deadline"
+        );
+        // No orphans: the whole process group is gone.
+        let orphan_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while faktor_pty::guardian::group_exists(leader_pid)
+            && std::time::Instant::now() < orphan_deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !faktor_pty::guardian::group_exists(leader_pid),
+            "the wall deadline must leave no orphan in the process group of pid {leader_pid}"
+        );
+        // Idempotent: the deadline cannot kill twice.
+        assert!(!service.kill(&sid, &terminal_id, "late kill").unwrap());
+        assert_eq!(terminal_kinds(&handle).len(), 3);
+    }
+
+    #[test]
+    fn a_finished_terminal_is_never_killed_late_by_its_cancelled_wall() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("candidate");
+        std::fs::create_dir_all(&root).unwrap();
+        let (manager, sid) = manager_at(dir.path(), &root, "budget-wall-cancel");
+        let policy = TerminalAuthorityPolicy {
+            budgets: TerminalBudgets {
+                wall_time_ms: 400,
+                ..TreeBudgets::disabled()
+            },
+            ..TerminalAuthorityPolicy::default()
+        };
+        let service = service_with_policy(&manager, policy);
+        let Some(creation) = spawn_or_skip(&service, &sid, &spawn_request("/bin/sleep", &["30"]))
+        else {
+            return;
+        };
+        let terminal_id = creation.handle.terminal_id().to_string();
+        // End the terminal well before the deadline: the live row (and its
+        // armed watchdog) is gone, so the deadline must not journal a second
+        // transition (or signal anything) later.
+        assert!(service.kill(&sid, &terminal_id, "early kill").unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        let handle = manager
+            .get_session(SessionId::new(sid.parse().unwrap()))
+            .unwrap()
+            .unwrap();
+        let rows = handle.ledger_terminal_rows(None).unwrap();
+        assert_eq!(rows.len(), 3, "no late wall transition: {rows:?}");
+        assert_eq!(rows[2].detail, "early kill");
     }
 
     #[test]

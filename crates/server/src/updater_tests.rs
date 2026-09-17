@@ -12,7 +12,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use faktor_cloud::{Action, ControlPlane, ManualClock, MemoryControlPlaneStore, Role};
 use faktor_updater::{
     Artifact, Channel, Compatibility, MemoryUpdaterStore, SchemaRange, TrustedKey, TrustedKeys,
-    UpdateError, UpdateManifest, Updater, UpdaterConfig, VersionRange,
+    UpdateError, UpdateManifest, UpdateOpKind, UpdateOpStatus, Updater, UpdaterConfig,
+    VersionRange,
 };
 
 use super::tests::test_deps;
@@ -99,6 +100,16 @@ fn range(min: &str, max: &str) -> VersionRange {
     VersionRange::from_parts(min, max).unwrap()
 }
 
+/// The signed anti-rollback generation of a test release: monotonic in the
+/// version (major*1e6 + minor*1e3 + patch), mirroring the lifecycle tests.
+fn generation_of(version: &str) -> u64 {
+    let mut parts = version.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    let patch = parts.next().unwrap_or(0);
+    major * 1_000_000 + minor * 1_000 + patch
+}
+
 /// One signed manifest + the URL it points at (already served by the
 /// fetcher) and its digest.
 fn signed_manifest(
@@ -117,6 +128,7 @@ fn signed_manifest(
         channel: Channel::Stable,
         version: version.to_string(),
         commit: "a".repeat(40),
+        release_generation: Some(generation_of(version)),
         artifacts: vec![Artifact {
             name,
             os: OS.into(),
@@ -178,6 +190,7 @@ async fn updater_harness() -> UpdaterHarness {
         host_os: OS.into(),
         host_arch: ARCH.into(),
         local_version: "0.1.0".into(),
+        allow_legacy_manifests_once: false,
     };
     let updater = Arc::new(
         Updater::with_default_probe(config, Arc::new(MemoryUpdaterStore::new()), fetcher.clone())
@@ -325,6 +338,7 @@ async fn updater_enabled_without_a_control_plane_refuses_with_cloud_disabled() {
                 host_os: OS.into(),
                 host_arch: ARCH.into(),
                 local_version: "0.1.0".into(),
+                allow_legacy_manifests_once: false,
             },
             Arc::new(MemoryUpdaterStore::new()),
             fetcher,
@@ -796,4 +810,268 @@ async fn an_apply_probe_failure_rolls_back_over_http_and_rollback_is_admin_gated
     let pointer = host._updater.layout().read_pointer().unwrap().unwrap();
     assert_eq!(pointer.digest, v1_digest);
     assert_eq!(pointer.version, "0.1.0");
+}
+
+/// Stage + apply one release over the real routes and return its digest.
+async fn install_version(
+    host: &UpdaterHarness,
+    client: &reqwest::Client,
+    version: &str,
+    payload: &[u8],
+    key: &SigningKey,
+) -> String {
+    let base = format!("http://{}", host.handle.addr);
+    let (manifest, digest) = signed_manifest(key, &host.fetcher, version, payload, |_| {});
+    for (path, key_id, body) in [
+        (
+            "/native/updater/stage",
+            format!("k-stage-{version}"),
+            serde_json::json!({ "manifest": manifest }),
+        ),
+        (
+            "/native/updater/apply",
+            format!("k-apply-{version}"),
+            serde_json::json!({ "confirm": true }),
+        ),
+    ] {
+        let resp = post(
+            client,
+            &base,
+            path,
+            &host.daemon_token,
+            &host.owner_token,
+            Some(&key_id),
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "{path}");
+    }
+    digest
+}
+
+#[tokio::test]
+async fn an_older_signed_manifest_is_refused_typed_over_http_and_never_stages() {
+    let host = updater_harness().await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", host.handle.addr);
+    let key = keypair();
+
+    // Install generation 2000 (v2).
+    let v2_digest = install_version(&host, &client, "2.0.0", b"v2", &key).await;
+    let status: serde_json::Value = client
+        .get(url(&base, "/native/updater/status"))
+        .bearer_auth(&host.daemon_token)
+        .header("x-faktor-control-token", &host.owner_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["status"]["high_water"]["generation"], 2_000_000);
+
+    // Replaying the older signed generation 1000 (v1) is refused by BOTH
+    // check and stage with the typed rollback refusal naming both sides.
+    let (v1, v1_digest) = signed_manifest(&key, &host.fetcher, "1.0.0", b"v1", |m| {
+        m.release_generation = Some(1_000_000);
+    });
+    for (path, key_id, body) in [
+        (
+            "/native/updater/check",
+            None,
+            serde_json::json!({ "manifest": v1 }),
+        ),
+        (
+            "/native/updater/stage",
+            Some("k-old-stage"),
+            serde_json::json!({ "manifest": v1 }),
+        ),
+    ] {
+        let resp = post(
+            &client,
+            &base,
+            path,
+            &host.daemon_token,
+            &host.owner_token,
+            key_id,
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), 409, "{path}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "rollback_refused", "{path}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("1000000"), "{message}");
+        assert!(message.contains("2000000"), "{message}");
+    }
+    // No v1 artifact was published and the install still points at v2.
+    assert!(!host
+        ._updater
+        .layout()
+        .artifact_path("faktor-cli-1.0.0-darwin-arm64.tar.gz", &v1_digest)
+        .exists());
+    assert_eq!(
+        host._updater
+            .layout()
+            .read_pointer()
+            .unwrap()
+            .unwrap()
+            .digest,
+        v2_digest
+    );
+    // The refusal is durable evidence: a failed check row exists, no stage
+    // row was recorded for it.
+    let operations = host._updater.store().list(64).unwrap();
+    assert!(operations
+        .iter()
+        .any(|op| op.kind == UpdateOpKind::Check && op.status == UpdateOpStatus::Failed));
+    assert!(!operations
+        .iter()
+        .any(|op| op.kind == UpdateOpKind::Stage && op.after_version.as_deref() == Some("1.0.0")));
+}
+
+#[tokio::test]
+async fn the_authorized_downgrade_is_admin_gated_audited_and_resets_the_floor() {
+    let host = updater_harness().await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", host.handle.addr);
+    let key = keypair();
+
+    // Install generation 2000 (v2).
+    let v2_digest = install_version(&host, &client, "2.0.0", b"v2", &key).await;
+    // The older target carries its own (lower) signed generation.
+    let (v1, v1_digest) = signed_manifest(&key, &host.fetcher, "1.0.0", b"v1", |m| {
+        m.release_generation = Some(1_000_000);
+    });
+
+    // A member can never bypass the floor.
+    let resp = post(
+        &client,
+        &base,
+        "/native/updater/downgrade",
+        &host.daemon_token,
+        &host.member_token,
+        Some("k-dg-member"),
+        serde_json::json!({ "confirm": true, "manifest": v1 }),
+    )
+    .await;
+    assert_eq!(resp.status(), 403);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "permission_denied");
+
+    // Even the owner needs explicit confirmation.
+    let resp = post(
+        &client,
+        &base,
+        "/native/updater/downgrade",
+        &host.daemon_token,
+        &host.owner_token,
+        Some("k-dg-noconfirm"),
+        serde_json::json!({ "confirm": false, "manifest": v1 }),
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "confirmation_required");
+
+    // The authorized downgrade succeeds and swaps the pointer back.
+    let resp = post(
+        &client,
+        &base,
+        "/native/updater/downgrade",
+        &host.daemon_token,
+        &host.owner_token,
+        Some("k-dg-owner"),
+        serde_json::json!({ "confirm": true, "manifest": v1 }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["apply"]["result"], "applied");
+    assert_eq!(body["apply"]["digest"], v1_digest);
+    let pointer = host._updater.layout().read_pointer().unwrap().unwrap();
+    assert_eq!(pointer.digest, v1_digest);
+    assert_eq!(pointer.version, "1.0.0");
+
+    // The durable floor is reset to the downgraded generation.
+    let status: serde_json::Value = client
+        .get(url(&base, "/native/updater/status"))
+        .bearer_auth(&host.daemon_token)
+        .header("x-faktor-control-token", &host.owner_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["status"]["high_water"]["generation"], 1_000_000);
+
+    // The audit row: a durable `downgrade` operation with the authorizing
+    // actor, both generations' evidence and the signed generation.
+    let operations = host._updater.store().list(64).unwrap();
+    let audit = operations
+        .iter()
+        .find(|op| op.kind == UpdateOpKind::Downgrade && op.status == UpdateOpStatus::Applied)
+        .expect("the authorized downgrade must be recorded as a durable audit row");
+    assert!(
+        audit
+            .actor
+            .as_deref()
+            .is_some_and(|a| a.starts_with("user:")),
+        "{:?}",
+        audit.actor
+    );
+    assert_eq!(audit.release_generation, Some(1_000_000));
+    assert_eq!(audit.before_digest.as_deref(), Some(v2_digest.as_str()));
+    assert_eq!(audit.after_digest.as_deref(), Some(v1_digest.as_str()));
+    assert_eq!(audit.idempotency_key.as_deref(), Some("k-dg-owner"));
+
+    // Now a still-older manifest is refused against the NEW floor.
+    let (v0, _) = signed_manifest(&key, &host.fetcher, "0.9.0", b"v0", |m| {
+        m.release_generation = Some(900);
+    });
+    let resp = post(
+        &client,
+        &base,
+        "/native/updater/check",
+        &host.daemon_token,
+        &host.owner_token,
+        None,
+        serde_json::json!({ "manifest": v0 }),
+    )
+    .await;
+    assert_eq!(resp.status(), 409);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "rollback_refused");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("900"), "{message}");
+    assert!(message.contains("1000000"), "{message}");
+
+    // A legacy downgrade target (no signed generation) is refused outright:
+    // an unauthenticated generation can never bypass the floor.
+    let (legacy, _) = signed_manifest(&key, &host.fetcher, "0.1.0", b"legacy", |m| {
+        m.release_generation = None;
+    });
+    let resp = post(
+        &client,
+        &base,
+        "/native/updater/downgrade",
+        &host.daemon_token,
+        &host.owner_token,
+        Some("k-dg-legacy"),
+        serde_json::json!({ "confirm": true, "manifest": legacy }),
+    )
+    .await;
+    assert_eq!(resp.status(), 409);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "legacy_manifest_refused");
+    assert_eq!(
+        host._updater
+            .layout()
+            .read_pointer()
+            .unwrap()
+            .unwrap()
+            .digest,
+        v1_digest
+    );
 }

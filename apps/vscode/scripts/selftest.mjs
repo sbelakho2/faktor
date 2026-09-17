@@ -25,7 +25,15 @@ import * as wb from '../src/workspaceBinding.ts';
 import * as px from '../src/pixelAgents.ts';
 import * as cp from '../src/cockpit.ts';
 import composerPolicy from '../media/composer-state.js';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import vm from 'node:vm';
@@ -1424,7 +1432,13 @@ async function daemonTests() {
     delete process.env.FAKTOR_BIN;
     try {
       await assertRejects(
-        () => dm.startDaemon({ workspaceRoot: '/nonexistent-root-for-selftest' }),
+        () =>
+          dm.startDaemon({
+            workspaceRoot: '/nonexistent-root-for-selftest',
+            // Deterministic: an explicit install root with no layout can
+            // never accidentally resolve through a real local install.
+            installRoot: '/nonexistent-install-root-for-selftest',
+          }),
         (error) => error instanceof Error && /binary not found/.test(error.message),
         'missing binary',
       );
@@ -1433,6 +1447,46 @@ async function daemonTests() {
         process.env.FAKTOR_BIN = saved;
       }
     }
+  });
+
+  await test('daemon resolves through the bootstrap launcher when an install layout exists', () => {
+    const root = mkdtempSync(join(tmpdir(), 'faktor-bootstrap-selftest-'));
+    try {
+      // No layout yet: legacy resolution (null bootstrap).
+      assertEqual(dm.bootstrapBinary({ workspaceRoot: '/nonexistent', installRoot: root }), null);
+      assertEqual(dm.installRootFor({ workspaceRoot: '/nonexistent', dataDir: '/tmp/data' }), join('/tmp/data', 'install'));
+      assertEqual(
+        dm.installRootFor({ workspaceRoot: '/nonexistent', installRoot: root, dataDir: '/tmp/data' }),
+        root,
+      );
+      mkdirSync(join(root, 'versions'));
+      writeFileSync(join(root, 'launcher'), '#!/bin/sh\n');
+      assertEqual(dm.bootstrapBinary({ workspaceRoot: '/nonexistent', installRoot: root }), join(root, 'launcher'));
+      // The explicit operator override still wins over the bootstrap.
+      assertEqual(
+        dm.resolveExecutable({
+          workspaceRoot: '/nonexistent',
+          installRoot: root,
+          binaryPath: '/tmp/explicit-faktor-cli',
+        }),
+        '/tmp/explicit-faktor-cli',
+      );
+      // Without an override the bootstrap is what gets spawned.
+      assertEqual(
+        dm.resolveExecutable({ workspaceRoot: '/nonexistent', installRoot: root }),
+        join(root, 'launcher'),
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('health release digests parse from the version and absence stays null', () => {
+    const digest = 'a'.repeat(64);
+    assertEqual(dm.releaseDigestOf(`0.9.1+release.0.9.1-abcdef123456.${digest}`), digest);
+    assertEqual(dm.releaseDigestOf('0.9.1'), null);
+    assertEqual(dm.releaseDigestOf('0.9.1+release.0.9.1-abcdef123456'), null);
+    assertEqual(dm.releaseDigestOf(`0.9.1+release.x.${'A'.repeat(64)}`), null);
   });
 }
 

@@ -51,10 +51,13 @@ fn oidc_err(e: OidcError) -> ApiError {
         OidcError::RedirectMismatch => ("sso_redirect_mismatch", 401, false),
         OidcError::NonceMismatch => ("sso_nonce_mismatch", 401, false),
         OidcError::BadSignature | OidcError::UnknownKey(_) => ("sso_token_untrusted", 401, false),
-        OidcError::Expired | OidcError::NotYetValid => ("sso_token_expired", 401, false),
-        OidcError::WrongIssuer { .. } | OidcError::WrongAudience { .. } => {
-            ("sso_token_mismatch", 401, false)
+        OidcError::Expired | OidcError::NotYetValid | OidcError::TimestampOutOfRange { .. } => {
+            ("sso_token_expired", 401, false)
         }
+        OidcError::WrongIssuer { .. }
+        | OidcError::WrongAudience { .. }
+        | OidcError::WrongAzp { .. }
+        | OidcError::AlgorithmRefused { .. } => ("sso_token_mismatch", 401, false),
         OidcError::Malformed(_) => ("malformed", 400, false),
         OidcError::MembershipRefused(_) => ("sso_membership_refused", 403, false),
         OidcError::DiscoveryUnavailable(_) | OidcError::CodeExchangeRefused(_) => {

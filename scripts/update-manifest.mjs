@@ -27,8 +27,18 @@
 //     [--channel stable|beta|dev] [--version V]
 //     [--commit SHA] [--out PATH] [--url-base URL] [--sign-key KEY]
 //     [--key-id ID] [--expires-in-days N] [--compat PATH] [--compat-min V]
-//     [--signatures PATH] [--require-signed-artifacts]
+//     [--release-generation N] [--signatures PATH]
+//     [--require-signed-artifacts]
 //     [--require-signed] [--dry-run]
+//
+// `--release-generation N` (or FAKTOR_UPDATE_RELEASE_GENERATION) records the
+// signed ANTI-ROLLBACK counter `release_generation` in the manifest: fold it
+// into the signed payload and bump it monotonically with every release. A
+// manifest assembled WITHOUT it is a legacy manifest (generation 0) that the
+// updater only admits while the durable per-channel high-water mark is still
+// 0 and the operator explicitly enabled `[updater]
+// allow_legacy_manifests_once` — a loud note is printed, since that path is a
+// one-time migration escape hatch, not a release policy.
 //
 // `--signatures PATH` (produced additively by scripts/package-artifacts.sh as
 // target/certification/artifact-signatures.json) binds the OS-level signing
@@ -102,6 +112,25 @@ function flag(args, name) {
   return args.includes(name);
 }
 
+// `--release-generation N` / FAKTOR_UPDATE_RELEASE_GENERATION: null when
+// absent (legacy assembly), a plain non-negative integer otherwise.
+function parseReleaseGeneration(raw) {
+  const value = String(raw == null ? '' : raw).trim();
+  if (value === '') {
+    return null;
+  }
+  if (!/^[0-9]+$/.test(value)) {
+    console.error('[update-manifest] --release-generation must be a non-negative integer');
+    process.exit(2);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    console.error('[update-manifest] --release-generation exceeds the safe integer range');
+    process.exit(2);
+  }
+  return parsed;
+}
+
 function sha256Hex(buffer) {
   return createHash('sha256').update(buffer).digest('hex');
 }
@@ -112,6 +141,23 @@ function isDigest(value) {
 
 function isSha(value) {
   return typeof value === 'string' && /^[0-9a-f]{40}$/.test(value);
+}
+
+// The signed anti-rollback generation must be a non-negative safe integer
+// (the Rust side carries it as u64 folded into the canonical payload).
+function assertGeneration(manifest) {
+  if (manifest.release_generation === undefined) {
+    return;
+  }
+  if (
+    typeof manifest.release_generation !== 'number' ||
+    !Number.isSafeInteger(manifest.release_generation) ||
+    manifest.release_generation < 0
+  ) {
+    throw new Error(
+      `release_generation ${JSON.stringify(manifest.release_generation)} is not a non-negative safe integer`,
+    );
+  }
 }
 
 function headCommit() {
@@ -274,6 +320,10 @@ function versionOf(artifacts, explicit) {
 function artifactOsArch(entry, artifacts) {
   switch (entry.kind) {
     case 'daemon-bundle':
+    case 'daemon-binary':
+      // `daemon-binary` is the RAW binary the immutable release layout
+      // installs as versions/<release-id>/faktor; it is sorted before the
+      // bundle (no extension), so the updater stages exactly those bytes.
       return { os: artifacts.os || 'unknown', arch: artifacts.arch || 'unknown' };
     case 'vsix':
     case 'jetbrains-plugin':
@@ -498,6 +548,14 @@ function assembleManifest(options) {
     issued_at: issuedAt,
     expires_at: expiresAt,
   };
+  if (options.releaseGeneration !== null) {
+    manifest.release_generation = options.releaseGeneration;
+  } else {
+    console.error(
+      '[update-manifest] NOTE: no --release-generation/FAKTOR_UPDATE_RELEASE_GENERATION: this is a legacy manifest (generation 0). The updater admits it only while the durable high-water mark is 0 and [updater] allow_legacy_manifests_once is enabled — exactly once. Bump the generation with every release.',
+    );
+  }
+  assertGeneration(manifest);
   let certification = null;
   if (options.certificationOptionalPath) {
     const path = resolve(ROOT, options.certificationOptionalPath);
@@ -556,6 +614,9 @@ function modeAssemble(args) {
     expiresInDays: Number(argValue(args, '--expires-in-days', String(DEFAULT_MAX_VALIDITY_DAYS))),
     compatPath: argValue(args, '--compat', ''),
     compatMin: argValue(args, '--compat-min', ''),
+    releaseGeneration: parseReleaseGeneration(
+      argValue(args, '--release-generation', process.env.FAKTOR_UPDATE_RELEASE_GENERATION || ''),
+    ),
     signaturesPath: argValue(args, '--signatures', ''),
     requireSignedArtifacts: flag(args, '--require-signed-artifacts'),
     requireSigned: flag(args, '--require-signed'),
@@ -633,6 +694,12 @@ function modeVerify(args) {
     console.error(`[update-manifest] REFUSED: schema '${manifest.schema}' != '${SCHEMA}'`);
     process.exit(1);
   }
+  try {
+    assertGeneration(manifest);
+  } catch (error) {
+    console.error(`[update-manifest] REFUSED: ${error.message}`);
+    process.exit(1);
+  }
   const keysPath = argValue(args, '--keys', '');
   const allowlist = keysPath ? loadAllowlist(resolve(ROOT, keysPath)) : null;
   const verdict = verifyManifestSignature(manifest, allowlist);
@@ -670,6 +737,7 @@ function modeSelftest() {
         arch: 'arm64',
         artifacts: [
           { name: 'faktor-cli-9.9.9-darwin-arm64.tar.gz', kind: 'daemon-bundle', status: 'built', sha256: 'a'.repeat(64), size: 1234 },
+          { name: 'faktor-cli-9.9.9-darwin-arm64', kind: 'daemon-binary', status: 'built', sha256: 'c'.repeat(64), size: 999 },
           { name: 'faktor-9.9.9.vsix', kind: 'vsix', status: 'built', sha256: 'b'.repeat(64), size: 42 },
           { name: 'broken.tar.gz', kind: 'daemon-bundle', status: 'failed', sha256: null },
         ],
@@ -678,11 +746,26 @@ function modeSelftest() {
     const keyPath = join(dir, 'key.pem');
     writeFileSync(keyPath, privateKey.export({ type: 'pkcs8', format: 'pem' }));
     const outPath = join(dir, 'update-manifest.json');
-    const run = (extra, env = {}) =>
-      spawnSync(process.execPath, [SCRIPT_PATH, '--artifacts', artifactsPath, '--commit', commit, '--out', outPath, '--url-base', 'https://mirror.test/faktor', ...extra], {
-        encoding: 'utf8',
-        env: { ...process.env, FAKTOR_UPDATE_SIGNING_KEY: '', ...env },
-      });
+    // Hermetic runs: unless the row passes its own certification option,
+    // point the default `--certification` at a path that does not exist, so
+    // a STALE target/certification/manifest.json from an earlier commit can
+    // never leak foreign evidence into the selftest.
+    const run = (extra, env = {}) => {
+      const hasCertification = extra.some(
+        (arg) => arg === '--certification' || arg === '--certification-optional',
+      );
+      const certification = hasCertification
+        ? []
+        : ['--certification', join(dir, 'absent-certification.json')];
+      return spawnSync(
+        process.execPath,
+        [SCRIPT_PATH, '--artifacts', artifactsPath, '--commit', commit, '--out', outPath, '--url-base', 'https://mirror.test/faktor', ...certification, ...extra],
+        {
+          encoding: 'utf8',
+          env: { ...process.env, FAKTOR_UPDATE_SIGNING_KEY: '', ...env },
+        },
+      );
+    };
 
     // Unsigned assembly is explicit and refuses to claim otherwise.
     const unsignedRun = run([]);
@@ -694,9 +777,12 @@ function modeSelftest() {
       spawnSync(process.execPath, [SCRIPT_PATH, 'verify', '--manifest', outPath], { encoding: 'utf8' }).status !== 0,
     );
     expect('--require-signed refuses an unsigned manifest', run(['--require-signed']).status !== 0);
-    expect('artifact mapping covers bundle + extension, skips failed', unsigned.artifacts.length === 2
+    expect('artifact mapping covers bundle + raw binary + extension, skips failed', unsigned.artifacts.length === 3
       && unsigned.artifacts.some((a) => a.os === 'darwin' && a.arch === 'arm64')
-      && unsigned.artifacts.some((a) => a.os === 'any' && a.arch === 'any'));
+      && unsigned.artifacts.some((a) => a.os === 'any' && a.arch === 'any')
+      && unsigned.artifacts.some((a) => a.name === 'faktor-cli-9.9.9-darwin-arm64')
+      && unsigned.artifacts.findIndex((a) => a.name === 'faktor-cli-9.9.9-darwin-arm64') <
+        unsigned.artifacts.findIndex((a) => a.name === 'faktor-cli-9.9.9-darwin-arm64.tar.gz'));
 
     // Signed assembly verifies, and the signature covers every field.
     expect('signed assembly succeeds', run(['--sign-key', keyPath, '--key-id', 'selftest']).status === 0);
@@ -730,6 +816,58 @@ function modeSelftest() {
       canonicalJson(manifestWithoutSignature(reordered)) === canonicalJson(manifestWithoutSignature(signed)),
     );
 
+    // --- signed release generation (anti-rollback counter) ----------------
+    expect(
+      'a malformed --release-generation is a usage error',
+      run(['--release-generation', 'not-a-number']).status === 2,
+    );
+    expect(
+      'a negative --release-generation is a usage error',
+      run(['--release-generation', '-1']).status === 2,
+    );
+    expect(
+      'signed generation assembly succeeds',
+      run(['--release-generation', '42', '--sign-key', keyPath, '--key-id', 'selftest']).status === 0,
+    );
+    const genSigned = JSON.parse(readFileSync(outPath, 'utf8'));
+    expect('the signed manifest carries the generation', genSigned.release_generation === 42);
+    expect(
+      'the generation manifest verifies',
+      verifyManifestSignature(genSigned, { selftest: publicB64 }).ok,
+    );
+    expect(
+      'tampering the signed generation is refused',
+      !verifyManifestSignature({ ...genSigned, release_generation: 41 }, { selftest: publicB64 }).ok,
+    );
+    const legacyStripped = manifestWithoutSignature(genSigned);
+    delete legacyStripped.release_generation;
+    expect(
+      'stripping the generation back to legacy changes the signed payload',
+      canonicalJson(legacyStripped) !== canonicalJson(manifestWithoutSignature(genSigned)),
+    );
+    // The verify mode accepts the generation manifest and refuses a
+    // tampered/negative one.
+    expect(
+      'verify accepts the generation manifest',
+      spawnSync(process.execPath, [SCRIPT_PATH, 'verify', '--manifest', outPath], { encoding: 'utf8' }).status === 0,
+    );
+    const negativePath = join(dir, 'negative-generation-manifest.json');
+    writeFileSync(negativePath, JSON.stringify({ ...genSigned, release_generation: -3 }));
+    expect(
+      'verify refuses a negative generation',
+      spawnSync(process.execPath, [SCRIPT_PATH, 'verify', '--manifest', negativePath], { encoding: 'utf8' }).status !== 0,
+    );
+    // Legacy assembly (no generation) is explicit and loud.
+    const legacyPath = join(dir, 'legacy-manifest.json');
+    const legacyRun = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--artifacts', artifactsPath, '--commit', commit, '--out', legacyPath, '--url-base', 'https://mirror.test/faktor', '--certification', join(dir, 'absent-certification.json'), '--sign-key', keyPath, '--key-id', 'selftest'],
+      { encoding: 'utf8', env: { ...process.env, FAKTOR_UPDATE_SIGNING_KEY: '', FAKTOR_UPDATE_RELEASE_GENERATION: '' } },
+    );
+    expect('legacy assembly still succeeds but says so', legacyRun.status === 0 && String(legacyRun.stderr).includes('legacy manifest (generation 0)'));
+    const legacy = JSON.parse(readFileSync(legacyPath, 'utf8'));
+    expect('the legacy manifest carries no generation field', !('release_generation' in legacy));
+
     // --- OS-signature records (additive packaging step 4.5) ---------------
     const signaturesPath = join(dir, 'artifact-signatures.json');
     const signatureRecord = (name, sha256, signature) => ({ name, sha256, status: 'built', signature });
@@ -741,6 +879,9 @@ function modeSelftest() {
       artifacts: [
         signatureRecord('faktor-cli-9.9.9-darwin-arm64.tar.gz', 'a'.repeat(64), {
           tool: 'macos', status: 'signed', scope: 'inner:bin/faktor-cli', detail: 'codesigned + notarized', marker: null, codesigned: true, notarized: true, stapled: false, ...bundleOverrides,
+        }),
+        signatureRecord('faktor-cli-9.9.9-darwin-arm64', 'c'.repeat(64), {
+          tool: 'macos', status: 'signed', scope: 'file', detail: 'the raw release-layout binary is the signed inner binary', marker: null, codesigned: true, notarized: false, stapled: false,
         }),
         signatureRecord('faktor-9.9.9.vsix', 'b'.repeat(64), {
           tool: 'macos', status: 'not_applicable', scope: 'file', detail: 'extension zip', marker: null, codesigned: false, notarized: false, stapled: false, ...vsixOverrides,

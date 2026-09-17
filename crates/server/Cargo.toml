@@ -16,6 +16,9 @@ faktor-provider.workspace = true
 faktor-evidence = { path = "../evidence" }
 faktor-semantic.workspace = true
 faktor-pty.workspace = true
+# Terminal budget enforcement (cgroup v2 / Job Object limits / rlimits +
+# wall watchdog) for the durable terminal authority.
+faktor-terminal.workspace = true
 faktor-openai.workspace = true
 faktor-fs.workspace = true
 faktor-snapshot.workspace = true

@@ -10,7 +10,16 @@
 //! Two implementations mirror the control-plane store seam: an in-memory
 //! store (tests, ephemeral hosts) and a SQLite store (`update.db`, WAL,
 //! `user_version` migration ladder).
+//!
+//! The same file also owns the durable per-channel ANTI-ROLLBACK high-water
+//! mark ([`HighWaterMark`]). It is deliberately stored here — OUTSIDE the
+//! install root — so replacing an installed version, its `current` pointer
+//! or the content-addressed payload can never lower it. [`UpdaterStore::raise_high_water`]
+//! is monotonic (`max(existing, generation)`, with the legacy-consumed flag
+//! sticky); [`UpdaterStore::set_high_water`] is the single lowering path and
+//! exists only for an explicitly authorized, audited downgrade.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -19,6 +28,8 @@ use serde::{Deserialize, Serialize};
 
 /// Bound on one listing page.
 pub const MAX_LIST: usize = 200;
+/// Bound on one high-water channel key.
+pub const MAX_CHANNEL_BYTES: usize = 32;
 
 /// Typed store failures.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -64,7 +75,7 @@ impl std::fmt::Display for UpdateOpId {
     }
 }
 
-/// The four lifecycle steps.
+/// The four lifecycle steps, plus the explicitly authorized downgrade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateOpKind {
@@ -72,6 +83,9 @@ pub enum UpdateOpKind {
     Stage,
     Apply,
     Rollback,
+    /// The separately authorized (admin) downgrade below the anti-rollback
+    /// floor. Recorded as its own durable, audited row.
+    Downgrade,
 }
 
 impl UpdateOpKind {
@@ -80,6 +94,7 @@ impl UpdateOpKind {
         UpdateOpKind::Stage,
         UpdateOpKind::Apply,
         UpdateOpKind::Rollback,
+        UpdateOpKind::Downgrade,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -88,6 +103,7 @@ impl UpdateOpKind {
             UpdateOpKind::Stage => "stage",
             UpdateOpKind::Apply => "apply",
             UpdateOpKind::Rollback => "rollback",
+            UpdateOpKind::Downgrade => "downgrade",
         }
     }
 
@@ -167,6 +183,16 @@ pub struct UpdateOperation {
     /// restore the exact previous state on rollback).
     pub before_artifact: Option<String>,
     pub artifact: Option<String>,
+    /// The signed release generation the manifest that produced this
+    /// operation carried (`None` = legacy manifest / pre-anti-rollback row,
+    /// treated as generation 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_generation: Option<u64>,
+    /// The control-plane actor that explicitly authorized the operation
+    /// (only the authorized downgrade carries one today); bounded text, never
+    /// a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
     /// The verified signing identity, when a manifest was involved.
     pub identity: Option<String>,
     /// The certification level the manifest carried, when any.
@@ -191,6 +217,8 @@ impl UpdateOperation {
             after_digest: None,
             before_artifact: None,
             artifact: None,
+            release_generation: None,
+            actor: None,
             identity: None,
             certification_level: None,
             idempotency_key: None,
@@ -204,6 +232,20 @@ impl UpdateOperation {
     pub fn is_running(&self) -> bool {
         self.status == UpdateOpStatus::Running
     }
+}
+
+/// The durable per-channel anti-rollback high-water mark. Persisted in the
+/// updater store (whose file lives outside the install root and is never part
+/// of the installed payload): replacing a version, its pointer or its
+/// artifacts cannot lower it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HighWaterMark {
+    pub channel: String,
+    pub generation: u64,
+    /// Sticky once the one-time legacy-manifest allowance has been consumed.
+    pub legacy_consumed: bool,
+    pub updated_ms: i64,
 }
 
 /// The durable seam.
@@ -224,16 +266,63 @@ pub trait UpdaterStore: Send + Sync {
     ) -> Result<Option<UpdateOperation>, UpdateStoreError>;
     /// A staged operation recorded under one idempotency key.
     fn by_key(&self, key: &str) -> Result<Option<UpdateOperation>, UpdateStoreError>;
+    /// The durable anti-rollback high-water mark of one channel, if any.
+    fn high_water(&self, channel: &str) -> Result<Option<HighWaterMark>, UpdateStoreError>;
+    /// Monotonically RAISE the mark: `generation = max(existing, generation)`
+    /// and `legacy_consumed |= legacy_consumed`. Never lowers; returns the
+    /// durable row that resulted.
+    fn raise_high_water(
+        &self,
+        channel: &str,
+        generation: u64,
+        legacy_consumed: bool,
+        now_ms: i64,
+    ) -> Result<HighWaterMark, UpdateStoreError>;
+    /// Explicitly SET the mark to `generation` — the SINGLE lowering path,
+    /// used only by an authorized, audited downgrade (and only after it
+    /// succeeded). `legacy_consumed` stays sticky.
+    fn set_high_water(
+        &self,
+        channel: &str,
+        generation: u64,
+        now_ms: i64,
+    ) -> Result<HighWaterMark, UpdateStoreError>;
 }
 
 fn bounded(limit: usize) -> usize {
     limit.clamp(1, MAX_LIST)
 }
 
+fn validate_channel(channel: &str) -> Result<(), UpdateStoreError> {
+    if channel.is_empty() || channel.len() > MAX_CHANNEL_BYTES || !channel.is_ascii() {
+        return Err(UpdateStoreError::Malformed(format!(
+            "high-water channel must be 1..={MAX_CHANNEL_BYTES} ASCII bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn generation_to_i64(generation: u64) -> Result<i64, UpdateStoreError> {
+    i64::try_from(generation).map_err(|_| {
+        UpdateStoreError::Malformed(format!(
+            "high-water generation {generation} exceeds the durable integer range"
+        ))
+    })
+}
+
+fn row_generation(channel: &str, generation: i64) -> Result<u64, UpdateStoreError> {
+    u64::try_from(generation).map_err(|_| {
+        UpdateStoreError::Malformed(format!(
+            "high-water row for channel {channel:?} carries a negative generation; refusing to guess"
+        ))
+    })
+}
+
 /// In-memory store (tests + embedded hosts without a data dir).
 #[derive(Debug, Default)]
 pub struct MemoryUpdaterStore {
     rows: Mutex<Vec<UpdateOperation>>,
+    high_water: Mutex<BTreeMap<String, HighWaterMark>>,
 }
 
 impl MemoryUpdaterStore {
@@ -245,6 +334,14 @@ impl MemoryUpdaterStore {
         self.rows
             .lock()
             .map_err(|_| UpdateStoreError::Backend("update store lock is poisoned".into()))
+    }
+
+    fn lock_high_water(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, BTreeMap<String, HighWaterMark>>, UpdateStoreError> {
+        self.high_water
+            .lock()
+            .map_err(|_| UpdateStoreError::Backend("high-water lock is poisoned".into()))
     }
 }
 
@@ -337,6 +434,51 @@ impl UpdaterStore for MemoryUpdaterStore {
             })
             .cloned())
     }
+
+    fn high_water(&self, channel: &str) -> Result<Option<HighWaterMark>, UpdateStoreError> {
+        validate_channel(channel)?;
+        Ok(self.lock_high_water()?.get(channel).cloned())
+    }
+
+    fn raise_high_water(
+        &self,
+        channel: &str,
+        generation: u64,
+        legacy_consumed: bool,
+        now_ms: i64,
+    ) -> Result<HighWaterMark, UpdateStoreError> {
+        validate_channel(channel)?;
+        let mut marks = self.lock_high_water()?;
+        let mark = marks.entry(channel.to_string()).or_insert(HighWaterMark {
+            channel: channel.to_string(),
+            generation: 0,
+            legacy_consumed: false,
+            updated_ms: now_ms,
+        });
+        mark.generation = mark.generation.max(generation);
+        mark.legacy_consumed |= legacy_consumed;
+        mark.updated_ms = now_ms;
+        Ok(mark.clone())
+    }
+
+    fn set_high_water(
+        &self,
+        channel: &str,
+        generation: u64,
+        now_ms: i64,
+    ) -> Result<HighWaterMark, UpdateStoreError> {
+        validate_channel(channel)?;
+        let mut marks = self.lock_high_water()?;
+        let mark = marks.entry(channel.to_string()).or_insert(HighWaterMark {
+            channel: channel.to_string(),
+            generation: 0,
+            legacy_consumed: false,
+            updated_ms: now_ms,
+        });
+        mark.generation = generation;
+        mark.updated_ms = now_ms;
+        Ok(mark.clone())
+    }
 }
 
 /// SQLite-backed durable store (the daemon's `update.db`).
@@ -344,7 +486,8 @@ pub struct SqliteUpdaterStore {
     conn: Mutex<rusqlite::Connection>,
 }
 
-const UPDATER_MIGRATIONS: &[&str] = &["
+const UPDATER_MIGRATIONS: &[&str] = &[
+    "
 CREATE TABLE IF NOT EXISTS update_operation (
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -354,7 +497,19 @@ CREATE TABLE IF NOT EXISTS update_operation (
 );
 CREATE INDEX IF NOT EXISTS update_operation_status ON update_operation (status);
 CREATE INDEX IF NOT EXISTS update_operation_kind_status ON update_operation (kind, status);
-"];
+",
+    // v2 — the anti-rollback high-water marks (per channel, monotonic).
+    // The updater database lives OUTSIDE the install root, so this durable
+    // floor is never replaced together with an installed version.
+    "
+CREATE TABLE IF NOT EXISTS update_high_water (
+    channel TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL,
+    legacy_consumed INTEGER NOT NULL DEFAULT 0,
+    updated_ms INTEGER NOT NULL
+);
+",
+];
 
 impl SqliteUpdaterStore {
     /// Open (creating) the updater database at `path`.
@@ -568,6 +723,79 @@ impl UpdaterStore for SqliteUpdaterStore {
             .map_err(backend)?;
         payload.map(|p| decode(&p)).transpose()
     }
+
+    fn high_water(&self, channel: &str) -> Result<Option<HighWaterMark>, UpdateStoreError> {
+        validate_channel(channel)?;
+        let conn = self.lock()?;
+        let row: Option<(i64, i64, i64)> = conn
+            .query_row(
+                "SELECT generation, legacy_consumed, updated_ms
+                 FROM update_high_water WHERE channel = ?1",
+                rusqlite::params![channel],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(backend)?;
+        row.map(|(generation, legacy_consumed, updated_ms)| {
+            Ok(HighWaterMark {
+                channel: channel.to_string(),
+                generation: row_generation(channel, generation)?,
+                legacy_consumed: legacy_consumed != 0,
+                updated_ms,
+            })
+        })
+        .transpose()
+    }
+
+    fn raise_high_water(
+        &self,
+        channel: &str,
+        generation: u64,
+        legacy_consumed: bool,
+        now_ms: i64,
+    ) -> Result<HighWaterMark, UpdateStoreError> {
+        validate_channel(channel)?;
+        let generation = generation_to_i64(generation)?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO update_high_water (channel, generation, legacy_consumed, updated_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(channel) DO UPDATE SET
+                 generation = MAX(update_high_water.generation, excluded.generation),
+                 legacy_consumed = MAX(update_high_water.legacy_consumed, excluded.legacy_consumed),
+                 updated_ms = excluded.updated_ms",
+            rusqlite::params![channel, generation, legacy_consumed as i64, now_ms],
+        )
+        .map_err(backend)?;
+        drop(conn);
+        self.high_water(channel)?.ok_or_else(|| {
+            UpdateStoreError::Backend("high-water row vanished after the raise".into())
+        })
+    }
+
+    fn set_high_water(
+        &self,
+        channel: &str,
+        generation: u64,
+        now_ms: i64,
+    ) -> Result<HighWaterMark, UpdateStoreError> {
+        validate_channel(channel)?;
+        let generation = generation_to_i64(generation)?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO update_high_water (channel, generation, legacy_consumed, updated_ms)
+             VALUES (?1, ?2, 0, ?3)
+             ON CONFLICT(channel) DO UPDATE SET
+                 generation = excluded.generation,
+                 updated_ms = excluded.updated_ms",
+            rusqlite::params![channel, generation, now_ms],
+        )
+        .map_err(backend)?;
+        drop(conn);
+        self.high_water(channel)?.ok_or_else(|| {
+            UpdateStoreError::Backend("high-water row vanished after the set".into())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -632,6 +860,34 @@ mod tests {
         store.insert(&keyed).unwrap();
         assert_eq!(store.by_key("k-1").unwrap(), Some(keyed));
         assert_eq!(store.by_key("missing").unwrap(), None);
+
+        // Anti-rollback high-water marks: absent until admitted, monotonic on
+        // raise, sticky on the legacy flag, and the explicit set is the only
+        // lowering path.
+        assert_eq!(store.high_water("stable").unwrap(), None);
+        let raised = store.raise_high_water("stable", 5, false, 100).unwrap();
+        assert_eq!(raised.generation, 5);
+        assert!(!raised.legacy_consumed);
+        let held = store.raise_high_water("stable", 3, true, 101).unwrap();
+        assert_eq!(held.generation, 5, "raise must never lower the mark");
+        assert!(held.legacy_consumed, "the legacy flag is sticky");
+        let lowered = store.set_high_water("stable", 2, 102).unwrap();
+        assert_eq!(
+            lowered.generation, 2,
+            "the explicit set is the lowering path"
+        );
+        assert!(
+            lowered.legacy_consumed,
+            "an explicit downgrade never revives the legacy allowance"
+        );
+        assert_eq!(store.high_water("beta").unwrap(), None);
+        assert!(store.high_water("").is_err());
+        assert!(
+            store
+                .high_water(&"x".repeat(MAX_CHANNEL_BYTES + 1))
+                .is_err(),
+            "an oversized channel key is a typed refusal"
+        );
     }
 
     #[test]
@@ -654,6 +910,12 @@ mod tests {
         let running = reopened.running().unwrap();
         assert_eq!(running.len(), 1);
         assert_eq!(running[0].kind, UpdateOpKind::Rollback);
+        // The durable floor survives the reopen: `raise` left it at 5 even
+        // though a later `set` lowered it to 2, and the legacy flag is
+        // sticky across connections.
+        let mark = reopened.high_water("stable").unwrap().unwrap();
+        assert_eq!(mark.generation, 2);
+        assert!(mark.legacy_consumed);
     }
 
     #[test]
