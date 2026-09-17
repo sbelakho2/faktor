@@ -31,11 +31,12 @@ use tokio::io::AsyncWriteExt as _;
 
 use crate::channel::Channel;
 use crate::compat::{self, CompatibilityReport, RunningComponents};
-use crate::error::UpdateError;
+use crate::error::{ManifestRefusal, UpdateError};
 use crate::install::{DigestProbe, HealthProbe, InstallLayout, InstallPointer};
 use crate::keys::TrustedKeys;
-use crate::manifest::{self, Artifact};
-use crate::store::{UpdateOpKind, UpdateOpStatus, UpdateOperation, UpdaterStore};
+use crate::manifest::{self, Artifact, UpdateManifest};
+use crate::release::release_id_for;
+use crate::store::{HighWaterMark, UpdateOpKind, UpdateOpStatus, UpdateOperation, UpdaterStore};
 use crate::transport::ArtifactFetcher;
 
 /// The native protocol schema version this runtime speaks (the `schema`
@@ -77,6 +78,13 @@ pub struct UpdaterConfig {
     /// applies it to the `cli` and `daemon` entries unless the caller
     /// overrides them.
     pub local_version: String,
+    /// The one-time legacy-manifest allowance (default `false`). When true,
+    /// a signed manifest WITHOUT `release_generation` (legacy, treated as
+    /// generation 0) is admissible while the durable high-water mark of its
+    /// channel is still 0; admitting one records and consumes the allowance
+    /// durably, so it can be used exactly once. Everything else about the
+    /// manifest (signature, expiry, channel pin, compatibility) is unchanged.
+    pub allow_legacy_manifests_once: bool,
 }
 
 /// The artifact summary rendered on the wire.
@@ -137,6 +145,8 @@ pub struct CheckOutcome {
     pub channel: String,
     pub commit: String,
     pub identity: String,
+    /// The signed anti-rollback generation of the manifest (0 = legacy).
+    pub release_generation: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub certification_level: Option<String>,
     pub artifact: ArtifactView,
@@ -153,6 +163,9 @@ pub struct StageOutcome {
     pub artifact: ArtifactView,
     pub digest: String,
     pub bytes: u64,
+    /// The signed anti-rollback generation of the staged manifest (0 =
+    /// legacy).
+    pub release_generation: u64,
     /// True when the same idempotency key replayed an already-staged
     /// operation instead of downloading again.
     pub idempotent: bool,
@@ -187,6 +200,81 @@ pub enum ApplyOutcome {
     },
 }
 
+/// The result of `stage_release`: the ordinary checked stage plus the
+/// immutable release materialization the bootstrap launcher authenticates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReleaseStageOutcome {
+    #[serde(flatten)]
+    pub stage: StageOutcome,
+    /// The immutable release id (`<version>-<digest[..12]>`).
+    pub release_id: String,
+    /// The materialized `versions/<release-id>/faktor` path.
+    pub binary: String,
+}
+
+/// The outcome of the release-aware activation state machine. `Activated`
+/// and `Applied` are deliberately distinct: only `Applied` means a process
+/// was OBSERVED running the activated digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum ReleaseOutcome {
+    /// The pointer was swapped and the filesystem probe passed, but no
+    /// supervised restart has been observed: the running process is still
+    /// the PREVIOUS release. Restart the daemon through the bootstrap
+    /// launcher and finalize with the digest it reports (or abort to
+    /// restore the previous pointer).
+    Activated {
+        op_id: String,
+        release_id: String,
+        version: String,
+        digest: String,
+        artifact: String,
+        restart_required: bool,
+    },
+    /// The restarted process was observed reporting the activated digest and
+    /// the health probe passed: final.
+    Applied {
+        op_id: String,
+        release_id: String,
+        version: String,
+        digest: String,
+        artifact: String,
+        running_digest: String,
+    },
+    /// A failure at activation, restart, digest verification, health or
+    /// finalize restored the exact previous pointer and (when a restarter
+    /// was wired) restarted the previous binary.
+    RolledBack {
+        op_id: String,
+        release_id: String,
+        version: String,
+        digest: String,
+        artifact: String,
+        restored_version: Option<String>,
+        restored_digest: Option<String>,
+        /// The digest the restarted previous process reported, when observed.
+        running_digest: Option<String>,
+        reason: String,
+    },
+}
+
+/// The supervised restart seam. A supervisor (the IDE daemon launcher, a
+/// service manager, a test harness) implements this: stop the daemon, start
+/// it again THROUGH the bootstrap launcher (so the pointer decides the
+/// binary), and return the release digest the new process reports (from its
+/// build report / health payload). The updater never finalizes an activation
+/// whose restart it cannot observe, so "activated" is never reported as
+/// "running".
+pub trait ReleaseRestarter: Send + Sync {
+    /// Restart the supervised process so `active` (the current pointer) is
+    /// what runs; return the release digest the restarted process reported.
+    fn restart(
+        &self,
+        layout: &InstallLayout,
+        active: &InstallPointer,
+    ) -> Result<String, UpdateError>;
+}
+
 /// What recovery did with one crash residue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
@@ -219,6 +307,10 @@ pub struct StatusView {
     pub operations: Vec<UpdateOperation>,
     /// True while a crash residue still needs `recover`/verification.
     pub recovery_required: bool,
+    /// The durable anti-rollback high-water mark of the configured channel,
+    /// when one has been recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub high_water: Option<HighWaterMark>,
 }
 
 /// One updater instance: config + durable store + checked transport +
@@ -229,6 +321,15 @@ pub struct Updater {
     store: Arc<dyn UpdaterStore>,
     fetcher: Arc<dyn ArtifactFetcher>,
     probe: Arc<dyn HealthProbe>,
+}
+
+/// The admission decision for one authenticated manifest: its signed
+/// generation and whether it is a legacy (generation-0) manifest admitted
+/// under the one-time allowance.
+#[derive(Debug, Clone, Copy)]
+struct Admission {
+    generation: u64,
+    legacy: bool,
 }
 
 impl Updater {
@@ -314,6 +415,99 @@ impl Updater {
             .ok_or(UpdateError::NothingStaged)
     }
 
+    /// Attach the immutable release id when `versions/<id>/faktor` is
+    /// materialized with EXACTLY this digest: the pointer then names the
+    /// bytes the bootstrap launcher authenticates and execs. Legacy layouts
+    /// (no materialized version directory) keep the legacy pointer shape
+    /// byte-identically.
+    fn with_launch_release(&self, pointer: InstallPointer) -> Result<InstallPointer, UpdateError> {
+        match self
+            .layout
+            .release_id_if_materialized(&pointer.version, &pointer.digest)
+        {
+            Some(release_id) => pointer.with_release_id(Some(release_id)),
+            None => Ok(pointer),
+        }
+    }
+
+    /// The durable anti-rollback policy for one ALREADY-AUTHENTICATED
+    /// manifest (signature, expiry and channel pin verified first):
+    ///
+    /// - an explicit signed `release_generation` is admissible when it is
+    ///   `>=` the durable high-water mark of its channel;
+    /// - a legacy manifest without the field is generation 0: admissible
+    ///   only while the mark is still 0 AND the operator enabled the
+    ///   one-time legacy allowance AND it was not consumed yet; otherwise a
+    ///   typed [`UpdateError::LegacyManifestRefused`];
+    /// - anything below the mark is a typed
+    ///   [`UpdateError::RollbackRefused`] naming both generations.
+    ///
+    /// This function only DECIDES; [`Updater::record_admission`] persists the
+    /// decision (record-first) before any activation step.
+    fn admit(&self, manifest: &UpdateManifest) -> Result<Admission, UpdateError> {
+        let channel = manifest.channel.to_string();
+        let floor = self.store.high_water(&channel)?;
+        let (high_water, legacy_consumed) = floor
+            .map(|mark| (mark.generation, mark.legacy_consumed))
+            .unwrap_or((0, false));
+        let generation = manifest.release_generation();
+        if manifest.is_legacy_generation() {
+            if high_water > 0 {
+                return Err(UpdateError::RollbackRefused {
+                    channel,
+                    high_water,
+                    offered: 0,
+                });
+            }
+            if !self.config.allow_legacy_manifests_once {
+                return Err(UpdateError::LegacyManifestRefused {
+                    channel,
+                    detail: "the manifest carries no signed release_generation and the one-time \
+                             legacy allowance is disabled (set [updater] \
+                             allow_legacy_manifests_once = true to admit it exactly once)"
+                        .into(),
+                });
+            }
+            if legacy_consumed {
+                return Err(UpdateError::LegacyManifestRefused {
+                    channel,
+                    detail: "the one-time legacy-manifest allowance was already consumed by an \
+                             earlier admission; refusing a second legacy manifest"
+                        .into(),
+                });
+            }
+        }
+        if generation < high_water {
+            return Err(UpdateError::RollbackRefused {
+                channel,
+                high_water,
+                offered: generation,
+            });
+        }
+        Ok(Admission {
+            generation,
+            legacy: manifest.is_legacy_generation(),
+        })
+    }
+
+    /// Persist one admission BEFORE the release is activated: the mark
+    /// becomes `max(high_water, generation)` (and the legacy allowance is
+    /// consumed), so a crash at any later point cannot lower it.
+    fn record_admission(
+        &self,
+        manifest: &UpdateManifest,
+        admission: Admission,
+        now_ms: i64,
+    ) -> Result<(), UpdateError> {
+        self.store.raise_high_water(
+            &manifest.channel.to_string(),
+            admission.generation,
+            admission.legacy,
+            now_ms,
+        )?;
+        Ok(())
+    }
+
     /// `GET status` data: pointer, staged op, recent operations.
     pub fn status(&self, now_ms: i64) -> Result<StatusView, UpdateError> {
         let installed = self.layout.read_pointer()?;
@@ -332,6 +526,7 @@ impl Updater {
             || operations
                 .iter()
                 .any(|op| op.status == UpdateOpStatus::Unverified);
+        let high_water = self.store.high_water(self.config.channel.as_str())?;
         let _ = now_ms;
         Ok(StatusView {
             channel: self.config.channel.to_string(),
@@ -350,6 +545,7 @@ impl Updater {
             staged,
             operations,
             recovery_required,
+            high_water,
         })
     }
 
@@ -382,8 +578,21 @@ impl Updater {
         );
         op.channel = Some(manifest.channel.to_string());
         op.after_version = Some(manifest.version.clone());
+        op.release_generation = manifest.release_generation;
         op.identity = Some(verified.identity().to_string());
         op.certification_level = manifest.certification.as_ref().map(|c| c.level.clone());
+
+        // Anti-rollback admission: an older signed manifest is refused with
+        // a typed `RollbackRefused` naming both generations, and the refusal
+        // is durable evidence (a failed check row) never a silent skip.
+        let admission = match self.admit(manifest) {
+            Ok(admission) => admission,
+            Err(e) => {
+                self.record_failed_check(&mut op, &e, now_ms)?;
+                return Err(e);
+            }
+        };
+        op.release_generation = Some(admission.generation);
 
         if report.refused {
             let detail = format!("incompatible: {report}");
@@ -431,6 +640,7 @@ impl Updater {
             channel: manifest.channel.to_string(),
             commit: manifest.commit.clone(),
             identity: verified.identity().to_string(),
+            release_generation: admission.generation,
             certification_level: manifest.certification.as_ref().map(|c| c.level.clone()),
             artifact: ArtifactView::from(artifact),
             compatible: true,
@@ -500,6 +710,13 @@ impl Updater {
             }
         }
 
+        // Anti-rollback admission, RECORD-FIRST: the durable high-water mark
+        // is raised to `max(mark, generation)` (and a legacy allowance, if
+        // this is one, is consumed) BEFORE the download starts, so a crash at
+        // any later point cannot lower the floor.
+        let admission = self.admit(manifest)?;
+        self.record_admission(manifest, admission, now_ms)?;
+
         let current = self.layout.read_pointer()?;
         let mut op = UpdateOperation::new(
             UpdateOpKind::Stage,
@@ -517,6 +734,7 @@ impl Updater {
         op.after_version = Some(manifest.version.clone());
         op.after_digest = Some(artifact.sha256.clone());
         op.artifact = Some(artifact.name.clone());
+        op.release_generation = Some(admission.generation);
         op.identity = Some(verified.identity().to_string());
         op.certification_level = manifest.certification.as_ref().map(|c| c.level.clone());
         op.idempotency_key = idempotency_key.map(str::to_string);
@@ -541,6 +759,7 @@ impl Updater {
                     artifact: ArtifactView::from(&artifact),
                     digest: artifact.sha256.clone(),
                     bytes,
+                    release_generation: admission.generation,
                     idempotent: false,
                 })
             }
@@ -570,6 +789,7 @@ impl Updater {
             },
             digest: op.after_digest.clone().unwrap_or_default(),
             bytes: 0,
+            release_generation: op.release_generation.unwrap_or(0),
             idempotent,
         }
     }
@@ -628,6 +848,27 @@ impl Updater {
     pub fn apply(&self, now_ms: i64) -> Result<ApplyOutcome, UpdateError> {
         self.ensure_no_running()?;
         let staged = self.latest_staged()?;
+        // Anti-rollback: the staged release must still be at or above the
+        // durable floor. Normally `stage` already raised the mark to exactly
+        // this generation; a mark that moved past it (a concurrent admission
+        // or a corrupt/rewritten staged row) refuses the swap.
+        let channel = staged
+            .channel
+            .clone()
+            .unwrap_or_else(|| self.config.channel.to_string());
+        let high_water = self
+            .store
+            .high_water(&channel)?
+            .map(|mark| mark.generation)
+            .unwrap_or(0);
+        let offered = staged.release_generation.unwrap_or(0);
+        if offered < high_water {
+            return Err(UpdateError::RollbackRefused {
+                channel,
+                high_water,
+                offered,
+            });
+        }
         // An already-applied staged artifact is not silently re-applied: the
         // operator asked for an update, and it is installed.
         if let Some(last) = self
@@ -653,6 +894,10 @@ impl Updater {
             staged.channel.as_deref().unwrap_or("stable"),
             now_ms,
         )?;
+        // A materialized immutable release is named by the pointer, so the
+        // bootstrap launcher (and every supervisor resolving through it)
+        // launches exactly these bytes.
+        let target = self.with_launch_release(target)?;
         // The staged artifact is re-hashed before the swap (deterministic FS
         // op verifying the expected resulting hash).
         self.layout.verify_installed(&target)?;
@@ -670,6 +915,7 @@ impl Updater {
         op.after_version = Some(target.version.clone());
         op.after_digest = Some(target.digest.clone());
         op.artifact = Some(target.artifact.clone());
+        op.release_generation = staged.release_generation;
         op.identity = staged.identity.clone();
         op.certification_level = staged.certification_level.clone();
         // Durable BEFORE the swap: a crash after this row exists is
@@ -710,6 +956,218 @@ impl Updater {
                 self.record_rollback(&current, &target, now_ms, &reason)?;
                 // The rollback restored the previous pointer; report it as
                 // an outcome (the install is consistent), with the reason.
+                Ok(ApplyOutcome::RolledBack {
+                    op_id: op.id.to_string(),
+                    version: target.version,
+                    digest: target.digest,
+                    artifact: target.artifact,
+                    reason,
+                })
+            }
+        }
+    }
+
+    /// The ONLY path below the durable anti-rollback high-water mark: an
+    /// explicitly authorized downgrade to an OLDER signed release. The
+    /// manifest is authenticated exactly like a normal update (signature,
+    /// validity window, channel pin, compatibility) and must carry an
+    /// explicit `release_generation` — a legacy manifest can never be a
+    /// downgrade target because its generation cannot be authenticated.
+    ///
+    /// Discipline:
+    ///
+    /// - the refusal edge exists only through this method (a normal
+    ///   `check`/`stage`/`apply` still honors the floor);
+    /// - the durable `downgrade` operation row (the audit row of the
+    ///   existing path: actor, before/after versions + digests, generation,
+    ///   idempotency correlation) is inserted BEFORE the download/swap;
+    /// - the high-water mark is reset to the downgraded generation ONLY
+    ///   AFTER the swap and its health probe both succeed, so a crash at any
+    ///   earlier point leaves the floor high (fail closed);
+    /// - a failed probe restores the previous pointer exactly and leaves the
+    ///   floor untouched.
+    pub async fn downgrade(
+        &self,
+        manifest_bytes: &[u8],
+        running: &RunningComponents,
+        idempotency_key: Option<&str>,
+        actor: Option<&str>,
+        now_ms: i64,
+    ) -> Result<ApplyOutcome, UpdateError> {
+        self.ensure_no_running()?;
+        let verified = manifest::verify_manifest(
+            manifest_bytes,
+            &self.config.keys,
+            self.config.channel,
+            now_ms,
+            self.config.clock_skew_ms,
+        )?;
+        let manifest = verified.manifest();
+        let channel = manifest.channel.to_string();
+        let Some(generation) = manifest.release_generation else {
+            return Err(UpdateError::LegacyManifestRefused {
+                channel,
+                detail: "an explicit downgrade requires a signed release_generation; a legacy \
+                         generation-0 manifest cannot be a downgrade target"
+                    .into(),
+            });
+        };
+        let actor = actor.map(|actor| {
+            actor
+                .chars()
+                .take(128)
+                .filter(|c| !c.is_control())
+                .collect::<String>()
+        });
+        let current = self.layout.read_pointer()?;
+        let mut op = UpdateOperation::new(
+            UpdateOpKind::Downgrade,
+            now_ms,
+            Some(format!(
+                "explicitly authorized downgrade to {} release generation {generation} signed by {}",
+                manifest.version,
+                verified.identity()
+            )),
+        );
+        op.channel = Some(channel.clone());
+        op.before_version = current.as_ref().map(|p| p.version.clone());
+        op.before_digest = current.as_ref().map(|p| p.digest.clone());
+        op.before_artifact = current.as_ref().map(|p| p.artifact.clone());
+        op.after_version = Some(manifest.version.clone());
+        op.identity = Some(verified.identity().to_string());
+        op.certification_level = manifest.certification.as_ref().map(|c| c.level.clone());
+        op.release_generation = Some(generation);
+        op.actor = actor.clone();
+        op.idempotency_key = idempotency_key.map(str::to_string);
+
+        let report = compat::check(&manifest.compatibility, running);
+        if report.refused {
+            let error = UpdateError::Incompatible(report);
+            op.status = UpdateOpStatus::Failed;
+            op.updated_ms = now_ms;
+            op.detail = Some(format!(
+                "{}; the authorized downgrade did not proceed",
+                error
+            ));
+            self.store.insert(&op)?;
+            return Err(error);
+        }
+        let artifact =
+            match manifest.artifact_for_host(&self.config.host_os, &self.config.host_arch) {
+                Some(artifact) => artifact.clone(),
+                None => {
+                    let error =
+                        UpdateError::Refused(crate::error::ManifestRefusal::NoArtifactForHost {
+                            os: self.config.host_os.clone(),
+                            arch: self.config.host_arch.clone(),
+                        });
+                    op.status = UpdateOpStatus::Failed;
+                    op.updated_ms = now_ms;
+                    op.detail = Some(error.to_string());
+                    self.store.insert(&op)?;
+                    return Err(error);
+                }
+            };
+        op.artifact = Some(artifact.name.clone());
+        op.after_digest = Some(artifact.sha256.clone());
+        if artifact
+            .size
+            .is_some_and(|size| size > self.config.max_artifact_bytes)
+        {
+            let error = UpdateError::ArtifactTooLarge {
+                artifact: artifact.name.clone(),
+                max_bytes: self.config.max_artifact_bytes,
+            };
+            op.status = UpdateOpStatus::Failed;
+            op.updated_ms = now_ms;
+            op.detail = Some(error.to_string());
+            self.store.insert(&op)?;
+            return Err(error);
+        }
+        if current
+            .as_ref()
+            .is_some_and(|pointer| pointer.digest == artifact.sha256)
+        {
+            return Err(UpdateError::Conflict(format!(
+                "the downgrade target {} ({}) is already installed",
+                manifest.version, artifact.sha256
+            )));
+        }
+
+        // Durable BEFORE any effect, carrying the actor + generations.
+        self.store.insert(&op)?;
+
+        if let Err(e) = self
+            .download_and_publish(&op.id.to_string(), &artifact)
+            .await
+        {
+            op.status = UpdateOpStatus::Failed;
+            op.updated_ms = now_ms;
+            op.detail = Some(e.to_string());
+            self.store.update(&op)?;
+            let _ = self.layout.clear_staging(op.id.as_str());
+            return Err(e);
+        }
+
+        let target = InstallPointer::new(
+            &artifact.name,
+            &artifact.sha256,
+            &manifest.version,
+            &channel,
+            now_ms,
+        )?;
+        // A materialized immutable release keeps its release identity in the
+        // pointer (the bootstrap launcher then runs exactly these bytes).
+        let target = self.with_launch_release(target)?;
+        self.layout.verify_installed(&target)?;
+        if let Err(e) = self.layout.write_pointer(&target) {
+            op.status = UpdateOpStatus::Failed;
+            op.updated_ms = now_ms;
+            op.detail = Some(format!("pointer swap failed: {e}"));
+            self.store.update(&op)?;
+            return Err(e);
+        }
+
+        match self.probe.probe(&self.layout, &target) {
+            Ok(()) => {
+                // The floor reset happens ONLY after the swap + probe
+                // succeeded: the single authorized lowering of the mark.
+                if let Err(e) = self.store.set_high_water(&channel, generation, now_ms) {
+                    op.status = UpdateOpStatus::Applied;
+                    op.updated_ms = now_ms;
+                    op.detail = Some(format!(
+                        "downgraded to {} ({}) but the high-water reset to generation \
+                         {generation} failed: {e}; the floor stays high (fail closed)",
+                        target.version, target.digest
+                    ));
+                    self.store.update(&op)?;
+                    return Err(e.into());
+                }
+                op.status = UpdateOpStatus::Applied;
+                op.updated_ms = now_ms;
+                op.detail = Some(format!(
+                    "downgraded to {} ({}); the high-water mark is reset to generation {generation}",
+                    target.version, target.digest
+                ));
+                self.store.update(&op)?;
+                Ok(ApplyOutcome::Applied {
+                    op_id: op.id.to_string(),
+                    version: target.version,
+                    digest: target.digest,
+                    artifact: target.artifact,
+                })
+            }
+            Err(probe_error) => {
+                let reason = probe_error.to_string();
+                let restored = self.restore_previous(&current, &reason);
+                op.status = UpdateOpStatus::RolledBack;
+                op.updated_ms = now_ms;
+                op.detail = Some(format!(
+                    "authorized downgrade failed its health probe: {reason}; {restored}; the \
+                     high-water mark is unchanged"
+                ));
+                self.store.update(&op)?;
+                self.record_rollback(&current, &target, now_ms, &reason)?;
                 Ok(ApplyOutcome::RolledBack {
                     op_id: op.id.to_string(),
                     version: target.version,
@@ -810,6 +1268,10 @@ impl Updater {
             last.channel.as_deref().unwrap_or("stable"),
             now_ms,
         )?;
+        // The rollback target keeps its immutable release identity when one
+        // is materialized: the bootstrap then restarts the EXACT previous
+        // release, not just a metadata pointer.
+        let target = self.with_launch_release(target)?;
         self.layout.verify_installed(&target)?;
 
         let mut op = UpdateOperation::new(
@@ -860,9 +1322,506 @@ impl Updater {
         }
     }
 
+    /// Stage one RELEASE-layout update: the ordinary checked stage PLUS the
+    /// immutable materialization `versions/<release-id>/{faktor,manifest}`
+    /// and the launch trust anchor. The pointer is NOT touched — activation
+    /// is a separate, recorded step. The stable bootstrap launcher is
+    /// installed from the running executable when absent (never replaced).
+    pub async fn stage_release(
+        &self,
+        manifest_bytes: &[u8],
+        running: &RunningComponents,
+        idempotency_key: Option<&str>,
+        now_ms: i64,
+    ) -> Result<ReleaseStageOutcome, UpdateError> {
+        let stage = self
+            .stage(manifest_bytes, running, idempotency_key, now_ms)
+            .await?;
+        let verified = manifest::verify_manifest(
+            manifest_bytes,
+            &self.config.keys,
+            self.config.channel,
+            now_ms,
+            self.config.clock_skew_ms,
+        )?;
+        let manifest = verified.manifest();
+        let artifact = manifest
+            .artifact_for_host(&self.config.host_os, &self.config.host_arch)
+            .ok_or_else(|| {
+                UpdateError::Refused(ManifestRefusal::NoArtifactForHost {
+                    os: self.config.host_os.clone(),
+                    arch: self.config.host_arch.clone(),
+                })
+            })?
+            .clone();
+        if artifact.sha256 != stage.digest {
+            return Err(UpdateError::Conflict(format!(
+                "the staged digest {} does not match the signed manifest digest {}",
+                stage.digest, artifact.sha256
+            )));
+        }
+        let release_id = release_id_for(&stage.version, &stage.digest);
+        crate::release::validate_release_id(&release_id)?;
+        // The trust anchor and the stable bootstrap exist BEFORE any pointer
+        // can name this release.
+        self.layout.write_trust(&self.config.keys)?;
+        if !self.layout.launcher_path().is_file() {
+            let current = std::env::current_exe().map_err(|e| {
+                UpdateError::Install(format!("bootstrap launcher source (current exe): {e}"))
+            })?;
+            self.layout.install_launcher(&current)?;
+        }
+        let binary = self.layout.materialize_release(
+            &release_id,
+            &artifact.name,
+            &stage.digest,
+            manifest_bytes,
+        )?;
+        Ok(ReleaseStageOutcome {
+            stage,
+            release_id,
+            binary: binary.display().to_string(),
+        })
+    }
+
+    /// Activate the staged release: record-first, atomic pointer swap, then
+    /// the release-aware verification branch:
+    ///
+    /// - WITH a [`ReleaseRestarter`]: restart through the pointer, require
+    ///   the NEW process to report the activated digest, run the health
+    ///   probe, finalize (`Applied`). A failure at ANY step restores the
+    ///   previous pointer, restarts the previous binary and records the
+    ///   rollback;
+    /// - WITHOUT one (explicit restart): the pointer swap plus a filesystem
+    ///   probe returns `Activated { restart_required: true }` and the apply
+    ///   row stays `Running` until [`Updater::finalize_release`] observes the
+    ///   restarted process's digest (or [`Updater::abort_release`] restores
+    ///   the previous release).
+    pub fn activate_release(
+        &self,
+        now_ms: i64,
+        restarter: Option<&dyn ReleaseRestarter>,
+    ) -> Result<ReleaseOutcome, UpdateError> {
+        self.ensure_no_running()?;
+        let staged = self.latest_staged()?;
+        // Anti-rollback: the staged release must still be at or above the
+        // durable floor (same rule as `apply`).
+        let channel = staged
+            .channel
+            .clone()
+            .unwrap_or_else(|| self.config.channel.to_string());
+        let high_water = self
+            .store
+            .high_water(&channel)?
+            .map(|mark| mark.generation)
+            .unwrap_or(0);
+        let offered = staged.release_generation.unwrap_or(0);
+        if offered < high_water {
+            return Err(UpdateError::RollbackRefused {
+                channel,
+                high_water,
+                offered,
+            });
+        }
+        if let Some(last) = self
+            .store
+            .latest(UpdateOpKind::Apply, UpdateOpStatus::Applied)?
+        {
+            if last.after_digest.is_some() && last.after_digest == staged.after_digest {
+                return Err(UpdateError::Conflict(format!(
+                    "the staged release {} ({}) is already applied",
+                    staged.after_version.as_deref().unwrap_or_default(),
+                    staged.after_digest.as_deref().unwrap_or_default()
+                )));
+            }
+        }
+        let version = staged.after_version.clone().unwrap_or_default();
+        let digest = staged
+            .after_digest
+            .clone()
+            .ok_or_else(|| UpdateError::Conflict("staged operation carries no digest".into()))?;
+        let artifact = staged
+            .artifact
+            .clone()
+            .ok_or_else(|| UpdateError::Conflict("staged operation carries no artifact".into()))?;
+        let release_id = release_id_for(&version, &digest);
+        crate::release::validate_release_id(&release_id)?;
+        let binary = self.layout.release_binary(&release_id);
+        if !binary.is_file() {
+            return Err(UpdateError::Conflict(format!(
+                "release {release_id} is not materialized under versions/; run stage_release first"
+            )));
+        }
+        // Re-authenticate the stored signed manifest and bind it to the
+        // staged operation: the pointer may only name what the operator key
+        // signed.
+        let manifest_path = self.layout.release_manifest(&release_id);
+        let manifest_bytes = std::fs::read(&manifest_path)
+            .map_err(|e| UpdateError::Install(format!("read {}: {e}", manifest_path.display())))?;
+        let signed = manifest::verify_manifest_at_launch(&manifest_bytes, &self.config.keys)?;
+        if signed.version != version {
+            return Err(UpdateError::Conflict(format!(
+                "the release manifest names version {} but the staged operation names {version}",
+                signed.version
+            )));
+        }
+        if !signed
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.sha256 == digest)
+        {
+            return Err(UpdateError::Conflict(format!(
+                "the staged digest {digest} does not appear in the signed release manifest"
+            )));
+        }
+        let target = InstallPointer::new(
+            &artifact,
+            &digest,
+            &version,
+            staged.channel.as_deref().unwrap_or("stable"),
+            now_ms,
+        )?
+        .with_release_id(Some(release_id.clone()))?;
+        // Deterministic FS op: the exact bytes the launcher will authenticate
+        // are re-hashed before the pointer moves.
+        self.layout.verify_installed(&target)?;
+
+        let current = self.layout.read_pointer()?;
+        let mut op = UpdateOperation::new(
+            UpdateOpKind::Apply,
+            now_ms,
+            Some(format!("release activation {release_id} ({version})")),
+        );
+        op.channel = staged.channel.clone();
+        op.before_version = current.as_ref().map(|p| p.version.clone());
+        op.before_digest = current.as_ref().map(|p| p.digest.clone());
+        op.before_artifact = current.as_ref().map(|p| p.artifact.clone());
+        op.after_version = Some(target.version.clone());
+        op.after_digest = Some(target.digest.clone());
+        op.artifact = Some(target.artifact.clone());
+        op.release_generation = staged.release_generation;
+        op.identity = staged.identity.clone();
+        op.certification_level = staged.certification_level.clone();
+        // Durable BEFORE the swap: a crash after this row exists is
+        // recoverable from the pointer alone.
+        self.store.insert(&op)?;
+
+        if let Err(e) = self.layout.write_pointer(&target) {
+            op.status = UpdateOpStatus::Failed;
+            op.updated_ms = now_ms;
+            op.detail = Some(format!("release pointer swap failed: {e}"));
+            self.store.update(&op)?;
+            return Err(e);
+        }
+
+        match restarter {
+            Some(restarter) => match restarter.restart(&self.layout, &target) {
+                Ok(reported) if reported == target.digest => {
+                    match self.probe.probe(&self.layout, &target) {
+                        Ok(()) => {
+                            op.status = UpdateOpStatus::Applied;
+                            op.updated_ms = now_ms;
+                            op.detail = Some(format!(
+                                "applied release {release_id} ({version}); the restarted process reports {}",
+                                target.digest
+                            ));
+                            self.store.update(&op)?;
+                            Ok(ReleaseOutcome::Applied {
+                                op_id: op.id.to_string(),
+                                release_id,
+                                version: target.version,
+                                digest: target.digest,
+                                artifact: target.artifact,
+                                running_digest: reported,
+                            })
+                        }
+                        Err(e) => self.fail_release(
+                            op,
+                            &current,
+                            &target,
+                            now_ms,
+                            Some(restarter),
+                            format!("health probe failed after the restart: {e}"),
+                        ),
+                    }
+                }
+                Ok(reported) => self.fail_release(
+                    op,
+                    &current,
+                    &target,
+                    now_ms,
+                    Some(restarter),
+                    format!(
+                        "the restarted process reports release digest {reported:?}, expected {}",
+                        target.digest
+                    ),
+                ),
+                Err(e) => self.fail_release(
+                    op,
+                    &current,
+                    &target,
+                    now_ms,
+                    Some(restarter),
+                    format!("restart failed: {e}"),
+                ),
+            },
+            None => match self.probe.probe(&self.layout, &target) {
+                Ok(()) => {
+                    op.detail = Some(format!(
+                        "activated release {release_id} ({version}); restart the daemon through the \
+                         bootstrap launcher and finalize with the digest it reports"
+                    ));
+                    op.updated_ms = now_ms;
+                    self.store.update(&op)?;
+                    Ok(ReleaseOutcome::Activated {
+                        op_id: op.id.to_string(),
+                        release_id,
+                        version: target.version,
+                        digest: target.digest,
+                        artifact: target.artifact,
+                        restart_required: true,
+                    })
+                }
+                Err(e) => self.fail_release(
+                    op,
+                    &current,
+                    &target,
+                    now_ms,
+                    None,
+                    format!("health probe failed after activation: {e}"),
+                ),
+            },
+        }
+    }
+
+    /// The full supervised release update: activate, restart, observe the
+    /// NEW process's reported digest, health-probe and finalize — with every
+    /// failure restoring the previous pointer and restarting the previous
+    /// binary.
+    pub fn apply_release(
+        &self,
+        now_ms: i64,
+        restarter: &dyn ReleaseRestarter,
+    ) -> Result<ReleaseOutcome, UpdateError> {
+        self.activate_release(now_ms, Some(restarter))
+    }
+
+    /// Finalize an explicit (`Activated`) release activation: the caller
+    /// observed the RESTARTED process reporting `reported_digest`. It must
+    /// equal the activated digest, then the health probe must pass; only
+    /// then is the apply row `Applied`. A probe failure restores the
+    /// previous pointer and records the rollback (the caller then restarts
+    /// the previous binary through the bootstrap).
+    pub fn finalize_release(
+        &self,
+        reported_digest: &str,
+        now_ms: i64,
+    ) -> Result<ReleaseOutcome, UpdateError> {
+        let current = self.layout.read_pointer()?.ok_or_else(|| {
+            UpdateError::Conflict("the install has no pointer to finalize".into())
+        })?;
+        let release_id = current.release_id.clone().ok_or_else(|| {
+            UpdateError::Conflict("the installed pointer is not a release pointer".into())
+        })?;
+        if reported_digest != current.digest {
+            return Err(UpdateError::Conflict(format!(
+                "the running process reports {reported_digest:?} but the activated release is {} ({release_id})",
+                current.digest
+            )));
+        }
+        let mut op = self
+            .running_release_apply(&current.digest)?
+            .ok_or_else(|| {
+                UpdateError::Conflict(
+                    "no in-flight release activation matches the installed pointer; nothing to finalize"
+                        .into(),
+                )
+            })?;
+        match self.probe.probe(&self.layout, &current) {
+            Ok(()) => {
+                op.status = UpdateOpStatus::Applied;
+                op.updated_ms = now_ms;
+                op.detail = Some(format!(
+                    "release {release_id} finalized: the running process reports {}",
+                    current.digest
+                ));
+                self.store.update(&op)?;
+                Ok(ReleaseOutcome::Applied {
+                    op_id: op.id.to_string(),
+                    release_id,
+                    version: current.version,
+                    digest: current.digest,
+                    artifact: current.artifact,
+                    running_digest: reported_digest.to_string(),
+                })
+            }
+            Err(e) => {
+                let previous = self.previous_pointer(&op)?;
+                self.fail_release(
+                    op,
+                    &previous,
+                    &current,
+                    now_ms,
+                    None,
+                    format!("health probe failed during finalize: {e}"),
+                )
+            }
+        }
+    }
+
+    /// Explicitly abort a pending (`Activated`) release activation: restore
+    /// the exact previous pointer and record the rolled-back rows. The
+    /// caller then restarts the daemon through the bootstrap launcher, which
+    /// now names the previous release.
+    pub fn abort_release(&self, now_ms: i64) -> Result<ReleaseOutcome, UpdateError> {
+        let current = self
+            .layout
+            .read_pointer()?
+            .ok_or_else(|| UpdateError::Conflict("the install has no pointer to abort".into()))?;
+        let release_id = current.release_id.clone().ok_or_else(|| {
+            UpdateError::Conflict("the installed pointer is not a release pointer".into())
+        })?;
+        let op = self
+            .running_release_apply(&current.digest)?
+            .ok_or_else(|| {
+                UpdateError::Conflict(
+                    "no in-flight release activation matches the installed pointer; nothing to abort"
+                        .into(),
+                )
+            })?;
+        let previous = self.previous_pointer(&op)?;
+        let outcome = self.fail_release(
+            op,
+            &previous,
+            &current,
+            now_ms,
+            None,
+            "explicit abort of the pending release activation".into(),
+        )?;
+        match outcome {
+            ReleaseOutcome::RolledBack {
+                op_id,
+                version,
+                digest,
+                artifact,
+                restored_version,
+                restored_digest,
+                running_digest,
+                reason,
+                ..
+            } => Ok(ReleaseOutcome::RolledBack {
+                op_id,
+                release_id,
+                version,
+                digest,
+                artifact,
+                restored_version,
+                restored_digest,
+                running_digest,
+                reason,
+            }),
+            other => Ok(other),
+        }
+    }
+
+    /// The in-flight release activation whose target digest is `digest`.
+    fn running_release_apply(&self, digest: &str) -> Result<Option<UpdateOperation>, UpdateError> {
+        Ok(self.store.running()?.into_iter().find(|op| {
+            op.kind == UpdateOpKind::Apply && op.after_digest.as_deref() == Some(digest)
+        }))
+    }
+
+    /// Failure path of the release state machine: restore the exact previous
+    /// pointer, restart the previous binary through the restarter when one
+    /// is wired (and require it to report the previous digest), record the
+    /// rolled-back apply + rollback rows, and return the outcome.
+    fn fail_release(
+        &self,
+        mut op: UpdateOperation,
+        previous: &Option<InstallPointer>,
+        target: &InstallPointer,
+        now_ms: i64,
+        restarter: Option<&dyn ReleaseRestarter>,
+        reason: String,
+    ) -> Result<ReleaseOutcome, UpdateError> {
+        tracing::warn!("release activation rollback: {reason}");
+        let restored = match previous {
+            Some(pointer) => match self.layout.write_pointer(pointer) {
+                Ok(()) => format!("restored {} ({})", pointer.version, pointer.digest),
+                Err(e) => format!("FAILED to restore the previous pointer: {e}"),
+            },
+            None => match self.layout.remove_pointer() {
+                Ok(()) => "removed the pointer (no previous install)".to_string(),
+                Err(e) => format!("FAILED to remove the pointer: {e}"),
+            },
+        };
+        let mut restart_note = String::new();
+        let mut running_digest = None;
+        if let Some(restarter) = restarter {
+            match previous {
+                Some(pointer) => match restarter.restart(&self.layout, pointer) {
+                    Ok(reported) if reported == pointer.digest => {
+                        restart_note = format!(
+                            "; the previous process was restarted and reports {}",
+                            pointer.digest
+                        );
+                        running_digest = Some(reported);
+                    }
+                    Ok(reported) => {
+                        restart_note = format!(
+                            "; WARNING: the restarted process reports {reported} (expected {})",
+                            pointer.digest
+                        );
+                        running_digest = Some(reported);
+                    }
+                    Err(e) => {
+                        restart_note = format!("; FAILED to restart the previous binary: {e}");
+                    }
+                },
+                None => restart_note = "; no previous release to restart".to_string(),
+            }
+        }
+        op.status = UpdateOpStatus::RolledBack;
+        op.updated_ms = now_ms;
+        op.detail = Some(format!(
+            "release activation failed: {reason}; {restored}{restart_note}"
+        ));
+        self.store.update(&op)?;
+        self.record_rollback(previous, target, now_ms, &reason)?;
+        Ok(ReleaseOutcome::RolledBack {
+            op_id: op.id.to_string(),
+            release_id: target.release_id.clone().unwrap_or_default(),
+            version: target.version.clone(),
+            digest: target.digest.clone(),
+            artifact: target.artifact.clone(),
+            restored_version: previous.as_ref().map(|p| p.version.clone()),
+            restored_digest: previous.as_ref().map(|p| p.digest.clone()),
+            running_digest,
+            reason,
+        })
+    }
+
     /// Resolve every crash residue. Never re-runs a download; an
-    /// interrupted apply is resumed (probe) or rolled back.
+    /// interrupted apply is resumed (probe) or rolled back. This entry point
+    /// cannot attest which release the RUNNING process is, so release
+    /// activations are never resumed as applied from here (see
+    /// [`Updater::recover_with_running_digest`]).
     pub fn recover(&self, now_ms: i64) -> Result<Vec<RecoveryOutcome>, UpdateError> {
+        self.recover_with_running_digest(now_ms, None)
+    }
+
+    /// Like [`Updater::recover`], but the caller attests which release digest
+    /// the RUNNING process reports (the daemon passes the
+    /// `FAKTOR_RELEASE_DIGEST` its bootstrap launcher verified). A release
+    /// activation whose pointer is already in place is only resumed as
+    /// `Applied` when the running process is observed as the activated
+    /// release; otherwise verification is forced — a metadata-only pointer
+    /// swap is never reported as a running update.
+    pub fn recover_with_running_digest(
+        &self,
+        now_ms: i64,
+        running_digest: Option<&str>,
+    ) -> Result<Vec<RecoveryOutcome>, UpdateError> {
         let mut outcomes = Vec::new();
         for mut op in self.store.running()? {
             match op.kind {
@@ -888,10 +1847,16 @@ impl Updater {
                     });
                 }
                 UpdateOpKind::Apply => {
-                    outcomes.push(self.recover_apply(&mut op, now_ms)?);
+                    outcomes.push(self.recover_apply(&mut op, now_ms, running_digest)?);
                 }
                 UpdateOpKind::Rollback => {
                     outcomes.push(self.recover_rollback(&mut op, now_ms)?);
+                }
+                // An interrupted authorized downgrade has exactly the swap
+                // semantics of an apply; recovery additionally re-applies the
+                // floor reset once the resumed probe proves it healthy.
+                UpdateOpKind::Downgrade => {
+                    outcomes.push(self.recover_apply(&mut op, now_ms, running_digest)?);
                 }
             }
         }
@@ -902,16 +1867,64 @@ impl Updater {
         &self,
         op: &mut UpdateOperation,
         now_ms: i64,
+        running_digest: Option<&str>,
     ) -> Result<RecoveryOutcome, UpdateError> {
         let current = self.layout.read_pointer()?;
         let target_digest = op.after_digest.clone().unwrap_or_default();
         let before_digest = op.before_digest.clone();
         let pointer_digest = current.as_ref().map(|p| p.digest.clone());
         if pointer_digest.as_deref() == Some(target_digest.as_str()) {
-            // The swap happened; the probe never ran. Resume by probing.
+            // The swap happened; the restart/finalize never ran. Resume by
+            // probing — but a RELEASE pointer additionally requires the
+            // running process to be the activated release: recovery refuses
+            // to call a metadata-only swap "applied".
             let target = current.clone().expect("pointer digest implies a pointer");
+            if let Some(release_id) = target.release_id.clone() {
+                if running_digest != Some(target_digest.as_str()) {
+                    op.status = UpdateOpStatus::Unverified;
+                    op.updated_ms = now_ms;
+                    op.detail = Some(format!(
+                        "release {release_id} is activated in the pointer but the running process \
+                         reports {} (expected {}); restart it through the bootstrap launcher and \
+                         finalize with the digest it reports",
+                        running_digest.unwrap_or("no release (started directly)"),
+                        target_digest
+                    ));
+                    self.store.update(op)?;
+                    return Ok(RecoveryOutcome::NeedsVerification {
+                        op_id: op.id.to_string(),
+                        detail: format!(
+                            "release {release_id} was never observed running; restart + finalize required"
+                        ),
+                    });
+                }
+            }
             match self.probe.probe(&self.layout, &target) {
                 Ok(()) => {
+                    // A resumed authorized downgrade must also complete the
+                    // deferred floor reset; if that reset cannot be recorded,
+                    // the operation is left for verification (fail closed)
+                    // instead of claiming a completed downgrade.
+                    if op.kind == UpdateOpKind::Downgrade {
+                        let channel = op
+                            .channel
+                            .clone()
+                            .unwrap_or_else(|| self.config.channel.to_string());
+                        let generation = op.release_generation.unwrap_or(0);
+                        if let Err(e) = self.store.set_high_water(&channel, generation, now_ms) {
+                            op.status = UpdateOpStatus::Unverified;
+                            op.updated_ms = now_ms;
+                            op.detail = Some(format!(
+                                "recovered the downgraded swap but the high-water reset failed: \
+                                 {e}; verification forced"
+                            ));
+                            self.store.update(op)?;
+                            return Ok(RecoveryOutcome::NeedsVerification {
+                                op_id: op.id.to_string(),
+                                detail: "the authorized downgrade's high-water reset failed".into(),
+                            });
+                        }
+                    }
                     op.status = UpdateOpStatus::Applied;
                     op.updated_ms = now_ms;
                     op.detail = Some("recovered: the interrupted swap is healthy".into());
@@ -937,6 +1950,26 @@ impl Updater {
                 }
             }
         } else if pointer_digest == before_digest {
+            // The pointer is back at the previous side. If the caller
+            // attests that the RUNNING process is something else (a release
+            // rollback that crashed after the new binary was restarted), the
+            // install is not proven: force verification instead of claiming
+            // the previous install is live.
+            if let (Some(running), Some(before)) = (running_digest, before_digest.as_deref()) {
+                if running != before {
+                    op.status = UpdateOpStatus::Unverified;
+                    op.updated_ms = now_ms;
+                    op.detail = Some(format!(
+                        "the pointer was restored to {before} but the running process reports \
+                         {running}; restart it through the bootstrap launcher; verification forced"
+                    ));
+                    self.store.update(op)?;
+                    return Ok(RecoveryOutcome::NeedsVerification {
+                        op_id: op.id.to_string(),
+                        detail: "the restored pointer and the running process disagree".into(),
+                    });
+                }
+            }
             op.status = UpdateOpStatus::Failed;
             op.updated_ms = now_ms;
             op.detail =
@@ -994,13 +2027,15 @@ impl Updater {
         op: &UpdateOperation,
     ) -> Result<Option<InstallPointer>, UpdateError> {
         match (&op.before_artifact, &op.before_digest, &op.before_version) {
-            (Some(artifact), Some(digest), version) => Ok(Some(InstallPointer::new(
-                artifact,
-                digest,
-                version.as_deref().unwrap_or_default(),
-                op.channel.as_deref().unwrap_or("stable"),
-                op.created_ms,
-            )?)),
+            (Some(artifact), Some(digest), version) => {
+                Ok(Some(self.with_launch_release(InstallPointer::new(
+                    artifact,
+                    digest,
+                    version.as_deref().unwrap_or_default(),
+                    op.channel.as_deref().unwrap_or("stable"),
+                    op.created_ms,
+                )?)?))
+            }
             _ => Ok(None),
         }
     }
@@ -1039,6 +2074,7 @@ mod tests {
             host_os: "darwin".into(),
             host_arch: "arm64".into(),
             local_version: "0.1.0".into(),
+            allow_legacy_manifests_once: false,
         }
     }
 

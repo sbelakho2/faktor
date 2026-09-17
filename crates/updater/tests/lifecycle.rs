@@ -165,6 +165,7 @@ fn fixture(probe_results: impl IntoIterator<Item = Result<(), String>>) -> HostF
                 host_os: OS.into(),
                 host_arch: ARCH.into(),
                 local_version: "0.1.0".into(),
+                allow_legacy_manifests_once: false,
             },
             store.clone(),
             fetcher.clone(),
@@ -178,6 +179,20 @@ fn fixture(probe_results: impl IntoIterator<Item = Result<(), String>>) -> HostF
         fetcher,
         store,
     }
+}
+
+/// The signed anti-rollback generation of one test version: monotonic in
+/// the versions these tests stage (major.minor.patch -> major*1e6 +
+/// minor*1e3 + patch), so the lifecycle fixtures exercise the normal
+/// forward path without touching the legacy-manifest allowance.
+fn generation_of(version: &str) -> u64 {
+    let mut parts = version
+        .split('.')
+        .map(|part| part.parse::<u64>().unwrap_or(0));
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    let patch = parts.next().unwrap_or(0);
+    major * 1_000_000 + minor * 1_000 + patch
 }
 
 /// One artifact for the fake transport + its signed manifest bytes.
@@ -195,6 +210,7 @@ fn signed_manifest(
         channel: Channel::Stable,
         version: version.to_string(),
         commit: format!("{version:0>40}").replace('.', "a"),
+        release_generation: Some(generation_of(version)),
         artifacts: vec![Artifact {
             name,
             os: OS.into(),
@@ -963,6 +979,7 @@ async fn the_durable_store_survives_reopen_with_the_full_history() {
                 host_os: OS.into(),
                 host_arch: ARCH.into(),
                 local_version: "0.1.0".into(),
+                allow_legacy_manifests_once: false,
             },
             store,
             fetcher.clone(),
@@ -986,6 +1003,7 @@ async fn the_durable_store_survives_reopen_with_the_full_history() {
             host_os: OS.into(),
             host_arch: ARCH.into(),
             local_version: "0.1.0".into(),
+            allow_legacy_manifests_once: false,
         },
         store.clone(),
         fetcher,

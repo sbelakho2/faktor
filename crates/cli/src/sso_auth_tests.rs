@@ -53,6 +53,7 @@ fn sso_cfg(issuer: String, secret: Option<&str>) -> CloudSsoCfg {
         discovery_max_age_ms: None,
         jwks_max_age_ms: None,
         max_jwks_refetches: None,
+        allowed_algorithms: None,
     }
 }
 
@@ -216,4 +217,33 @@ async fn confidential_section_builds_from_the_staged_secret_and_refuses_bad_meth
     .validate()
     .unwrap_err();
     assert!(err.contains("confidential"), "{err}");
+}
+
+/// The deployment algorithm policy defaults to RS256-only and refuses
+/// `none`, empty and unsupported lists; an explicit HS256 opt-in
+/// round-trips.
+#[test]
+fn allowed_algorithms_default_to_rs256_and_refuse_hostile_lists() {
+    let mut cfg = sso_cfg("https://idp.example".into(), None);
+    assert_eq!(cfg.allowed_algorithms().unwrap(), vec!["RS256".to_string()]);
+    cfg.allowed_algorithms = Some(vec!["none".into()]);
+    assert!(cfg.validate().unwrap_err().contains("none"));
+    assert!(cfg.allowed_algorithms().unwrap_err().contains("none"));
+    cfg.allowed_algorithms = Some(vec!["HS512".into()]);
+    assert!(cfg.validate().unwrap_err().contains("not supported"));
+    assert!(cfg
+        .allowed_algorithms()
+        .unwrap_err()
+        .contains("not supported"));
+    cfg.allowed_algorithms = Some(Vec::new());
+    assert!(cfg.validate().unwrap_err().contains("1..="));
+    cfg.allowed_algorithms = Some(vec!["RS256".into(), "HS256".into()]);
+    assert_eq!(
+        cfg.allowed_algorithms().unwrap(),
+        vec!["RS256".to_string(), "HS256".to_string()]
+    );
+    // The refused list never reaches a wired authority.
+    cfg.allowed_algorithms = Some(vec!["none".into()]);
+    let err = build_sso_authority(&cfg, Path::new("/nonexistent"), transport()).unwrap_err();
+    assert!(err.contains("none"), "{err}");
 }

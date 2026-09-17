@@ -335,12 +335,17 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
   store.patch({ daemon: 'starting', daemonDetail: 'locating faktor-cli', lastError: null });
   const binaryPath = config('binaryPath', '');
   const dataDir = config('dataDir', '');
+  const installRoot = config('installRoot', '');
   const extraArgs = config<string[]>('extraArgs', []);
   const startupTimeoutMs = config('startupTimeoutMs', 10_000);
   const daemon = await startDaemon({
     workspaceRoot: workspaceRoot(context),
     binaryPath: binaryPath.length > 0 ? binaryPath : undefined,
     dataDir: dataDir.length > 0 ? dataDir : undefined,
+    // When an immutable install layout exists at this root, the daemon is
+    // spawned through its stable bootstrap launcher so the activated release
+    // (and only that release) runs. No layout => legacy resolution.
+    installRoot: installRoot.length > 0 ? installRoot : undefined,
     extraArgs,
     startupTimeoutMs,
   });
@@ -356,6 +361,8 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
     active.client = client;
     store.patch({
       daemon: 'running',
+      // The health version already carries the bootstrap-verified release
+      // digest when the daemon was launched through an install layout.
       daemonDetail: `${health.version} on port ${daemon.port}`,
       baseUrl: daemon.baseUrl,
       lastError: null,

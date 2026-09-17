@@ -507,6 +507,14 @@ pub struct CloudSsoCfg {
     pub jwks_max_age_ms: Option<i64>,
     #[serde(default)]
     pub max_jwks_refetches: Option<u32>,
+    /// The ID-token signing algorithms this deployment explicitly allows (the
+    /// header `alg` must be in the intersection of this list, the discovery
+    /// document's advertised set and the selected JWK's own constraints).
+    /// Absent = the adapter default `["RS256"]`; `none` and unsupported names
+    /// are refused at load, and symmetric `HS*` is honored only when listed
+    /// here AND the JWK is an `oct` key with `use = "sig"`.
+    #[serde(default)]
+    pub allowed_algorithms: Option<Vec<String>>,
 }
 
 /// The `[cloud.github_app]` section: the real GitHub App wiring. Disabled by
@@ -826,7 +834,46 @@ impl CloudSsoCfg {
                 ));
             }
         }
+        if let Some(algorithms) = &self.allowed_algorithms {
+            if algorithms.is_empty() || algorithms.len() > faktor_cloud::MAX_ALLOWED_ALGORITHMS {
+                return Err(format!(
+                    "cloud sso: allowed_algorithms must carry 1..={} entries",
+                    faktor_cloud::MAX_ALLOWED_ALGORITHMS
+                ));
+            }
+            for algorithm in algorithms {
+                if algorithm == "none" {
+                    return Err(
+                        "cloud sso: \"none\" is never an accepted id-token signing algorithm"
+                            .into(),
+                    );
+                }
+                if !faktor_cloud::SUPPORTED_ALGORITHMS.contains(&algorithm.as_str()) {
+                    return Err(format!(
+                        "cloud sso: allowed_algorithms entry {algorithm:?} is not supported \
+                         (supported: {})",
+                        faktor_cloud::SUPPORTED_ALGORITHMS.join(", ")
+                    ));
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The resolved allowed-algorithm policy: the configured list, or the
+    /// adapter default (`["RS256"]`) when absent. Validated on the way out.
+    pub fn allowed_algorithms(&self) -> Result<Vec<String>, String> {
+        match &self.allowed_algorithms {
+            Some(algorithms) => {
+                faktor_cloud::NetworkOidcConfig::validate_allowed_algorithms(algorithms)
+                    .map_err(|e| format!("cloud sso: {e}"))?;
+                Ok(algorithms.clone())
+            }
+            None => Ok(faktor_cloud::DEFAULT_ALLOWED_ALGORITHMS
+                .iter()
+                .map(|alg| (*alg).to_string())
+                .collect()),
+        }
     }
 
     /// The configured issuer (required when enabled).
@@ -1025,7 +1072,13 @@ impl CloudGithubAppReconcileCfg {
 ///   An empty allowlist refuses every manifest (there is no implicit trust
 ///   anchor), so an enabled section without keys is a config error;
 /// - `max_artifact_bytes` (default 256 MiB, cap 4 GiB) and `clock_skew_ms`
-///   (default 5 minutes, cap 1 hour) are bounded.
+///   (default 5 minutes, cap 1 hour) are bounded;
+/// - `allow_legacy_manifests_once` (default `false`) is the documented
+///   one-time escape hatch for a signed manifest that predates the
+///   `release_generation` anti-rollback counter: it is admissible only while
+///   the durable per-channel high-water mark is still 0, and admitting it
+///   consumes the allowance durably. Leave it off once releases carry the
+///   generation.
 ///
 /// Unknown keys, duplicates, non-object shapes and wrong value types are
 /// parse errors.
@@ -1041,6 +1094,8 @@ pub struct UpdaterCfg {
     pub max_artifact_bytes: Option<u64>,
     #[serde(default)]
     pub clock_skew_ms: Option<i64>,
+    #[serde(default)]
+    pub allow_legacy_manifests_once: bool,
     #[serde(default)]
     pub keys: Vec<UpdaterKeyCfg>,
 }
@@ -1061,6 +1116,7 @@ pub const UPDATER_FIELDS: &[&str] = &[
     "install_root",
     "max_artifact_bytes",
     "clock_skew_ms",
+    "allow_legacy_manifests_once",
     "keys",
 ];
 
@@ -1142,6 +1198,15 @@ impl<'de> serde::Deserialize<'de> for UpdaterCfg {
                             }
                             seen |= 32;
                             out.keys = map.next_value::<Vec<UpdaterKeyCfg>>()?;
+                        }
+                        "allow_legacy_manifests_once" => {
+                            if seen & 64 != 0 {
+                                return Err(A::Error::duplicate_field(
+                                    "allow_legacy_manifests_once",
+                                ));
+                            }
+                            seen |= 64;
+                            out.allow_legacy_manifests_once = map.next_value::<bool>()?;
                         }
                         other => return Err(A::Error::unknown_field(other, UPDATER_FIELDS)),
                     }
@@ -1250,6 +1315,11 @@ impl UpdaterCfg {
     pub fn clock_skew_ms_resolved(&self) -> i64 {
         self.clock_skew_ms
             .unwrap_or(faktor_updater::DEFAULT_CLOCK_SKEW_MS)
+    }
+
+    /// The documented one-time legacy-manifest allowance (default false).
+    pub fn allow_legacy_manifests_once_resolved(&self) -> bool {
+        self.allow_legacy_manifests_once
     }
 
     /// The install root under `data_dir` (`None` when the section is
@@ -5272,6 +5342,34 @@ mod completion_cfg_tests {
             dir.path().join("payloads")
         );
 
+        // The SSO signing-algorithm policy is additive and strict: the
+        // default is RS256-only, `none`/unsupported/empty lists and
+        // non-list shapes are refused at load.
+        std::fs::write(
+            &path,
+            r#"{"cloud": {"enabled": true, "sso": {"enabled": true, "issuer": "https://idp.example", "client_id": "c", "allowed_algorithms": ["RS256", "HS256"]}}}"#,
+        )
+        .unwrap();
+        let sso = Config::load_strict(&path).unwrap();
+        assert_eq!(
+            sso.cloud
+                .sso
+                .as_ref()
+                .unwrap()
+                .allowed_algorithms()
+                .unwrap(),
+            vec!["RS256".to_string(), "HS256".to_string()]
+        );
+        for bad_alg_list in [
+            r#"{"cloud": {"enabled": true, "sso": {"enabled": true, "issuer": "https://idp.example", "client_id": "c", "allowed_algorithms": ["none"]}}}"#,
+            r#"{"cloud": {"enabled": true, "sso": {"enabled": true, "issuer": "https://idp.example", "client_id": "c", "allowed_algorithms": []}}}"#,
+            r#"{"cloud": {"enabled": true, "sso": {"enabled": true, "issuer": "https://idp.example", "client_id": "c", "allowed_algorithms": ["RS512"]}}}"#,
+            r#"{"cloud": {"enabled": true, "sso": {"enabled": true, "issuer": "https://idp.example", "client_id": "c", "allowed_algorithms": "RS256"}}}"#,
+        ] {
+            std::fs::write(&path, bad_alg_list).unwrap();
+            assert!(Config::load_strict(&path).is_err(), "{bad_alg_list}");
+        }
+
         // An enabled GitHub App section requires app id, both staged payload
         // names and the tenant organization.
         for bad_app in [
@@ -5503,6 +5601,24 @@ mod completion_cfg_tests {
         std::fs::write(&path, &enabled_json).unwrap();
         let enabled = Config::load_strict(&path).unwrap();
         assert!(enabled.updater.enabled);
+        assert!(
+            !enabled.updater.allow_legacy_manifests_once_resolved(),
+            "the one-time legacy allowance is off by default"
+        );
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"updater": {{"enabled": true, "allow_legacy_manifests_once": true, "keys": [{{"id": "op", "public_key": "{KEY}"}}]}}}}"#
+            ),
+        )
+        .unwrap();
+        assert!(
+            Config::load_strict(&path)
+                .unwrap()
+                .updater
+                .allow_legacy_manifests_once_resolved(),
+            "the documented one-time legacy allowance round-trips"
+        );
         assert_eq!(
             enabled.updater.channel().unwrap(),
             faktor_updater::Channel::Beta
@@ -5556,6 +5672,8 @@ mod completion_cfg_tests {
             r#"{"updater": {"enabled": true, "bogus": 1}}"#,
             r#"{"updater": {"enabled": true, "enabled": false}}"#,
             r#"{"updater": {"channel": 1}}"#,
+            r#"{"updater": {"allow_legacy_manifests_once": "yes"}}"#,
+            r#"{"updater": {"allow_legacy_manifests_once": true, "allow_legacy_manifests_once": false}}"#,
             r#"{"updater": true}"#,
             r#"{"updater": ["enabled"]}"#,
             // Unknown key field / missing key field.

@@ -33,9 +33,18 @@ const NOW_MS: i64 = 1_700_000_000_000;
 
 struct MockKey {
     kid: String,
-    keypair: RsaKeyPair,
+    /// The RSA keypair (`None` for `oct` symmetric keys).
+    keypair: Option<RsaKeyPair>,
     n: Vec<u8>,
     e: Vec<u8>,
+    /// The `oct` shared secret (`None` for RSA keys).
+    secret: Option<Vec<u8>>,
+    /// The JWKS `alg` this key advertises.
+    alg: String,
+    /// The JWKS `use` field (absent = `None`).
+    use_: Option<String>,
+    /// The JWKS `key_ops` field (absent = `None`).
+    key_ops: Option<Vec<String>>,
 }
 
 struct ProviderState {
@@ -45,6 +54,14 @@ struct ProviderState {
     codes: BTreeMap<String, MockTokenSpec>,
     discovery_max_age_s: Option<i64>,
     jwks_max_age_s: Option<i64>,
+    /// The discovery document's `id_token_signing_alg_values_supported`.
+    discovery_algs: Vec<String>,
+}
+
+#[derive(Clone)]
+enum MockAudience {
+    Single(String),
+    Multi(Vec<String>),
 }
 
 #[derive(Clone)]
@@ -54,6 +71,45 @@ struct MockTokenSpec {
     groups: Vec<String>,
     nonce: Option<String>,
     expires_at_ms: i64,
+    audience: MockAudience,
+    azp: Option<String>,
+    /// Raw `exp` seconds override (extreme-value tests).
+    exp_s: Option<i64>,
+    /// Raw `iat` seconds override (extreme-value tests).
+    iat_s: Option<i64>,
+}
+
+impl MockTokenSpec {
+    /// The JSON payload signed for this spec.
+    fn payload(&self) -> serde_json::Value {
+        let aud = match &self.audience {
+            MockAudience::Single(value) => serde_json::Value::String(value.clone()),
+            MockAudience::Multi(values) => serde_json::Value::Array(
+                values
+                    .iter()
+                    .map(|value| serde_json::Value::String(value.clone()))
+                    .collect(),
+            ),
+        };
+        let seconds = self.expires_at_ms / 1000;
+        let exp = self.exp_s.unwrap_or(seconds);
+        let iat = self.iat_s.unwrap_or(seconds - 60);
+        let mut payload = serde_json::json!({
+            "iss": ISSUER,
+            "sub": self.subject,
+            "aud": aud,
+            "email": self.email,
+            "email_verified": true,
+            "iat": iat,
+            "exp": exp,
+            "nonce": self.nonce,
+            "groups": self.groups,
+        });
+        if let Some(azp) = &self.azp {
+            payload["azp"] = serde_json::Value::String(azp.clone());
+        }
+        payload
+    }
 }
 
 struct MockProvider {
@@ -126,9 +182,38 @@ fn generate_key(kid: &str) -> MockKey {
     let (n, e) = parse_rsa_public_key_der(keypair.public_key().as_ref());
     MockKey {
         kid: kid.to_string(),
-        keypair,
+        keypair: Some(keypair),
         n,
         e,
+        secret: None,
+        alg: "RS256".into(),
+        use_: Some("sig".into()),
+        key_ops: None,
+    }
+}
+
+/// One `oct` symmetric key with the given JWKS metadata.
+fn oct_key(kid: &str, secret: &[u8], use_: Option<&str>, key_ops: Option<&[&str]>) -> MockKey {
+    MockKey {
+        kid: kid.to_string(),
+        keypair: None,
+        n: Vec::new(),
+        e: Vec::new(),
+        secret: Some(secret.to_vec()),
+        alg: "HS256".into(),
+        use_: use_.map(str::to_string),
+        key_ops: key_ops.map(|ops| ops.iter().map(|op| op.to_string()).collect()),
+    }
+}
+
+/// One RSA key with overridden JWKS metadata (conflicting `alg`/`use`/
+/// `key_ops` adversarial cases).
+fn rsa_key_with(kid: &str, alg: &str, use_: Option<&str>, key_ops: Option<&[&str]>) -> MockKey {
+    MockKey {
+        alg: alg.to_string(),
+        use_: use_.map(str::to_string),
+        key_ops: key_ops.map(|ops| ops.iter().map(|op| op.to_string()).collect()),
+        ..generate_key(kid)
     }
 }
 
@@ -177,6 +262,7 @@ impl MockProvider {
                 codes: BTreeMap::new(),
                 discovery_max_age_s: Some(3600),
                 jwks_max_age_s: Some(3600),
+                discovery_algs: vec!["RS256".into()],
             }),
             requests: Mutex::new(Vec::new()),
             token_request_detail: Mutex::new(None),
@@ -184,6 +270,20 @@ impl MockProvider {
             jwks_requests: AtomicUsize::new(0),
             token_requests: AtomicUsize::new(0),
         }
+    }
+
+    /// Install one pre-built key (with arbitrary metadata) as the ONLY
+    /// active key.
+    fn push_key(&self, key: MockKey) {
+        let mut state = self.state.lock().unwrap();
+        state.keys.push(key);
+        state.active = state.keys.len() - 1;
+    }
+
+    /// The discovery document's advertised signing algorithms.
+    fn set_discovery_algs(&self, algs: &[&str]) {
+        let mut state = self.state.lock().unwrap();
+        state.discovery_algs = algs.iter().map(|alg| alg.to_string()).collect();
     }
 
     fn rotate(&self, kid: &str) {
@@ -226,6 +326,14 @@ impl MockProvider {
         sign_claims(key, &key.kid, spec)
     }
 
+    /// Sign an arbitrary raw payload under the ACTIVE key (malformed-claim
+    /// adversarial cases).
+    fn sign_payload(&self, payload: &serde_json::Value) -> String {
+        let state = self.state.lock().unwrap();
+        let key = &state.keys[state.active];
+        sign_raw_payload(key, &key.kid, payload)
+    }
+
     /// Sign a claims set under an ARBITRARY kid label (forged kid tests).
     fn sign_with_kid_label(&self, kid_label: &str, spec: &MockTokenSpec) -> String {
         let state = self.state.lock().unwrap();
@@ -257,7 +365,7 @@ impl MockProvider {
                 "authorization_endpoint": format!("{ISSUER}/authorize"),
                 "token_endpoint": format!("{ISSUER}/token"),
                 "jwks_uri": format!("{ISSUER}/jwks"),
-                "id_token_signing_alg_values_supported": ["RS256"],
+                "id_token_signing_alg_values_supported": self.state.lock().unwrap().discovery_algs.clone(),
             });
             return (200, headers, serde_json::to_vec(&doc).unwrap());
         }
@@ -271,14 +379,30 @@ impl MockProvider {
                 .enumerate()
                 .filter(|(index, _)| *index == state.active)
                 .map(|(_, key)| {
-                    serde_json::json!({
-                        "kty": "RSA",
+                    let mut value = serde_json::json!({
+                        "kty": if key.secret.is_some() { "oct" } else { "RSA" },
                         "kid": key.kid,
-                        "alg": "RS256",
-                        "use": "sig",
-                        "n": b64url(&key.n),
-                        "e": b64url(&key.e),
-                    })
+                        "alg": key.alg,
+                    });
+                    if let Some(use_) = &key.use_ {
+                        value["use"] = serde_json::Value::String(use_.clone());
+                    }
+                    if let Some(key_ops) = &key.key_ops {
+                        value["key_ops"] = serde_json::Value::Array(
+                            key_ops
+                                .iter()
+                                .map(|op| serde_json::Value::String(op.clone()))
+                                .collect(),
+                        );
+                    }
+                    match &key.secret {
+                        Some(secret) => value["k"] = serde_json::Value::String(b64url(secret)),
+                        None => {
+                            value["n"] = serde_json::Value::String(b64url(&key.n));
+                            value["e"] = serde_json::Value::String(b64url(&key.e));
+                        }
+                    }
+                    value
                 })
                 .collect();
             let mut headers = vec![("content-type".into(), "application/json".into())];
@@ -325,27 +449,53 @@ impl MockProvider {
 }
 
 fn sign_claims(key: &MockKey, kid: &str, spec: &MockTokenSpec) -> String {
-    let header = serde_json::json!({"alg": "RS256", "kid": kid, "typ": "JWT"});
-    let payload = serde_json::json!({
-        "iss": ISSUER,
-        "sub": spec.subject,
-        "aud": CLIENT,
-        "email": spec.email,
-        "email_verified": true,
-        "iat": spec.expires_at_ms / 1000 - 60,
-        "exp": spec.expires_at_ms / 1000,
-        "nonce": spec.nonce,
-        "groups": spec.groups,
-    });
+    sign_raw_payload(key, kid, &spec.payload())
+}
+
+fn sign_raw_payload(key: &MockKey, kid: &str, payload: &serde_json::Value) -> String {
+    // The header `alg` is the algorithm the signature is ACTUALLY produced
+    // with (RS256 for RSA material, HS256 for oct material); the JWKS may
+    // advertise conflicting metadata, which the policy must refuse.
+    let alg = if key.secret.is_some() {
+        "HS256"
+    } else {
+        "RS256"
+    };
+    let header = serde_json::json!({"alg": alg, "kid": kid, "typ": "JWT"});
     let header = b64url(&serde_json::to_vec(&header).unwrap());
-    let payload = b64url(&serde_json::to_vec(&payload).unwrap());
+    let payload = b64url(&serde_json::to_vec(payload).unwrap());
     let input = format!("{header}.{payload}");
-    let rng = SystemRandom::new();
-    let mut signature = vec![0u8; key.keypair.public().modulus_len()];
-    key.keypair
-        .sign(&RSA_PKCS1_SHA256, &rng, input.as_bytes(), &mut signature)
-        .expect("sign");
-    format!("{input}.{}", b64url(&signature))
+    match (&key.secret, &key.keypair) {
+        (Some(secret), _) => {
+            let signature = hmac_sha256(secret, input.as_bytes());
+            format!("{input}.{}", b64url(&signature))
+        }
+        (None, Some(keypair)) => {
+            let rng = SystemRandom::new();
+            let mut signature = vec![0u8; keypair.public().modulus_len()];
+            keypair
+                .sign(&RSA_PKCS1_SHA256, &rng, input.as_bytes(), &mut signature)
+                .expect("sign");
+            format!("{input}.{}", b64url(&signature))
+        }
+        (None, None) => panic!("a mock key needs RSA or oct material"),
+    }
+}
+
+/// A JWT with header `alg = "none"` and an empty signature (never acceptable).
+fn alg_none_token(spec: &MockTokenSpec) -> String {
+    let header = b64url(br#"{"alg":"none","kid":"kid-1","typ":"JWT"}"#);
+    let payload = b64url(&serde_json::to_vec(&spec.payload()).unwrap());
+    format!("{header}.{payload}.")
+}
+
+fn hmac_sha256(secret: &[u8], message: &[u8]) -> Vec<u8> {
+    ring::hmac::sign(
+        &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret),
+        message,
+    )
+    .as_ref()
+    .to_vec()
 }
 
 fn b64url(bytes: &[u8]) -> String {
@@ -420,6 +570,7 @@ fn config() -> NetworkOidcConfig {
         max_jwks_refetches: 2,
         client_auth: ClientAuthMethod::None,
         client_secret: None,
+        allowed_algorithms: vec!["RS256".into()],
     }
 }
 
@@ -434,6 +585,32 @@ fn confidential_config(method: ClientAuthMethod, secret: &str) -> NetworkOidcCon
 
 fn adapter(provider: Arc<MockProvider>, clock: Arc<ManualClock>) -> NetworkOidcAdapter {
     NetworkOidcAdapter::new(provider, clock, config()).unwrap()
+}
+
+/// The strict config with an explicit allowed-algorithm policy.
+fn config_with_algs(algs: &[&str]) -> NetworkOidcConfig {
+    NetworkOidcConfig {
+        allowed_algorithms: algs.iter().map(|alg| alg.to_string()).collect(),
+        ..config()
+    }
+}
+
+fn adapter_with_algs(
+    provider: Arc<MockProvider>,
+    clock: Arc<ManualClock>,
+    algs: &[&str],
+) -> NetworkOidcAdapter {
+    NetworkOidcAdapter::new(provider, clock, config_with_algs(algs)).unwrap()
+}
+
+fn expectations(nonce: Option<&str>, now_ms: i64) -> IdTokenExpectations {
+    IdTokenExpectations {
+        issuer: ISSUER.into(),
+        audience: CLIENT.into(),
+        nonce: nonce.map(str::to_string),
+        now_ms,
+        clock_skew_ms: 0,
+    }
 }
 
 fn sso_ref() -> SsoConfigRef {
@@ -461,6 +638,10 @@ fn token_spec(nonce: Option<&str>, expires_at_ms: i64) -> MockTokenSpec {
         groups: vec!["faktor-admins".into(), "faktor-viewers".into()],
         nonce: nonce.map(str::to_string),
         expires_at_ms,
+        audience: MockAudience::Single(CLIENT.into()),
+        azp: None,
+        exp_s: None,
+        iat_s: None,
     }
 }
 
@@ -1012,4 +1193,430 @@ async fn callback_is_bound_to_the_starting_organization() {
             .await,
         Err(OidcError::StateInvalid)
     ));
+}
+
+// ------------------------------------------------- adversarial: alg policy
+
+/// Build one single-purpose provider + adapter and verify one token.
+async fn verify_with_meta(
+    key: MockKey,
+    discovery_algs: &[&str],
+    configured_algs: &[&str],
+    spec: &MockTokenSpec,
+) -> Result<OidcClaims, OidcError> {
+    let provider = Arc::new(MockProvider::new());
+    provider.push_key(key);
+    provider.set_discovery_algs(discovery_algs);
+    let clock = Arc::new(ManualClock::new(NOW_MS));
+    let adapter = adapter_with_algs(provider.clone(), clock, configured_algs);
+    let token = provider.sign(spec);
+    adapter
+        .verify_id_token(&token, &expectations(None, NOW_MS))
+        .await
+}
+
+/// A header `alg` outside the discovery document's advertised set is refused
+/// typed, and the refusal names every set in the intersection.
+#[tokio::test]
+async fn algorithm_not_advertised_by_discovery_is_refused_naming_each_set() {
+    let err = verify_with_meta(
+        oct_key("kid-oct", b"shared-secret", Some("sig"), None),
+        &["RS256"],
+        &["RS256", "HS256"],
+        &token_spec(None, NOW_MS + 60_000),
+    )
+    .await
+    .unwrap_err();
+    let rendered = err.to_string();
+    match err {
+        OidcError::AlgorithmRefused {
+            alg,
+            discovery,
+            jwk,
+            configured,
+        } => {
+            assert_eq!(alg, "HS256");
+            assert_eq!(discovery, ["RS256"]);
+            assert_eq!(jwk, ["HS256"]);
+            assert_eq!(configured, ["RS256", "HS256"]);
+        }
+        other => panic!("expected AlgorithmRefused, got {other:?}"),
+    }
+    for needle in [
+        "HS256",
+        "RS256",
+        "discovery",
+        "signing key",
+        "configuration",
+    ] {
+        assert!(rendered.contains(needle), "{rendered}");
+    }
+}
+
+/// The header `alg` being advertised by discovery is not enough: the JWK's
+/// own `alg`/`use`/`key_ops` constraints must also permit it, and a
+/// consistent JWK passes.
+#[tokio::test]
+async fn alg_in_discovery_but_conflicting_with_jwk_metadata_is_refused() {
+    // The JWK advertises RS384 while the token is actually RS256-signed.
+    let err = verify_with_meta(
+        rsa_key_with("kid-1", "RS384", Some("sig"), None),
+        &["RS256"],
+        &["RS256"],
+        &token_spec(None, NOW_MS + 60_000),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, OidcError::AlgorithmRefused { ref jwk, .. } if jwk.is_empty()),
+        "{err}"
+    );
+
+    // use = enc never verifies signatures.
+    let err = verify_with_meta(
+        rsa_key_with("kid-1", "RS256", Some("enc"), None),
+        &["RS256"],
+        &["RS256"],
+        &token_spec(None, NOW_MS + 60_000),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, OidcError::AlgorithmRefused { ref jwk, .. } if jwk.is_empty()));
+
+    // key_ops without `verify` never verifies signatures.
+    let err = verify_with_meta(
+        rsa_key_with("kid-1", "RS256", Some("sig"), Some(&["encrypt"])),
+        &["RS256"],
+        &["RS256"],
+        &token_spec(None, NOW_MS + 60_000),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, OidcError::AlgorithmRefused { ref jwk, .. } if jwk.is_empty()));
+
+    // A fully consistent JWK (matching alg, use = sig, key_ops = verify)
+    // passes the same policy.
+    let claims = verify_with_meta(
+        rsa_key_with("kid-1", "RS256", Some("sig"), Some(&["verify"])),
+        &["RS256"],
+        &["RS256"],
+        &token_spec(None, NOW_MS + 60_000),
+    )
+    .await
+    .unwrap();
+    assert_eq!(claims.subject, "sub-1");
+}
+
+/// Symmetric HS256 is accepted only when the operator explicitly allows it
+/// AND the JWK is an `oct` key declaring `use = "sig"`; every weaker shape
+/// is refused and `alg = none` is never acceptable.
+#[tokio::test]
+async fn symmetric_hs256_is_accepted_only_under_the_explicit_config_with_an_oct_sig_jwk() {
+    // Positive: explicit config + discovery + oct/use=sig.
+    let claims = verify_with_meta(
+        oct_key("kid-oct", b"shared-secret", Some("sig"), None),
+        &["HS256"],
+        &["RS256", "HS256"],
+        &token_spec(None, NOW_MS + 60_000),
+    )
+    .await
+    .unwrap();
+    assert_eq!(claims.subject, "sub-1");
+
+    // The SAME token under the default policy (RS256 only) is refused.
+    let err = verify_with_meta(
+        oct_key("kid-oct", b"shared-secret", Some("sig"), None),
+        &["HS256"],
+        &["RS256"],
+        &token_spec(None, NOW_MS + 60_000),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, OidcError::AlgorithmRefused { ref configured, .. } if configured == &["RS256"]),
+        "{err}"
+    );
+
+    // use = enc is refused even with the explicit config...
+    let err = verify_with_meta(
+        oct_key("kid-oct", b"shared-secret", Some("enc"), None),
+        &["HS256"],
+        &["RS256", "HS256"],
+        &token_spec(None, NOW_MS + 60_000),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, OidcError::AlgorithmRefused { ref jwk, .. } if jwk.is_empty()));
+
+    // ...and so is an oct key that never declares `use = "sig"`.
+    let err = verify_with_meta(
+        oct_key("kid-oct", b"shared-secret", None, None),
+        &["HS256"],
+        &["RS256", "HS256"],
+        &token_spec(None, NOW_MS + 60_000),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, OidcError::AlgorithmRefused { ref jwk, .. } if jwk.is_empty()));
+
+    // A key_ops that omits `verify` is refused too.
+    let err = verify_with_meta(
+        oct_key("kid-oct", b"shared-secret", Some("sig"), Some(&["sign"])),
+        &["HS256"],
+        &["RS256", "HS256"],
+        &token_spec(None, NOW_MS + 60_000),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, OidcError::AlgorithmRefused { ref jwk, .. } if jwk.is_empty()));
+
+    // `alg = "none"` with an empty signature is never accepted.
+    let provider = Arc::new(MockProvider::new());
+    let clock = Arc::new(ManualClock::new(NOW_MS));
+    let adapter = adapter(provider, clock);
+    let token = alg_none_token(&token_spec(None, NOW_MS + 60_000));
+    let err = adapter
+        .verify_id_token(&token, &expectations(None, NOW_MS))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, OidcError::AlgorithmRefused { ref alg, .. } if alg == "none"),
+        "{err}"
+    );
+}
+
+/// The configured algorithm policy is strict at construction: empty lists,
+/// `none` and unsupported names are refused before any request; the default
+/// is RS256-only.
+#[test]
+fn configured_algorithm_policy_is_strict_at_construction() {
+    assert!(NetworkOidcConfig::validate_allowed_algorithms(&[]).is_err());
+    assert!(NetworkOidcConfig::validate_allowed_algorithms(&["none".to_string()]).is_err());
+    assert!(NetworkOidcConfig::validate_allowed_algorithms(&["HS512".to_string()]).is_err());
+    assert!(NetworkOidcConfig::validate_allowed_algorithms(&["hs256".to_string()]).is_err());
+    assert!(NetworkOidcConfig::validate_allowed_algorithms(&[
+        "RS256".to_string(),
+        "HS256".to_string(),
+    ])
+    .is_ok());
+    assert_eq!(NetworkOidcConfig::default().allowed_algorithms, ["RS256"]);
+    let provider = Arc::new(MockProvider::new());
+    let clock = Arc::new(ManualClock::new(NOW_MS));
+    let err = NetworkOidcAdapter::new(provider, clock, config_with_algs(&["none"])).unwrap_err();
+    assert!(err.to_string().contains("none"), "{err}");
+}
+
+// --------------------------------------------------------- adversarial: azp
+
+/// An `azp` claim that contradicts the expected client is refused, a
+/// multi-valued `aud` REQUIRES `azp == client_id`, and a single-valued `aud`
+/// with a present `azp` must still match.
+#[tokio::test]
+async fn multi_valued_audience_requires_matching_azp_and_azp_always_must_match() {
+    let provider = Arc::new(MockProvider::new());
+    let clock = Arc::new(ManualClock::new(NOW_MS));
+    let adapter = adapter(provider.clone(), clock);
+    let multi = MockAudience::Multi(vec![CLIENT.into(), "other-client".into()]);
+
+    // Multi-valued aud without azp: refused (client_id occurring in aud is
+    // never sufficient).
+    let token = provider.sign(&MockTokenSpec {
+        audience: multi.clone(),
+        ..token_spec(None, NOW_MS + 60_000)
+    });
+    assert_eq!(
+        adapter
+            .verify_id_token(&token, &expectations(None, NOW_MS))
+            .await
+            .unwrap_err(),
+        OidcError::WrongAzp {
+            expected: CLIENT.into(),
+            actual: None,
+        }
+    );
+
+    // Multi-valued aud with a wrong azp: refused.
+    let token = provider.sign(&MockTokenSpec {
+        audience: multi.clone(),
+        azp: Some("other-client".into()),
+        ..token_spec(None, NOW_MS + 60_000)
+    });
+    assert_eq!(
+        adapter
+            .verify_id_token(&token, &expectations(None, NOW_MS))
+            .await
+            .unwrap_err(),
+        OidcError::WrongAzp {
+            expected: CLIENT.into(),
+            actual: Some("other-client".into()),
+        }
+    );
+
+    // Multi-valued aud with the correct azp: accepted.
+    let token = provider.sign(&MockTokenSpec {
+        audience: multi.clone(),
+        azp: Some(CLIENT.into()),
+        ..token_spec(None, NOW_MS + 60_000)
+    });
+    let claims = adapter
+        .verify_id_token(&token, &expectations(None, NOW_MS))
+        .await
+        .unwrap();
+    assert_eq!(claims.audience, [CLIENT, "other-client"]);
+
+    // A multi-valued aud that does not even contain the client id is a
+    // WrongAudience regardless of azp.
+    let token = provider.sign(&MockTokenSpec {
+        audience: MockAudience::Multi(vec!["other-client".into(), "third".into()]),
+        azp: Some(CLIENT.into()),
+        ..token_spec(None, NOW_MS + 60_000)
+    });
+    assert!(matches!(
+        adapter
+            .verify_id_token(&token, &expectations(None, NOW_MS))
+            .await
+            .unwrap_err(),
+        OidcError::WrongAudience { .. }
+    ));
+
+    // Single-valued aud with a wrong azp: refused.
+    let token = provider.sign(&MockTokenSpec {
+        azp: Some("other-client".into()),
+        ..token_spec(None, NOW_MS + 60_000)
+    });
+    assert_eq!(
+        adapter
+            .verify_id_token(&token, &expectations(None, NOW_MS))
+            .await
+            .unwrap_err(),
+        OidcError::WrongAzp {
+            expected: CLIENT.into(),
+            actual: Some("other-client".into()),
+        }
+    );
+
+    // Single-valued aud with the matching azp: accepted.
+    let token = provider.sign(&MockTokenSpec {
+        azp: Some(CLIENT.into()),
+        ..token_spec(None, NOW_MS + 60_000)
+    });
+    assert!(adapter
+        .verify_id_token(&token, &expectations(None, NOW_MS))
+        .await
+        .is_ok());
+
+    // An `aud` array with a non-text entry is malformed, never partially
+    // honored.
+    let mut payload = token_spec(None, NOW_MS + 60_000).payload();
+    payload["aud"] = serde_json::json!([CLIENT, 7]);
+    let token = provider.sign_payload(&payload);
+    assert!(matches!(
+        adapter
+            .verify_id_token(&token, &expectations(None, NOW_MS))
+            .await
+            .unwrap_err(),
+        OidcError::Malformed(_)
+    ));
+
+    // A non-text azp is malformed too.
+    let mut payload = token_spec(None, NOW_MS + 60_000).payload();
+    payload["azp"] = serde_json::json!(7);
+    let token = provider.sign_payload(&payload);
+    assert!(matches!(
+        adapter
+            .verify_id_token(&token, &expectations(None, NOW_MS))
+            .await
+            .unwrap_err(),
+        OidcError::Malformed(_)
+    ));
+}
+
+// --------------------------------------------------------- adversarial: time
+
+/// i64::MAX/MIN time claims and extreme skews cannot overflow: impossible
+/// millisecond conversions are typed refusals and every comparison is
+/// i128-exact.
+#[tokio::test]
+async fn extreme_time_claims_are_typed_outcomes_never_overflow() {
+    let provider = Arc::new(MockProvider::new());
+    let clock = Arc::new(ManualClock::new(NOW_MS));
+    let adapter = adapter(provider.clone(), clock);
+
+    // exp = i64::MAX seconds cannot be represented in milliseconds.
+    let spec = MockTokenSpec {
+        exp_s: Some(i64::MAX),
+        ..token_spec(None, NOW_MS + 60_000)
+    };
+    let token = provider.sign(&spec);
+    assert_eq!(
+        adapter
+            .verify_id_token(&token, &expectations(None, NOW_MS))
+            .await
+            .unwrap_err(),
+        OidcError::TimestampOutOfRange {
+            claim: "exp".into(),
+            value: i64::MAX,
+        }
+    );
+
+    // iat = i64::MIN seconds cannot be represented in milliseconds either.
+    let spec = MockTokenSpec {
+        iat_s: Some(i64::MIN),
+        ..token_spec(None, NOW_MS + 60_000)
+    };
+    let token = provider.sign(&spec);
+    assert_eq!(
+        adapter
+            .verify_id_token(&token, &expectations(None, NOW_MS))
+            .await
+            .unwrap_err(),
+        OidcError::TimestampOutOfRange {
+            claim: "iat".into(),
+            value: i64::MIN,
+        }
+    );
+
+    // exp = i64::MIN seconds is refused the same way (multiplication
+    // underflows).
+    let spec = MockTokenSpec {
+        exp_s: Some(i64::MIN),
+        ..token_spec(None, NOW_MS + 60_000)
+    };
+    let token = provider.sign(&spec);
+    assert!(matches!(
+        adapter
+            .verify_id_token(&token, &expectations(None, NOW_MS))
+            .await
+            .unwrap_err(),
+        OidcError::TimestampOutOfRange { ref claim, .. } if claim == "exp"
+    ));
+
+    // A near-ceiling exp and a floor iat with i64::MAX skew stay in i128:
+    // the token is accepted without any wrap or panic.
+    let spec = MockTokenSpec {
+        exp_s: Some(i64::MAX / 1000),
+        iat_s: Some(i64::MIN / 1000),
+        ..token_spec(None, NOW_MS + 60_000)
+    };
+    let token = provider.sign(&spec);
+    let mut wide = expectations(None, 0);
+    wide.clock_skew_ms = i64::MAX;
+    adapter
+        .verify_id_token(&token, &wide)
+        .await
+        .expect("an i128 skew window cannot overflow");
+
+    // The same floor exp with now = i64::MAX and i64::MAX skew is a typed
+    // Expired (not an overflow).
+    let spec = MockTokenSpec {
+        exp_s: Some(i64::MIN / 1000),
+        ..token_spec(None, NOW_MS + 60_000)
+    };
+    let token = provider.sign(&spec);
+    let mut wide = expectations(None, i64::MAX);
+    wide.clock_skew_ms = i64::MAX;
+    assert_eq!(
+        adapter.verify_id_token(&token, &wide).await.unwrap_err(),
+        OidcError::Expired
+    );
 }

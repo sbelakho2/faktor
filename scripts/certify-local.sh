@@ -497,6 +497,10 @@ section_install_matrix() {
 # into the certification evidence when a certificate is present.
 #   UPDATE_MANIFEST_CHANNEL  stable|beta|dev (default stable)
 #   FAKTOR_UPDATE_URL_BASE   distribution URL base for artifact urls
+#   FAKTOR_UPDATE_RELEASE_GENERATION  the signed anti-rollback counter
+#                            (`release_generation`) folded into the manifest;
+#                            omit it only for a one-time legacy manifest the
+#                            updater admits via allow_legacy_manifests_once
 #   PACKAGE_REQUIRE_SIGNED=1 refuse to publish an OS-unsigned release (the
 #                            same policy flag the packaging section reads)
 section_update_manifest() {

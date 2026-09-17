@@ -50,6 +50,7 @@ pub fn build_sso_authority(
         max_jwks_refetches: cfg
             .max_jwks_refetches
             .unwrap_or(faktor_cloud::NetworkOidcConfig::default().max_jwks_refetches),
+        allowed_algorithms: cfg.allowed_algorithms()?,
         ..Default::default()
     };
     if let Some(name) = cfg.client_secret.as_deref() {

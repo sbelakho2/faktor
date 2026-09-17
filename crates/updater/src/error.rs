@@ -87,6 +87,34 @@ pub enum UpdateError {
     NotFound(String),
     #[error("update operation refused: {0}")]
     Conflict(String),
+    /// The signed release is BELOW the durable per-channel high-water mark:
+    /// a replay/rollback attempt, refused with both generations named. The
+    /// only way past this floor is an explicitly authorized downgrade.
+    #[error(
+        "rollback refused on channel {channel:?}: the signed release generation {offered} is below the durable high-water mark {high_water}"
+    )]
+    RollbackRefused {
+        channel: String,
+        high_water: u64,
+        offered: u64,
+    },
+    /// A legacy manifest (no signed `release_generation`, treated as
+    /// generation 0) was offered where the documented legacy rule does not
+    /// admit it (allowance disabled, already consumed, or a downgrade
+    /// target).
+    #[error("legacy manifest refused on channel {channel:?}: {detail}")]
+    LegacyManifestRefused { channel: String, detail: String },
+    /// The bootstrap launcher refused to run the activated release (no
+    /// pointer, legacy pointer, empty trust anchor, unsigned/unknown-key/
+    /// tampered release manifest, or a digest mismatch). The running process
+    /// is never replaced by an unauthenticated binary.
+    #[error("release launch refused: {detail}")]
+    LaunchRefused { detail: String },
+    /// The supervised restart step failed (or reported a digest that is not
+    /// the activated release). The pointer is rolled back and the previous
+    /// binary restarted; this names the failure.
+    #[error("release restart failed: {detail}")]
+    RestartFailed { detail: String },
     #[error("the updater store is unavailable: {0}")]
     Backend(String),
 }
@@ -108,6 +136,10 @@ impl UpdateError {
             UpdateError::Install(_) => "install_error",
             UpdateError::NotFound(_) => "not_found",
             UpdateError::Conflict(_) => "conflict",
+            UpdateError::RollbackRefused { .. } => "rollback_refused",
+            UpdateError::LegacyManifestRefused { .. } => "legacy_manifest_refused",
+            UpdateError::LaunchRefused { .. } => "launch_refused",
+            UpdateError::RestartFailed { .. } => "restart_failed",
             UpdateError::Backend(_) => "internal",
         }
     }
@@ -128,6 +160,10 @@ impl UpdateError {
             UpdateError::Install(_) => 500,
             UpdateError::NotFound(_) => 404,
             UpdateError::Conflict(_) => 409,
+            UpdateError::RollbackRefused { .. } => 409,
+            UpdateError::LegacyManifestRefused { .. } => 409,
+            UpdateError::LaunchRefused { .. } => 409,
+            UpdateError::RestartFailed { .. } => 500,
         }
     }
 
@@ -222,5 +258,27 @@ mod tests {
         }
         .retryable());
         assert!(!UpdateError::NothingStaged.retryable());
+    }
+
+    #[test]
+    fn anti_rollback_refusals_are_typed_and_never_retryable() {
+        let rollback = UpdateError::RollbackRefused {
+            channel: "stable".into(),
+            high_water: 9,
+            offered: 4,
+        };
+        assert_eq!(rollback.code(), "rollback_refused");
+        assert_eq!(rollback.http_status(), 409);
+        assert!(!rollback.retryable());
+        assert!(rollback.to_string().contains("9"), "{rollback}");
+        assert!(rollback.to_string().contains('4'), "{rollback}");
+        assert!(rollback.to_string().contains("stable"), "{rollback}");
+        let legacy = UpdateError::LegacyManifestRefused {
+            channel: "beta".into(),
+            detail: "allowance disabled".into(),
+        };
+        assert_eq!(legacy.code(), "legacy_manifest_refused");
+        assert_eq!(legacy.http_status(), 409);
+        assert!(!legacy.retryable());
     }
 }

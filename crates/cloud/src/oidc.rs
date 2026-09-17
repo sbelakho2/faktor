@@ -129,6 +129,31 @@ pub enum OidcError {
     WrongIssuer { expected: String, actual: String },
     #[error("oidc id token audience does not include {expected:?}")]
     WrongAudience { expected: String },
+    /// The header `alg` is not in the intersection of the discovery set, the
+    /// signing key's own constraints and the configured allowed algorithms
+    /// (each set is named so the refusal is diagnosable without guessing).
+    #[error(
+        "oidc id token alg {alg:?} is refused: discovery advertises {discovery:?}, \
+         the signing key permits {jwk:?}, the configuration allows {configured:?}"
+    )]
+    AlgorithmRefused {
+        alg: String,
+        discovery: Vec<String>,
+        jwk: Vec<String>,
+        configured: Vec<String>,
+    },
+    /// The `azp` (authorized party) claim is missing where required (a
+    /// multi-valued `aud`) or names a party other than the expected client.
+    #[error("oidc id token azp {actual:?} does not match the authorized party {expected:?}")]
+    WrongAzp {
+        expected: String,
+        actual: Option<String>,
+    },
+    /// A numeric time claim (`exp`/`iat`) cannot be represented in
+    /// milliseconds without overflowing — impossible, refused typed instead
+    /// of wrapping or panicking.
+    #[error("oidc id token claim {claim:?} value {value} is out of the representable range")]
+    TimestampOutOfRange { claim: String, value: i64 },
     #[error("oidc id token nonce does not match")]
     NonceMismatch,
     #[error("oidc login state is unknown, expired or already used")]

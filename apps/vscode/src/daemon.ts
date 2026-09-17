@@ -1,16 +1,25 @@
 // The Faktor daemon lifecycle (extracted from the launcher-only
 // extension.ts):
 //
-//  1. Find the platform binary (env FAKTOR_BIN, else target/debug or
-//     target/release relative to the workspace root).
-//  2. Generate a 64-hex FAKTOR_SERVER_PASSWORD and spawn
-//     `faktor-cli serve --port 0` with it in the environment.
+//  1. Resolve the executable. An explicit `binaryPath`/FAKTOR_BIN wins;
+//     otherwise, when an INSTALL LAYOUT exists at the install root
+//     (`<root>/launcher` beside a `current` pointer or `versions/`), the
+//     STABLE BOOTSTRAP LAUNCHER is spawned: it authenticates the activated
+//     release through the signed pointer and execs exactly those bytes, so
+//     an updater activation actually controls which binary runs. Only when
+//     NO install layout is present does resolution fall back to the legacy
+//     target/debug|release/faktor-cli lookup.
+//  2. Generate a 64-hex FAKTOR_SERVER_PASSWORD and spawn the resolved
+//     executable with `serve --port 0` and it in the environment.
 //  3. Read stdout line-by-line until the EXACT frozen startup line
 //     `/faktor server listening on http:\/\/127\.0\.0\.1:(\d+)/`, resolve
 //     the port, and build the Faktor-native bearer claim
 //     (`Authorization: Bearer <password>`). Basic/compat auth forms were
 //     removed with the auth cutover; there is no downgrade path.
-//  4. Expose health() against GET /global/health.
+//  4. Expose health() against GET /global/health. The daemon's health
+//     `version` carries `+release.<id>.<digest>` whenever it was launched
+//     through the bootstrap; `releaseDigest` surfaces that digest so a
+//     supervisor can observe WHICH artifact is live.
 //
 // Deliberately dependency-free (node:http only; no axios, no vscode
 // import — the caller supplies the workspace root). The daemon never
@@ -20,6 +29,7 @@ import * as http from 'node:http';
 import * as crypto from 'node:crypto';
 import { ChildProcess, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 export const STARTUP_LINE = /faktor server listening on http:\/\/127\.0\.0\.1:(\d+)/;
@@ -32,10 +42,17 @@ const MAX_HEALTH_BODY_BYTES = 64 * 1024;
 export interface DaemonOptions {
   /** Workspace root used to locate target/debug|release/faktor-cli. */
   readonly workspaceRoot: string;
-  /** Explicit binary override (config `faktor.binaryPath` or FAKTOR_BIN). */
+  /** Explicit binary override (config `faktor.binaryPath` or FAKTOR_BIN).
+   * Wins over the bootstrap: an explicit operator path is never silently
+   * replaced. */
   readonly binaryPath?: string;
   /** Optional `--data-dir` for the daemon (config `faktor.dataDir`). */
   readonly dataDir?: string;
+  /** The install root holding the immutable release layout (`current`,
+   * `launcher`, `versions/`, `trusted-keys.json`). Defaults to
+   * `<dataDir>/install`, or `~/.faktor/install` when no data dir is
+   * configured (the daemon's own default data dir). */
+  readonly installRoot?: string;
   /** Extra argv appended after `serve --port 0`. */
   readonly extraArgs?: readonly string[];
   readonly startupTimeoutMs?: number;
@@ -45,6 +62,10 @@ export interface DaemonOptions {
 export interface DaemonHealth {
   readonly ok: boolean;
   readonly version: string;
+  /** The release digest the running daemon reports (verified by the stable
+   * bootstrap launcher). `null` when the daemon was not started through an
+   * install layout — an honest absence, never a guess. */
+  readonly releaseDigest: string | null;
 }
 
 export interface DaemonHandle {
@@ -85,6 +106,50 @@ export function findBinary(options: DaemonOptions): string {
   );
 }
 
+/** The install root this launcher resolves through. */
+export function installRootFor(options: DaemonOptions): string {
+  if (options.installRoot && options.installRoot.length > 0) {
+    return options.installRoot;
+  }
+  if (options.dataDir && options.dataDir.length > 0) {
+    return join(options.dataDir, 'install');
+  }
+  return join(homedir(), '.faktor', 'install');
+}
+
+/**
+ * The stable bootstrap launcher when an install layout exists:
+ * `<installRoot>/launcher` beside a `current` pointer or a `versions/`
+ * directory. `null` when no layout is present, in which case the caller
+ * falls back to the legacy binary resolution. The bootstrap itself refuses
+ * an unsigned/tampered release or a digest mismatch (exit 3); it never
+ * falls back to another binary.
+ */
+export function bootstrapBinary(options: DaemonOptions): string | null {
+  const root = installRootFor(options);
+  const launcher = join(root, 'launcher');
+  if (!existsSync(launcher)) {
+    return null;
+  }
+  if (!existsSync(join(root, 'current')) && !existsSync(join(root, 'versions'))) {
+    return null;
+  }
+  return launcher;
+}
+
+/**
+ * The executable to spawn: an explicit operator override first, then the
+ * bootstrap launcher when an install layout exists, then the legacy
+ * workspace lookup. Exactly one of those decides.
+ */
+export function resolveExecutable(options: DaemonOptions): string {
+  const explicit = options.binaryPath ?? process.env.FAKTOR_BIN;
+  if (explicit && explicit.length > 0) {
+    return explicit;
+  }
+  return bootstrapBinary(options) ?? findBinary(options);
+}
+
 export function isRunning(): boolean {
   return activeHandle !== null && activeHandle.alive();
 }
@@ -101,7 +166,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   if (activeHandle && activeHandle.alive()) {
     return activeHandle;
   }
-  const bin = findBinary(options);
+  const bin = resolveExecutable(options);
   const password = crypto.randomBytes(32).toString('hex');
   const args = ['serve', '--port', '0'];
   if (options.dataDir && options.dataDir.length > 0) {
@@ -284,9 +349,14 @@ function health(port: number, password: string): Promise<DaemonHealth> {
             reject(new Error('health check failed: unexpected response shape'));
             return;
           }
+          const version = (parsed as { version: string }).version;
           resolveHealth({
             ok: (parsed as { ok: boolean }).ok,
-            version: (parsed as { version: string }).version,
+            version,
+            // The daemon folds the bootstrap-verified release digest into the
+            // health version (`<pkg>+release.<id>.<digest>`). Absence is an
+            // honest null, never a guess.
+            releaseDigest: releaseDigestOf(version),
           });
         });
       },
@@ -297,6 +367,12 @@ function health(port: number, password: string): Promise<DaemonHealth> {
     req.on('error', (err) => reject(err));
     req.end();
   });
+}
+
+/** The release digest folded into a daemon health version, if any. */
+export function releaseDigestOf(version: string): string | null {
+  const match = /\+release\.([A-Za-z0-9._+-]+)\.([0-9a-f]{64})$/.exec(version);
+  return match ? match[2]! : null;
 }
 
 /** A byte-bounded ring buffer (no unbounded stderr in RAM). */

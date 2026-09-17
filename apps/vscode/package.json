@@ -80,6 +80,11 @@
           "default": "",
           "description": "Persistent daemon data directory; empty uses the daemon default."
         },
+        "faktor.installRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Install root holding the immutable release layout (current, launcher, versions/). When a layout exists there the daemon is spawned through the stable bootstrap launcher, so the activated release and only that release runs; empty resolves to <faktor.dataDir>/install (or ~/.faktor/install), with the legacy binary lookup as the fallback when no layout exists."
+        },
         "faktor.extraArgs": {
           "type": "array",
           "items": {

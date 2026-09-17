@@ -1,4 +1,5 @@
-//! The native updater surface: status, check, stage, apply, rollback.
+//! The native updater surface: status, check, stage, apply, rollback and the
+//! explicitly authorized downgrade.
 //!
 //! Contract:
 //!
@@ -7,14 +8,23 @@
 //!   update is a role-gated control-plane operation: `updater.read` needs the
 //!   viewer role, `updater.stage` the member role, and `updater.apply` the
 //!   ADMIN role. There is no anonymous apply;
+//! - the anti-rollback floor refuses older signed manifests at
+//!   check/stage/apply with a typed `rollback_refused` naming both
+//!   generations. The ONLY way below the floor is
+//!   `POST /native/updater/downgrade` (ADMIN + `confirm: true` +
+//!   Idempotency-Key), which records a durable `downgrade` operation row on
+//!   the updater's existing audit path (actor, before/after versions and
+//!   digests, signed release generation) BEFORE any effect and resets the
+//!   high-water mark only after the swap and its health probe succeed;
 //! - when the `[updater]` section is disabled (the default), every route
 //!   answers a typed 409 `updater_disabled` and NOTHING else in the daemon
 //!   changes; when the updater is enabled but the control plane is not, the
 //!   routes answer a typed 409 `cloud_disabled` (role gating needs a
 //!   principal);
-//! - mutating routes (`stage`/`apply`/`rollback`) require an
-//!   `Idempotency-Key` header (bounded, printable ASCII); `apply` also
-//!   requires `confirm: true` — an update is never applied by accident;
+//! - mutating routes (`stage`/`apply`/`rollback`/`downgrade`) require an
+//!   `Idempotency-Key` header (bounded, printable ASCII); `apply` and
+//!   `downgrade` also require `confirm: true` — an update is never applied
+//!   by accident;
 //! - the manifest travels in the request body and is verified from those
 //!   exact bytes (signature, expiry, channel, compatibility) before anything
 //!   is downloaded, staged or swapped.
@@ -198,6 +208,74 @@ pub(crate) async fn native_updater_rollback(
     }
 }
 
+/// `POST /native/updater/downgrade` (ADMIN, Idempotency-Key, `confirm:
+/// true`) — the ONLY path below the durable anti-rollback high-water mark.
+/// The operator supplies the OLDER signed manifest; the service authenticates
+/// it exactly like an update (it must carry an explicit signed
+/// `release_generation`), records a durable `downgrade` operation row — the
+/// updater's existing audit path, naming the control-plane actor, the
+/// before/after versions + digests and the signed generation — BEFORE any
+/// effect, and resets the high-water mark to the downgraded generation only
+/// after the swap and its health probe succeed.
+pub(crate) async fn native_updater_downgrade(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<DowngradeBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let principal = match updater_gate(&state, &headers, Action::UpdaterApply, true) {
+        Ok(principal) => principal,
+        Err(e) => return wire_status(e),
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return wire_status(malformed_body(
+                "invalid updater downgrade body (strict DTO)",
+            ))
+        }
+    };
+    if !body.confirm {
+        return wire_status(ApiError {
+            code: "confirmation_required",
+            message: "downgrade requires {\"confirm\": true}: the anti-rollback floor is never \
+                      bypassed implicitly"
+                .into(),
+            http_status: 400,
+            retryable: false,
+        });
+    }
+    let key = match idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(e) => return wire_status(e),
+    };
+    let Some(updater) = state.deps.updater.as_ref() else {
+        return wire_status(updater_disabled());
+    };
+    let running = match resolve_components(updater, &body.components) {
+        Ok(running) => running,
+        Err(e) => return wire_status(e),
+    };
+    let bytes = match manifest_bytes(&body.manifest) {
+        Ok(bytes) => bytes,
+        Err(e) => return wire_status(e),
+    };
+    let actor = actor_label(&principal);
+    match updater
+        .downgrade(&bytes, &running, Some(&key), Some(&actor), now_ms())
+        .await
+    {
+        Ok(outcome) => Json(serde_json::json!({ "ok": true, "apply": outcome })).into_response(),
+        Err(e) => wire_status(update_err(e)),
+    }
+}
+
+/// The bounded audit label of one control-plane principal (the durable
+/// `downgrade` row records it as the authorizing actor).
+fn actor_label(principal: &faktor_cloud::Principal) -> String {
+    let actor = faktor_cloud::AuditPrincipal::from_principal(principal);
+    format!("{}:{}", actor.kind.as_str(), actor.id)
+}
+
 // ------------------------------------------------------------------ DTOs
 
 #[derive(Debug, Deserialize)]
@@ -233,6 +311,18 @@ pub(crate) struct ApplyBody {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RollbackBody {
     confirm: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DowngradeBody {
+    confirm: bool,
+    /// The OLDER signed manifest to install; it must carry an explicit
+    /// signed `release_generation` (a legacy manifest can never bypass the
+    /// floor because its generation cannot be authenticated).
+    manifest: serde_json::Value,
+    #[serde(default)]
+    components: Option<ComponentsBody>,
 }
 
 // -------------------------------------------------------------- plumbing

@@ -610,15 +610,17 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
             post(native_approvals_decide),
         )
         // Signed updater surface (additive; disabled by default): status,
-        // check, stage, apply and rollback. Every route needs a control-plane
-        // principal (viewer for status/check, member for stage, ADMIN for
-        // apply/rollback); with no `[updater]` section wired every route
-        // answers a typed 409 `updater_disabled`.
+        // check, stage, apply, rollback and the explicitly authorized
+        // downgrade below the anti-rollback floor. Every route needs a
+        // control-plane principal (viewer for status/check, member for
+        // stage, ADMIN for apply/rollback/downgrade); with no `[updater]`
+        // section wired every route answers a typed 409 `updater_disabled`.
         .route("/native/updater/status", get(native_updater_status))
         .route("/native/updater/check", post(native_updater_check))
         .route("/native/updater/stage", post(native_updater_stage))
         .route("/native/updater/apply", post(native_updater_apply))
         .route("/native/updater/rollback", post(native_updater_rollback))
+        .route("/native/updater/downgrade", post(native_updater_downgrade))
         // Remote/VPC worker plane (additive; disabled by default). Worker
         // routes authenticate with a registration token (no daemon
         // password); operator routes ride the daemon password + a

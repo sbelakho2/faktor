@@ -230,6 +230,19 @@ fn override_network_probe(v: Option<NetworkEnforcement>) {
 #[path = "sandbox/linux.rs"]
 mod sandbox;
 
+/// Process-tree resource budgets: the authorization side of the terminal
+/// authority's `TerminalBudgets`. Linux cgroup v2 (with `prlimit`
+/// fallback), Windows Job Object limits, unix pre-exec rlimits and the wall
+/// watchdog — each limit's EFFECTIVE state is reported (`Enforced` /
+/// `Degraded` / `Unsupported` / `NotRequested`), never silently claimed.
+pub mod budget;
+
+/// The budget types the terminal authority persists and enforces.
+pub use budget::{
+    BudgetEnforcement, BudgetPlatform, BudgetRefusal, LimitState, TreeBudgetGuard, TreeBudgets,
+    WallWatchdog,
+};
+
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
     pub cmd: String,
@@ -672,6 +685,71 @@ impl ProcessSupervisor {
         cmd
     }
 
+    /// [`Self::command`] plus the pre-exec budget plan: on unix the
+    /// requested rlimits are installed AFTER the environment is applied and
+    /// BEFORE `exec`, so the whole tree inherits them (failures are
+    /// per-resource non-fatal; the effective report says which resources the
+    /// platform honors).
+    fn command_with_budgets(
+        &self,
+        cfg: &SpawnConfig,
+        budgets: Option<&TreeBudgets>,
+    ) -> std::process::Command {
+        let mut cmd = self.command(cfg);
+        #[cfg(unix)]
+        if let Some(budgets) = budgets {
+            budget::install_child_rlimits(&mut cmd, budgets);
+        }
+        #[cfg(not(unix))]
+        let _ = budgets;
+        cmd
+    }
+
+    /// The EFFECTIVE budget report of one spawn, applied post-spawn on top
+    /// of the pre-exec plan: Linux cgroup v2 (tree-wide memory/process
+    /// limits, race-free thanks to `cgroup.freeze`) when the unified
+    /// hierarchy is writable. The returned guard owns the cgroup cleanup and
+    /// must live exactly as long as the tree does.
+    fn apply_spawn_budgets(
+        &self,
+        pid: u32,
+        budgets: Option<&TreeBudgets>,
+    ) -> (BudgetEnforcement, Option<TreeBudgetGuard>) {
+        let Some(budgets) = budgets else {
+            return (BudgetEnforcement::default(), None);
+        };
+        let mut enforcement = budget::spawn_path_enforcement(budgets);
+        if budgets.wall_time_ms > 0 {
+            enforcement.wall = LimitState::Enforced;
+            enforcement.note(&format!(
+                "wall: the run deadline (min(caller deadline, {}ms wall budget)) kills the \
+                 whole group",
+                budgets.wall_time_ms
+            ));
+        }
+        if budgets.is_disabled() {
+            return (enforcement, None);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            match budget::enforce_tree_budgets(pid, budgets) {
+                Ok(guard) => {
+                    enforcement = enforcement.merge_best(guard.enforcement().clone());
+                    (enforcement, Some(guard))
+                }
+                Err(error) => {
+                    enforcement.note(&format!("post-spawn budget guard refused: {error}"));
+                    (enforcement, None)
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            (enforcement, None)
+        }
+    }
+
     /// Refuse the spawn when the live-child ceiling is reached: the caller
     /// holds `spawn_serial`, so admit→spawn→register is atomic and a spawn
     /// race can never overshoot the ceiling.
@@ -788,6 +866,34 @@ impl ProcessSupervisor {
         deadline: Duration,
         token: CancellationToken,
     ) -> Result<CommandOutput, Error> {
+        self.run_inner(cfg, None, deadline, token)
+            .await
+            .map(|(output, _enforcement)| output)
+    }
+
+    /// [`Self::run`] under an explicit process-tree budget (see
+    /// [`Self::run_sync_with_budgets`] for the enforcement semantics): the
+    /// requested limits are installed before `exec` (unix rlimits) and
+    /// upgraded post-spawn where the platform can do better (Linux cgroup
+    /// v2); the deadline is tightened to the requested wall budget. The
+    /// returned [`BudgetEnforcement`] is the EFFECTIVE per-limit state.
+    pub async fn run_with_budgets(
+        &self,
+        cfg: SpawnConfig,
+        budgets: TreeBudgets,
+        deadline: Duration,
+        token: CancellationToken,
+    ) -> Result<(CommandOutput, BudgetEnforcement), Error> {
+        self.run_inner(cfg, Some(budgets), deadline, token).await
+    }
+
+    async fn run_inner(
+        &self,
+        cfg: SpawnConfig,
+        budgets: Option<TreeBudgets>,
+        deadline: Duration,
+        token: CancellationToken,
+    ) -> Result<(CommandOutput, BudgetEnforcement), Error> {
         // The run OWNS the materialized cmd script (when lowering produced
         // one): deleted on every return path after the child is gone.
         let _cmd_script = CmdScriptGuard(materialized_cmd_script(&cfg));
@@ -797,17 +903,21 @@ impl ProcessSupervisor {
         use tokio::io::AsyncReadExt;
         use tokio::process::Command as TokioCommand;
 
-        let mut std_cmd = contain_on_create(self.command(&cfg));
+        let effective_deadline = budgets
+            .map(|budgets| budget::deadline_with_wall(deadline, &budgets))
+            .unwrap_or(deadline);
+        let mut std_cmd = contain_on_create(self.command_with_budgets(&cfg, budgets.as_ref()));
         if cfg.capture {
             std_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         } else {
             std_cmd.stdout(Stdio::null()).stderr(Stdio::null());
         }
         // Windows containment (before any process exists): the per-child
-        // kill-on-close job. The process is spawned CREATE_SUSPENDED, is
-        // assigned strictly, has membership verified while it cannot run,
-        // and is resumed LAST — an uncontained child is never exposed.
-        let containment = prepare_containment()?;
+        // kill-on-close job, carrying the requested budget limits when
+        // present. The process is spawned CREATE_SUSPENDED, is assigned
+        // strictly, has membership verified while it cannot run, and is
+        // resumed LAST — an unbudgeted, uncontained child is never exposed.
+        let containment = prepare_containment_with_limits(budgets.as_ref())?;
         let started_ms = now_ms();
         let mut cmd = TokioCommand::from(std_cmd);
         // Audit round 11: a DROPPED run() future (outer timeout/unwind) must
@@ -830,6 +940,7 @@ impl ProcessSupervisor {
                 .collect(),
             &cfg.owner,
         );
+        let (enforcement, _post_guard) = self.apply_spawn_budgets(pid, budgets.as_ref());
 
         let shared: Arc<Mutex<SharedCapture>> = Arc::new(Mutex::new(SharedCapture {
             ring: RingBuffer::new(RING_LINES),
@@ -919,7 +1030,7 @@ impl ProcessSupervisor {
         // descendant still owns the pipe -> terminate the OWNED tree (a
         // descendant holding our pipe means the group is alive, so the
         // pgid cannot have been recycled) -> bounded final drain -> finish.
-        let deadline_at = tokio::time::Instant::now() + deadline;
+        let deadline_at = tokio::time::Instant::now() + effective_deadline;
         let outcome = tokio::select! {
             s = child.wait() => RunOutcome::Exited(s.ok()),
             _ = tokio::time::sleep_until(deadline_at) => {
@@ -976,7 +1087,7 @@ impl ProcessSupervisor {
                 return Err(Error::timeout(format!(
                     "command {} exceeded its {}ms deadline",
                     cfg.cmd,
-                    deadline.as_millis()
+                    effective_deadline.as_millis()
                 )));
             }
             RunOutcome::Cancelled => {
@@ -1001,14 +1112,17 @@ impl ProcessSupervisor {
         if let Some(a) = &artifact {
             slice_hint = Some(format!("{a}?slice=0&len=1024"));
         }
-        Ok(CommandOutput {
-            excerpt,
-            exit_code,
-            artifact,
-            slice_hint,
-            ring_lines: RING_LINES,
-            artifact_truncated,
-        })
+        Ok((
+            CommandOutput {
+                excerpt,
+                exit_code,
+                artifact,
+                slice_hint,
+                ring_lines: RING_LINES,
+                artifact_truncated,
+            },
+            enforcement,
+        ))
     }
 
     /// Stream a child pipe into a bounded head: read incrementally, keep at
@@ -1071,17 +1185,51 @@ impl ProcessSupervisor {
         stdout_cap: usize,
         stderr_cap: usize,
     ) -> Result<SyncRunOutput, Error> {
+        self.run_sync_inner(cfg, None, deadline, stdout_cap, stderr_cap)
+            .map(|(output, _enforcement)| output)
+    }
+
+    /// [`Self::run_sync`] under an explicit process-tree budget: the
+    /// requested limits are installed BEFORE `exec` (unix rlimits where the
+    /// platform honors them) and upgraded where the platform can do better
+    /// (Linux cgroup v2 when the unified hierarchy is writable); the run
+    /// deadline is tightened to the requested wall budget. The returned
+    /// [`BudgetEnforcement`] is the EFFECTIVE per-limit state — `Enforced`,
+    /// `Degraded`, `Unsupported` (typed) or `NotRequested`, never a silent
+    /// claim.
+    pub fn run_sync_with_budgets(
+        &self,
+        cfg: SpawnConfig,
+        budgets: TreeBudgets,
+        deadline: Duration,
+        stdout_cap: usize,
+        stderr_cap: usize,
+    ) -> Result<(SyncRunOutput, BudgetEnforcement), Error> {
+        self.run_sync_inner(cfg, Some(budgets), deadline, stdout_cap, stderr_cap)
+    }
+
+    fn run_sync_inner(
+        &self,
+        cfg: SpawnConfig,
+        budgets: Option<TreeBudgets>,
+        deadline: Duration,
+        stdout_cap: usize,
+        stderr_cap: usize,
+    ) -> Result<(SyncRunOutput, BudgetEnforcement), Error> {
         // The run OWNS the materialized cmd script (when lowering produced
         // one): deleted on every return path after the child is gone.
         let _cmd_script = CmdScriptGuard(materialized_cmd_script(&cfg));
         if cfg.network_isolation == NetworkIsolation::DenyAll {
             isolation_gate(&cfg)?;
         }
+        let effective_deadline = budgets
+            .map(|budgets| budget::deadline_with_wall(deadline, &budgets))
+            .unwrap_or(deadline);
         let argv = format!("{} {}", cfg.cmd, cfg.args.join(" "))
             .chars()
             .take(300)
             .collect();
-        let mut cmd = contain_on_create(self.command(&cfg));
+        let mut cmd = contain_on_create(self.command_with_budgets(&cfg, budgets.as_ref()));
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1090,8 +1238,9 @@ impl ProcessSupervisor {
             let _serial = self.spawn_serial.lock().unwrap();
             self.admit()?;
             // Windows containment: job BEFORE process, spawn suspended,
-            // assign strictly, verify membership, resume LAST.
-            let containment = prepare_containment()?;
+            // assign strictly, verify membership, resume LAST. Budgets are
+            // part of the job, so limits exist before the child can run.
+            let containment = prepare_containment_with_limits(budgets.as_ref())?;
             #[allow(unused_mut)]
             let mut child = cmd.spawn().map_err(|e| spawn_failure(&cfg, e))?;
             #[cfg(windows)]
@@ -1103,6 +1252,7 @@ impl ProcessSupervisor {
             self.timeline_spawn(id, pid, argv, &cfg.owner);
             (child, pid, id)
         };
+        let (enforcement, _post_guard) = self.apply_spawn_budgets(pid, budgets.as_ref());
         // Dedicated reader threads: bounded head per stream, remainder
         // drained, then ONE send. Reads can never block the caller past
         // the bounded settles below.
@@ -1137,7 +1287,7 @@ impl ProcessSupervisor {
                 let _ = exit_tx.send(code);
             });
         }
-        let (exit_code, timed_out) = match exit_rx.recv_timeout(deadline) {
+        let (exit_code, timed_out) = match exit_rx.recv_timeout(effective_deadline) {
             Ok(code) => (code, false),
             Err(_) => {
                 // Deadline fired: kill the OWNED tree (only while the child
@@ -1174,14 +1324,17 @@ impl ProcessSupervisor {
         }
         let (stdout_head, stdout_truncated) = out_head.unwrap_or_else(|| (String::new(), false));
         let (stderr_head, stderr_truncated) = err_head.unwrap_or_else(|| (String::new(), false));
-        Ok(SyncRunOutput {
-            exit_code,
-            timed_out,
-            stdout_head,
-            stderr_head,
-            stdout_truncated,
-            stderr_truncated,
-        })
+        Ok((
+            SyncRunOutput {
+                exit_code,
+                timed_out,
+                stdout_head,
+                stderr_head,
+                stdout_truncated,
+                stderr_truncated,
+            },
+            enforcement,
+        ))
     }
 
     /// Spawn with piped stdin/stdout/stderr (for MCP/LSP style servers).
@@ -1549,13 +1702,32 @@ fn contain_on_create(cmd: std::process::Command) -> std::process::Command {
 /// nothing to carry (the process group is the authority).
 #[cfg(windows)]
 fn prepare_containment() -> Result<ChildContainment, Error> {
-    Ok(ChildContainment {
-        job: win_spawn::create_job()?,
-    })
+    prepare_containment_with_limits(None)
 }
 
 #[cfg(not(windows))]
 fn prepare_containment() -> Result<ChildContainment, Error> {
+    Ok(ChildContainment)
+}
+
+/// [`prepare_containment`] with the requested tree budgets folded into the
+/// Windows Job Object (`PROCESS_MEMORY` / `ACTIVE_PROCESS`) so the limits
+/// exist BEFORE the suspended child is resumed. Off Windows the budgets are
+/// installed by the pre-exec rlimit plan instead.
+#[cfg(windows)]
+fn prepare_containment_with_limits(
+    budgets: Option<&TreeBudgets>,
+) -> Result<ChildContainment, Error> {
+    let limits = budgets.map(budget::job_limits_for).unwrap_or_default();
+    Ok(ChildContainment {
+        job: win_spawn::create_job_with_limits(limits)?,
+    })
+}
+
+#[cfg(not(windows))]
+fn prepare_containment_with_limits(
+    _budgets: Option<&TreeBudgets>,
+) -> Result<ChildContainment, Error> {
     Ok(ChildContainment)
 }
 
@@ -1592,7 +1764,7 @@ mod win_containment_policy {
 mod win_spawn {
     use std::os::windows::process::CommandExt;
 
-    use faktor_winjob::JobGuard;
+    use faktor_winjob::{JobGuard, JobLimits};
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SUSPEND_RESUME};
 
@@ -1618,6 +1790,19 @@ mod win_spawn {
         JobGuard::create_strict().map_err(|code| {
             Error::internal(format!(
                 "windows containment: CreateJobObject(KILL_ON_JOB_CLOSE) failed \
+                 (win32 error {code}); refusing the spawn"
+            ))
+        })
+    }
+
+    /// [`create_job`] with the requested Job Object resource limits
+    /// (`PROCESS_MEMORY` / `ACTIVE_PROCESS`): the job carries them BEFORE
+    /// the suspended child is assigned, so the tree is bounded from its
+    /// first instruction.
+    pub(super) fn create_job_with_limits(limits: JobLimits) -> Result<JobGuard, Error> {
+        JobGuard::create_with_limits_strict(limits).map_err(|code| {
+            Error::internal(format!(
+                "windows containment: CreateJobObject(memory/process limits) failed \
                  (win32 error {code}); refusing the spawn"
             ))
         })
@@ -4319,16 +4504,27 @@ mod containment_policy_tests {
             .expect("test module split");
         let contain = body(production, "fn contain_on_create(mut cmd:");
         assert!(contain.contains("suspend_on_create"));
+        // Every spawn entry point suspends on create: run/run_sync through
+        // the budget-aware command builder, spawn/detached through the plain
+        // env builder. The budget-aware form must still be contain_on_create.
+        let contain_calls = production
+            .matches("contain_on_create(self.command(&cfg))")
+            .count()
+            + production
+                .matches("contain_on_create(self.command_with_budgets(&cfg, budgets.as_ref()))")
+                .count();
         assert_eq!(
-            production
-                .matches("contain_on_create(self.command(&cfg))")
-                .count(),
-            4,
+            contain_calls, 4,
             "every spawn entry point (run/run_sync/spawn/detached) must suspend on create"
         );
+        // Every spawn entry point prepares the containment job (with budget
+        // limits where requested) before spawning.
+        let prepare_calls = production.matches("prepare_containment()?").count()
+            + production
+                .matches("prepare_containment_with_limits(budgets.as_ref())?")
+                .count();
         assert_eq!(
-            production.matches("prepare_containment()?").count(),
-            4,
+            prepare_calls, 4,
             "every spawn entry point must prepare the containment job before spawning"
         );
     }

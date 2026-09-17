@@ -11,6 +11,10 @@
 # Artifacts (under $PACKAGE_ARTIFACT_DIR, default target/certification/artifacts):
 #   faktor-cli-<version>-<os>-<arch>.tar.gz   daemon bundle: bin/faktor-cli,
 #                                             checksums.txt, RELEASE
+#   faktor-cli-<version>-<os>-<arch>          the RAW daemon binary (additive):
+#                                             the artifact the immutable
+#                                             release layout installs as
+#                                             versions/<release-id>/faktor
 #   faktor-<version>.vsix                     VS Code extension (vsce package)
 #   faktor-jetbrains-plugin-<version>.zip     copy of the Gradle plugin zip
 #
@@ -52,7 +56,20 @@
 # evidence via scripts/update-manifest.mjs: with FAKTOR_UPDATE_SIGNING_KEY
 # set the manifest is signed (and --require-signed fails the packaging run
 # if signing breaks); without it the manifest is written explicitly UNSIGNED.
-# Node absent => the step is recorded as skipped, never silently claimed.
+# FAKTOR_UPDATE_RELEASE_GENERATION (env, passed through to
+# update-manifest.mjs) records the signed anti-rollback counter
+# `release_generation`; absent it the manifest is a legacy generation-0
+# manifest the updater only admits via [updater]
+# allow_legacy_manifests_once. Node absent => the step is recorded as
+# skipped, never silently claimed.
+#
+# Additively (step 6) the immutable release layout tree is staged under
+# $OUT_DIR/install/versions/<release-id>/{faktor,manifest}, with
+# release-id = <version>-<raw binary sha256[..12]> (the exact derivation of
+# crates/updater::release::release_id_for). The signed update manifest MUST
+# carry the raw binary's digest or the step refuses: the bootstrap launcher
+# re-verifies that binding at every launch, so a doctored staging tree can
+# never be activated.
 #
 # Exit non-zero when the daemon bundle cannot be produced, when a VSIX
 # packaging attempt fails for a non-environmental reason, when
@@ -290,6 +307,8 @@ VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml 2>/dev/null | head -n
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
 BUNDLE_NAME="faktor-cli-$VERSION-$OS-$ARCH.tar.gz"
+RAW_NAME="faktor-cli-$VERSION-$OS-$ARCH"
+RAW_SHA=""
 
 printf '[package] commit=%s dirty=%s version=%s host=%s/%s\n' \
     "$COMMIT" "$DIRTY" "$VERSION" "$OS" "$ARCH"
@@ -350,6 +369,21 @@ if [ "$CARGO_OK" = "1" ]; then
     else
         add_artifact "$BUNDLE_NAME" daemon-bundle "$BUNDLE_PATH" "failed" \
             "tar -czf failed while bundling target/release/faktor-cli"
+        FATAL=1
+    fi
+    # Additive RAW daemon binary artifact (the immutable release layout
+    # installs exactly these bytes as versions/<release-id>/faktor). Identical
+    # to the bundle's signed inner binary; the signed update manifest must
+    # carry this digest for the release layout to be launchable.
+    RAW_PATH="$ART_DIR/$RAW_NAME"
+    if cp "$STAGE/bin/faktor-cli" "$RAW_PATH" && chmod +x "$RAW_PATH" 2>/dev/null; then
+        sign_artifact "$RAW_NAME" "$RAW_PATH" daemon-binary "file"
+        RAW_SHA="$(hash_file "$RAW_PATH" 2>/dev/null || printf unknown)"
+        add_artifact "$RAW_NAME" daemon-binary "$RAW_PATH" "built" \
+            "raw daemon binary for the immutable release layout; sha256=$RAW_SHA"
+    else
+        add_artifact "$RAW_NAME" daemon-binary "$RAW_PATH" "failed" \
+            "copy of the signed inner daemon binary failed"
         FATAL=1
     fi
 fi
@@ -567,6 +601,7 @@ emit_signatures >"$SIGNATURES.tmp" && mv "$SIGNATURES.tmp" "$SIGNATURES" || exit
 # 5. Signed update manifest (additive; assembled from this run).
 # ---------------------------------------------------------------------------
 UPDATE_MANIFEST="$OUT_DIR/update-manifest.json"
+UPDATE_MANIFEST_OK=0
 if [ "${PACKAGE_SKIP_UPDATE_MANIFEST:-0}" = "1" ]; then
     printf '[package] update-manifest: skipped (PACKAGE_SKIP_UPDATE_MANIFEST=1)\n'
 elif ! command -v node >/dev/null 2>&1; then
@@ -597,11 +632,48 @@ else
     if node "$ROOT/scripts/update-manifest.mjs" selftest \
         >"$LOG_DIR/package-update-manifest-selftest.log" 2>&1 &&
         um >>"$LOG_DIR/package-update-manifest.log" 2>&1; then
+        UPDATE_MANIFEST_OK=1
         printf '[package] update-manifest: %s\n' "$(rel_path "$UPDATE_MANIFEST")"
     else
         detail="$(first_error_line "$LOG_DIR/package-update-manifest.log")"
         [ -n "$detail" ] || detail="update-manifest assembly failed"
         printf '[package] update-manifest: FAILED %s\n' "$detail" >&2
+        FATAL=1
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Immutable release layout staging (additive): the tree the bootstrap
+#    launcher authenticates. versions/<release-id>/faktor is byte-identical
+#    to the raw daemon artifact and manifest is the signed update manifest;
+#    the step refuses when the manifest does not carry the raw digest
+#    (release-id = <version>-<raw sha256[..12]>, the exact Rust derivation).
+# ---------------------------------------------------------------------------
+if [ -z "$RAW_SHA" ] || [ "$RAW_SHA" = "unknown" ]; then
+    printf '[package] release-layout: skipped (no raw daemon binary this run)\n'
+elif [ "$UPDATE_MANIFEST_OK" != "1" ]; then
+    printf '[package] release-layout: skipped (no update manifest this run)\n'
+elif ! command -v node >/dev/null 2>&1; then
+    printf '[package] release-layout: skipped (node unavailable; cannot bind the manifest)\n'
+else
+    RELEASE_ID="$VERSION-$(printf '%s' "$RAW_SHA" | cut -c1-12)"
+    LAYOUT_DIR="$OUT_DIR/install/versions/$RELEASE_ID"
+    if node -e '
+        const fs = require("node:fs");
+        const [file, digest] = process.argv.slice(1);
+        const manifest = JSON.parse(fs.readFileSync(file, "utf8"));
+        if (manifest.schema !== "faktor-update/v1") process.exit(1);
+        if (!Array.isArray(manifest.artifacts)) process.exit(1);
+        process.exit(manifest.artifacts.some((a) => a && a.sha256 === digest) ? 0 : 1);
+    ' "$UPDATE_MANIFEST" "$RAW_SHA" 2>>"$LOG_DIR/package-release-layout.log"; then
+        mkdir -p "$LAYOUT_DIR" || FATAL=1
+        cp "$RAW_PATH" "$LAYOUT_DIR/faktor" && chmod +x "$LAYOUT_DIR/faktor" || FATAL=1
+        cp "$UPDATE_MANIFEST" "$LAYOUT_DIR/manifest" || FATAL=1
+        printf '[package] release-layout: %s (release-id %s)\n' \
+            "$(rel_path "$LAYOUT_DIR")" "$RELEASE_ID"
+    else
+        printf '[package] release-layout: FAILED the manifest does not carry the raw digest %s\n' \
+            "$RAW_SHA" >&2
         FATAL=1
     fi
 fi

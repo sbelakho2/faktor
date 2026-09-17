@@ -793,6 +793,26 @@ mod scans {
         );
     }
 
+    /// Tightness proof for [`SPAWN_BOOTSTRAP_EXEMPT`]: the updater's
+    /// bootstrap launcher may hold exactly ONE spawn site — the
+    /// hash-then-exec of the verified artifact — so the file-level
+    /// exemption can never hide a growing process runtime.
+    #[test]
+    fn bootstrap_launcher_exemption_covers_exactly_one_spawn_site() {
+        let path = repo_root().join("crates/updater/src/release.rs");
+        let text = std::fs::read_to_string(&path).expect("release.rs readable");
+        let construct_or_spawn = ["Command::new", "Command::spawn", "process::Stdio"];
+        let sites: usize = text
+            .lines()
+            .filter(|l| construct_or_spawn.iter().any(|m| l.contains(m)))
+            .count();
+        assert_eq!(
+            sites, 1,
+            "crates/updater/src/release.rs must hold exactly one construct/spawn site \
+             (the verified exec; the CommandExt exec import is not a spawn)"
+        );
+    }
+
     // ------------------------------------------------------------------
     // scan 1: production child spawning
     // ------------------------------------------------------------------
@@ -800,6 +820,13 @@ mod scans {
     /// Files whose plain `use std::process::Command` import is the
     /// documented environment authority, never a spawn site.
     const SPAWN_NAME_IMPORT_ALLOWLIST: &[&str] = &["crates/core/src/command.rs"];
+
+    /// The ONE bootstrap launcher: it digest-verifies the release artifact
+    /// and execve()s it BEFORE any daemon (and therefore any supervisor)
+    /// exists, so the exec IS the launch contract and cannot be supervised.
+    /// The tightness proof below asserts this file holds exactly ONE spawn
+    /// site, so the exemption can never silently grow.
+    const SPAWN_BOOTSTRAP_EXEMPT: &[&str] = &["crates/updater/src/release.rs"];
 
     const SPAWN_MARKERS: &[&str] = &[
         "std::process::Command",
@@ -823,6 +850,9 @@ mod scans {
         }
         if is_test_file(&rel) {
             return Vec::new(); // out-of-line test bodies are test-only by declaration
+        }
+        if SPAWN_BOOTSTRAP_EXEMPT.contains(&rel.as_str()) {
+            return Vec::new(); // verified-artifact bootstrap exec (see above)
         }
         find_markers(f, SPAWN_MARKERS)
             .into_iter()

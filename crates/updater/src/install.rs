@@ -8,6 +8,13 @@
 //!   staging/<op-id>/<artifact-name>           in-flight download (same fs)
 //! ```
 //!
+//! The ADDITIVE immutable-version layout (see [`crate::release`]) lives in
+//! the same root and adds `launcher`, `trusted-keys.json` and
+//! `versions/<release-id>/{faktor,manifest}`. When a pointer carries a
+//! `release_id`, [`InstallLayout::verify_installed`] verifies the immutable
+//! `versions/<release-id>/faktor` bytes instead of the legacy artifact path;
+//! a pointer without one keeps the legacy behavior byte-identically.
+//!
 //! Never in-place: a downloaded artifact is streamed into `staging/` (same
 //! filesystem as `artifacts/`), digest-verified, flushed+fsynced, and only
 //! then renamed into `artifacts/<name>/<digest>` through
@@ -32,8 +39,20 @@ use sha2::{Digest, Sha256};
 use crate::error::UpdateError;
 use crate::manifest::{is_lower_hex, Artifact};
 
-/// Schema tag of the `current` pointer file.
+/// Schema tag of the `current` pointer file (the `release_id` member is
+/// additive; legacy pointers parse with `release_id: None`).
 pub const INSTALL_POINTER_SCHEMA: &str = "faktor-install-pointer/v1";
+
+/// The stable bootstrap launcher file name.
+pub const LAUNCHER_FILE_NAME: &str = "launcher";
+/// The immutable release directories.
+pub const VERSIONS_DIR_NAME: &str = "versions";
+/// The exact release binary inside one release directory.
+pub const RELEASE_BINARY_NAME: &str = "faktor";
+/// The signed release manifest inside one release directory.
+pub const RELEASE_MANIFEST_NAME: &str = "manifest";
+/// The launch trust anchor (operator key allowlist).
+pub const TRUST_FILE_NAME: &str = "trusted-keys.json";
 
 /// The durable answer to "what is installed here".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +64,11 @@ pub struct InstallPointer {
     pub version: String,
     pub channel: String,
     pub applied_ms: i64,
+    /// The immutable release this pointer names (`versions/<release-id>/`).
+    /// `None` = the legacy content-addressed layout. Additive: absent on
+    /// every pre-release-layout pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_id: Option<String>,
 }
 
 impl InstallPointer {
@@ -62,9 +86,19 @@ impl InstallPointer {
             version: version.to_string(),
             channel: channel.to_string(),
             applied_ms,
+            release_id: None,
         };
         pointer.validate()?;
         Ok(pointer)
+    }
+
+    /// Attach (or clear) the immutable release id. The value is validated;
+    /// callers pass `Some(id)` only when `versions/<id>/faktor` is
+    /// materialized with exactly the pointer's digest.
+    pub fn with_release_id(mut self, release_id: Option<String>) -> Result<Self, UpdateError> {
+        self.release_id = release_id;
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn validate(&self) -> Result<(), UpdateError> {
@@ -88,6 +122,9 @@ impl InstallPointer {
             return Err(UpdateError::Install(
                 "install pointer digest must be 64 lowercase hex".into(),
             ));
+        }
+        if let Some(release_id) = &self.release_id {
+            crate::release::validate_release_id(release_id)?;
         }
         Ok(())
     }
@@ -139,6 +176,13 @@ impl InstallLayout {
             ))
         })?;
         Ok(layout)
+    }
+
+    /// Open one EXISTING install root read-only: no directory is created and
+    /// no side effect is possible. The bootstrap launcher uses this so a
+    /// launched process never mutates the layout it is authenticating.
+    pub fn open_readonly(root: impl Into<PathBuf>) -> Self {
+        InstallLayout { root: root.into() }
     }
 
     pub fn root(&self) -> &Path {
@@ -255,8 +299,28 @@ impl InstallLayout {
         })
     }
 
-    /// Verify the artifact the pointer names is still present AND intact.
+    /// Verify the bytes the pointer names are still present AND intact.
+    /// A release pointer (`release_id` present) is verified against the
+    /// IMMUTABLE `versions/<id>/faktor`; a legacy pointer against the
+    /// content-addressed artifact path, exactly as before.
     pub fn verify_installed(&self, pointer: &InstallPointer) -> Result<(), UpdateError> {
+        if let Some(release_id) = &pointer.release_id {
+            let binary = self.release_binary(release_id);
+            let actual = file_digest(&binary).map_err(|e| UpdateError::StagedArtifactUnusable {
+                artifact: format!("{release_id}/{RELEASE_BINARY_NAME}"),
+                detail: e.to_string(),
+            })?;
+            if actual != pointer.digest {
+                return Err(UpdateError::StagedArtifactUnusable {
+                    artifact: format!("{release_id}/{RELEASE_BINARY_NAME}"),
+                    detail: format!(
+                        "release binary digest {actual} != pointer digest {}",
+                        pointer.digest
+                    ),
+                });
+            }
+            return Ok(());
+        }
         let actual = self.artifact_digest(&pointer.artifact, &pointer.digest)?;
         if actual != pointer.digest {
             return Err(UpdateError::StagedArtifactUnusable {
