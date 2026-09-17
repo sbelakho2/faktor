@@ -14,8 +14,14 @@
 //!   failure), so no half-wired SCM surface ever boots;
 //! - after readiness the caller runs [`ScmDaemon::run`]: one bounded initial
 //!   installation/repository sync, then one idempotent re-sync per verified
-//!   webhook delivery through a bounded queue. Both paths converge on the
-//!   durable upserts, so a crash/retry/redelivery can never duplicate rows.
+//!   webhook delivery through a bounded queue. When the optional
+//!   `[cloud.github_app.reconcile]` timer is enabled, the SAME loop also
+//!   re-runs the sync on the configured jittered cadence (with bounded
+//!   failure backoff) — every path shares one single-flight slot, so
+//!   overlapping triggers coalesce instead of duplicating provider calls.
+//!   All paths converge on the durable upserts, so a crash/retry/
+//!   redelivery/timer pass can never duplicate rows. Disabled reconcile =
+//!   no timer, byte-identical to the webhook-only surface.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -23,8 +29,8 @@ use std::sync::Arc;
 use faktor_provider::egress::HttpTransport;
 use faktor_scm::{
     Clock, GitHubApp, GitHubAppConfig, GitHubAppTokenConfig, GitHubAppTokenSource, IngestOutcome,
-    ScmInstallationId, ScmStore, ScmSync, SystemClock, WebhookError, WebhookHeaders, WebhookInbox,
-    WebhookVerifier,
+    ScmInstallationId, ScmReconcile, ScmStore, ScmSync, SystemClock, WebhookError, WebhookHeaders,
+    WebhookInbox, WebhookVerifier,
 };
 use faktor_server::native::scm_webhook::WebhookSink;
 
@@ -75,9 +81,13 @@ enum SyncRequest {
 
 /// The wired GitHub App surface: the durable inbox the webhook route
 /// dispatches into plus the bounded re-sync queue. `run` owns the consuming
-/// half (initial sync, then one re-sync per delivery).
+/// half (initial sync, then one re-sync per delivery, plus the optional
+/// periodic reconcile timer).
 pub struct ScmDaemon {
     sync: Arc<ScmSync>,
+    /// The single-flight reconcile runner; `None` while the timer is
+    /// disabled (disabled parity: webhook-only, no extra provider call).
+    reconcile: Option<Arc<ScmReconcile>>,
     inbox: Arc<WebhookInbox>,
     organization: String,
     queue: tokio::sync::mpsc::Sender<SyncRequest>,
@@ -152,12 +162,20 @@ pub fn build_scm_daemon(
         clock.clone(),
     )
     .map_err(|e| format!("cloud github_app: {e}"))?;
-    let sync = Arc::new(ScmSync::new(Arc::new(app), store.clone(), clock));
+    let sync = Arc::new(ScmSync::new(Arc::new(app), store.clone(), clock.clone()));
+    let reconcile = match app_cfg.reconcile_policy()? {
+        Some(policy) => Some(Arc::new(
+            ScmReconcile::new(sync.clone(), organization.clone(), policy, clock.clone())
+                .map_err(|e| format!("cloud github_app reconcile: {e}"))?,
+        )),
+        None => None,
+    };
     let verifier = WebhookVerifier::new(webhook_secret.into_bytes())
         .map_err(|e| format!("cloud github_app: webhook secret: {e}"))?;
     let (queue, receiver) = tokio::sync::mpsc::channel(MAX_WEBHOOK_SYNC_QUEUE);
     Ok(Some(Arc::new(ScmDaemon {
         sync,
+        reconcile,
         inbox: Arc::new(WebhookInbox::new(verifier, store)),
         organization,
         queue,
@@ -166,19 +184,41 @@ pub fn build_scm_daemon(
 }
 
 impl ScmDaemon {
-    /// One bounded installation/repository sync of the whole app.
+    /// One bounded installation/repository sync of the whole app. When the
+    /// reconcile timer is enabled, this path shares the runner's
+    /// single-flight slot with webhook passes and the timer.
     pub async fn sync_all(&self) -> Result<faktor_scm::SyncReport, faktor_scm::ScmError> {
-        self.sync.sync_all(&self.organization).await
+        match &self.reconcile {
+            Some(reconcile) => reconcile.sync_all().await,
+            None => self.sync.sync_all(&self.organization).await,
+        }
     }
 
-    /// One bounded re-sync of a single installation (webhook path).
+    /// One bounded re-sync of a single installation (webhook path), sharing
+    /// the same single-flight slot as [`Self::sync_all`].
     pub async fn sync_installation(
         &self,
         installation: ScmInstallationId,
     ) -> Result<faktor_scm::SyncReport, faktor_scm::ScmError> {
-        self.sync
-            .sync_installation(&self.organization, installation)
-            .await
+        match &self.reconcile {
+            Some(reconcile) => reconcile.sync_installation(installation).await,
+            None => {
+                self.sync
+                    .sync_installation(&self.organization, installation)
+                    .await
+            }
+        }
+    }
+
+    /// The bounded, typed reconcile journal (empty while the timer is
+    /// disabled). Test-surface observation of the single-flight/backoff
+    /// state.
+    #[cfg(test)]
+    pub fn reconcile_journal(&self) -> Vec<faktor_scm::ReconcileEvent> {
+        self.reconcile
+            .as_ref()
+            .map(|reconcile| reconcile.journal())
+            .unwrap_or_default()
     }
 
     fn take_receiver(&self) -> Option<tokio::sync::mpsc::Receiver<SyncRequest>> {
@@ -188,10 +228,36 @@ impl ScmDaemon {
             .take()
     }
 
+    /// Handle one queued webhook-driven sync request (idempotent upserts).
+    async fn handle_request(&self, request: SyncRequest) {
+        let outcome = match request {
+            SyncRequest::All => self.sync_all().await.map(|report| (report, None)),
+            SyncRequest::Installation(installation) => self
+                .sync_installation(installation)
+                .await
+                .map(|report| (report, Some(installation))),
+        };
+        match outcome {
+            Ok((report, Some(installation))) => tracing::info!(
+                installation = installation.raw(),
+                repositories = report.repositories,
+                "scm webhook sync complete"
+            ),
+            Ok((report, None)) => tracing::info!(
+                installations = report.installations,
+                repositories = report.repositories,
+                "scm webhook sync complete"
+            ),
+            Err(e) => tracing::warn!("scm webhook sync failed (redelivery converges): {e}"),
+        }
+    }
+
     /// Run the durable sync half: ONE initial bounded sync, then one
-    /// idempotent re-sync per queued webhook delivery until the queue (and
-    /// every sender) is dropped or the task is aborted at shutdown. Failures
-    /// are logged, never fatal: the next delivery (or restart) converges.
+    /// idempotent re-sync per queued webhook delivery — plus, when the
+    /// periodic reconcile timer is enabled, one single-flight pass on the
+    /// configured cadence. Runs until the queue (and every sender) is
+    /// dropped or the task is aborted at shutdown. Failures are logged,
+    /// never fatal: the next delivery, timer pass or restart converges.
     pub async fn run(self: Arc<Self>) {
         let Some(mut receiver) = self.take_receiver() else {
             tracing::warn!("scm daemon run called twice; the second run has no queue");
@@ -205,26 +271,32 @@ impl ScmDaemon {
             ),
             Err(e) => tracing::warn!("scm initial sync failed (webhook syncs still apply): {e}"),
         }
-        while let Some(request) = receiver.recv().await {
-            let outcome = match request {
-                SyncRequest::All => self.sync_all().await.map(|report| (report, None)),
-                SyncRequest::Installation(installation) => self
-                    .sync_installation(installation)
-                    .await
-                    .map(|report| (report, Some(installation))),
-            };
-            match outcome {
-                Ok((report, Some(installation))) => tracing::info!(
-                    installation = installation.raw(),
-                    repositories = report.repositories,
-                    "scm webhook sync complete"
-                ),
-                Ok((report, None)) => tracing::info!(
-                    installations = report.installations,
-                    repositories = report.repositories,
-                    "scm webhook sync complete"
-                ),
-                Err(e) => tracing::warn!("scm webhook sync failed (redelivery converges): {e}"),
+        let Some(reconcile) = self.reconcile.clone() else {
+            // Disabled parity: exactly the pre-reconcile webhook-only loop.
+            while let Some(request) = receiver.recv().await {
+                self.handle_request(request).await;
+            }
+            return;
+        };
+        loop {
+            let delay = reconcile.scheduled_delay_ms().max(1) as u64;
+            tokio::select! {
+                request = receiver.recv() => match request {
+                    Some(request) => self.handle_request(request).await,
+                    None => break,
+                },
+                _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => {
+                    match self.sync_all().await {
+                        Ok(report) => tracing::info!(
+                            installations = report.installations,
+                            repositories = report.repositories,
+                            "scm reconcile sync complete"
+                        ),
+                        Err(e) => tracing::warn!(
+                            "scm reconcile sync failed (bounded backoff applies): {e}"
+                        ),
+                    }
+                }
             }
         }
     }

@@ -19,9 +19,9 @@ use ring::rand::SystemRandom;
 use ring::signature::{KeyPair, RsaKeyPair, RSA_PKCS1_SHA256};
 
 use faktor_cloud::{
-    AsyncOidcAdapter, ClaimMapping, CodeExchangeRequest, ControlPlane, FakeOidcAdapter,
-    IdTokenExpectations, ManualClock, MemoryControlPlaneStore, NetworkOidcAdapter,
-    NetworkOidcConfig, OidcClaims, OidcError, Role, SsoConfigRef, SsoLogin,
+    AsyncOidcAdapter, ClaimMapping, ClientAuthMethod, ClientSecret, CodeExchangeRequest,
+    ControlPlane, FakeOidcAdapter, IdTokenExpectations, ManualClock, MemoryControlPlaneStore,
+    NetworkOidcAdapter, NetworkOidcConfig, OidcClaims, OidcError, Role, SsoConfigRef, SsoLogin,
 };
 use faktor_provider::egress::{EgressError, HttpTransport};
 
@@ -59,10 +59,14 @@ struct MockTokenSpec {
 struct MockProvider {
     state: Mutex<ProviderState>,
     requests: Mutex<Vec<(String, String)>>,
+    token_request_detail: Mutex<Option<TokenRequestDetail>>,
     discovery_requests: AtomicUsize,
     jwks_requests: AtomicUsize,
     token_requests: AtomicUsize,
 }
+
+/// The headers + body of one token-endpoint request.
+type TokenRequestDetail = (Vec<(String, String)>, Vec<u8>);
 
 /// Two fixed 2048-bit RSA PKCS#8 test keys (test fixtures only; generated
 /// once with `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048`).
@@ -175,6 +179,7 @@ impl MockProvider {
                 jwks_max_age_s: Some(3600),
             }),
             requests: Mutex::new(Vec::new()),
+            token_request_detail: Mutex::new(None),
             discovery_requests: AtomicUsize::new(0),
             jwks_requests: AtomicUsize::new(0),
             token_requests: AtomicUsize::new(0),
@@ -204,6 +209,16 @@ impl MockProvider {
             .count()
     }
 
+    /// The headers + body of the LAST token-endpoint request (the
+    /// confidential-client tests assert the configured method on the wire).
+    fn token_request(&self) -> (Vec<(String, String)>, Vec<u8>) {
+        self.token_request_detail
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a token request was recorded")
+    }
+
     /// Sign a claims set under the ACTIVE key.
     fn sign(&self, spec: &MockTokenSpec) -> String {
         let state = self.state.lock().unwrap();
@@ -222,6 +237,7 @@ impl MockProvider {
         &self,
         method: &str,
         url: &str,
+        request_headers: &[(String, String)],
         body: &[u8],
     ) -> (u16, Vec<(String, String)>, Vec<u8>) {
         self.requests
@@ -277,6 +293,8 @@ impl MockProvider {
         }
         if path.ends_with("/token") {
             self.token_requests.fetch_add(1, Ordering::SeqCst);
+            *self.token_request_detail.lock().unwrap() =
+                Some((request_headers.to_vec(), body.to_vec()));
             let code = form_field(body, "code").unwrap_or_default();
             let mut state = self.state.lock().unwrap();
             let Some(spec) = state.codes.remove(&code) else {
@@ -362,12 +380,22 @@ impl HttpTransport for MockProvider {
     fn execute(&self, req: Request) -> BoxFuture<'_, Result<Response, EgressError>> {
         let method = req.method().to_string();
         let url = req.url().to_string();
+        let headers: Vec<(String, String)> = req
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect();
         let body = req
             .body()
             .and_then(|b| b.as_bytes())
             .unwrap_or(&[])
             .to_vec();
-        let (status, headers, body) = self.handle(&method, &url, &body);
+        let (status, headers, body) = self.handle(&method, &url, &headers, &body);
         Box::pin(async move {
             let mut builder = http::Response::builder().status(status);
             for (name, value) in headers {
@@ -390,6 +418,17 @@ fn config() -> NetworkOidcConfig {
         discovery_max_age_ms: 300_000,
         jwks_max_age_ms: 300_000,
         max_jwks_refetches: 2,
+        client_auth: ClientAuthMethod::None,
+        client_secret: None,
+    }
+}
+
+/// The same strict config with a confidential client method + secret.
+fn confidential_config(method: ClientAuthMethod, secret: &str) -> NetworkOidcConfig {
+    NetworkOidcConfig {
+        client_auth: method,
+        client_secret: Some(ClientSecret::new(secret).unwrap()),
+        ..config()
     }
 }
 
@@ -721,6 +760,165 @@ async fn discovery_cache_honors_max_age() {
     // A foreign issuer is refused before any request.
     assert!(adapter.discovery("https://other.example").await.is_err());
     assert_eq!(provider.discovery_requests.load(Ordering::SeqCst), 2);
+}
+
+/// ONE adapter serves both client kinds: the public-PKCE exchange form is
+/// byte-identical to the pre-confidential shape and carries no credential.
+#[tokio::test]
+async fn public_exchange_form_is_byte_identical_and_unauthenticated() {
+    let provider = Arc::new(MockProvider::new());
+    let clock = Arc::new(ManualClock::new(NOW_MS));
+    let adapter = adapter(provider.clone(), clock);
+    provider.issue_code("code-public", token_spec(None, NOW_MS + 60_000));
+    let tokens = adapter
+        .exchange_code(&exchange("code-public"))
+        .await
+        .unwrap();
+    assert_eq!(tokens.token_type, "Bearer");
+    let (headers, body) = provider.token_request();
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        "grant_type=authorization_code&code=code-public&redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&code_verifier=verifier&client_id=faktor-test",
+        "the public path's form must not change"
+    );
+    assert!(headers.iter().all(|(name, _)| name != "authorization"));
+}
+
+/// `client_secret_post`: the configured secret rides the form; it is
+/// redacted everywhere it could be rendered or logged.
+#[tokio::test]
+async fn confidential_post_sends_the_secret_in_the_form_and_never_renders_it() {
+    let provider = Arc::new(MockProvider::new());
+    let clock = Arc::new(ManualClock::new(NOW_MS));
+    let config = confidential_config(ClientAuthMethod::ClientSecretPost, "top-secret");
+    let adapter = NetworkOidcAdapter::new(provider.clone(), clock, config.clone()).unwrap();
+    provider.issue_code("code-post", token_spec(None, NOW_MS + 60_000));
+    let tokens = adapter.exchange_code(&exchange("code-post")).await.unwrap();
+    assert!(!tokens.id_token.is_empty());
+    let (headers, body) = provider.token_request();
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains("client_id=faktor-test"), "{body}");
+    assert!(body.contains("client_secret=top-secret"), "{body}");
+    assert!(body.contains("code_verifier=verifier"), "{body}");
+    assert!(headers.iter().all(|(name, _)| name != "authorization"));
+
+    // A refused exchange never echoes the secret...
+    let error = adapter
+        .exchange_code(&exchange("code-never-issued"))
+        .await
+        .unwrap_err();
+    assert!(!error.to_string().contains("top-secret"), "{error}");
+    // ...and neither Debug nor Display ever renders it.
+    let secret = config.client_secret.clone().unwrap();
+    for rendered in [
+        format!("{adapter:?}"),
+        format!("{config:?}"),
+        format!("{secret}"),
+        format!("{secret:?}"),
+    ] {
+        assert!(!rendered.contains("top-secret"), "{rendered}");
+    }
+    assert!(format!("{secret:?}").contains("redacted"));
+    assert_eq!(format!("{secret}"), "<redacted>");
+}
+
+/// `client_secret_basic`: the secret rides the RFC 6749 §2.3.1 Basic header
+/// (urlencoded credentials, standard base64) and NEVER the form.
+#[tokio::test]
+async fn confidential_basic_sends_the_basic_header_and_keeps_the_form_clean() {
+    let provider = Arc::new(MockProvider::new());
+    let clock = Arc::new(ManualClock::new(NOW_MS));
+    let config = confidential_config(ClientAuthMethod::ClientSecretBasic, "top/secret?");
+    let adapter = NetworkOidcAdapter::new(provider.clone(), clock, config).unwrap();
+    provider.issue_code("code-basic", token_spec(None, NOW_MS + 60_000));
+    adapter
+        .exchange_code(&exchange("code-basic"))
+        .await
+        .unwrap();
+    let (headers, body) = provider.token_request();
+    let expected = base64::engine::general_purpose::STANDARD.encode(b"faktor-test:top%2Fsecret%3F");
+    let authorization = headers
+        .iter()
+        .find(|(name, _)| name == "authorization")
+        .map(|(_, value)| value.clone())
+        .expect("the basic method carries an authorization header");
+    assert_eq!(authorization, format!("Basic {expected}"));
+    let body = String::from_utf8(body).unwrap();
+    assert!(!body.contains("client_secret"), "{body}");
+    assert!(!body.contains("client_id"), "{body}");
+    assert!(!body.contains("top"), "{body}");
+}
+
+/// A confidential method without a secret (and a secret without a method)
+/// fails closed typed at construction, BEFORE any request could be built.
+#[tokio::test]
+async fn confidential_config_contradictions_fail_closed_typed() {
+    let provider = Arc::new(MockProvider::new());
+    let clock = Arc::new(ManualClock::new(NOW_MS));
+    let err = NetworkOidcAdapter::new(
+        provider.clone(),
+        clock.clone(),
+        NetworkOidcConfig {
+            client_auth: ClientAuthMethod::ClientSecretPost,
+            ..config()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, OidcError::DiscoveryUnavailable(_)));
+    assert!(err.to_string().contains("client_secret_post"), "{err}");
+    let err = NetworkOidcAdapter::new(
+        provider.clone(),
+        clock,
+        NetworkOidcConfig {
+            client_auth: ClientAuthMethod::None,
+            client_secret: Some(ClientSecret::new("s3cret").unwrap()),
+            ..config()
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("client_auth"), "{err}");
+    assert!(!err.to_string().contains("s3cret"), "{err}");
+    assert_eq!(provider.request_count(""), 0, "no request was ever sent");
+}
+
+#[test]
+fn client_secret_shape_is_strict_and_never_parsed_loosely() {
+    assert!(ClientSecret::new("").is_err());
+    assert!(ClientSecret::new("two words").is_err());
+    assert!(ClientSecret::new("line\nbreak").is_err());
+    assert!(ClientSecret::new("x".repeat(4097)).is_err());
+    assert!(ClientSecret::new("x".repeat(4096)).is_ok());
+    // The refusal never echoes the candidate value.
+    let err = ClientSecret::new("hunter2 hunter2").unwrap_err();
+    assert!(!err.to_string().contains("hunter2"), "{err}");
+    assert_eq!(
+        faktor_cloud::ClientAuthMethod::parse("client_secret_post"),
+        Some(ClientAuthMethod::ClientSecretPost)
+    );
+    assert_eq!(
+        faktor_cloud::ClientAuthMethod::parse("client_secret_basic"),
+        Some(ClientAuthMethod::ClientSecretBasic)
+    );
+    assert_eq!(
+        faktor_cloud::ClientAuthMethod::parse("none"),
+        Some(ClientAuthMethod::None)
+    );
+    assert_eq!(
+        faktor_cloud::ClientAuthMethod::parse("CLIENT_SECRET_POST"),
+        None
+    );
+    assert_eq!(
+        faktor_cloud::ClientAuthMethod::parse("client_secret_jwt"),
+        None
+    );
+}
+
+fn exchange(code: &str) -> CodeExchangeRequest {
+    CodeExchangeRequest {
+        code: code.into(),
+        redirect_uri: "https://app.example/callback".into(),
+        code_verifier: "verifier".into(),
+    }
 }
 
 /// The sync fake implements the same async seam through the blanket

@@ -11,6 +11,11 @@
 // `evidence:<n>` refs.
 
 import type { AgentSummary, TaskSummary, UsageSummary, VerificationSummary } from './state';
+import type {
+  NativeBillingUsage,
+  NativeEntitlementSnapshot,
+  NativeIdentity,
+} from './nativeClient';
 
 export interface CockpitEvidenceRef {
   readonly id: number | null;
@@ -496,9 +501,479 @@ export function proofStepLines(proof: CockpitProofView): string[] {
   return lines;
 }
 
+// ------------------------------------------------------- usage / credits panel
+//
+// The commercial-metering panel: current-period tokens and cost (managed vs
+// BYOK), quota/limit progress with the EXACT limit name from the snapshot,
+// subscription state (active/expired/canceled/grace/unavailable), the credit
+// balance from the control plane, cursor pagination and the role-aware
+// grant-credits affordance. Everything is projected from the served payload;
+// a refusal is an explicit disabled/unavailable state carrying the refusal
+// text — zeros are NEVER rendered in its place.
+
+/** The exact limit names the daemon's plan config uses. */
+export const USAGE_LIMIT_MAX_TOKENS = 'max_tokens_per_period';
+export const USAGE_LIMIT_MANAGED_SPEND = 'max_managed_spend_micro_per_period';
+export const USAGE_LIMIT_MIN_CREDIT = 'min_credit_balance_micro';
+export const USAGE_LIMIT_ACTIVE_TASKS = 'max_active_tasks';
+export const USAGE_LIMIT_CHILDREN_PER_TASK = 'max_children_per_task';
+export const USAGE_LIMIT_ATTEMPTS_PER_TASK = 'max_provider_attempts_per_task';
+
+/** Why the panel cannot show numbers: disabled locally, or a refused read. */
+export type CockpitUsagePanelState = 'ok' | 'disabled' | 'unavailable';
+
+/** The effective subscription state; `grace` = durable active row, inactive. */
+export type CockpitSubscriptionState =
+  | 'active'
+  | 'expired'
+  | 'canceled'
+  | 'grace'
+  | 'unavailable';
+
+export interface CockpitUsageQuota {
+  /** The EXACT limit name from the entitlement snapshot. */
+  readonly limit: string;
+  readonly value: number;
+  /** The observed counter, or null when this snapshot serves none. */
+  readonly observed: number | null;
+  /** True only when the observed counter is known to breach the limit. */
+  readonly exceeded: boolean | null;
+  /** `ceiling` limits are exceeded at/above the value; `floor` below it. */
+  readonly kind: 'ceiling' | 'floor';
+  readonly reason: string | null;
+}
+
+export interface CockpitUsageBucketView {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly cacheReadTokens: number;
+  readonly cacheWriteTokens: number;
+  readonly reasoningTokens: number;
+  readonly providerCostMicro: number;
+  readonly managedCostMicro: number;
+  readonly byokCostMicro: number;
+  readonly events: number;
+  readonly correctedEvents: number;
+}
+
+export interface CockpitUsageTaskView {
+  readonly taskId: number;
+  readonly runId: string;
+  readonly totals: CockpitUsageBucketView;
+}
+
+export interface CockpitUsagePeriodView extends CockpitUsageBucketView {
+  readonly totalTokens: number;
+  readonly tasks: readonly CockpitUsageTaskView[];
+  /** The fold's own scan-bound cursor (informational; not the page cursor). */
+  readonly scanCursor: string | null;
+}
+
+export interface CockpitUsageCreditsView {
+  readonly grantedMicro: number;
+  readonly consumedMicro: number;
+  readonly refundedMicro: number;
+  readonly heldMicro: number;
+  readonly pendingConsumes: number;
+  /** grants + refunds − effective debits, saturating (the server's rule). */
+  readonly balanceMicro: number;
+}
+
+export interface CockpitUsagePageView {
+  /** The cursor this page was read with (null = first page). */
+  readonly cursor: string | null;
+  readonly nextCursor: string | null;
+  readonly itemCount: number;
+  readonly hasPrev: boolean;
+}
+
+export interface CockpitUsagePanel {
+  readonly state: CockpitUsagePanelState;
+  /** The explicit refusal/disabled reason; null only in the `ok` state. */
+  readonly reason: string | null;
+  readonly organization: string | null;
+  readonly planId: string | null;
+  readonly planFound: boolean;
+  readonly subscription: {
+    readonly state: CockpitSubscriptionState;
+    readonly status: string | null;
+    readonly expiresMs: number | null;
+    readonly active: boolean | null;
+  };
+  readonly period: CockpitUsagePeriodView | null;
+  readonly credits: CockpitUsageCreditsView | null;
+  readonly quotas: readonly CockpitUsageQuota[];
+  readonly inFlight: readonly {
+    readonly id: string;
+    readonly kind: string;
+    readonly reference: string;
+    readonly startedMs: number;
+    readonly endedMs: number | null;
+  }[];
+  readonly page: CockpitUsagePageView;
+  readonly canGrantCredits: boolean;
+  readonly grantDisabledReason: string | null;
+  readonly actions: readonly CockpitAction[];
+}
+
+export interface CockpitUsageInput {
+  readonly identity: NativeIdentity | null;
+  readonly entitlements: NativeEntitlementSnapshot | null;
+  readonly usage: NativeBillingUsage | null;
+  /**
+   * The explicit refusal of the last read (`NativeApiError` code + message,
+   * or a validation failure). A `billing_disabled` refusal renders the
+   * "billing disabled locally" state; anything else is unavailable.
+   */
+  readonly refusal: { readonly code: string; readonly reason: string } | null;
+  readonly cursor: string | null;
+  readonly hasPrev: boolean;
+}
+
+function usageBucketView(bucket: NativeBillingUsage['fold']['totals']): CockpitUsageBucketView {
+  return {
+    inputTokens: bucket.input_tokens,
+    outputTokens: bucket.output_tokens,
+    cacheReadTokens: bucket.cache_read_tokens,
+    cacheWriteTokens: bucket.cache_write_tokens,
+    reasoningTokens: bucket.reasoning_tokens,
+    providerCostMicro: bucket.provider_cost_micro,
+    managedCostMicro: bucket.managed_cost_micro,
+    byokCostMicro: bucket.byok_cost_micro,
+    events: bucket.events,
+    correctedEvents: bucket.corrected_events,
+  };
+}
+
+function creditBalanceView(
+  credits: NativeBillingUsage['credits'],
+): CockpitUsageCreditsView {
+  const balanceMicro = Math.max(
+    0,
+    credits.granted_micro + credits.refunded_micro - credits.consumed_micro,
+  );
+  return {
+    grantedMicro: credits.granted_micro,
+    consumedMicro: credits.consumed_micro,
+    refundedMicro: credits.refunded_micro,
+    heldMicro: credits.held_micro,
+    pendingConsumes: credits.pending_consumes,
+    balanceMicro,
+  };
+}
+
+function subscriptionViewOf(
+  snapshot: NativeEntitlementSnapshot | null,
+): CockpitUsagePanel['subscription'] {
+  if (snapshot === null) {
+    return { state: 'unavailable', status: null, expiresMs: null, active: null };
+  }
+  const status = snapshot.subscription_status;
+  const expiresMs = snapshot.subscription_expires_ms;
+  const active = snapshot.subscription_active;
+  if (active) {
+    return { state: 'active', status, expiresMs, active };
+  }
+  if (status === 'expired' || status === 'canceled') {
+    return { state: status, status, expiresMs, active };
+  }
+  if (status === 'active') {
+    // The durable row says active but the effective snapshot is inactive:
+    // the expiry has passed (the server derives, never sweeps). Honest
+    // grace/lapse rendering — never reported as active.
+    return { state: 'grace', status, expiresMs, active };
+  }
+  return { state: 'unavailable', status, expiresMs, active };
+}
+
+function quotaRowsOf(snapshot: NativeEntitlementSnapshot | null, panel: {
+  readonly tokens: number | null;
+  readonly managedMicro: number | null;
+  readonly balanceMicro: number | null;
+}): CockpitUsageQuota[] {
+  if (snapshot === null) {
+    return [];
+  }
+  const rows: CockpitUsageQuota[] = [];
+  for (const [limit, value] of Object.entries(snapshot.limits).sort(([a], [b]) =>
+    a.localeCompare(b),
+  )) {
+    let observed: number | null = null;
+    let reason: string | null = null;
+    switch (limit) {
+      case USAGE_LIMIT_MAX_TOKENS:
+        observed = panel.tokens;
+        if (observed === null) {
+          reason = 'the entitlement snapshot serves no token counter';
+        }
+        break;
+      case USAGE_LIMIT_MANAGED_SPEND:
+        observed = panel.managedMicro;
+        if (observed === null) {
+          reason = 'the entitlement snapshot serves no managed-spend counter';
+        }
+        break;
+      case USAGE_LIMIT_MIN_CREDIT:
+        observed = panel.balanceMicro;
+        if (observed === null) {
+          reason = 'the entitlement snapshot serves no credit balance';
+        }
+        break;
+      default:
+        reason = 'no observed counter is served for this limit';
+        break;
+    }
+    const kind = limit === USAGE_LIMIT_MIN_CREDIT ? 'floor' : 'ceiling';
+    const exceeded =
+      observed === null
+        ? null
+        : kind === 'floor'
+          ? observed < value
+          : observed >= value;
+    rows.push({ limit, value, observed, exceeded, kind, reason });
+  }
+  return rows;
+}
+
+/**
+ * Build the usage/credits panel from the three served payloads plus the last
+ * refusal. The `ok` state requires BOTH the entitlement snapshot and the
+ * usage fold; a `billing_disabled` refusal renders "billing disabled locally"
+ * with an explicit reason and NO numbers. Role-aware: the grant-credits
+ * affordance is enabled only when the identity's effective actions carry
+ * `credits_grant` (the server's admin role rule); it is visible-but-disabled
+ * otherwise, with the precise reason.
+ */
+export function buildUsagePanel(input: CockpitUsageInput): CockpitUsagePanel {
+  const { identity, entitlements, usage, refusal, cursor, hasPrev } = input;
+  const page: CockpitUsagePageView = {
+    cursor,
+    nextCursor: usage === null ? null : usage.nextCursor,
+    itemCount: usage === null ? 0 : usage.items.length,
+    hasPrev,
+  };
+  const base = {
+    organization: identity?.organization ?? entitlements?.organization_id ?? null,
+    planId: entitlements?.plan_id ?? null,
+    planFound: entitlements?.plan_found ?? false,
+    subscription: subscriptionViewOf(entitlements),
+    inFlight:
+      entitlements === null
+        ? []
+        : entitlements.in_flight.map((txn) => ({
+            id: txn.id,
+            kind: txn.kind,
+            reference: txn.reference,
+            startedMs: txn.started_ms,
+            endedMs: txn.ended_ms,
+          })),
+    page,
+  };
+  const canGrantCredits =
+    identity !== null && identity.effective_actions.includes('credits_grant');
+  const grantDisabledReason = canGrantCredits
+    ? null
+    : identity === null
+      ? 'the control plane did not serve an identity; the granting role is unknown'
+      : `the ${identity.role} role carries no credits_grant capability (admin only)`;
+  const grantAction = (enabled: boolean): CockpitAction => ({
+    key: 'grant-credits',
+    label: 'Grant credits…',
+    enabled,
+  });
+  const pageActions: CockpitAction[] = [
+    { key: 'usage-prev', label: 'Previous page', enabled: hasPrev },
+    { key: 'usage-next', label: 'Next page', enabled: usage !== null && usage.nextCursor !== null },
+  ];
+  if (refusal !== null) {
+    const disabled = refusal.code === 'billing_disabled';
+    return {
+      state: disabled ? 'disabled' : 'unavailable',
+      reason: refusal.reason,
+      ...base,
+      period: null,
+      credits: null,
+      quotas: [],
+      canGrantCredits,
+      grantDisabledReason: canGrantCredits
+        ? 'the billing surface is disabled or unavailable; a grant cannot be attempted'
+        : grantDisabledReason,
+      actions: [grantAction(false), ...pageActions],
+    };
+  }
+  if (entitlements === null || usage === null) {
+    return {
+      state: 'unavailable',
+      reason: 'the control plane served no usage/entitlement payload',
+      ...base,
+      period: null,
+      credits: null,
+      quotas: [],
+      canGrantCredits,
+      grantDisabledReason: canGrantCredits
+        ? 'the control plane served no usage/entitlement payload; a grant cannot be attempted'
+        : grantDisabledReason,
+      actions: [grantAction(false), ...pageActions],
+    };
+  }
+  const totals = usageBucketView(usage.fold.totals);
+  const totalTokens =
+    totals.inputTokens +
+    totals.outputTokens +
+    totals.cacheReadTokens +
+    totals.cacheWriteTokens +
+    totals.reasoningTokens;
+  const period: CockpitUsagePeriodView = {
+    ...totals,
+    totalTokens,
+    tasks: usage.fold.per_task.map((task) => ({
+      taskId: task.task_id,
+      runId: task.run_id,
+      totals: usageBucketView(task.totals),
+    })),
+    scanCursor: usage.fold.next_cursor,
+  };
+  return {
+    state: 'ok',
+    reason: null,
+    ...base,
+    period,
+    credits: creditBalanceView(usage.credits),
+    quotas: quotaRowsOf(entitlements, {
+      tokens: entitlements.total_tokens,
+      managedMicro: entitlements.managed_spend_micro,
+      balanceMicro: creditBalanceView(entitlements.credits).balanceMicro,
+    }),
+    canGrantCredits,
+    grantDisabledReason,
+    actions: [grantAction(canGrantCredits), ...pageActions],
+  };
+}
+
+function microText(value: number): string {
+  return `${value}\u00b5$`;
+}
+
+/** One bounded line per quota row; `[EXCEEDED]` leads so it survives a clamp. */
+export function usageQuotaLine(quota: CockpitUsageQuota): string {
+  const head = quota.exceeded === true ? '[EXCEEDED] ' : '';
+  if (quota.observed === null) {
+    return `${head}quota ${quota.limit} — limit ${quota.value} (observed not served: ${quota.reason ?? 'unavailable'})`;
+  }
+  const unit = quota.limit === USAGE_LIMIT_MANAGED_SPEND || quota.limit === USAGE_LIMIT_MIN_CREDIT
+    ? microText
+    : String;
+  return `${head}quota ${quota.limit} — observed ${unit(quota.observed)} / limit ${quota.value}`;
+}
+
+/** The bounded section lines of the usage/credits panel. */
+export function usagePanelLines(panel: CockpitUsagePanel): string[] {
+  const lines: string[] = [];
+  if (panel.state === 'disabled') {
+    lines.push(`billing disabled locally${panel.reason === null ? '' : ` — ${panel.reason}`}`);
+  } else if (panel.state === 'unavailable') {
+    lines.push(`usage unavailable${panel.reason === null ? '' : ` — ${panel.reason}`}`);
+  }
+  if (panel.organization !== null) {
+    lines.push(
+      `organization ${panel.organization} · plan ${panel.planId ?? 'none'}${
+        panel.planId !== null && !panel.planFound
+          ? ' (plan not defined in the billing config — admission denies it)'
+          : ''
+      }`,
+    );
+  }
+  const subscription = panel.subscription;
+  const expires =
+    subscription.expiresMs === null
+      ? ''
+      : ` (expires ${utcSeconds(subscription.expiresMs)})`;
+  switch (subscription.state) {
+    case 'active':
+      lines.push(`subscription active${expires}`);
+      break;
+    case 'expired':
+      lines.push(`[EXPIRED] subscription expired${expires} — new tasks are denied`);
+      break;
+    case 'canceled':
+      lines.push(`[CANCELED] subscription canceled${expires}`);
+      break;
+    case 'grace':
+      lines.push(
+        `[GRACE] subscription lapsed: the durable row says active but the effective snapshot is inactive${expires} — new tasks are denied`,
+      );
+      break;
+    default:
+      lines.push('subscription unavailable (the snapshot serves no subscription)');
+      break;
+  }
+  if (panel.period !== null) {
+    lines.push(
+      `period tokens — in ${panel.period.inputTokens} · out ${panel.period.outputTokens} · cache read ${panel.period.cacheReadTokens} · cache write ${panel.period.cacheWriteTokens} · reasoning ${panel.period.reasoningTokens} · total ${panel.period.totalTokens}`,
+    );
+    lines.push(
+      `period spend — managed ${microText(panel.period.managedCostMicro)} · BYOK ${microText(panel.period.byokCostMicro)} · provider cost ${microText(panel.period.providerCostMicro)} · events ${panel.period.events} (corrected ${panel.period.correctedEvents})`,
+    );
+    for (const task of panel.period.tasks) {
+      lines.push(
+        `task ${task.taskId} (${task.runId}) — in ${task.totals.inputTokens} · out ${task.totals.outputTokens} · cache ${task.totals.cacheReadTokens}/${task.totals.cacheWriteTokens} · reasoning ${task.totals.reasoningTokens} · managed ${microText(task.totals.managedCostMicro)} · BYOK ${microText(task.totals.byokCostMicro)}`,
+      );
+    }
+    if (panel.period.scanCursor !== null) {
+      lines.push(
+        `fold scan bound reached — fold cursor ${panel.period.scanCursor} (the fold is not exact past this cursor)`,
+      );
+    }
+  }
+  for (const quota of panel.quotas) {
+    lines.push(usageQuotaLine(quota));
+  }
+  if (panel.credits !== null) {
+    lines.push(
+      `credits balance ${microText(panel.credits.balanceMicro)} — granted ${microText(panel.credits.grantedMicro)} · consumed ${microText(panel.credits.consumedMicro)} · refunded ${microText(panel.credits.refundedMicro)} · held ${microText(panel.credits.heldMicro)} · pending consumes ${panel.credits.pendingConsumes}`,
+    );
+  }
+  for (const txn of panel.inFlight) {
+    lines.push(
+      `in-flight ${txn.kind} ${txn.id} (${txn.reference}) since ${utcSeconds(txn.startedMs)}${
+        txn.endedMs === null ? '' : ` — ended ${utcSeconds(txn.endedMs)}`
+      }`,
+    );
+  }
+  lines.push(
+    `usage events page — ${panel.page.itemCount} row(s) · cursor ${
+      panel.page.cursor ?? 'first page'
+    } · next ${panel.page.nextCursor ?? 'none'}`,
+  );
+  lines.push(
+    panel.canGrantCredits
+      ? 'role grants credits (credits_grant capability present)'
+      : `grant credits disabled — ${panel.grantDisabledReason ?? 'not permitted'}`,
+  );
+  return lines.map((line) => clamp(line)).slice(0, MAX_LINES);
+}
+
+/**
+ * The render plan of the usage/credits panel: one section carrying the
+ * cursor controls and the role-gated grant affordance. A disabled action is
+ * rendered disabled and never posts (the server role check is the gate).
+ */
+export function usagePanelSections(panel: CockpitUsagePanel): CockpitSection[] {
+  return [
+    {
+      key: 'usage',
+      title: 'Usage / Credits',
+      present: panel.state === 'ok',
+      lines: usagePanelLines(panel),
+      evidence: [],
+      actions: panel.actions,
+    },
+  ];
+}
+
 /** One state-gated control a cockpit section renders. */
 export interface CockpitAction {
-  readonly key: 'decide' | 'abort';
+  readonly key: 'decide' | 'abort' | 'usage-prev' | 'usage-next' | 'grant-credits';
   readonly label: string;
   readonly enabled: boolean;
 }

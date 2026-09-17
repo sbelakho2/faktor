@@ -157,6 +157,14 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
 
     private val historyPanel = HistoryPanel()
 
+    private val usagePanel = UsagePanel()
+
+    // The organization-wide usage cursor stack: Previous pages are replayed
+    // exactly from their recorded cursors, never recomputed.
+    private var billingCursor: String? = null
+
+    private val billingPrevCursors = ArrayList<String>()
+
     private val tabs = JTabbedPane()
 
     private var renderedSeq: Long = 0
@@ -221,6 +229,7 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
         tabs.addTab("Evidence", navigator)
         tabs.addTab("Terminal", terminalPanel)
         tabs.addTab("Settings", settingsPanel)
+        tabs.addTab("Usage", usagePanel)
         tabs.addTab("History", historyPanel)
         tabs.preferredSize = Dimension(430, 600)
 
@@ -491,6 +500,57 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
                 }
             }
         })
+        usagePanel.setListener(object : UsagePanel.Listener {
+            override fun onNextPage() {
+                val model = usagePanel.model() ?: return
+                val next = model.nextCursor ?: return
+                billingPrevCursors.add(billingCursor ?: "")
+                billingCursor = next
+                runAsync("usage next page") { refreshUsagePanelBlocking() }
+            }
+
+            override fun onPreviousPage() {
+                if (billingPrevCursors.isEmpty()) return
+                val previous = billingPrevCursors.removeAt(billingPrevCursors.size - 1)
+                billingCursor = previous.ifEmpty { null }
+                runAsync("usage previous page") { refreshUsagePanelBlocking() }
+            }
+
+            override fun onGrantCredits() {
+                val model = usagePanel.model()
+                if (model == null || !model.grantEnabled()) {
+                    appendSystem(model?.grantDisabledReason ?: "grant credits is not permitted")
+                    return
+                }
+                val amountRaw = JOptionPane.showInputDialog(
+                    this@FaktorChatPanel,
+                    "Credit grant amount in microUSD (integer > 0)",
+                    "1000000"
+                ) ?: return
+                val amount = amountRaw.trim().toLongOrNull()
+                if (amount == null || amount <= 0) {
+                    appendSystem("grant refused: enter a positive integer amount in microUSD")
+                    return
+                }
+                runAsync("grant credits") {
+                    val ack = service.grantCredits(
+                        amountMicro = amount,
+                        idempotencyKey = java.util.UUID.randomUUID().toString(),
+                        reason = "operator grant"
+                    )
+                    onEdt {
+                        appendSystem(
+                            if (ack.duplicate) {
+                                "credit grant replayed (idempotent); the recorded grant is unchanged"
+                            } else {
+                                "credits granted; balance ${micro(ack.credits.balanceMicro())}"
+                            }
+                        )
+                    }
+                    refreshUsagePanelBlocking()
+                }
+            }
+        })
         tournamentPanel.setListener(object : TournamentPanel.Listener {
             override fun onLoadTournament(tournamentId: String) {
                 runAsync("load tournament") {
@@ -733,7 +793,11 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
     // ----------------------------------------------------------- refreshers
 
     private fun refreshAllBlocking() {
-        if (!service.isRunning() || service.currentSessionId() == null) return
+        if (!service.isRunning()) return
+        // The usage/credits panel is ORGANIZATION-scoped: it refreshes even
+        // before a session is selected.
+        refreshUsagePanelBlocking()
+        if (service.currentSessionId() == null) return
         refreshStatusBlocking()
         refreshMessagesBlocking()
         refreshTaskRunsBlocking()
@@ -939,6 +1003,47 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
             usageLabel.text =
                 "usage: sessions=${usage.sessions} tokens=${sessionUsage.tokens} " +
                     "taskCostMicro=${usage.settledCostMicro}"
+        }
+    }
+
+    /**
+     * The commercial-metering panel: the control-plane identity fixes the
+     * organization, then one entitlement snapshot and one cursor page of the
+     * usage fold. A typed refusal renders as the panel's explicit
+     * disabled/unavailable state (billing_disabled → "billing disabled
+     * locally") — never fabricated numbers. No session is required.
+     */
+    private fun refreshUsagePanelBlocking() {
+        if (!service.isRunning()) return
+        val cursor = billingCursor
+        val hasPrev = billingPrevCursors.isNotEmpty()
+        try {
+            val identity = service.identity()
+            val entitlements = service.entitlements()
+            val usage = service.billingUsage(identity.organization, cursor, 50L)
+            onEdt {
+                usagePanel.setModel(
+                    usagePanelModelOf(identity, entitlements, usage, null, null, cursor, hasPrev)
+                )
+            }
+        } catch (e: NativeApiException) {
+            onEdt {
+                usagePanel.setModel(
+                    usagePanelModelOf(
+                        null, null, null, e.code,
+                        "${e.status} ${e.code}: ${e.detail}", cursor, hasPrev
+                    )
+                )
+            }
+        } catch (e: Exception) {
+            onEdt {
+                usagePanel.setModel(
+                    usagePanelModelOf(
+                        null, null, null, "unavailable",
+                        e.message ?: e.javaClass.simpleName, cursor, hasPrev
+                    )
+                )
+            }
         }
     }
 
@@ -1334,6 +1439,8 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
     internal fun historyView(): HistoryPanel = historyPanel
 
     internal fun tournamentViewForTest(): TournamentPanel = tournamentPanel
+
+    internal fun usageView(): UsagePanel = usagePanel
 
     internal fun boardView(): BoardPanel = boardPanel
 

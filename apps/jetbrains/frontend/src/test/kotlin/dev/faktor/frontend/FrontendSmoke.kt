@@ -15,8 +15,11 @@ import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeProtocolException
 import dev.faktor.shared.NativeRequests
 import dev.faktor.shared.parseNativeAgents
+import dev.faktor.shared.parseNativeBillingUsage
 import dev.faktor.shared.parseNativeBoardPage
 import dev.faktor.shared.parseNativeBoardPost
+import dev.faktor.shared.parseNativeEntitlements
+import dev.faktor.shared.parseNativeIdentity
 import dev.faktor.shared.parseNativeModelCatalog
 import dev.faktor.shared.parseNativeOrchestratorGraph
 import dev.faktor.shared.parseNativePermissionList
@@ -348,6 +351,57 @@ private const val PRESENTATION_ACK_JSON = "{" +
 private const val PERMISSION_LIST_JSON = "{" +
     "\"permissions\":[{\"id\":\"7\",\"session_id\":\"9\",\"capability\":\"shell\"," +
     "\"detail\":{\"tool\":\"bash\"}}]}"
+
+private const val BILLING_USAGE_JSON = "{" +
+    "\"ok\":true,\"organization\":\"org-local\"," +
+    "\"fold\":{\"organization_id\":\"org-local\"," +
+    "\"totals\":{\"input_tokens\":1000,\"output_tokens\":500,\"cache_read_tokens\":200," +
+    "\"cache_write_tokens\":50,\"reasoning_tokens\":25,\"provider_cost_micro\":900000," +
+    "\"managed_cost_micro\":700000,\"byok_cost_micro\":200000,\"events\":12," +
+    "\"corrected_events\":1}," +
+    "\"per_task\":[{\"task_id\":3,\"run_id\":\"r1\"," +
+    "\"totals\":{\"input_tokens\":400,\"output_tokens\":100,\"cache_read_tokens\":0," +
+    "\"cache_write_tokens\":0,\"reasoning_tokens\":0,\"provider_cost_micro\":700000," +
+    "\"managed_cost_micro\":700000,\"byok_cost_micro\":0,\"events\":3," +
+    "\"corrected_events\":0}}],\"next_cursor\":null}," +
+    "\"credits\":{\"granted_micro\":5000000,\"consumed_micro\":2000000," +
+    "\"refunded_micro\":100000,\"held_micro\":250000,\"pending_consumes\":1}," +
+    "\"items\":[{\"cursor\":\"9\",\"event\":{\"unit\":\"input_tokens\",\"quantity\":10}}]," +
+    "\"nextCursor\":\"9\"" +
+    "}"
+
+private const val ENTITLEMENTS_JSON = "{" +
+    "\"ok\":true,\"entitlements\":{" +
+    "\"organization_id\":\"org-local\",\"billing_account_id\":\"acct-1\"," +
+    "\"plan_id\":\"pro\",\"plan_found\":true,\"subscription_status\":\"active\"," +
+    "\"subscription_expires_ms\":1800000000000,\"subscription_active\":true," +
+    "\"features\":[\"managed_providers\",\"byok\",\"credits\"]," +
+    "\"limits\":{\"max_tokens_per_period\":100000," +
+    "\"max_managed_spend_micro_per_period\":1000000,\"min_credit_balance_micro\":1000," +
+    "\"max_active_tasks\":4}," +
+    "\"credits\":{\"granted_micro\":5000000,\"consumed_micro\":2000000," +
+    "\"refunded_micro\":100000,\"held_micro\":250000,\"pending_consumes\":1}," +
+    "\"managed_spend_micro\":700000,\"byok_spend_micro\":200000," +
+    "\"total_tokens\":1775," +
+    "\"in_flight\":[{\"id\":\"txn-1\",\"organization\":\"org-local\"," +
+    "\"kind\":\"integration\",\"reference\":\"run-1\"," +
+    "\"started_ms\":1750000000000,\"ended_ms\":null}]," +
+    "\"now_ms\":1750000000000" +
+    "}}"
+
+private const val IDENTITY_JSON = "{" +
+    "\"ok\":true,\"identity\":{\"subject_kind\":\"user\",\"subject_id\":\"u-1\"," +
+    "\"display_name\":\"Admin\",\"email\":\"admin@example.com\"," +
+    "\"organization\":\"org-local\",\"organization_name\":\"Local Org\"," +
+    "\"role\":\"admin\",\"effective_actions\":[\"billing_read\",\"credits_grant\"]}" +
+    "}"
+
+private const val MEMBER_IDENTITY_JSON = "{" +
+    "\"ok\":true,\"identity\":{\"subject_kind\":\"user\",\"subject_id\":\"u-2\"," +
+    "\"display_name\":\"Member\",\"organization\":\"org-local\"," +
+    "\"organization_name\":\"Local Org\",\"role\":\"member\"," +
+    "\"effective_actions\":[\"billing_read\"]}" +
+    "}"
 
 // -------------------------------------------------------------------- smoke
 
@@ -1172,6 +1226,284 @@ object FrontendSmoke {
             )
         }
 
+        step("commercial metering parses: usage fold, entitlements, identity") {
+            val usage = parseNativeBillingUsage(BILLING_USAGE_JSON)
+            assertEquals("org-local", usage.organization)
+            assertEquals(700_000L, usage.fold.totals.managedCostMicro)
+            assertEquals(200_000L, usage.fold.totals.byokCostMicro)
+            assertEquals(1_775L, usage.fold.totals.totalTokens())
+            assertEquals(3L, usage.fold.perTask[0].taskId)
+            assertEquals(3_100_000L, usage.credits.balanceMicro())
+            assertEquals(1, usage.itemCount)
+            assertEquals("9", usage.nextCursor)
+            val entitlements = parseNativeEntitlements(ENTITLEMENTS_JSON)
+            assertEquals("pro", entitlements.planId)
+            assertEquals(true, entitlements.planFound)
+            assertEquals(true, entitlements.subscriptionActive)
+            assertEquals(100_000L, entitlements.limits[USAGE_LIMIT_MAX_TOKENS])
+            assertEquals(4, entitlements.limits.size)
+            assertEquals(1, entitlements.inFlight.size)
+            assertEquals(null, entitlements.inFlight[0].endedMs)
+            val identity = parseNativeIdentity(IDENTITY_JSON)
+            assertEquals("admin", identity.role)
+            assertEquals("org-local", identity.organization)
+            assertEquals(true, identity.effectiveActions.contains("credits_grant"))
+            assertEquals(false, parseNativeIdentity(MEMBER_IDENTITY_JSON).effectiveActions.contains("credits_grant"))
+        }
+
+        step("usage panel renders populated aggregates, credits and exact limits") {
+            val model = usagePanelModelOf(
+                parseNativeIdentity(IDENTITY_JSON),
+                parseNativeEntitlements(ENTITLEMENTS_JSON),
+                parseNativeBillingUsage(BILLING_USAGE_JSON),
+                null, null, null, false
+            )
+            assertEquals("ok", model.state)
+            assertEquals("org-local", model.organization)
+            assertEquals("pro", model.planId)
+            assertEquals(1_775L, model.totals?.totalTokens())
+            assertEquals(3_100_000L, model.credits?.balanceMicro())
+            assertEquals(250_000L, model.credits?.heldMicro)
+            assertEquals("active", model.subscription)
+            assertEquals(1, model.tasks.size)
+            assertEquals(1, model.inFlight.size)
+            assertEquals(1, model.itemCount)
+            assertEquals("9", model.nextCursor)
+            val tokensQuota = model.quotas.first { it.limit == USAGE_LIMIT_MAX_TOKENS }
+            assertEquals(100_000L, tokensQuota.value)
+            assertEquals(1_775L, tokensQuota.observed)
+            assertEquals(false, tokensQuota.exceeded)
+            // An unserved observed counter is null, never a fabricated zero.
+            val unserved = model.quotas.first { it.limit == USAGE_LIMIT_ACTIVE_TASKS }
+            assertEquals(null, unserved.observed)
+            assertEquals(null, unserved.exceeded)
+            val lines = model.lines()
+            assertTrue(lines.any { it.contains("managed") && it.contains("BYOK") }, lines.toString())
+            assertTrue(lines.any { it.contains("quota $USAGE_LIMIT_MAX_TOKENS") }, lines.toString())
+            assertTrue(lines.any { it.contains("observed not served") }, lines.toString())
+            assertTrue(lines.any { it.contains("subscription active") }, lines.toString())
+            assertTrue(lines.any { it.contains("credits balance") }, lines.toString())
+            assertTrue(lines.any { it.contains("org-local") }, lines.toString())
+            val panel = UsagePanel()
+            panel.setModel(model)
+            assertEquals(true, panel.nextEnabled())
+            assertEquals(false, panel.prevEnabled())
+            assertEquals(true, panel.grantEnabled())
+            assertTrue(panel.lines().any { it.contains("quota ") }, panel.lines().toString())
+        }
+
+        step("billing_disabled renders \"billing disabled locally\", never zeros") {
+            val model = usagePanelModelOf(
+                parseNativeIdentity(IDENTITY_JSON), null, null,
+                "billing_disabled",
+                "409 billing_disabled: commercial billing is disabled " +
+                    "(enable the [billing] section to use it)",
+                null, false
+            )
+            assertEquals("disabled", model.state)
+            assertEquals(null, model.totals)
+            assertEquals(null, model.credits)
+            assertTrue(model.quotas.isEmpty(), "no quotas behind a disabled state")
+            assertTrue(model.lines()[0].startsWith("billing disabled locally"), model.lines()[0])
+            assertTrue(model.lines()[0].contains("billing_disabled"), model.lines()[0])
+            assertTrue(
+                model.lines().none { it.contains("\u00b5") },
+                "no money is fabricated behind a disabled state: ${model.lines()}"
+            )
+            assertTrue(model.lines().none { it.contains("quota") }, model.lines().toString())
+            assertEquals(false, model.grantEnabled())
+            val panel = UsagePanel()
+            panel.setModel(model)
+            assertEquals(false, panel.nextEnabled())
+            assertEquals(false, panel.prevEnabled())
+            assertEquals(false, panel.grantEnabled())
+        }
+
+        step("expired subscription banner and quota-exceeded limit naming") {
+            val entitlements = parseNativeEntitlements(ENTITLEMENTS_JSON)
+            val usage = parseNativeBillingUsage(BILLING_USAGE_JSON)
+            val identity = parseNativeIdentity(IDENTITY_JSON)
+            val expired = usagePanelModelOf(
+                identity,
+                entitlements.copy(
+                    subscriptionStatus = "expired",
+                    subscriptionActive = false,
+                    subscriptionExpiresMs = 1_700_000_000_000L
+                ),
+                usage, null, null, null, false
+            )
+            assertEquals("expired", expired.subscription)
+            assertTrue(
+                expired.lines().any {
+                    it.startsWith("[EXPIRED]") && it.contains("new tasks are denied")
+                },
+                expired.lines().toString()
+            )
+            val lapsed = usagePanelModelOf(
+                identity,
+                entitlements.copy(subscriptionStatus = "active", subscriptionActive = false),
+                usage, null, null, null, false
+            )
+            assertEquals("grace", lapsed.subscription)
+            assertTrue(
+                lapsed.lines().any { it.startsWith("[GRACE]") && it.contains("inactive") },
+                lapsed.lines().toString()
+            )
+            val canceled = usagePanelModelOf(
+                identity,
+                entitlements.copy(subscriptionStatus = "canceled", subscriptionActive = false),
+                usage, null, null, null, false
+            )
+            assertEquals("canceled", canceled.subscription)
+            assertTrue(
+                canceled.lines().any { it.startsWith("[CANCELED]") },
+                canceled.lines().toString()
+            )
+            val over = usagePanelModelOf(
+                identity,
+                entitlements.copy(totalTokens = 250_000L, managedSpendMicro = 1_000_000L),
+                usage, null, null, null, false
+            )
+            assertTrue(over.quotas.any { it.limit == USAGE_LIMIT_MAX_TOKENS && it.exceeded == true })
+            assertTrue(over.quotas.any { it.limit == USAGE_LIMIT_MANAGED_SPEND && it.exceeded == true })
+            val tokenLine = over.lines().first { it.contains(USAGE_LIMIT_MAX_TOKENS) }
+            assertTrue(tokenLine.startsWith("[EXCEEDED] quota $USAGE_LIMIT_MAX_TOKENS"), tokenLine)
+            assertTrue(tokenLine.contains("/ limit 100000"), tokenLine)
+            val floor = usagePanelModelOf(
+                identity,
+                entitlements.copy(
+                    credits = entitlements.credits.copy(
+                        grantedMicro = 100, consumedMicro = 50, refundedMicro = 0
+                    )
+                ),
+                usage, null, null, null, false
+            )
+            assertTrue(floor.quotas.any { it.limit == USAGE_LIMIT_MIN_CREDIT && it.exceeded == true })
+            assertTrue(
+                floor.lines().any { it.startsWith("[EXCEEDED] quota $USAGE_LIMIT_MIN_CREDIT") },
+                floor.lines().toString()
+            )
+        }
+
+        step("grant-credits affordance and cursor controls are role- and cursor-gated") {
+            val identity = parseNativeIdentity(IDENTITY_JSON)
+            val member = parseNativeIdentity(MEMBER_IDENTITY_JSON)
+            val entitlements = parseNativeEntitlements(ENTITLEMENTS_JSON)
+            val usage = parseNativeBillingUsage(BILLING_USAGE_JSON)
+            val adminModel = usagePanelModelOf(identity, entitlements, usage, null, null, null, false)
+            val memberModel = usagePanelModelOf(member, entitlements, usage, null, null, null, false)
+            assertEquals(true, adminModel.grantEnabled())
+            assertEquals(true, adminModel.canGrantCredits)
+            assertEquals(null, adminModel.grantDisabledReason)
+            assertTrue(
+                adminModel.lines().any { it.contains("grants credits") },
+                adminModel.lines().toString()
+            )
+            assertEquals(false, memberModel.grantEnabled())
+            assertTrue(
+                memberModel.grantDisabledReason?.contains("member") == true &&
+                    memberModel.grantDisabledReason?.contains("credits_grant") == true,
+                memberModel.grantDisabledReason ?: "(none)"
+            )
+            assertTrue(
+                memberModel.lines().any { it.contains("grant credits disabled") },
+                memberModel.lines().toString()
+            )
+            val events = ArrayList<String>()
+            val panel = UsagePanel()
+            panel.setListener(object : UsagePanel.Listener {
+                override fun onNextPage() {
+                    events.add("next")
+                }
+
+                override fun onPreviousPage() {
+                    events.add("prev")
+                }
+
+                override fun onGrantCredits() {
+                    events.add("grant")
+                }
+            })
+            panel.setModel(memberModel)
+            panel.clickGrant()
+            assertEquals(0, events.size, "a disabled grant must never fire")
+            panel.setModel(adminModel)
+            panel.clickGrant()
+            assertEquals(listOf("grant"), events)
+            // Cursor paging: Next fires while served, Previous only with a
+            // cursor stack; a disabled control never fires.
+            panel.setModel(adminModel)
+            assertEquals(true, panel.nextEnabled())
+            assertEquals(false, panel.prevEnabled())
+            panel.clickPrevious()
+            assertEquals(listOf("grant"), events)
+            panel.clickNext()
+            assertEquals(listOf("grant", "next"), events)
+            val second = usagePanelModelOf(
+                identity,
+                entitlements,
+                usage.copy(nextCursor = null),
+                null, null, "9", true
+            )
+            panel.setModel(second)
+            assertEquals(false, panel.nextEnabled())
+            assertEquals(true, panel.prevEnabled())
+            assertTrue(
+                second.lines().any { it.contains("cursor 9") && it.contains("next none") },
+                second.lines().toString()
+            )
+            panel.clickNext()
+            assertEquals(listOf("grant", "next"), events, "a disabled Next must never fire")
+            panel.clickPrevious()
+            assertEquals(listOf("grant", "next", "prev"), events)
+            assertEquals("9", second.cursor)
+        }
+
+        step("malformed billing payloads are loud protocol violations") {
+            for (text in listOf(
+                "{}",
+                "{\"ok\":true}",
+                "{\"organization\":\"o\",\"fold\":{\"organization_id\":\"o\"," +
+                    "\"totals\":{\"input_tokens\":\"many\"},\"per_task\":[]," +
+                    "\"next_cursor\":null},\"credits\":{},\"items\":[],\"nextCursor\":null}"
+            )) {
+                try {
+                    parseNativeBillingUsage(text)
+                    fail("hostile billing usage must be rejected: $text")
+                } catch (e: NativeProtocolException) {
+                    // expected: the panel renders an explicit unavailable state
+                }
+            }
+            try {
+                parseNativeEntitlements("{\"ok\":true,\"entitlements\":{}}")
+                fail("a malformed entitlement snapshot must be rejected")
+            } catch (e: NativeProtocolException) {
+                // expected
+            }
+            try {
+                parseNativeIdentity("{\"ok\":true,\"identity\":{}}")
+                fail("a malformed identity must be rejected")
+            } catch (e: NativeProtocolException) {
+                // expected
+            }
+            val malformed = usagePanelModelOf(
+                null, null, null,
+                "malformed", "GET /native/usage: missing required field credits",
+                null, false
+            )
+            assertEquals("unavailable", malformed.state)
+            assertEquals(null, malformed.totals)
+            assertEquals(null, malformed.credits)
+            assertTrue(
+                malformed.lines()[0].startsWith("usage unavailable"),
+                malformed.lines()[0]
+            )
+            assertTrue(
+                malformed.lines().none { it.contains("\u00b5") },
+                "no fabricated numbers: ${malformed.lines()}"
+            )
+        }
+
         step("every new UI section is constructible from the mock payload") {
             val model = TaskTree.build(
                 task = parseNativeTaskViews(TASK_JSON)[0],
@@ -1207,6 +1539,17 @@ object FrontendSmoke {
                 TaskTree.tournamentView(parseNativeTournament(TOURNAMENT_JSON))
             )
             assertEquals(2, tournament.candidateCount())
+            val usagePanel = UsagePanel()
+            usagePanel.setModel(
+                usagePanelModelOf(
+                    parseNativeIdentity(IDENTITY_JSON),
+                    parseNativeEntitlements(ENTITLEMENTS_JSON),
+                    parseNativeBillingUsage(BILLING_USAGE_JSON),
+                    null, null, null, false
+                )
+            )
+            assertEquals("ok", usagePanel.model()?.state)
+            assertTrue(usagePanel.lines().isNotEmpty(), "the usage panel must render lines")
             val navigator = EvidenceNavigatorPanel()
             navigator.setEvidence(model.evidence)
             navigator.setMessages(

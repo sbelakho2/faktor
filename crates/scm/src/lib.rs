@@ -16,6 +16,9 @@
 //!   delivery-id dedupe and the replay window, over the durable
 //!   [`webhook::WebhookInbox`];
 //! - [`sync`]: installation/repository sync into durable rows;
+//! - [`reconcile`]: the periodic, single-flight reconcile timer over that
+//!   sync (bounded cadence jitter, bounded failure backoff, typed bounded
+//!   journal);
 //! - [`store`]: the [`store::ScmStore`] durable seam plus its in-memory and
 //!   SQLite implementations.
 //!
@@ -27,6 +30,7 @@ pub mod error;
 pub mod github;
 pub mod ids;
 pub mod provider;
+pub mod reconcile;
 pub mod store;
 pub mod sync;
 pub mod token;
@@ -43,6 +47,13 @@ pub use ids::{
 pub use provider::{
     BranchSpec, CommentTarget, PullRequestSpec, ScmBranch, ScmComment, ScmInstallation, ScmIssue,
     ScmProvider, ScmPullRequest, ScmRemoteRef, ScmRepository, ScmReviewEvent,
+};
+pub use reconcile::{
+    failure_backoff_ms, jittered_delay_ms, ReconcileEvent, ReconcileKind, ReconcilePolicy,
+    ScmReconcile, DEFAULT_RECONCILE_INTERVAL_MS, DEFAULT_RECONCILE_JITTER_MS,
+    DEFAULT_RECONCILE_MAX_BACKOFF_MS, MAX_RECONCILE_BACKOFF_MS, MAX_RECONCILE_ERROR_BYTES,
+    MAX_RECONCILE_INTERVAL_MS, MAX_RECONCILE_JITTER_MS, MAX_RECONCILE_JOURNAL,
+    MIN_RECONCILE_INTERVAL_MS,
 };
 pub use store::{
     DeliveryClaim, InstallationRow, MemoryScmStore, RateLimitRow, RepositoryRow, ScmOperationRow,

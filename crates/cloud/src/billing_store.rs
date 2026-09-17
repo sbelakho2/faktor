@@ -112,8 +112,8 @@ pub struct StoredUsageEvent {
 
 /// The SQL schema of the durable billing-report schedule (migration v4 of
 /// the control-plane ladder). Append-only in spirit: rows advance through
-/// their open -> reported/failed states, and a REPORTED/FAILED period is
-/// terminal (the runner never re-opens it), so a period can never be
+/// their open -> reported/failed/skipped states, and a terminal period is
+/// never re-opened (the runner never re-opens it), so a period can never be
 /// double-reported even across a crash or restart.
 pub const BILLING_REPORT_SCHEMA_V4: &str = "
      CREATE TABLE IF NOT EXISTS billing_report_period (
@@ -141,6 +141,12 @@ pub enum ReportPeriodStatus {
     /// Terminally failed (a final vendor refusal or exhausted attempts);
     /// never retried.
     Failed,
+    /// Permanently skipped: the schedule was down long enough that this
+    /// period fell outside the bounded catch-up window. The row IS the
+    /// durable audit record (`last_error` names the skipped range, and
+    /// `skipped_at_ms` records when the decision was made) — a missed
+    /// period is never silently ignored.
+    Skipped,
 }
 
 impl ReportPeriodStatus {
@@ -149,6 +155,7 @@ impl ReportPeriodStatus {
             ReportPeriodStatus::Open => "open",
             ReportPeriodStatus::Reported => "reported",
             ReportPeriodStatus::Failed => "failed",
+            ReportPeriodStatus::Skipped => "skipped",
         }
     }
 
@@ -157,8 +164,15 @@ impl ReportPeriodStatus {
             "open" => Some(ReportPeriodStatus::Open),
             "reported" => Some(ReportPeriodStatus::Reported),
             "failed" => Some(ReportPeriodStatus::Failed),
+            "skipped" => Some(ReportPeriodStatus::Skipped),
             _ => None,
         }
+    }
+
+    /// Whether the status is terminal (a terminal period is never
+    /// re-opened or re-sent).
+    pub const fn is_terminal(self) -> bool {
+        !matches!(self, ReportPeriodStatus::Open)
     }
 }
 
@@ -182,6 +196,10 @@ pub struct ReportPeriodRow {
     #[serde(default)]
     pub reported_at_ms: Option<i64>,
     pub next_attempt_at_ms: i64,
+    /// When a [`ReportPeriodStatus::Skipped`] audit decision was made
+    /// (never set for any other status).
+    #[serde(default)]
+    pub skipped_at_ms: Option<i64>,
 }
 
 /// Bound on the retained report periods of ONE organization (oldest rows
@@ -834,8 +852,8 @@ fn report_key(organization: &str, period: &str) -> String {
 
 /// Prune one organization's report rows to the newest `bound` (by first
 /// sighting, then period): the schedule stays bounded over an unbounded
-/// lifetime. Terminal (reported/failed) rows are pruned first so an open
-/// period is never silently dropped while an old terminal row survives.
+/// lifetime. Terminal rows are pruned first so an open period or a skipped
+/// audit row is never silently dropped while an old terminal row survives.
 fn prune_report_periods(
     rows: &mut BTreeMap<String, ReportPeriodRow>,
     organization: &str,
@@ -847,7 +865,7 @@ fn prune_report_periods(
         .map(|(key, row)| {
             (
                 key.clone(),
-                row.status == ReportPeriodStatus::Open,
+                row.status == ReportPeriodStatus::Open || row.status == ReportPeriodStatus::Skipped,
                 row.first_seen_ms,
                 row.period.clone(),
             )
@@ -1420,11 +1438,12 @@ impl BillingStore for SqliteControlPlaneStore {
         )
         .map_err(backend)?;
         // Bounded schedule: prune the organization's oldest rows beyond the
-        // bound (terminal rows first at the same age).
+        // bound (reported/failed rows first at the same age; open periods
+        // and skipped audit rows are retained preferentially).
         tx.execute(
             "DELETE FROM billing_report_period WHERE organization_id = ?1 AND period NOT IN (
                  SELECT period FROM billing_report_period WHERE organization_id = ?1
-                 ORDER BY (status = 'open') DESC, first_seen_ms DESC, period DESC
+                 ORDER BY (status IN ('open', 'skipped')) DESC, first_seen_ms DESC, period DESC
                  LIMIT ?2)",
             params![row.organization_id, MAX_REPORT_PERIODS_PER_ORG as i64],
         )

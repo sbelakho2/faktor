@@ -14,13 +14,17 @@
 
 import * as vscode from 'vscode';
 import { resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { DaemonHandle, startDaemon, stopDaemon } from './daemon';
 import {
   FetchLike,
   NativeApiError,
+  NativeBillingUsage,
   NativeClient,
   NativeCompletionContract,
+  NativeEntitlementSnapshot,
   NativeEvidenceSelector,
+  NativeIdentity,
   NativeMessagePage,
   NativeModelInfo,
   NativeSessionUsage,
@@ -60,7 +64,7 @@ import {
   transcriptFromMessages,
   unavailableBoardState,
 } from './state';
-import { CockpitTaskVerification, buildCockpit, cockpitSections, tournamentViewOf } from './cockpit';
+import { CockpitTaskVerification, CockpitUsagePanel, buildCockpit, buildUsagePanel, cockpitSections, tournamentViewOf, usagePanelSections } from './cockpit';
 import type { PixelPresence } from './pixelAgents';
 import {
   AdmitFailure,
@@ -87,6 +91,8 @@ const MAX_EVIDENCE_PREVIEW_BYTES = 256 * 1024;
 const SESSION_BINDINGS_KEY = 'faktor.sessionBindings';
 /** One bounded newest-first board page per read (the daemon caps at 100). */
 const BOARD_PAGE_LIMIT = 100;
+/** One bounded billing usage page per read (the daemon caps at 200). */
+const BILLING_PAGE_LIMIT = 50;
 
 interface ActiveSession {
   daemon: DaemonHandle | null;
@@ -115,6 +121,13 @@ interface ActiveSession {
   /** Board read watermark: posts newer than this revision are unread. Only
    * an explicit read/post moves it; automatic refreshes never mark read. */
   boardSeenRevision: number;
+  /** Commercial-metering read state: the identity's organization fixes the
+   * billing tenant; the cursor stack drives the panel's paging controls. */
+  billingIdentity: NativeIdentity | null;
+  billingEntitlements: NativeEntitlementSnapshot | null;
+  billingUsage: NativeBillingUsage | null;
+  billingCursor: string | null;
+  billingPrevCursors: string[];
 }
 
 const active: ActiveSession = {
@@ -134,6 +147,11 @@ const active: ActiveSession = {
   pixelPresence: new Map(),
   completionContract: null,
   boardSeenRevision: 0,
+  billingIdentity: null,
+  billingEntitlements: null,
+  billingUsage: null,
+  billingCursor: null,
+  billingPrevCursors: [],
 };
 
 const store = new FaktorStore();
@@ -330,6 +348,7 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
     const client = new NativeClient({
       baseUrl: daemon.baseUrl,
       bearerToken: daemon.bearerToken,
+      controlToken: config('controlToken', ''),
       fetch: fetchAdapter(),
     });
     const health = await client.health();
@@ -377,6 +396,11 @@ function stopServer(): void {
   active.pixelPresence = new Map();
   active.completionContract = null;
   active.boardSeenRevision = 0;
+  active.billingIdentity = null;
+  active.billingEntitlements = null;
+  active.billingUsage = null;
+  active.billingCursor = null;
+  active.billingPrevCursors = [];
   store.patch({
     daemon: 'stopped',
     daemonDetail: '',
@@ -596,6 +620,9 @@ async function refresh(): Promise<void> {
     // else the newest summary. A missing listing/state is a null block, never
     // a fabricated tournament.
     const tournament = tournamentViewOf(await tournamentFor(client, sessionId));
+    // The commercial-metering panel is best-effort like the board: a refusal
+    // becomes an explicit disabled/unavailable panel, never a snapshot error.
+    const usagePanel = await billingPanelFor(client);
     const cockpit = buildCockpit({
       task,
       agents: agentSummaries,
@@ -606,6 +633,7 @@ async function refresh(): Promise<void> {
       proof: proofRead.proof,
       proofUnavailable: proofRead.unavailable,
     });
+    const sections = cockpit === null ? [] : cockpitSections(cockpit);
     store.patch({
       sessions,
       machineState: projection.state.machine,
@@ -618,7 +646,8 @@ async function refresh(): Promise<void> {
       activeRunId,
       busy: activeRunId !== null,
       cockpit,
-      cockpitSections: cockpit === null ? [] : cockpitSections(cockpit),
+      cockpitSections: [...sections, ...usagePanelSections(usagePanel)],
+      usagePanel,
       tournament: cockpit?.tournament ?? null,
       board,
       lastError: null,
@@ -722,6 +751,55 @@ async function taskProofFor(
     active.taskProof = null;
     active.taskProofUnavailable = reason;
     return { proof: null, unavailable: reason };
+  }
+}
+
+/**
+ * Read the commercial-metering surface: the control-plane identity fixes the
+ * organization, then one entitlement snapshot and one cursor page of the
+ * usage fold. Every refusal is captured as the panel's explicit
+ * disabled/unavailable reason — the panel NEVER shows stale numbers behind a
+ * refusal, and a `billing_disabled` refusal renders "billing disabled
+ * locally" instead of zeros.
+ */
+async function billingPanelFor(client: NativeClient): Promise<CockpitUsagePanel> {
+  const cursor = active.billingCursor;
+  const hasPrev = active.billingPrevCursors.length > 0;
+  try {
+    const identityView = await client.identity();
+    active.billingIdentity = identityView.identity;
+    const [entitlementsView, usage] = await Promise.all([
+      client.entitlements(),
+      client.billingUsage(identityView.identity.organization, {
+        since: cursor,
+        limit: BILLING_PAGE_LIMIT,
+      }),
+    ]);
+    active.billingEntitlements = entitlementsView.entitlements;
+    active.billingUsage = usage;
+    return buildUsagePanel({
+      identity: identityView.identity,
+      entitlements: entitlementsView.entitlements,
+      usage,
+      refusal: null,
+      cursor,
+      hasPrev,
+    });
+  } catch (error) {
+    const refusal =
+      error instanceof NativeApiError
+        ? { code: error.code, reason: `${error.status} ${error.code}: ${error.message}` }
+        : { code: 'unavailable', reason: messageOf(error) };
+    active.billingUsage = null;
+    active.billingEntitlements = null;
+    return buildUsagePanel({
+      identity: active.billingIdentity,
+      entitlements: null,
+      usage: null,
+      refusal,
+      cursor,
+      hasPrev,
+    });
   }
 }
 
@@ -1169,6 +1247,96 @@ async function controlTournament(message: ChatMessage): Promise<void> {
   }
 }
 
+/**
+ * The usage/credits panel controls. `usage-next`/`usage-prev` move the
+ * organization-wide event cursor (a stack keeps Previous exact); the
+ * `grant-credits` key is refused unless the identity carries the
+ * `credits_grant` capability — the server role check stays the gate.
+ */
+async function controlUsage(message: ChatMessage): Promise<void> {
+  const action = typeof message.action === 'string' ? message.action : '';
+  const panel = store.snapshot().usagePanel;
+  if (action === 'usage-next') {
+    const next = panel?.page.nextCursor ?? null;
+    if (next === null) {
+      chatProvider?.postNotice('info', 'no further usage page is served');
+      return;
+    }
+    active.billingPrevCursors.push(active.billingCursor ?? '');
+    active.billingCursor = next;
+    await refresh();
+    return;
+  }
+  if (action === 'usage-prev') {
+    if (active.billingPrevCursors.length === 0) {
+      chatProvider?.postNotice('info', 'already at the first usage page');
+      return;
+    }
+    const previous = active.billingPrevCursors.pop() ?? '';
+    active.billingCursor = previous.length > 0 ? previous : null;
+    await refresh();
+    return;
+  }
+  if (action === 'grant-credits') {
+    await grantCreditsFromCommand();
+    return;
+  }
+}
+
+/** The operator credit grant: amount + reason prompts, idempotency-keyed. */
+async function grantCreditsFromCommand(): Promise<void> {
+  const client = active.client;
+  const panel = store.snapshot().usagePanel;
+  if (!client) {
+    return;
+  }
+  if (panel === null || !panel.canGrantCredits) {
+    chatProvider?.postNotice(
+      'error',
+      panel?.grantDisabledReason ?? 'grant credits requires an admin control-plane principal',
+    );
+    return;
+  }
+  const amountRaw = await vscode.window.showInputBox({
+    prompt: 'Credit grant amount in microUSD (integer, > 0)',
+    placeHolder: '1000000',
+    validateInput: (value) =>
+      Number.isInteger(Number(value)) && Number(value) > 0
+        ? undefined
+        : 'enter a positive integer amount in microUSD',
+  });
+  if (amountRaw === undefined) {
+    return;
+  }
+  const reasonRaw = await vscode.window.showInputBox({
+    prompt: 'Grant reason (optional)',
+    placeHolder: 'operator grant',
+  });
+  if (reasonRaw === undefined) {
+    return;
+  }
+  try {
+    const ack = await client.grantCredits({
+      amountMicro: Number(amountRaw),
+      reason: reasonRaw.trim(),
+      idempotencyKey: randomUUID(),
+    });
+    const balance = Math.max(
+      0,
+      ack.credits.granted_micro + ack.credits.refunded_micro - ack.credits.consumed_micro,
+    );
+    chatProvider?.postNotice(
+      'info',
+      ack.duplicate
+        ? 'credit grant replayed (idempotent); the recorded grant is unchanged'
+        : `credits granted; the balance is now ${balance}\u00b5$`,
+    );
+    await refresh();
+  } catch (error) {
+    reportError(error);
+  }
+}
+
 async function controlAgent(message: ChatMessage): Promise<void> {
   const client = active.client;
   const agentId = typeof message.agentId === 'string' ? message.agentId : '';
@@ -1389,6 +1557,9 @@ async function handleWebviewMessage(
       return;
     case 'tournamentControl':
       await controlTournament(message);
+      return;
+    case 'usageControl':
+      await controlUsage(message);
       return;
     case 'retrieveEvidence':
       await retrieveEvidence(message);

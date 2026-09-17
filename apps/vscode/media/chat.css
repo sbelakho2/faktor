@@ -456,6 +456,14 @@ details summary {
   font-style: italic;
 }
 
+/* Usage/credits alert lines: a breached quota, an expired/canceled
+   subscription or a lapsed (grace) one reads as an alert, never as a
+   healthy number. */
+.usage-alert {
+  color: var(--vscode-testing-iconFailed, #f85149);
+  font-weight: 600;
+}
+
 /* Accessibility: with prefers-reduced-motion every .pixel-* animation and
    transform is removed, while each state keeps a STATIC cue (opacity) so
    presence is still legible without motion. */

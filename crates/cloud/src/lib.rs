@@ -36,6 +36,7 @@ pub mod model;
 pub mod oidc;
 pub mod oidc_net;
 pub mod rbac;
+pub mod report_schedule;
 pub mod service;
 pub mod sso;
 pub mod store;
@@ -92,12 +93,18 @@ pub use oidc::{
     OidcClaims, OidcDiscovery, OidcError, OidcMembership, OidcTokenSet, ScimProvisioningSeam,
 };
 pub use oidc_net::{
-    AsyncOidcAdapter, CachedJwksView, NetworkOidcAdapter, NetworkOidcConfig,
-    DEFAULT_DISCOVERY_MAX_AGE_MS, DEFAULT_JWKS_MAX_AGE_MS, MAX_CACHE_MAX_AGE_MS,
-    MAX_JWKS_REFETCHES,
+    AsyncOidcAdapter, CachedJwksView, ClientAuthMethod, ClientSecret, NetworkOidcAdapter,
+    NetworkOidcConfig, DEFAULT_DISCOVERY_MAX_AGE_MS, DEFAULT_JWKS_MAX_AGE_MS, MAX_CACHE_MAX_AGE_MS,
+    MAX_CLIENT_SECRET_BYTES, MAX_CODE_EXCHANGE_INPUT_BYTES, MAX_JWKS_REFETCHES,
 };
 pub use rbac::{
     authorize, Action, Denied, Principal, PrincipalSubject, Resource, Role, ALL_ACTIONS,
+};
+pub use report_schedule::{
+    backoff_ms, catch_up_plan, period_from_index, period_index, period_key, BillingReportRunner,
+    CatchUpPlan, ReportPolicy, TickOutcome, DEFAULT_REPORT_CATCH_UP, MAX_REPORT_CATCH_UP_PERIODS,
+    MAX_REPORT_INTERVAL_MS, MAX_REPORT_MAX_BACKOFF_MS, MAX_REPORT_PERIOD_MS,
+    MIN_REPORT_INTERVAL_MS, MIN_REPORT_PERIOD_MS,
 };
 pub use service::{
     sha256_hex, BootstrapResult, Clock, ControlPlane, ExternalLogin, IdentityView,

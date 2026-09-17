@@ -20,13 +20,17 @@ import dev.faktor.shared.NativeAbortAck
 import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeAgentControlAck
 import dev.faktor.shared.NativeApiException
+import dev.faktor.shared.NativeBillingUsage
 import dev.faktor.shared.NativeBoardPage
 import dev.faktor.shared.NativeBoardPost
 import dev.faktor.shared.NativeCompletionContract
+import dev.faktor.shared.NativeCreditGrant
+import dev.faktor.shared.NativeEntitlementSnapshot
 import dev.faktor.shared.NativeEventPage
 import dev.faktor.shared.NativeEvidence
 import dev.faktor.shared.NativeEvidenceRetrieval
 import dev.faktor.shared.NativeHealth
+import dev.faktor.shared.NativeIdentity
 import dev.faktor.shared.NativeMessagePage
 import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.NativeProjection
@@ -62,12 +66,16 @@ import dev.faktor.shared.NativeVerificationView
 import dev.faktor.shared.parseNativeAbortAck
 import dev.faktor.shared.parseNativeAgentControlAck
 import dev.faktor.shared.parseNativeAgents
+import dev.faktor.shared.parseNativeBillingUsage
 import dev.faktor.shared.parseNativeBoardPage
 import dev.faktor.shared.parseNativeBoardPost
+import dev.faktor.shared.parseNativeCreditGrant
+import dev.faktor.shared.parseNativeEntitlements
 import dev.faktor.shared.parseNativeEventPage
 import dev.faktor.shared.parseNativeEvidence
 import dev.faktor.shared.parseNativeEvidenceRetrieval
 import dev.faktor.shared.parseNativeHealth
+import dev.faktor.shared.parseNativeIdentity
 import dev.faktor.shared.parseNativeMessagePage
 import dev.faktor.shared.parseNativeModelCatalog
 import dev.faktor.shared.parseNativeOrchestratorGraph
@@ -118,7 +126,14 @@ class NativeClient(
     val baseUrl: String,
     val bearerToken: String,
     private val timeoutMs: Long = DEFAULT_TIMEOUT_MS,
-    private val maxBodyBytes: Long = DEFAULT_MAX_BODY_BYTES
+    private val maxBodyBytes: Long = DEFAULT_MAX_BODY_BYTES,
+    /**
+     * The control-plane credential (`x-faktor-control-token`): an auth-session
+     * or service-account token, NEVER the daemon password. Absent = no
+     * control-plane principal; the billing/identity routes then refuse loudly
+     * and the usage panel renders that refusal (never fabricated numbers).
+     */
+    private val controlToken: String? = null
 ) {
     companion object {
         const val DEFAULT_TIMEOUT_MS = 15_000L
@@ -126,8 +141,11 @@ class NativeClient(
         const val EVIDENCE_MAX_BODY_BYTES = 32L * 1024 * 1024
         const val READY_POLL_MS = 100L
 
-        fun forConnection(connection: BackendConnection): NativeClient =
-            NativeClient(connection.baseUrl, connection.password)
+        fun forConnection(
+            connection: BackendConnection,
+            controlToken: String? = null
+        ): NativeClient =
+            NativeClient(connection.baseUrl, connection.password, controlToken = controlToken)
     }
 
     private val http: HttpClient = HttpClient.newBuilder()
@@ -511,6 +529,54 @@ class NativeClient(
         request("GET", "/native/session/" + encode(sessionId) + "/usage")
     )
 
+    // ------------------------------------------------- commercial metering
+
+    /** The caller's control-plane identity (fixes the billing organization). */
+    fun identity(): NativeIdentity = parseNativeIdentity(request("GET", "/native/identity"))
+
+    /** The derived entitlement snapshot of the caller's organization. */
+    fun entitlements(): NativeEntitlementSnapshot =
+        parseNativeEntitlements(request("GET", "/native/entitlements"))
+
+    /**
+     * The organization's usage fold plus ONE cursor page of its usage events.
+     * `since` is the exclusive cursor a previous page returned as
+     * `nextCursor`; the daemon bounds the page size (1..=200).
+     */
+    fun billingUsage(
+        organization: String,
+        since: String? = null,
+        limit: Long? = null
+    ): NativeBillingUsage = parseNativeBillingUsage(
+        request(
+            "GET", "/native/usage",
+            query(
+                "org" to organization,
+                "since" to since,
+                "limit" to limit?.toString()
+            )
+        )
+    )
+
+    /**
+     * Grant credits (admin role only; the server is the guard). The daemon
+     * REQUIRES the `Idempotency-Key` header: the same key + same request
+     * replays the recorded result instead of appending a second grant.
+     */
+    fun grantCredits(
+        amountMicro: Long,
+        idempotencyKey: String,
+        reason: String? = null,
+        accountId: String? = null
+    ): NativeCreditGrant = parseNativeCreditGrant(
+        request(
+            "POST", "/native/credits/grant", null,
+            NativeRequests.grantCredits(amountMicro, reason, accountId),
+            maxBodyBytes,
+            listOf(Pair("idempotency-key", idempotencyKey))
+        )
+    )
+
     fun verification(sessionId: String): NativeVerificationView = parseNativeVerificationView(
         request("GET", "/native/session/" + encode(sessionId) + "/verification")
     )
@@ -584,7 +650,8 @@ class NativeClient(
         path: String,
         queryParams: List<Pair<String, String>>? = null,
         body: String? = null,
-        maxBytes: Long = maxBodyBytes
+        maxBytes: Long = maxBodyBytes,
+        extraHeaders: List<Pair<String, String>>? = null
     ): String {
         val url = StringBuilder(baseUrl.trimEnd('/')).append(path)
         if (queryParams != null && queryParams.isNotEmpty()) {
@@ -598,6 +665,14 @@ class NativeClient(
             .timeout(Duration.ofMillis(timeoutMs))
             .header("Authorization", "Bearer $bearerToken")
             .header("Accept", "application/json")
+        if (controlToken != null && controlToken.isNotEmpty()) {
+            builder.header("x-faktor-control-token", controlToken)
+        }
+        if (extraHeaders != null) {
+            for (header in extraHeaders) {
+                builder.header(header.first, header.second)
+            }
+        }
         if (body != null) {
             builder.header("Content-Type", "application/json")
             builder.method(method, HttpRequest.BodyPublishers.ofString(body))

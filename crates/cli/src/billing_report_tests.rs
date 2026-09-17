@@ -30,6 +30,7 @@ fn policy() -> ReportPolicy {
         max_attempts: 3,
         retry_base_ms: 250,
         max_backoff_ms: 5_000,
+        max_catch_up: 24,
     }
 }
 
@@ -323,6 +324,7 @@ fn period_keys_are_stable_and_backoff_is_jittered_and_bounded() {
         max_attempts: 5,
         retry_base_ms: 1_000,
         max_backoff_ms: 10_000,
+        max_catch_up: 24,
     };
     for attempts in 0..12u32 {
         let delay = backoff_ms(&p, "p7", attempts);
@@ -347,4 +349,175 @@ fn period_keys_are_stable_and_backoff_is_jittered_and_bounded() {
         ..p
     };
     assert_eq!(backoff_ms(&zero, "p7", 3), 0);
+}
+
+/// Downtime crossing three whole periods: each missed period is backfilled
+/// oldest-first, exactly once, before the regular cadence resumes.
+#[tokio::test]
+async fn three_missed_periods_are_backfilled_oldest_first_exactly_once_each() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("billing.db");
+    let mock = MockServer::start().await;
+    for _ in 0..8 {
+        mock.push("POST", VENDOR_PATH, Reply::json(200, serde_json::json!({})));
+    }
+    let clock = Arc::new(ManualClock::new(1_000));
+    let h = harness(&db, &mock, clock.clone(), policy());
+    match h.runner.tick().await.unwrap() {
+        TickOutcome::Reported { period, .. } => assert_eq!(period, "p0"),
+        other => panic!("expected Reported(p0), got {other:?}"),
+    }
+    // The schedule is down for four period boundaries: p1..p3 were crossed.
+    clock.advance(4 * 60_000);
+    for expected in ["p1", "p2", "p3", "p4"] {
+        match h.runner.tick().await.unwrap() {
+            TickOutcome::Reported { period, .. } => assert_eq!(period, expected),
+            other => panic!("expected Reported({expected}), got {other:?}"),
+        }
+    }
+    assert_eq!(h.runner.tick().await.unwrap(), TickOutcome::Idle);
+    let posts = mock.requests("POST", VENDOR_PATH);
+    assert_eq!(posts.len(), 5, "one page per period, oldest first");
+    for (index, post) in posts.iter().enumerate() {
+        assert!(
+            post.body.contains(&format!(r#""period":"p{index}""#)),
+            "{}",
+            post.body
+        );
+        assert!(
+            post.header("idempotency-key")
+                .unwrap_or_default()
+                .ends_with(&format!(":p{index}:head")),
+            "period p{index} must keep its own record-before-send key"
+        );
+    }
+    for index in 0..=4i64 {
+        let row = h
+            .store
+            .report_period(&h.organization, &format!("p{index}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, ReportPeriodStatus::Reported);
+        assert!(row.skipped_at_ms.is_none());
+    }
+}
+
+/// A downtime gap larger than the configured cap: the most recent missed
+/// periods are backfilled and every older one is marked skipped-permanently
+/// with a durable audit row — never silently dropped.
+#[tokio::test]
+async fn catch_up_cap_marks_older_periods_skipped_with_a_durable_audit_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("billing.db");
+    let mock = MockServer::start().await;
+    for _ in 0..8 {
+        mock.push("POST", VENDOR_PATH, Reply::json(200, serde_json::json!({})));
+    }
+    let clock = Arc::new(ManualClock::new(1_000));
+    let mut p = policy();
+    p.max_catch_up = 2;
+    let h = harness(&db, &mock, clock.clone(), p);
+    match h.runner.tick().await.unwrap() {
+        TickOutcome::Reported { period, .. } => assert_eq!(period, "p0"),
+        other => panic!("expected Reported(p0), got {other:?}"),
+    }
+    // Three missed periods (p1..p3), cap 2: p1 is skipped, p2/p3 backfilled.
+    clock.advance(4 * 60_000);
+    for expected in ["p2", "p3", "p4"] {
+        match h.runner.tick().await.unwrap() {
+            TickOutcome::Reported { period, .. } => assert_eq!(period, expected),
+            other => panic!("expected Reported({expected}), got {other:?}"),
+        }
+    }
+    assert_eq!(h.runner.tick().await.unwrap(), TickOutcome::Idle);
+    // The skipped period was NEVER sent...
+    let posts = mock.requests("POST", VENDOR_PATH);
+    assert_eq!(posts.len(), 4);
+    assert!(posts
+        .iter()
+        .all(|post| !post.body.contains(r#""period":"p1""#)));
+    // ...and it is durably audited, naming the range and the cap.
+    let audit = h
+        .store
+        .report_period(&h.organization, "p1")
+        .unwrap()
+        .expect("the skipped period carries an audit row");
+    assert_eq!(audit.status, ReportPeriodStatus::Skipped);
+    assert_eq!(audit.skipped_at_ms, Some(clock.now_ms()));
+    let message = audit.last_error.as_deref().unwrap();
+    assert!(
+        message.contains("skipped 1 missed periods p1..p1"),
+        "{message}"
+    );
+    assert!(message.contains("cap"), "{message}");
+    // The backfilled periods are terminal too (exactly once).
+    for period in ["p2", "p3", "p4"] {
+        assert_eq!(
+            h.store
+                .report_period(&h.organization, period)
+                .unwrap()
+                .unwrap()
+                .status,
+            ReportPeriodStatus::Reported
+        );
+    }
+}
+
+/// A restart in the MIDDLE of a backfill replays nothing: the already
+/// reported missed period is terminal, the remaining ones continue oldest
+/// first, and no period is double-reported.
+#[tokio::test]
+async fn restart_mid_backfill_never_double_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("billing.db");
+    let mock = MockServer::start().await;
+    for _ in 0..8 {
+        mock.push("POST", VENDOR_PATH, Reply::json(200, serde_json::json!({})));
+    }
+    let clock = Arc::new(ManualClock::new(1_000));
+    {
+        let h = harness(&db, &mock, clock.clone(), policy());
+        assert!(matches!(
+            h.runner.tick().await.unwrap(),
+            TickOutcome::Reported { .. }
+        ));
+        clock.advance(4 * 60_000);
+        // The first catch-up tick plans p1..p3 and reports the oldest.
+        match h.runner.tick().await.unwrap() {
+            TickOutcome::Reported { period, .. } => assert_eq!(period, "p1"),
+            other => panic!("expected Reported(p1), got {other:?}"),
+        }
+        drop(h);
+    }
+    // Crash + restart mid-backfill: p1 is already terminal; p2, p3 and the
+    // current period continue exactly once each.
+    let h = harness(&db, &mock, clock, policy());
+    for expected in ["p2", "p3", "p4"] {
+        match h.runner.tick().await.unwrap() {
+            TickOutcome::Reported { period, .. } => assert_eq!(period, expected),
+            other => panic!("expected Reported({expected}), got {other:?}"),
+        }
+    }
+    assert_eq!(h.runner.tick().await.unwrap(), TickOutcome::Idle);
+    let posts = mock.requests("POST", VENDOR_PATH);
+    assert_eq!(posts.len(), 5, "each of p0..p4 exactly once");
+    let mut keys: Vec<String> = posts
+        .iter()
+        .map(|post| {
+            post.header("idempotency-key")
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(keys.len(), 5, "no idempotency key was replayed");
+    assert!(
+        !h.store
+            .report_periods(&h.organization, 10)
+            .unwrap()
+            .iter()
+            .any(|row| row.status == ReportPeriodStatus::Skipped),
+        "a restart never re-audits or skips a period that was backfilled"
+    );
 }

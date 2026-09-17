@@ -197,6 +197,12 @@ async fn handle_conn(
     for (name, value) in &reply.headers {
         response.push_str(&format!("{name}: {value}\r\n"));
     }
+    // This mock serves exactly ONE request per connection and then drops
+    // the socket; `Connection: close` keeps the pooled client from reusing
+    // a socket the server is about to close (the pooled-reuse race was a
+    // real flake: a reused half-closed socket surfaces as "error sending
+    // request" on the NEXT request).
+    response.push_str("connection: close\r\n");
     response.push_str(&format!("content-length: {}\r\n\r\n", reply.body.len()));
     response.push_str(&reply.body);
     socket.write_all(response.as_bytes()).await?;
