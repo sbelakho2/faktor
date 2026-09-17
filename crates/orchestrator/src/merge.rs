@@ -43,6 +43,9 @@ use std::fs;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 
+use faktor_core::authority::{
+    authority_digest_hex, classify_authority_digest, Fields, DOMAIN_BASE_MAP, DOMAIN_CHANGE_SET,
+};
 use faktor_core::error::{Error, ErrorKind};
 use faktor_core::hash::FileHash;
 use faktor_core::id::{SessionId, WorkspaceId};
@@ -259,42 +262,45 @@ pub struct ChangeSet {
 }
 
 impl ChangeSet {
+    /// The identity version stored in the change-set header: 2 = the
+    /// canonical BLAKE3 authority digest ([`Self::id`]); a stored header
+    /// without it is a pre-BLAKE3 row that may be VIEWED but never
+    /// authorized (its recomputed id no longer equals its stored id).
+    pub const ID_VERSION: u64 = 2;
+
     /// Deterministic content identity of one staged change set: the child,
-    /// its base anchors and every ordered change entry are digested
-    /// together (NOT just the base name). Re-staging an identical candidate
-    /// re-derives the SAME id; any content drift derives a different one.
+    /// its base anchors and every ordered change entry are hashed as
+    /// structured, length-prefixed fields (NOT just the base name, never a
+    /// 64-bit FNV fold). Re-staging an identical candidate re-derives the
+    /// SAME id; any content drift derives a different one.
     pub fn id(&self) -> String {
-        let mut parts: Vec<String> = vec![
-            format!("child={}", self.child_id),
-            format!("base={}", self.base_id),
-            format!(
-                "run_base={}",
-                self.run_base_snapshot.as_deref().unwrap_or("")
-            ),
-            format!(
-                "start={}",
-                self.child_start_snapshot.as_deref().unwrap_or("")
-            ),
-            format!(
-                "final={}",
-                self.final_child_snapshot.as_deref().unwrap_or("")
-            ),
-        ];
+        let side = |state: Option<EntryState>| match state {
+            Some(s) => s.describe(),
+            None => "deleted".to_string(),
+        };
+        let mut fields = Fields::new()
+            .text(&self.child_id)
+            .text(&self.base_id)
+            .opt_text(self.run_base_snapshot.as_deref())
+            .opt_text(self.child_start_snapshot.as_deref())
+            .opt_text(self.final_child_snapshot.as_deref())
+            .uint(self.files.len() as u64);
         for entry in &self.files {
             // The canonical triple (kind|mode|payload) is the identity; the
             // legacy byte mirrors are projections and never participate.
-            let side = |state: Option<EntryState>| match state {
-                Some(s) => s.describe(),
-                None => "deleted".to_string(),
-            };
-            parts.push(format!(
-                "{}|{}|{}",
-                entry.path.to_string_lossy(),
-                side(entry.child_state()),
-                side(entry.base_state()),
-            ));
+            fields = fields
+                .text(&entry.path.to_string_lossy())
+                .text(&side(entry.child_state()))
+                .text(&side(entry.base_state()));
         }
-        format!("cs-{}", stable_content_digest(&parts))
+        format!("cs-{}", authority_digest_hex(DOMAIN_CHANGE_SET, 1, fields))
+    }
+
+    /// Whether this decoded change set was written under the canonical
+    /// BLAKE3 identity: a legacy row may be viewed, but never authorized
+    /// (the caller must restage/reverify before any merge or integration).
+    pub fn canonical_identity(&self) -> bool {
+        classify_authority_digest(&self.id()).is_authoritative()
     }
 
     /// True when every entry carries the canonical kind/mode/payload triple
@@ -305,41 +311,17 @@ impl ChangeSet {
     }
 }
 
-/// Deterministic 64-hex content digest of a bounded string list (FNV-1a
-/// folded under four seeds; stable across processes and platforms — the
-/// session layer uses the same discipline for its list digests).
-pub(crate) fn stable_content_digest(items: &[String]) -> String {
-    let mut out = String::with_capacity(64);
-    for seed in [
-        0xcbf2_9ce4_8422_2325u64,
-        0x9e37_79b9_7f4a_7c15,
-        0x2545_f491_4f6c_dd1d,
-        0x94d0_49bb_1331_11ebu64,
-    ] {
-        let mut hash = seed;
-        for item in items {
-            for b in item.as_bytes() {
-                hash ^= u64::from(*b);
-                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-            hash ^= 0xff;
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        out.push_str(&format!("{hash:016x}"));
-    }
-    out
-}
-
 /// Deterministic digest of one recorded base map (sorted
 /// `path|kind|mode|payload` rows — the SAME triple identity every root
 /// snapshot uses, so a mode- or kind-only tree difference can never fold
-/// into the same map digest).
+/// into the same map digest). The rows enter the canonical BLAKE3 authority
+/// digest as structured, boundary-safe fields — never a 64-bit FNV fold.
 pub(crate) fn base_map_digest(map: &[(PathBuf, EntryState)]) -> String {
-    let rows: Vec<String> = map
-        .iter()
-        .map(|(p, s)| format!("{}|{}", p.to_string_lossy(), s.describe()))
-        .collect();
-    stable_content_digest(&rows)
+    let mut fields = Fields::new().uint(map.len() as u64);
+    for (path, state) in map {
+        fields = fields.text(&path.to_string_lossy()).text(&state.describe());
+    }
+    authority_digest_hex(DOMAIN_BASE_MAP, 1, fields)
 }
 
 /// Durable merge record (audit 99): `merge_records(child_id, seq, status
@@ -729,6 +711,7 @@ pub(crate) fn put_change_set(
         "child_id": cs.child_id,
         "base_id": cs.base_id,
         "cs_id": cs.id(),
+        "id_version": ChangeSet::ID_VERSION,
         "run_base_snapshot": cs.run_base_snapshot,
         "child_start_snapshot": cs.child_start_snapshot,
         "final_child_snapshot": cs.final_child_snapshot,
@@ -745,7 +728,10 @@ pub(crate) fn put_change_set(
 /// Read the stored change set of one child (by change-set content id, or by
 /// a legacy `{base_id}-cs` id: the stored rows are scanned for a header whose
 /// content id or legacy id matches — a caller that only knows the base
-/// anchor still resolves the same candidate).
+/// anchor still resolves the same candidate). Viewing read: a legacy row
+/// still decodes (its id is re-derived under the canonical identity), but
+/// authorization goes through [`read_change_set_authoritative`], which
+/// refuses legacy rows typed.
 pub(crate) fn read_change_set(
     manager: &Arc<faktor_session::SessionManager>,
     parent: SessionId,
@@ -753,6 +739,40 @@ pub(crate) fn read_change_set(
     child_id: &str,
     cs_id: &str,
 ) -> Result<ChangeSet, ExecError> {
+    read_change_set_versioned(manager, parent, run, child_id, cs_id).map(|(cs, _)| cs)
+}
+
+/// The authorization read of one stored change set: a row written before
+/// the canonical BLAKE3 change-set identity (no `id_version` marker) may be
+/// VIEWED but never merged or integrated — the typed refusal forces a
+/// restage and reverification under the canonical identity.
+pub(crate) fn read_change_set_authoritative(
+    manager: &Arc<faktor_session::SessionManager>,
+    parent: SessionId,
+    run: &str,
+    child_id: &str,
+    cs_id: &str,
+) -> Result<ChangeSet, ExecError> {
+    let (cs, id_version) = read_change_set_versioned(manager, parent, run, child_id, cs_id)?;
+    if id_version != ChangeSet::ID_VERSION {
+        return Err(ExecError::IntegrationConflict(format!(
+            "change set {cs_id} of child {child_id} was written under the legacy 64-bit FNV \
+             identity (id version {id_version}); it can be viewed but never authorized — \
+             restage the child and reverify under the canonical BLAKE3 change-set identity"
+        )));
+    }
+    Ok(cs)
+}
+
+/// The versioned read: the decoded set plus the identity version stored in
+/// its header (1 = pre-BLAKE3 legacy, 2 = canonical).
+pub(crate) fn read_change_set_versioned(
+    manager: &Arc<faktor_session::SessionManager>,
+    parent: SessionId,
+    run: &str,
+    child_id: &str,
+    cs_id: &str,
+) -> Result<(ChangeSet, u64), ExecError> {
     let handle = parent_handle(manager, parent)?;
     let key = cs_key(run, child_id, cs_id);
     if let Some(cs) = read_change_set_at(&handle, child_id, &key)? {
@@ -788,7 +808,7 @@ fn read_change_set_at(
     handle: &faktor_session::SessionHandle,
     child_id: &str,
     key: &str,
-) -> Result<Option<ChangeSet>, ExecError> {
+) -> Result<Option<(ChangeSet, u64)>, ExecError> {
     let Some((header, chunks)) = read_chunks(handle, KIND_CS, key)? else {
         return Ok(None);
     };
@@ -807,7 +827,11 @@ fn read_change_set_at(
             files.len()
         )));
     }
-    Ok(Some(ChangeSet {
+    let id_version = header
+        .get("id_version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+    let cs = ChangeSet {
         child_id: header
             .get("child_id")
             .and_then(|c| c.as_str())
@@ -835,7 +859,8 @@ fn read_change_set_at(
             .get("created_ms")
             .and_then(|c| c.as_i64())
             .unwrap_or(0),
-    }))
+    };
+    Ok(Some((cs, id_version)))
 }
 
 fn cs_id_of(base_id: &str) -> String {
@@ -2236,7 +2261,8 @@ impl OrchestratorRuntime {
                 child.ownership
             )));
         }
-        let cs = read_change_set(&self.manager, parent, &run, child_id, change_set_id)?;
+        let cs =
+            read_change_set_authoritative(&self.manager, parent, &run, child_id, change_set_id)?;
         if cs.id() != change_set_id {
             return Err(ExecError::NotFound(format!(
                 "change set {change_set_id} does not belong to child {child_id}"
@@ -2741,6 +2767,7 @@ enum MergeFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faktor_core::authority::AuthorityDigestKind;
 
     /// A canonical regular (100644) entry state for a hex payload digest.
     fn state(hex: &str) -> EntryState {
@@ -2775,6 +2802,92 @@ mod tests {
 
     const H: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const H2: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn change_set_and_base_map_ids_are_canonical_stable_and_one_byte_sensitive() {
+        let set = cs(vec![entry("src/a.rs", Some(H), Some(H2))]);
+        let id = set.id();
+        assert!(id.starts_with("cs-"), "{id}");
+        let body = id.strip_prefix("cs-").unwrap();
+        assert_eq!(body.len(), 64, "the id body is a full BLAKE3 hex: {id}");
+        assert_eq!(
+            classify_authority_digest(body),
+            AuthorityDigestKind::Blake3Hex,
+            "change-set ids are canonical BLAKE3, never a 64-bit FNV fold"
+        );
+        // Identical content re-derives the identical id, including through
+        // the durable serde shape a reopen decodes.
+        assert_eq!(set.id(), id);
+        let json = serde_json::to_string(&set).unwrap();
+        let decoded: ChangeSet = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.id(), id, "the content id survives decode/reopen");
+        // A one-byte payload drift derives a different id.
+        let drifted = cs(vec![entry("src/a.rs", Some(H2), Some(H2))]);
+        assert_ne!(drifted.id(), id);
+        let renamed = cs(vec![entry("src/b.rs", Some(H), Some(H2))]);
+        assert_ne!(renamed.id(), id);
+
+        // Base-map identity: canonical BLAKE3, stable and one-byte sensitive.
+        let map_a = vec![(PathBuf::from("a.rs"), state(H))];
+        let map_b = vec![(PathBuf::from("a.rs"), state(H2))];
+        assert_eq!(base_map_digest(&map_a), base_map_digest(&map_a.clone()));
+        assert_ne!(base_map_digest(&map_a), base_map_digest(&map_b));
+        let map_digest = base_map_digest(&map_a);
+        assert_eq!(map_digest.len(), 64);
+        assert_eq!(
+            classify_authority_digest(&map_digest),
+            AuthorityDigestKind::Blake3Hex
+        );
+    }
+
+    #[test]
+    fn change_set_ids_survive_a_real_reopen_and_legacy_rows_never_authorize() {
+        let dir = tempfile::tempdir().unwrap();
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let parent = m
+            .create_session(m.create_workspace("/w").unwrap(), "t", "p", "m")
+            .unwrap()
+            .id();
+        let set = cs(vec![entry("src/a.rs", Some(H), Some(H2))]);
+        put_change_set(&m, parent, "run-1", &set).unwrap();
+        let id = set.id();
+        drop(m);
+        let m2 =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let read = read_change_set(&m2, parent, "run-1", "child-0", &id).unwrap();
+        assert_eq!(read.id(), id, "the content id survives a real reopen");
+        assert_eq!(read.id(), set.id());
+
+        // A stored row without the canonical identity marker decodes for
+        // VIEWING but is refused by the authorization read: it forces a
+        // restage/reverification instead of an integration.
+        let handle = parent_handle(&m2, parent).unwrap();
+        let legacy_key = cs_key("run-legacy", "child-0", "cs-legacy");
+        let chunks = pack_chunks(&set.files).unwrap();
+        let legacy_header = serde_json::json!({
+            "child_id": "child-0",
+            "base_id": "base-child-0",
+            "cs_id": "cs-legacy",
+            "files": set.files.len(),
+            "chunks": chunks.len(),
+            "created_ms": 1,
+        })
+        .to_string();
+        put_chunks(&handle, KIND_CS, &legacy_key, &legacy_header, &chunks).unwrap();
+        let viewed = read_change_set(&m2, parent, "run-legacy", "child-0", "cs-legacy").unwrap();
+        assert_eq!(
+            viewed.id(),
+            set.id(),
+            "legacy rows still decode for viewing"
+        );
+        let err = read_change_set_authoritative(&m2, parent, "run-legacy", "child-0", "cs-legacy")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("legacy 64-bit FNV identity"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn compute_entries_skips_unchanged_and_anchors_deletes_and_creates() {

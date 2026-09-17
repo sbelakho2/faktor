@@ -52,12 +52,17 @@ use std::time::{Duration, Instant};
 
 use faktor_agent::AgentRuntime;
 use faktor_core::attachment::AttachmentId;
+use faktor_core::authority::{
+    authority_digest_hex, classify_authority_digest, AuthorityDigestKind, Fields,
+    DOMAIN_CANDIDATE_MANIFEST, DOMAIN_CHANGED_FILES, DOMAIN_CHECK_BASIS, DOMAIN_CHECK_EXECUTION,
+    DOMAIN_INTEGRATION_SOURCES, DOMAIN_RUN_BASE_MANIFEST, DOMAIN_TASK_CONTRACT,
+};
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::completion::CompletionContract;
 use faktor_core::hash::FileHash;
 use faktor_core::id::{OpId, SessionId, TaskId, TaskRevision, VerificationRecordId, WorktreeId};
 use faktor_core::state::{
-    command_binding_digest, CandidateProofRef, CheckExecution, CriterionBinding,
+    command_binding_digest_parts, CandidateProofRef, CheckExecution, CriterionBinding,
     CriterionVerification, EnvironmentFingerprint, NoOpDisposition, TaskState, TaskTransition,
     VerificationStatus,
 };
@@ -1255,17 +1260,22 @@ impl TaskExecutor {
             let after = digest(owner_root)?;
             let copied = digest(base_root)?;
             if before == after && after == copied {
-                let rows: Vec<String> = manifest
-                    .entries()
-                    .iter()
-                    .map(|e| format!("{}|{}", e.normalized_path, e.payload_digest))
-                    .collect();
+                let mut manifest_fields = Fields::new().uint(manifest.entries().len() as u64);
+                for entry in manifest.entries() {
+                    manifest_fields = manifest_fields
+                        .text(&entry.normalized_path)
+                        .text(&entry.payload_digest.to_string());
+                }
                 let record = faktor_session::ledger::RunBaseRecord {
                     run_id: run_id.to_string(),
                     workspace_id,
                     worktree_id,
                     snapshot_hash: copied,
-                    manifest_digest: stable_list_digest(&rows),
+                    manifest_digest: authority_digest_hex(
+                        DOMAIN_RUN_BASE_MANIFEST,
+                        1,
+                        manifest_fields,
+                    ),
                     root: base_root.to_string_lossy().into_owned(),
                     created_ms: handle.now_ms(),
                 };
@@ -3407,17 +3417,14 @@ impl TaskExecutor {
         let sources_digest = if sources.is_empty() {
             String::new()
         } else {
-            stable_list_digest(
-                &sources
-                    .iter()
-                    .map(|s| {
-                        format!(
-                            "{}|{}|{}",
-                            s.child_id, s.change_set_id, s.candidate_root_hash
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            )
+            let mut fields = Fields::new().uint(sources.len() as u64);
+            for source in &sources {
+                fields = fields
+                    .text(&source.child_id)
+                    .text(&source.change_set_id)
+                    .text(&source.candidate_root_hash);
+            }
+            authority_digest_hex(DOMAIN_INTEGRATION_SOURCES, 1, fields)
         };
         Ok(PreparedRunIntegration {
             run_id: run_id.to_string(),
@@ -3557,8 +3564,15 @@ impl TaskExecutor {
             change_set_id: cs.id(),
             candidate_root_hash: candidate_snapshot.clone(),
         };
-        let sources_digest =
-            stable_list_digest(&[format!("shadow|{}|{}", cs.id(), candidate_snapshot)]);
+        let sources_digest = authority_digest_hex(
+            DOMAIN_INTEGRATION_SOURCES,
+            1,
+            Fields::new()
+                .uint(1)
+                .text("shadow")
+                .text(&cs.id())
+                .text(&candidate_snapshot),
+        );
         let staged = vec![PreparedChildChangeSet {
             child_id: "shadow".to_string(),
             child_root: candidate_root.clone(),
@@ -4248,11 +4262,7 @@ impl TaskExecutor {
         prepared: &PreparedRunIntegration,
         conflicts: &[String],
     ) -> Result<(), ExecError> {
-        let files_digest = if prepared.changed.is_empty() {
-            String::new()
-        } else {
-            stable_list_digest(&prepared.changed)
-        };
+        let files_digest = changed_files_authority_digest(&prepared.changed);
         // A blocked record names its landing transaction when one exists
         // (the deterministic txn identity), and the exact run base /
         // candidate it refused to land. NOTHING is derived from
@@ -4327,11 +4337,7 @@ impl TaskExecutor {
                 return Ok(());
             }
         }
-        let files_digest = if prepared.changed.is_empty() {
-            String::new()
-        } else {
-            stable_list_digest(&prepared.changed)
-        };
+        let files_digest = changed_files_authority_digest(&prepared.changed);
         // The deterministic identity of the landing transaction that
         // produced this snapshot (record-first rows always exist by the
         // time an integration is finalized; a `None` here is only possible
@@ -4586,11 +4592,7 @@ impl TaskExecutor {
                 args: check.args.clone(),
             })
             .collect();
-        let changed_files_digest = if prepared.changed.is_empty() {
-            String::new()
-        } else {
-            stable_list_digest(&prepared.changed)
-        };
+        let changed_files_digest = changed_files_authority_digest(&prepared.changed);
         // Probes through the daemon's ONE supervisor (bounded, deadline-
         // enforced). A missing supervisor degrades every probe to an
         // explicit marker; the lists are NEVER silently empty.
@@ -4620,7 +4622,7 @@ impl TaskExecutor {
         Ok(ProofBasis {
             task_id: task_id.raw(),
             task_revision: revision.raw(),
-            task_contract_digest: stable_list_digest(&task.acceptance_criteria),
+            task_contract_digest: acceptance_criteria_authority_digest(&task.acceptance_criteria),
             candidate_snapshot: prepared.candidate_snapshot.clone(),
             integration_sources_digest: prepared.sources_digest.clone(),
             changed_files_digest,
@@ -5742,18 +5744,17 @@ fn required_check_binding_verdict(
     check_id: &str,
     command_digest: &str,
 ) -> VerificationStatus {
-    let canonical = |check: &CheckExecution| {
-        if check.args.is_empty() {
-            check.program.clone()
-        } else {
-            format!("{} {}", check.program, check.args.join(" "))
-        }
-    };
+    // A legacy 64-bit FNV digest can be viewed but never resolves: the
+    // binding must be re-derived under the canonical BLAKE3 identity.
+    if classify_authority_digest(command_digest) == AuthorityDigestKind::LegacyFnv {
+        return VerificationStatus::Unavailable;
+    }
     let matches: Vec<&CheckExecution> = checks
         .iter()
         .filter(|check| {
             (check_id.is_empty() || check.check == check_id)
-                && command_binding_digest(&canonical(check)) == command_digest
+                && command_binding_digest_parts(&check.program, &check.args, None, &[])
+                    == command_digest
         })
         .collect();
     match matches.as_slice() {
@@ -5926,6 +5927,25 @@ fn canonical_proof_reuse(
             reason: format!("record {record_id} does not exist"),
         });
     };
+    // Legacy 64-bit FNV identities inside a recorded fingerprint can be
+    // VIEWED but never authorize reuse: the typed detection forces a fresh
+    // record (reverification) instead of a proof reuse.
+    if let Some(fingerprint) = record.environment_fingerprint.as_ref() {
+        for (what, value) in [
+            ("task-contract", fingerprint.task_contract_hash.as_str()),
+            ("check-basis", fingerprint.check_argv_cwd_env_hash.as_str()),
+        ] {
+            if classify_authority_digest(value) == AuthorityDigestKind::LegacyFnv {
+                return Ok(ProofReuse::Refused {
+                    reason: format!(
+                        "record {record_id} carries the legacy FNV {what} digest {value}; \
+                         it can be viewed but never reused — reverify under the canonical \
+                         BLAKE3 authority digests"
+                    ),
+                });
+            }
+        }
+    }
     let Some(recorded) = record
         .environment_fingerprint
         .as_ref()
@@ -5961,11 +5981,6 @@ fn root_verification_fingerprint(
         .get_task(task_id)
         .map_err(|e| ExecError::Internal(format!("root task row read: {e}")))?
         .ok_or_else(|| ExecError::Internal(format!("root task {task_id} missing")))?;
-    let check_basis: Vec<String> = basis
-        .checks
-        .iter()
-        .map(|c| format!("{}|{}|{}", c.check_id, c.program, c.args.join(" ")))
-        .collect();
     Ok(EnvironmentFingerprint {
         platform: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
@@ -5974,8 +5989,8 @@ fn root_verification_fingerprint(
         lockfile_hashes: Vec::new(),
         instruction_epoch: None,
         base_tree_hash: None,
-        task_contract_hash: stable_list_digest(&task.acceptance_criteria),
-        check_argv_cwd_env_hash: stable_list_digest(&check_basis),
+        task_contract_hash: acceptance_criteria_authority_digest(&task.acceptance_criteria),
+        check_argv_cwd_env_hash: check_basis_authority_digest(basis),
         verification_impl_version: faktor_agent::runtime::VERIFICATION_IMPL_VERSION.to_string(),
         proof_basis_digest: Some(canonical_proof_basis_digest(basis)),
     })
@@ -5998,8 +6013,8 @@ fn root_verification_candidate_proof(
         .map_err(|e| ExecError::Internal(format!("accounting snapshot digest: {e}")))?;
     Ok(CandidateProofRef {
         task_revision: revision,
-        base_manifest_hash: stable_list_digest(&[]),
-        candidate_manifest_hash: stable_list_digest(&[final_snapshot.to_string()]),
+        base_manifest_hash: authority_digest_hex(DOMAIN_CANDIDATE_MANIFEST, 1, ()),
+        candidate_manifest_hash: authority_digest_hex(DOMAIN_CANDIDATE_MANIFEST, 1, final_snapshot),
         source_diff_evidence: None,
         risk_report_evidence: None,
         accounting_snapshot_digest: accounting,
@@ -6008,7 +6023,8 @@ fn root_verification_candidate_proof(
         candidate_snapshot: Some(final_snapshot.to_string()),
         sources_digest: (!prepared.sources_digest.is_empty())
             .then(|| prepared.sources_digest.clone()),
-        changed_files_digest: (!run.changed.is_empty()).then(|| stable_list_digest(&run.changed)),
+        changed_files_digest: (!run.changed.is_empty())
+            .then(|| changed_files_authority_digest(&run.changed)),
     })
 }
 
@@ -6101,31 +6117,44 @@ fn persist_root_verification_fact(
         .map_err(|e| ExecError::Internal(format!("root verification fact write: {}", e.message)))
 }
 
-/// Deterministic 64-hex digest of a bounded string list (integration record
-/// source/file coverage). FNV-1a folded under four independent seeds and
-/// concatenated: stable across processes and platforms, and only used to
-/// detect list drift (`source_count`/`integrated_file_count` carry the
-/// exact cardinality beside it).
-fn stable_list_digest(items: &[String]) -> String {
-    let mut out = String::with_capacity(64);
-    for seed in [
-        0xcbf2_9ce4_8422_2325u64,
-        0x9e37_79b9_7f4a_7c15,
-        0x2545_f491_4f6c_dd1d,
-        0x94d0_49bb_1331_11ebu64,
-    ] {
-        let mut hash = seed;
-        for item in items {
-            for b in item.as_bytes() {
-                hash ^= u64::from(*b);
-                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-            hash ^= 0xff;
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        out.push_str(&format!("{hash:016x}"));
+/// The canonical acceptance-criteria contract digest: the ordered criteria
+/// are length-prefixed fields (with their exact count), so two contracts can
+/// never alias by concatenation and no 64-bit FNV fold remains.
+fn acceptance_criteria_authority_digest(criteria: &[String]) -> String {
+    authority_digest_hex(
+        DOMAIN_TASK_CONTRACT,
+        1,
+        Fields::new().uint(criteria.len() as u64).list(criteria),
+    )
+}
+
+/// The canonical changed-file-list digest; an EMPTY list is an honest
+/// absence (empty string), exactly the former contract, while a non-empty
+/// list is length-prefixed fields with its exact cardinality.
+fn changed_files_authority_digest(changed: &[String]) -> String {
+    if changed.is_empty() {
+        return String::new();
     }
-    out
+    authority_digest_hex(
+        DOMAIN_CHANGED_FILES,
+        1,
+        Fields::new().uint(changed.len() as u64).list(changed),
+    )
+}
+
+/// The canonical check-basis digest of the fingerprint's
+/// `check_argv_cwd_env_hash`: per check the id, the program and every argv
+/// element as its own length-prefixed field (never a joined string). No
+/// cwd/env are recorded in this projection, so none participate.
+fn check_basis_authority_digest(basis: &ProofBasis) -> String {
+    let mut fields = Fields::new().uint(basis.checks.len() as u64);
+    for check in &basis.checks {
+        fields = fields
+            .text(&check.check_id)
+            .text(&check.program)
+            .list(&check.args);
+    }
+    authority_digest_hex(DOMAIN_CHECK_BASIS, 1, fields)
 }
 
 fn truncate_bytes(s: &str, max: usize) -> String {
@@ -6283,14 +6312,18 @@ fn criterion_pass_evidence_digests(
 /// The deterministic digest of one executed check row (the immutable
 /// evidence a check-bound criterion pass resolves to).
 fn check_execution_digest(check: &CheckExecution) -> String {
-    stable_list_digest(&[
-        "check".to_string(),
-        check.check.clone(),
-        check.program.clone(),
-        check.args.join("\u{1f}"),
-        format!("{:?}", check.status),
-        check.exit.map(|c| c.to_string()).unwrap_or_default(),
-    ])
+    let status = format!("{:?}", check.status);
+    let exit = check.exit.map(|code| code.to_string());
+    authority_digest_hex(
+        DOMAIN_CHECK_EXECUTION,
+        1,
+        Fields::new()
+            .text(&check.check)
+            .text(&check.program)
+            .list(&check.args)
+            .text(&status)
+            .opt_text(exit.as_deref()),
+    )
 }
 
 #[cfg(test)]

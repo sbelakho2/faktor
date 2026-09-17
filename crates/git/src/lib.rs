@@ -29,7 +29,8 @@ fn recover_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 mod guard;
 pub use guard::{
-    pid_start_marker, process_alive, DiskLease, LeaseRecord, DEFAULT_LEASE_BUDGET, LEASE_FILE,
+    lease_verdict, pid_start_marker, process_alive, DiskLease, LeaseRecord, ObserveResult,
+    ReclaimReason, Verdict, DEFAULT_LEASE_BUDGET, LEASE_FILE,
 };
 
 /// fsync a directory so a completed rename/create is durable (best effort:
@@ -2966,7 +2967,10 @@ mod tests {
             let recorded: LeaseRecord =
                 serde_json::from_slice(&std::fs::read(&lease_path).unwrap()).unwrap();
             assert_eq!(recorded.pid, std::process::id());
-            assert!(!recorded.pid_start_marker.is_empty());
+            assert!(
+                !recorded.pid_start_marker.is_empty() || recorded.pid_created_ms != 0,
+                "the lease must carry a pid-reuse-safe process identity: {recorded:?}"
+            );
             let err = other
                 .acquire_mutation_guard_with_budget(
                     &repo,
@@ -3005,6 +3009,7 @@ mod tests {
                 serde_json::to_vec(&LeaseRecord {
                     pid: dead_pid,
                     pid_start_marker: "proc:1".into(),
+                    pid_created_ms: 0,
                     owner: "crashed-runtime".into(),
                     started_ms: 1,
                     purpose: "crashed".into(),

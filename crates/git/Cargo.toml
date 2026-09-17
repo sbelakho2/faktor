@@ -20,3 +20,13 @@ tempfile.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# Same windows-sys 0.61.2 revision the workspace already locks. The
+# pid-reuse-safe process identity needs OpenProcess/GetProcessTimes
+# (Win32_System_Threading) plus FILETIME/CloseHandle/GetLastError
+# (Win32_Foundation); no other Windows API is used here.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+

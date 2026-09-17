@@ -2152,4 +2152,141 @@ fn prod_only() {}
         );
         assert!(authority_lock_offenders("crates/fs/src/atomic.rs", &test_only).is_empty());
     }
+
+    // ------------------------------------------------------------------
+    // scan: canonical BLAKE3 authority digests (no 64-bit FNV folds)
+    // ------------------------------------------------------------------
+
+    /// Production files whose identities AUTHORIZE work (verification,
+    /// proof reuse, integration, change-set/base-map identity, semantic
+    /// fact identity). A 64-bit FNV fold, `stable_list_digest` or
+    /// `stable_content_digest` must never appear here: those values could
+    /// authorize a reuse or alias two identities under a truncated hash.
+    const AUTHORITY_DIGEST_FILES: &[&str] = &[
+        "crates/core/src/authority.rs",
+        "crates/core/src/state.rs",
+        "crates/verify/src/criteria.rs",
+        "crates/verify/src/lib.rs",
+        "crates/session/src/task.rs",
+        "crates/session/src/ledger.rs",
+        "crates/orchestrator/src/merge.rs",
+        "crates/orchestrator/src/task_executor.rs",
+        "crates/orchestrator/src/shadow.rs",
+        "crates/memory/src/lib.rs",
+        // Included so any NEW FNV fold in the tournament criterion identity
+        // is a red scan; the two grandfathered lines are allowlisted below.
+        "crates/orchestrator/src/tournament.rs",
+    ];
+
+    /// `(rel, exact trimmed line prefix)` allowlist. Deliberately TINY and
+    /// justified:
+    ///
+    /// - `session/src/task.rs`: the pre-v22 `CriterionId::legacy` decoder,
+    ///   REQUIRED to keep legacy durable rows readable. It never mints a new
+    ///   id (the modern constructor is BLAKE3) and every new authority
+    ///   decision refuses the legacy class typed
+    ///   (`LegacyAuthorityDigest`).
+    /// - `orchestrator/src/tournament.rs`: the pre-existing FNV criterion
+    ///   id, outside the authorized change set of this migration; the scan
+    ///   keeps it from spreading to any other line.
+    const AUTHORITY_DIGEST_ALLOWLIST: &[(&str, &str)] = &[
+        (
+            "crates/session/src/task.rs",
+            "const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;",
+        ),
+        (
+            "crates/session/src/task.rs",
+            "const PRIME: u64 = 0x0000_0100_0000_01b3;",
+        ),
+        (
+            "crates/orchestrator/src/tournament.rs",
+            "let mut hash: u64 = 0xcbf2_9ce4_8422_2325;",
+        ),
+        (
+            "crates/orchestrator/src/tournament.rs",
+            "hash = hash.wrapping_mul(0x0000_0100_0000_01b3);",
+        ),
+    ];
+
+    const AUTHORITY_DIGEST_MARKERS: &[&str] = &[
+        "stable_list_digest",
+        "stable_content_digest",
+        "fnv1a",
+        "0xcbf2_9ce4_8422_2325",
+        "0x0000_0100_0000_01b3",
+    ];
+
+    /// FNV/stable-list offenders at one authority file's production (kept,
+    /// code-masked) positions, with the justified legacy-decode allowlist.
+    fn authority_digest_offenders(rel: &str, f: &File<'_>) -> Vec<String> {
+        let rel = normalize_rel(rel);
+        find_markers(f, AUTHORITY_DIGEST_MARKERS)
+            .into_iter()
+            .filter(|(_, text)| {
+                !AUTHORITY_DIGEST_ALLOWLIST
+                    .iter()
+                    .any(|(file, prefix)| *file == rel.as_str() && text.starts_with(prefix))
+            })
+            .map(|(line, text)| format!("{rel}:{line}: {text}"))
+            .collect()
+    }
+
+    #[test]
+    fn authority_files_never_fold_fnv_or_stable_list_digests() {
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for rel in AUTHORITY_DIGEST_FILES {
+            let f = load(rel).unwrap_or_else(|| panic!("authority digest file missing: {rel}"));
+            scanned += 1;
+            offenders.extend(authority_digest_offenders(rel, &f));
+        }
+        assert_no_offenders(
+            "canonical BLAKE3 authority digests",
+            &offenders,
+            scanned,
+            AUTHORITY_DIGEST_FILES.len(),
+        );
+    }
+
+    #[test]
+    fn authority_digest_scan_detects_fnv_and_stable_list_markers() {
+        let fnv = synthetic_file(
+            "crates/memory/src/lib.rs",
+            "fn f() { let x = 0xcbf2_9ce4_8422_2325u64; let _ = x; }\n",
+        );
+        assert_eq!(
+            authority_digest_offenders("crates/memory/src/lib.rs", &fnv).len(),
+            1
+        );
+        let allowlisted = synthetic_file(
+            "crates/session/src/task.rs",
+            "        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;\n",
+        );
+        assert!(
+            authority_digest_offenders("crates/session/src/task.rs", &allowlisted).is_empty(),
+            "the justified legacy-decode line is allowlisted"
+        );
+        let list = synthetic_file(
+            "crates/verify/src/criteria.rs",
+            "fn f(items: &[String]) -> String { stable_list_digest(items) }\n",
+        );
+        assert_eq!(
+            authority_digest_offenders("crates/verify/src/criteria.rs", &list).len(),
+            1
+        );
+        let content = synthetic_file(
+            "crates/orchestrator/src/merge.rs",
+            "fn f(items: &[String]) -> String { stable_content_digest(items) }\n",
+        );
+        assert_eq!(
+            authority_digest_offenders("crates/orchestrator/src/merge.rs", &content).len(),
+            1
+        );
+        // A doc/string mention can never count as an implementation.
+        let doc = synthetic_file(
+            "crates/memory/src/lib.rs",
+            "//! stable_list_digest is retired here\nconst X: &str = \"fnv1a\";\n",
+        );
+        assert!(authority_digest_offenders("crates/memory/src/lib.rs", &doc).is_empty());
+    }
 }
