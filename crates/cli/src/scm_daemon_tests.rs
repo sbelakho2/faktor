@@ -45,6 +45,7 @@ fn github_app_cfg(base: &str) -> CloudCfg {
             user_agent: None,
             page_size: None,
             max_pages: None,
+            reconcile: None,
         }),
     }
 }
@@ -331,6 +332,162 @@ async fn webhook_delivery_resyncs_idempotently_and_bad_signatures_never_claim() 
         duplicate,
         faktor_scm::IngestOutcome::Duplicate { .. }
     ));
+    assert_eq!(store.webhook_deliveries(10).unwrap().len(), 1);
+    run.abort();
+}
+
+/// The optional reconcile timer is strict, normalized-on-disabled and
+/// bounded: a disabled section resolves exactly like the absent one, and a
+/// hostile interval is a load refusal, never a silent clamp.
+#[test]
+fn reconcile_config_is_strict_and_disabled_parity_holds() {
+    let absent: CloudCfg = serde_json::from_str(
+        r#"{"enabled": true, "github_app": {"enabled": true, "app_id": 7,
+           "private_key": "k.pem", "webhook_secret": "s", "organization": "org_acme"}}"#,
+    )
+    .unwrap();
+    let disabled: CloudCfg = serde_json::from_str(
+        r#"{"enabled": true, "github_app": {"enabled": true, "app_id": 7,
+           "private_key": "k.pem", "webhook_secret": "s", "organization": "org_acme",
+           "reconcile": {"enabled": false, "interval_ms": 999}}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        absent, disabled,
+        "a disabled reconcile section must resolve byte-identically to the absent one"
+    );
+    assert!(absent
+        .github_app
+        .as_ref()
+        .unwrap()
+        .reconcile_policy()
+        .unwrap()
+        .is_none());
+
+    let enabled: CloudCfg = serde_json::from_str(
+        r#"{"enabled": true, "github_app": {"enabled": true, "app_id": 7,
+           "private_key": "k.pem", "webhook_secret": "s", "organization": "org_acme",
+           "reconcile": {"enabled": true, "interval_ms": 60000, "jitter_ms": 5000,
+                          "max_backoff_ms": 600000}}}"#,
+    )
+    .unwrap();
+    let policy = enabled
+        .github_app
+        .as_ref()
+        .unwrap()
+        .reconcile_policy()
+        .unwrap()
+        .expect("enabled reconcile resolves a policy");
+    assert_eq!(policy.interval_ms, 60_000);
+    assert_eq!(policy.jitter_ms, 5_000);
+    assert_eq!(policy.max_backoff_ms, 600_000);
+    enabled.validate().unwrap();
+
+    // Unknown keys, hostile types and out-of-bounds values are refused.
+    for hostile in [
+        r#"{"enabled": true, "github_app": {"enabled": true, "app_id": 7,
+            "private_key": "k.pem", "webhook_secret": "s", "organization": "org_acme",
+            "reconcile": {"enabled": true, "hostile": 1}}}"#,
+        r#"{"enabled": true, "github_app": {"enabled": true, "app_id": 7,
+            "private_key": "k.pem", "webhook_secret": "s", "organization": "org_acme",
+            "reconcile": {"enabled": true, "interval_ms": 10}}}"#,
+        r#"{"enabled": true, "github_app": {"enabled": true, "app_id": 7,
+            "private_key": "k.pem", "webhook_secret": "s", "organization": "org_acme",
+            "reconcile": {"enabled": true, "interval_ms": 1000, "jitter_ms": 2000}}}"#,
+    ] {
+        match serde_json::from_str::<CloudCfg>(hostile) {
+            Err(_) => {}
+            Ok(cfg) => assert!(cfg.validate().is_err(), "accepted {hostile}"),
+        }
+    }
+}
+
+/// The webhook path and the timer path share one single-flight slot: two
+/// concurrent whole-app reconciles collapse into ONE provider pass, and the
+/// later webhook re-sync converges without ever duplicating rows.
+#[tokio::test]
+async fn timer_and_webhook_syncs_coalesce_and_never_duplicate_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let payloads = dir.path().join("payloads");
+    stage_payload(&payloads, "app.pem", TEST_PRIVATE_KEY.as_bytes());
+    stage_payload(&payloads, "hook.secret", WEBHOOK_SECRET);
+    let mock = MockServer::start().await;
+    // Initial sync, the coalesced pair, and the webhook pass: script enough
+    // replies for all of them.
+    for _ in 0..4 {
+        mock.push(
+            "GET",
+            "/app/installations",
+            installation_reply(INSTALLATION_ID),
+        );
+        mock.push("POST", "/app/installations/7/access_tokens", token_reply());
+        mock.push("GET", "/installation/repositories", repositories_reply());
+    }
+    let store = Arc::new(SqliteScmStore::open(&store_path(dir.path())).unwrap());
+    let transport =
+        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::with_policy(None));
+    let mut cfg = github_app_cfg(&mock.base());
+    cfg.github_app.as_mut().unwrap().reconcile = Some(crate::config::CloudGithubAppReconcileCfg {
+        enabled: true,
+        // A cadence far beyond the test: the timer itself must not fire, the
+        // calls below stand in for its passes.
+        interval_ms: Some(3_600_000),
+        jitter_ms: Some(0),
+        max_backoff_ms: Some(3_600_000),
+    });
+    cfg.validate().unwrap();
+    let daemon = build_scm_daemon(&cfg, dir.path(), store.clone(), transport)
+        .unwrap()
+        .expect("enabled github app builds");
+    let run = tokio::spawn(daemon.clone().run());
+    // The initial sync lands.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(240);
+    while mock
+        .requests("GET", "/installation/repositories")
+        .is_empty()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "initial sync never landed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    // Two simultaneous whole-app reconciles (the timer's shape) coalesce
+    // into ONE provider pass.
+    let (first, second) = tokio::join!(daemon.sync_all(), daemon.sync_all());
+    first.unwrap();
+    second.unwrap();
+    assert_eq!(
+        mock.requests("GET", "/installation/repositories").len(),
+        2,
+        "a coalesced caller must not start a second provider pass"
+    );
+    assert!(daemon
+        .reconcile_journal()
+        .iter()
+        .any(|event| event.code() == "scm_reconcile_coalesced"));
+
+    // The webhook re-sync converges on the same durable rows.
+    let body = br#"{"installation":{"id":7},"action":"created"}"#;
+    let headers = signed_webhook(body, "d-timer");
+    daemon.deliver(&headers, body).unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    while mock.requests("GET", "/installation/repositories").len() < 3 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "webhook sync never ran"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        store
+            .repositories_for_organization("org_acme", 0, 10)
+            .unwrap()
+            .len(),
+        1,
+        "timer + webhook passes must converge, never duplicate"
+    );
+    assert_eq!(store.installations().unwrap().len(), 1);
     assert_eq!(store.webhook_deliveries(10).unwrap().len(), 1);
     run.abort();
 }

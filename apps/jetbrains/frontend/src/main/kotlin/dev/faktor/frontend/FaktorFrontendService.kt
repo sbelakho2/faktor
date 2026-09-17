@@ -21,10 +21,14 @@ import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeAgentControlAck
 import dev.faktor.shared.NativeBoardPage
 import dev.faktor.shared.NativeBoardPost
+import dev.faktor.shared.NativeBillingUsage
 import dev.faktor.shared.NativeCompletionContract
+import dev.faktor.shared.NativeCreditGrant
+import dev.faktor.shared.NativeEntitlementSnapshot
 import dev.faktor.shared.NativeEvidence
 import dev.faktor.shared.NativeEvidenceRetrieval
 import dev.faktor.shared.NativeHealth
+import dev.faktor.shared.NativeIdentity
 import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.NativeOrchestratorGraph
 import dev.faktor.shared.NativePermissionAck
@@ -61,7 +65,11 @@ import java.nio.file.Path
  */
 class FaktorFrontendService(
     private val binaryPath: Path,
-    private val dataDir: Path
+    private val dataDir: Path,
+    /** The control-plane credential (`x-faktor-control-token`), when the
+     * operator provisioned one; absent = the usage/credits panel renders the
+     * explicit unavailable state the daemon refuses with. */
+    private val controlToken: String? = null
 ) {
     interface Listener {
         fun onDaemonStatus(status: String, detail: String?) {}
@@ -117,7 +125,7 @@ class FaktorFrontendService(
             listener?.onDaemonStatus("failed", e.message)
             throw e
         }
-        val cl = NativeClient.forConnection(backendConnection)
+        val cl = NativeClient.forConnection(backendConnection, controlToken)
         try {
             val health = cl.health()
             val ready = cl.awaitReady()
@@ -186,7 +194,7 @@ class FaktorFrontendService(
         synchronized(lifecycleLock) {
             if (client != null) throw BackendException("a daemon connection is already attached")
         }
-        val cl = NativeClient.forConnection(backendConnection)
+        val cl = NativeClient.forConnection(backendConnection, controlToken)
         val health = cl.health()
         val ready = cl.awaitReady()
         if (!ready.ready) {
@@ -423,6 +431,28 @@ class FaktorFrontendService(
     /** The durable usage of ANY session id (child session spend envelopes). */
     fun sessionUsageFor(sessionId: String): NativeSessionUsage =
         clientOrThrow().sessionUsage(sessionId)
+
+    // ------------------------------------------------ commercial metering
+
+    /** The control-plane identity; its organization fixes the billing read. */
+    fun identity(): NativeIdentity = clientOrThrow().identity()
+
+    fun entitlements(): NativeEntitlementSnapshot = clientOrThrow().entitlements()
+
+    /** One cursor page of the organization's usage fold. */
+    fun billingUsage(
+        organization: String,
+        since: String? = null,
+        limit: Long? = null
+    ): NativeBillingUsage = clientOrThrow().billingUsage(organization, since, limit)
+
+    /** Admin-only, idempotency-keyed credit grant (the server is the guard). */
+    fun grantCredits(
+        amountMicro: Long,
+        idempotencyKey: String,
+        reason: String? = null
+    ): NativeCreditGrant =
+        clientOrThrow().grantCredits(amountMicro, idempotencyKey, reason)
 
     fun verification(): NativeVerificationView =
         clientOrThrow().verification(requireSession())

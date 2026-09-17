@@ -49,7 +49,7 @@
   function renderCockpit(view, sections) {
     var node = byId('cockpit');
     clear(node);
-    if (!view || !Array.isArray(sections) || sections.length === 0) {
+    if (!Array.isArray(sections) || sections.length === 0) {
       return;
     }
     for (var i = 0; i < sections.length; i++) {
@@ -72,40 +72,63 @@
         for (var j = 0; j < lines.length; j++) {
           if (section.key === 'evidence') {
             renderEvidenceLine(block, section, lines[j], j);
+          } else if (section.key === 'usage') {
+            renderUsageLine(block, lines[j]);
           } else {
             var verdict = /^\[(pass|fail|unavailable)\]/.exec(String(lines[j]));
             line(block, lines[j], verdict ? 'criterion-line criterion-line-' + verdict[1] : 'muted');
           }
         }
       }
-      // State-gated tournament controls: a disabled action is rendered
-      // disabled and NEVER posts (the engine's settle rule is the gate).
+      // State-gated controls: a disabled action is rendered disabled and
+      // NEVER posts (the server gate is authoritative). Tournament actions
+      // route to the tournament engine; usage actions route to the
+      // commercial-metering controls (cursor paging + role-gated grants).
       var actions = Array.isArray(section.actions) ? section.actions : [];
-      if (section.key === 'tournament' && view && view.tournament && actions.length > 0) {
+      if (actions.length > 0 && (section.key === 'tournament' || section.key === 'usage')) {
         var controls = document.createElement('div');
         controls.className = 'cockpit-actions';
         for (var k = 0; k < actions.length; k++) {
-          (function (action) {
+          (function (action, sectionKey) {
             var button = document.createElement('button');
             button.type = 'button';
             button.textContent = action.label;
             button.disabled = action.enabled !== true;
             button.addEventListener('click', function () {
-              if (action.enabled !== true || !view.tournament) {
+              if (action.enabled !== true) {
                 return;
               }
-              vscode.postMessage({
-                type: 'tournamentControl',
-                tournamentId: view.tournament.id,
-                action: action.key,
-              });
+              if (sectionKey === 'tournament') {
+                if (!view || !view.tournament) {
+                  return;
+                }
+                vscode.postMessage({
+                  type: 'tournamentControl',
+                  tournamentId: view.tournament.id,
+                  action: action.key,
+                });
+              } else {
+                vscode.postMessage({ type: 'usageControl', action: action.key });
+              }
             });
             controls.appendChild(button);
-          })(actions[k]);
+          })(actions[k], section.key);
         }
         block.appendChild(controls);
       }
       node.appendChild(block);
+    }
+  }
+
+  // Usage/credits lines carry honest state markers: a breached quota, an
+  // expired/canceled subscription or a lapsed (grace) one are styled, never
+  // silently rendered as healthy numbers.
+  function renderUsageLine(block, value) {
+    var text = String(value);
+    if (/^\[(EXCEEDED|EXPIRED|CANCELED|GRACE)\]/.test(text)) {
+      line(block, text, 'usage-alert');
+    } else {
+      line(block, text, 'muted');
     }
   }
 

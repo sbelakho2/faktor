@@ -10,7 +10,7 @@
 
 import { foldPixelPresence, pixelPresence } from './pixelAgents.ts';
 import type { PixelPresence } from './pixelAgents.ts';
-import type { CockpitSection, CockpitTournamentView, CockpitView } from './cockpit';
+import type { CockpitSection, CockpitTournamentView, CockpitUsagePanel, CockpitView } from './cockpit';
 import type { NativeBoardPage } from './nativeClient.ts';
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
@@ -419,6 +419,10 @@ export interface FaktorSnapshot {
   readonly task: TaskSummary | null;
   readonly verification: VerificationSummary | null;
   readonly usage: UsageSummary | null;
+  /** The commercial-metering panel (usage fold + credits + entitlements);
+   * null until a read happens, an explicit disabled/unavailable state when
+   * the control plane refuses (never fabricated numbers). */
+  readonly usagePanel: CockpitUsagePanel | null;
   /** The persistent Task cockpit assembled from every native section. */
   readonly cockpit: CockpitView | null;
   readonly cockpitSections: readonly CockpitSection[];
@@ -448,6 +452,7 @@ export function emptySnapshot(): FaktorSnapshot {
     task: null,
     verification: null,
     usage: null,
+    usagePanel: null,
     cockpit: null,
     cockpitSections: [],
     tournament: null,
@@ -500,6 +505,11 @@ export class FaktorStore {
     if (sessionChanged || stopped) {
       next.tournament = null;
       next.board = null;
+    }
+    // The usage/credits panel is ORGANIZATION-scoped (not session-owned): it
+    // survives a session switch and is dropped only when the daemon stops.
+    if (stopped) {
+      next.usagePanel = null;
     }
     this.state = nextState;
     this.emit();

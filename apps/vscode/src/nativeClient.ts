@@ -52,6 +52,13 @@ export interface NativeClientOptions {
   readonly baseUrl: string;
   /** Native auth form: `Authorization: Bearer <password>`. */
   readonly bearerToken: string;
+  /**
+   * The control-plane credential (`x-faktor-control-token`): an auth-session
+   * or service-account token, NEVER the daemon password. Absent = no
+   * control-plane principal; the billing/identity/control-plane routes then
+   * refuse loudly (401/403/409) and the panel renders that refusal.
+   */
+  readonly controlToken?: string;
   readonly fetch?: FetchLike;
   readonly timeoutMs?: number;
   readonly maxBodyBytes?: number;
@@ -737,6 +744,130 @@ export interface NativeUsageTotals {
     readonly reservations: NativeReservations;
     readonly truncated: boolean;
   };
+}
+
+// ------------------------------------------------- commercial metering (v1)
+//
+// `GET /native/usage?org=` (the billing branch), `GET /native/entitlements`,
+// `GET /native/identity` and `POST /native/credits/grant` (crates/server/src/
+// native/billing.rs, control_plane.rs). These routes require the daemon
+// password AND a control-plane principal (`x-faktor-control-token`); when no
+// billing service is wired the daemon answers a typed 409 `billing_disabled`
+// — the client maps it to a `NativeApiError` and the panel renders
+// "billing disabled locally", never fabricated zeros.
+
+/** One aggregate bucket (org totals and per-task rows share this shape). */
+export interface NativeUsageBuckets {
+  readonly input_tokens: number;
+  readonly output_tokens: number;
+  readonly cache_read_tokens: number;
+  readonly cache_write_tokens: number;
+  readonly reasoning_tokens: number;
+  readonly provider_cost_micro: number;
+  readonly managed_cost_micro: number;
+  readonly byok_cost_micro: number;
+  readonly events: number;
+  readonly corrected_events: number;
+}
+
+/** One per-task aggregate row of an organization's usage fold. */
+export interface NativeBillingTaskUsage {
+  readonly task_id: number;
+  readonly run_id: string;
+  readonly totals: NativeUsageBuckets;
+}
+
+/** The per-organization usage fold plus its scan-bound cursor. */
+export interface NativeBillingFold {
+  readonly organization_id: string;
+  readonly totals: NativeUsageBuckets;
+  readonly per_task: NativeBillingTaskUsage[];
+  readonly next_cursor: string | null;
+}
+
+/** The free/held credit picture of one organization. */
+export interface NativeCreditBalance {
+  readonly granted_micro: number;
+  readonly consumed_micro: number;
+  readonly refunded_micro: number;
+  readonly held_micro: number;
+  readonly pending_consumes: number;
+}
+
+/** One usage-ledger row of the served cursor page (cursor + raw event). */
+export interface NativeBillingUsageItem {
+  readonly cursor: string;
+  readonly event: Json;
+}
+
+/** `GET /native/usage?org=&since=&limit=` (the billing branch). */
+export interface NativeBillingUsage {
+  readonly ok: boolean;
+  readonly organization: string;
+  readonly fold: NativeBillingFold;
+  readonly credits: NativeCreditBalance;
+  readonly items: NativeBillingUsageItem[];
+  readonly nextCursor: string | null;
+}
+
+/** One in-flight integration/rollback/completion transaction. */
+export interface NativeInFlightTxn {
+  readonly id: string;
+  readonly organization: string;
+  readonly kind: string;
+  readonly reference: string;
+  readonly started_ms: number;
+  readonly ended_ms: number | null;
+}
+
+/** The derived entitlement snapshot (`GET /native/entitlements`). */
+export interface NativeEntitlementSnapshot {
+  readonly organization_id: string;
+  readonly billing_account_id: string | null;
+  readonly plan_id: string | null;
+  readonly plan_found: boolean;
+  readonly subscription_status: string | null;
+  readonly subscription_expires_ms: number | null;
+  readonly subscription_active: boolean;
+  readonly features: string[];
+  readonly limits: Record<string, number>;
+  readonly credits: NativeCreditBalance;
+  readonly managed_spend_micro: number;
+  readonly byok_spend_micro: number;
+  readonly total_tokens: number;
+  readonly in_flight: NativeInFlightTxn[];
+  readonly now_ms: number;
+}
+
+/** `GET /native/entitlements` — the wrapped snapshot. */
+export interface NativeEntitlements {
+  readonly ok: boolean;
+  readonly entitlements: NativeEntitlementSnapshot;
+}
+
+/** The caller's control-plane identity (`GET /native/identity`). */
+export interface NativeIdentity {
+  readonly subject_kind: string;
+  readonly subject_id: string;
+  readonly display_name: string;
+  readonly email: string | null;
+  readonly organization: string;
+  readonly organization_name: string;
+  readonly role: string;
+  readonly effective_actions: string[];
+}
+
+/** `GET /native/identity` — the wrapped identity view. */
+export interface NativeIdentityView {
+  readonly ok: boolean;
+  readonly identity: NativeIdentity;
+}
+
+/** `POST /native/credits/grant` — the appended/replayed credit state. */
+export interface NativeCreditGrant {
+  readonly ok: boolean;
+  readonly duplicate: boolean;
+  readonly credits: NativeCreditBalance;
 }
 
 /** The typed criterion-binding kinds of the proof system (`faktor_core`). */
@@ -2181,6 +2312,211 @@ export function validateUsage(json: Json): NativeUsageTotals {
   };
 }
 
+function validateUsageBuckets(object: JsonObject, path: string): NativeUsageBuckets {
+  checkResponseKeys(object, path, [
+    'input_tokens',
+    'output_tokens',
+    'cache_read_tokens',
+    'cache_write_tokens',
+    'reasoning_tokens',
+    'provider_cost_micro',
+    'managed_cost_micro',
+    'byok_cost_micro',
+    'events',
+    'corrected_events',
+  ]);
+  return {
+    input_tokens: fInt(object, 'input_tokens', path),
+    output_tokens: fInt(object, 'output_tokens', path),
+    cache_read_tokens: fInt(object, 'cache_read_tokens', path),
+    cache_write_tokens: fInt(object, 'cache_write_tokens', path),
+    reasoning_tokens: fInt(object, 'reasoning_tokens', path),
+    provider_cost_micro: fInt(object, 'provider_cost_micro', path),
+    managed_cost_micro: fInt(object, 'managed_cost_micro', path),
+    byok_cost_micro: fInt(object, 'byok_cost_micro', path),
+    events: fInt(object, 'events', path),
+    corrected_events: fInt(object, 'corrected_events', path),
+  };
+}
+
+export function validateCreditBalance(object: JsonObject, path: string): NativeCreditBalance {
+  checkResponseKeys(object, path, [
+    'granted_micro',
+    'consumed_micro',
+    'refunded_micro',
+    'held_micro',
+    'pending_consumes',
+  ]);
+  return {
+    granted_micro: fInt(object, 'granted_micro', path),
+    consumed_micro: fInt(object, 'consumed_micro', path),
+    refunded_micro: fInt(object, 'refunded_micro', path),
+    held_micro: fInt(object, 'held_micro', path),
+    pending_consumes: fInt(object, 'pending_consumes', path),
+  };
+}
+
+export function validateBillingUsage(json: Json): NativeBillingUsage {
+  const path = 'GET /native/usage';
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, ['ok', 'organization', 'fold', 'credits', 'items', 'nextCursor']);
+  const fold = asObject(field(object, 'fold', path), `${path}.fold`);
+  checkResponseKeys(fold, `${path}.fold`, ['organization_id', 'totals', 'per_task', 'next_cursor']);
+  return {
+    ok: fBool(object, 'ok', path),
+    organization: fString(object, 'organization', path),
+    fold: {
+      organization_id: fString(fold, 'organization_id', `${path}.fold`),
+      totals: validateUsageBuckets(
+        asObject(field(fold, 'totals', `${path}.fold`), `${path}.fold.totals`),
+        `${path}.fold.totals`,
+      ),
+      per_task: fObjectArray(fold, 'per_task', `${path}.fold`).map((entry, index) => {
+        const itemPath = `${path}.fold.per_task[${index}]`;
+        checkResponseKeys(entry, itemPath, ['task_id', 'run_id', 'totals']);
+        return {
+          task_id: fInt(entry, 'task_id', itemPath),
+          run_id: fString(entry, 'run_id', itemPath),
+          totals: validateUsageBuckets(
+            asObject(field(entry, 'totals', itemPath), `${itemPath}.totals`),
+            `${itemPath}.totals`,
+          ),
+        };
+      }),
+      next_cursor: fNullableString(fold, 'next_cursor', `${path}.fold`),
+    },
+    credits: validateCreditBalance(
+      asObject(field(object, 'credits', path), `${path}.credits`),
+      `${path}.credits`,
+    ),
+    items: fObjectArray(object, 'items', path).map((entry, index) => {
+      const itemPath = `${path}.items[${index}]`;
+      checkResponseKeys(entry, itemPath, ['cursor', 'event']);
+      return { cursor: fString(entry, 'cursor', itemPath), event: fJson(entry, 'event', itemPath) };
+    }),
+    nextCursor: fNullableString(object, 'nextCursor', path),
+  };
+}
+
+export function validateEntitlements(json: Json): NativeEntitlements {
+  const path = 'GET /native/entitlements';
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, ['ok', 'entitlements']);
+  const view = asObject(field(object, 'entitlements', path), `${path}.entitlements`);
+  checkResponseKeys(view, `${path}.entitlements`, [
+    'organization_id',
+    'billing_account_id',
+    'plan_id',
+    'plan_found',
+    'subscription_status',
+    'subscription_expires_ms',
+    'subscription_active',
+    'features',
+    'limits',
+    'credits',
+    'managed_spend_micro',
+    'byok_spend_micro',
+    'total_tokens',
+    'in_flight',
+    'now_ms',
+  ]);
+  const limitsObject = asObject(field(view, 'limits', `${path}.entitlements`), `${path}.entitlements.limits`);
+  const limits: Record<string, number> = {};
+  for (const [name, value] of Object.entries(limitsObject)) {
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+      fail(
+        `${path}.entitlements.limits.${name}`,
+        `expected a non-negative integer, got ${describe(value)}`,
+      );
+    }
+    limits[name] = value;
+  }
+  return {
+    ok: fBool(object, 'ok', path),
+    entitlements: {
+      organization_id: fString(view, 'organization_id', `${path}.entitlements`),
+      billing_account_id: fNullableString(view, 'billing_account_id', `${path}.entitlements`),
+      plan_id: fNullableString(view, 'plan_id', `${path}.entitlements`),
+      plan_found: fBool(view, 'plan_found', `${path}.entitlements`),
+      subscription_status: fNullableString(view, 'subscription_status', `${path}.entitlements`),
+      subscription_expires_ms: fNullableInt(view, 'subscription_expires_ms', `${path}.entitlements`),
+      subscription_active: fBool(view, 'subscription_active', `${path}.entitlements`),
+      features: fStringArray(view, 'features', `${path}.entitlements`),
+      limits,
+      credits: validateCreditBalance(
+        asObject(field(view, 'credits', `${path}.entitlements`), `${path}.entitlements.credits`),
+        `${path}.entitlements.credits`,
+      ),
+      managed_spend_micro: fInt(view, 'managed_spend_micro', `${path}.entitlements`),
+      byok_spend_micro: fInt(view, 'byok_spend_micro', `${path}.entitlements`),
+      total_tokens: fInt(view, 'total_tokens', `${path}.entitlements`),
+      in_flight: fObjectArray(view, 'in_flight', `${path}.entitlements`).map((entry, index) => {
+        const itemPath = `${path}.entitlements.in_flight[${index}]`;
+        checkResponseKeys(entry, itemPath, [
+          'id',
+          'organization',
+          'kind',
+          'reference',
+          'started_ms',
+          'ended_ms',
+        ]);
+        return {
+          id: fString(entry, 'id', itemPath),
+          organization: fString(entry, 'organization', itemPath),
+          kind: fString(entry, 'kind', itemPath),
+          reference: fString(entry, 'reference', itemPath),
+          started_ms: fInt(entry, 'started_ms', itemPath),
+          ended_ms: fNullableInt(entry, 'ended_ms', itemPath),
+        };
+      }),
+      now_ms: fInt(view, 'now_ms', `${path}.entitlements`),
+    },
+  };
+}
+
+export function validateIdentity(json: Json): NativeIdentityView {
+  const path = 'GET /native/identity';
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, ['ok', 'identity']);
+  const view = asObject(field(object, 'identity', path), `${path}.identity`);
+  checkResponseKeys(view, `${path}.identity`, [
+    'subject_kind',
+    'subject_id',
+    'display_name',
+    'organization',
+    'organization_name',
+    'role',
+    'effective_actions',
+  ]);
+  return {
+    ok: fBool(object, 'ok', path),
+    identity: {
+      subject_kind: fString(view, 'subject_kind', `${path}.identity`),
+      subject_id: fString(view, 'subject_id', `${path}.identity`),
+      display_name: fString(view, 'display_name', `${path}.identity`),
+      email: 'email' in view ? fNullableString(view, 'email', `${path}.identity`) : null,
+      organization: fString(view, 'organization', `${path}.identity`),
+      organization_name: fString(view, 'organization_name', `${path}.identity`),
+      role: fString(view, 'role', `${path}.identity`),
+      effective_actions: fStringArray(view, 'effective_actions', `${path}.identity`),
+    },
+  };
+}
+
+export function validateCreditGrant(json: Json): NativeCreditGrant {
+  const path = 'POST /native/credits/grant';
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, ['ok', 'duplicate', 'credits']);
+  return {
+    ok: fBool(object, 'ok', path),
+    duplicate: fBool(object, 'duplicate', path),
+    credits: validateCreditBalance(
+      asObject(field(object, 'credits', path), `${path}.credits`),
+      `${path}.credits`,
+    ),
+  };
+}
+
 export function validateTaskVerification(json: Json): NativeTaskVerification {
   const path = 'GET /native/session/{id}/tasks/{task_id}/verification';
   const object = asObject(json, path);
@@ -2807,6 +3143,7 @@ export function validateAbortAck(json: Json): NativeAbortAck {
 
 interface RequestOptions<T> {
   readonly query?: Record<string, string | number | undefined>;
+  readonly headers?: Record<string, string>;
   readonly body?: Json;
   readonly maxBytes?: number;
   readonly timeoutMs?: number;
@@ -2817,6 +3154,7 @@ export class NativeClient {
   readonly baseUrl: string;
   readonly bearerToken: string;
   private readonly fetchImpl: FetchLike;
+  private readonly controlToken: string | null;
   private readonly timeoutMs: number;
   private readonly maxBodyBytes: number;
 
@@ -2827,6 +3165,10 @@ export class NativeClient {
     }
     this.baseUrl = base;
     this.bearerToken = options.bearerToken;
+    this.controlToken =
+      options.controlToken !== undefined && options.controlToken.length > 0
+        ? options.controlToken
+        : null;
     const injected = options.fetch;
     if (injected) {
       this.fetchImpl = injected;
@@ -2857,6 +3199,14 @@ export class NativeClient {
       Authorization: `Bearer ${this.bearerToken}`,
       Accept: 'application/json',
     };
+    if (this.controlToken !== null) {
+      headers['x-faktor-control-token'] = this.controlToken;
+    }
+    if (options.headers) {
+      for (const [key, value] of Object.entries(options.headers)) {
+        headers[key] = value;
+      }
+    }
     let body: string | undefined;
     if (options.body !== undefined) {
       headers['Content-Type'] = 'application/json';
@@ -3222,6 +3572,73 @@ export class NativeClient {
 
   usage(): Promise<NativeUsageTotals> {
     return this.request('GET', '/native/usage', { validate: validateUsage });
+  }
+
+  /**
+   * The caller's control-plane identity (`GET /native/identity`). The
+   * organization it names is the ONLY org the billing routes accept for this
+   * principal; a foreign org is the byte-identical 404 a missing one answers.
+   */
+  identity(): Promise<NativeIdentityView> {
+    return this.request('GET', '/native/identity', { validate: validateIdentity });
+  }
+
+  /** The derived entitlement snapshot of the caller's organization. */
+  entitlements(): Promise<NativeEntitlements> {
+    return this.request('GET', '/native/entitlements', { validate: validateEntitlements });
+  }
+
+  /**
+   * The organization's usage fold plus ONE cursor page of its usage events
+   * (`GET /native/usage?org=&since=&limit=`, the billing branch). `since` is
+   * the exclusive cursor a previous page returned as `nextCursor`; the limit
+   * is bounded by the daemon (1..=200, 0 and oversized are typed 400s).
+   */
+  billingUsage(
+    org: string,
+    page: { since?: string | null; limit?: number } = {},
+  ): Promise<NativeBillingUsage> {
+    return this.request('GET', '/native/usage', {
+      query: {
+        org,
+        since: page.since === undefined || page.since === null ? undefined : page.since,
+        limit: page.limit,
+      },
+      validate: validateBillingUsage,
+    });
+  }
+
+  /**
+   * Grant credits to the caller organization's billing account (admin role
+   * only; the server is the guard). The `Idempotency-Key` header is required
+   * by the daemon: the same key + same request replays the recorded result
+   * (`duplicate: true`) instead of appending a second grant.
+   */
+  grantCredits(request: {
+    amountMicro: number;
+    reason?: string;
+    accountId?: string;
+    idempotencyKey: string;
+  }): Promise<NativeCreditGrant> {
+    if (request.idempotencyKey.trim().length === 0) {
+      throw new NativeProtocolError(
+        'POST /native/credits/grant',
+        'an idempotency key is required for a credit grant',
+      );
+    }
+    return this.request('POST', '/native/credits/grant', {
+      headers: { 'idempotency-key': request.idempotencyKey },
+      body: {
+        amount_micro: request.amountMicro,
+        ...(request.reason !== undefined && request.reason.length > 0
+          ? { reason: request.reason }
+          : {}),
+        ...(request.accountId !== undefined && request.accountId.length > 0
+          ? { account_id: request.accountId }
+          : {}),
+      },
+      validate: validateCreditGrant,
+    });
   }
 
   sessionUsage(sessionId: string): Promise<NativeSessionUsage> {

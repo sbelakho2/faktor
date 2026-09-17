@@ -623,6 +623,115 @@ data class NativeUsageTotals(
 
 data class NativeSessionTaskUsage(val taskId: String, val budget: NativeTaskBudget)
 
+// ------------------------------------------- commercial metering (native, v1)
+//
+// `GET /native/usage?org=` (the billing branch), `GET /native/entitlements`
+// and `POST /native/credits/grant` — the Wave 3 control-plane routes. They
+// require the daemon password AND a control-plane principal
+// (`x-faktor-control-token`); when no billing service is wired the daemon
+// answers a typed 409 `billing_disabled` and the panel renders
+// "billing disabled locally" — zeros are never fabricated in its place.
+
+/** One aggregate bucket (org totals and per-task rows share this shape). */
+data class NativeUsageBuckets(
+    val inputTokens: Long,
+    val outputTokens: Long,
+    val cacheReadTokens: Long,
+    val cacheWriteTokens: Long,
+    val reasoningTokens: Long,
+    val providerCostMicro: Long,
+    val managedCostMicro: Long,
+    val byokCostMicro: Long,
+    val events: Long,
+    val correctedEvents: Long
+) {
+    fun totalTokens(): Long =
+        inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens + reasoningTokens
+}
+
+/** One per-task aggregate row of an organization's usage fold. */
+data class NativeBillingTaskUsage(
+    val taskId: Long,
+    val runId: String,
+    val totals: NativeUsageBuckets
+)
+
+/** The per-organization usage fold plus its scan-bound cursor. */
+data class NativeBillingFold(
+    val organizationId: String,
+    val totals: NativeUsageBuckets,
+    val perTask: List<NativeBillingTaskUsage>,
+    val nextCursor: String?
+)
+
+/** The free/held credit picture of one organization. */
+data class NativeCreditBalance(
+    val grantedMicro: Long,
+    val consumedMicro: Long,
+    val refundedMicro: Long,
+    val heldMicro: Long,
+    val pendingConsumes: Long
+) {
+    /** grants + refunds − effective debits, saturating (the server's rule). */
+    fun balanceMicro(): Long {
+        val credits = grantedMicro + refundedMicro
+        return if (credits < consumedMicro) 0L else credits - consumedMicro
+    }
+}
+
+/** `GET /native/usage?org=&since=&limit=` (the billing branch). */
+data class NativeBillingUsage(
+    val organization: String,
+    val fold: NativeBillingFold,
+    val credits: NativeCreditBalance,
+    val itemCount: Int,
+    val nextCursor: String?
+)
+
+/** One in-flight integration/rollback/completion transaction. */
+data class NativeInFlightTxn(
+    val id: String,
+    val organization: String,
+    val kind: String,
+    val reference: String,
+    val startedMs: Long,
+    val endedMs: Long?
+)
+
+/** The derived entitlement snapshot (`GET /native/entitlements`). */
+data class NativeEntitlementSnapshot(
+    val organizationId: String,
+    val billingAccountId: String?,
+    val planId: String?,
+    val planFound: Boolean,
+    val subscriptionStatus: String?,
+    val subscriptionExpiresMs: Long?,
+    val subscriptionActive: Boolean,
+    val features: List<String>,
+    val limits: Map<String, Long>,
+    val credits: NativeCreditBalance,
+    val managedSpendMicro: Long,
+    val byokSpendMicro: Long,
+    val totalTokens: Long,
+    val inFlight: List<NativeInFlightTxn>,
+    val nowMs: Long
+)
+
+/** The caller's control-plane identity (`GET /native/identity`). */
+data class NativeIdentity(
+    val subjectKind: String,
+    val subjectId: String,
+    val displayName: String,
+    val email: String?,
+    val organization: String,
+    val organizationName: String,
+    val role: String,
+    val effectiveActions: List<String>
+)
+
+/** `POST /native/credits/grant` — the appended/replayed credit state. */
+data class NativeCreditGrant(val duplicate: Boolean, val credits: NativeCreditBalance)
+
 data class NativeSessionUsage(
     val sessionId: String,
     val tokens: Long,
@@ -1405,6 +1514,116 @@ fun parseNativeSessionUsage(json: String): NativeSessionUsage {
     )
 }
 
+private fun parseUsageBuckets(v: JsonView): NativeUsageBuckets = NativeUsageBuckets(
+    inputTokens = v.field("input_tokens").long(),
+    outputTokens = v.field("output_tokens").long(),
+    cacheReadTokens = v.field("cache_read_tokens").long(),
+    cacheWriteTokens = v.field("cache_write_tokens").long(),
+    reasoningTokens = v.field("reasoning_tokens").long(),
+    providerCostMicro = v.field("provider_cost_micro").long(),
+    managedCostMicro = v.field("managed_cost_micro").long(),
+    byokCostMicro = v.field("byok_cost_micro").long(),
+    events = v.field("events").long(),
+    correctedEvents = v.field("corrected_events").long()
+)
+
+private fun parseCreditBalance(v: JsonView): NativeCreditBalance = NativeCreditBalance(
+    grantedMicro = v.field("granted_micro").long(),
+    consumedMicro = v.field("consumed_micro").long(),
+    refundedMicro = v.field("refunded_micro").long(),
+    heldMicro = v.field("held_micro").long(),
+    pendingConsumes = v.field("pending_consumes").long()
+)
+
+/** The limit map is additive: every served name is kept, values must be ints. */
+private fun parseLimits(v: JsonView): Map<String, Long> {
+    val objectValue = v.field("limits")
+    objectValue.objectValue()
+    val fields = (objectValue.value as JsonValue.Obj).fields
+    val limits = LinkedHashMap<String, Long>()
+    for ((name, value) in fields) {
+        val number = value as? JsonValue.Int64
+            ?: objectValue.fail("limits.$name must be an integer")
+        limits[name] = number.value
+    }
+    return limits
+}
+
+fun parseNativeBillingUsage(json: String): NativeBillingUsage {
+    val v = JsonCodec.parse(json).view("GET /native/usage?org=")
+    val fold = v.field("fold")
+    return NativeBillingUsage(
+        organization = v.field("organization").string(),
+        fold = NativeBillingFold(
+            organizationId = fold.field("organization_id").string(),
+            totals = parseUsageBuckets(fold.field("totals")),
+            perTask = fold.field("per_task").array().map {
+                NativeBillingTaskUsage(
+                    taskId = it.field("task_id").long(),
+                    runId = it.field("run_id").string(),
+                    totals = parseUsageBuckets(it.field("totals"))
+                )
+            },
+            nextCursor = fold.optionalField("next_cursor")?.string()
+        ),
+        credits = parseCreditBalance(v.field("credits")),
+        itemCount = v.field("items").array().size,
+        nextCursor = v.optionalField("nextCursor")?.string()
+    )
+}
+
+fun parseNativeEntitlements(json: String): NativeEntitlementSnapshot {
+    val v = JsonCodec.parse(json).view("GET /native/entitlements").field("entitlements")
+    return NativeEntitlementSnapshot(
+        organizationId = v.field("organization_id").string(),
+        billingAccountId = v.optionalField("billing_account_id")?.string(),
+        planId = v.optionalField("plan_id")?.string(),
+        planFound = v.field("plan_found").bool(),
+        subscriptionStatus = v.optionalField("subscription_status")?.string(),
+        subscriptionExpiresMs = v.optionalField("subscription_expires_ms")?.long(),
+        subscriptionActive = v.field("subscription_active").bool(),
+        features = v.field("features").stringArray(),
+        limits = parseLimits(v),
+        credits = parseCreditBalance(v.field("credits")),
+        managedSpendMicro = v.field("managed_spend_micro").long(),
+        byokSpendMicro = v.field("byok_spend_micro").long(),
+        totalTokens = v.field("total_tokens").long(),
+        inFlight = v.field("in_flight").array().map {
+            NativeInFlightTxn(
+                id = it.field("id").string(),
+                organization = it.field("organization").string(),
+                kind = it.field("kind").string(),
+                reference = it.field("reference").string(),
+                startedMs = it.field("started_ms").long(),
+                endedMs = it.optionalField("ended_ms")?.long()
+            )
+        },
+        nowMs = v.field("now_ms").long()
+    )
+}
+
+fun parseNativeIdentity(json: String): NativeIdentity {
+    val v = JsonCodec.parse(json).view("GET /native/identity").field("identity")
+    return NativeIdentity(
+        subjectKind = v.field("subject_kind").string(),
+        subjectId = v.field("subject_id").string(),
+        displayName = v.field("display_name").string(),
+        email = v.optionalField("email")?.string(),
+        organization = v.field("organization").string(),
+        organizationName = v.field("organization_name").string(),
+        role = v.field("role").string(),
+        effectiveActions = v.field("effective_actions").stringArray()
+    )
+}
+
+fun parseNativeCreditGrant(json: String): NativeCreditGrant {
+    val v = JsonCodec.parse(json).view("POST /native/credits/grant")
+    return NativeCreditGrant(
+        duplicate = v.field("duplicate").bool(),
+        credits = parseCreditBalance(v.field("credits"))
+    )
+}
+
 fun parseNativeVerificationView(json: String): NativeVerificationView {
     val v = JsonCodec.parse(json).view("GET /native/session/{id}/verification")
     return NativeVerificationView(
@@ -2040,6 +2259,17 @@ object NativeRequests {
 
     fun evidenceSelectorAll(): String =
         JsonObjectBuilder().put("selector", "all").toJson()
+
+    /** The strict credit-grant body (`POST /native/credits/grant`). */
+    fun grantCredits(
+        amountMicro: Long,
+        reason: String? = null,
+        accountId: String? = null
+    ): String = JsonObjectBuilder()
+        .put("amount_micro", amountMicro)
+        .put("reason", reason?.takeIf { it.isNotEmpty() })
+        .put("account_id", accountId?.takeIf { it.isNotEmpty() })
+        .toJson()
 
     fun evidenceSelectorRange(start: Long, end: Long): String =
         JsonObjectBuilder()

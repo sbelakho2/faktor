@@ -384,6 +384,104 @@ const usageTotalsJson = {
     truncated: false,
   },
 };
+const creditBalanceJson = {
+  granted_micro: 5_000_000,
+  consumed_micro: 2_000_000,
+  refunded_micro: 100_000,
+  held_micro: 250_000,
+  pending_consumes: 1,
+};
+const usageBucketsJson = {
+  input_tokens: 1000,
+  output_tokens: 500,
+  cache_read_tokens: 200,
+  cache_write_tokens: 50,
+  reasoning_tokens: 25,
+  provider_cost_micro: 900_000,
+  managed_cost_micro: 700_000,
+  byok_cost_micro: 200_000,
+  events: 12,
+  corrected_events: 1,
+};
+const billingUsageJson = {
+  ok: true,
+  organization: 'org-local',
+  fold: {
+    organization_id: 'org-local',
+    totals: usageBucketsJson,
+    per_task: [
+      {
+        task_id: 3,
+        run_id: 'r1',
+        totals: { ...usageBucketsJson, input_tokens: 400, managed_cost_micro: 700_000 },
+      },
+    ],
+    next_cursor: null,
+  },
+  credits: creditBalanceJson,
+  items: [{ cursor: '9', event: { unit: 'input_tokens', quantity: 10 } }],
+  nextCursor: '9',
+};
+const entitlementsJson = {
+  ok: true,
+  entitlements: {
+    organization_id: 'org-local',
+    billing_account_id: 'acct-1',
+    plan_id: 'pro',
+    plan_found: true,
+    subscription_status: 'active',
+    subscription_expires_ms: 1_800_000_000_000,
+    subscription_active: true,
+    features: ['managed_providers', 'byok', 'credits'],
+    limits: {
+      max_tokens_per_period: 100_000,
+      max_managed_spend_micro_per_period: 1_000_000,
+      min_credit_balance_micro: 1000,
+      max_active_tasks: 4,
+      max_children_per_task: 3,
+      max_provider_attempts_per_task: 5,
+    },
+    credits: creditBalanceJson,
+    managed_spend_micro: 700_000,
+    byok_spend_micro: 200_000,
+    total_tokens: 1775,
+    in_flight: [
+      {
+        id: 'txn-1',
+        organization: 'org-local',
+        kind: 'integration',
+        reference: 'run-1',
+        started_ms: 1_750_000_000_000,
+        ended_ms: null,
+      },
+    ],
+    now_ms: 1_750_000_000_000,
+  },
+};
+const identityJson = {
+  ok: true,
+  identity: {
+    subject_kind: 'user',
+    subject_id: 'u-1',
+    display_name: 'Admin',
+    email: 'admin@example.com',
+    organization: 'org-local',
+    organization_name: 'Local Org',
+    role: 'admin',
+    effective_actions: ['billing_read', 'credits_grant'],
+  },
+};
+const memberIdentityJson = {
+  ...clone(identityJson),
+  identity: {
+    ...clone(identityJson.identity),
+    subject_id: 'u-2',
+    display_name: 'Member',
+    role: 'member',
+    effective_actions: ['billing_read'],
+  },
+};
+const creditGrantJson = { ok: true, duplicate: false, credits: creditBalanceJson };
 const verificationRecordJson = {
   recordId: 'rec1',
   revision: 'rev1',
@@ -597,6 +695,21 @@ async function validatorAccepts() {
     assertEqual(nc.validateSemanticStatus(clone(semanticStatusJson)).providerCount, 0);
     assertEqual(nc.validateSemanticStatus(clone(semanticStatusJson)).fallback.version, 1);
     assertEqual(nc.validateAbortAck(clone(abortAckJson)).aborted[0], '1');
+    const billingUsage = nc.validateBillingUsage(clone(billingUsageJson));
+    assertEqual(billingUsage.fold.totals.managed_cost_micro, 700_000);
+    assertEqual(billingUsage.fold.per_task[0].task_id, 3);
+    assertEqual(billingUsage.credits.held_micro, 250_000);
+    assertEqual(billingUsage.nextCursor, '9');
+    const entitlements = nc.validateEntitlements(clone(entitlementsJson));
+    assertEqual(entitlements.entitlements.plan_id, 'pro');
+    assertEqual(entitlements.entitlements.limits.max_tokens_per_period, 100_000);
+    assertEqual(entitlements.entitlements.subscription_active, true);
+    assertEqual(nc.validateIdentity(clone(identityJson)).identity.effective_actions.includes('credits_grant'), true);
+    assertEqual(nc.validateCreditGrant(clone(creditGrantJson)).duplicate, false);
+    // A pre-billing daemon serving no `email` on the identity is tolerated.
+    const legacyIdentity = clone(identityJson);
+    delete legacyIdentity.identity.email;
+    assertEqual(nc.validateIdentity(legacyIdentity).identity.email, null);
 
     // v1 additive contract: a newer daemon's unknown optional field is
     // ignored at every nesting level, never a rejection.
@@ -699,6 +812,35 @@ async function validatorRejects() {
       'expected an integer',
     );
     assertProtocol(() => nc.validateBoardPost({}), 'missing required field id');
+    // Billing payloads: a missing known field, a typed mismatch and a
+    // hostile limit value all fail loudly (never a silently wrong panel).
+    const missingCredits = clone(billingUsageJson);
+    delete missingCredits.credits;
+    assertProtocol(() => nc.validateBillingUsage(missingCredits), 'missing required field credits');
+    assertProtocol(
+      () => nc.validateBillingUsage({ ...clone(billingUsageJson), nextCursor: 9 }),
+      'expected a string or null',
+    );
+    assertProtocol(
+      () => nc.validateBillingUsage({ ...clone(billingUsageJson), credits: { ...creditBalanceJson, held_micro: '1' } }),
+      'expected a finite number',
+    );
+    assertProtocol(
+      () => nc.validateEntitlements({ ...clone(entitlementsJson), entitlements: { ...entitlementsJson.entitlements, limits: { max_tokens_per_period: -1 } } }),
+      'expected a non-negative integer',
+    );
+    assertProtocol(
+      () => nc.validateEntitlements({ ...clone(entitlementsJson), entitlements: { ...entitlementsJson.entitlements, subscription_status: 7 } }),
+      'expected a string or null',
+    );
+    assertProtocol(
+      () => nc.validateIdentity({ ...clone(identityJson), identity: { ...identityJson.identity, effective_actions: 'credits_grant' } }),
+      'expected an array',
+    );
+    assertProtocol(
+      () => nc.validateCreditGrant({ ok: true, duplicate: false }),
+      'missing required field credits',
+    );
   });
 }
 
@@ -742,8 +884,12 @@ async function clientAccepts() {
       'POST /native/session/7/board': () => jsonResponse(boardPostJson),
       'GET /native/messages': () => jsonResponse(messagePageJson),
       'GET /native/events': () => jsonResponse(eventPageJson),
-      'GET /native/usage': () => jsonResponse(usageTotalsJson),
+      'GET /native/usage': (call) =>
+        jsonResponse(call.query.org ? billingUsageJson : usageTotalsJson),
       'GET /native/session/7/usage': () => jsonResponse(sessionUsageJson),
+      'GET /native/identity': () => jsonResponse(identityJson),
+      'GET /native/entitlements': () => jsonResponse(entitlementsJson),
+      'POST /native/credits/grant': () => jsonResponse(creditGrantJson),
       'GET /native/session/7/tasks/t1/verification': () => jsonResponse(taskVerificationJson),
       'GET /native/evidence/41': () => jsonResponse(evidenceJson),
       'POST /native/evidence/41/retrieve': () => jsonResponse(evidenceRetrievalJson),
@@ -800,6 +946,18 @@ async function clientAccepts() {
     assertEqual((await client.events('7', { after: 7, limit: 3 })).events[0].seq, 1);
     assertEqual((await client.usage()).sessions, 1);
     assertEqual((await client.sessionUsage('7')).providerCalls.tokens, 130);
+    assertEqual((await client.identity()).identity.organization, 'org-local');
+    assertEqual((await client.entitlements()).entitlements.plan_found, true);
+    assertEqual(
+      (await client.billingUsage('org-local', { since: '9', limit: 25 })).fold.totals.byok_cost_micro,
+      200_000,
+    );
+    assertEqual((await client.billingUsage('org-local')).nextCursor, '9');
+    assertEqual(
+      (await client.grantCredits({ amountMicro: 1_000_000, reason: 'top up', idempotencyKey: 'selftest-key-1' }))
+        .duplicate,
+      false,
+    );
     assertEqual((await client.taskVerification('7', 't1')).records[0].recordId, 'rec1');
     assertEqual((await client.evidence('7', 41)).backingRetained, true);
     assertEqual((await client.retrieveEvidence('7', 41, { selector: 'all' })).byteLen, 3);
@@ -864,6 +1022,45 @@ async function clientAccepts() {
       session_id: '7',
       op_id: '3',
     });
+    // Billing request construction: the org/since/limit query, the
+    // idempotency header and the strict grant body (the legacy usage read
+    // carries no org query, so the billing call is matched by its org).
+    const billingCall = calls.find(
+      (call) => call.method === 'GET' && call.path === '/native/usage' && call.query.org !== undefined,
+    );
+    assert(billingCall, 'the billing usage read must carry an org query');
+    assertDeepEqual(billingCall.query, {
+      org: 'org-local',
+      since: '9',
+      limit: '25',
+    });
+    assertEqual(
+      findCall(calls, 'POST', '/native/credits/grant').headers['idempotency-key'],
+      'selftest-key-1',
+    );
+    assertDeepEqual(findCall(calls, 'POST', '/native/credits/grant').body, {
+      amount_micro: 1_000_000,
+      reason: 'top up',
+    });
+  });
+
+  await test('billing reads carry the control-plane token only when configured', async () => {
+    const routes = {
+      'GET /native/identity': () => jsonResponse(identityJson),
+    };
+    const withToken = makeClient(routes, { controlToken: 'cp-selftest-token' });
+    assertEqual((await withToken.client.identity()).identity.role, 'admin');
+    assertEqual(
+      findCall(withToken.calls, 'GET', '/native/identity').headers['x-faktor-control-token'],
+      'cp-selftest-token',
+    );
+    const withoutToken = makeClient(routes);
+    await withoutToken.client.identity();
+    assertEqual(
+      findCall(withoutToken.calls, 'GET', '/native/identity').headers['x-faktor-control-token'],
+      undefined,
+      'an unconfigured control token is never sent',
+    );
   });
 }
 
@@ -3810,6 +4007,275 @@ async function proofSummaryTests() {
   });
 }
 
+// ------------------------------------------------ usage / credits panel (v1)
+
+async function usagePanelTests() {
+  const admin = nc.validateIdentity(clone(identityJson)).identity;
+  const member = nc.validateIdentity(clone(memberIdentityJson)).identity;
+  const entitlements = nc.validateEntitlements(clone(entitlementsJson)).entitlements;
+  const usage = nc.validateBillingUsage(clone(billingUsageJson));
+  const panelInput = (overrides) => ({
+    identity: admin,
+    entitlements,
+    usage,
+    refusal: null,
+    cursor: null,
+    hasPrev: false,
+    ...overrides,
+  });
+
+  await test('usage panel renders populated aggregates, credits and the exact limits', () => {
+    const panel = cp.buildUsagePanel(panelInput({}));
+    assertEqual(panel.state, 'ok');
+    assertEqual(panel.reason, null);
+    assertEqual(panel.organization, 'org-local');
+    assertEqual(panel.planId, 'pro');
+    assertEqual(panel.planFound, true);
+    assertEqual(panel.period.totalTokens, 1775);
+    assertEqual(panel.period.inputTokens, 1000);
+    assertEqual(panel.period.reasoningTokens, 25);
+    assertEqual(panel.period.managedCostMicro, 700_000);
+    assertEqual(panel.period.byokCostMicro, 200_000);
+    assertEqual(panel.period.providerCostMicro, 900_000);
+    assertEqual(panel.period.correctedEvents, 1);
+    assertEqual(panel.period.tasks[0].taskId, 3);
+    assertEqual(panel.period.tasks[0].runId, 'r1');
+    assertEqual(panel.period.tasks[0].totals.inputTokens, 400);
+    assertEqual(panel.credits.balanceMicro, 5_000_000 + 100_000 - 2_000_000);
+    assertEqual(panel.credits.heldMicro, 250_000);
+    assertEqual(panel.credits.pendingConsumes, 1);
+    assertEqual(panel.subscription.state, 'active');
+    assertEqual(panel.inFlight[0].kind, 'integration');
+    assertEqual(panel.inFlight[0].endedMs, null);
+    assertEqual(panel.page.itemCount, 1);
+    assertEqual(panel.page.nextCursor, '9');
+    const limits = panel.quotas.map((quota) => quota.limit);
+    assert(limits.includes('max_tokens_per_period'), JSON.stringify(limits));
+    assert(limits.includes('max_managed_spend_micro_per_period'), JSON.stringify(limits));
+    assert(limits.includes('min_credit_balance_micro'), JSON.stringify(limits));
+    const tokensQuota = panel.quotas.find((quota) => quota.limit === 'max_tokens_per_period');
+    assertEqual(tokensQuota.observed, 1775);
+    assertEqual(tokensQuota.value, 100_000);
+    assertEqual(tokensQuota.exceeded, false);
+    const unserved = panel.quotas.find((quota) => quota.limit === 'max_active_tasks');
+    assertEqual(unserved.observed, null, 'an unserved observed counter is null, never zero');
+    assertEqual(unserved.exceeded, null);
+    const lines = cp.usagePanelLines(panel);
+    assert(lines.some((line) => line.includes('managed') && line.includes('BYOK')), JSON.stringify(lines));
+    assert(
+      lines.some((line) => line.includes('quota max_tokens_per_period')),
+      JSON.stringify(lines),
+    );
+    assert(
+      lines.some((line) => line.includes('observed not served')),
+      JSON.stringify(lines),
+    );
+    assert(lines.some((line) => line.includes('subscription active')), JSON.stringify(lines));
+    assert(lines.some((line) => line.includes('credits balance')), JSON.stringify(lines));
+    const section = cp.usagePanelSections(panel)[0];
+    assertEqual(section.key, 'usage');
+    assertEqual(section.title, 'Usage / Credits');
+    assertEqual(section.present, true);
+    assertEqual(section.actions.length, 3);
+  });
+
+  await test('billing_disabled renders "billing disabled locally", never zeros', () => {
+    const panel = cp.buildUsagePanel(
+      panelInput({
+        entitlements: null,
+        usage: null,
+        refusal: {
+          code: 'billing_disabled',
+          reason: '409 billing_disabled: commercial billing is disabled (enable the [billing] section to use it)',
+        },
+      }),
+    );
+    assertEqual(panel.state, 'disabled');
+    assertEqual(panel.period, null);
+    assertEqual(panel.credits, null);
+    assertDeepEqual(panel.quotas, []);
+    const lines = cp.usagePanelLines(panel);
+    assert(lines[0].startsWith('billing disabled locally'), lines[0]);
+    assert(lines[0].includes('billing_disabled'), lines[0]);
+    assert(!lines.some((line) => line.includes('\u00b5$')), `no money behind a disabled state: ${JSON.stringify(lines)}`);
+    assert(!lines.some((line) => line.includes('quota')), JSON.stringify(lines));
+    assert(!lines.some((line) => line.includes('tokens')), JSON.stringify(lines));
+    assertEqual(cp.usagePanelSections(panel)[0].present, false);
+  });
+
+  await test('expired / canceled / lapsed subscriptions render explicit banners', () => {
+    const expired = cp.buildUsagePanel(
+      panelInput({
+        identity: member,
+        entitlements: {
+          ...clone(entitlements),
+          subscription_status: 'expired',
+          subscription_active: false,
+          subscription_expires_ms: 1_700_000_000_000,
+        },
+      }),
+    );
+    assertEqual(expired.subscription.state, 'expired');
+    assertEqual(expired.subscription.active, false);
+    const expiredLines = cp.usagePanelLines(expired);
+    assert(expiredLines.some((line) => line.startsWith('[EXPIRED]')), JSON.stringify(expiredLines));
+    assert(
+      expiredLines.some((line) => line.startsWith('[EXPIRED]') && line.includes('new tasks are denied')),
+      JSON.stringify(expiredLines),
+    );
+    const grace = cp.buildUsagePanel(
+      panelInput({
+        entitlements: { ...clone(entitlements), subscription_status: 'active', subscription_active: false },
+      }),
+    );
+    assertEqual(grace.subscription.state, 'grace', 'a durable active row that is effectively inactive is a lapse');
+    const graceLines = cp.usagePanelLines(grace);
+    assert(graceLines.some((line) => line.startsWith('[GRACE]')), JSON.stringify(graceLines));
+    assert(
+      graceLines.some((line) => line.startsWith('[GRACE]') && line.includes('inactive')),
+      JSON.stringify(graceLines),
+    );
+    const canceled = cp.buildUsagePanel(
+      panelInput({
+        entitlements: { ...clone(entitlements), subscription_status: 'canceled', subscription_active: false },
+      }),
+    );
+    assertEqual(canceled.subscription.state, 'canceled');
+    assert(
+      cp.usagePanelLines(canceled).some((line) => line.startsWith('[CANCELED]')),
+      JSON.stringify(cp.usagePanelLines(canceled)),
+    );
+    const none = cp.buildUsagePanel(
+      panelInput({ entitlements: { ...clone(entitlements), subscription_status: null, subscription_active: false } }),
+    );
+    assertEqual(none.subscription.state, 'unavailable');
+  });
+
+  await test('quota-exceeded styling names the exact breached limit', () => {
+    const over = nc.validateEntitlements({
+      ...clone(entitlementsJson),
+      entitlements: {
+        ...clone(entitlementsJson.entitlements),
+        total_tokens: 250_000,
+        managed_spend_micro: 1_000_000,
+      },
+    }).entitlements;
+    const panel = cp.buildUsagePanel(panelInput({ entitlements: over }));
+    const exceeded = panel.quotas.filter((quota) => quota.exceeded === true).map((quota) => quota.limit);
+    assert(exceeded.includes('max_tokens_per_period'), JSON.stringify(exceeded));
+    assert(
+      exceeded.includes('max_managed_spend_micro_per_period'),
+      JSON.stringify(exceeded),
+    );
+    const lines = cp.usagePanelLines(panel);
+    const tokenLine = lines.find((line) => line.includes('max_tokens_per_period'));
+    assert(tokenLine.startsWith('[EXCEEDED] quota max_tokens_per_period'), tokenLine);
+    assert(tokenLine.includes('/ limit 100000'), tokenLine);
+    const moneyLine = lines.find((line) => line.includes('max_managed_spend_micro_per_period'));
+    assert(moneyLine.startsWith('[EXCEEDED]'), moneyLine);
+    assertEqual(lines.filter((line) => line.startsWith('[EXCEEDED]')).length, 2);
+    // The floor limit (min credit balance) is breached BELOW its value.
+    const low = nc.validateEntitlements({
+      ...clone(entitlementsJson),
+      entitlements: {
+        ...clone(entitlementsJson.entitlements),
+        credits: { ...clone(creditBalanceJson), granted_micro: 100, consumed_micro: 50, refunded_micro: 0 },
+      },
+    }).entitlements;
+    const floorPanel = cp.buildUsagePanel(panelInput({ entitlements: low }));
+    const floorQuota = floorPanel.quotas.find((quota) => quota.limit === 'min_credit_balance_micro');
+    assertEqual(floorQuota.exceeded, true);
+    assert(
+      cp.usagePanelLines(floorPanel).some((line) => line.startsWith('[EXCEEDED] quota min_credit_balance_micro')),
+      JSON.stringify(cp.usagePanelLines(floorPanel)),
+    );
+  });
+
+  await test('grant-credits affordance follows the credits_grant capability', () => {
+    const adminPanel = cp.buildUsagePanel(panelInput({}));
+    assertEqual(adminPanel.canGrantCredits, true);
+    assertEqual(adminPanel.actions.find((action) => action.key === 'grant-credits').enabled, true);
+    assertEqual(adminPanel.grantDisabledReason, null);
+    assert(
+      cp.usagePanelLines(adminPanel).some((line) => line.includes('grants credits')),
+      JSON.stringify(cp.usagePanelLines(adminPanel)),
+    );
+    const memberPanel = cp.buildUsagePanel(panelInput({ identity: member }));
+    assertEqual(memberPanel.canGrantCredits, false);
+    assertEqual(memberPanel.actions.find((action) => action.key === 'grant-credits').enabled, false);
+    assert(
+      memberPanel.grantDisabledReason.includes('member') &&
+        memberPanel.grantDisabledReason.includes('credits_grant'),
+      memberPanel.grantDisabledReason,
+    );
+    assert(
+      cp.usagePanelLines(memberPanel).some((line) => line.includes('grant credits disabled')),
+      JSON.stringify(cp.usagePanelLines(memberPanel)),
+    );
+    const anonymous = cp.buildUsagePanel(panelInput({ identity: null }));
+    assertEqual(anonymous.canGrantCredits, false);
+    assertEqual(anonymous.actions.find((action) => action.key === 'grant-credits').enabled, false);
+    assert(
+      anonymous.grantDisabledReason.includes('identity'),
+      anonymous.grantDisabledReason,
+    );
+  });
+
+  await test('cursor pagination controls wire next/prev from the served cursors', () => {
+    const first = cp.buildUsagePanel(panelInput({}));
+    assertEqual(first.page.cursor, null);
+    assertEqual(first.page.nextCursor, '9');
+    assertEqual(first.page.hasPrev, false);
+    assertEqual(first.actions.find((action) => action.key === 'usage-next').enabled, true);
+    assertEqual(first.actions.find((action) => action.key === 'usage-prev').enabled, false);
+    const second = cp.buildUsagePanel(
+      panelInput({
+        usage: { ...clone(billingUsageJson), nextCursor: null },
+        cursor: '9',
+        hasPrev: true,
+      }),
+    );
+    assertEqual(second.page.cursor, '9');
+    assertEqual(second.page.nextCursor, null);
+    assertEqual(second.actions.find((action) => action.key === 'usage-next').enabled, false);
+    assertEqual(second.actions.find((action) => action.key === 'usage-prev').enabled, true);
+    const lines = cp.usagePanelLines(second);
+    assert(lines.some((line) => line.includes('cursor 9') && line.includes('next none')), JSON.stringify(lines));
+  });
+
+  await test('malformed or refused payloads render honest unavailable states', () => {
+    assertProtocol(
+      () =>
+        nc.validateBillingUsage({
+          ...clone(billingUsageJson),
+          fold: { ...clone(billingUsageJson.fold), totals: { ...clone(usageBucketsJson), input_tokens: 'many' } },
+        }),
+      'expected a finite number',
+    );
+    assertProtocol(
+      () => nc.validateEntitlements({ ...clone(entitlementsJson), entitlements: { ...clone(entitlementsJson.entitlements), credits: null } }),
+      'expected an object',
+    );
+    const panel = cp.buildUsagePanel(
+      panelInput({
+        entitlements: null,
+        usage: null,
+        refusal: { code: 'malformed', reason: 'GET /native/usage: missing required field credits' },
+      }),
+    );
+    assertEqual(panel.state, 'unavailable');
+    assertEqual(panel.period, null);
+    assertEqual(panel.credits, null);
+    assertDeepEqual(panel.quotas, []);
+    const lines = cp.usagePanelLines(panel);
+    assert(lines[0].startsWith('usage unavailable'), lines[0]);
+    assert(lines[0].includes('missing required field credits'), lines[0]);
+    assert(!lines.some((line) => line.includes('\u00b5$')), `no fabricated money: ${JSON.stringify(lines)}`);
+    assert(!lines.some((line) => line.includes('quota')), JSON.stringify(lines));
+    assertEqual(cp.usagePanelSections(panel)[0].present, false);
+  });
+}
+
 async function main() {
   await validatorAccepts();
   await validatorRejects();
@@ -3830,6 +4296,7 @@ async function main() {
   await cockpitTests();
   await acceptanceProofTests();
   await proofSummaryTests();
+  await usagePanelTests();
   await presentationWebviewTests();
   await tournamentWebviewTests();
   await reducedMotionTests();

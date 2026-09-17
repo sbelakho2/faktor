@@ -11,6 +11,22 @@
 //! [`faktor_provider::egress::execute_raw`], so the transport's request-time
 //! destination gate applies to every call.
 //!
+//! ONE implementation serves both client kinds. The [`ClientAuthMethod`] of
+//! [`NetworkOidcConfig`] selects the token-endpoint authentication:
+//!
+//! - `None` (the default): the public PKCE client — the exchange sends
+//!   exactly `grant_type, code, redirect_uri, code_verifier, client_id` and
+//!   nothing else, byte-identical to the pre-confidential shape;
+//! - `client_secret_post`: the configured [`ClientSecret`] rides the form;
+//! - `client_secret_basic`: the secret rides an RFC 6749 §2.3.1 HTTP Basic
+//!   header (`base64(urlencode(client_id):urlencode(secret))`) and neither
+//!   the secret nor the client id appears in the form.
+//!
+//! The secret is validated at construction, redacted in `Debug`/`Display`
+//! and never interpolated into an error: a missing secret for a confidential
+//! method is a typed configuration refusal (fail closed), never a silently
+//! unauthenticated exchange.
+//!
 //! Caching and bounds (all documented):
 //!
 //! - **discovery** is cached for the response's `Cache-Control: max-age`
@@ -47,6 +63,91 @@ pub const DEFAULT_JWKS_MAX_AGE_MS: i64 = 300_000;
 pub const MAX_JWKS_REFETCHES: u32 = 3;
 /// Hard cap on the configured discovery/JWKS max-age ceiling.
 pub const MAX_CACHE_MAX_AGE_MS: i64 = 3_600_000;
+/// Hard cap on one configured client secret (mirrors the staged-payload
+/// bound: a secret is not a document).
+pub const MAX_CLIENT_SECRET_BYTES: usize = 4096;
+/// Hard cap on one authorization-code exchange input field.
+pub const MAX_CODE_EXCHANGE_INPUT_BYTES: usize = 1024 * 1024;
+
+/// How the adapter authenticates itself at the token endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ClientAuthMethod {
+    /// Public client: PKCE only (the pre-existing exchange shape).
+    #[default]
+    None,
+    /// `client_secret_post`: the secret rides the token request form.
+    ClientSecretPost,
+    /// `client_secret_basic`: the secret rides an HTTP Basic header.
+    ClientSecretBasic,
+}
+
+impl ClientAuthMethod {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ClientAuthMethod::None => "none",
+            ClientAuthMethod::ClientSecretPost => "client_secret_post",
+            ClientAuthMethod::ClientSecretBasic => "client_secret_basic",
+        }
+    }
+
+    /// Strict parse of the configured method name (exact match only).
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "none" => Some(ClientAuthMethod::None),
+            "client_secret_post" => Some(ClientAuthMethod::ClientSecretPost),
+            "client_secret_basic" => Some(ClientAuthMethod::ClientSecretBasic),
+            _ => None,
+        }
+    }
+
+    /// Whether the method requires a configured secret.
+    pub const fn requires_secret(self) -> bool {
+        !matches!(self, ClientAuthMethod::None)
+    }
+}
+
+/// A confidential client's secret. The value is bounded printable ASCII, and
+/// its `Debug`/`Display` are REDACTED — the only reach for the bytes is the
+/// token-endpoint request the configured method builds, and no error message
+/// ever carries it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClientSecret(String);
+
+impl ClientSecret {
+    /// Validate + wrap one secret. A malformed secret is a typed refusal
+    /// that never echoes the value.
+    pub fn new(secret: impl Into<String>) -> Result<Self, OidcError> {
+        let secret = secret.into();
+        if secret.is_empty() || secret.len() > MAX_CLIENT_SECRET_BYTES {
+            return Err(OidcError::DiscoveryUnavailable(format!(
+                "client secret must be 1..={MAX_CLIENT_SECRET_BYTES} bytes"
+            )));
+        }
+        if !secret.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(OidcError::DiscoveryUnavailable(
+                "client secret must be printable ASCII without whitespace".into(),
+            ));
+        }
+        Ok(Self(secret))
+    }
+
+    /// The secret bytes (the exchange is the ONLY caller).
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ClientSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClientSecret(<redacted>)")
+    }
+}
+
+impl std::fmt::Display for ClientSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
 
 /// The strict network-adapter configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +164,12 @@ pub struct NetworkOidcConfig {
     /// Forced JWKS refetches allowed per verification when the `kid` is
     /// unknown (bounded rotation response).
     pub max_jwks_refetches: u32,
+    /// How the adapter authenticates at the token endpoint (`none` = public
+    /// PKCE client, the pre-existing shape).
+    pub client_auth: ClientAuthMethod,
+    /// The confidential client's secret; required iff `client_auth` is not
+    /// `none`, refused when configured without a method.
+    pub client_secret: Option<ClientSecret>,
 }
 
 impl Default for NetworkOidcConfig {
@@ -73,12 +180,17 @@ impl Default for NetworkOidcConfig {
             discovery_max_age_ms: DEFAULT_DISCOVERY_MAX_AGE_MS,
             jwks_max_age_ms: DEFAULT_JWKS_MAX_AGE_MS,
             max_jwks_refetches: 2,
+            client_auth: ClientAuthMethod::None,
+            client_secret: None,
         }
     }
 }
 
 impl NetworkOidcConfig {
-    /// Strict validation; every bound is enforced.
+    /// Strict validation; every bound is enforced. A confidential method
+    /// without a secret (or a secret without a method) is refused BEFORE any
+    /// request could be built: the adapter never falls back to an
+    /// unauthenticated exchange.
     pub fn validate(&self) -> Result<(), OidcError> {
         if !(self.issuer.starts_with("https://") || self.issuer.starts_with("http://")) {
             return Err(OidcError::DiscoveryUnavailable(
@@ -109,6 +221,22 @@ impl NetworkOidcConfig {
             return Err(OidcError::DiscoveryUnavailable(format!(
                 "max_jwks_refetches must be <= {MAX_JWKS_REFETCHES}"
             )));
+        }
+        match (self.client_auth, &self.client_secret) {
+            (ClientAuthMethod::None, Some(_)) => {
+                return Err(OidcError::DiscoveryUnavailable(
+                    "a client secret is configured but client_auth is \"none\"; select \
+                     client_secret_post or client_secret_basic"
+                        .into(),
+                ));
+            }
+            (method, None) if method.requires_secret() => {
+                return Err(OidcError::DiscoveryUnavailable(format!(
+                    "client auth method {:?} requires a client secret (none configured)",
+                    method.as_str()
+                )));
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -212,6 +340,8 @@ impl std::fmt::Debug for NetworkOidcAdapter {
         f.debug_struct("NetworkOidcAdapter")
             .field("issuer", &self.config.issuer)
             .field("client_id", &self.config.client_id)
+            .field("client_auth", &self.config.client_auth.as_str())
+            .field("authenticated", &self.config.client_secret.is_some())
             .field(
                 "jwks_cached",
                 &self.jwks_cache.lock().map(|c| c.is_some()).unwrap_or(false),
@@ -445,32 +575,75 @@ impl AsyncOidcAdapter for NetworkOidcAdapter {
                 "code, redirect_uri and code_verifier are required".into(),
             ));
         }
+        if request.code.len() > MAX_CODE_EXCHANGE_INPUT_BYTES
+            || request.redirect_uri.len() > MAX_CODE_EXCHANGE_INPUT_BYTES
+            || request.code_verifier.len() > MAX_CODE_EXCHANGE_INPUT_BYTES
+        {
+            return Err(OidcError::CodeExchangeRefused(
+                "authorization-code exchange inputs are oversized".into(),
+            ));
+        }
         let doc = self.discovery(&self.config.issuer).await?;
-        let form = [
-            ("grant_type", "authorization_code"),
-            ("code", request.code.as_str()),
-            ("redirect_uri", request.redirect_uri.as_str()),
-            ("code_verifier", request.code_verifier.as_str()),
-            ("client_id", self.config.client_id.as_str()),
-        ];
+        // The secret is resolved ONCE per exchange; a confidential method
+        // without one can only exist if validate() was bypassed, and refuses
+        // here typed instead of ever sending an unauthenticated request.
+        let secret = match self.config.client_auth {
+            ClientAuthMethod::None => None,
+            _ => Some(
+                self.config
+                    .client_secret
+                    .as_ref()
+                    .ok_or_else(|| {
+                        OidcError::CodeExchangeRefused(format!(
+                            "client auth method {:?} requires a client secret (none configured)",
+                            self.config.client_auth.as_str()
+                        ))
+                    })?
+                    .expose(),
+            ),
+        };
+        // Public PKCE shape first (unchanged byte-for-byte); the confidential
+        // methods APPEND their credential per the configured method.
         let mut body = String::new();
-        for (index, (name, value)) in form.iter().enumerate() {
-            if index > 0 {
+        let mut field = |name: &str, value: &str| {
+            if !body.is_empty() {
                 body.push('&');
             }
             body.push_str(name);
             body.push('=');
             body.push_str(&urlencode(value));
+        };
+        field("grant_type", "authorization_code");
+        field("code", request.code.as_str());
+        field("redirect_uri", request.redirect_uri.as_str());
+        field("code_verifier", request.code_verifier.as_str());
+        match self.config.client_auth {
+            // RFC 6749 §2.3.1: the client_id rides the Basic header, never
+            // the form, when the client authenticates with HTTP Basic.
+            ClientAuthMethod::ClientSecretBasic => {}
+            ClientAuthMethod::None | ClientAuthMethod::ClientSecretPost => {
+                field("client_id", self.config.client_id.as_str());
+            }
         }
-        let raw = execute_raw(
-            &*self.transport,
-            RawRequest::new("POST", doc.token_endpoint)
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("accept", "application/json")
-                .bytes_body(body.into_bytes()),
-        )
-        .await
-        .map_err(|e| OidcError::CodeExchangeRefused(e.to_string()))?;
+        if self.config.client_auth == ClientAuthMethod::ClientSecretPost {
+            field("client_secret", secret.unwrap_or_default());
+        }
+        let mut raw_request = RawRequest::new("POST", doc.token_endpoint)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("accept", "application/json")
+            .bytes_body(body.into_bytes());
+        if self.config.client_auth == ClientAuthMethod::ClientSecretBasic {
+            let credentials = format!(
+                "{}:{}",
+                urlencode(self.config.client_id.as_str()),
+                urlencode(secret.unwrap_or_default())
+            );
+            let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
+            raw_request = raw_request.header("authorization", format!("Basic {encoded}"));
+        }
+        let raw = execute_raw(&*self.transport, raw_request)
+            .await
+            .map_err(|e| OidcError::CodeExchangeRefused(e.to_string()))?;
         if !(200..300).contains(&raw.status) {
             return Err(OidcError::CodeExchangeRefused(format!(
                 "token endpoint answered {}",

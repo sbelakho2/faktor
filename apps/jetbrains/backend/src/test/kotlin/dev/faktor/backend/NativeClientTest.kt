@@ -24,11 +24,15 @@ import dev.faktor.shared.NativeProtocolException
 import dev.faktor.shared.NativeRequests
 import dev.faktor.shared.parseNativeAgentControlAck
 import dev.faktor.shared.parseNativeAgents
+import dev.faktor.shared.parseNativeBillingUsage
 import dev.faktor.shared.parseNativeBoardPage
 import dev.faktor.shared.parseNativeBoardPost
+import dev.faktor.shared.parseNativeCreditGrant
+import dev.faktor.shared.parseNativeEntitlements
 import dev.faktor.shared.parseNativeEvidence
 import dev.faktor.shared.parseNativeEvidenceRetrieval
 import dev.faktor.shared.parseNativeHealth
+import dev.faktor.shared.parseNativeIdentity
 import dev.faktor.shared.parseNativeModelCatalog
 import dev.faktor.shared.parseNativeProjection
 import dev.faktor.shared.parseNativePromptReceipt
@@ -62,6 +66,7 @@ object NativeClientTest {
         assertJsonCodec()
         assertRequestBodies()
         assertResponseParsers()
+        assertBillingParsers()
         assertHostileParsers()
         assertClientRoutes()
         assertErrorMapping()
@@ -172,6 +177,61 @@ private const val USAGE_JSON = "{" +
     "\"uncertain\":{\"count\":0,\"predictedMicro\":0},\"truncated\":false}}," +
     "\"truncated\":false" +
     "}"
+
+private const val BILLING_USAGE_JSON = "{" +
+    "\"ok\":true,\"organization\":\"org-local\"," +
+    "\"fold\":{\"organization_id\":\"org-local\"," +
+    "\"totals\":{\"input_tokens\":1000,\"output_tokens\":500,\"cache_read_tokens\":200," +
+    "\"cache_write_tokens\":50,\"reasoning_tokens\":25,\"provider_cost_micro\":900000," +
+    "\"managed_cost_micro\":700000,\"byok_cost_micro\":200000,\"events\":12," +
+    "\"corrected_events\":1}," +
+    "\"per_task\":[{\"task_id\":3,\"run_id\":\"r1\"," +
+    "\"totals\":{\"input_tokens\":400,\"output_tokens\":100,\"cache_read_tokens\":0," +
+    "\"cache_write_tokens\":0,\"reasoning_tokens\":0,\"provider_cost_micro\":700000," +
+    "\"managed_cost_micro\":700000,\"byok_cost_micro\":0,\"events\":3," +
+    "\"corrected_events\":0}}],\"next_cursor\":null}," +
+    "\"credits\":{\"granted_micro\":5000000,\"consumed_micro\":2000000," +
+    "\"refunded_micro\":100000,\"held_micro\":250000,\"pending_consumes\":1}," +
+    "\"items\":[{\"cursor\":\"9\",\"event\":{\"unit\":\"input_tokens\",\"quantity\":10}}]," +
+    "\"nextCursor\":\"9\"" +
+    "}"
+
+private const val ENTITLEMENTS_JSON = "{" +
+    "\"ok\":true,\"entitlements\":{" +
+    "\"organization_id\":\"org-local\",\"billing_account_id\":\"acct-1\"," +
+    "\"plan_id\":\"pro\",\"plan_found\":true,\"subscription_status\":\"active\"," +
+    "\"subscription_expires_ms\":1800000000000,\"subscription_active\":true," +
+    "\"features\":[\"managed_providers\",\"byok\",\"credits\"]," +
+    "\"limits\":{\"max_tokens_per_period\":100000," +
+    "\"max_managed_spend_micro_per_period\":1000000,\"min_credit_balance_micro\":1000," +
+    "\"max_active_tasks\":4}," +
+    "\"credits\":{\"granted_micro\":5000000,\"consumed_micro\":2000000," +
+    "\"refunded_micro\":100000,\"held_micro\":250000,\"pending_consumes\":1}," +
+    "\"managed_spend_micro\":700000,\"byok_spend_micro\":200000," +
+    "\"total_tokens\":1775," +
+    "\"in_flight\":[{\"id\":\"txn-1\",\"organization\":\"org-local\"," +
+    "\"kind\":\"integration\",\"reference\":\"run-1\"," +
+    "\"started_ms\":1750000000000,\"ended_ms\":null}]," +
+    "\"now_ms\":1750000000000" +
+    "}}"
+
+private const val IDENTITY_JSON = "{" +
+    "\"ok\":true,\"identity\":{\"subject_kind\":\"user\",\"subject_id\":\"u-1\"," +
+    "\"display_name\":\"Admin\",\"email\":\"admin@example.com\"," +
+    "\"organization\":\"org-local\",\"organization_name\":\"Local Org\"," +
+    "\"role\":\"admin\",\"effective_actions\":[\"billing_read\",\"credits_grant\"]}" +
+    "}"
+
+private const val CREDIT_GRANT_JSON = "{" +
+    "\"ok\":true,\"duplicate\":false," +
+    "\"credits\":{\"granted_micro\":6000000,\"consumed_micro\":2000000," +
+    "\"refunded_micro\":100000,\"held_micro\":250000,\"pending_consumes\":1}" +
+    "}"
+
+private const val BILLING_DISABLED_JSON =
+    "{\"error\":{\"code\":\"billing_disabled\"," +
+        "\"message\":\"commercial billing is disabled (enable the [billing] section to use it)\"," +
+        "\"retryable\":false}}"
 
 private const val SESSION_USAGE_JSON = "{" +
     "\"sessionId\":\"7\",\"providerCalls\":{\"tokens\":10,\"prefixObservations\":[]}," +
@@ -286,6 +346,14 @@ private fun assertRequestBodies() {
         NativeRequests.boardPost("s", "b", listOf("r1", "r2"))
     )
     assertEquals("{\"subject\":\"s\",\"body\":\"b\"}", NativeRequests.boardPost("s", "b"))
+    assertEquals(
+        "{\"amount_micro\":1000000,\"reason\":\"top up\"}",
+        NativeRequests.grantCredits(1_000_000L, "top up")
+    )
+    assertEquals(
+        "{\"amount_micro\":5,\"account_id\":\"acct-1\"}",
+        NativeRequests.grantCredits(5L, accountId = "acct-1")
+    )
 }
 
 // ---------------------------------------------------------- response parsers
@@ -368,6 +436,84 @@ private fun assertResponseParsers() {
     assertEquals("hello", messages.messages[1].text)
     val events = dev.faktor.shared.parseNativeEventPage(EVENTS_JSON)
     assertEquals("session_created", events.events[0].kind)
+}
+
+private fun assertBillingParsers() {
+    val usage = parseNativeBillingUsage(BILLING_USAGE_JSON)
+    assertEquals("org-local", usage.organization)
+    assertEquals(700_000L, usage.fold.totals.managedCostMicro)
+    assertEquals(200_000L, usage.fold.totals.byokCostMicro)
+    assertEquals(1_775L, usage.fold.totals.totalTokens())
+    assertEquals(3L, usage.fold.perTask[0].taskId)
+    assertEquals("r1", usage.fold.perTask[0].runId)
+    assertEquals(3_100_000L, usage.credits.balanceMicro())
+    assertEquals(250_000L, usage.credits.heldMicro)
+    assertEquals(1, usage.itemCount)
+    assertEquals("9", usage.nextCursor)
+
+    val entitlements = parseNativeEntitlements(ENTITLEMENTS_JSON)
+    assertEquals("pro", entitlements.planId)
+    assertEquals(true, entitlements.planFound)
+    assertEquals(true, entitlements.subscriptionActive)
+    assertEquals("active", entitlements.subscriptionStatus)
+    assertEquals(100_000L, entitlements.limits["max_tokens_per_period"])
+    assertEquals(4, entitlements.limits.size)
+    assertEquals(1_775L, entitlements.totalTokens)
+    assertEquals(1, entitlements.inFlight.size)
+    assertEquals("integration", entitlements.inFlight[0].kind)
+    assertEquals(null, entitlements.inFlight[0].endedMs)
+
+    val identity = parseNativeIdentity(IDENTITY_JSON)
+    assertEquals("admin", identity.role)
+    assertEquals("org-local", identity.organization)
+    assertEquals(true, identity.effectiveActions.contains("credits_grant"))
+
+    val grant = parseNativeCreditGrant(CREDIT_GRANT_JSON)
+    assertEquals(false, grant.duplicate)
+    assertEquals(6_000_000L, grant.credits.grantedMicro)
+
+    // Hostile billing payloads are loud protocol violations (never a
+    // silently wrong panel).
+    for (text in listOf(
+        "{}",
+        "{\"organization\":\"o\",\"fold\":{},\"credits\":{},\"items\":[],\"nextCursor\":null}",
+        "{\"organization\":\"o\",\"fold\":{\"organization_id\":\"o\",\"totals\":{}," +
+            "\"per_task\":[],\"next_cursor\":null}," +
+            "\"credits\":{\"granted_micro\":1,\"consumed_micro\":0,\"refunded_micro\":0," +
+            "\"held_micro\":0,\"pending_consumes\":0},\"items\":[],\"nextCursor\":0}",
+        "{\"ok\":true,\"entitlements\":{\"organization_id\":\"o\",\"plan_found\":true," +
+            "\"subscription_active\":false,\"features\":[]," +
+            "\"limits\":{\"max_tokens_per_period\":\"many\"},\"credits\":{}," +
+            "\"managed_spend_micro\":0,\"byok_spend_micro\":0,\"total_tokens\":0," +
+            "\"in_flight\":[],\"now_ms\":0}}"
+    )) {
+        try {
+            parseNativeBillingUsage(text)
+            fail("hostile billing usage must be rejected: $text")
+        } catch (e: NativeProtocolException) {
+            // expected
+        }
+    }
+    try {
+        parseNativeEntitlements(
+            "{\"ok\":true,\"entitlements\":{\"organization_id\":\"o\",\"plan_found\":true," +
+                "\"subscription_active\":false,\"features\":[]," +
+                "\"limits\":{\"max_tokens_per_period\":\"many\"},\"credits\":{}," +
+                "\"managed_spend_micro\":0,\"byok_spend_micro\":0,\"total_tokens\":0," +
+                "\"in_flight\":[],\"now_ms\":0}}"
+        )
+        fail("a hostile limit value must be rejected")
+    } catch (e: NativeProtocolException) {
+        // expected
+    }
+    try {
+        parseNativeIdentity("{\"ok\":true,\"identity\":{\"subject_kind\":\"user\"," +
+            "\"subject_id\":\"u\",\"display_name\":\"d\",\"organization\":\"o\"," +
+            "\"organization_name\":\"O\",\"role\":\"admin\",\"effective_actions\":{}}}")
+        fail("hostile effective_actions must be rejected")
+    } catch (e: NativeProtocolException) {
+        // expected
+    }
 }
 
 private fun assertHostileParsers() {
@@ -646,7 +792,20 @@ private fun assertClientRoutes() {
             response.json(200, AGENT_ACK_JSON)
         }
     }
-    daemon.on("GET", "/native/usage") { _, response -> response.json(200, USAGE_JSON) }
+    daemon.on("GET", "/native/usage") { request, response ->
+        if (request.query["org"] != null) {
+            response.json(200, BILLING_USAGE_JSON)
+        } else {
+            response.json(200, USAGE_JSON)
+        }
+    }
+    daemon.on("GET", "/native/identity") { _, response -> response.json(200, IDENTITY_JSON) }
+    daemon.on("GET", "/native/entitlements") { _, response ->
+        response.json(200, ENTITLEMENTS_JSON)
+    }
+    daemon.on("POST", "/native/credits/grant") { _, response ->
+        response.json(200, CREDIT_GRANT_JSON)
+    }
     daemon.on("GET", "/native/session/7/usage") { _, response ->
         response.json(200, SESSION_USAGE_JSON)
     }
@@ -686,6 +845,14 @@ private fun assertClientRoutes() {
         client.setAgentBudget("child-1", maxTokens = 1000)
         assertEquals(2L, client.usage().sessions)
         assertEquals("7", client.sessionUsage("7").sessionId)
+        assertEquals("admin", client.identity().role)
+        assertEquals("pro", client.entitlements().planId)
+        assertEquals(
+            700_000L,
+            client.billingUsage("org-local", since = "9", limit = 25L).fold.totals.managedCostMicro
+        )
+        assertEquals("9", client.billingUsage("org-local").nextCursor)
+        assertEquals(false, client.grantCredits(1_000_000L, "selftest-key-1", "top up").duplicate)
         assertEquals(1, client.verification("7").owed.size)
         assertEquals("3", client.taskVerification("7", "3").taskId)
         assertEquals(9L, client.evidence("7", 9).id)
@@ -715,6 +882,31 @@ private fun assertClientRoutes() {
                 daemon.requestCount("POST", "/native/agents/child-1/$action")
             )
         }
+        val billingRead = daemon.requests.first {
+            it.method == "GET" && it.path == "/native/usage" && it.query["org"] != null
+        }
+        assertEquals("org-local", billingRead.query["org"])
+        assertEquals("9", billingRead.query["since"])
+        assertEquals("25", billingRead.query["limit"])
+        val grant = daemon.requests.first {
+            it.method == "POST" && it.path == "/native/credits/grant"
+        }
+        assertEquals("selftest-key-1", grant.headers["idempotency-key"])
+        assertEquals(
+            "{\"amount_micro\":1000000,\"reason\":\"top up\"}",
+            grant.body
+        )
+        // The control-plane credential rides the identity/billing reads only
+        // when the operator configured one: absent by default, exact when set.
+        assertEquals(null, daemon.requests.first {
+            it.method == "GET" && it.path == "/native/identity"
+        }.headers["x-faktor-control-token"])
+        val privileged = NativeClient(daemon.baseUrl, "tok", controlToken = "cp-selftest")
+        assertEquals("admin", privileged.identity().role)
+        val claimed = daemon.requests.last {
+            it.method == "GET" && it.path == "/native/identity"
+        }
+        assertEquals("cp-selftest", claimed.headers["x-faktor-control-token"])
     } finally {
         daemon.stop()
     }
@@ -731,6 +923,9 @@ private fun assertErrorMapping() {
     }
     daemon.on("GET", "/native/ready") { _, response ->
         response.text(500, "boom")
+    }
+    daemon.on("GET", "/native/entitlements") { _, response ->
+        response.json(409, BILLING_DISABLED_JSON)
     }
     daemon.start()
     try {
@@ -749,6 +944,14 @@ private fun assertErrorMapping() {
         } catch (e: NativeApiException) {
             assertEquals(500, e.status)
             assertEquals("http_error", e.code)
+        }
+        try {
+            client.entitlements()
+            fail("409 billing_disabled must throw")
+        } catch (e: NativeApiException) {
+            assertEquals(409, e.status)
+            assertEquals("billing_disabled", e.code)
+            assertEquals(false, e.retryable)
         }
     } finally {
         daemon.stop()

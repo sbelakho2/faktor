@@ -452,12 +452,15 @@ impl<'de> serde::Deserialize<'de> for EfficiencyCfg {
 ///   a referenced-but-missing/corrupt/too-permissive payload refuses
 ///   startup (fail closed, never a half-wired cloud surface);
 /// - `[cloud.sso]`: the network OIDC adapter wiring (issuer, client id and
-///   the optional operator-staged client secret);
+///   the optional operator-staged client secret plus its strict
+///   `client_secret_post`/`client_secret_basic` method);
 /// - `[cloud.github_app]`: the GitHub App wiring (app id, staged private
 ///   key and webhook secret, api base, tenant organization). When enabled
 ///   the daemon builds the real adapter/token source/webhook inbox/sync,
 ///   runs one bounded initial sync after readiness and re-syncs on webhook
-///   delivery; `/native/scm/webhook` dispatches into the wired inbox;
+///   delivery; the optional `[cloud.github_app.reconcile]` sub-section adds
+///   the bounded periodic re-sync timer (disabled = webhook parity);
+///   `/native/scm/webhook` dispatches into the wired inbox;
 /// - unknown keys, duplicates, non-object shapes and wrong value types are
 ///   parse errors.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default)]
@@ -492,6 +495,12 @@ pub struct CloudSsoCfg {
     /// client's secret. Optional: absent = the public PKCE client path.
     #[serde(default)]
     pub client_secret: Option<String>,
+    /// How the confidential client authenticates at the token endpoint:
+    /// `client_secret_post` (the default when a secret is staged) or
+    /// `client_secret_basic`. Only meaningful together with `client_secret`;
+    /// a method without a secret, or an unknown method, is refused at load.
+    #[serde(default)]
+    pub client_secret_method: Option<String>,
     #[serde(default)]
     pub discovery_max_age_ms: Option<i64>,
     #[serde(default)]
@@ -529,6 +538,45 @@ pub struct CloudGithubAppCfg {
     pub page_size: Option<usize>,
     #[serde(default)]
     pub max_pages: Option<usize>,
+    /// The optional periodic reconcile timer. Absent (or explicitly
+    /// disabled, normalized away byte-for-byte) = webhook-only parity: no
+    /// timer is built and no extra sync ever runs.
+    #[serde(default, deserialize_with = "deserialize_reconcile_section")]
+    pub reconcile: Option<CloudGithubAppReconcileCfg>,
+}
+
+/// The `[cloud.github_app.reconcile]` section: the bounded periodic
+/// installation/repository re-sync (post-readiness, in addition to the
+/// webhook-driven syncs). Disabled by default; a disabled section resolves
+/// byte-identically to the absent one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CloudGithubAppReconcileCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base cadence between passes (`1s..=24h`; default 5min).
+    #[serde(default)]
+    pub interval_ms: Option<i64>,
+    /// Cadence jitter bound (`0..=60s`, also capped by the interval; default
+    /// 30s). The next pass is `interval + deterministic jitter`.
+    #[serde(default)]
+    pub jitter_ms: Option<i64>,
+    /// Failure-backoff ceiling (`interval..=24h`; default 1h). A failed pass
+    /// retries after a bounded exponential backoff.
+    #[serde(default)]
+    pub max_backoff_ms: Option<i64>,
+}
+
+/// Disabled parity: `{enabled: false}` (or a missing section) resolves to
+/// `None`, exactly like the absent key.
+fn deserialize_reconcile_section<'de, D>(
+    de: D,
+) -> Result<Option<CloudGithubAppReconcileCfg>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<CloudGithubAppReconcileCfg> as serde::Deserialize>::deserialize(de)?;
+    Ok(raw.filter(|section| section.enabled))
 }
 
 /// The `[cloud]` keys, in stable order (unknown-field errors list them).
@@ -742,6 +790,16 @@ impl CloudSsoCfg {
             crate::payload::PayloadDir::validate_name(client_secret)
                 .map_err(|e| format!("cloud sso: client_secret {e}"))?;
         }
+        if let Some(method) = &self.client_secret_method {
+            if self.client_secret.is_none() {
+                return Err(
+                    "cloud sso: client_secret_method requires a `client_secret` payload name"
+                        .into(),
+                );
+            }
+            let _ = self.client_auth_method()?;
+            let _ = method;
+        }
         if !self.enabled {
             return Ok(());
         }
@@ -797,6 +855,31 @@ impl CloudSsoCfg {
         }
         Ok(raw)
     }
+
+    /// The strict confidential-client auth method: `client_secret_post`
+    /// (the default when a secret is staged) or `client_secret_basic`.
+    /// Callers reach this only when `client_secret` is configured; the
+    /// method must select a confidential exchange (never `none`).
+    pub fn client_auth_method(&self) -> Result<faktor_cloud::ClientAuthMethod, String> {
+        let raw = self
+            .client_secret_method
+            .as_deref()
+            .unwrap_or("client_secret_post");
+        let method = faktor_cloud::ClientAuthMethod::parse(raw).ok_or_else(|| {
+            format!(
+                "cloud sso: client_secret_method {raw:?} must be client_secret_post \
+                 or client_secret_basic"
+            )
+        })?;
+        if !method.requires_secret() {
+            return Err(
+                "cloud sso: client_secret_method must select a confidential method \
+                 (client_secret_post or client_secret_basic)"
+                    .into(),
+            );
+        }
+        Ok(method)
+    }
 }
 
 impl CloudGithubAppCfg {
@@ -812,6 +895,14 @@ impl CloudGithubAppCfg {
                 crate::payload::PayloadDir::validate_name(name)
                     .map_err(|e| format!("cloud github_app: {field} {e}"))?;
             }
+        }
+        if let Some(reconcile) = &self.reconcile {
+            if !self.enabled {
+                return Err(
+                    "cloud github_app: reconcile requires an enabled github_app section".into(),
+                );
+            }
+            reconcile.validate()?;
         }
         if !self.enabled {
             return Ok(());
@@ -871,6 +962,44 @@ impl CloudGithubAppCfg {
             .validate()
             .map_err(|e| format!("cloud github_app: {e}"))?;
         Ok(config)
+    }
+
+    /// The optional periodic-reconcile policy (`None` = no timer; webhook
+    /// parity) with every bound already validated.
+    pub fn reconcile_policy(&self) -> Result<Option<faktor_scm::ReconcilePolicy>, String> {
+        self.reconcile
+            .as_ref()
+            .map(CloudGithubAppReconcileCfg::policy)
+            .transpose()
+    }
+}
+
+impl CloudGithubAppReconcileCfg {
+    /// The strict policy handed to the reconcile runner: configured values
+    /// or documented defaults, validated against the crate's hard bounds.
+    pub fn policy(&self) -> Result<faktor_scm::ReconcilePolicy, String> {
+        let policy = faktor_scm::ReconcilePolicy {
+            interval_ms: self
+                .interval_ms
+                .unwrap_or(faktor_scm::DEFAULT_RECONCILE_INTERVAL_MS),
+            jitter_ms: self
+                .jitter_ms
+                .unwrap_or(faktor_scm::DEFAULT_RECONCILE_JITTER_MS),
+            max_backoff_ms: self
+                .max_backoff_ms
+                .unwrap_or(faktor_scm::DEFAULT_RECONCILE_MAX_BACKOFF_MS),
+        };
+        policy
+            .validate()
+            .map_err(|e| format!("cloud github_app reconcile: {e}"))?;
+        Ok(policy)
+    }
+
+    /// Validate the section (bounds only; disabled sections are normalized
+    /// away before this is reached).
+    pub fn validate(&self) -> Result<(), String> {
+        let _ = self.policy()?;
+        Ok(())
     }
 }
 
@@ -1231,6 +1360,10 @@ pub struct BillingCfg {
 /// - `interval_ms` (default 60s, 1s..=24h): how often the maintenance loop
 ///   checks whether the current period is due;
 /// - `period_ms` (default 24h, 1min..=366d): the reporting period bucket;
+/// - `max_catch_up` (default 24, 0..=256): how many periods crossed during a
+///   downtime gap are backfilled (oldest first) before the regular cadence
+///   resumes; older periods beyond the cap are marked skipped-permanently
+///   with a durable audit row, never silently dropped;
 /// - `max_attempts` (default 5, cap 5) and `retry_base_ms` /
 ///   `max_backoff_ms`: the retry policy of a failed period (exponential
 ///   backoff with deterministic jitter).
@@ -1257,6 +1390,8 @@ pub struct BillingReportCfg {
     pub retry_base_ms: Option<i64>,
     #[serde(default)]
     pub max_backoff_ms: Option<i64>,
+    #[serde(default)]
+    pub max_catch_up: Option<usize>,
 }
 
 /// The `[billing]` keys, in stable order (unknown-field errors list them).
@@ -1539,12 +1674,22 @@ impl BillingReportCfg {
                 crate::billing_report::MAX_REPORT_MAX_BACKOFF_MS
             ));
         }
+        let max_catch_up = self
+            .max_catch_up
+            .unwrap_or(faktor_cloud::DEFAULT_REPORT_CATCH_UP);
+        if max_catch_up > faktor_cloud::MAX_REPORT_CATCH_UP_PERIODS {
+            return Err(format!(
+                "billing report: max_catch_up must be <= {}",
+                faktor_cloud::MAX_REPORT_CATCH_UP_PERIODS
+            ));
+        }
         Ok(crate::billing_report::ReportPolicy {
             interval_ms: interval,
             period_ms: period,
             max_attempts: self.max_attempts_resolved(),
             retry_base_ms: self.retry_base_ms_resolved(),
             max_backoff_ms: max_backoff,
+            max_catch_up,
         })
     }
 }
@@ -5226,6 +5371,7 @@ mod completion_cfg_tests {
             ("period_ms", "99999999999999"),
             ("max_backoff_ms", "-1"),
             ("max_backoff_ms", "999999999"),
+            ("max_catch_up", "999999"),
         ] {
             std::fs::write(
                 &path,
@@ -5241,7 +5387,7 @@ mod completion_cfg_tests {
         // local-mock shape.
         std::fs::write(
             &path,
-            r#"{"cloud": {"enabled": true}, "billing": {"enabled": true, "organization": "org", "plans": {"pro": {"plan_id": "pro"}}, "report": {"enabled": true, "base_url": "http://127.0.0.1:9/", "auth_env": "", "interval_ms": 5000, "period_ms": 60000, "max_attempts": 2, "retry_base_ms": 0, "max_backoff_ms": 1000}}}"#,
+            r#"{"cloud": {"enabled": true}, "billing": {"enabled": true, "organization": "org", "plans": {"pro": {"plan_id": "pro"}}, "report": {"enabled": true, "base_url": "http://127.0.0.1:9/", "auth_env": "", "interval_ms": 5000, "period_ms": 60000, "max_attempts": 2, "retry_base_ms": 0, "max_backoff_ms": 1000, "max_catch_up": 3}}}"#,
         )
         .unwrap();
         let cfg = Config::load_strict(&path).unwrap();
@@ -5253,9 +5399,27 @@ mod completion_cfg_tests {
         assert_eq!(policy.max_attempts, 2);
         assert_eq!(policy.retry_base_ms, 0);
         assert_eq!(policy.max_backoff_ms, 1000);
+        assert_eq!(policy.max_catch_up, 3);
         assert_eq!(
             report.vendor_config().unwrap().base_url,
             "http://127.0.0.1:9"
+        );
+        // The default catch-up window is the documented 24-period bound.
+        std::fs::write(
+            &path,
+            r#"{"cloud": {"enabled": true}, "billing": {"enabled": true, "organization": "org", "plans": {"pro": {"plan_id": "pro"}}, "report": {"enabled": true, "base_url": "http://127.0.0.1:9/"}}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_strict(&path).unwrap();
+        assert_eq!(
+            cfg.billing
+                .report
+                .as_ref()
+                .unwrap()
+                .policy()
+                .unwrap()
+                .max_catch_up,
+            faktor_cloud::DEFAULT_REPORT_CATCH_UP
         );
     }
 

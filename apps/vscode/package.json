@@ -129,6 +129,11 @@
           "default": 0,
           "minimum": 0,
           "description": "max_cost_micro for new task runs (0 = daemon default)."
+        },
+        "faktor.controlToken": {
+          "type": "string",
+          "default": "",
+          "description": "Control-plane credential (x-faktor-control-token) for the identity/entitlements/usage/credits routes; empty hides the Usage/Credits panel behind an explicit unavailable state."
         }
       }
     }

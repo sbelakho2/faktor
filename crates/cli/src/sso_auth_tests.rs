@@ -1,19 +1,17 @@
 //! Adversarial tests of the SSO authority construction: the payload
-//! contract (missing/world-readable/corrupt client secret), the happy path
-//! that mints a real authorization URL through the network adapter, and the
-//! confidential-client exchange that posts the staged secret.
+//! contract (missing/world-readable/corrupt client secret), the strict
+//! method selection, the public PKCE happy path that mints a real
+//! authorization URL through the network adapter, and a confidential
+//! authority built from a staged secret.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use faktor_cloud::{
-    AsyncOidcAdapter, Clock, CodeExchangeRequest, NetworkOidcAdapter, NetworkOidcConfig,
-    OrganizationId, SsoConfigRef, SystemClock,
-};
+use faktor_cloud::{ClientAuthMethod, OrganizationId, SsoConfigRef};
 use faktor_provider::egress::{HttpTransport, PolicyCheckedHttpTransport};
 
-use super::{build_sso_authority, ConfidentialOidcAdapter};
+use super::build_sso_authority;
 use crate::config::CloudSsoCfg;
 use crate::test_http::{MockServer, Reply};
 
@@ -51,6 +49,7 @@ fn sso_cfg(issuer: String, secret: Option<&str>) -> CloudSsoCfg {
         issuer: Some(issuer),
         client_id: Some("client-1".into()),
         client_secret: secret.map(str::to_string),
+        client_secret_method: None,
         discovery_max_age_ms: None,
         jwks_max_age_ms: None,
         max_jwks_refetches: None,
@@ -152,8 +151,11 @@ async fn public_client_happy_path_mints_an_authorization_url() {
     assert!(!payload_root.exists());
 }
 
+/// The confidential authority loads the staged secret through the payload
+/// contract and serves the same start flow; a method that contradicts the
+/// staged material is refused at load, never half-wired.
 #[tokio::test]
-async fn confidential_client_posts_the_staged_secret_and_never_logs_it() {
+async fn confidential_section_builds_from_the_staged_secret_and_refuses_bad_methods() {
     let dir = tempfile::tempdir().unwrap();
     let payload_root = dir.path().join("payloads");
     staged_secret(&payload_root, "idp.secret", b"top-secret\n");
@@ -164,59 +166,54 @@ async fn confidential_client_posts_the_staged_secret_and_never_logs_it() {
         "/.well-known/openid-configuration",
         discovery_reply(&base),
     );
-    mock.push(
-        "POST",
-        "/token",
-        Reply::json(
-            200,
-            serde_json::json!({
-                "access_token": "at-1",
-                "id_token": "id-1",
-                "token_type": "Bearer",
-                "expires_in": 60,
-            }),
-        ),
+    // Explicit client_secret_post builds and starts.
+    let mut cfg = sso_cfg(base.clone(), Some("idp.secret"));
+    cfg.client_secret_method = Some("client_secret_post".into());
+    let authority = build_sso_authority(&cfg, &payload_root, transport()).unwrap();
+    let organization = OrganizationId::try_new("org_sso").unwrap();
+    let sso_ref = SsoConfigRef {
+        issuer: base.clone(),
+        client_id: "client-1".into(),
+        membership_claim: "groups".into(),
+        group_role_map: BTreeMap::new(),
+        client_secret_ref: Some("idp.secret".into()),
+        enabled: true,
+    };
+    let start = authority
+        .start(&organization, &sso_ref, "https://app.example/sso/callback")
+        .await
+        .unwrap();
+    assert!(start
+        .authorization_url
+        .starts_with(&format!("{base}/authorize?")));
+    assert_eq!(
+        cfg.client_auth_method().unwrap(),
+        ClientAuthMethod::ClientSecretPost
     );
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let inner = Arc::new(
-        NetworkOidcAdapter::new(
-            transport(),
-            clock,
-            NetworkOidcConfig {
-                issuer: base.clone(),
-                client_id: "client-1".into(),
-                ..Default::default()
-            },
-        )
-        .unwrap(),
+
+    // client_secret_basic is accepted and maps to the basic method.
+    cfg.client_secret_method = Some("client_secret_basic".into());
+    assert_eq!(
+        cfg.client_auth_method().unwrap(),
+        ClientAuthMethod::ClientSecretBasic
     );
-    let wrapper = ConfidentialOidcAdapter::new(
-        inner,
-        transport(),
-        base.clone(),
-        "client-1".into(),
-        "top-secret".into(),
-    );
-    let outcome = AsyncOidcAdapter::exchange_code(
-        &wrapper,
-        &CodeExchangeRequest {
-            code: "auth-code".into(),
-            redirect_uri: "https://app.example/sso/callback".into(),
-            code_verifier: "verifier".into(),
-        },
+    assert!(build_sso_authority(&cfg, &payload_root, transport()).is_ok());
+
+    // An unknown method is a load refusal.
+    cfg.client_secret_method = Some("client_secret_jwt".into());
+    let err = cfg.validate().unwrap_err();
+    assert!(err.contains("client_secret_post"), "{err}");
+    // A confidential method without a staged secret payload is refused.
+    let mut no_secret = sso_cfg(base, None);
+    no_secret.client_secret_method = Some("client_secret_basic".into());
+    let err = no_secret.validate().unwrap_err();
+    assert!(err.contains("requires a `client_secret`"), "{err}");
+    // A malformed serialized section is refused before it reaches the daemon.
+    let err = serde_json::from_str::<CloudSsoCfg>(
+        r#"{"enabled": true, "issuer": "https://idp.example", "client_id": "c", "client_secret": "s", "client_secret_method": "none"}"#,
     )
-    .await
-    .unwrap();
-    assert_eq!(outcome.id_token, "id-1");
-    assert_eq!(outcome.token_type, "Bearer");
-    let posts = mock.requests("POST", "/token");
-    assert_eq!(posts.len(), 1);
-    let body = &posts[0].body;
-    assert!(body.contains("grant_type=authorization_code"), "{body}");
-    assert!(body.contains("client_id=client-1"), "{body}");
-    assert!(body.contains("client_secret=top-secret"), "{body}");
-    assert!(body.contains("code_verifier=verifier"), "{body}");
-    let rendered = format!("{wrapper:?}");
-    assert!(!rendered.contains("top-secret"), "{rendered}");
-    assert!(!rendered.contains("secret"), "{rendered}");
+    .unwrap()
+    .validate()
+    .unwrap_err();
+    assert!(err.contains("confidential"), "{err}");
 }
