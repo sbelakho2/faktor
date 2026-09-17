@@ -30,6 +30,10 @@
 
 use std::collections::BTreeMap;
 
+use faktor_core::authority::{
+    classify_authority_digest, refuse_legacy_authority_digest, AuthorityDigestKind,
+    LegacyAuthorityDigest,
+};
 use faktor_core::completion::{CompletionContract, CompletionStep, CompletionStepOutcome};
 use serde::{Deserialize, Serialize};
 
@@ -1154,6 +1158,34 @@ impl IntegrationRecordRow {
     pub fn is_bound_to_proof_basis(&self, basis_digest: &str) -> bool {
         self.proof_basis_digest() == Some(basis_digest)
     }
+
+    /// The algorithm class of the recorded source-list digest.
+    pub fn sources_digest_kind(&self) -> AuthorityDigestKind {
+        classify_authority_digest(&self.sources_digest)
+    }
+
+    /// The algorithm class of the recorded integrated-file-list digest.
+    pub fn integrated_files_digest_kind(&self) -> AuthorityDigestKind {
+        classify_authority_digest(&self.integrated_files_digest)
+    }
+
+    /// The typed refusal of a legacy source/integrated-file digest, when
+    /// this record carries one: the record decodes for viewing, but its
+    /// integration can never authorize completion.
+    pub fn legacy_authority_digest(&self) -> Option<LegacyAuthorityDigest> {
+        for (what, value) in [
+            ("integration_record sources_digest", &self.sources_digest),
+            (
+                "integration_record integrated_files_digest",
+                &self.integrated_files_digest,
+            ),
+        ] {
+            if let Some(legacy) = refuse_legacy_authority_digest(what, value).err() {
+                return Some(legacy);
+            }
+        }
+        None
+    }
 }
 
 /// The durable IMMUTABLE run base of one orchestrated run (prepare phase
@@ -1172,11 +1204,27 @@ pub struct RunBaseRecord {
     /// Lowercase 64-hex BLAKE3 of the owner root at the moment the base was
     /// accepted (before == after == copied by the stable-copy contract).
     pub snapshot_hash: String,
-    /// Deterministic digest of the copied manifest (path|hash rows).
+    /// Canonical BLAKE3 authority digest of the copied manifest (path/hash
+    /// rows; see [`faktor_core::authority`]).
     pub manifest_digest: String,
     /// The daemon-owned base root every child/candidate derives from.
     pub root: String,
     pub created_ms: i64,
+}
+
+impl RunBaseRecord {
+    /// The algorithm class of the manifest digest: a legacy 64-bit FNV
+    /// value may be viewed but never authorizes a new derivation from this
+    /// base — the caller must restage/reverify.
+    pub fn manifest_digest_kind(&self) -> AuthorityDigestKind {
+        classify_authority_digest(&self.manifest_digest)
+    }
+
+    /// The typed refusal of a legacy manifest digest, when this record
+    /// carries one.
+    pub fn legacy_manifest_digest(&self) -> Option<LegacyAuthorityDigest> {
+        refuse_legacy_authority_digest("run_base manifest_digest", &self.manifest_digest).err()
+    }
 }
 
 /// One entry of the VERIFIED manifest the publication artifact binds: the
@@ -2631,6 +2679,12 @@ pub(crate) fn validate_completion_step_status(
 pub(crate) fn validate_integration_record(
     record: &IntegrationRecordRow,
 ) -> Result<(), SessionError> {
+    // Legacy 64-bit FNV identities never authorize a new integration row:
+    // the typed refusal names the legacy class BEFORE any shape check, so a
+    // labelled FNV value can never be masked by a generic hex-shape error.
+    if let Some(legacy) = record.legacy_authority_digest() {
+        return Err(SessionError::Malformed(legacy.to_string()));
+    }
     let check_id = |value: &str, what: &str| -> Result<(), SessionError> {
         if value.is_empty() || value.len() > MAX_INTEGRATION_ID_BYTES {
             return Err(SessionError::Malformed(format!(
@@ -2928,6 +2982,9 @@ pub(crate) fn validate_run_base_record(record: &RunBaseRecord) -> Result<(), Ses
         ));
     }
     check_snapshot_digest(&record.snapshot_hash, "snapshot_hash")?;
+    if let Some(legacy) = record.legacy_manifest_digest() {
+        return Err(SessionError::Malformed(legacy.to_string()));
+    }
     let manifest_legacy = record.manifest_digest.len() == MAX_RUN_BASE_DIGEST_BYTES
         && record
             .manifest_digest
@@ -2989,6 +3046,12 @@ pub(crate) fn validate_integration_txn(row: &IntegrationTxnRow) -> Result<(), Se
         "verified_candidate_snapshot",
     )?;
     if !row.sources_digest.is_empty() {
+        if let Some(legacy) =
+            refuse_legacy_authority_digest("integration_txn sources_digest", &row.sources_digest)
+                .err()
+        {
+            return Err(SessionError::Malformed(legacy.to_string()));
+        }
         check_hex(&row.sources_digest, "sources_digest")?;
     }
     if row.paths.len() > MAX_INTEGRATION_TXN_PATHS {
@@ -7125,5 +7188,84 @@ mod tests {
             Some(completed),
             "the reconciliation authority outlives compaction"
         );
+    }
+
+    #[test]
+    fn legacy_fnv_authority_digests_are_refused_at_the_ledger_boundary() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        // The canonical (BLAKE3) shapes classify as authoritative.
+        let canonical = RunBaseRecord {
+            run_id: "run-ok".into(),
+            workspace_id: 1,
+            worktree_id: 1,
+            snapshot_hash: format!("tm1:{}", "a".repeat(64)),
+            manifest_digest: "b".repeat(64),
+            root: "/base".into(),
+            created_ms: 1,
+        };
+        assert_eq!(
+            canonical.manifest_digest_kind(),
+            AuthorityDigestKind::Blake3Hex
+        );
+        assert!(canonical.legacy_manifest_digest().is_none());
+        s.ledger_run_base_set(&canonical).unwrap();
+
+        // A legacy 64-bit FNV manifest digest is refused typed, and nothing
+        // is appended (the row can be VIEWED only from before the change).
+        let legacy = RunBaseRecord {
+            manifest_digest: "0123456789abcdef".into(),
+            ..canonical.clone()
+        };
+        assert_eq!(
+            legacy.manifest_digest_kind(),
+            AuthorityDigestKind::LegacyFnv
+        );
+        let err = s.ledger_run_base_set(&legacy).unwrap_err();
+        assert!(
+            err.to_string().contains("legacy FNV") && err.to_string().contains("restage"),
+            "{err}"
+        );
+        assert_eq!(
+            s.ledger_run_base_read("run-ok").valid(),
+            Some(canonical),
+            "the refused legacy append wrote nothing"
+        );
+
+        // A labelled FNV digest in an integration record is refused typed
+        // before any row lands.
+        let hex = |c: char| c.to_string().repeat(64);
+        let mut record = IntegrationRecordRow {
+            run_id: "run-legacy".into(),
+            task_id: 7,
+            base_revision: None,
+            base_snapshot: Some(hex('1')),
+            run_base_snapshot: Some(hex('1')),
+            candidate_snapshot: Some(hex('2')),
+            landed_snapshot: Some(hex('4')),
+            proof_basis_digest: Some(format!("blake3:{}", hex('5'))),
+            integration_txn_id: None,
+            final_root: "/owner".into(),
+            final_snapshot_hash: hex('4'),
+            integrated_files: Vec::new(),
+            integrated_file_count: 0,
+            integrated_files_digest: String::new(),
+            conflicts: Vec::new(),
+            conflict_count: 0,
+            sources: vec![IntegrationSourceRow {
+                child_id: "child-1".into(),
+                change_set_id: format!("cs-{}", hex('7')),
+                candidate_root_hash: hex('8'),
+            }],
+            source_count: 1,
+            sources_digest: hex('9'),
+            at_ms: 6,
+        };
+        assert_eq!(record.sources_digest_kind(), AuthorityDigestKind::Blake3Hex);
+        record.sources_digest = "fnv1a64:fedcba9876543210".into();
+        assert!(record.legacy_authority_digest().is_some());
+        let err = s.ledger_integration_record_set(&record).unwrap_err();
+        assert!(err.to_string().contains("legacy FNV"), "{err}");
+        assert!(s.ledger_integration_record_for_task_read(7).is_missing());
     }
 }

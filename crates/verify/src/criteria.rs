@@ -22,7 +22,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use faktor_core::state::{command_binding_digest, CriterionBinding};
+use faktor_core::authority::{classify_authority_digest, AuthorityDigestKind};
+use faktor_core::state::{command_binding_digest_parts, CriterionBinding};
 
 /// Hard bound on the structured reviewer's evidence reference list.
 pub const MAX_REVIEW_EVIDENCE_REFS: usize = 16;
@@ -160,9 +161,11 @@ impl AdditionalCheckRequest {
     }
 
     /// The command digest of this request: the value the resulting proof row
-    /// carries so the requesting binding resolves to it.
+    /// carries so the requesting binding resolves to it. The identity is the
+    /// STRUCTURED (program, argv) pair — never the whitespace-joined command
+    /// text — so no argv boundary can be forged.
     pub fn command_digest(&self) -> String {
-        command_binding_digest(&self.command_text())
+        command_binding_digest_parts(&self.program, &self.args, None, &[])
     }
 
     /// Parse `verify: <program> <args...>` (bounded, whitespace-split, never
@@ -497,6 +500,18 @@ impl FallbackEvaluator {
         check_id: &str,
         command_digest: &str,
     ) -> CriterionEvaluation {
+        // Legacy 64-bit FNV digests decode for viewing but never authorize a
+        // pass: a binding written before the canonical BLAKE3 authority
+        // digests forces re-verification instead of resolving.
+        if classify_authority_digest(command_digest) == AuthorityDigestKind::LegacyFnv {
+            return CriterionEvaluation::Unavailable {
+                reason: format!(
+                    "required-check binding carries the legacy FNV digest {command_digest}; \
+                     it can be viewed but never certified — reverify under the canonical \
+                     BLAKE3 authority digests"
+                ),
+            };
+        }
         // A testable criterion may request an ADDITIONAL verification check;
         // the check executes through the normal verifier port and becomes a
         // proof row before the binding is resolved.
@@ -821,6 +836,7 @@ impl FallbackEvaluator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faktor_core::state::command_binding_digest;
 
     #[derive(Clone)]
     struct StaticReviewer(Result<StructuredReviewOutput, String>);
@@ -892,6 +908,72 @@ mod tests {
             evidence_refs: refs,
             explanation: "reviewed the candidate".into(),
         }
+    }
+
+    #[test]
+    fn additional_check_identity_is_structured_and_boundary_safe() {
+        let request = AdditionalCheckRequest {
+            check_id: "c".into(),
+            program: "cargo".into(),
+            args: vec!["test".into(), "--workspace".into()],
+        };
+        // The structured digest equals the digest of the canonical text the
+        // text-only producers carry (one exact rendering, one identity).
+        assert_eq!(
+            request.command_digest(),
+            command_binding_digest(&request.command_text())
+        );
+        // Whitespace-joined ambiguity can never alias: ("a b", "c") and
+        // ("a", "b c") render different canonical texts AND digest as
+        // different structured identities.
+        let left = AdditionalCheckRequest {
+            check_id: String::new(),
+            program: "a b".into(),
+            args: vec!["c".into()],
+        };
+        let right = AdditionalCheckRequest {
+            check_id: String::new(),
+            program: "a".into(),
+            args: vec!["b c".into()],
+        };
+        // The whitespace rendering collapses both to the same prose; the
+        // structured identity must still separate them.
+        assert_eq!(left.command_text(), right.command_text());
+        assert_ne!(left.command_digest(), right.command_digest());
+        // The digest is a labelled BLAKE3 authority digest, never FNV.
+        assert!(request.command_digest().starts_with("blake3:"));
+    }
+
+    #[tokio::test]
+    async fn additional_check_identity_refusal_does_not_accept_a_fnv_legacy_digest() {
+        // A check row whose digest is the legacy FNV shape can never resolve
+        // a structured binding: the digest mismatch forces re-verification.
+        let mut ctx = base_ctx();
+        let request = AdditionalCheckRequest {
+            check_id: "additional".into(),
+            program: "cargo".into(),
+            args: vec!["clippy".into()],
+        };
+        let legacy = "fnv1a64:0123456789abcdef".to_string();
+        ctx.checks = vec![CheckOutcomeRow {
+            check_id: request.check_id.clone(),
+            command_digest: legacy.clone(),
+            status: CheckOutcomeStatus::Passed,
+            evidence: Some("exit 0".into()),
+        }];
+        let criterion = Criterion::new(
+            "crit-1",
+            "verify: cargo clippy",
+            Some(CriterionBinding::RequiredCheck {
+                check_id: request.check_id.clone(),
+                command_digest: legacy,
+            }),
+        );
+        let eval = FallbackEvaluator.evaluate(&mut ctx, &criterion).await;
+        assert!(
+            !eval.is_passed(),
+            "a legacy FNV digest must never certify a criterion: {eval:?}"
+        );
     }
 
     #[tokio::test]

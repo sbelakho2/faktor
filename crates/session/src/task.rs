@@ -60,6 +60,11 @@
 //! unchanged.
 
 use faktor_core::attachment::{AttachmentId, MAX_ATTACHMENTS_PER_TASK};
+use faktor_core::authority::{
+    authority_digest_hex, authority_digest_labeled, classify_authority_digest,
+    refuse_legacy_authority_digest, AuthorityDigestKind, Fields, LegacyAuthorityDigest,
+    DOMAIN_ACCOUNTING_BALANCE, DOMAIN_CHECK_BASIS,
+};
 use faktor_core::completion::{CompletionContract, CompletionStep, CompletionStepOutcome};
 use faktor_core::id::{
     SessionId, TaskId, TaskRevision, VerificationRecordId, WorkspaceId, WorktreeId,
@@ -1076,6 +1081,12 @@ pub enum TaskError {
         task_id: TaskId,
         violations: Vec<crate::budget::ChangeBudgetViolation>,
     },
+    #[error(
+        "legacy 64-bit FNV authority digest {digest:?} in {field}: it may be viewed but never \
+         authorizes new verification or proof reuse; restage and reverify under the canonical \
+         BLAKE3 authority digests"
+    )]
+    LegacyAuthorityDigest { field: String, digest: String },
     #[error("input exceeds bound: {0}")]
     Oversized(String),
     #[error("malformed input: {0}")]
@@ -1286,6 +1297,41 @@ impl ProofBasis {
             )
         })
     }
+
+    /// The first legacy 64-bit FNV authority digest carried by this basis,
+    /// when any: such a basis may be VIEWED but never authorizes a new
+    /// record or a proof reuse — the caller refuses typed and forces a
+    /// restage/reverification under the canonical BLAKE3 identities.
+    pub fn legacy_authority_digest(&self) -> Option<LegacyAuthorityDigest> {
+        let members: [(&'static str, &str); 3] = [
+            ("task_contract_digest", &self.task_contract_digest),
+            (
+                "integration_sources_digest",
+                &self.integration_sources_digest,
+            ),
+            ("changed_files_digest", &self.changed_files_digest),
+        ];
+        for (what, value) in members {
+            if let Err(legacy) = refuse_legacy_authority_digest(what, value) {
+                return Some(legacy);
+            }
+        }
+        for criterion in &self.criteria {
+            if let Some(digest) = &criterion.binding_digest {
+                if let Err(legacy) =
+                    refuse_legacy_authority_digest("criterion binding_digest", digest)
+                {
+                    return Some(legacy);
+                }
+            }
+        }
+        if let Some(reviewer) = &self.reviewer_digest {
+            if let Err(legacy) = refuse_legacy_authority_digest("reviewer_digest", reviewer) {
+                return Some(legacy);
+            }
+        }
+        None
+    }
 }
 
 /// Hard bound on one layered effective-configuration digest string.
@@ -1423,19 +1469,20 @@ pub fn layered_effective_config_digest(layers: &[ProofConfigLayer]) -> Result<St
     Ok(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
-/// Deterministic digest of one verification record's check-command basis
-/// (the fingerprint's `check_argv_cwd_env_hash`), domain-separated and
-/// length-prefixed so entry boundaries can never be forged by concatenation.
-/// The fingerprint schema requires BARE hex text, so the `blake3:` label
-/// stays out of this value.
-fn check_basis_digest(entries: &[String]) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"faktor-check-basis:v1\0");
-    for entry in entries {
-        hasher.update(&(entry.len() as u64).to_le_bytes());
-        hasher.update(entry.as_bytes());
+/// The canonical BLAKE3 authority digest of one verification record's
+/// check-command basis (the fingerprint's `check_argv_cwd_env_hash`): per
+/// check the id, the program and every argv element as its own ordered
+/// length-prefixed field — never a joined string. The fingerprint schema
+/// requires BARE hex text, so the `blake3:` label stays out of this value.
+fn check_basis_digest(checks: &[CheckExecution]) -> String {
+    let mut fields = Fields::new().uint(checks.len() as u64);
+    for check in checks {
+        fields = fields
+            .text(&check.check)
+            .text(&check.program)
+            .list(&check.args);
     }
-    hasher.finalize().to_hex().to_string()
+    authority_digest_hex(DOMAIN_CHECK_BASIS, 1, fields)
 }
 
 fn validate_proof_config_digest(digest: &str) -> Result<(), TaskError> {
@@ -2692,10 +2739,15 @@ impl SessionHandle {
         // under; an unbound basis can never produce a configuration-
         // attributable record.
         basis.require_config_digest()?;
-        let check_basis: Vec<String> = checks
-            .iter()
-            .map(|c| format!("{}|{}|{}", c.check, c.program, c.args.join(" ")))
-            .collect();
+        // Fail closed on legacy identities: a basis carrying a 64-bit FNV
+        // member can be viewed but can never mint a new record — the typed
+        // refusal forces a restage/reverification under canonical BLAKE3.
+        if let Some(legacy) = basis.legacy_authority_digest() {
+            return Err(TaskError::LegacyAuthorityDigest {
+                field: legacy.what.to_string(),
+                digest: legacy.value,
+            });
+        }
         let fingerprint = EnvironmentFingerprint {
             platform: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
@@ -2708,7 +2760,7 @@ impl SessionHandle {
             // session layer cannot re-derive a hex tree digest here).
             base_tree_hash: None,
             task_contract_hash: basis.task_contract_digest.clone(),
-            check_argv_cwd_env_hash: check_basis_digest(&check_basis),
+            check_argv_cwd_env_hash: check_basis_digest(&checks),
             verification_impl_version: basis.verification_impl_version.clone(),
             proof_basis_digest: Some(basis.digest()),
         };
@@ -2776,11 +2828,38 @@ impl SessionHandle {
         record_id: VerificationRecordId,
         basis: &ProofBasis,
     ) -> Result<ProofReuse, TaskError> {
+        // Fail closed on legacy identities on BOTH sides: a current basis or
+        // a recorded fingerprint carrying a 64-bit FNV digest may be viewed
+        // but never authorizes a reuse — the typed error forces a
+        // restage/reverification under the canonical BLAKE3 authority
+        // digests.
+        if let Some(legacy) = basis.legacy_authority_digest() {
+            return Err(TaskError::LegacyAuthorityDigest {
+                field: legacy.what.to_string(),
+                digest: legacy.value,
+            });
+        }
         let Some(record) = self.get_verification_record(record_id)? else {
             return Ok(ProofReuse::Refused {
                 reason: format!("record {record_id} does not exist"),
             });
         };
+        if let Some(fingerprint) = record.environment_fingerprint.as_ref() {
+            for (field, value) in [
+                ("task_contract_hash", &fingerprint.task_contract_hash),
+                (
+                    "check_argv_cwd_env_hash",
+                    &fingerprint.check_argv_cwd_env_hash,
+                ),
+            ] {
+                if classify_authority_digest(value) == AuthorityDigestKind::LegacyFnv {
+                    return Err(TaskError::LegacyAuthorityDigest {
+                        field: format!("verification record {record_id} {field}"),
+                        digest: value.clone(),
+                    });
+                }
+            }
+        }
         let Some(recorded) = record
             .environment_fingerprint
             .as_ref()
@@ -2843,12 +2922,15 @@ impl SessionHandle {
     /// The deterministic digest of the task's durable completion-accounting
     /// picture (audits 116/117): the counts and reserved-micro sums of every
     /// reservation still holding budget plus the durable settled spend,
-    /// folded with the crate's stable FNV-1a 64 content hash into
-    /// `accounting:v1:{hash:016x}`. The candidate-proof reference records
-    /// this digest at record build; the completion transaction reconciles
-    /// and conservatively finalizes every reservation before it asserts the
-    /// balance zero — so an already-settled task recomputes the SAME digest
-    /// before and after completion.
+    /// folded through the canonical BLAKE3 authority digest into
+    /// `accounting:v1:blake3:{64-hex}` (the `accounting:v1:` envelope is
+    /// preserved for prefix consumers; a legacy `accounting:v1:{16-hex}` FNV
+    /// value classifies as legacy and never authorizes a completion
+    /// binding). The candidate-proof reference records this digest at record
+    /// build; the completion transaction reconciles and conservatively
+    /// finalizes every reservation before it asserts the balance zero — so
+    /// an already-settled task recomputes the SAME digest before and after
+    /// completion.
     pub fn accounting_snapshot_digest(&self, task_id: TaskId) -> Result<String, TaskError> {
         let ledger = crate::budget::DurableBudgetLedger::new(self.manager.clone());
         let balance = ledger
@@ -3290,31 +3372,24 @@ fn parse_candidate_proof_ref(
     Ok(Some(reference))
 }
 
-/// Stable FNV-1a 64 content hash of one completion-accounting balance, over
-/// the fixed field order. Mirrors the criterion-id construction (this crate
-/// carries no blake3 dependency) so the digest is reproducible across
-/// restarts and processes.
+/// The canonical BLAKE3 authority digest of one completion-accounting
+/// balance, over the fixed field order (counts and micro-amounts as
+/// length-prefixed little-endian fields). The `accounting:v1:` envelope is
+/// preserved so pre-existing prefix consumers keep working; `v1:blake3:`
+/// marks the BLAKE3 body — a legacy `accounting:v1:<16-hex>` value still
+/// classifies as legacy FNV and never authorizes a completion binding.
 fn accounting_digest_of(balance: &crate::budget::TaskCompletionBalance) -> String {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET;
-    let mut feed = |bytes: &[u8]| {
-        for b in bytes {
-            hash ^= u64::from(*b);
-            hash = hash.wrapping_mul(PRIME);
-        }
-    };
-    for value in [
-        balance.open_count as u64,
-        balance.open_micro,
-        balance.dispatched_count as u64,
-        balance.uncertain_count as u64,
-        balance.uncertain_micro,
-        balance.spent_cost_micro,
-    ] {
-        feed(&value.to_le_bytes());
-    }
-    format!("accounting:v1:{hash:016x}")
+    let fields = Fields::new()
+        .uint(balance.open_count as u64)
+        .uint(balance.open_micro)
+        .uint(balance.dispatched_count as u64)
+        .uint(balance.uncertain_count as u64)
+        .uint(balance.uncertain_micro)
+        .uint(balance.spent_cost_micro);
+    format!(
+        "accounting:v1:{}",
+        authority_digest_labeled(DOMAIN_ACCOUNTING_BALANCE, 1, fields)
+    )
 }
 
 #[cfg(test)]
@@ -6783,6 +6858,121 @@ mod tests {
             .clone()
             .bind_config_digest("x".repeat(1024).as_str())
             .is_err());
+    }
+
+    #[test]
+    fn legacy_fnv_basis_is_refused_for_reuse_and_record_creation_with_a_typed_error() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let t = s
+            .create_task(criteria_task(&s, s.task_id().unwrap(), vec!["c1".into()]))
+            .unwrap();
+        let rev = s.task_revision(t.task_id).unwrap();
+        let config = layered_effective_config_digest(&[ProofConfigLayer::of_value(
+            ProofConfigScope::Task,
+            1,
+            "task-overrides",
+        )])
+        .unwrap();
+        let mut basis = proof_basis_fixture(t.task_id.raw(), rev.raw(), "check-basis-a")
+            .bind_config_digest(&config)
+            .unwrap();
+        // A canonical basis is reusable-eligible in shape.
+        assert!(basis.legacy_authority_digest().is_none());
+        basis.task_contract_digest = "fnv1a64:0123456789abcdef".into();
+        let err = s
+            .verification_record_reusable(VerificationRecordId::new(1), &basis)
+            .unwrap_err();
+        match err {
+            TaskError::LegacyAuthorityDigest {
+                ref digest,
+                ref field,
+            } => {
+                assert_eq!(digest, "fnv1a64:0123456789abcdef");
+                assert!(field.contains("task_contract_digest"), "{field}");
+            }
+            other => panic!("expected the typed legacy refusal, got {other:?}"),
+        }
+        // A legacy-contaminated basis can never mint a NEW record either:
+        // completion must restage/reverify.
+        let err = s
+            .create_verification_record_bound_to_basis(
+                t.task_id,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Passed,
+                1,
+                &basis,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TaskError::LegacyAuthorityDigest { .. }),
+            "{err:?}"
+        );
+        assert!(s.list_verification_records(t.task_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_fnv_fingerprint_is_refused_for_reuse_with_a_typed_error() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let t = s
+            .create_task(criteria_task(&s, s.task_id().unwrap(), vec!["c1".into()]))
+            .unwrap();
+        let rev = s.task_revision(t.task_id).unwrap();
+        let config = layered_effective_config_digest(&[ProofConfigLayer::of_value(
+            ProofConfigScope::Task,
+            1,
+            "task-overrides",
+        )])
+        .unwrap();
+        let basis = proof_basis_fixture(t.task_id.raw(), rev.raw(), "check-basis-a")
+            .bind_config_digest(&config)
+            .unwrap();
+        let (mut fp, cref) = fingerprint_with_basis(&basis, rev);
+        // A pre-BLAKE3 record's fingerprint carries a 16-hex FNV contract
+        // hash: it decodes (the record stays viewable) but never reuses.
+        fp.task_contract_hash = "0123456789abcdef".into();
+        let record = s
+            .create_verification_record_with_evidence(
+                t.task_id,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Passed,
+                1,
+                Some(fp),
+                Some(cref),
+            )
+            .unwrap();
+        let viewable = s.get_verification_record(record).unwrap().unwrap();
+        assert_eq!(
+            viewable
+                .environment_fingerprint
+                .as_ref()
+                .map(|f| f.task_contract_hash.as_str()),
+            Some("0123456789abcdef"),
+            "the legacy row still DECODES for viewing"
+        );
+        let err = s.verification_record_reusable(record, &basis).unwrap_err();
+        match err {
+            TaskError::LegacyAuthorityDigest {
+                ref digest,
+                ref field,
+            } => {
+                assert_eq!(digest, "0123456789abcdef");
+                assert!(field.contains("task_contract_hash"), "{field}");
+            }
+            other => panic!("expected the typed legacy refusal, got {other:?}"),
+        }
     }
 
     fn proof_basis_fixture(task_id: u64, revision: u64, check: &str) -> ProofBasis {

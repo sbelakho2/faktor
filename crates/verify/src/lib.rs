@@ -50,6 +50,17 @@ pub use inventory::{
     ManifestProbeRefusal, RepoInventory, MAX_INVENTORY_DEPTH,
 };
 
+/// The ONE check-command identity surface of the verification crate: the
+/// canonical BLAKE3 authority digests over the structured (program, argv)
+/// pair. Text-only producers derive the identical digest from the canonical
+/// text rendering ([`faktor_core::state::canonical_command_text`]), so a
+/// binding created from a derived `Check.command` resolves against the
+/// structured executed-check rows and vice versa. Never a whitespace-joined
+/// string, never a 64-bit FNV fold.
+pub use faktor_core::state::{
+    canonical_command_text, command_binding_digest, command_binding_digest_parts,
+};
+
 /// Hard cap on the checks one derivation may return. The legacy
 /// single-project derivation ([`derive_checks`]) truncates to it; the
 /// multi-component derivation ([`derive::derive_checks`]) REFUSES with a

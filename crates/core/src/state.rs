@@ -3,6 +3,9 @@
 //! There is **no generic `await Promise` that determines application state**.
 //! Every session is an explicit state machine; every transition is validated.
 
+use crate::authority::{
+    authority_digest_labeled, Fields, DOMAIN_COMMAND_BINDING, DOMAIN_CRITERION_BINDING,
+};
 use crate::error::{Error, ErrorKind};
 use crate::id::TaskRevision;
 
@@ -966,8 +969,9 @@ pub struct CriterionVerification {
 /// Hard bound on the free-text members of a [`CriterionBinding`] (check id,
 /// path, evidence id, reviewer id, reason).
 pub const MAX_CRITERION_BINDING_TEXT_BYTES: usize = 512;
-/// Hard bound on the digest members of a [`CriterionBinding`] (a hex BLAKE3
-/// is 64 chars; the FNV fallback carries an algorithm prefix).
+/// Hard bound on the digest members of a [`CriterionBinding`] (a labelled
+/// BLAKE3 authority digest is 71 chars; the bound also admits foreign
+/// digest-shaped evidence values).
 pub const MAX_CRITERION_BINDING_DIGEST_BYTES: usize = 128;
 /// Hard bound on the required work items of one `IntegrationCoverage` binding.
 pub const MAX_CRITERION_BINDING_WORK_ITEMS: usize = 64;
@@ -1126,32 +1130,105 @@ impl CriterionBinding {
         }
     }
 
-    /// A stable content digest of this binding (used by the proof basis).
+    /// A stable content digest of this binding (used by the proof basis):
+    /// the canonical BLAKE3 authority digest over the binding's structured
+    /// fields (kind label first, then the variant's fields in order) — never
+    /// a serialized JSON blob, never a 64-bit FNV fold.
     pub fn content_digest(&self) -> String {
-        let encoded = serde_json::to_vec(self).unwrap_or_default();
-        fnv1a64_hex(b"criterion-binding:v1\0", &encoded)
+        let mut fields = Fields::new().text(self.kind_label());
+        match self {
+            CriterionBinding::RequiredCheck {
+                check_id,
+                command_digest,
+            } => {
+                fields = fields.text(check_id).text(command_digest);
+            }
+            CriterionBinding::IntegrationCoverage {
+                required_work_items,
+            } => {
+                fields = fields
+                    .uint(required_work_items.len() as u64)
+                    .list(required_work_items);
+            }
+            CriterionBinding::FileState {
+                path,
+                expected_digest,
+            } => {
+                fields = fields.text(path).text(expected_digest);
+            }
+            CriterionBinding::Evidence {
+                evidence_id,
+                evidence_digest,
+            } => {
+                fields = fields.text(evidence_id).text(evidence_digest);
+            }
+            CriterionBinding::IndependentReview { reviewer_id } => {
+                fields = fields.text(reviewer_id);
+            }
+            CriterionBinding::AggregateGoal => {}
+            CriterionBinding::Unavailable { reason } => {
+                fields = fields.text(reason);
+            }
+        }
+        authority_digest_labeled(DOMAIN_CRITERION_BINDING, 1, fields)
     }
 }
 
-/// The deterministic FNV-1a 64 digest of a check command's canonical text:
-/// the `command_digest` half of a `RequiredCheck` binding. Prefix-labelled so
-/// a digest can never be mistaken for a raw command.
+/// The canonical command text of one structured check command: the program
+/// followed by every argv element, each separated by exactly one ASCII space.
+/// This is the ONE text rendering the codebase's text-only producers emit
+/// (`faktor-verify`'s derivations), and [`split_canonical_command`] is its
+/// exact inverse, so text-based and structured producers derive the identical
+/// [`command_binding_digest`].
+pub fn canonical_command_text(program: &str, args: &[String]) -> String {
+    let mut out =
+        String::with_capacity(program.len() + args.iter().map(|a| a.len() + 1).sum::<usize>());
+    out.push_str(program);
+    for arg in args {
+        out.push(' ');
+        out.push_str(arg);
+    }
+    out
+}
+
+/// The exact inverse of [`canonical_command_text`]: the first space splits
+/// the program from the argv; every further space splits one argv element
+/// (empty elements preserved, so the mapping is injective).
+fn split_canonical_command(command: &str) -> (&str, Vec<String>) {
+    match command.split_once(' ') {
+        Some((program, rest)) => (program, rest.split(' ').map(str::to_string).collect()),
+        None => (command, Vec::new()),
+    }
+}
+
+/// The structured command-binding digest: program, every argv element,
+/// optional working directory and the relevant environment pairs are hashed
+/// as separate length-prefixed fields (boundary-safe: an argv element can
+/// never shift into its neighbour). NEVER built by whitespace-joining argv.
+pub fn command_binding_digest_parts(
+    program: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    env: &[(String, String)],
+) -> String {
+    let mut fields = Fields::new().text(program);
+    for arg in args {
+        fields = fields.text(arg);
+    }
+    fields = fields.opt_text(cwd).uint(env.len() as u64);
+    for (key, value) in env {
+        fields = fields.text(key).text(value);
+    }
+    authority_digest_labeled(DOMAIN_COMMAND_BINDING, 1, fields)
+}
+
+/// The canonical BLAKE3 digest of a check command, derived from its canonical
+/// text form. The text is split exactly as [`canonical_command_text`] renders
+/// it, so `command_binding_digest(&canonical_command_text(program, args))`
+/// always equals `command_binding_digest_parts(program, args, None, &[])`.
 pub fn command_binding_digest(command: &str) -> String {
-    format!(
-        "fnv1a64:{}",
-        fnv1a64_hex(b"check-command:v1\0", command.as_bytes())
-    )
-}
-
-fn fnv1a64_hex(domain: &[u8], bytes: &[u8]) -> String {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET;
-    for b in domain.iter().chain(bytes.iter()) {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    format!("{hash:016x}")
+    let (program, args) = split_canonical_command(command);
+    command_binding_digest_parts(program, &args, None, &[])
 }
 
 /// Migrate one legacy criterion TEXT to its typed binding (V2-compatible
@@ -2885,6 +2962,46 @@ mod fingerprint_tests {
         assert_ne!(
             command_binding_digest("cargo check"),
             command_binding_digest("cargo test")
+        );
+    }
+
+    #[test]
+    fn structured_command_digest_matches_canonical_text_and_keeps_boundaries() {
+        let args = vec!["test".to_string(), "--workspace".to_string()];
+        assert_eq!(
+            command_binding_digest_parts("cargo", &args, None, &[]),
+            command_binding_digest(&canonical_command_text("cargo", &args))
+        );
+        // Whitespace-joined boundaries are never confusable: ("a b","c")
+        // and ("a","b c") render different canonical texts and digest
+        // differently.
+        assert_ne!(
+            command_binding_digest_parts("a b", &["c".to_string()], None, &[]),
+            command_binding_digest_parts("a", &["b c".to_string()], None, &[])
+        );
+        // An empty arg survives text round-trips (injective rendering).
+        let empty_arg = vec![String::new(), "x".to_string()];
+        assert_eq!(
+            command_binding_digest_parts("p", &empty_arg, None, &[]),
+            command_binding_digest(&canonical_command_text("p", &empty_arg))
+        );
+        // cwd/env participate in the structured identity.
+        let env = vec![("CC".to_string(), "clang".to_string())];
+        assert_ne!(
+            command_binding_digest_parts("p", &[], Some("/w"), &env),
+            command_binding_digest_parts("p", &[], Some("/w"), &[])
+        );
+        assert_ne!(
+            command_binding_digest_parts("p", &[], Some("/a"), &[]),
+            command_binding_digest_parts("p", &[], Some("/b"), &[])
+        );
+        // A legible digest is a labelled BLAKE3 authority digest, never a
+        // 64-bit FNV value.
+        let digest = command_binding_digest("cargo check");
+        assert!(digest.starts_with("blake3:"));
+        assert_eq!(
+            crate::authority::classify_authority_digest(&digest),
+            crate::authority::AuthorityDigestKind::Blake3Labeled
         );
     }
 

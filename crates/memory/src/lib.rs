@@ -541,17 +541,22 @@ impl MemoryFactV2 {
 }
 
 fn derived_id(scope: &MemoryScope, subject: &str, predicate: &str) -> String {
-    // FNV-1a 64: dependency-free, deterministic across processes.
-    fn fnv1a64(bytes: &[u8]) -> u64 {
-        let mut hash = 0xcbf2_9ce4_8422_2325u64;
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        hash
-    }
-    let key = format!("{}\u{1f}{subject}\u{1f}{predicate}", scope.key());
-    format!("v2-{:016x}", fnv1a64(key.as_bytes()))
+    // Canonical BLAKE3 authority digest: scope, subject and predicate are
+    // ordered length-prefixed fields, so no concatenation ambiguity and no
+    // 64-bit FNV collision surface can change a semantic fact's identity.
+    // The `v2-` envelope is preserved (row key compatibility); legacy
+    // `v2-<16-hex>` FNV ids still decode for viewing but are never minted.
+    format!(
+        "v2-{}",
+        faktor_core::authority::authority_digest_hex(
+            faktor_core::authority::DOMAIN_SEMANTIC_FACT,
+            1,
+            faktor_core::authority::Fields::new()
+                .text(&scope.key())
+                .text(subject)
+                .text(predicate),
+        )
+    )
 }
 
 fn check_bounded(field: &str, value: &str, min: usize, max: usize) -> Result<(), MemoryError> {
@@ -1782,6 +1787,32 @@ mod tests {
         ms: i64,
     ) -> MemoryFactV2 {
         MemoryFactV2::new(scope.clone(), subject, predicate, value, ms)
+    }
+
+    #[test]
+    fn derived_ids_are_canonical_blake3_and_collision_boundary_safe() {
+        let (_d, _store, session) = fixture();
+        let scope = MemoryScope::session_scope(session);
+        let a = derived_id(&scope, "server", "port");
+        let b = derived_id(&scope, "server", "port");
+        assert_eq!(a, b, "identical identities must derive the identical id");
+        assert!(a.starts_with("v2-"), "{a}");
+        let body = a.strip_prefix("v2-").unwrap();
+        assert_eq!(body.len(), 64, "the id body is a full BLAKE3 hex: {a}");
+        assert!(body.bytes().all(|b| b.is_ascii_hexdigit()));
+        // One-byte drift changes identity; field boundaries are not
+        // confusable ("ab"/"c" never aliases "a"/"bc").
+        assert_ne!(
+            derived_id(&scope, "server", "port"),
+            derived_id(&scope, "server", "ports")
+        );
+        assert_ne!(derived_id(&scope, "ab", "c"), derived_id(&scope, "a", "bc"));
+        // A scope change is an identity change too.
+        let other = MemoryScope::session_scope(SessionId::new(session.raw() + 1));
+        assert_ne!(
+            derived_id(&scope, "server", "port"),
+            derived_id(&other, "server", "port")
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@
 //! - model capabilities (provider behavior lives here, not in the agent)
 
 pub mod attachment;
+pub mod authority;
 pub mod blocker;
 pub mod cancellation;
 pub mod capability;
@@ -35,6 +36,15 @@ pub mod time;
 pub use attachment::{
     validate_filename, validate_mime, AttachmentId, MAX_ATTACHMENTS_PER_TASK, MAX_ATTACHMENT_BYTES,
     MAX_ATTACHMENT_FILENAME_BYTES, MAX_ATTACHMENT_MIME_BYTES,
+};
+pub use authority::{
+    authority_digest, authority_digest_hex, authority_digest_labeled, classify_authority_digest,
+    refuse_legacy_authority_digest, AuthorityDigestKind, CanonicalFieldWriter, CanonicalFields,
+    Fields, LegacyAuthorityDigest, DOMAIN_ACCOUNTING_BALANCE, DOMAIN_BASE_MAP,
+    DOMAIN_CANDIDATE_MANIFEST, DOMAIN_CHANGED_FILES, DOMAIN_CHANGE_SET, DOMAIN_CHECK_BASIS,
+    DOMAIN_CHECK_EXECUTION, DOMAIN_COMMAND_BINDING, DOMAIN_CRITERION_BINDING,
+    DOMAIN_INTEGRATION_SOURCES, DOMAIN_RUN_BASE_MANIFEST, DOMAIN_SEMANTIC_FACT,
+    DOMAIN_TASK_CONTRACT, MAX_AUTHORITY_FIELD_BYTES,
 };
 pub use blocker::{
     child_lifecycle_tag_is_known, validate_child_runtime_state, BlockerKind, ChildBlocker,

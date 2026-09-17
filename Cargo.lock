@@ -1012,6 +1012,7 @@ dependencies = [
 name = "faktor-core"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "rand",
  "serde",
  "serde_json",
@@ -1123,6 +1124,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

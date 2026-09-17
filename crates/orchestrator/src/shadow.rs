@@ -60,7 +60,7 @@ use faktor_fs::entry_state::EntryState;
 
 use crate::runtime::merge::{
     base_id_of, base_map_digest, compute_change_entries, parent_handle, put_base_map,
-    put_change_set, read_base_state_map, read_change_set, ChangeSet, MAX_BASE_ENTRIES,
+    put_change_set, read_base_state_map, read_change_set_versioned, ChangeSet, MAX_BASE_ENTRIES,
 };
 use crate::runtime::ExecError;
 
@@ -439,8 +439,14 @@ impl ShadowRoots {
                 ))
             })?;
         let cs_id = format!("{}-cs", base_id_of(&row.shadow_id));
-        match read_change_set(&self.manager, session, &row.shadow_id, CHILD_ID, &cs_id) {
-            Ok(cs) if cs.run_base_snapshot.as_deref() == Some(run_base.snapshot_hash.as_str()) => {
+        match read_change_set_versioned(&self.manager, session, &row.shadow_id, CHILD_ID, &cs_id) {
+            // Reuse ONLY a canonical-identity set bound to the CURRENT run
+            // base: a legacy (pre-BLAKE3) or stale-generation row is
+            // re-staged, so no legacy identity is ever presented as the
+            // current candidate.
+            Ok((cs, ChangeSet::ID_VERSION))
+                if cs.run_base_snapshot.as_deref() == Some(run_base.snapshot_hash.as_str()) =>
+            {
                 Ok(cs)
             }
             Ok(_) => self.stage_change_set(session),
