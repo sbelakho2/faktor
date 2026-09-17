@@ -143,9 +143,19 @@ class NativeClient(
 
         fun forConnection(
             connection: BackendConnection,
-            controlToken: String? = null
+            controlToken: String? = null,
+            // Submitting a prompt starts real work (candidate prep,
+            // verification, integration); the 15 s default read timeout can
+            // expire on a loaded machine even though the run is healthy.
+            // Long-operation callers pass a generous budget.
+            timeoutMs: Long = DEFAULT_TIMEOUT_MS
         ): NativeClient =
-            NativeClient(connection.baseUrl, connection.password, controlToken = controlToken)
+            NativeClient(
+                connection.baseUrl,
+                connection.password,
+                timeoutMs = timeoutMs,
+                controlToken = controlToken
+            )
     }
 
     private val http: HttpClient = HttpClient.newBuilder()
