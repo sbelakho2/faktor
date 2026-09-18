@@ -68,8 +68,10 @@ class FaktorFrontendService(
     private val dataDir: Path,
     /** The control-plane credential (`x-faktor-control-token`), when the
      * operator provisioned one; absent = the usage/credits panel renders the
-     * explicit unavailable state the daemon refuses with. */
-    private val controlToken: String? = null
+     * explicit unavailable state the daemon refuses with. Supplied by the
+     * production host from the IDE credential store (PasswordSafe), never
+     * from a product setting. */
+    private var controlToken: String? = null
 ) {
     interface Listener {
         fun onDaemonStatus(status: String, detail: String?) {}
@@ -102,6 +104,51 @@ class FaktorFrontendService(
     }
 
     fun isRunning(): Boolean = synchronized(lifecycleLock) { client != null }
+
+    /**
+     * Replace the control-plane credential (sign-in / sign-out from the
+     * Settings panel). The live client is rebuilt over the same connection so
+     * the next request carries the new value; the daemon-password bearer
+     * token is untouched. A blank value clears the credential.
+     */
+    fun setControlToken(token: String?) {
+        val normalized = token?.takeIf { it.trim().isNotEmpty() }
+        var rebuilt = false
+        synchronized(lifecycleLock) {
+            controlToken = normalized
+            val conn = connection
+            if (conn != null) {
+                client = NativeClient.forConnection(conn, normalized)
+                rebuilt = true
+            }
+        }
+        if (rebuilt) {
+            listener?.onDaemonStatus("running", "control-plane credential updated")
+        }
+    }
+
+    /** True when a control-plane credential is configured (for smoke/UI). */
+    fun controlPlaneTokenConfigured(): Boolean =
+        synchronized(lifecycleLock) { controlToken != null }
+
+    /**
+     * The exact value the next control-plane request would carry; exposed for
+     * smoke assertions and status rendering only. Never logged.
+     */
+    internal fun currentControlPlaneToken(): String? =
+        synchronized(lifecycleLock) { controlToken }
+
+    /**
+     * Revoke the caller's control-plane session durably
+     * (`POST /native/sso/logout`): the live client presents the daemon
+     * password AND the stored control token, and the strict body names the
+     * `{organization, session_id}` the token must own. Typed refusals
+     * propagate to the caller, which reports them and still removes the local
+     * credential.
+     */
+    fun revokeControlPlaneSession(organization: String, sessionId: String) {
+        clientOrThrow().revokeControlSession(organization, sessionId)
+    }
 
     fun currentSessionId(): String? = sessionId
 

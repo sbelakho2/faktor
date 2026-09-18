@@ -158,6 +158,25 @@ pub fn check_bearer(token: &AuthToken, header: Option<&str>) -> bool {
     ct_eq(token.as_str().as_bytes(), bearer.as_bytes())
 }
 
+/// Constant-time check of one `Authorization: Bearer <value>` header against
+/// an expected opaque bearer VALUE (the worker plane's own transport
+/// credential, which is configured as plain text and is deliberately NOT the
+/// daemon password and NOT a worker registration token). Same strictness as
+/// [`check_bearer`]: exact `Bearer ` prefix, bounded header, full-value
+/// constant-time equality, oversized headers refused before any comparison.
+pub fn check_bearer_value(expected: &str, header: Option<&str>) -> bool {
+    let Some(header) = header else {
+        return false;
+    };
+    if header.len() > MAX_AUTH_HEADER_BYTES {
+        return false;
+    }
+    let Some(bearer) = header.strip_prefix("Bearer ") else {
+        return false;
+    };
+    ct_eq(expected.as_bytes(), bearer.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

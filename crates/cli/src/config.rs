@@ -70,6 +70,13 @@ pub struct Config {
     /// `workers_disabled`, and every task run executes locally exactly as
     /// before.
     pub workers: WorkersCfg,
+    /// The additive `[worker_plane]` section: the deployment boundary of the
+    /// remote/VPC worker HTTP surface (a SECOND listener with its own bind,
+    /// transport and auth identity, separate from the loopback-oriented
+    /// native listener). Disabled by default; while disabled no second
+    /// socket exists and the worker routes keep their exact native-listener
+    /// behavior.
+    pub worker_plane: WorkerPlaneCfg,
     /// The additive `[enterprise]` section: retention classes + guarded GC,
     /// the append-only audit ledger, deletion jobs, admin settings and the
     /// layered configuration. Disabled by default; while disabled the local
@@ -1997,6 +2004,194 @@ impl WorkersCfg {
     }
 }
 
+/// The additive `[worker_plane]` section: the DEPLOYMENT BOUNDARY of the
+/// remote/VPC worker HTTP surface — a SECOND listener with its OWN identity,
+/// separate from the loopback-oriented native listener.
+///
+/// Strict and additive:
+///
+/// - `enabled` (default `false`): while false the daemon binds no second
+///   socket, the native listener stays exactly as before and the worker
+///   routes keep their existing behavior (disabled parity);
+/// - `bind` (default `127.0.0.1:8790`): the dedicated worker-plane socket.
+///   The native listener's bind is NOT configurable (always loopback), so
+///   the two listeners can never share exposure. A non-loopback bind is
+///   refused at startup with a typed refusal NAMING the deployment boundary
+///   unless `trusted_gateway = true` acknowledges an external
+///   TLS-terminating gateway fronting the socket;
+/// - `tls` (default `false`): request IN-PROCESS TLS termination. This
+///   workspace compiles no inbound TLS stack (rustls exists only as a
+///   transitive outbound HTTP-client dependency), so `tls = true` is a
+///   typed startup refusal — never fabricated. Terminate TLS at the trusted
+///   gateway and use the gateway-only mode;
+/// - `trusted_gateway` (default `false`): the explicit acknowledgement
+///   naming the boundary: an external, trusted gateway terminates TLS (and,
+///   under `auth = "gateway_mtls"`, client mTLS) in front of this socket.
+///   It is required for any non-loopback bind and recorded in the daemon's
+///   startup audit line and by `faktor doctor --config`;
+/// - `auth` (default `"worker_tokens"`): the plane's OWN transport
+///   client-auth mode. `"gateway_mtls"` requires `trusted_gateway = true`
+///   and a `bearer` (mTLS termination exists only at the gateway);
+/// - `bearer`: an optional transport credential required as
+///   `Authorization: Bearer <bearer>` on EVERY worker-plane request, in
+///   addition to the worker registration token. The daemon password is
+///   never accepted on the worker socket.
+///
+/// Enabling the section requires `[workers] enabled = true` (there is no
+/// plane to expose otherwise); the pair is refused at config load. `Debug`
+/// redacts the transport bearer.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, Default)]
+pub struct WorkerPlaneCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub bind: Option<String>,
+    #[serde(default)]
+    pub tls: bool,
+    #[serde(default)]
+    pub trusted_gateway: bool,
+    #[serde(default)]
+    pub auth: Option<String>,
+    #[serde(default)]
+    pub bearer: Option<String>,
+}
+
+impl std::fmt::Debug for WorkerPlaneCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerPlaneCfg")
+            .field("enabled", &self.enabled)
+            .field("bind", &self.bind)
+            .field("tls", &self.tls)
+            .field("trusted_gateway", &self.trusted_gateway)
+            .field("auth", &self.auth)
+            .field("bearer", &self.bearer.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// The `[worker_plane]` keys, in stable order (unknown-field errors list
+/// them).
+pub const WORKER_PLANE_FIELDS: &[&str] = &[
+    "enabled",
+    "bind",
+    "tls",
+    "trusted_gateway",
+    "auth",
+    "bearer",
+];
+
+/// The default worker-plane bind: loopback (only an explicit operator bind
+/// moves it, and only under the gateway rules).
+pub const DEFAULT_WORKER_PLANE_BIND: &str = faktor_server::DEFAULT_WORKER_PLANE_BIND;
+
+impl<'de> serde::Deserialize<'de> for WorkerPlaneCfg {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error as _, MapAccess, Visitor};
+
+        struct SectionVisitor;
+
+        impl<'de> Visitor<'de> for SectionVisitor {
+            type Value = WorkerPlaneCfg;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("the [worker_plane] section as a JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<WorkerPlaneCfg, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut out = WorkerPlaneCfg::default();
+                let mut seen: u8 = 0;
+                while let Some(key) = map.next_key::<String>()? {
+                    let (bit, name) = match key.as_str() {
+                        "enabled" => (1u8, "enabled"),
+                        "bind" => (2, "bind"),
+                        "tls" => (4, "tls"),
+                        "trusted_gateway" => (8, "trusted_gateway"),
+                        "auth" => (16, "auth"),
+                        "bearer" => (32, "bearer"),
+                        other => return Err(A::Error::unknown_field(other, WORKER_PLANE_FIELDS)),
+                    };
+                    if seen & bit != 0 {
+                        return Err(A::Error::duplicate_field(name));
+                    }
+                    seen |= bit;
+                    match bit {
+                        1 => out.enabled = map.next_value::<bool>()?,
+                        2 => out.bind = map.next_value::<Option<String>>()?,
+                        4 => out.tls = map.next_value::<bool>()?,
+                        8 => out.trusted_gateway = map.next_value::<bool>()?,
+                        16 => out.auth = map.next_value::<Option<String>>()?,
+                        _ => out.bearer = map.next_value::<Option<String>>()?,
+                    }
+                }
+                Ok(out)
+            }
+        }
+
+        de.deserialize_map(SectionVisitor)
+    }
+}
+
+impl WorkerPlaneCfg {
+    /// The parsed bind (shape-checked on both load paths, enabled or not).
+    pub fn bind(&self) -> Result<std::net::SocketAddr, String> {
+        let raw = self.bind.as_deref().unwrap_or(DEFAULT_WORKER_PLANE_BIND);
+        raw.parse()
+            .map_err(|_| format!("worker_plane: bind {raw:?} must be a host:port socket address"))
+    }
+
+    /// The parsed transport client-auth mode.
+    pub fn auth(&self) -> Result<faktor_server::WorkerPlaneAuth, String> {
+        match self.auth.as_deref() {
+            None | Some("worker_tokens") => Ok(faktor_server::WorkerPlaneAuth::WorkerTokens),
+            Some("gateway_mtls") => Ok(faktor_server::WorkerPlaneAuth::GatewayMtls),
+            Some(other) => Err(format!(
+                "worker_plane: auth {other:?} must be one of worker_tokens|gateway_mtls"
+            )),
+        }
+    }
+
+    /// The resolved worker-plane bind/transport configuration (`None` while
+    /// the section is disabled — the daemon then binds no second socket).
+    /// Every boundary refusal is the server crate's typed error, rendered
+    /// with its stable machine code so startup refusals are unmistakable.
+    pub fn resolve(&self) -> Result<Option<faktor_server::WorkerPlaneBindConfig>, String> {
+        let bind = self.bind()?;
+        let auth = self.auth()?;
+        if !self.enabled {
+            return Ok(None);
+        }
+        let config = faktor_server::WorkerPlaneBindConfig {
+            bind,
+            transport: if self.tls {
+                faktor_server::WorkerPlaneTransport::Tls
+            } else {
+                faktor_server::WorkerPlaneTransport::Plaintext
+            },
+            trusted_gateway: self.trusted_gateway,
+            auth,
+            bearer: self.bearer.clone(),
+        };
+        config
+            .validate()
+            .map_err(|refusal| format!("worker_plane: [{}] {refusal}", refusal.code()))?;
+        Ok(Some(config))
+    }
+
+    /// Validate the section (called by [`Config::validate`] on both load
+    /// paths). Shape errors (bind/auth) are always errors; the deployment
+    /// boundary rules apply when the section is enabled.
+    pub fn validate(&self) -> Result<(), String> {
+        let _ = self.resolve()?;
+        Ok(())
+    }
+}
+
 /// The additive `[worker_node]` section: THIS host acting as a remote worker
 /// node of a control plane (the client half of the `[workers]` plane).
 ///
@@ -2668,6 +2863,8 @@ impl<'de> serde::Deserialize<'de> for Config {
             #[serde(default)]
             workers: WorkersCfg,
             #[serde(default)]
+            worker_plane: WorkerPlaneCfg,
+            #[serde(default)]
             enterprise: EnterpriseCfg,
             #[serde(default)]
             worker_node: WorkerNodeCfg,
@@ -2697,6 +2894,7 @@ impl<'de> serde::Deserialize<'de> for Config {
             billing: file.billing,
             updater: file.updater,
             workers: file.workers,
+            worker_plane: file.worker_plane,
             enterprise: file.enterprise,
             worker_node: file.worker_node,
         })
@@ -2738,6 +2936,7 @@ impl Default for Config {
             billing: BillingCfg::default(),
             updater: UpdaterCfg::default(),
             workers: WorkersCfg::default(),
+            worker_plane: WorkerPlaneCfg::default(),
             enterprise: EnterpriseCfg::default(),
             worker_node: WorkerNodeCfg::default(),
         }
@@ -3416,6 +3615,7 @@ impl Config {
         self.billing.validate()?;
         self.updater.validate()?;
         self.workers.validate()?;
+        self.worker_plane.validate()?;
         self.enterprise.validate()?;
         self.worker_node.validate()?;
         // The billing routes derive their tenant from the control-plane
@@ -3437,6 +3637,16 @@ impl Config {
         if self.workers.enabled && !self.cloud.enabled {
             return Err(
                 "workers: an enabled [workers] section requires [cloud] enabled (the control plane supplies the organization principal)"
+                    .into(),
+            );
+        }
+        // The worker-plane listener exposes the worker credential/protocol
+        // routes; without the [workers] plane there is nothing to expose (and
+        // every route would answer workers_disabled), so the pair is refused
+        // at load.
+        if self.worker_plane.enabled && !self.workers.enabled {
+            return Err(
+                "worker_plane: an enabled [worker_plane] section requires [workers] enabled (there is no worker plane to expose)"
                     .into(),
             );
         }
@@ -5913,6 +6123,112 @@ mod completion_cfg_tests {
             serde_json::from_str(r#"{"model": "m", "workers": {"database": "../escape.db"}}"#)
                 .unwrap();
         assert!(traversal.validate().is_err(), "path traversal is refused");
+    }
+
+    #[test]
+    fn worker_plane_section_is_strict_and_enforces_the_deployment_boundary() {
+        // Absent/disabled = no second socket, nothing to resolve.
+        let cfg = Config::default();
+        assert!(!cfg.worker_plane.enabled);
+        assert!(cfg.worker_plane.resolve().unwrap().is_none());
+        // Strict shape: unknown keys, duplicates and wrong types are parse
+        // errors.
+        for bad in [
+            r#"{"model": "m", "worker_plane": {"enabled": false, "hostile": 1}}"#,
+            r#"{"model": "m", "worker_plane": {"enabled": true, "enabled": true}}"#,
+            r#"{"model": "m", "worker_plane": {"enabled": "yes"}}"#,
+            r#"{"model": "m", "worker_plane": {"tls": "yes"}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Config>(bad).is_err(),
+                "the config must refuse: {bad}"
+            );
+        }
+        // Bind/auth shapes are errors even while the section is disabled.
+        for bad in [
+            r#"{"model": "m", "worker_plane": {"bind": "not-a-socket"}}"#,
+            r#"{"model": "m", "worker_plane": {"bind": "127.0.0.1:99999"}}"#,
+            r#"{"model": "m", "worker_plane": {"auth": "hostile"}}"#,
+        ] {
+            let cfg: Config = serde_json::from_str(bad).unwrap();
+            assert!(cfg.validate().is_err(), "the config must refuse: {bad}");
+        }
+        // An enabled boundary without the [workers] plane never boots.
+        let cfg: Config =
+            serde_json::from_str(r#"{"model": "m", "worker_plane": {"enabled": true}}"#).unwrap();
+        let error = cfg.validate().unwrap_err();
+        assert!(error.contains("requires [workers] enabled"), "{error}");
+
+        let base = |extra: &str| {
+            format!(
+                r#"{{"model": "m", "cloud": {{"enabled": true}}, "workers": {{"enabled": true, "organization": "org_local"}}, "worker_plane": {{"enabled": true{extra}}}}}"#
+            )
+        };
+
+        // The default bind is loopback: allowed with no acknowledgement.
+        let cfg: Config = serde_json::from_str(&base("")).unwrap();
+        cfg.validate().unwrap();
+        let resolved = cfg.worker_plane.resolve().unwrap().unwrap();
+        assert!(resolved.bind.ip().is_loopback());
+        assert_eq!(resolved.bind.port(), 8790);
+        assert!(!resolved.trusted_gateway);
+
+        // A non-loopback bind without TLS or the gateway acknowledgement is
+        // the typed startup refusal NAMING the deployment boundary.
+        let cfg: Config = serde_json::from_str(&base(r#", "bind": "0.0.0.0:8790""#)).unwrap();
+        let error = cfg.validate().unwrap_err();
+        assert!(
+            error.contains("worker-plane deployment boundary"),
+            "the refusal names the boundary: {error}"
+        );
+        assert!(
+            error.contains("worker_plane_boundary_refused"),
+            "the refusal carries its stable code: {error}"
+        );
+
+        // Gateway mode admits non-loopback and the acknowledgement is
+        // visible in the resolved exposure/audit line.
+        let cfg: Config = serde_json::from_str(&base(
+            r#", "bind": "0.0.0.0:8790", "trusted_gateway": true"#,
+        ))
+        .unwrap();
+        cfg.validate().unwrap();
+        let exposure = cfg
+            .worker_plane
+            .resolve()
+            .unwrap()
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert!(exposure.beyond_loopback && exposure.trusted_gateway);
+        assert!(exposure.audit_line().contains("trusted_gateway=true"));
+
+        // In-process TLS is refused typed: this build has no inbound TLS
+        // stack, so the gateway-only mode is the honest path.
+        let cfg: Config = serde_json::from_str(&base(r#", "tls": true"#)).unwrap();
+        let error = cfg.validate().unwrap_err();
+        assert!(error.contains("no inbound TLS stack"), "{error}");
+        assert!(
+            error.contains("worker-plane deployment boundary"),
+            "{error}"
+        );
+
+        // gateway_mtls requires the acknowledgement AND the gateway bearer.
+        let cfg: Config = serde_json::from_str(&base(r#", "auth": "gateway_mtls""#)).unwrap();
+        assert!(cfg.validate().unwrap_err().contains("gateway_mtls"));
+        let cfg: Config = serde_json::from_str(&base(
+            r#", "auth": "gateway_mtls", "trusted_gateway": true"#,
+        ))
+        .unwrap();
+        assert!(cfg.validate().unwrap_err().contains("bearer"));
+        let cfg: Config = serde_json::from_str(&base(
+            r#", "auth": "gateway_mtls", "trusted_gateway": true, "bearer": "gw-secret""#,
+        ))
+        .unwrap();
+        cfg.validate().unwrap();
+        let resolved = cfg.worker_plane.resolve().unwrap().unwrap();
+        assert_eq!(resolved.auth, faktor_server::WorkerPlaneAuth::GatewayMtls);
+        assert_eq!(resolved.bearer.as_deref(), Some("gw-secret"));
     }
 
     #[test]

@@ -294,6 +294,10 @@ pub enum RecoveryOutcome {
 /// The full updater status view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StatusView {
+    /// The caller-supplied wall clock the view was assembled at (the
+    /// operations/high-water rows carry their own timestamps; this makes the
+    /// observation instant explicit for staleness judgments).
+    pub observed_at_ms: i64,
     pub channel: String,
     pub os: String,
     pub arch: String,
@@ -527,8 +531,8 @@ impl Updater {
                 .iter()
                 .any(|op| op.status == UpdateOpStatus::Unverified);
         let high_water = self.store.high_water(self.config.channel.as_str())?;
-        let _ = now_ms;
         Ok(StatusView {
+            observed_at_ms: now_ms,
             channel: self.config.channel.to_string(),
             os: self.config.host_os.clone(),
             arch: self.config.host_arch.clone(),
@@ -588,8 +592,7 @@ impl Updater {
         let admission = match self.admit(manifest) {
             Ok(admission) => admission,
             Err(e) => {
-                self.record_failed_check(&mut op, &e, now_ms)?;
-                return Err(e);
+                return Err(self.record_failed_check_or_refusal(&mut op, e, now_ms));
             }
         };
         op.release_generation = Some(admission.generation);
@@ -606,15 +609,16 @@ impl Updater {
         let artifact = manifest
             .artifact_for_host(&self.config.host_os, &self.config.host_arch)
             .ok_or_else(|| {
+                // The operation row is recorded even when no artifact
+                // matches this host: the refusal is durable evidence. A
+                // durable-write failure is surfaced (a retryable marker
+                // naming both failures) WITHOUT masking the refusal.
                 let error =
                     UpdateError::Refused(crate::error::ManifestRefusal::NoArtifactForHost {
                         os: self.config.host_os.clone(),
                         arch: self.config.host_arch.clone(),
                     });
-                // The operation row is recorded even when no artifact
-                // matches this host: the refusal is durable evidence.
-                let _ = self.record_failed_check(&mut op, &error, now_ms);
-                error
+                self.record_failed_check_or_refusal(&mut op, error, now_ms)
             })?;
 
         op.artifact = Some(artifact.name.clone());
@@ -629,8 +633,7 @@ impl Updater {
                 artifact: artifact.name.clone(),
                 max_bytes: self.config.max_artifact_bytes,
             };
-            self.record_failed_check(&mut op, &e, now_ms)?;
-            return Err(e);
+            return Err(self.record_failed_check_or_refusal(&mut op, e, now_ms));
         }
         self.store.insert(&op)?;
 
@@ -659,6 +662,26 @@ impl Updater {
         op.updated_ms = now_ms;
         self.store.insert(op)?;
         Ok(())
+    }
+
+    /// Record a refusal durably and return it; when the durable write itself
+    /// fails, the refusal is STILL the returned error (its code and HTTP
+    /// status preserved) wrapped with the write diagnostic and marked
+    /// retryable, so a retry records the audit row. The refusal is never
+    /// masked and the write failure is never discarded.
+    fn record_failed_check_or_refusal(
+        &self,
+        op: &mut UpdateOperation,
+        refusal: UpdateError,
+        now_ms: i64,
+    ) -> UpdateError {
+        match self.record_failed_check(op, &refusal, now_ms) {
+            Ok(()) => refusal,
+            Err(write) => UpdateError::RefusalUnrecorded {
+                refusal: Box::new(refusal),
+                write: write.to_string(),
+            },
+        }
     }
 
     /// Download + verify + publish one artifact, leaving the install
@@ -2163,9 +2186,221 @@ mod tests {
         .unwrap();
         let status = updater.status(1_000).unwrap();
         assert_eq!(status.channel, "stable");
+        assert_eq!(status.observed_at_ms, 1_000);
         assert!(status.installed.is_none());
         assert!(status.staged.is_none());
         assert!(!status.recovery_required);
+    }
+
+    const CHECK_NOW: i64 = 1_700_000_000_000;
+
+    fn check_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[9u8; 32])
+    }
+
+    fn check_trusted_keys(key: &ed25519_dalek::SigningKey) -> TrustedKeys {
+        use base64::Engine as _;
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes());
+        TrustedKeys::new(vec![crate::keys::TrustedKey::from_base64(
+            "operator", &encoded,
+        )
+        .unwrap()])
+        .unwrap()
+    }
+
+    /// A correctly signed stable manifest whose only artifact targets
+    /// LINUX, so this darwin host has no matching artifact (the refusal path
+    /// under test).
+    fn signed_manifest_without_a_host_artifact(key: &ed25519_dalek::SigningKey) -> Vec<u8> {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+        let mut doc = manifest::UpdateManifest {
+            schema: manifest::UPDATE_MANIFEST_SCHEMA.to_string(),
+            channel: Channel::Stable,
+            version: "0.2.0".into(),
+            commit: "a".repeat(40),
+            release_generation: Some(1),
+            artifacts: vec![Artifact {
+                name: "faktor-cli-0.2.0-linux-x86_64.tar.gz".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                sha256: "b".repeat(64),
+                url: "https://mirror.test/linux-x86_64".into(),
+                size: Some(4),
+            }],
+            compatibility: manifest::Compatibility {
+                cli: crate::version::VersionRange::from_parts("0.1.0", "9.9.9").unwrap(),
+                daemon: crate::version::VersionRange::from_parts("0.1.0", "9.9.9").unwrap(),
+                vscode: crate::version::VersionRange::from_parts("*", "*").unwrap(),
+                jetbrains: crate::version::VersionRange::from_parts("*", "*").unwrap(),
+                schema: crate::SchemaRange { min: 1, max: 1 },
+            },
+            issued_at: CHECK_NOW - 1_000,
+            expires_at: CHECK_NOW + 600_000,
+            certification: None,
+            signature: None,
+        };
+        let payload = doc.signing_payload().unwrap();
+        let signature = key.sign(&payload);
+        doc.signature = Some(manifest::ManifestSignature {
+            algorithm: "ed25519".into(),
+            identity: "operator".into(),
+            public_key: base64::engine::general_purpose::STANDARD
+                .encode(key.verifying_key().to_bytes()),
+            value: base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()),
+        });
+        serde_json::to_vec(&doc).unwrap()
+    }
+
+    /// A store that delegates every read but refuses every `insert`: the
+    /// deterministic durable-write failure of the refusal-recording path.
+    struct FailingInsertStore {
+        inner: crate::store::MemoryUpdaterStore,
+    }
+
+    impl UpdaterStore for FailingInsertStore {
+        fn insert(
+            &self,
+            _operation: &UpdateOperation,
+        ) -> Result<(), crate::store::UpdateStoreError> {
+            Err(crate::store::UpdateStoreError::Backend(
+                "injected insert failure".into(),
+            ))
+        }
+
+        fn update(
+            &self,
+            operation: &UpdateOperation,
+        ) -> Result<(), crate::store::UpdateStoreError> {
+            self.inner.update(operation)
+        }
+
+        fn get(&self, id: &str) -> Result<Option<UpdateOperation>, crate::store::UpdateStoreError> {
+            self.inner.get(id)
+        }
+
+        fn list(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<UpdateOperation>, crate::store::UpdateStoreError> {
+            self.inner.list(limit)
+        }
+
+        fn running(&self) -> Result<Vec<UpdateOperation>, crate::store::UpdateStoreError> {
+            self.inner.running()
+        }
+
+        fn latest(
+            &self,
+            kind: UpdateOpKind,
+            status: UpdateOpStatus,
+        ) -> Result<Option<UpdateOperation>, crate::store::UpdateStoreError> {
+            self.inner.latest(kind, status)
+        }
+
+        fn by_key(
+            &self,
+            key: &str,
+        ) -> Result<Option<UpdateOperation>, crate::store::UpdateStoreError> {
+            self.inner.by_key(key)
+        }
+
+        fn high_water(
+            &self,
+            channel: &str,
+        ) -> Result<Option<HighWaterMark>, crate::store::UpdateStoreError> {
+            self.inner.high_water(channel)
+        }
+
+        fn raise_high_water(
+            &self,
+            channel: &str,
+            generation: u64,
+            legacy_consumed: bool,
+            now_ms: i64,
+        ) -> Result<HighWaterMark, crate::store::UpdateStoreError> {
+            self.inner
+                .raise_high_water(channel, generation, legacy_consumed, now_ms)
+        }
+
+        fn set_high_water(
+            &self,
+            channel: &str,
+            generation: u64,
+            now_ms: i64,
+        ) -> Result<HighWaterMark, crate::store::UpdateStoreError> {
+            self.inner.set_high_water(channel, generation, now_ms)
+        }
+    }
+
+    #[test]
+    fn check_without_a_host_artifact_records_the_refusal_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = check_key();
+        let store = Arc::new(crate::store::MemoryUpdaterStore::new());
+        let mut cfg = config(dir.path().join("install"));
+        cfg.keys = check_trusted_keys(&key);
+        let updater =
+            Updater::with_default_probe(cfg, store.clone(), Arc::new(RefusingFetcher)).unwrap();
+        let running = updater.running_components(None, None, None, None).unwrap();
+        let err = updater
+            .check(
+                &signed_manifest_without_a_host_artifact(&key),
+                &running,
+                CHECK_NOW,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            UpdateError::Refused(ManifestRefusal::NoArtifactForHost { .. })
+        ));
+        // The refusal is durable evidence: one failed check row naming it.
+        let rows = store.list(10).unwrap();
+        assert_eq!(rows.len(), 1, "exactly the failed check row");
+        assert_eq!(rows[0].status, UpdateOpStatus::Failed);
+        assert!(
+            rows[0].detail.as_deref().unwrap().contains("no artifact"),
+            "{:?}",
+            rows[0].detail
+        );
+    }
+
+    #[test]
+    fn failed_refusal_record_is_surfaced_without_masking_the_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = check_key();
+        let store = Arc::new(FailingInsertStore {
+            inner: crate::store::MemoryUpdaterStore::new(),
+        });
+        let mut cfg = config(dir.path().join("install"));
+        cfg.keys = check_trusted_keys(&key);
+        let updater =
+            Updater::with_default_probe(cfg, store.clone(), Arc::new(RefusingFetcher)).unwrap();
+        let running = updater.running_components(None, None, None, None).unwrap();
+        let err = updater
+            .check(
+                &signed_manifest_without_a_host_artifact(&key),
+                &running,
+                CHECK_NOW,
+            )
+            .unwrap_err();
+        // The refusal is still the surfaced error (code + HTTP status), and
+        // the durable-write failure is explicit, not discarded.
+        assert_eq!(err.code(), "manifest_no_artifact_for_host");
+        assert_eq!(err.http_status(), 409);
+        assert!(err.retryable(), "the missing audit row is a retry marker");
+        assert!(err.to_string().contains("injected insert failure"), "{err}");
+        match err {
+            UpdateError::RefusalUnrecorded { refusal, write } => {
+                assert!(matches!(
+                    *refusal,
+                    UpdateError::Refused(ManifestRefusal::NoArtifactForHost { .. })
+                ));
+                assert!(write.contains("injected insert failure"), "{write}");
+            }
+            other => panic!("expected RefusalUnrecorded, got {other:?}"),
+        }
     }
 
     #[test]

@@ -12,7 +12,23 @@ pub mod api;
 pub mod auth;
 pub mod native;
 pub mod permission;
+/// The worker-plane deployment boundary: the dedicated second listener and
+/// its own bind/transport/auth identity (see the module docs for the
+/// TLS-or-gateway-only rules).
+pub mod worker_plane;
 
-pub use api::{empty_evidence_store, serve, EvidenceStoreHandle, ServerDeps, ServerHandle};
+pub use api::{
+    drain_chunk_stream, empty_evidence_store, serve, serve_arc, EvidenceStoreHandle, ServerDeps,
+    ServerHandle,
+};
 pub use auth::{check_bearer, check_password, AuthToken, ServerPassword};
 pub use permission::{ChannelPermissionRequester, PendingPermission};
+pub use worker_plane::{
+    serve_worker_plane, WorkerPlaneAuth, WorkerPlaneBindConfig, WorkerPlaneBoundaryRefusal,
+    WorkerPlaneExposure, WorkerPlaneHandle, WorkerPlaneServeError, WorkerPlaneTransport,
+    DEFAULT_WORKER_PLANE_BIND, MAX_WORKER_PLANE_BEARER_BYTES,
+};
+
+#[cfg(test)]
+#[path = "worker_plane_tests.rs"]
+mod worker_plane_tests;

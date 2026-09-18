@@ -57,8 +57,16 @@ private const val MAX_TRANSCRIPT_CHARS = 400_000
 private const val MAX_EVIDENCE_PREVIEW_CHARS = 4000
 private const val MAX_CHILD_USAGE_FETCHES = 12
 
-class FaktorChatPanel(private val service: FaktorFrontendService) :
-    JPanel(BorderLayout()), FaktorFrontendService.Listener {
+class FaktorChatPanel(
+    private val service: FaktorFrontendService,
+    /** The IDE credential store for the control-plane token (PasswordSafe in
+     * production); null only in display tests with no credential wiring. */
+    private val controlPlaneCredentials: ControlPlaneCredentialStore? = null,
+    /** The NON-secret (endpoint, organization) coordinates. */
+    private val controlPlaneScopeStore: ControlPlaneScopeStore? = null,
+    /** The NON-secret auth-session id the sign-out revoke route names. */
+    private val controlPlaneSessionStore: ControlPlaneSessionStore? = null
+) : JPanel(BorderLayout()), FaktorFrontendService.Listener {
 
     private val worker = Executors.newSingleThreadExecutor { runnable ->
         val thread = Thread(runnable, "faktor-ui")
@@ -159,6 +167,9 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
 
     private val usagePanel = UsagePanel()
 
+    /** The bounded PasswordSafe row watch (no platform change event exists). */
+    private val controlPlaneWatcher: ControlPlaneCredentialWatcher?
+
     // The organization-wide usage cursor stack: Previous pages are replayed
     // exactly from their recorded cursors, never recomputed.
     private var billingCursor: String? = null
@@ -184,6 +195,25 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
         buildLayout()
         wireActions()
         setControlsEnabled(false)
+        val scope = controlPlaneScopeStore?.read()
+        if (scope != null) {
+            settingsPanel.setControlPlaneScope(scope)
+        }
+        settingsPanel.setControlPlaneSession(controlPlaneSessionStore?.read())
+        settingsPanel.setControlPlaneStatus(controlPlaneStatusText(controlPlaneCredentials?.resolve(scope)))
+        val credentials = controlPlaneCredentials
+        val scopeStore = controlPlaneScopeStore
+        controlPlaneWatcher = if (credentials != null && scopeStore != null) {
+            // NOT started here: the panel host starts it with the daemon, and
+            // tests drive pollOnce() synchronously (no background timing).
+            ControlPlaneCredentialWatcher(
+                store = credentials,
+                scopeStore = scopeStore,
+                onTokenChanged = { token -> applyWatchedControlPlaneToken(token) }
+            )
+        } else {
+            null
+        }
     }
 
     // ------------------------------------------------------------------ UI
@@ -412,6 +442,155 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
             refreshTaskTreeBlocking()
         }
     }
+
+    // ------------------------------------------------ control-plane credential
+
+    /**
+     * The Settings-panel save path: the credential goes into the IDE
+     * credential store (PasswordSafe in production) and NOWHERE else; the
+     * non-secret coordinates and auth-session id are persisted separately, the
+     * token field is already cleared, and the running client picks the token
+     * up immediately (parity with the VS Code sign-in command).
+     */
+    private fun storeControlPlaneCredential(
+        endpoint: String,
+        organization: String,
+        sessionId: String,
+        token: String
+    ) {
+        val store = controlPlaneCredentials
+        if (store == null) {
+            settingsPanel.setControlPlaneStatus(
+                "control plane: credential store unavailable in this embedding"
+            )
+            return
+        }
+        val scope = ControlPlaneScope(endpoint, organization)
+        try {
+            store.store(scope, token)
+        } catch (e: IllegalArgumentException) {
+            settingsPanel.setControlPlaneStatus("control plane: ${e.message}")
+            return
+        }
+        val normalizedSession = sessionId.trim().ifEmpty { null }
+        controlPlaneScopeStore?.write(scope)
+        controlPlaneSessionStore?.write(normalizedSession)
+        settingsPanel.setControlPlaneScope(scope)
+        settingsPanel.setControlPlaneSession(normalizedSession)
+        settingsPanel.clearControlPlaneTokenInput()
+        service.setControlToken(store.resolve(scope))
+        settingsPanel.setControlPlaneStatus(controlPlaneStatusText(store.resolve(scope)))
+        appendSystem("control-plane credential stored in the IDE credential store")
+    }
+
+    /**
+     * The Settings-panel sign-out path. The remote revoke is attempted FIRST
+     * (`POST /native/sso/logout` needs the live token), then the credential
+     * row is removed UNCONDITIONALLY and the live client cleared; the remote
+     * outcome is reported, never fabricated.
+     */
+    private fun signOutControlPlane() {
+        val store = controlPlaneCredentials
+        if (store == null) {
+            settingsPanel.setControlPlaneStatus(
+                "control plane: credential store unavailable in this embedding"
+            )
+            return
+        }
+        val scope = controlPlaneScopeStore?.read()
+            ?: ControlPlaneScope(
+                settingsPanel.controlPlaneEndpointText(),
+                settingsPanel.controlPlaneOrganizationText()
+            )
+        val sessionId = controlPlaneSessionStore?.read()
+            ?: settingsPanel.controlPlaneSessionText().ifEmpty { null }
+        val remote = revokeRemoteControlPlaneSession(scope.takeIf { it.valid() }, sessionId)
+        val removed = store.delete(if (scope.valid()) scope else null)
+        controlPlaneSessionStore?.write(null)
+        settingsPanel.setControlPlaneSession(null)
+        service.setControlToken(null)
+        settingsPanel.clearControlPlaneTokenInput()
+        settingsPanel.setControlPlaneStatus(
+            if (removed) {
+                "control plane: credential removed from the IDE credential store"
+            } else {
+                "control plane: no credential was stored"
+            }
+        )
+        appendSystem(
+            if (removed) {
+                "control-plane sign-out: $remote; the credential was removed from the IDE credential store"
+            } else {
+                "no stored control-plane credential to remove ($remote)"
+            }
+        )
+    }
+
+    /**
+     * The sign-out revoke. The daemon route names the `{organization,
+     * session_id}` the presented token must own, so it is attempted ONLY when
+     * the non-secret session id and a live client exist; a refusal is reported
+     * as the daemon typed it (401 non-owner, 404 unknown session, 409 cloud
+     * disabled) and the local credential is removed by the caller either way.
+     */
+    private fun revokeRemoteControlPlaneSession(
+        scope: ControlPlaneScope?,
+        sessionId: String?
+    ): String {
+        if (scope == null || sessionId.isNullOrBlank()) {
+            return "no auth-session id is known, so the remote session was not revoked"
+        }
+        if (!service.isRunning()) {
+            return "the daemon is not running, so the remote session was not revoked"
+        }
+        return try {
+            service.revokeControlPlaneSession(scope.organization, sessionId)
+            "the remote session was revoked"
+        } catch (e: Exception) {
+            "the remote revoke failed (${e.message}); the local credential was still removed"
+        }
+    }
+
+    /**
+     * A PasswordSafe row change observed by the watcher: the live client gets
+     * the new value; a removed row hands `null`, so the old token stops being
+     * sent instead of lingering until a restart.
+     */
+    private fun applyWatchedControlPlaneToken(token: String?) {
+        service.setControlToken(token)
+        onEdt {
+            settingsPanel.setControlPlaneStatus(
+                if (token != null) {
+                    "control plane: credential refreshed from the IDE credential store"
+                } else {
+                    "control plane: credential removed from the IDE credential store"
+                }
+            )
+            appendSystem(
+                if (token != null) {
+                    "control-plane credential refreshed from the IDE credential store"
+                } else {
+                    "control-plane credential removed externally; the client credential was cleared"
+                }
+            )
+        }
+    }
+
+    /**
+     * Starts the bounded PasswordSafe row watch after the daemon is adopted;
+     * idempotent. The first poll applies the vault value, so an external
+     * update between panel construction and startup is never missed.
+     */
+    fun startControlPlaneWatch() {
+        controlPlaneWatcher?.start()
+    }
+
+    private fun controlPlaneStatusText(token: String?): String =
+        if (token != null) {
+            "control plane: credential stored in the IDE credential store"
+        } else {
+            "control plane: no credential stored"
+        }
 
     private fun wireActions() {
         startButton.addActionListener { startDaemon() }
@@ -703,6 +882,19 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
                     modelField.text = model
                 }
             }
+
+            override fun onControlPlaneCredential(
+                endpoint: String,
+                organization: String,
+                sessionId: String,
+                token: String
+            ) {
+                storeControlPlaneCredential(endpoint, organization, sessionId, token)
+            }
+
+            override fun onControlPlaneLogout() {
+                signOutControlPlane()
+            }
         })
         historyPanel.setListener(object : HistoryPanel.Listener {
             override fun onOpenSession(sessionId: String) {
@@ -738,6 +930,10 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
 
     /** Starts the daemon off the EDT (public so the app entry point can call it). */
     fun startDaemon() {
+        // The credential watch starts BEFORE the daemon: its first poll
+        // applies the vault value, so an external PasswordSafe update between
+        // panel construction and startup is reconciled, never missed.
+        startControlPlaneWatch()
         runAsync("start daemon") {
             val health = service.start()
             onEdt {
@@ -1377,9 +1573,14 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
     // ------------------------------------------------------------- plumbing
 
     fun shutdown() {
+        controlPlaneWatcher?.stop()
         service.stopStream()
         worker.shutdownNow()
     }
+
+    /** One synchronous credential-watch poll (internal smoke hook). */
+    internal fun pollControlPlaneWatcherOnce(): Boolean =
+        controlPlaneWatcher?.pollOnce() ?: false
 
     // ------------------------------------------------------------- test hooks
     // Internal (module-visible) seams used by the Kotlin parity smoke to

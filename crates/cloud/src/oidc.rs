@@ -9,9 +9,10 @@
 //! property (signature, expiry, issuer, audience, nonce, key rotation) is
 //! exercised without a network.
 //!
-//! SCIM provisioning is a PLACEHOLDER interface only ([`ScimProvisioningSeam`]):
-//! the trait documents the intended boundary and no implementation is
-//! provided or claimed.
+//! Inbound SCIM provisioning is deliberately NOT part of this contract: no
+//! SCIM push/deprovision surface exists, none is declared here, and nothing
+//! in this tree calls one. An identity provider's directory sync is an
+//! adapter outside this seam; this crate only consumes OIDC claims.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -492,7 +493,7 @@ impl OidcAdapter for FakeOidcAdapter {
             _ => {
                 return Err(OidcError::Malformed(
                     "claim \"aud\" is missing or malformed".into(),
-                ))
+                ));
             }
         };
         if !audience.iter().any(|aud| aud == &expected.audience) {
@@ -586,19 +587,6 @@ pub(crate) fn map_membership_claims(
         role: role.unwrap_or(mapping.default_role),
         matched_groups,
     })
-}
-
-/// SCIM provisioning: PLACEHOLDER interface, documented but NOT implemented.
-///
-/// This trait names the boundary a future SCIM 2.0 adapter would implement
-/// (users/groups push, deprovisioning). No implementation exists, none is
-/// claimed, and nothing in this crate calls it. Treat any claim of SCIM
-/// support in this tree as false until that changes.
-pub trait ScimProvisioningSeam: Send + Sync {
-    /// Apply one inbound SCIM user/group push (unimplemented boundary).
-    fn apply_push(&self, payload: &[u8]) -> Result<(), OidcError>;
-    /// Deprovision one subject (unimplemented boundary).
-    fn deprovision(&self, subject: &str) -> Result<(), OidcError>;
 }
 
 #[cfg(test)]

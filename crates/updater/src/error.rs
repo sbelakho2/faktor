@@ -115,6 +115,16 @@ pub enum UpdateError {
     /// binary restarted; this names the failure.
     #[error("release restart failed: {detail}")]
     RestartFailed { detail: String },
+    /// A refusal that could NOT be recorded durably: the refusal itself is
+    /// still returned (its code and HTTP status are preserved), but the
+    /// failed-check row is missing, so the error is marked retryable — a
+    /// retry writes the audit row. The diagnostic names both failures; the
+    /// refusal is never masked.
+    #[error("update refused ({refusal}) but the durable check record failed: {write}")]
+    RefusalUnrecorded {
+        refusal: Box<UpdateError>,
+        write: String,
+    },
     #[error("the updater store is unavailable: {0}")]
     Backend(String),
 }
@@ -140,6 +150,7 @@ impl UpdateError {
             UpdateError::LegacyManifestRefused { .. } => "legacy_manifest_refused",
             UpdateError::LaunchRefused { .. } => "launch_refused",
             UpdateError::RestartFailed { .. } => "restart_failed",
+            UpdateError::RefusalUnrecorded { refusal, .. } => refusal.code(),
             UpdateError::Backend(_) => "internal",
         }
     }
@@ -164,13 +175,16 @@ impl UpdateError {
             UpdateError::LegacyManifestRefused { .. } => 409,
             UpdateError::LaunchRefused { .. } => 409,
             UpdateError::RestartFailed { .. } => 500,
+            UpdateError::RefusalUnrecorded { refusal, .. } => refusal.http_status(),
         }
     }
 
     pub const fn retryable(&self) -> bool {
         matches!(
             self,
-            UpdateError::Transport { .. } | UpdateError::Backend(_)
+            UpdateError::Transport { .. }
+                | UpdateError::Backend(_)
+                | UpdateError::RefusalUnrecorded { .. }
         )
     }
 }

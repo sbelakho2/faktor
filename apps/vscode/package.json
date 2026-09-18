@@ -18,6 +18,8 @@
     "onCommand:faktor.newTask",
     "onCommand:faktor.cancelTask",
     "onCommand:faktor.refresh",
+    "onCommand:faktor.controlPlaneSignIn",
+    "onCommand:faktor.controlPlaneSignOut",
     "onView:faktor.chat"
   ],
   "main": "out/extension.js",
@@ -47,6 +49,14 @@
       {
         "command": "faktor.refresh",
         "title": "Faktor: Refresh State"
+      },
+      {
+        "command": "faktor.controlPlaneSignIn",
+        "title": "Faktor: Sign in to Control Plane"
+      },
+      {
+        "command": "faktor.controlPlaneSignOut",
+        "title": "Faktor: Sign out of Control Plane"
       }
     ],
     "viewsContainers": {
@@ -135,10 +145,26 @@
           "minimum": 0,
           "description": "max_cost_micro for new task runs (0 = daemon default)."
         },
+        "faktor.controlPlaneEndpoint": {
+          "type": "string",
+          "default": "https://api.faktor.dev",
+          "description": "Cloud control-plane endpoint the stored credential belongs to. Non-secret: it is half of the SecretStorage key (endpoint + organization), never a credential."
+        },
+        "faktor.controlPlaneOrganization": {
+          "type": "string",
+          "default": "",
+          "description": "Organization (or account) id the stored control-plane credential belongs to. Non-secret: written by \"Faktor: Sign in to Control Plane\"."
+        },
+        "faktor.controlPlaneAuthSession": {
+          "type": "string",
+          "default": "",
+          "description": "Auth-session id (non-secret) the stored credential owns, from the SSO callback or bootstrap result. Written by \"Faktor: Sign in to Control Plane\"; used only to name the session in the daemon's sign-out revoke body. Never a credential."
+        },
         "faktor.controlToken": {
           "type": "string",
           "default": "",
-          "description": "Control-plane credential (x-faktor-control-token) for the identity/entitlements/usage/credits routes; empty hides the Usage/Credits panel behind an explicit unavailable state."
+          "deprecationMessage": "Deprecated plaintext credential. The extension never sends this value to control-plane routes; sign in through \"Faktor: Sign in to Control Plane\" to store the credential in the OS/IDE secret store (this setting is deleted once migrated).",
+          "description": "DEPRECATED (plaintext, never sent): legacy control-plane credential kept only so the one-shot migration prompt can find and delete it. Use \"Faktor: Sign in to Control Plane\" instead; the local daemon password is handled separately and is unchanged."
         }
       }
     }

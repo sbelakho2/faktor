@@ -72,6 +72,18 @@ pub trait ControlPlaneTx {
     fn user(&mut self, id: &UserId) -> Result<Option<User>, CloudStoreError>;
     fn user_by_email(&mut self, email: &str) -> Result<Option<User>, CloudStoreError>;
 
+    /// Link one external identity INSIDE the transaction: the SSO login
+    /// resolves the subject and attaches it in the SAME transaction as the
+    /// user resolution/creation, so no window exists where two concurrent
+    /// logins could bind one subject to different accounts.
+    fn put_external_identity(&mut self, identity: &ExternalIdentity)
+        -> Result<(), CloudStoreError>;
+    fn external_identity(
+        &mut self,
+        provider: &str,
+        subject: &str,
+    ) -> Result<Option<ExternalIdentity>, CloudStoreError>;
+
     fn put_organization(&mut self, organization: &Organization) -> Result<(), CloudStoreError>;
     fn organization(
         &mut self,
@@ -311,6 +323,36 @@ fn mem_user_by_email(inner: &MemInner, email: &str) -> Option<User> {
     inner.users.values().find(|u| u.email == email).cloned()
 }
 
+fn mem_external_identity(
+    inner: &MemInner,
+    provider: &str,
+    subject: &str,
+) -> Option<ExternalIdentity> {
+    inner
+        .external_identities
+        .get(&format!("{provider}:{subject}"))
+        .cloned()
+}
+
+/// Attach one external identity under the (provider, subject) uniqueness
+/// invariant: a second id may never claim an already-bound subject.
+fn mem_put_external_identity(
+    inner: &mut MemInner,
+    identity: &ExternalIdentity,
+) -> Result<(), CloudStoreError> {
+    let key = format!("{}:{}", identity.provider, identity.subject);
+    if let Some(existing) = inner.external_identities.get(&key) {
+        if existing.id != identity.id {
+            return Err(CloudStoreError::Malformed(format!(
+                "external identity ({}, {}) is already linked",
+                identity.provider, identity.subject
+            )));
+        }
+    }
+    inner.external_identities.insert(key, identity.clone());
+    Ok(())
+}
+
 fn mem_put_organization(inner: &mut MemInner, organization: &Organization) {
     inner
         .organizations
@@ -421,6 +463,35 @@ impl ControlPlaneTx for MemoryTx<'_> {
 
     fn user_by_email(&mut self, email: &str) -> Result<Option<User>, CloudStoreError> {
         Ok(mem_user_by_email(self.inner, email))
+    }
+
+    fn put_external_identity(
+        &mut self,
+        identity: &ExternalIdentity,
+    ) -> Result<(), CloudStoreError> {
+        // The map key IS the (provider, subject) uniqueness invariant, so a
+        // re-link of an already-bound subject cannot smuggle in a second row.
+        let key = format!("{}:{}", identity.provider, identity.subject);
+        let previous = self.inner.external_identities.get(&key).cloned();
+        mem_put_external_identity(self.inner, identity)?;
+        let undo = Box::new(move |inner: &mut MemInner| match previous {
+            Some(value) => {
+                inner.external_identities.insert(key, value);
+            }
+            None => {
+                inner.external_identities.remove(&key);
+            }
+        });
+        self.undo.push(undo);
+        Ok(())
+    }
+
+    fn external_identity(
+        &mut self,
+        provider: &str,
+        subject: &str,
+    ) -> Result<Option<ExternalIdentity>, CloudStoreError> {
+        Ok(mem_external_identity(self.inner, provider, subject))
     }
 
     fn put_organization(&mut self, organization: &Organization) -> Result<(), CloudStoreError> {
@@ -569,11 +640,7 @@ impl ControlPlaneStore for MemoryControlPlaneStore {
     }
 
     fn put_external_identity(&self, identity: &ExternalIdentity) -> Result<(), CloudStoreError> {
-        self.lock()?.external_identities.insert(
-            format!("{}:{}", identity.provider, identity.subject),
-            identity.clone(),
-        );
-        Ok(())
+        mem_put_external_identity(&mut *self.lock()?, identity)
     }
 
     fn external_identity(
@@ -581,11 +648,7 @@ impl ControlPlaneStore for MemoryControlPlaneStore {
         provider: &str,
         subject: &str,
     ) -> Result<Option<ExternalIdentity>, CloudStoreError> {
-        Ok(self
-            .lock()?
-            .external_identities
-            .get(&format!("{provider}:{subject}"))
-            .cloned())
+        Ok(mem_external_identity(&*self.lock()?, provider, subject))
     }
 
     fn external_identities_for_user(
@@ -863,8 +926,20 @@ fn replay_record(
 // ---------------------------------------------------------------- sqlite
 
 /// The durable [`ControlPlaneStore`] over its own SQLite database file.
+///
+/// Durability policy (P1 audit): the writer connection opens with
+/// `synchronous = FULL` (see [`crate::durability`]), so every acknowledged
+/// commit — credit grants, usage settles, invitations, approvals — fsyncs its
+/// WAL frame before the caller sees `Ok`. File-backed opens additionally
+/// record the policy marker, write a VERIFIED pre-migration restore point
+/// before any schema migration, and run the interval-gated rotating backup.
+/// This database is the LOCAL commercial deployment authority; hosted
+/// deployments must move these authorities to a transactional service.
 pub struct SqliteControlPlaneStore {
     conn: Mutex<Connection>,
+    /// The database path (`None` for in-memory stores): the durability stack
+    /// (backups, fingerprints, doctor) needs it.
+    path: Option<std::path::PathBuf>,
     /// Test-only crash-injection seam: when below `usize::MAX`, the next
     /// `execute_idempotent` transaction fails after this many statements
     /// (each claim/domain/persist statement counts as one).
@@ -950,36 +1025,93 @@ const CP_MIGRATIONS: &[&str] = &[
     // v2/v3, the billing domain owns this ladder slot; a REPORTED/FAILED
     // period row is terminal, so the report can never double-send a period.
     crate::billing_store::BILLING_REPORT_SCHEMA_V4,
+    // v5 — the durability policy marker (P1 audit): the writer RECORDS the
+    // acknowledged-durability policy (`synchronous = FULL`) so `doctor` can
+    // observe it (SQLite pragmas are connection-scoped and invisible to a
+    // separate probe connection). Owned by the durability stack.
+    crate::durability::POLICY_SCHEMA_V5,
 ];
 
 impl SqliteControlPlaneStore {
     /// Open (creating) the control-plane database at `path`.
     pub fn open(path: &Path) -> Result<Self, CloudStoreError> {
         let conn = Connection::open(path).map_err(backend)?;
-        Self::prepare(conn)
+        Self::prepare(conn, Some(path))
     }
 
     /// Open an in-memory database (tests, ephemeral hosts).
     pub fn open_in_memory() -> Result<Self, CloudStoreError> {
         let conn = Connection::open_in_memory().map_err(backend)?;
-        Self::prepare(conn)
+        Self::prepare(conn, None)
     }
 
-    fn prepare(conn: Connection) -> Result<Self, CloudStoreError> {
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             PRAGMA busy_timeout = 5000;
-             PRAGMA foreign_keys = ON;",
-        )
-        .map_err(backend)?;
+    fn prepare(conn: Connection, path: Option<&Path>) -> Result<Self, CloudStoreError> {
+        // The acknowledged-durability policy (WAL + synchronous = FULL; see
+        // `crate::durability` for the documented choice) applies to EVERY
+        // open, in-memory included, before any migration or query.
+        crate::durability::apply_policy(&conn)?;
         let mut conn = conn;
-        migrate(&mut conn)?;
+        migrate(&mut conn, path)?;
+        if let Some(path) = path {
+            let now = crate::durability::now_ms();
+            // Record the writer's policy for `doctor` (best effort: a full
+            // disk must not take the control plane down; doctor then reports
+            // the absent/stale marker loudly).
+            if let Err(e) = crate::durability::record_open_policy(&conn, now) {
+                tracing::error!("control-plane durability marker not recorded: {e}");
+            }
+            // Interval-gated verified backup (main store convention). Best
+            // effort, like the daemon's startup backup.
+            match crate::durability::rotate_backup(&conn, path) {
+                Ok(Some(dest)) => {
+                    tracing::info!("commercial backup written to {}", dest.display());
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("commercial backup skipped: {e}"),
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
+            path: path.map(Path::to_path_buf),
             #[cfg(test)]
             crash_after: std::sync::atomic::AtomicUsize::new(usize::MAX),
         })
+    }
+
+    /// The database path (`None` for in-memory stores).
+    pub fn db_path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// The full `PRAGMA integrity_check` over the live database.
+    pub fn integrity_check(&self) -> Result<Vec<String>, CloudStoreError> {
+        let conn = self.lock()?;
+        crate::durability::integrity_check(&conn, true)
+    }
+
+    /// The canonical schema/row-count fingerprint (restore verification).
+    pub fn fingerprint(&self) -> Result<crate::durability::DbFingerprint, CloudStoreError> {
+        let conn = self.lock()?;
+        crate::durability::canonical_fingerprint(&conn)
+    }
+
+    /// Online backup into `dest` through the SQLite backup API (the main
+    /// store's `Store::backup_to` convention). The caller owns verification:
+    /// [`crate::durability::restore_verify`] against [`Self::fingerprint`].
+    pub fn backup_to(&self, dest: &Path) -> Result<(), CloudStoreError> {
+        let conn = self.lock()?;
+        crate::durability::backup_to(&conn, dest)
+    }
+
+    /// The read-only durability report (`doctor`'s `cloud-db` section).
+    pub fn durability_report(
+        &self,
+        deep: bool,
+    ) -> Result<crate::durability::CommercialDbReport, CloudStoreError> {
+        let path = self.path.as_deref().ok_or_else(|| {
+            CloudStoreError::Backend("in-memory store has no durability file".into())
+        })?;
+        crate::durability::doctor_probe(path, deep)
     }
 
     /// Test-only: fail the NEXT `execute_idempotent` transaction once it has
@@ -1000,6 +1132,18 @@ impl SqliteControlPlaneStore {
             .lock()
             .map_err(|_| CloudStoreError::Backend("control-plane store lock is poisoned".into()))
     }
+}
+
+/// Test-only one-shot: make the NEXT migration fail AFTER the pre-migration
+/// restore point and BEFORE any migration SQL, reproducing the crash-mid-
+/// migration durable state.
+#[cfg(test)]
+static MIGRATION_CRASH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Arm [`MIGRATION_CRASH`] (one-shot; tests only).
+#[cfg(test)]
+pub(crate) fn inject_crash_before_migration() {
+    MIGRATION_CRASH.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Test-only statement budget of one idempotent transaction. `tick` is
@@ -1058,6 +1202,23 @@ impl ControlPlaneTx for SqliteTx<'_> {
     fn user_by_email(&mut self, email: &str) -> Result<Option<User>, CloudStoreError> {
         self.tick()?;
         sql_user_by_email(&self.tx, email)
+    }
+
+    fn put_external_identity(
+        &mut self,
+        identity: &ExternalIdentity,
+    ) -> Result<(), CloudStoreError> {
+        self.tick()?;
+        sql_put_external_identity(&self.tx, identity)
+    }
+
+    fn external_identity(
+        &mut self,
+        provider: &str,
+        subject: &str,
+    ) -> Result<Option<ExternalIdentity>, CloudStoreError> {
+        self.tick()?;
+        sql_external_identity(&self.tx, provider, subject)
     }
 
     fn put_organization(&mut self, organization: &Organization) -> Result<(), CloudStoreError> {
@@ -1120,10 +1281,33 @@ fn backend(e: rusqlite::Error) -> CloudStoreError {
     CloudStoreError::Backend(e.to_string())
 }
 
-fn migrate(conn: &mut Connection) -> Result<(), CloudStoreError> {
+fn migrate(conn: &mut Connection, db_path: Option<&Path>) -> Result<(), CloudStoreError> {
     let mut version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(backend)?;
+    if version >= CP_MIGRATIONS.len() as i64 {
+        return Ok(());
+    }
+    // A schema transition on an EXISTING database is irreversible structural
+    // work: before the first pending migration runs, a verified pre-migration
+    // restore point must be durable. If the restore point cannot be written
+    // and restore-verified, the migration is REFUSED (open fails) — never a
+    // schema change without a way back.
+    if version > 0 {
+        if let Some(path) = db_path {
+            crate::durability::migration_backup(conn, path, version).map_err(|e| {
+                CloudStoreError::Backend(format!(
+                    "refusing migration without a verified pre-migration restore point: {e}"
+                ))
+            })?;
+            #[cfg(test)]
+            if MIGRATION_CRASH.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(CloudStoreError::Backend(
+                    "injected crash after the pre-migration restore point".into(),
+                ));
+            }
+        }
+    }
     for (i, sql) in CP_MIGRATIONS.iter().enumerate() {
         let target = (i + 1) as i64;
         if version >= target {
@@ -1213,6 +1397,66 @@ fn sql_user_by_email(conn: &Connection, email: &str) -> Result<Option<User>, Clo
         .query_row(
             "SELECT payload FROM cp_user WHERE email = ?1",
             params![email],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(backend)?;
+    payload.map(|p| parse(&p)).transpose()
+}
+
+fn sql_put_external_identity(
+    conn: &Connection,
+    identity: &ExternalIdentity,
+) -> Result<(), CloudStoreError> {
+    // The (provider, subject) UNIQUE constraint is the subject-ownership
+    // invariant: a second row for the same subject is refused here as a typed
+    // malformed write rather than surfacing as a raw constraint error (and an
+    // in-transaction caller that checked first can never rebind a subject).
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT id FROM cp_external_identity WHERE provider = ?1 AND subject = ?2",
+            params![identity.provider, identity.subject],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(backend)?;
+    if let Some(existing) = existing {
+        if existing != identity.id.as_str() {
+            return Err(CloudStoreError::Malformed(format!(
+                "external identity ({}, {}) is already linked",
+                identity.provider, identity.subject
+            )));
+        }
+    }
+    conn.execute(
+        "INSERT INTO cp_external_identity (id, provider, subject, user_id, payload)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET
+            provider = excluded.provider,
+            subject = excluded.subject,
+            user_id = excluded.user_id,
+            payload = excluded.payload",
+        params![
+            identity.id.as_str(),
+            identity.provider,
+            identity.subject,
+            identity.user.as_str(),
+            encode(identity)?,
+        ],
+    )
+    .map_err(backend)?;
+    Ok(())
+}
+
+fn sql_external_identity(
+    conn: &Connection,
+    provider: &str,
+    subject: &str,
+) -> Result<Option<ExternalIdentity>, CloudStoreError> {
+    let payload: Option<String> = conn
+        .query_row(
+            "SELECT payload FROM cp_external_identity WHERE provider = ?1 AND subject = ?2",
+            params![provider, subject],
             |r| r.get(0),
         )
         .optional()
@@ -1423,25 +1667,7 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
     }
 
     fn put_external_identity(&self, identity: &ExternalIdentity) -> Result<(), CloudStoreError> {
-        let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO cp_external_identity (id, provider, subject, user_id, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(id) DO UPDATE SET
-                provider = excluded.provider,
-                subject = excluded.subject,
-                user_id = excluded.user_id,
-                payload = excluded.payload",
-            params![
-                identity.id.as_str(),
-                identity.provider,
-                identity.subject,
-                identity.user.as_str(),
-                encode(identity)?,
-            ],
-        )
-        .map_err(backend)?;
-        Ok(())
+        sql_put_external_identity(&*self.lock()?, identity)
     }
 
     fn external_identity(
@@ -1449,16 +1675,7 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         provider: &str,
         subject: &str,
     ) -> Result<Option<ExternalIdentity>, CloudStoreError> {
-        let conn = self.lock()?;
-        let payload: Option<String> = conn
-            .query_row(
-                "SELECT payload FROM cp_external_identity WHERE provider = ?1 AND subject = ?2",
-                params![provider, subject],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(backend)?;
-        payload.map(|p| parse(&p)).transpose()
+        sql_external_identity(&*self.lock()?, provider, subject)
     }
 
     fn external_identities_for_user(
@@ -1833,6 +2050,7 @@ mod tests {
     use super::*;
     use crate::ids::{ExternalIdentityId, MembershipId};
     use crate::rbac::{Action, Role};
+    use std::sync::Arc;
 
     fn user(id: &str, email: &str) -> User {
         User {
@@ -2142,6 +2360,89 @@ mod tests {
         idempotent_transaction_contract(&SqliteControlPlaneStore::open_in_memory().unwrap());
     }
 
+    /// The in-transaction external-identity seam: an attach is visible in the
+    /// same transaction, a refusal rolls the attach back, and a second row
+    /// for a bound `(provider, subject)` is refused typed so a subject can
+    /// never silently change owners.
+    fn external_identity_transaction_contract(store: &dyn ControlPlaneStore) {
+        let identity = ExternalIdentity {
+            id: ExternalIdentityId::try_new("ext_tx_00000000000000000000000000000001").unwrap(),
+            user: UserId::try_new("usr_tx_owner").unwrap(),
+            provider: "idp.example".into(),
+            subject: "sub-1".into(),
+            created_ms: 5,
+        };
+        let executed = store
+            .execute_idempotent("tx-ext-1", "link", "d", 5, &mut |tx| {
+                assert!(tx.external_identity("idp.example", "sub-1")?.is_none());
+                tx.put_external_identity(&identity)?;
+                let seen = tx
+                    .external_identity("idp.example", "sub-1")?
+                    .expect("visible inside the same transaction");
+                assert_eq!(seen, identity);
+                Ok(serde_json::json!({"ok": true}))
+            })
+            .unwrap();
+        assert!(matches!(executed, IdempotentOutcome::Executed(_)));
+        assert_eq!(
+            store
+                .external_identity("idp.example", "sub-1")
+                .unwrap()
+                .unwrap(),
+            identity
+        );
+
+        // A refusal rolls the attach back with the rest of the transaction.
+        let refused = store
+            .execute_idempotent("tx-ext-2", "link", "d", 5, &mut |tx| {
+                tx.put_external_identity(&ExternalIdentity {
+                    id: ExternalIdentityId::try_new("ext_tx_00000000000000000000000000000002")
+                        .unwrap(),
+                    user: UserId::try_new("usr_tx_owner").unwrap(),
+                    provider: "idp.example".into(),
+                    subject: "sub-2".into(),
+                    created_ms: 5,
+                })?;
+                Err(ControlPlaneError::Unauthorized("refused".into()))
+            })
+            .unwrap_err();
+        assert!(matches!(refused, ControlPlaneError::Unauthorized(_)));
+        assert!(store
+            .external_identity("idp.example", "sub-2")
+            .unwrap()
+            .is_none());
+
+        // A different id may not claim an already-bound subject.
+        let stolen = ExternalIdentity {
+            id: ExternalIdentityId::try_new("ext_tx_00000000000000000000000000000003").unwrap(),
+            user: UserId::try_new("usr_tx_thief").unwrap(),
+            provider: "idp.example".into(),
+            subject: "sub-1".into(),
+            created_ms: 6,
+        };
+        let error = store.put_external_identity(&stolen).unwrap_err();
+        assert!(matches!(error, CloudStoreError::Malformed(_)));
+        assert_eq!(
+            store
+                .external_identity("idp.example", "sub-1")
+                .unwrap()
+                .unwrap()
+                .user
+                .as_str(),
+            "usr_tx_owner"
+        );
+    }
+
+    #[test]
+    fn memory_store_external_identity_transaction_contract() {
+        external_identity_transaction_contract(&MemoryControlPlaneStore::new());
+    }
+
+    #[test]
+    fn sqlite_store_external_identity_transaction_contract() {
+        external_identity_transaction_contract(&SqliteControlPlaneStore::open_in_memory().unwrap());
+    }
+
     #[test]
     fn memory_store_roundtrip() {
         roundtrip(&MemoryControlPlaneStore::new());
@@ -2196,5 +2497,199 @@ mod tests {
             store.user(&UserId::try_new("usr_1").unwrap()).unwrap_err(),
             CloudStoreError::Malformed(_)
         ));
+    }
+
+    // ------------------------------------------------ commercial durability
+
+    #[test]
+    fn file_backed_open_is_full_synchronous_and_records_the_policy_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.db");
+        let store = SqliteControlPlaneStore::open(&path).unwrap();
+        {
+            let conn = store.lock().unwrap();
+            let sync: i64 = conn
+                .query_row("PRAGMA synchronous", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(sync, 2, "the writer connection is synchronous=FULL");
+        }
+        let report = store.durability_report(false).unwrap();
+        assert_eq!(report.journal_mode, "wal");
+        let policy = report.policy.expect("the policy marker is recorded");
+        assert_eq!(
+            policy
+                .iter()
+                .find(|(k, _)| k == "synchronous")
+                .map(|(_, v)| v.as_str()),
+            Some("FULL")
+        );
+        assert_eq!(
+            policy
+                .iter()
+                .find(|(k, _)| k == "backup_policy")
+                .map(|(_, v)| v.as_str()),
+            Some("rotating")
+        );
+        assert!(report.integrity.is_empty(), "fresh database is intact");
+        assert!(
+            report.last_backup.is_some(),
+            "the first open writes a verified rotating backup"
+        );
+    }
+
+    /// Crash-mid-migration: the injected failure fires AFTER the pre-migration
+    /// restore point and BEFORE any migration SQL. The database must stay at
+    /// the old version, the restore point must exist and restore-verify, and
+    /// `doctor` must report it.
+    #[test]
+    fn migration_crash_leaves_a_verified_restore_point_doctor_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.db");
+        drop(SqliteControlPlaneStore::open(&path).unwrap());
+        // Roll the cursor back one version so the next open has a pending
+        // migration (the tables are already there; the transition is the
+        // crash point under test).
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA user_version = 4").unwrap();
+        }
+        inject_crash_before_migration();
+        let err = SqliteControlPlaneStore::open(&path)
+            .err()
+            .expect("the injected crash must fail the open");
+        assert!(
+            err.to_string().contains("injected crash"),
+            "the failure is the injected crash: {err}"
+        );
+        // The database is untouched at v4.
+        {
+            let conn = Connection::open(&path).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 4, "no migration ran without its restore point");
+        }
+        let report = crate::durability::doctor_probe(&path, false).unwrap();
+        let (point, _) = report
+            .migration_restore_point
+            .expect("doctor reports the pre-migration restore point");
+        assert!(
+            point
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("-pre-migration-v4-"),
+            "the restore point names the version it protects: {}",
+            point.display()
+        );
+        // The restore point is a real v4 database, not a partial copy.
+        let backup =
+            Connection::open_with_flags(&point, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let version: i64 = backup
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        assert!(crate::durability::integrity_check(&backup, true)
+            .unwrap()
+            .is_empty());
+        // A clean re-open completes the migration and records the policy.
+        let store = SqliteControlPlaneStore::open(&path).unwrap();
+        let report = store.durability_report(false).unwrap();
+        assert!(report.policy.is_some());
+    }
+
+    /// The kill proof: the child opens the commercial database, records an
+    /// acknowledged credit grant, prints the ACK + writer pragma, and hangs;
+    /// the parent SIGKILLs it and reopens the database. The acknowledged
+    /// grant must be there. (Kill -9 proves no application-level buffering;
+    /// the `synchronous = FULL` assertion on the WRITER connection is what
+    /// extends that to a power-loss boundary — `NORMAL` can roll back the WAL
+    /// tail of an acknowledged commit.)
+    #[test]
+    fn acknowledged_credit_commit_survives_sigkill_and_reopen() {
+        const CHILD_ENV: &str = "FAKTOR_CP_DURABILITY_CHILD_DB";
+        if let Ok(db_path) = std::env::var(CHILD_ENV) {
+            child_acknowledged_credit_commit(&db_path);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("billing.db");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("store::tests::acknowledged_credit_commit_survives_sigkill_and_reopen")
+            .arg("--nocapture")
+            .env(CHILD_ENV, &path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut lines = std::io::BufRead::lines(std::io::BufReader::new(stdout));
+        let mut ack = None;
+        while let Some(Ok(line)) = lines.next() {
+            if let Some(rest) = line.strip_prefix("ACK ") {
+                ack = Some(rest.to_string());
+                break;
+            }
+        }
+        // SIGKILL the child while it holds the acknowledged commit.
+        child.kill().unwrap();
+        let _ = child.wait();
+        let ack = ack.expect("the child acknowledges its credit commit");
+        assert!(
+            ack.contains("SYNC=2"),
+            "the writer connection was FULL at acknowledgement: {ack}"
+        );
+        let store = SqliteControlPlaneStore::open(&path).unwrap();
+        let service = crate::entitlements::EntitlementService::with_system_clock(
+            Arc::new(store),
+            crate::billing::BillingConfig::default(),
+        )
+        .unwrap();
+        let balance = service
+            .credit_balance(&OrganizationId::try_new("org_durability").unwrap())
+            .unwrap();
+        assert_eq!(
+            balance.granted_micro, 500,
+            "the acknowledged credit grant survived the kill"
+        );
+    }
+
+    /// The child body of the kill test. Never returns: the parent SIGKILLs it
+    /// after the ACK (the bounded loop is only the fail-safe).
+    fn child_acknowledged_credit_commit(db_path: &str) -> ! {
+        let store = SqliteControlPlaneStore::open(std::path::Path::new(db_path)).unwrap();
+        let sync: i64 = {
+            let conn = store.lock().unwrap();
+            conn.query_row("PRAGMA synchronous", [], |r| r.get(0))
+                .unwrap()
+        };
+        let service = crate::entitlements::EntitlementService::with_system_clock(
+            Arc::new(store),
+            crate::billing::BillingConfig::default(),
+        )
+        .unwrap();
+        let organization = OrganizationId::try_new("org_durability").unwrap();
+        let account = crate::ids::BillingAccountId::try_new("acct_durability").unwrap();
+        service
+            .ensure_account(&organization, &account, "local", true)
+            .unwrap();
+        service
+            .grant_credits(
+                &organization,
+                &account,
+                500,
+                "durability test",
+                Some("key-1"),
+            )
+            .unwrap();
+        println!("ACK SYNC={sync}");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        for _ in 0..600 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::process::exit(2);
     }
 }

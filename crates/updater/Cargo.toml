@@ -9,6 +9,7 @@ rust-version.workspace = true
 faktor-core.workspace = true
 faktor-fs.workspace = true
 faktor-provider.workspace = true
+faktor-cloud.workspace = true
 async-trait = "0.1"
 base64 = "0.22"
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }

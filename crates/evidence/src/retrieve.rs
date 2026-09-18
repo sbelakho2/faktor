@@ -931,7 +931,7 @@ mod tests {
     #[test]
     fn policy_of_exposes_the_envelope_policy() {
         let store = store_with(1, b"abc", open(9));
-        let stored = store.get(EvidenceId(1)).unwrap();
+        let stored = store.get(EvidenceId(1)).unwrap().unwrap();
         assert_eq!(policy_of(&stored), open(9));
     }
 }

@@ -1047,7 +1047,7 @@ mod tests {
     /// logical payload streamed through [`Scanner`] with bounded memory;
     /// the secret lands at logical byte 5 GiB and must be found.
     #[test]
-    #[ignore]
+    #[ignore = "[soak] 10 GiB logical payload stream with bounded memory — release-only manual soak"]
     fn soak_ten_gib_logical_stream_stays_bounded() {
         let policy = ScanPolicy::default();
         let chunk = vec![b'n'; 64 * 1024];
@@ -1083,8 +1083,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    fn perf_ten_gib_real_bytes_stream_bounded_memory() {
+    #[ignore = "[soak] 10 GiB of real bytes streamed through the scanner with bounded memory — release-only manual soak"]
+    fn soak_ten_gib_real_bytes_stream_bounded_memory() {
         // Manual soak: 10 GiB of REAL bytes through the engine.
         let policy = ScanPolicy::default();
         let mut scanner = Scanner::new(&policy);

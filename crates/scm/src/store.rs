@@ -351,31 +351,58 @@ const SCM_MIGRATIONS: &[&str] = &[
         until_ms INTEGER NOT NULL,
         observed_ms INTEGER NOT NULL
      );",
+    // v2 — the durability policy marker (P1 audit): the writer RECORDS the
+    // acknowledged-durability policy (`synchronous = FULL`) so `doctor` can
+    // observe it (SQLite pragmas are connection-scoped and invisible to a
+    // separate probe connection). Owned by the durability stack
+    // (`faktor_cloud::durability`), the same marker cloud records.
+    faktor_cloud::durability::POLICY_SCHEMA_V5,
 ];
 
 impl SqliteScmStore {
-    /// Open (creating) the SCIM database at `path` and apply migrations.
+    /// Open (creating) the SCM database at `path` and apply migrations.
+    ///
+    /// Durability policy (P1 audit; the [`faktor_cloud::durability`] stack):
+    /// the writer connection opens `synchronous = FULL`, file-backed opens
+    /// record the policy marker, write a VERIFIED pre-migration restore point
+    /// before any schema transition away from an existing version, and run
+    /// the interval-gated rotating backup.
     pub fn open(path: &Path) -> Result<Self, ScmStoreError> {
         let conn = Connection::open(path).map_err(backend)?;
-        Self::prepare(conn)
+        Self::prepare(conn, Some(path))
     }
 
     /// Open an in-memory database (tests, ephemeral hosts).
     pub fn open_in_memory() -> Result<Self, ScmStoreError> {
         let conn = Connection::open_in_memory().map_err(backend)?;
-        Self::prepare(conn)
+        Self::prepare(conn, None)
     }
 
-    fn prepare(conn: Connection) -> Result<Self, ScmStoreError> {
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             PRAGMA busy_timeout = 5000;
-             PRAGMA foreign_keys = ON;",
-        )
-        .map_err(backend)?;
+    fn prepare(conn: Connection, path: Option<&Path>) -> Result<Self, ScmStoreError> {
+        // The acknowledged-durability policy (WAL + synchronous = FULL; see
+        // `faktor_cloud::durability` for the documented choice) applies to
+        // EVERY open, in-memory included, before any migration or query.
+        faktor_cloud::durability::apply_policy(&conn).map_err(durability)?;
         let mut conn = conn;
-        migrate(&mut conn)?;
+        migrate(&mut conn, path)?;
+        if let Some(path) = path {
+            let now = faktor_cloud::durability::now_ms();
+            // Record the writer's policy for `doctor` (best effort: a full
+            // disk must not take SCM down; doctor then reports the
+            // absent/stale marker loudly).
+            if let Err(e) = faktor_cloud::durability::record_open_policy(&conn, now) {
+                tracing::error!("scm durability marker not recorded: {e}");
+            }
+            // Interval-gated verified backup. Best effort, like the daemon's
+            // startup backup.
+            match faktor_cloud::durability::rotate_backup(&conn, path) {
+                Ok(Some(dest)) => {
+                    tracing::info!("scm backup written to {}", dest.display());
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("scm backup skipped: {e}"),
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -392,10 +419,36 @@ fn backend(e: rusqlite::Error) -> ScmStoreError {
     ScmStoreError::Backend(e.to_string())
 }
 
-fn migrate(conn: &mut Connection) -> Result<(), ScmStoreError> {
+fn durability(e: faktor_cloud::CloudStoreError) -> ScmStoreError {
+    ScmStoreError::Backend(e.to_string())
+}
+
+fn migrate(conn: &mut Connection, db_path: Option<&Path>) -> Result<(), ScmStoreError> {
     let mut version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(backend)?;
+    if version >= SCM_MIGRATIONS.len() as i64 {
+        return Ok(());
+    }
+    // A schema transition on an EXISTING database is irreversible structural
+    // work: before the first pending migration runs, a verified pre-migration
+    // restore point must be durable. If it cannot be written and
+    // restore-verified, the migration is REFUSED (open fails).
+    if version > 0 {
+        if let Some(path) = db_path {
+            faktor_cloud::durability::migration_backup(conn, path, version).map_err(|e| {
+                ScmStoreError::Backend(format!(
+                    "refusing migration without a verified pre-migration restore point: {e}"
+                ))
+            })?;
+            #[cfg(test)]
+            if take_injected_crash(path) {
+                return Err(ScmStoreError::Backend(
+                    "injected crash after the pre-migration restore point".into(),
+                ));
+            }
+        }
+    }
     for (i, sql) in SCM_MIGRATIONS.iter().enumerate() {
         let target = (i + 1) as i64;
         if version >= target {
@@ -412,6 +465,31 @@ fn migrate(conn: &mut Connection) -> Result<(), ScmStoreError> {
         version = target;
     }
     Ok(())
+}
+
+/// Test-only one-shot: make the NEXT migration of exactly `db_path` fail
+/// AFTER the pre-migration restore point and BEFORE any migration SQL,
+/// reproducing the crash-mid-migration durable state. Keyed by path so
+/// concurrent tests never consume each other's injection.
+#[cfg(test)]
+static MIGRATION_CRASH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// Arm [`MIGRATION_CRASH`] for `db_path` (one-shot; tests only).
+#[cfg(test)]
+fn inject_crash_before_migration(db_path: &Path) {
+    *MIGRATION_CRASH.lock().unwrap() = Some(db_path.to_path_buf());
+}
+
+/// Consume the one-shot injection when it targets `db_path`.
+#[cfg(test)]
+fn take_injected_crash(db_path: &Path) -> bool {
+    let mut armed = MIGRATION_CRASH.lock().unwrap();
+    if armed.as_deref() == Some(db_path) {
+        *armed = None;
+        true
+    } else {
+        false
+    }
 }
 
 fn installation_from_row(r: &rusqlite::Row<'_>) -> Result<InstallationRow, rusqlite::Error> {
@@ -706,6 +784,256 @@ impl ScmStore for SqliteScmStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P1 durability: the commercial SCM writer connection acknowledges a
+    /// commit only after an fsync (`synchronous = FULL`), so a crash/power
+    /// loss cannot roll back an acknowledged repository/webhook mutation.
+    #[test]
+    fn commercial_writer_connection_is_synchronous_full() {
+        let store = SqliteScmStore::open_in_memory().unwrap();
+        let conn = store.lock().unwrap();
+        let sync: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync, 2, "synchronous = FULL on the writer connection");
+    }
+
+    /// A file-backed open records the writer policy marker `doctor` reads and
+    /// writes a first restore-verified rotating backup.
+    #[test]
+    fn file_backed_open_records_the_policy_marker_and_a_verified_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scm.db");
+        let store = SqliteScmStore::open(&path).unwrap();
+        drop(store);
+        let report = faktor_cloud::durability::doctor_probe(&path, false).unwrap();
+        assert_eq!(report.journal_mode, "wal");
+        assert!(report.integrity.is_empty(), "{:?}", report.integrity);
+        let policy = report.policy.expect("the policy marker is recorded");
+        for (key, value) in [
+            ("synchronous", "FULL"),
+            ("backup_policy", "rotating"),
+            ("policy_version", "1"),
+        ] {
+            assert_eq!(
+                policy
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.as_str()),
+                Some(value),
+                "marker key {key}"
+            );
+        }
+        let (backup, _) = report
+            .last_backup
+            .expect("the first open writes a verified rotating backup");
+        let expected = {
+            let conn = Connection::open(&path).unwrap();
+            faktor_cloud::durability::canonical_fingerprint(&conn).unwrap()
+        };
+        faktor_cloud::durability::restore_verify(&backup, &expected).unwrap();
+    }
+
+    /// Adversarial: more verified snapshots than the retention bound. The
+    /// rotation must bound the kept set, and the newest must still verify.
+    #[test]
+    fn verified_backups_rotate_within_both_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scm.db");
+        let store = SqliteScmStore::open(&path).unwrap();
+        let conn = store.lock().unwrap();
+        for _ in 0..(faktor_cloud::durability::MAX_BACKUP_FILES + 4) {
+            let dest = faktor_cloud::durability::force_backup(&conn, &path).unwrap();
+            let fp = faktor_cloud::durability::canonical_fingerprint(&conn).unwrap();
+            faktor_cloud::durability::restore_verify(&dest, &fp).unwrap();
+        }
+        let kept = faktor_cloud::durability::list_rotating_backups(&path);
+        assert_eq!(
+            kept.len(),
+            faktor_cloud::durability::MAX_BACKUP_FILES,
+            "the rotating set is bounded"
+        );
+        let newest = kept.first().expect("a rotating backup is kept");
+        let fp = faktor_cloud::durability::canonical_fingerprint(&conn).unwrap();
+        faktor_cloud::durability::restore_verify(newest, &fp).unwrap();
+        // Migration restore points are a separate class: never rotated as
+        // rotating backups.
+        faktor_cloud::durability::migration_backup(&conn, &path, 1).unwrap();
+        assert_eq!(
+            faktor_cloud::durability::list_rotating_backups(&path).len(),
+            faktor_cloud::durability::MAX_BACKUP_FILES
+        );
+        assert!(faktor_cloud::durability::latest_migration_backup(&path).is_some());
+    }
+
+    /// Crash-mid-migration: the injected failure fires AFTER the
+    /// pre-migration restore point and BEFORE any migration SQL. The database
+    /// must stay at the old version, the restore point must exist and
+    /// restore-verify, and `doctor` must report it.
+    #[test]
+    fn migration_crash_leaves_a_verified_restore_point_doctor_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scm.db");
+        drop(SqliteScmStore::open(&path).unwrap());
+        // Roll the cursor back one version so the next open has a pending
+        // migration (the tables are already there; the transition is the
+        // crash point under test).
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA user_version = 1").unwrap();
+        }
+        inject_crash_before_migration(&path);
+        let err = SqliteScmStore::open(&path)
+            .err()
+            .expect("the injected crash must fail the open");
+        assert!(
+            err.to_string().contains("injected crash"),
+            "the failure is the injected crash: {err}"
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 1, "no migration ran without its restore point");
+        }
+        let report = faktor_cloud::durability::doctor_probe(&path, false).unwrap();
+        let (point, _) = report
+            .migration_restore_point
+            .expect("doctor reports the pre-migration restore point");
+        assert!(
+            point
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("-pre-migration-v1-"),
+            "the restore point names the version it protects: {}",
+            point.display()
+        );
+        // The restore point is a real v1 database, not a partial copy.
+        let backup =
+            Connection::open_with_flags(&point, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let version: i64 = backup
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        assert!(faktor_cloud::durability::integrity_check(&backup, true)
+            .unwrap()
+            .is_empty());
+        // A clean re-open completes the migration and records the policy.
+        drop(SqliteScmStore::open(&path).unwrap());
+        let report = faktor_cloud::durability::doctor_probe(&path, false).unwrap();
+        assert!(report.policy.is_some());
+    }
+
+    /// Adversarial: when the pre-migration restore point CANNOT be written,
+    /// the migration is refused and the database stays at the old version —
+    /// never a schema change without a way back.
+    #[test]
+    fn migration_is_refused_when_the_restore_point_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scm.db");
+        drop(SqliteScmStore::open(&path).unwrap());
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA user_version = 1").unwrap();
+        }
+        // Block the backup directory: a regular file where the directory must
+        // be makes every restore-point write impossible.
+        let blocked = faktor_cloud::durability::backup_dir(&path);
+        let _ = std::fs::remove_dir_all(&blocked);
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let err = SqliteScmStore::open(&path)
+            .err()
+            .expect("a migration without its restore point must be refused");
+        assert!(
+            err.to_string()
+                .contains("refusing migration without a verified pre-migration restore point"),
+            "the refusal is typed and names the gate: {err}"
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 1, "the refused migration never ran");
+        }
+        // Unblock: the same open now migrates and records the policy.
+        std::fs::remove_file(&blocked).unwrap();
+        drop(SqliteScmStore::open(&path).unwrap());
+        let report = faktor_cloud::durability::doctor_probe(&path, false).unwrap();
+        assert!(report.policy.is_some());
+    }
+
+    /// The kill proof: the child opens the SCM database, records an
+    /// acknowledged webhook claim, prints the ACK + writer pragma, and hangs;
+    /// the parent SIGKILLs it and reopens. The acknowledged claim must be
+    /// there (a redelivery is a durable Duplicate, not a Fresh claim).
+    #[test]
+    fn acknowledged_webhook_claim_survives_sigkill_and_reopen() {
+        const CHILD_ENV: &str = "FAKTOR_SCM_DURABILITY_CHILD_DB";
+        if let Ok(db_path) = std::env::var(CHILD_ENV) {
+            child_acknowledged_webhook_claim(&db_path);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scm.db");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("store::tests::acknowledged_webhook_claim_survives_sigkill_and_reopen")
+            .arg("--nocapture")
+            .env(CHILD_ENV, &path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut lines = std::io::BufRead::lines(std::io::BufReader::new(stdout));
+        let mut ack = None;
+        while let Some(Ok(line)) = lines.next() {
+            if let Some(rest) = line.strip_prefix("ACK ") {
+                ack = Some(rest.to_string());
+                break;
+            }
+        }
+        child.kill().unwrap();
+        let _ = child.wait();
+        let ack = ack.expect("the child acknowledges its webhook claim");
+        assert!(
+            ack.contains("SYNC=2"),
+            "the writer connection was FULL at acknowledgement: {ack}"
+        );
+        let store = SqliteScmStore::open(&path).unwrap();
+        assert_eq!(
+            store
+                .claim_webhook_delivery("kill-delivery", "push", 7)
+                .unwrap(),
+            DeliveryClaim::Duplicate { first_seen_ms: 7 },
+            "the acknowledged claim survived the kill"
+        );
+    }
+
+    /// The child body of the kill test. Never returns: the parent SIGKILLs it
+    /// after the ACK (the bounded loop is only the fail-safe).
+    fn child_acknowledged_webhook_claim(db_path: &str) -> ! {
+        let store = SqliteScmStore::open(Path::new(db_path)).unwrap();
+        let sync: i64 = {
+            let conn = store.lock().unwrap();
+            conn.query_row("PRAGMA synchronous", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            store
+                .claim_webhook_delivery("kill-delivery", "push", 7)
+                .unwrap(),
+            DeliveryClaim::Fresh
+        );
+        println!("ACK SYNC={sync}");
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
 
     fn installation() -> InstallationRow {
         InstallationRow {

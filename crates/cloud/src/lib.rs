@@ -26,6 +26,7 @@
 
 pub mod billing;
 pub mod billing_store;
+pub mod durability;
 pub mod enterprise;
 pub mod enterprise_store;
 pub mod entitlements;
@@ -90,7 +91,7 @@ pub use model::{
 };
 pub use oidc::{
     ClaimMapping, CodeExchangeRequest, FakeOidcAdapter, IdTokenExpectations, JwkView, OidcAdapter,
-    OidcClaims, OidcDiscovery, OidcError, OidcMembership, OidcTokenSet, ScimProvisioningSeam,
+    OidcClaims, OidcDiscovery, OidcError, OidcMembership, OidcTokenSet,
 };
 pub use oidc_net::{
     AsyncOidcAdapter, CachedJwksView, ClientAuthMethod, ClientSecret, NetworkOidcAdapter,
@@ -109,8 +110,8 @@ pub use report_schedule::{
 };
 pub use service::{
     sha256_hex, BootstrapResult, Clock, ControlPlane, ExternalLogin, IdentityView,
-    InvitationIssued, ManualClock, MemberView, ServiceAccountIssued, SystemClock,
-    MAX_IDEMPOTENCY_KEY_BYTES, MAX_PAGE,
+    InvitationIssued, ManualClock, MemberView, ServiceAccountIssued, SessionRevocation,
+    SystemClock, MAX_IDEMPOTENCY_KEY_BYTES, MAX_PAGE,
 };
 pub use sso::{SsoLogin, SsoLoginOutcome, SsoStart, MAX_PENDING_SSO_LOGINS, SSO_STATE_TTL_MS};
 pub use store::{

@@ -33,8 +33,15 @@ fn recover_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
-#[allow(dead_code)]
+/// The initialize-handshake read bound: while the handshake has not
+/// completed, the reader accumulates at most this many bytes before it fails
+/// the connection closed. A hostile server cannot force the client to buffer
+/// a multi-megabyte frame before capabilities were even negotiated.
 const MAX_INITIAL_BYTES: usize = 64 * 1024;
+/// Internal (never wire) marker kind a reader-originated failure carries so
+/// [`McpServer::call`] can surface the typed [`ErrorKind::Oversized`] instead
+/// of a generic provider error.
+const OVERSIZED_MARKER: &str = "oversized";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpConfig {
@@ -65,14 +72,16 @@ struct Conn {
     stdin: BufWriter<ChildStdin>,
     next_id: u64,
     pending: HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>,
+    /// False until [`McpServer::initialize`] observed the handshake reply:
+    /// the reader bounds accumulated bytes by [`MAX_INITIAL_BYTES`] while
+    /// false and by [`MAX_RESPONSE_BYTES`] afterwards.
+    handshake_done: bool,
 }
 
 pub struct McpServer {
     name: String,
     conn: Arc<Mutex<Conn>>,
     supervisor: Arc<ProcessSupervisor>,
-    #[allow(dead_code)]
-    cfg: McpConfig,
 }
 
 impl McpServer {
@@ -108,6 +117,7 @@ impl McpServer {
             stdin: BufWriter::new(spawned.stdin),
             next_id: 1,
             pending: HashMap::new(),
+            handshake_done: false,
         }));
         // Reader thread: incremental Content-Length framing; responses are
         // dispatched by id; EOF/kill cleans up. The thread owns stdout, so
@@ -122,7 +132,6 @@ impl McpServer {
             name: cfg.name.clone(),
             conn,
             supervisor,
-            cfg,
         });
         server.initialize().await?;
         Ok(server)
@@ -183,13 +192,25 @@ impl McpServer {
         match tokio::time::timeout(deadline, rx).await {
             Ok(Ok(response)) => {
                 if let Some(err) = response.get("error") {
-                    return Err(Error::new(
+                    // Reader-originated failures are INTERNAL (the error
+                    // object is minted by `read_loop`, never parsed from the
+                    // server's own frame): the oversized marker keeps the
+                    // typed bound failure instead of degrading it to a
+                    // generic provider error.
+                    let kind = if err
+                        .get("data")
+                        .and_then(|data| data.get("faktor_kind"))
+                        .and_then(|kind| kind.as_str())
+                        == Some(OVERSIZED_MARKER)
+                    {
+                        ErrorKind::Oversized
+                    } else {
                         ErrorKind::Provider {
                             code: "mcp".into(),
                             retryable: false,
-                        },
-                        format!("mcp {method}: {err}"),
-                    ));
+                        }
+                    };
+                    return Err(Error::new(kind, format!("mcp {method}: {err}")));
                 }
                 Ok(response
                     .get("result")
@@ -224,6 +245,9 @@ impl McpServer {
             )
             .await?;
         let _ = result;
+        // The handshake reply was observed: from here the reader applies the
+        // full response bound instead of the initial handshake bound.
+        recover_lock(&self.conn).handshake_done = true;
         // Notify initialized (fire and forget; never blocks the runtime).
         let _ = self
             .call(
@@ -344,8 +368,27 @@ fn read_loop(conn: Arc<Mutex<Conn>>, stdout: std::process::ChildStdout) {
             Err(_) => break,
         };
         buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > MAX_RESPONSE_BYTES {
-            break; // hostile server: stop reading
+        if recover_lock(&conn).handshake_done {
+            if buf.len() > MAX_RESPONSE_BYTES {
+                break; // hostile server: stop reading
+            }
+        } else if buf.len() > MAX_INITIAL_BYTES {
+            // The INITIAL handshake read is bounded separately: fail every
+            // pending call with the typed limit (never a multi-megabyte
+            // buffer before capabilities are negotiated) and stop reading.
+            let mut guard = recover_lock(&conn);
+            for (_, tx) in guard.pending.drain() {
+                let _ = tx.send(serde_json::json!({
+                    "error": {
+                        "code": -32002,
+                        "message": format!(
+                            "the initial handshake exceeds the {MAX_INITIAL_BYTES}-byte MAX_INITIAL_BYTES bound"
+                        ),
+                        "data": { "faktor_kind": OVERSIZED_MARKER },
+                    }
+                }));
+            }
+            return;
         }
         // Parse as many complete frames as available.
         loop {
@@ -558,6 +601,59 @@ sys.exit(0)
         let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
         let r = parse_frame(frame.as_bytes());
         assert!(r.is_err());
+    }
+
+    /// The INITIAL handshake read is bounded by `MAX_INITIAL_BYTES`, not the
+    /// 16MB response cap: a server that answers `initialize` with a huge
+    /// frame is refused with the typed bound error NAMING the limit (and the
+    /// child is killed — no orphan), never buffered.
+    #[tokio::test]
+    async fn oversized_initial_handshake_is_refused_typed_and_bounded() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("python3 missing; skipping");
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = ProcessSupervisor::new(cas);
+        let pad = MAX_INITIAL_BYTES * 2;
+        let script = format!(
+            r#"
+import sys, time
+body = ('{{"jsonrpc":"2.0","id":1,"result":{{"pad":"' + 'x' * {pad} + '"}}}}').encode()
+sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+sys.stdout.buffer.write(body)
+sys.stdout.buffer.flush()
+while True:
+    time.sleep(0.05)
+"#
+        );
+        let cfg = McpConfig {
+            name: "oversized-init".into(),
+            command: "python3".into(),
+            args: vec!["-c".into(), script],
+            env: vec![],
+        };
+        let err = match McpServer::connect(cfg, sup.clone()).await {
+            Ok(_) => panic!("an oversized initial handshake must refuse the connection"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind, ErrorKind::Oversized, "{err:?}");
+        assert!(
+            err.message.contains(&MAX_INITIAL_BYTES.to_string()),
+            "the typed error must name the limit: {err:?}"
+        );
+        assert!(
+            err.message.contains("MAX_INITIAL_BYTES"),
+            "the typed error must name the bound: {err:?}"
+        );
+        // Zero orphans: the refused connection's child is killed by Drop.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(sup.reap().is_empty() || sup.registered() == 0);
     }
 
     /// A child that answers exactly one frame, then closes its stdin and

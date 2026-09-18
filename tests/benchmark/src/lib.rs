@@ -1117,7 +1117,7 @@ mod tests {
     /// `RunMetrics` collection, markdown report emission) plugs in here and is
     /// deliberately left unwired: routing policy belongs to the economy crate.
     #[test]
-    #[ignore = "live benchmark lanes are env-gated by FAKTOR_BENCH_LIVE=1"]
+    #[ignore = "[soak] live benchmark lanes, env-gated by FAKTOR_BENCH_LIVE=1 — run explicitly, never in CI"]
     fn live_benchmark_requires_env() {
         if !live_mode() {
             eprintln!("FAKTOR_BENCH_LIVE != 1: live lanes disabled, running nothing");
@@ -1282,7 +1282,7 @@ mod tests {
     /// The `#[ignore]`-gated slow twin: the SAME end-to-end lane over every
     /// corpus entry PLUS the slow-marked entries the normal lane skips.
     #[test]
-    #[ignore = "[slow-lane] corpus end-to-end incl. slow-marked entries — run explicitly"]
+    #[ignore = "[soak] corpus end-to-end incl. slow-marked entries — run explicitly"]
     fn bench_corpus_tasks_end_to_end_slow_entries_twin() {
         let corpus = TaskCorpus::load_embedded().expect("frozen corpus must load");
         let slow_task = inline_task(

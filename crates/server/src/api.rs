@@ -52,7 +52,9 @@ pub fn empty_evidence_store() -> EvidenceStoreHandle {
     )))
 }
 
-const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+/// The daemon's bounded request-body limit (`pub(crate)`: the dedicated
+/// worker-plane listener applies the same bound).
+pub(crate) const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 pub struct ServerDeps {
     pub session: Arc<SessionManager>,
@@ -343,6 +345,29 @@ pub struct ServerHandle {
 
 /// Bind (port 0 = ephemeral) and serve. Returns once listening.
 pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHandle> {
+    drain_chunk_stream(&mut deps);
+    serve_arc(Arc::new(deps), port).await
+}
+
+/// Take and eagerly drain the bounded live chunk stream of one dependency
+/// envelope (idempotent: a second call is a no-op). The native surface is
+/// durable and journal-driven (clients page `/native/events` and
+/// `/native/messages`), so there is no live subscriber to fan out to; the
+/// bounded channel is consumed eagerly so the agent's coalescing sink never
+/// blocks on a dead consumer. Hosts that start a SECOND listener over the
+/// same deps (the worker plane) call this once before sharing the `Arc`.
+pub fn drain_chunk_stream(deps: &mut ServerDeps) {
+    if let Some(mut rx) = deps.chunk_rx.take() {
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    }
+}
+
+/// Arc-taking twin of [`serve`]: lets a host run the dedicated worker-plane
+/// listener over the SAME [`ServerDeps`] authority (ONE session/worker graph,
+/// two listeners) without constructing a second dependency envelope. The
+/// caller must have drained the chunk stream already (see
+/// [`drain_chunk_stream`]); [`serve`] does that itself.
+pub async fn serve_arc(deps: Arc<ServerDeps>, port: u16) -> std::io::Result<ServerHandle> {
     // Bind first, then compute the line (needs the bound address) and
     // finally move the deps into the router.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
@@ -357,15 +382,6 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
     // false forever: /native/ready answers 503 {ready:false}.
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let set_ready = !deps.simulate_not_ready;
-    // Live chunk path (audit 41): the agent's bounded, coalescing chunk
-    // sink must stay drained, but the native surface is durable and
-    // journal-driven (clients page `/native/events` and `/native/messages`),
-    // so there is no live subscriber to fan out to. The bounded channel is
-    // consumed eagerly so the agent's sink never coalesces under a dead
-    // consumer.
-    if let Some(mut rx) = deps.chunk_rx.take() {
-        tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    }
     let app = Router::new()
         // Faktor Native Protocol v1 (docs/native-protocol.md): the daemon's
         // OWN surface, optimized around this runtime. These handlers speak
@@ -644,6 +660,12 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
         // answers a typed 409 `sso_disabled`.
         .route("/native/sso/start", post(native_sso_start))
         .route("/native/sso/callback", post(native_sso_callback))
+        // Logout (additive): durably revoke the presented control-plane
+        // session. Rides the daemon password (like start/callback) PLUS the
+        // session's own token in `x-faktor-control-token`; a foreign session
+        // id is the same typed 404 a missing one answers, and a second
+        // logout is the typed idempotent replay.
+        .route("/native/sso/logout", post(native_sso_logout))
         // Enterprise plane (additive; disabled by default): retention
         // artifacts + guarded GC, the audit-ledger cursor export, deletion
         // jobs, admin settings and the effective-config attestation. Every
@@ -690,7 +712,7 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
         )
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .with_state(AppState {
-            deps: Arc::new(deps),
+            deps,
             auth: Arc::new(std::sync::RwLock::new(None)),
             terminal_events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             next_terminal_event_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),

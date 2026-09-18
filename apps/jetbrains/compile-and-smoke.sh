@@ -44,8 +44,10 @@ $JETBRAINS/backend/src/test/kotlin/dev/faktor/backend/NativeClientTest.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/FrontendTestSupport.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/FrontendSmoke.kt
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/ControlPlaneCredentialSmoke.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt"
 FRONTEND_SRC="$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorFrontendService.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/ControlPlaneCredentials.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/PanelSupport.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/PixelAgents.kt
@@ -241,6 +243,9 @@ run_smoke NativeBridgeSmoke dev.faktor.backend.NativeBridgeSmoke || exit $?
 
 echo "[compile-and-smoke] running FrontendSmoke (panels + canned native JSON + real daemon) against $BIN"
 run_smoke FrontendSmoke dev.faktor.frontend.FrontendSmoke
+
+echo "[compile-and-smoke] running ControlPlaneCredentialSmoke (fake PasswordSafe rows) against $BIN"
+run_smoke ControlPlaneCredentialSmoke dev.faktor.frontend.ControlPlaneCredentialSmoke || exit $?
 
 echo "[compile-and-smoke] running JetBrainsParitySmoke (pin hashes + fake daemon + real daemon parity) against $BIN"
 run_smoke JetBrainsParitySmoke dev.faktor.frontend.JetBrainsParitySmoke

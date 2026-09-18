@@ -34,7 +34,7 @@ use faktor_tests_coding_benchmark::daemon::{run_corpus_real, DaemonBenchConfig};
 use faktor_tests_coding_benchmark::Corpus;
 
 #[test]
-#[ignore = "[real-model] drives the actual daemon against a real provider (needs FAKTOR_BENCH_PROVIDER/MODEL/API_KEY + a built faktor-cli binary); run explicitly, never in CI"]
+#[ignore = "[soak] drives the actual daemon against a real provider (needs FAKTOR_BENCH_PROVIDER/MODEL/API_KEY + a built faktor-cli binary); run explicitly, never in CI"]
 fn real_model_corpus_run() {
     let (cfg, note) = match DaemonBenchConfig::from_env() {
         Ok(Some(x)) => x,
@@ -174,7 +174,7 @@ fn spawn_stub_provider() -> (
 }
 
 #[test]
-#[ignore = "[real-model mechanics] drives the ACTUAL daemon end to end against a STUB openai-compatible provider (no keys, no money); needs a built faktor-cli binary; run explicitly, never in CI"]
+#[ignore = "[soak] drives the ACTUAL daemon end to end against a STUB openai-compatible provider (no keys, no money); needs a built faktor-cli binary; run explicitly, never in CI"]
 fn real_daemon_mechanics_with_stub_provider() {
     use std::sync::atomic::Ordering;
     use std::time::Duration;

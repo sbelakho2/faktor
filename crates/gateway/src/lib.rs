@@ -19,7 +19,6 @@ pub struct GatewayConfig {
     pub base_url: String,
     pub api_key: Option<String>,
     /// Extra headers forwarded verbatim (e.g. OpenRouter referer/title).
-    #[allow(dead_code)]
     pub extra_headers: Vec<(String, String)>,
     /// Route-by-prefix model mapping: (prefix, target model).
     pub route_prefixes: Vec<(String, String)>,
@@ -224,8 +223,9 @@ mod tests {
 
     #[tokio::test]
     async fn extra_headers_arrive_on_the_chat_completions_request() {
-        // P0: GatewayConfig.extra_headers were dead config — the stream
-        // never applied them. They must land on the wire request verbatim.
+        // Regression guard: configured extra headers must land on the wire
+        // request verbatim, and an explicit authorization header overrides
+        // the configured key.
         let server = MockServer::new();
         server.route(
             "POST",
@@ -400,8 +400,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_transport_canned_sse_drives_the_parser_without_http() {
-        let body =
-            "data: {\"choices\":[{\"delta\":{\"content\":\"canned\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"canned\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         let mock = Arc::new(MockHttpTransport::new(200, body));
         let as_transport: Arc<dyn HttpTransport> = mock.clone();
         let cfg = GatewayConfig {

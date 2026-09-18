@@ -216,13 +216,13 @@ impl ConfigLayer {
                     return Err(LayeredConfigError::Malformed(format!(
                         "policy layer for {} carries a preference value",
                         key.as_str()
-                    )))
+                    )));
                 }
                 (LayerSemantics::Preference, LayerValue::Policy(_)) => {
                     return Err(LayeredConfigError::Malformed(format!(
                         "preference layer for {} carries a policy value",
                         key.as_str()
-                    )))
+                    )));
                 }
             }
         }

@@ -7,20 +7,33 @@
 //!   authorization code (PKCE), verify the ID token against the login's
 //!   nonce, map the verified claims to a membership role and mint ONE
 //!   control-plane session (the plaintext session token is returned exactly
-//!   once).
+//!   once);
+//! - `POST /native/sso/logout` — durably revoke the PRESENTED control-plane
+//!   session: the session's own token rides `x-faktor-control-token` (the
+//!   same header every control-plane principal uses) and the body names the
+//!   `{organization, session_id}` it must own. Revocation is a durable row
+//!   update, never a delete: every later presentation of the token is
+//!   refused 401 by `ControlPlane::authenticate`. The route needs the
+//!   control plane only (not the OIDC adapter): a session minted by
+//!   bootstrap, invitation or SSO is revocable through it. A second logout
+//!   of an already-revoked session is the typed idempotent replay; a
+//!   foreign-organization session id is the same typed 404 a missing one
+//!   answers.
 //!
-//! Both routes ride the daemon password (no control-plane principal exists
-//! yet). With no SSO authority wired every route answers a typed 409
-//! `sso_disabled`; an organization without an enabled `[enterprise]` SSO
-//! configuration answers a typed 409 `sso_not_configured`.
+//! All routes ride the daemon password. With no SSO authority wired,
+//! start/callback answer a typed 409 `sso_disabled`; with no control plane
+//! wired, logout answers a typed 409 `cloud_disabled`; an organization
+//! without an enabled `[enterprise]` SSO configuration answers a typed 409
+//! `sso_not_configured`.
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use faktor_cloud::{OidcError, OrganizationId, SsoConfigRef};
+use faktor_cloud::{AuthSessionId, OidcError, OrganizationId, SsoConfigRef};
 use faktor_protocol::error::ApiError;
 
+use super::control_plane::{control_plane_err, CONTROL_TOKEN_HEADER, MAX_CONTROL_HEADER_BYTES};
 use super::{authed, malformed_body, wire_status};
 use crate::api::AppState;
 
@@ -217,6 +230,79 @@ pub(crate) async fn native_sso_callback(
         }))
         .into_response(),
         Err(e) => wire_status(oidc_err(e)),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SsoLogoutBody {
+    pub(crate) organization: String,
+    pub(crate) session_id: String,
+}
+
+/// The presented control-plane session token (bounded, never logged).
+fn control_token(headers: &HeaderMap) -> Result<&str, ApiError> {
+    headers
+        .get(CONTROL_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= MAX_CONTROL_HEADER_BYTES)
+        .ok_or_else(|| ApiError {
+            code: "unauthorized",
+            message: format!("missing {CONTROL_TOKEN_HEADER} control-plane credential"),
+            http_status: 401,
+            retryable: false,
+        })
+}
+
+/// `POST /native/sso/logout` — durably revoke the presented control-plane
+/// session. The named `{organization, session_id}` must be owned by the
+/// presented token; the durable `revoked_ms` row update kills the token for
+/// every later request (401). Idempotent: a repeat reports
+/// `alreadyRevoked: true`.
+pub(crate) async fn native_sso_logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<SsoLogoutBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return wire_status(malformed_body("invalid sso logout body (strict DTO)")),
+    };
+    let Some(control_plane) = state.deps.control_plane.as_ref() else {
+        return wire_status(ApiError {
+            code: "cloud_disabled",
+            message: "the control plane is disabled (enable the [cloud] section)".into(),
+            http_status: 409,
+            retryable: false,
+        });
+    };
+    let token = match control_token(&headers) {
+        Ok(token) => token,
+        Err(e) => return wire_status(e),
+    };
+    let organization = match parse_organization(&body.organization) {
+        Ok(organization) => organization,
+        Err(e) => return wire_status(e),
+    };
+    let session_id = match AuthSessionId::try_new(body.session_id.clone()) {
+        Ok(session_id) => session_id,
+        Err(e) => return wire_status(control_plane_err(e)),
+    };
+    match control_plane.revoke_session(&organization, &session_id, token) {
+        Ok(outcome) => Json(serde_json::json!({
+            "ok": true,
+            "session": outcome.session.id,
+            "organization": outcome.session.organization,
+            "user": outcome.session.user,
+            "revoked": !outcome.already_revoked,
+            "alreadyRevoked": outcome.already_revoked,
+            "revokedMs": outcome.session.revoked_ms,
+        }))
+        .into_response(),
+        Err(e) => wire_status(control_plane_err(e)),
     }
 }
 

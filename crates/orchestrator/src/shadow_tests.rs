@@ -858,6 +858,127 @@ fn drop_removes_every_live_shadow() {
 }
 
 #[test]
+fn shutdown_retirement_failure_is_reported_and_retried() {
+    // The durable half of graceful retirement can fail: the failure must be
+    // surfaced (report) and the directory retained — never a live row whose
+    // shadow was already removed — and a retry must complete cleanly.
+    let fix = open_fix(default_limits());
+    let shadow = fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
+    fix.shadows.arm_retire_fault();
+    let report = fix.shadows.shutdown();
+    assert_eq!(report.len(), 1, "{report:?}");
+    assert!(report[0].contains("not persisted"), "{report:?}");
+    assert_eq!(shadow_row_of(&fix).state, ShadowRowState::Active);
+    assert!(
+        shadow.root.is_dir(),
+        "the directory is retained, not orphaned"
+    );
+    // The seam fired once: the retry retires durably and removes the dir.
+    let report = fix.shadows.shutdown();
+    assert!(report.is_empty(), "{report:?}");
+    assert_eq!(shadow_row_of(&fix).state, ShadowRowState::Discarded);
+    assert!(!shadow.root.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn shutdown_removal_failure_is_reported_and_reconcile_finishes_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let fix = open_fix(default_limits());
+    let shadow = fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
+    // A directory without write permission cannot unlink its children, so
+    // the removal fails for this (non-root) test process.
+    fs::set_permissions(&shadow.root, fs::Permissions::from_mode(0o555)).unwrap();
+    let report = fix.shadows.shutdown();
+    let removed = !shadow.root.exists();
+    let _ = fs::set_permissions(&shadow.root, fs::Permissions::from_mode(0o755));
+    if removed {
+        // Root ignores directory permissions; the failure cannot be
+        // simulated in this environment.
+        eprintln!("running with permission bypass; removal-failure row skipped");
+        return;
+    }
+    // Record-first: the row IS retired even though the directory survived.
+    assert_eq!(shadow_row_of(&fix).state, ShadowRowState::Discarded);
+    assert_eq!(report.len(), 1, "{report:?}");
+    assert!(report[0].contains("not removed"), "{report:?}");
+    // The next open's reconcile removes the retired directory, exactly once.
+    let actions = fix.shadows.reconcile().unwrap();
+    assert!(
+        actions.iter().any(|a| a.contains("directory removed")),
+        "{actions:?}"
+    );
+    assert!(!shadow.root.exists(), "no orphan dir after reconcile");
+    assert!(
+        fix.shadows.reconcile().unwrap().is_empty(),
+        "the tombstone is never re-discarded"
+    );
+}
+
+#[test]
+fn crash_between_discard_and_persist_reconciles_without_double_discard() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = dir.path().join("user");
+    fs::create_dir_all(&user).unwrap();
+    fs::write(user.join("a.txt"), b"alpha").unwrap();
+    let shadow_id;
+    let session;
+    {
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let ws = manager.create_workspace(user.to_str().unwrap()).unwrap();
+        session = manager
+            .create_session(ws, "crash", "fake", "m")
+            .unwrap()
+            .id();
+        let shadows = ShadowRoots::new(manager.clone(), dir.path().join("shadows"));
+        let shadow = shadows.begin_shadow(session, &user).unwrap();
+        shadow_id = shadow.shadow_id.clone();
+        // Crash window A (remove-first): the directory is gone but the row
+        // was never persisted. Leak the service exactly like a killed
+        // daemon (no Drop).
+        fs::remove_dir_all(&shadow.root).unwrap();
+        std::mem::forget(shadows);
+    }
+    // The next open reconciles the live row whose directory vanished.
+    let manager2 =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let shadows2 = ShadowRoots::new(manager2.clone(), dir.path().join("shadows"));
+    let actions = shadows2.reconcile().unwrap();
+    assert!(
+        actions.iter().any(|a| a.contains("directory gone")),
+        "{actions:?}"
+    );
+    let row = manager2.shadow_row(session).unwrap().expect("tombstone");
+    assert_eq!(row.state, ShadowRowState::Discarded);
+    assert_eq!(row.shadow_id, shadow_id);
+    // A second reconcile is a no-op: no double-discard.
+    assert!(shadows2.reconcile().unwrap().is_empty());
+
+    // Crash window B (record-first): the row is retired but the directory
+    // removal never happened.
+    let shadow = shadows2.begin_shadow(session, &user).unwrap();
+    let mut retired = shadows2.active_shadow(session).unwrap().unwrap();
+    retired.state = ShadowRowState::Discarded;
+    manager2.put_shadow_row(session, &retired).unwrap();
+    assert!(shadow.root.is_dir());
+    let actions = shadows2.reconcile().unwrap();
+    assert!(
+        actions.iter().any(|a| a.contains("directory removed")),
+        "{actions:?}"
+    );
+    assert!(!shadow.root.exists(), "no orphan dir");
+    assert_eq!(
+        manager2.shadow_row(session).unwrap().unwrap().state,
+        ShadowRowState::Discarded
+    );
+    assert!(
+        shadows2.reconcile().unwrap().is_empty(),
+        "no double-discard after the crash window"
+    );
+}
+
+#[test]
 fn reconcile_deterministically_settles_crash_residue() {
     let fix = open_fix(default_limits());
     fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();

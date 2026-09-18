@@ -1,6 +1,6 @@
 //! Static source-authority certification (audit 31/107-109).
 //!
-//! Seven structural invariants are locked by scanning the repository's
+//! Eight structural invariants are locked by scanning the repository's
 //! *production* Rust sources (`crates/*/src`, test modules and out-of-line
 //! `#[cfg(test)] mod` bodies excluded):
 //!
@@ -49,6 +49,16 @@
 //!    artifact: stale bundles, VSIX archives, jars count) outside the
 //!    standard build/cache skip trees; the token literals are assembled at
 //!    runtime so the scanner source cannot exempt itself.
+//! 8. **No secret-shaped product settings** — the IDE apps' settings
+//!    manifests (`apps/**/package.json` contributed properties,
+//!    `apps/**/plugin.xml` name/key attributes, `*.schema.json` /
+//!    `settings.json` schemas) must never declare a key shaped like a
+//!    credential (`*Token`, `*Secret`, `*ApiKey`, `*Credential`, `*Password`,
+//!    provider keys such as `openaiKey`). Credentials belong in the OS/IDE
+//!    secret store (`vscode.SecretStorage` / JetBrains `PasswordSafe`). The
+//!    allowlist is TIGHT — exact (manifest, key) pairs, each with a written
+//!    justification, asserted load-bearing and non-stale — and a planted
+//!    `faktor.someApiKey` setting fails the scan.
 //!
 //! Scanning methodology: per file, comments and string literals are masked
 //! out and every `#[cfg(...)]`-gated item that can never compile in a
@@ -1568,8 +1578,600 @@ mod scans {
     }
 
     // ------------------------------------------------------------------
-    // adversarial tests of the machinery itself
+    // scan 8: secret-shaped product settings (apps)
     // ------------------------------------------------------------------
+
+    /// Skip trees for the settings scan: build outputs, caches, vendored code
+    /// and test resources are not product settings declarations.
+    const SETTING_MANIFEST_SKIP_DIRS: &[&str] =
+        &["node_modules", "build", "out", ".gradle", "target", ".git"];
+
+    /// Files that DECLARE product settings. A lockfile, bundle, jar or visual
+    /// baseline is not a settings schema and is deliberately not scanned
+    /// (dependency names may legitimately contain "token" substrings).
+    fn is_setting_manifest(name: &str) -> bool {
+        name == "package.json"
+            || name == "plugin.xml"
+            || name == "settings.json"
+            || name.ends_with(".schema.json")
+    }
+
+    /// Every settings manifest under `apps/`, `/`-normalized.
+    fn walk_setting_manifests() -> Vec<String> {
+        let root = repo_root().join("apps");
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy().to_string();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    if SETTING_MANIFEST_SKIP_DIRS.contains(&name.as_str()) {
+                        continue;
+                    }
+                    stack.push(entry.path());
+                } else if file_type.is_file() && is_setting_manifest(&name) {
+                    let rel = entry
+                        .path()
+                        .strip_prefix(repo_root())
+                        .unwrap_or(&entry.path())
+                        .display()
+                        .to_string();
+                    out.push(normalize_rel(&rel));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The RAW secret-shape matcher: separators and case never matter.
+    /// Families: `*Token`, `*Secret`, `*ApiKey`, `*Credential`, `*Password`,
+    /// the common key-material fragments, and a provider name combined with
+    /// `key` (e.g. `openaiKey`). Non-secret path/size shapes (`tokenBudget`,
+    /// `credentialsPath`, `defaultProvider`) deliberately pass: the scan
+    /// targets credential VALUES, not words containing their stem.
+    fn is_secret_shaped_setting_key(key: &str) -> bool {
+        let normalized: String = key
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if normalized.is_empty() {
+            return false;
+        }
+        const SECRET_SUFFIXES: &[&str] = &["token", "secret", "apikey", "credential", "password"];
+        if SECRET_SUFFIXES
+            .iter()
+            .any(|suffix| normalized.ends_with(suffix))
+        {
+            return true;
+        }
+        const SECRET_FRAGMENTS: &[&str] = &[
+            "clientsecret",
+            "privatekey",
+            "accesskey",
+            "providerkey",
+            "providertoken",
+            "providersecret",
+            "providercredential",
+            "llmkey",
+        ];
+        if SECRET_FRAGMENTS
+            .iter()
+            .any(|fragment| normalized.contains(fragment))
+        {
+            return true;
+        }
+        const PROVIDER_NAMES: &[&str] = &[
+            "openai",
+            "anthropic",
+            "gemini",
+            "googleai",
+            "azure",
+            "bedrock",
+            "vertex",
+            "mistral",
+            "cohere",
+            "groq",
+            "openrouter",
+            "deepseek",
+            "xai",
+            "huggingface",
+            "replicate",
+            "together",
+        ];
+        normalized.ends_with("key") && PROVIDER_NAMES.iter().any(|name| normalized.contains(name))
+    }
+
+    /// The ONLY permitted exceptions: exact (manifest, key) pairs, each with a
+    /// written justification. Keep this list TINY; every entry is asserted
+    /// load-bearing (the key really is declared there and really matches the
+    /// raw matcher) and non-stale by the tests below.
+    const SECRET_SETTING_ALLOWLIST: &[(&str, &str, &str)] = &[(
+        "apps/vscode/package.json",
+        "faktor.controlToken",
+        "DEPRECATED plaintext migration shim: declared only so VS Code surfaces the deprecation \
+         message; the client REFUSES to send it for cloud calls, and the one-shot migration prompt \
+         stores the value in SecretStorage and deletes this setting (the local daemon password path \
+         is separate and unchanged). Removed from this list when the declaration is dropped.",
+    )];
+
+    fn secret_setting_allowlisted(rel: &str, key: &str) -> bool {
+        SECRET_SETTING_ALLOWLIST
+            .iter()
+            .any(|(file, allowed, _)| *file == rel && *allowed == key)
+    }
+
+    /// Minimal JSON value tree; only object member names are retained.
+    enum JsonValue {
+        Object(Vec<(String, JsonValue)>),
+        Array(Vec<JsonValue>),
+        Scalar,
+    }
+
+    fn skip_json_ws(bytes: &[u8], pos: &mut usize) {
+        while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+            *pos += 1;
+        }
+    }
+
+    fn parse_json_string(bytes: &[u8], pos: &mut usize) -> Option<String> {
+        if bytes.get(*pos) != Some(&b'"') {
+            return None;
+        }
+        *pos += 1;
+        let mut out = String::new();
+        while *pos < bytes.len() {
+            match bytes[*pos] {
+                b'"' => {
+                    *pos += 1;
+                    return Some(out);
+                }
+                b'\\' => {
+                    *pos += 1;
+                    let escape = *bytes.get(*pos)?;
+                    *pos += 1;
+                    match escape {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'b' => out.push('\u{0008}'),
+                        b'f' => out.push('\u{000c}'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => {
+                            let hex = bytes.get(*pos..*pos + 4)?;
+                            let text = std::str::from_utf8(hex).ok()?;
+                            let code = u32::from_str_radix(text, 16).ok()?;
+                            out.push(char::from_u32(code)?);
+                            *pos += 4;
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => {
+                    let rest = std::str::from_utf8(&bytes[*pos..]).ok()?;
+                    let ch = rest.chars().next()?;
+                    out.push(ch);
+                    *pos += ch.len_utf8();
+                }
+            }
+        }
+        None
+    }
+
+    fn parse_json_value(bytes: &[u8], pos: &mut usize) -> Option<JsonValue> {
+        skip_json_ws(bytes, pos);
+        match *bytes.get(*pos)? {
+            b'{' => {
+                *pos += 1;
+                let mut members = Vec::new();
+                skip_json_ws(bytes, pos);
+                if bytes.get(*pos) == Some(&b'}') {
+                    *pos += 1;
+                    return Some(JsonValue::Object(members));
+                }
+                loop {
+                    skip_json_ws(bytes, pos);
+                    let key = parse_json_string(bytes, pos)?;
+                    skip_json_ws(bytes, pos);
+                    if bytes.get(*pos) != Some(&b':') {
+                        return None;
+                    }
+                    *pos += 1;
+                    let value = parse_json_value(bytes, pos)?;
+                    members.push((key, value));
+                    skip_json_ws(bytes, pos);
+                    match bytes.get(*pos) {
+                        Some(b',') => *pos += 1,
+                        Some(b'}') => {
+                            *pos += 1;
+                            return Some(JsonValue::Object(members));
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b'[' => {
+                *pos += 1;
+                let mut items = Vec::new();
+                skip_json_ws(bytes, pos);
+                if bytes.get(*pos) == Some(&b']') {
+                    *pos += 1;
+                    return Some(JsonValue::Array(items));
+                }
+                loop {
+                    items.push(parse_json_value(bytes, pos)?);
+                    skip_json_ws(bytes, pos);
+                    match bytes.get(*pos) {
+                        Some(b',') => *pos += 1,
+                        Some(b']') => {
+                            *pos += 1;
+                            return Some(JsonValue::Array(items));
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b'"' => {
+                parse_json_string(bytes, pos)?;
+                Some(JsonValue::Scalar)
+            }
+            _ => {
+                // number / true / false / null: consume the token.
+                let start = *pos;
+                while *pos < bytes.len() && !matches!(bytes[*pos], b',' | b'}' | b']') {
+                    *pos += 1;
+                }
+                if *pos == start {
+                    return None;
+                }
+                Some(JsonValue::Scalar)
+            }
+        }
+    }
+
+    /// Strict whole-document parse; trailing garbage is a parse failure.
+    fn parse_json(text: &str) -> Option<JsonValue> {
+        let bytes = text.as_bytes();
+        let mut pos = 0usize;
+        let value = parse_json_value(bytes, &mut pos)?;
+        skip_json_ws(bytes, &mut pos);
+        if pos != bytes.len() {
+            return None;
+        }
+        Some(value)
+    }
+
+    fn json_member<'a>(value: &'a JsonValue, key: &str) -> Option<&'a JsonValue> {
+        match value {
+            JsonValue::Object(members) => members
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, entry)| entry),
+            _ => None,
+        }
+    }
+
+    fn collect_properties_keys(value: &JsonValue, out: &mut Vec<String>) {
+        let Some(JsonValue::Object(properties)) = json_member(value, "properties") else {
+            return;
+        };
+        for (key, _) in properties {
+            out.push(key.clone());
+        }
+    }
+
+    /// The setting keys a VS Code manifest contributes: `contributes.
+    /// configuration(.properties)` in both the object and the array form.
+    fn json_setting_keys(root: &JsonValue) -> Vec<String> {
+        let mut out = Vec::new();
+        let Some(contributes) = json_member(root, "contributes") else {
+            return out;
+        };
+        let Some(configuration) = json_member(contributes, "configuration") else {
+            return out;
+        };
+        match configuration {
+            JsonValue::Object(_) => collect_properties_keys(configuration, &mut out),
+            JsonValue::Array(items) => {
+                for item in items {
+                    collect_properties_keys(item, &mut out);
+                }
+            }
+            JsonValue::Scalar => {}
+        }
+        out
+    }
+
+    /// `name=` / `key=` attribute values of an XML settings manifest
+    /// (plugin.xml `option name="..."`, setting/config elements).
+    fn xml_setting_attribute_values(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for prefix in ["name=\"", "key=\"", "name='", "key='"] {
+            let quote = prefix.chars().last().unwrap_or('"');
+            let mut pos = 0usize;
+            while let Some(relative) = text[pos..].find(prefix) {
+                let start = pos + relative + prefix.len();
+                let Some(end) = text[start..].find(quote) else {
+                    break;
+                };
+                out.push(text[start..start + end].to_string());
+                pos = start + end + 1;
+            }
+        }
+        out
+    }
+
+    /// Secret-shaped settings of one manifest. An unparseable JSON manifest is
+    /// an OFFENDER (fail-closed): a malformed/hostile manifest must never pass
+    /// silently just because the scan could not read it.
+    fn secret_setting_offenders(rel: &str) -> Vec<String> {
+        let rel = normalize_rel(rel);
+        let path = repo_root().join(&rel);
+        let name = rel.rsplit('/').next().unwrap_or(&rel);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        let keys = if name == "plugin.xml" {
+            xml_setting_attribute_values(&text)
+        } else {
+            match parse_json(&text) {
+                Some(root) => json_setting_keys(&root),
+                None => {
+                    return vec![format!(
+                        "{rel}: settings manifest is not parseable JSON (fail-closed: a malformed \
+                         manifest may hide a secret-shaped setting)"
+                    )];
+                }
+            }
+        };
+        keys.into_iter()
+            .filter(|key| is_secret_shaped_setting_key(key))
+            .filter(|key| !secret_setting_allowlisted(&rel, key))
+            .map(|key| {
+                format!(
+                    "{rel}: secret-shaped product setting {key:?} — credentials must live in the \
+                     OS/IDE secret store (vscode.SecretStorage / JetBrains PasswordSafe), never in \
+                     a product setting"
+                )
+            })
+            .collect()
+    }
+
+    /// The real-tree invariant: every settings manifest under `apps/` declares
+    /// no secret-shaped key outside the documented allowlist.
+    #[test]
+    fn apps_never_declare_secret_shaped_product_settings() {
+        let manifests = walk_setting_manifests();
+        let mut offenders = Vec::new();
+        for rel in &manifests {
+            offenders.extend(secret_setting_offenders(rel));
+        }
+        assert_no_offenders(
+            "secret-shaped product settings: settings manifests (apps/**/package.json, plugin.xml, \
+             *.schema.json, settings.json) must never declare *Token/*Secret/*ApiKey/*Credential/\
+             *Password/provider keys; credentials belong in the OS/IDE secret store",
+            &offenders,
+            manifests.len(),
+            2,
+        );
+        assert!(
+            manifests
+                .iter()
+                .any(|rel| rel == "apps/vscode/package.json"),
+            "the VS Code settings manifest must be walked (walk: {manifests:?})"
+        );
+        assert!(
+            manifests.iter().any(|rel| rel.ends_with("plugin.xml")),
+            "the JetBrains settings manifest must be walked (walk: {manifests:?})"
+        );
+    }
+
+    /// The allowlist stays tight: every entry is exact, justified, declared in
+    /// the real manifest, matches the raw matcher (load-bearing) and does not
+    /// leak into other keys.
+    #[test]
+    fn secret_setting_allowlist_entries_are_documented_and_load_bearing() {
+        assert!(
+            SECRET_SETTING_ALLOWLIST.len() <= 2,
+            "the secret-settings allowlist must stay tiny ({} entries)",
+            SECRET_SETTING_ALLOWLIST.len()
+        );
+        for (file, key, justification) in SECRET_SETTING_ALLOWLIST {
+            assert!(
+                justification.len() >= 40,
+                "allowlist entry {file} {key} needs a real written justification"
+            );
+            assert!(
+                is_secret_shaped_setting_key(key),
+                "allowlist entry {file} {key} must be load-bearing (it must match the raw matcher)"
+            );
+            let path = repo_root().join(file);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("allowlisted manifest missing: {file}"));
+            let declared = if file.ends_with("plugin.xml") {
+                xml_setting_attribute_values(&text)
+            } else {
+                parse_json(&text)
+                    .map(|root| json_setting_keys(&root))
+                    .unwrap_or_default()
+            };
+            assert!(
+                declared.iter().any(|entry| entry == key),
+                "allowlist entry {file} {key} is stale: the key is not declared there"
+            );
+            assert!(
+                secret_setting_offenders(file)
+                    .iter()
+                    .all(|offender| !offender.contains(&format!("{key:?}"))),
+                "the allowlisted key must be the ONLY reason it does not appear as an offender"
+            );
+            assert!(
+                !secret_setting_allowlisted(file, "faktor.someApiKey"),
+                "the allowlist may never widen to a different key in {file}"
+            );
+        }
+    }
+
+    /// Planted-failure proof: a planted `faktor.someApiKey` setting (object and
+    /// array manifest forms, plus a plugin.xml attribute) is flagged, and a
+    /// safe control manifest is not.
+    #[test]
+    fn planted_api_key_setting_fails_the_scan() {
+        let dir = repo_root()
+            .join("target/certification")
+            .join(format!("secret-setting-selfcheck-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("planted settings dir");
+        // Assembled at runtime so this scanner's own source stays clean.
+        let key = ["faktor", "some", "Api", "Key"].join(".");
+        let rel_of = |path: &Path| {
+            normalize_rel(
+                &path
+                    .strip_prefix(repo_root())
+                    .unwrap_or(path)
+                    .display()
+                    .to_string(),
+            )
+        };
+
+        // Object-form VS Code manifest.
+        let object_form = dir.join("object/package.json");
+        std::fs::create_dir_all(object_form.parent().expect("parent")).expect("planted dir");
+        std::fs::write(
+            &object_form,
+            format!(
+                "{{\"name\":\"planted\",\"contributes\":{{\"configuration\":{{\"properties\":\
+                 {{\"{key}\":{{\"type\":\"string\"}}}}}}}}}}"
+            ),
+        )
+        .expect("planted object manifest");
+        let offenders = secret_setting_offenders(&rel_of(&object_form));
+        assert_eq!(
+            offenders.len(),
+            1,
+            "the planted {key} setting must fail the scan: {offenders:?}"
+        );
+        assert!(
+            offenders[0].contains(&key),
+            "the offender must name the planted key: {}",
+            offenders[0]
+        );
+
+        // Array-form VS Code manifest.
+        let array_form = dir.join("array/package.json");
+        std::fs::create_dir_all(array_form.parent().expect("parent")).expect("planted dir");
+        std::fs::write(
+            &array_form,
+            format!(
+                "{{\"name\":\"planted\",\"contributes\":{{\"configuration\":[{{\"title\":\"f\",\
+                 \"properties\":{{\"{key}\":{{\"type\":\"string\"}}}}}}]}}}}"
+            ),
+        )
+        .expect("planted array manifest");
+        assert_eq!(
+            secret_setting_offenders(&rel_of(&array_form)).len(),
+            1,
+            "the array manifest form must be scanned"
+        );
+
+        // plugin.xml attribute form.
+        let xml_form = dir.join("xml/plugin.xml");
+        std::fs::create_dir_all(xml_form.parent().expect("parent")).expect("planted dir");
+        std::fs::write(
+            &xml_form,
+            format!("<idea-plugin><component><option name=\"{key}\" value=\"x\"/></component></idea-plugin>"),
+        )
+        .expect("planted plugin.xml");
+        assert_eq!(
+            secret_setting_offenders(&rel_of(&xml_form)).len(),
+            1,
+            "the plugin.xml attribute form must be scanned"
+        );
+
+        // Safe control: non-secret settings and non-configuration members pass.
+        let safe = dir.join("safe/package.json");
+        std::fs::create_dir_all(safe.parent().expect("parent")).expect("planted dir");
+        std::fs::write(
+            &safe,
+            "{\"name\":\"safe\",\"contributes\":{\"configuration\":{\"properties\":{\
+             \"faktor.binaryPath\":{\"type\":\"string\"},\"faktor.controlPlaneEndpoint\":{\"type\":\"string\"},\
+             \"faktor.mutationMode\":{\"type\":\"string\"}}}}}",
+        )
+        .expect("safe manifest");
+        assert!(
+            secret_setting_offenders(&rel_of(&safe)).is_empty(),
+            "non-secret settings must pass"
+        );
+
+        // A malformed manifest is an offender (fail-closed), never a silent pass.
+        let malformed = dir.join("malformed/package.json");
+        std::fs::create_dir_all(malformed.parent().expect("parent")).expect("planted dir");
+        std::fs::write(&malformed, "{\"contributes\": {\"configuration\": ")
+            .expect("malformed manifest");
+        assert_eq!(
+            secret_setting_offenders(&rel_of(&malformed)).len(),
+            1,
+            "an unparseable manifest must fail closed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The raw matcher's adversarial matrix: every required family fires and
+    /// the documented non-secret shapes pass.
+    #[test]
+    fn secret_setting_matcher_flags_every_required_family() {
+        for key in [
+            "faktor.controlToken",
+            "some_api_key",
+            "accessSecret",
+            "llmCredential",
+            "daemonPassword",
+            "openaiKey",
+            "anthropicApiKey",
+            "provider_token",
+            "clientSecret",
+            "privateKey",
+            "accessKey",
+            "FAKTOR_APIKEY",
+        ] {
+            assert!(
+                is_secret_shaped_setting_key(key),
+                "{key:?} must be flagged as secret-shaped"
+            );
+        }
+        for key in [
+            "faktor.binaryPath",
+            "faktor.dataDir",
+            "faktor.installRoot",
+            "faktor.extraArgs",
+            "faktor.defaultProvider",
+            "faktor.defaultModel",
+            "faktor.mutationMode",
+            "faktor.budgetTokens",
+            "faktor.controlPlaneEndpoint",
+            "faktor.controlPlaneOrganization",
+            "tokenBudget",
+            "credentialsPath",
+            "secretiveNotes",
+            "apiKeyRotationDays",
+            "",
+        ] {
+            assert!(
+                !is_secret_shaped_setting_key(key),
+                "{key:?} is not a credential and must pass"
+            );
+        }
+    }
 
     #[test]
     fn cfg_stripper_removes_every_test_module_shape() {

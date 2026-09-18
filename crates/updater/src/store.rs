@@ -509,30 +509,61 @@ CREATE TABLE IF NOT EXISTS update_high_water (
     updated_ms INTEGER NOT NULL
 );
 ",
+    // v3 — the durability policy marker (P1 audit): the writer RECORDS the
+    // acknowledged-durability policy (`synchronous = FULL`) so `doctor` can
+    // observe it (SQLite pragmas are connection-scoped and invisible to a
+    // separate probe connection). Owned by the durability stack
+    // (`faktor_cloud::durability`), the same marker cloud records.
+    faktor_cloud::durability::POLICY_SCHEMA_V5,
 ];
 
 impl SqliteUpdaterStore {
     /// Open (creating) the updater database at `path`.
+    ///
+    /// Durability policy (P1 audit; the [`faktor_cloud::durability`] stack):
+    /// the writer connection opens `synchronous = FULL`, file-backed opens
+    /// record the policy marker, write a VERIFIED pre-migration restore point
+    /// before any schema transition away from an existing version, and run
+    /// the interval-gated rotating backup.
     pub fn open(path: &Path) -> Result<Self, UpdateStoreError> {
         let conn = rusqlite::Connection::open(path).map_err(backend)?;
-        Self::prepare(conn)
+        Self::prepare(conn, Some(path))
     }
 
     /// Open an in-memory database (tests, ephemeral hosts).
     pub fn open_in_memory() -> Result<Self, UpdateStoreError> {
         let conn = rusqlite::Connection::open_in_memory().map_err(backend)?;
-        Self::prepare(conn)
+        Self::prepare(conn, None)
     }
 
-    fn prepare(conn: rusqlite::Connection) -> Result<Self, UpdateStoreError> {
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             PRAGMA busy_timeout = 5000;",
-        )
-        .map_err(backend)?;
+    fn prepare(conn: rusqlite::Connection, path: Option<&Path>) -> Result<Self, UpdateStoreError> {
+        // The acknowledged-durability policy (WAL + synchronous = FULL; see
+        // `faktor_cloud::durability` for the documented choice) applies to
+        // EVERY open, in-memory included, before any migration or query. The
+        // updater database holds the signed-release high-water floor
+        // (anti-rollback), so the writer connection acknowledges commits only
+        // after an fsync.
+        faktor_cloud::durability::apply_policy(&conn).map_err(durability)?;
         let mut conn = conn;
-        migrate(&mut conn)?;
+        migrate(&mut conn, path)?;
+        if let Some(path) = path {
+            let now = faktor_cloud::durability::now_ms();
+            // Record the writer's policy for `doctor` (best effort: a full
+            // disk must not take the updater down; doctor then reports the
+            // absent/stale marker loudly).
+            if let Err(e) = faktor_cloud::durability::record_open_policy(&conn, now) {
+                tracing::error!("updater durability marker not recorded: {e}");
+            }
+            // Interval-gated verified backup. Best effort, like the daemon's
+            // startup backup.
+            match faktor_cloud::durability::rotate_backup(&conn, path) {
+                Ok(Some(dest)) => {
+                    tracing::info!("updater backup written to {}", dest.display());
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("updater backup skipped: {e}"),
+            }
+        }
         Ok(SqliteUpdaterStore {
             conn: Mutex::new(conn),
         })
@@ -549,10 +580,39 @@ fn backend(e: rusqlite::Error) -> UpdateStoreError {
     UpdateStoreError::Backend(e.to_string())
 }
 
-fn migrate(conn: &mut rusqlite::Connection) -> Result<(), UpdateStoreError> {
+fn durability(e: faktor_cloud::CloudStoreError) -> UpdateStoreError {
+    UpdateStoreError::Backend(e.to_string())
+}
+
+fn migrate(
+    conn: &mut rusqlite::Connection,
+    db_path: Option<&Path>,
+) -> Result<(), UpdateStoreError> {
     let mut version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(backend)?;
+    if version >= UPDATER_MIGRATIONS.len() as i64 {
+        return Ok(());
+    }
+    // A schema transition on an EXISTING database is irreversible structural
+    // work: before the first pending migration runs, a verified pre-migration
+    // restore point must be durable. If it cannot be written and
+    // restore-verified, the migration is REFUSED (open fails).
+    if version > 0 {
+        if let Some(path) = db_path {
+            faktor_cloud::durability::migration_backup(conn, path, version).map_err(|e| {
+                UpdateStoreError::Backend(format!(
+                    "refusing migration without a verified pre-migration restore point: {e}"
+                ))
+            })?;
+            #[cfg(test)]
+            if take_injected_crash(path) {
+                return Err(UpdateStoreError::Backend(
+                    "injected crash after the pre-migration restore point".into(),
+                ));
+            }
+        }
+    }
     for (i, sql) in UPDATER_MIGRATIONS.iter().enumerate() {
         let target = (i + 1) as i64;
         if version >= target {
@@ -569,6 +629,31 @@ fn migrate(conn: &mut rusqlite::Connection) -> Result<(), UpdateStoreError> {
         version = target;
     }
     Ok(())
+}
+
+/// Test-only one-shot: make the NEXT migration of exactly `db_path` fail
+/// AFTER the pre-migration restore point and BEFORE any migration SQL,
+/// reproducing the crash-mid-migration durable state. Keyed by path so
+/// concurrent tests never consume each other's injection.
+#[cfg(test)]
+static MIGRATION_CRASH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// Arm [`MIGRATION_CRASH`] for `db_path` (one-shot; tests only).
+#[cfg(test)]
+fn inject_crash_before_migration(db_path: &Path) {
+    *MIGRATION_CRASH.lock().unwrap() = Some(db_path.to_path_buf());
+}
+
+/// Consume the one-shot injection when it targets `db_path`.
+#[cfg(test)]
+fn take_injected_crash(db_path: &Path) -> bool {
+    let mut armed = MIGRATION_CRASH.lock().unwrap();
+    if armed.as_deref() == Some(db_path) {
+        *armed = None;
+        true
+    } else {
+        false
+    }
 }
 
 fn encode(operation: &UpdateOperation) -> Result<String, UpdateStoreError> {
@@ -801,6 +886,252 @@ impl UpdaterStore for SqliteUpdaterStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P1 durability: the updater database carries the anti-rollback
+    /// high-water floor, so its writer connection acknowledges a commit only
+    /// after an fsync (`synchronous = FULL`): a crash/power loss must not roll
+    /// back a raised release generation.
+    #[test]
+    fn commercial_writer_connection_is_synchronous_full() {
+        let store = SqliteUpdaterStore::open_in_memory().unwrap();
+        let conn = store.lock().unwrap();
+        let sync: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync, 2, "synchronous = FULL on the writer connection");
+    }
+
+    /// A file-backed open records the writer policy marker `doctor` reads and
+    /// writes a first restore-verified rotating backup.
+    #[test]
+    fn file_backed_open_records_the_policy_marker_and_a_verified_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update.db");
+        drop(SqliteUpdaterStore::open(&path).unwrap());
+        let report = faktor_cloud::durability::doctor_probe(&path, false).unwrap();
+        assert_eq!(report.journal_mode, "wal");
+        assert!(report.integrity.is_empty(), "{:?}", report.integrity);
+        let policy = report.policy.expect("the policy marker is recorded");
+        for (key, value) in [
+            ("synchronous", "FULL"),
+            ("backup_policy", "rotating"),
+            ("policy_version", "1"),
+        ] {
+            assert_eq!(
+                policy
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.as_str()),
+                Some(value),
+                "marker key {key}"
+            );
+        }
+        let (backup, _) = report
+            .last_backup
+            .expect("the first open writes a verified rotating backup");
+        let expected = {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            faktor_cloud::durability::canonical_fingerprint(&conn).unwrap()
+        };
+        faktor_cloud::durability::restore_verify(&backup, &expected).unwrap();
+    }
+
+    /// Adversarial: more verified snapshots than the retention bound. The
+    /// rotation must bound the kept set, and the newest must still verify.
+    #[test]
+    fn verified_backups_rotate_within_both_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update.db");
+        let store = SqliteUpdaterStore::open(&path).unwrap();
+        let conn = store.lock().unwrap();
+        for _ in 0..(faktor_cloud::durability::MAX_BACKUP_FILES + 4) {
+            let dest = faktor_cloud::durability::force_backup(&conn, &path).unwrap();
+            let fp = faktor_cloud::durability::canonical_fingerprint(&conn).unwrap();
+            faktor_cloud::durability::restore_verify(&dest, &fp).unwrap();
+        }
+        let kept = faktor_cloud::durability::list_rotating_backups(&path);
+        assert_eq!(
+            kept.len(),
+            faktor_cloud::durability::MAX_BACKUP_FILES,
+            "the rotating set is bounded"
+        );
+        let newest = kept.first().expect("a rotating backup is kept");
+        let fp = faktor_cloud::durability::canonical_fingerprint(&conn).unwrap();
+        faktor_cloud::durability::restore_verify(newest, &fp).unwrap();
+        // Migration restore points are a separate class: never rotated as
+        // rotating backups.
+        faktor_cloud::durability::migration_backup(&conn, &path, 2).unwrap();
+        assert_eq!(
+            faktor_cloud::durability::list_rotating_backups(&path).len(),
+            faktor_cloud::durability::MAX_BACKUP_FILES
+        );
+        assert!(faktor_cloud::durability::latest_migration_backup(&path).is_some());
+    }
+
+    /// Crash-mid-migration: the injected failure fires AFTER the
+    /// pre-migration restore point and BEFORE any migration SQL. The database
+    /// must stay at the old version, the restore point must exist and
+    /// restore-verify, and `doctor` must report it.
+    #[test]
+    fn migration_crash_leaves_a_verified_restore_point_doctor_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update.db");
+        drop(SqliteUpdaterStore::open(&path).unwrap());
+        // Roll the cursor back one version so the next open has a pending
+        // migration (the tables are already there; the transition is the
+        // crash point under test).
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA user_version = 2").unwrap();
+        }
+        inject_crash_before_migration(&path);
+        let err = SqliteUpdaterStore::open(&path)
+            .err()
+            .expect("the injected crash must fail the open");
+        assert!(
+            err.to_string().contains("injected crash"),
+            "the failure is the injected crash: {err}"
+        );
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 2, "no migration ran without its restore point");
+        }
+        let report = faktor_cloud::durability::doctor_probe(&path, false).unwrap();
+        let (point, _) = report
+            .migration_restore_point
+            .expect("doctor reports the pre-migration restore point");
+        assert!(
+            point
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("-pre-migration-v2-"),
+            "the restore point names the version it protects: {}",
+            point.display()
+        );
+        // The restore point is a real v2 database, not a partial copy.
+        let backup = rusqlite::Connection::open_with_flags(
+            &point,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let version: i64 = backup
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        assert!(faktor_cloud::durability::integrity_check(&backup, true)
+            .unwrap()
+            .is_empty());
+        // A clean re-open completes the migration and records the policy.
+        drop(SqliteUpdaterStore::open(&path).unwrap());
+        let report = faktor_cloud::durability::doctor_probe(&path, false).unwrap();
+        assert!(report.policy.is_some());
+    }
+
+    /// Adversarial: when the pre-migration restore point CANNOT be written,
+    /// the migration is refused and the database stays at the old version —
+    /// never a schema change without a way back.
+    #[test]
+    fn migration_is_refused_when_the_restore_point_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update.db");
+        drop(SqliteUpdaterStore::open(&path).unwrap());
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA user_version = 2").unwrap();
+        }
+        // Block the backup directory: a regular file where the directory must
+        // be makes every restore-point write impossible.
+        let blocked = faktor_cloud::durability::backup_dir(&path);
+        let _ = std::fs::remove_dir_all(&blocked);
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let err = SqliteUpdaterStore::open(&path)
+            .err()
+            .expect("a migration without its restore point must be refused");
+        assert!(
+            err.to_string()
+                .contains("refusing migration without a verified pre-migration restore point"),
+            "the refusal is typed and names the gate: {err}"
+        );
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 2, "the refused migration never ran");
+        }
+        // Unblock: the same open now migrates and records the policy.
+        std::fs::remove_file(&blocked).unwrap();
+        drop(SqliteUpdaterStore::open(&path).unwrap());
+        let report = faktor_cloud::durability::doctor_probe(&path, false).unwrap();
+        assert!(report.policy.is_some());
+    }
+
+    /// The kill proof: the child opens the updater database, records an
+    /// acknowledged high-water raise (the anti-rollback floor), prints the
+    /// ACK + writer pragma, and hangs; the parent SIGKILLs it and reopens.
+    /// The acknowledged floor must be there.
+    #[test]
+    fn acknowledged_high_water_raise_survives_sigkill_and_reopen() {
+        const CHILD_ENV: &str = "FAKTOR_UPDATER_DURABILITY_CHILD_DB";
+        if let Ok(db_path) = std::env::var(CHILD_ENV) {
+            child_acknowledged_high_water_raise(&db_path);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update.db");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("store::tests::acknowledged_high_water_raise_survives_sigkill_and_reopen")
+            .arg("--nocapture")
+            .env(CHILD_ENV, &path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut lines = std::io::BufRead::lines(std::io::BufReader::new(stdout));
+        let mut ack = None;
+        while let Some(Ok(line)) = lines.next() {
+            if let Some(rest) = line.strip_prefix("ACK ") {
+                ack = Some(rest.to_string());
+                break;
+            }
+        }
+        child.kill().unwrap();
+        let _ = child.wait();
+        let ack = ack.expect("the child acknowledges its high-water raise");
+        assert!(
+            ack.contains("SYNC=2"),
+            "the writer connection was FULL at acknowledgement: {ack}"
+        );
+        let store = SqliteUpdaterStore::open(&path).unwrap();
+        let mark = store
+            .high_water("stable")
+            .unwrap()
+            .expect("the acknowledged high-water floor survived the kill");
+        assert_eq!(mark.generation, 7);
+    }
+
+    /// The child body of the kill test. Never returns: the parent SIGKILLs it
+    /// after the ACK (the bounded loop is only the fail-safe).
+    fn child_acknowledged_high_water_raise(db_path: &str) -> ! {
+        let store = SqliteUpdaterStore::open(Path::new(db_path)).unwrap();
+        let sync: i64 = {
+            let conn = store.lock().unwrap();
+            conn.query_row("PRAGMA synchronous", [], |r| r.get(0))
+                .unwrap()
+        };
+        let mark = store.raise_high_water("stable", 7, false, 100).unwrap();
+        assert_eq!(mark.generation, 7);
+        println!("ACK SYNC={sync}");
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
 
     fn row(kind: UpdateOpKind, status: UpdateOpStatus, created_ms: i64) -> UpdateOperation {
         let mut operation = UpdateOperation::new(kind, created_ms, None);

@@ -1958,50 +1958,6 @@ fn group_gone(pgid: u32) -> bool {
     false
 }
 
-/// Blocking pipe reads (reader-thread only): drain both streams into the
-/// shared capture until both EOF.
-#[allow(dead_code)]
-fn read_pipes(
-    stdout: Option<std::process::ChildStdout>,
-    stderr: Option<std::process::ChildStderr>,
-    shared: Arc<Mutex<SharedCapture>>,
-) {
-    let mut readers: Vec<Box<dyn Read + Send>> = Vec::new();
-    if let Some(s) = stdout {
-        readers.push(Box::new(s));
-    }
-    if let Some(s) = stderr {
-        readers.push(Box::new(s));
-    }
-    if readers.is_empty() {
-        return;
-    }
-    let mut buf = [0u8; 8192];
-    let mut total = 0usize;
-    loop {
-        let mut progressed = false;
-        readers.retain_mut(|r| match r.read(&mut buf) {
-            Ok(0) => false,
-            Ok(n) => {
-                progressed = true;
-                total += n;
-                shared.lock().unwrap().push(&buf[..n]);
-                true
-            }
-            Err(e) => {
-                eprintln!("reader: error {e:?}");
-                false
-            }
-        });
-        if readers.is_empty() {
-            break;
-        }
-        if !progressed {
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    }
-}
-
 /// Best-effort process-tree kill for a pid this supervisor does NOT own (no
 /// containment row exists, so there is no job to close): `taskkill /T`.
 /// Deliberately an afterthought — it is never the primary guarantee and
