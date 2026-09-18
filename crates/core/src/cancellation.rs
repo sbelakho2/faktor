@@ -429,18 +429,27 @@ mod tests {
     #[test]
     fn many_waiters_all_wake() {
         let t = Arc::new(CancellationToken::new());
+        let woke = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut handles = vec![];
         for _ in 0..32 {
             let t = t.clone();
+            let woke = woke.clone();
             handles.push(thread::spawn(move || {
                 t.wait();
+                woke.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }));
         }
         thread::sleep(Duration::from_millis(20));
-        t.cancel();
+        assert!(t.cancel(), "the first cancel wins");
         for h in handles {
             h.join().unwrap();
         }
+        assert!(t.is_cancelled());
+        assert_eq!(
+            woke.load(std::sync::atomic::Ordering::SeqCst),
+            32,
+            "every blocked waiter must observe the cancellation"
+        );
     }
 
     #[test]
@@ -514,14 +523,25 @@ mod tests {
     #[test]
     fn wait_never_hangs_after_cancel_under_stress() {
         let parent = Arc::new(CancellationToken::new());
+        let woke = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut waiters = vec![];
         for _ in 0..16 {
             let p = parent.clone();
-            waiters.push(thread::spawn(move || p.wait()));
+            let woke = woke.clone();
+            waiters.push(thread::spawn(move || {
+                p.wait();
+                woke.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }));
         }
         parent.cancel();
         for w in waiters {
             w.join().unwrap();
         }
+        assert!(parent.is_cancelled());
+        assert_eq!(
+            woke.load(std::sync::atomic::Ordering::SeqCst),
+            16,
+            "no waiter may hang or be skipped"
+        );
     }
 }

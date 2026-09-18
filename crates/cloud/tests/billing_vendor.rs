@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use faktor_cloud::{
     BillingAccountId, BillingConfig, BillingVendorAdapter, BillingVendorConfig, ControlPlaneError,
     DurableSpendRow, EntitlementService, MemoryBillingStore, OrganizationId, SpendCategory,
+    VENDOR_HTTP_TIMEOUT_MS,
 };
 use faktor_provider::egress::{EgressError, HttpTransport};
 use reqwest::Request;
@@ -452,4 +453,61 @@ fn strict_config_validation_refuses_illegal_shapes() {
     ] {
         assert!(bad.validate().is_err(), "{bad:?} must be refused");
     }
+}
+
+/// A transport that never resolves: a vendor that accepts and stalls.
+struct StallingTransport;
+
+impl HttpTransport for StallingTransport {
+    fn execute(
+        &self,
+        _req: Request,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<reqwest::Response, EgressError>> + Send + '_>,
+    > {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_vendor_is_bounded_by_the_attempt_and_network_bounds() {
+    let (service, organization, _account) = service();
+    let adapter = BillingVendorAdapter::new(
+        service,
+        BillingVendorConfig {
+            base_url: "https://vendor.test".into(),
+            report_path: "/v1/usage-reports".into(),
+            auth_env: "FAKTOR_TEST_VENDOR_TOKEN".into(),
+            user_agent: "faktor-test/0.1".into(),
+            max_attempts: 3,
+            retry_base_ms: 250,
+        },
+        Arc::new(StallingTransport),
+        Some("vendor-secret-token".into()),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let call =
+        tokio::spawn(async move { adapter.report_period(&organization, "2026-09", None).await });
+    // Advance virtual time past every attempt bound + backoff, yielding so
+    // the retry loop can schedule each next timer.
+    for _ in 0..12 {
+        tokio::task::yield_now().await;
+        if call.is_finished() {
+            break;
+        }
+        tokio::time::advance(std::time::Duration::from_millis(
+            VENDOR_HTTP_TIMEOUT_MS + 1_000,
+        ))
+        .await;
+    }
+    let err = call.await.unwrap().unwrap_err();
+    assert!(
+        matches!(&err, ControlPlaneError::Backend(m) if m.contains("network bound")),
+        "{err:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "virtual time only: no real-time hang"
+    );
 }

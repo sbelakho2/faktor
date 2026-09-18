@@ -196,7 +196,7 @@ async fn hostile_http_is_clean_4xx() {
         SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
     let perm = ChannelPermissionRequester::new(Duration::from_secs(5));
     let agent = test_agent(session.clone(), vec![ScriptedResponse::End], perm.clone());
-    let deps = ServerDeps::new(session.clone(), agent, perm);
+    let deps = ServerDeps::new(session.clone(), agent, perm).unwrap();
     let token = deps.auth_token.clone();
     let handle = serve(deps, 0).await.unwrap();
     let client = reqwest::Client::new();

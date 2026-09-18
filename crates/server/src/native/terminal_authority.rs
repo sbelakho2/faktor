@@ -888,14 +888,24 @@ pub struct DurableTerminal {
 }
 
 impl DurableTerminal {
-    /// The listing projection of one durable row.
-    fn view(&self, live: Option<&LiveRow>) -> TerminalView {
-        TerminalView {
+    /// The listing projection of one durable row. The id fields decode
+    /// through their fallible constructors: a hand-corrupted durable row
+    /// whose `session_id`/`task_id`/`operation_id` is zero (it could never
+    /// have been written through the typed appenders) is a typed refusal
+    /// naming the terminal and the field — never `Id::new(0)` panicking the
+    /// listing/reconcile task.
+    fn view(&self, live: Option<&LiveRow>) -> Result<TerminalView, TerminalServiceError> {
+        let session_id =
+            durable_terminal_id(&self.row.terminal_id, "session_id", self.row.session_id)?;
+        let task_id = durable_terminal_id(&self.row.terminal_id, "task_id", self.row.task_id)?;
+        let operation_id =
+            durable_terminal_id(&self.row.terminal_id, "operation_id", self.row.operation_id)?;
+        Ok(TerminalView {
             terminal_id: self.row.terminal_id.clone(),
-            session_id: SessionId::new(self.row.session_id),
-            task_id: TaskId::new(self.row.task_id),
+            session_id,
+            task_id,
             agent_id: self.row.agent_id.clone(),
-            operation_id: OpId::new(self.row.operation_id),
+            operation_id,
             pid: self.row.pid,
             start_time_ms: self.row.start_time_ms,
             spawned_ms: self.spawned_ms,
@@ -906,12 +916,31 @@ impl DurableTerminal {
             detail: self.detail.clone(),
             pty_id: live.map(|row| row.pty_id),
             execution_profile: self.row.execution_profile.clone(),
-        }
+        })
     }
 
     fn is_open(&self) -> bool {
         !self.state.is_terminal()
     }
+}
+
+/// Fallible decode of one durable terminal id field: the typed appenders
+/// refuse zero, so a zero row value is corruption and surfaces as a typed
+/// refusal naming the terminal and the field — never a panic.
+fn durable_terminal_id<T>(
+    terminal_id: &str,
+    field: &str,
+    raw: u64,
+) -> Result<T, TerminalServiceError>
+where
+    T: TryFrom<u64>,
+    T::Error: fmt::Display,
+{
+    T::try_from(raw).map_err(|e| {
+        TerminalServiceError::Refused(format!(
+            "durable terminal {terminal_id:?} carries a corrupt {field}: {e}"
+        ))
+    })
 }
 
 /// Durable ownership of one session-owned terminal row (legacy read surface:
@@ -975,6 +1004,12 @@ enum LiveState {
 struct LiveRow {
     terminal_id: String,
     session_id: SessionId,
+    /// Typed ids of the durable row this live handle mirrors. They are
+    /// carried as decoded values so the legacy ownership projection can
+    /// never mint an id from a raw field (a live row is only built from the
+    /// typed appenders' own non-zero values).
+    task_id: TaskId,
+    operation_id: OpId,
     pty_id: u64,
     pty: Arc<Mutex<Pty>>,
     row: TerminalDurableRow,
@@ -1005,6 +1040,41 @@ impl fmt::Debug for LiveRow {
     }
 }
 
+/// The pending-ownership guard of one in-flight create: the child is in the
+/// service's `pending` map from the instant the PTY exists. `promote()` when
+/// the live row takes over; dropping the guard without promotion removes the
+/// entry and kills the child, so a failed or panicking create can never leak
+/// a process. The guard holds only a `Weak` service: dropping the guard is
+/// also correct when the whole service is gone (the pty is killed and its
+/// last `Arc` drops with the guard).
+struct PendingSpawn {
+    service: Weak<TerminalService>,
+    terminal_id: String,
+    pty: Arc<Mutex<Pty>>,
+    promoted: bool,
+}
+
+impl PendingSpawn {
+    /// Ownership moved into the live map: neither remove nor kill.
+    fn promote(&mut self) {
+        self.promoted = true;
+        if let Some(service) = self.service.upgrade() {
+            service.lock_pending().remove(&self.terminal_id);
+        }
+    }
+}
+
+impl Drop for PendingSpawn {
+    fn drop(&mut self) {
+        if let Some(service) = self.service.upgrade() {
+            service.lock_pending().remove(&self.terminal_id);
+        }
+        if !self.promoted {
+            kill_pty(&self.pty);
+        }
+    }
+}
+
 /// The session-owned terminal service of one daemon process. The DURABLE
 /// ledger rows are the authority; the live map is a strictly derived cache
 /// of this boot's pty handles and can never disagree with a durable fold.
@@ -1017,6 +1087,14 @@ pub struct TerminalService {
     next_pty_id: AtomicU64,
     /// Live pty handles of THIS boot, keyed by terminal UUID.
     live: Mutex<HashMap<String, Arc<LiveRow>>>,
+    /// Children in the spawn→registration window, inserted the instant the
+    /// PTY exists — BEFORE budget enforcement, journaling or registration
+    /// can delay. A spawned child is therefore owned from birth: every
+    /// sweep/recovery/teardown path that scans the service's ownership can
+    /// never observe it as unowned. The successful create promotes the
+    /// entry into `live`; every failure path (and an unwind) removes it and
+    /// kills the child, so no process can outlive a failed create.
+    pending: Mutex<HashMap<String, Arc<Mutex<Pty>>>>,
     /// Terminal ids whose create is mid-flight (journaled but not yet live):
     /// recovery must never mark one Lost before its live row is registered.
     inflight: Mutex<HashSet<String>>,
@@ -1024,7 +1102,17 @@ pub struct TerminalService {
     index: Mutex<HashMap<u64, SessionIndex>>,
     /// Serializes recovery scans (the recovered flag alone would race).
     recovery_lock: Mutex<()>,
+    /// Test-only interleaving seam: called with `(terminal_id, pid)`
+    /// immediately after the child exists and before any budget/journal/
+    /// registration work. Production is `None`.
+    spawn_hook: Option<SpawnHook>,
 }
+
+/// Test seam for the spawn→registration window: `Ok(())` continues the
+/// create (the hook may block to force the interleaving); `Err(reason)`
+/// aborts it typed and the just-spawned child is killed by the pending
+/// ownership guard.
+pub type SpawnHook = Arc<dyn Fn(&str, u32) -> Result<(), String> + Send + Sync>;
 
 /// One registry entry: the manager's address key, the manager weak (so a
 /// dead manager's stale entry is pruned) and the service.
@@ -1125,10 +1213,26 @@ impl TerminalService {
             authority,
             next_pty_id: AtomicU64::new(1),
             live: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashSet::new()),
             index: Mutex::new(HashMap::new()),
             recovery_lock: Mutex::new(()),
+            spawn_hook: None,
         }
+    }
+
+    /// An unregistered service with the spawn→registration interleaving
+    /// seam armed (adversarial tests only). The hook runs on the spawning
+    /// thread immediately after the child exists; the child is already in
+    /// the pending ownership map when it runs.
+    pub fn with_spawn_hook(
+        session: Arc<SessionManager>,
+        probe: IdentityProbe,
+        hook: SpawnHook,
+    ) -> Arc<Self> {
+        let mut service = Self::with_probe(session, probe);
+        service.spawn_hook = Some(hook);
+        Arc::new(service)
     }
 
     /// Build a service over the daemon's ONE session manager (legacy
@@ -1155,11 +1259,26 @@ impl TerminalService {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn lock_pending(&self) -> MutexGuard<'_, HashMap<String, Arc<Mutex<Pty>>>> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Clone one live row out of the map (the map lock is released before
     /// any per-row state lock is taken, so kill/exit/sweep can never
     /// deadlock against each other).
     fn live_row(&self, terminal_id: &str) -> Option<Arc<LiveRow>> {
         self.lock_live().get(terminal_id).cloned()
+    }
+
+    /// Whether this service owns `terminal_id` right now — in the live map
+    /// or in the spawn→registration window. A child is inserted into the
+    /// pending ownership map the instant its PTY exists, so this is true
+    /// from birth to teardown; it is a diagnostic/regression probe, not a
+    /// stable state.
+    pub fn owns_child(&self, terminal_id: &str) -> bool {
+        self.lock_pending().contains_key(terminal_id) || self.lock_live().contains_key(terminal_id)
     }
 
     /// Live-row count (diagnostic/test probe).
@@ -1182,9 +1301,9 @@ impl TerminalService {
                     row.terminal_id.clone(),
                     TerminalOwnership {
                         session_id: row.session_id,
-                        task_id: TaskId::new(row.row.task_id),
+                        task_id: row.task_id,
                         agent_id: row.row.agent_id.clone(),
-                        operation_id: OpId::new(row.row.operation_id),
+                        operation_id: row.operation_id,
                         pid: row.row.pid,
                         spawned_ms: row.row.at_ms,
                     },
@@ -1544,20 +1663,42 @@ impl TerminalService {
         let cfg = authorized.to_pty_config();
         let pty = Pty::spawn(&cfg).map_err(|e| TerminalServiceError::Refused(e.message))?;
         let pid = pty.pid();
+        // OWNERSHIP FROM BIRTH: the child enters the service's pending
+        // ownership map BEFORE any budget enforcement, journaling or
+        // registration can delay. From here on every internal path — the
+        // recovery scan, the live sweep, a service teardown — sees the
+        // terminal as owned, and the guard below kills it on every failure
+        // path (including an unwind), so a create can never leak a process.
+        let pty = Arc::new(Mutex::new(pty));
+        self.lock_pending()
+            .insert(terminal_id.to_string(), Arc::clone(&pty));
+        let mut pending = PendingSpawn {
+            service: Arc::downgrade(self),
+            terminal_id: terminal_id.to_string(),
+            pty: Arc::clone(&pty),
+            promoted: false,
+        };
+        if let Some(hook) = &self.spawn_hook {
+            // The adversarial interleaving seam: the child exists and is
+            // owned; a hook may block here to force the window or refuse.
+            if let Err(refusal) = hook(terminal_id, pid) {
+                return Err(TerminalServiceError::Refused(format!(
+                    "terminal spawn hook refused before registration: {refusal}"
+                )));
+            }
+        }
         // Push the requested budgets into the process tree BEFORE the
         // terminal is journaled or exposed: the row only becomes usable with
         // its budget in force. The report is the EFFECTIVE per-limit state
         // (Enforced / Degraded / Unsupported with the typed reason); a
         // mechanism that cannot be applied is never silently recorded as if
         // it were. A STRICT profile whose requested limit ended Unsupported
-        // is refused TYPED here and the just-spawned child is killed (no
-        // durable row, no live row, no orphan).
+        // is refused TYPED here and the just-spawned child is killed by the
+        // pending guard (no durable row, no live row, no orphan).
         let mut budget_guard =
             match faktor_terminal::budget::enforce_tree_budgets(pid, &profile.budgets) {
                 Ok(guard) => guard,
                 Err(refusal) => {
-                    let mut pty = pty;
-                    pty.kill();
                     return Err(TerminalServiceError::Denied(format!(
                         "terminal budget enforcement refused: {refusal}"
                     )));
@@ -1568,8 +1709,6 @@ impl TerminalService {
                 .enforcement()
                 .strict_violations(&profile.budgets);
             if !violations.is_empty() {
-                let mut pty = pty;
-                pty.kill();
                 return Err(TerminalServiceError::Denied(format!(
                     "strict terminal budget profile refused: requested limits cannot be \
                      enforced on this platform: {}",
@@ -1596,21 +1735,22 @@ impl TerminalService {
                 }
             }
         }) {
-            let mut pty = pty;
-            pty.kill();
             return Err(TerminalServiceError::Denied(format!(
                 "terminal wall budget refused: {refusal}"
             )));
         }
         profile.budget_enforcement = Some(budget_guard.enforcement().clone());
         let start_time_ms = (self.probe)(pid).unwrap_or(0);
-        let pty = Arc::new(Mutex::new(pty));
+        let operation_id = self
+            .session
+            .try_next_op_id()
+            .map_err(|e| TerminalServiceError::from(faktor_core::Error::from(e)))?;
         let mut durable = TerminalDurableRow {
             terminal_id: terminal_id.to_string(),
             session_id: handle.id().raw(),
             task_id: task_id.raw(),
             agent_id: profile.agent_id.clone(),
-            operation_id: self.session.next_op_id().raw(),
+            operation_id: operation_id.raw(),
             pid,
             start_time_ms,
             at_ms: self.session.now_ms(),
@@ -1621,7 +1761,6 @@ impl TerminalService {
         let created_seq = match handle.ledger_terminal_created(&created_row) {
             Ok(seq) => seq,
             Err(error) => {
-                kill_pty(&pty);
                 return Err(TerminalServiceError::Refused(error.message));
             }
         };
@@ -1630,9 +1769,9 @@ impl TerminalService {
             Ok(seq) => seq,
             Err(error) => {
                 // The Created row stays durable with no live authority: the
-                // next recovery scan marks it Lost. The pty is killed so no
-                // process is orphaned without its journaled state.
-                kill_pty(&pty);
+                // next recovery scan marks it Lost. The pending guard kills
+                // the pty so no process is orphaned without its journaled
+                // state.
                 return Err(TerminalServiceError::Refused(error.message));
             }
         };
@@ -1661,6 +1800,8 @@ impl TerminalService {
         let live = Arc::new(LiveRow {
             terminal_id: terminal_id.to_string(),
             session_id: handle.id(),
+            task_id,
+            operation_id,
             pty_id,
             pty: Arc::clone(&pty),
             row: durable.clone(),
@@ -1669,6 +1810,11 @@ impl TerminalService {
         });
         self.lock_live()
             .insert(terminal_id.to_string(), Arc::clone(&live));
+        // Ownership transferred to the live row: from here the pending guard
+        // neither removes nor kills. The row is registered BEFORE any caller
+        // can observe the terminal (the response is written after this
+        // function returns).
+        pending.promote();
         let view = DurableTerminal {
             row: durable.clone(),
             state: TerminalEventKind::Running,
@@ -1678,7 +1824,7 @@ impl TerminalService {
             spawned_ms: durable.at_ms,
             updated_ms: durable.at_ms,
         }
-        .view(Some(&live));
+        .view(Some(&live))?;
 
         Ok(TerminalCreation {
             handle: TerminalHandle {
@@ -1719,7 +1865,7 @@ impl TerminalService {
             .values()
             .filter(|entry| entry.row.session_id == sid.raw())
             .map(|entry| entry.view(live.get(&entry.row.terminal_id).map(|row| &**row)))
-            .collect();
+            .collect::<Result<Vec<_>, TerminalServiceError>>()?;
         out.sort_by(|a, b| a.terminal_id.cmp(&b.terminal_id));
         Ok(out)
     }
@@ -2100,7 +2246,7 @@ impl TerminalService {
                 session_id: session_id.to_string(),
                 terminal_id: terminal_id.to_string(),
             })?;
-        Ok(entry.view(None))
+        entry.view(None)
     }
 
     /// Kill every live row and journal each kill (bounded daemon shutdown).
@@ -2114,7 +2260,8 @@ impl TerminalService {
 
 impl Drop for TerminalService {
     /// Emergency failsafe: dropping the last reference kills every pty tree
-    /// this service still owns (the per-row `terminal_killed` rows are
+    /// this service still owns — live rows AND children in the
+    /// spawn→registration window (the per-row `terminal_killed` rows are
     /// journaled by [`TerminalService::shutdown_all`]; a drop without it
     /// leaves the rows for the next recovery scan).
     fn drop(&mut self) {
@@ -2126,6 +2273,15 @@ impl Drop for TerminalService {
         );
         for row in live.into_values() {
             kill_pty(&row.pty);
+        }
+        let pending = std::mem::take(
+            &mut *self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for pty in pending.into_values() {
+            kill_pty(&pty);
         }
     }
 }
@@ -3178,6 +3334,247 @@ mod tests {
         assert_eq!(terminal_kinds(&handle).len(), 3);
     }
 
+    /// A one-shot flag + condvar gate.
+    #[cfg(unix)]
+    type Gate = Arc<(Mutex<bool>, std::sync::Condvar)>;
+
+    /// A `(entered, release)` condvar pair: force the spawn→registration
+    /// window open and hold it until the test has attacked every reaping
+    /// surface.
+    #[cfg(unix)]
+    fn interleaving_gate() -> (Gate, Gate) {
+        (
+            Arc::new((Mutex::new(false), std::sync::Condvar::new())),
+            Arc::new((Mutex::new(false), std::sync::Condvar::new())),
+        )
+    }
+
+    #[cfg(unix)]
+    fn wait_flag(flag: &Gate, what: &str) {
+        let (lock, cv) = &**flag;
+        let mut seen = lock.lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !*seen {
+            let (guard, _timeout) = cv
+                .wait_timeout(seen, std::time::Duration::from_millis(20))
+                .unwrap();
+            seen = guard;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the spawn hook never {what}"
+            );
+        }
+    }
+
+    /// ADVERSARIAL INTERLEAVING: hold a create open between `Pty::spawn` and
+    /// registration and prove that the child is owned from birth — the sweep,
+    /// the recovery scan (session-local and global) and the listing can never
+    /// observe or reap it as an unowned/orphan process; after release the
+    /// create is owned by the live row exactly once, and only an explicit
+    /// kill ends it.
+    #[test]
+    #[cfg(unix)]
+    fn spawn_window_is_owned_from_birth_and_survives_every_reaper() {
+        let (_dir, manager) = manager();
+        let sid = session(&manager, "terminal-birth-ownership");
+        let (probe, _map) = recording_probe();
+        let (entered, release) = interleaving_gate();
+        let entered_hook = Arc::clone(&entered);
+        let release_hook = Arc::clone(&release);
+        let hook: SpawnHook = Arc::new(move |terminal_id: &str, pid: u32| {
+            assert!(!terminal_id.is_empty(), "the hook sees the owned id");
+            assert!(pid > 0, "the hook sees the real child pid");
+            let (lock, cv) = &*entered_hook;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+            let (lock, cv) = &*release_hook;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                let (guard, _) = cv
+                    .wait_timeout(released, std::time::Duration::from_secs(10))
+                    .unwrap();
+                released = guard;
+            }
+            Ok(())
+        });
+        let service = TerminalService::with_spawn_hook(manager.clone(), probe, hook);
+        let spawn_service = Arc::clone(&service);
+        let spawn_sid = sid.clone();
+        let spawning = std::thread::spawn(move || {
+            spawn_service.spawn(&spawn_sid, &spawn_request("/bin/sleep", &["30"]))
+        });
+
+        wait_flag(&entered, "entered");
+        let (terminal_id, pid) = {
+            let pending = service.lock_pending();
+            assert_eq!(
+                pending.len(),
+                1,
+                "the child must be pending-owned before any journal/registration"
+            );
+            let (id, pty) = pending.iter().next().unwrap();
+            let observed = (id.clone(), pty.lock().unwrap().pid());
+            observed
+        };
+        assert!(pid > 0 && service.owns_child(&terminal_id));
+
+        // Every internal reaping surface runs while the create is in flight.
+        service.sweep_live();
+        service.recover_session(&sid).unwrap();
+        service.recover_all().unwrap();
+        let rows = service.list(&sid).unwrap();
+        assert!(
+            rows.iter().all(|row| row.terminal_id != terminal_id),
+            "the in-flight child has no durable row yet: {rows:?}"
+        );
+        assert!(
+            faktor_pty::guardian::group_exists(pid),
+            "no sweep/recovery path may reap a child owned from birth (pid {pid})"
+        );
+        assert!(
+            service.owns_child(&terminal_id),
+            "the pending ownership survives every scan"
+        );
+
+        {
+            let (lock, cv) = &*release;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        let creation = spawning
+            .join()
+            .unwrap()
+            .expect("the create succeeds after the window");
+        assert_eq!(creation.handle.pid(), pid, "the create returns the child");
+        assert!(creation.handle.is_alive(), "the returned child is alive");
+        assert!(
+            service.lock_pending().is_empty(),
+            "the successful create promotes out of the pending map"
+        );
+        assert!(service.owns_child(&terminal_id));
+        let rows = service.session_rows(SessionId::new(sid.parse().unwrap()));
+        assert_eq!(rows.len(), 1, "exactly one session-owned row: {rows:?}");
+        assert_eq!(rows[0].1.pid, pid);
+        assert!(service.kill(&sid, &terminal_id, "cleanup").unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while faktor_pty::guardian::group_exists(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the explicit kill must take the whole group (pid {pid})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// A failure injected inside the birth window (before journaling) kills
+    /// the just-spawned child and leaves no owner, no live row and no
+    /// durable row — no create failure may leak a process.
+    #[test]
+    #[cfg(unix)]
+    fn spawn_window_failure_kills_the_child_and_leaves_no_orphan() {
+        let (_dir, manager) = manager();
+        let sid = session(&manager, "terminal-birth-refusal");
+        let (probe, _map) = recording_probe();
+        let seen = Arc::new(Mutex::new(None::<u32>));
+        let seen_hook = Arc::clone(&seen);
+        let hook: SpawnHook = Arc::new(move |_terminal_id: &str, pid: u32| {
+            *seen_hook.lock().unwrap() = Some(pid);
+            Err("injected refusal inside the birth window".into())
+        });
+        let service = TerminalService::with_spawn_hook(manager.clone(), probe, hook);
+        let error = match service.spawn(&sid, &spawn_request("/bin/sleep", &["30"])) {
+            Ok(_) => panic!("the injected refusal must fail the create"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, TerminalServiceError::Refused(ref message) if message.contains("injected refusal")),
+            "the refusal is typed and names the injection: {error:?}"
+        );
+        let pid = seen.lock().unwrap().expect("the hook observed the child");
+        assert!(service.lock_pending().is_empty(), "no pending owner");
+        assert_eq!(service.live_rows(), 0, "no live row");
+        assert!(service
+            .session_rows(SessionId::new(sid.parse().unwrap()))
+            .is_empty());
+        let handle = manager
+            .get_session(SessionId::new(sid.parse().unwrap()))
+            .unwrap()
+            .unwrap();
+        assert!(
+            handle.ledger_terminal_rows(None).unwrap().is_empty(),
+            "no durable row"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while faktor_pty::guardian::group_exists(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the refused child must be killed and reaped (pid {pid})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Load cycles: concurrent create/kill rounds on ONE service. Every
+    /// returned child is owned+registered before the create returns, every
+    /// explicit kill leaves no live row and no group member, and the
+    /// service's ownership maps drain to empty.
+    #[test]
+    #[cfg(unix)]
+    fn concurrent_create_kill_cycles_never_expose_unowned_children() {
+        let (_dir, manager) = manager();
+        let sid = session(&manager, "terminal-cycle-load");
+        let (probe, _map) = recording_probe();
+        let service = TerminalService::with_identity_probe(manager.clone(), probe);
+        let mut workers = Vec::new();
+        for worker in 0..3u32 {
+            let service = Arc::clone(&service);
+            let sid = sid.clone();
+            workers.push(std::thread::spawn(move || {
+                for cycle in 0..8u32 {
+                    let request = spawn_request("/bin/sleep", &["30"]);
+                    let creation = service
+                        .spawn(&sid, &request)
+                        .unwrap_or_else(|e| panic!("create {worker}/{cycle} failed: {e:?}"));
+                    let terminal_id = creation.handle.terminal_id().to_string();
+                    let pid = creation.handle.pid();
+                    assert!(pid > 0);
+                    assert!(
+                        service.owns_child(&terminal_id),
+                        "a returned child is owned (worker {worker}, cycle {cycle})"
+                    );
+                    assert!(
+                        creation.handle.is_alive(),
+                        "a returned child is alive (worker {worker}, cycle {cycle})"
+                    );
+                    let rows = service.session_rows(SessionId::new(sid.parse().unwrap()));
+                    assert!(
+                        rows.iter()
+                            .any(|(id, row)| *id == terminal_id && row.pid == pid),
+                        "the returned child is session-registered (worker {worker})"
+                    );
+                    assert!(service.kill(&sid, &terminal_id, "cycle").unwrap());
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while faktor_pty::guardian::group_exists(pid) {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "cycle kill leaves no group member (pid {pid})"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    assert!(
+                        !service.owns_child(&terminal_id),
+                        "owned until killed, then not"
+                    );
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("cycle worker");
+        }
+        assert!(service.lock_pending().is_empty(), "pending drained");
+        assert_eq!(service.live_rows(), 0, "every cycle terminal is retired");
+    }
+
     #[test]
     fn foreign_scope_is_denied_without_touching_the_owned_terminal() {
         let (_dir, manager) = manager();
@@ -3566,11 +3963,12 @@ mod tests {
 
     #[test]
     fn poisoned_service_locks_recover_on_next_authority_op() {
-        // The live map, the inflight set, the per-session fold cache and the
-        // recovery serializer are all DERIVED from the durable ledger rows —
-        // no cross-entry invariant can be left broken by a panicking holder.
-        // Poison every one of them and prove the next authority operation
-        // recovers and serves instead of panicking (no panic cascade).
+        // The live map, the pending-ownership map, the inflight set, the
+        // per-session fold cache and the recovery serializer are all DERIVED
+        // from the durable ledger rows — no cross-entry invariant can be left
+        // broken by a panicking holder. Poison every one of them and prove
+        // the next authority operation recovers and serves instead of
+        // panicking (no panic cascade).
         let (_dir, manager) = manager();
         let sid = session(&manager, "terminal-poison");
         let (probe, _map) = recording_probe();
@@ -3580,6 +3978,7 @@ mod tests {
             let service = Arc::clone(&service);
             std::thread::spawn(move || {
                 let _live = service.live.lock().unwrap();
+                let _pending = service.pending.lock().unwrap();
                 let _inflight = service.inflight.lock().unwrap();
                 let _index = service.index.lock().unwrap();
                 let _recovery = service.recovery_lock.lock().unwrap();
@@ -3588,6 +3987,7 @@ mod tests {
         };
         assert!(poisoner.join().is_err(), "the holder must unwind");
         assert!(service.live.is_poisoned());
+        assert!(service.pending.is_poisoned());
         assert!(service.inflight.is_poisoned());
         assert!(service.index.is_poisoned());
         assert!(service.recovery_lock.is_poisoned());
@@ -3600,5 +4000,123 @@ mod tests {
             .session_rows(SessionId::new(sid.parse().unwrap()))
             .is_empty());
         assert_eq!(service.live_rows(), 0);
+        assert!(!service.owns_child("unowned-terminal"));
+    }
+
+    /// A hand-corrupted durable terminal row whose id fields are zero (a
+    /// value the typed appenders refuse, so it can only come from a decoded
+    /// hostile JSON payload) must surface as a typed refusal naming the
+    /// terminal and field — never `Id::new(0)` panicking the listing or
+    /// reconcile task — and the authority must stay usable with valid rows.
+    #[test]
+    fn corrupt_durable_terminal_ids_refuse_typed_and_authority_stays_usable() {
+        let (_dir, manager) = manager();
+        let sid = session(&manager, "terminal-corrupt-id");
+        let (probe, _map) = recording_probe();
+        let service = TerminalService::detached(manager, probe);
+        let handle = service.session_handle(&sid).unwrap();
+        let base = TerminalDurableRow {
+            terminal_id: "term-corrupt".into(),
+            session_id: handle.id().raw(),
+            task_id: 1,
+            agent_id: None,
+            operation_id: 9,
+            pid: 4242,
+            start_time_ms: 0,
+            at_ms: 10,
+            execution_profile: String::new(),
+        };
+        let terminal = |row: TerminalDurableRow| DurableTerminal {
+            row,
+            state: TerminalEventKind::Created,
+            detail: String::new(),
+            exit_code: None,
+            seq: 1,
+            spawned_ms: 10,
+            updated_ms: 10,
+        };
+
+        // Valid rows project exactly.
+        let view = terminal(base.clone()).view(None).unwrap();
+        assert_eq!(view.session_id, handle.id());
+        assert_eq!(view.task_id, TaskId::new(1));
+        assert_eq!(view.operation_id, OpId::new(9));
+
+        for (field, corrupt) in [
+            (
+                "session_id",
+                TerminalDurableRow {
+                    session_id: 0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "task_id",
+                TerminalDurableRow {
+                    task_id: 0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "operation_id",
+                TerminalDurableRow {
+                    operation_id: 0,
+                    ..base.clone()
+                },
+            ),
+        ] {
+            match terminal(corrupt).view(None) {
+                Err(TerminalServiceError::Refused(message)) => assert!(
+                    message.contains(field) && message.contains("corrupt"),
+                    "the refusal must name {field} and corruption: {message}"
+                ),
+                other => panic!("corrupt {field} must refuse typed, got {other:?}"),
+            }
+        }
+
+        // The authority stays usable: a valid durable row still lists with
+        // its decoded ids after the hostile projections were refused.
+        handle.ledger_terminal_created(&base).unwrap();
+        let rows = service.list(&sid).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].terminal_id, "term-corrupt");
+        assert_eq!(rows[0].operation_id, OpId::new(9));
+        assert_eq!(rows[0].session_id, handle.id());
+        assert_eq!(rows[0].task_id, TaskId::new(1));
+
+        // The durable JSON path: corrupting the PERSISTED payload's
+        // operation_id to 0 (only reachable by hand-corrupting the DB) is
+        // refused typed by `list` — never a panic, never a silently skipped
+        // row. Repairing the row restores the authority.
+        service
+            .session
+            .store()
+            .sql_execute(&format!(
+                "UPDATE ledger_entry \
+                 SET payload = replace(payload, '\"operation_id\":9', '\"operation_id\":0') \
+                 WHERE session_id = {} AND entry_type = 'terminal_created'",
+                handle.id().raw()
+            ))
+            .unwrap();
+        match service.list(&sid) {
+            Err(TerminalServiceError::Refused(message)) => assert!(
+                message.contains("operation_id"),
+                "the durable corruption refusal must name operation_id: {message}"
+            ),
+            other => panic!("durable operation_id 0 must refuse typed, got {other:?}"),
+        }
+        service
+            .session
+            .store()
+            .sql_execute(&format!(
+                "UPDATE ledger_entry \
+                 SET payload = replace(payload, '\"operation_id\":0', '\"operation_id\":9') \
+                 WHERE session_id = {} AND entry_type = 'terminal_created'",
+                handle.id().raw()
+            ))
+            .unwrap();
+        let repaired = service.list(&sid).unwrap();
+        assert_eq!(repaired.len(), 1, "{repaired:?}");
+        assert_eq!(repaired[0].operation_id, OpId::new(9));
     }
 }

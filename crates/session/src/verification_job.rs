@@ -408,6 +408,41 @@ fn job_from_row(row: VerificationJobRow) -> Result<VerificationJob, SessionError
     };
     let environment_fingerprint =
         parse_fingerprint(row.environment_fingerprint_json.clone(), &row.check_id)?;
+    // `spec_json` NULL/empty is legitimate ONLY for inline checks (they are
+    // terminal from birth and never execute; the writer stores no spec for
+    // them, including legacy imported rows). A BACKGROUND job's spec is its
+    // execution input: a missing/empty/oversized spec is durable corruption
+    // and must fail closed with a typed error, never silently default to an
+    // empty body. This read-side bound also backstops a raw SQL write.
+    let spec_json = match row.spec_json.as_deref() {
+        Some("") => {
+            if inline.is_some() {
+                String::new()
+            } else {
+                return Err(malformed_row(
+                    &row.check_id,
+                    "spec_json is empty for a background job",
+                ));
+            }
+        }
+        Some(spec) => {
+            if spec.len() > MAX_VERIFICATION_JOB_SPEC_JSON_BYTES {
+                return Err(SessionError::Oversized(format!(
+                    "verification job '{}' spec_json column of {} bytes exceeds {MAX_VERIFICATION_JOB_SPEC_JSON_BYTES}",
+                    row.check_id,
+                    spec.len()
+                )));
+            }
+            spec.to_string()
+        }
+        None if inline.is_some() => String::new(),
+        None => {
+            return Err(malformed_row(
+                &row.check_id,
+                "spec_json is NULL for a background job",
+            ))
+        }
+    };
     Ok(VerificationJob {
         id: format!(
             "vj:{}:{}:{}",
@@ -421,7 +456,7 @@ fn job_from_row(row: VerificationJobRow) -> Result<VerificationJob, SessionError
         check_id: row.check_id,
         kind: row.kind,
         command: row.command,
-        spec_json: row.spec_json.unwrap_or_default(),
+        spec_json,
         budget_ms: row.budget_ms,
         attempt_op: row.attempt_op_id,
         ordinal: row.ordinal,
@@ -1742,5 +1777,102 @@ mod tests {
         assert_eq!(again.imported_attempts, 0);
         assert_eq!(again.imported_jobs, 0);
         assert_eq!(s.open_verification_jobs(TASK).unwrap().len(), 1);
+    }
+
+    /// Audit: a background job's missing/empty spec is durable corruption and
+    /// must surface as a TYPED error — never a silent empty default. An
+    /// inline check's absent spec is the documented legitimate absence and
+    /// keeps decoding.
+    #[test]
+    fn corrupt_or_missing_spec_json_fails_loud_for_background_jobs() {
+        let (_dir, m) = test_manager();
+        let s = session(&m);
+        let op = 71u64;
+        s.begin_verification_attempt(
+            TASK,
+            REV,
+            op,
+            ROOT,
+            &[],
+            &[inline_pass("make_build"), job_check("make_test")],
+            &[job_input("make_test")],
+        )
+        .unwrap();
+        assert_eq!(s.open_verification_jobs(TASK).unwrap().len(), 1);
+
+        // NULL spec on a background job: typed corruption naming the check.
+        m.store()
+            .sql_execute(
+                "UPDATE verification_job SET spec_json = NULL WHERE check_id = 'make_test'",
+            )
+            .unwrap();
+        let err = s.open_verification_jobs(TASK).unwrap_err();
+        assert!(matches!(err, SessionError::Malformed(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("make_test"), "{message}");
+        assert!(message.contains("spec_json"), "{message}");
+        assert!(message.contains("NULL"), "{message}");
+
+        // Empty spec is corruption too (the writer bounds it to non-empty).
+        m.store()
+            .sql_execute("UPDATE verification_job SET spec_json = '' WHERE check_id = 'make_test'")
+            .unwrap();
+        let err = s.open_verification_jobs(TASK).unwrap_err();
+        assert!(matches!(err, SessionError::Malformed(_)), "{err:?}");
+        assert!(err.to_string().contains("empty"), "{err}");
+
+        // Oversized spec injected behind the API is a typed Oversized error
+        // naming the field, not a silent pass.
+        let oversized = "x".repeat(MAX_VERIFICATION_JOB_SPEC_JSON_BYTES + 1);
+        m.store()
+            .sql_execute(&format!(
+                "UPDATE verification_job SET spec_json = '{oversized}' WHERE check_id = 'make_test'"
+            ))
+            .unwrap();
+        let err = s.open_verification_jobs(TASK).unwrap_err();
+        assert!(matches!(err, SessionError::Oversized(_)), "{err:?}");
+        assert!(err.to_string().contains("spec_json"), "{err}");
+
+        // Restore the valid spec: the manager stays fully usable afterwards.
+        let valid = spec("make_test", "ctest", &[]).replace('\'', "''");
+        m.store()
+            .sql_execute(&format!(
+                "UPDATE verification_job SET spec_json = '{valid}' WHERE check_id = 'make_test'"
+            ))
+            .unwrap();
+        let open = s.open_verification_jobs(TASK).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].spec_json, spec("make_test", "ctest", &[]));
+        // The inline legacy row (NULL spec from birth) still decodes: its
+        // absence is documented, not corruption. Inline rows are filtered
+        // from every background reader, so this exercises the row decoder
+        // directly.
+        let inline_row = faktor_store::VerificationJobRow {
+            session_id: s.id,
+            task_id: faktor_core::id::TaskId::new(TASK),
+            attempt_op_id: op,
+            check_id: "make_build".into(),
+            ordinal: 0,
+            task_revision: faktor_core::id::TaskRevision::new(REV),
+            workspace_root: ROOT.into(),
+            kind: String::new(),
+            command: "make make_build".into(),
+            program: String::new(),
+            args_json: "[]".into(),
+            spec_json: None,
+            budget_ms: 0,
+            inline_status: Some("passed".into()),
+            state: "passed".into(),
+            result_json: None,
+            note: None,
+            op_id: None,
+            environment_fingerprint_json: None,
+            created_ms: 1,
+            updated_ms: 1,
+            finished_ms: Some(1),
+        };
+        let inline = job_from_row(inline_row).expect("an inline row needs no spec");
+        assert!(inline.spec_json.is_empty());
+        assert_eq!(inline.inline, Some(VerificationInlineStatus::Passed));
     }
 }

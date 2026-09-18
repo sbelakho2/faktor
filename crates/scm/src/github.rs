@@ -35,7 +35,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use faktor_provider::egress::{execute_raw, EgressError, HttpTransport, RawRequest, RawResponse};
+use faktor_provider::egress::{HttpTransport, RawRequest, RawResponse};
 
 use crate::error::ScmError;
 use crate::ids::{
@@ -501,9 +501,12 @@ impl GitHubApp {
         if let Some(body) = &body {
             request = request.json_body(body);
         }
-        let response = execute_raw(self.transport.as_ref(), request)
-            .await
-            .map_err(map_egress)?;
+        let response = crate::execute_raw_bounded(
+            self.transport.as_ref(),
+            request,
+            &format!("{method} {path}"),
+        )
+        .await?;
         self.observe_rate_limit(&response, self.now_ms())?;
         if response.status == 304 {
             let cache = self.cache_lock()?;
@@ -763,15 +766,6 @@ fn bounded_excerpt(text: &str) -> String {
         end -= 1;
     }
     format!("{}…", &text[..end])
-}
-
-fn map_egress(e: EgressError) -> ScmError {
-    match e {
-        EgressError::Denied { url, .. } => {
-            ScmError::Forbidden(format!("egress to {url} denied by policy"))
-        }
-        other => ScmError::Transport(other.to_string()),
-    }
 }
 
 #[async_trait]

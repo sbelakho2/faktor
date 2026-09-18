@@ -61,7 +61,7 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use serde::Deserialize;
 
-use faktor_provider::egress::{execute_raw, HttpTransport, RawRequest};
+use faktor_provider::egress::{execute_raw, HttpTransport, RawRequest, RawResponse};
 
 use crate::oidc::{
     constant_time_eq, hmac_sha256, map_membership_claims, ClaimMapping, CodeExchangeRequest,
@@ -91,6 +91,34 @@ pub const SUPPORTED_ALGORITHMS: &[&str] = &["HS256", "RS256"];
 pub const DEFAULT_ALLOWED_ALGORITHMS: &[&str] = &["RS256"];
 /// Hard cap on the configured allowed-algorithm list.
 pub const MAX_ALLOWED_ALGORITHMS: usize = 8;
+
+/// Documented wall-clock bound for ONE OIDC network round trip (discovery,
+/// JWKS, or token exchange). The shared egress client only bounds connect,
+/// so an issuer that accepts and then stalls would otherwise pin the
+/// adapter — and every verification queued behind it — forever.
+pub const OIDC_NETWORK_TIMEOUT_MS: u64 = 30_000;
+
+/// Execute one raw OIDC request under [`OIDC_NETWORK_TIMEOUT_MS`]. The
+/// returned `String` is the call-attributable failure message; callers wrap
+/// it in their typed error variant. A breach names the bound explicitly.
+async fn execute_raw_bounded(
+    transport: &dyn HttpTransport,
+    request: RawRequest,
+    what: &str,
+) -> Result<RawResponse, String> {
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(OIDC_NETWORK_TIMEOUT_MS),
+        execute_raw(transport, request),
+    )
+    .await
+    {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(e)) => Err(format!("{what}: {e}")),
+        Err(_) => Err(format!(
+            "{what} exceeded the {OIDC_NETWORK_TIMEOUT_MS} ms network bound"
+        )),
+    }
+}
 
 /// How the adapter authenticates itself at the token endpoint.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -460,9 +488,10 @@ impl NetworkOidcAdapter {
 
     async fn fetch_discovery(&self) -> Result<CachedDiscovery, OidcError> {
         let url = format!("{}/.well-known/openid-configuration", self.config.issuer);
-        let response = execute_raw(&*self.transport, RawRequest::new("GET", url))
-            .await
-            .map_err(|e| OidcError::DiscoveryUnavailable(e.to_string()))?;
+        let response =
+            execute_raw_bounded(&*self.transport, RawRequest::new("GET", url), "discovery")
+                .await
+                .map_err(OidcError::DiscoveryUnavailable)?;
         if !(200..300).contains(&response.status) {
             return Err(OidcError::DiscoveryUnavailable(format!(
                 "discovery endpoint answered {}",
@@ -512,9 +541,13 @@ impl NetworkOidcAdapter {
 
     async fn fetch_jwks(&self) -> Result<Vec<JwkKey>, OidcError> {
         let doc = self.discovery(&self.config.issuer).await?;
-        let response = execute_raw(&*self.transport, RawRequest::new("GET", doc.jwks_uri))
-            .await
-            .map_err(|e| OidcError::DiscoveryUnavailable(format!("jwks: {e}")))?;
+        let response = execute_raw_bounded(
+            &*self.transport,
+            RawRequest::new("GET", doc.jwks_uri),
+            "jwks",
+        )
+        .await
+        .map_err(OidcError::DiscoveryUnavailable)?;
         if !(200..300).contains(&response.status) {
             return Err(OidcError::DiscoveryUnavailable(format!(
                 "jwks endpoint answered {}",
@@ -769,9 +802,9 @@ impl AsyncOidcAdapter for NetworkOidcAdapter {
             let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
             raw_request = raw_request.header("authorization", format!("Basic {encoded}"));
         }
-        let raw = execute_raw(&*self.transport, raw_request)
+        let raw = execute_raw_bounded(&*self.transport, raw_request, "token exchange")
             .await
-            .map_err(|e| OidcError::CodeExchangeRefused(e.to_string()))?;
+            .map_err(OidcError::CodeExchangeRefused)?;
         if !(200..300).contains(&raw.status) {
             return Err(OidcError::CodeExchangeRefused(format!(
                 "token endpoint answered {}",

@@ -995,7 +995,24 @@ mod tests {
     fn unicode_query_safe() {
         let (idx, ws) = corpus();
         let svc = SearchService::new(idx, Some(Arc::new(KeywordEmbedder)));
-        let _ = svc.fused(ws, "解析 parse", 5);
-        let _ = svc.evidence_package(ws, &["解析".into(), "parse".into()], 5);
+        // A mixed CJK+ASCII query must still retrieve through the ASCII
+        // token (CJK is tokenized safely, never panics, never blanks the
+        // whole query).
+        let hits = svc.fused(ws, "解析 parse", 5);
+        assert!(!hits.is_empty(), "mixed CJK+ASCII query must retrieve");
+        assert!(
+            hits.iter().any(|h| h.path.ends_with("parser.rs")),
+            "{hits:?}"
+        );
+        // Per-concept evidence: the ASCII concept retrieves real snippets;
+        // the pure-CJK concept is handled without fabricating hits.
+        let mixed = svc.evidence_package(ws, &["解析".into(), "parse".into()], 5);
+        assert!(!mixed.is_empty(), "the ASCII concept must retrieve");
+        assert!(mixed.len() <= 5, "evidence stays bounded");
+        assert!(mixed
+            .iter()
+            .all(|e| !e.snippet.is_empty() && e.path.ends_with(".rs")));
+        let cjk_only = svc.evidence_package(ws, &["解析".into()], 5);
+        assert!(cjk_only.len() <= 5, "a pure-CJK concept stays bounded");
     }
 }

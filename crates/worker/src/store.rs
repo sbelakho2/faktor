@@ -1684,7 +1684,17 @@ impl WorkerStore for SqliteWorkerStore {
                 |r| r.get(0),
             )
             .map_err(backend)?;
-        Ok(max.unwrap_or(0).max(0) as u32)
+        // The column only ever holds `u32` attempt numbers written by the
+        // typed API (bit-cast into the signed column), so the read side casts
+        // back through u64 and a value that does not fit is corruption:
+        // refuse it by field name instead of silently wrapping with `as u32`.
+        let max = max.unwrap_or(0);
+        u32::try_from(max as u64).map_err(|_| {
+            WorkerError::Malformed(format!(
+                "wp_attempt max attempt number {max} for job {} is outside u32",
+                job.as_str()
+            ))
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2322,6 +2332,49 @@ mod tests {
         }
         let err = store.job(&j.job_id).unwrap_err();
         assert!(matches!(err, WorkerError::Malformed(_)), "{err}");
+    }
+
+    /// Adversarial: an out-of-range persisted attempt number is refused by
+    /// field name, never narrowed with `as u32`; the largest valid `u32`
+    /// value still round-trips exactly.
+    #[test]
+    fn oversize_persisted_attempt_number_is_a_typed_field_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workers.db");
+        let store = SqliteWorkerStore::open(&path).unwrap();
+        let j = job("job_1", "org_1");
+        store.put_job(&j).unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "INSERT INTO wp_attempt(job_id, generation, attempt, state, worker_id, lease_id, payload)
+                 VALUES (?1, 1, ?2, 'running', NULL, NULL, '{}')",
+                params![j.job_id.as_str(), i64::from(u32::MAX) + 1],
+            )
+            .unwrap();
+        }
+        match store.max_attempt_number(&j.job_id).unwrap_err() {
+            WorkerError::Malformed(msg) => {
+                assert!(msg.contains("max attempt number"), "{msg}");
+                assert!(msg.contains("outside u32"), "{msg}");
+            }
+            other => panic!("oversize attempt must be a typed Malformed refusal: {other}"),
+        }
+        {
+            let conn = store.lock().unwrap();
+            conn.execute("DELETE FROM wp_attempt", []).unwrap();
+            conn.execute(
+                "INSERT INTO wp_attempt(job_id, generation, attempt, state, worker_id, lease_id, payload)
+                 VALUES (?1, 1, ?2, 'running', NULL, NULL, '{}')",
+                params![j.job_id.as_str(), i64::from(u32::MAX)],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store.max_attempt_number(&j.job_id).unwrap(),
+            u32::MAX,
+            "u32::MAX must survive the i64 column round-trip exactly"
+        );
     }
 
     /// The CAS accept is structural: two acceptors of one generation yield

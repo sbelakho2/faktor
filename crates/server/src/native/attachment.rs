@@ -405,7 +405,8 @@ mod tests {
                 .unwrap()
             },
             permissions,
-        );
+        )
+        .unwrap();
         deps.directory = Some(root.to_string_lossy().into_owned());
         let ws = session.create_workspace(root.to_str().unwrap()).unwrap();
         let created = session

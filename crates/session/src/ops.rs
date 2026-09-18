@@ -818,7 +818,7 @@ mod tests {
         s: SessionId,
         recovery: faktor_core::op::RecoveryStrategy,
     ) -> OpMeta {
-        let op = m.next_op_id();
+        let op = m.try_next_op_id().unwrap();
         OpMeta::new(
             op,
             s,
@@ -1043,7 +1043,7 @@ mod tests {
         // No tracked op yet: loud NotFound.
         let err = s
             .request_permission(
-                m.next_op_id(),
+                m.try_next_op_id().unwrap(),
                 &Capability::Network {
                     destination: "https://x".into(),
                 },
@@ -1235,7 +1235,7 @@ mod tests {
     fn provider_call_records_are_durable_and_bounded() {
         let (_d, m) = test_manager();
         let s = session(&m);
-        let op = m.next_op_id();
+        let op = m.try_next_op_id().unwrap();
         let id = s
             .record_provider_call(op, "ollama", "qwen3.8", "ok", Some(100), Some(50), None)
             .unwrap();
@@ -1400,7 +1400,7 @@ mod tests {
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let s = session(&m);
         let sid = s.id();
-        let op = || m.next_op_id();
+        let op = || m.try_next_op_id().unwrap();
         // Turn 1-3: identical prompt heads.
         settle_bytes(&s, op(), b"static prefix bytes");
         settle_bytes(&s, op(), b"static prefix bytes");
@@ -1459,7 +1459,7 @@ mod tests {
         assert_eq!(agg2.observations, agg.observations);
         assert!((agg2.mean - agg.mean).abs() < 1e-12);
         // A new observation on the reopened session chains off the last row.
-        settle_bytes(&s2, m2.next_op_id(), b"static prefix bytes");
+        settle_bytes(&s2, m2.try_next_op_id().unwrap(), b"static prefix bytes");
         let rows3 = prefix_rows(&s2);
         assert_eq!(rows3.len(), 6);
         assert_eq!(
@@ -1494,7 +1494,7 @@ mod tests {
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let s = session(&m);
         let sid = s.id();
-        let op = || m.next_op_id();
+        let op = || m.try_next_op_id().unwrap();
         let seg1 = segments_json(0x10, &[10, 20, 30, 40, 50, 5, 4, 3]);
         let seg2 = segments_json(0x10, &[10, 20, 30, 40, 50, 5, 9, 2]);
         s.settle_usage_with_prefix_segments(
@@ -1575,7 +1575,7 @@ mod tests {
         let (_d, m) = test_manager();
         let a = session(&m);
         let b = session(&m);
-        let op = || m.next_op_id();
+        let op = || m.try_next_op_id().unwrap();
         settle_bytes(&a, op(), b"session A head");
         settle_bytes(&b, op(), b"session B head");
         settle_bytes(&a, op(), b"session A head");
@@ -1650,7 +1650,7 @@ mod tests {
         let huge = "p".repeat(300);
         assert!(s
             .settle_usage_with_prefix(
-                m.next_op_id(),
+                m.try_next_op_id().unwrap(),
                 &huge,
                 "m",
                 "completed",
@@ -1663,7 +1663,7 @@ mod tests {
             .is_err());
         assert!(s
             .settle_usage_with_prefix(
-                m.next_op_id(),
+                m.try_next_op_id().unwrap(),
                 "fake",
                 &"m".repeat(300),
                 "completed",
@@ -1679,7 +1679,7 @@ mod tests {
         // error mapping) and writes nothing.
         let err = s
             .settle_usage_with_prefix(
-                m.next_op_id(),
+                m.try_next_op_id().unwrap(),
                 "fake",
                 "m",
                 "completed",
@@ -1698,8 +1698,16 @@ mod tests {
         assert!(prefix_rows(&s).is_empty());
         // Prefix-less settles land with NULL prefix columns and are excluded
         // from the observation series (like plain settle_usage rows).
-        s.record_provider_call(m.next_op_id(), "fake", "m", "started", None, None, None)
-            .unwrap();
+        s.record_provider_call(
+            m.try_next_op_id().unwrap(),
+            "fake",
+            "m",
+            "started",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(prefix_rows(&s).is_empty());
         assert!(s.stored_prefix_stability().unwrap().is_none());
     }
@@ -1711,9 +1719,9 @@ mod tests {
         // shared one op id across attempts), and each write is its own row.
         let (_d, m) = test_manager();
         let s = session(&m);
-        let logical = m.next_op_id();
-        let a0 = ModelCallAttempt::new(logical, m.next_op_id(), 0).unwrap();
-        let a1 = ModelCallAttempt::new(logical, m.next_op_id(), 1).unwrap();
+        let logical = m.try_next_op_id().unwrap();
+        let a0 = ModelCallAttempt::new(logical, m.try_next_op_id().unwrap(), 0).unwrap();
+        let a1 = ModelCallAttempt::new(logical, m.try_next_op_id().unwrap(), 1).unwrap();
 
         // Distinct attempts -> distinct durable rows, distinct row ids.
         let p0 = s
@@ -1752,7 +1760,7 @@ mod tests {
         // rather than persisted as a link to nothing.
         let err = s
             .record_provider_call_attempt(
-                ModelCallAttempt::new(logical, m.next_op_id(), 2).unwrap(),
+                ModelCallAttempt::new(logical, m.try_next_op_id().unwrap(), 2).unwrap(),
                 Some(crate::budget::ReservationId::new(0)),
                 "fake",
                 "m",

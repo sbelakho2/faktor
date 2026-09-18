@@ -1147,29 +1147,36 @@ mod tests {
 
     #[test]
     fn write_rules_refuse_money_on_token_rows_and_pending_corrections() {
+        // Every refusal is the typed Malformed error naming the exact rule —
+        // never a generic failure and never a silent write.
+        fn refuse(event: &UsageEvent, needle: &str) {
+            match event.validate() {
+                Err(ControlPlaneError::Malformed(msg)) => {
+                    assert!(msg.contains(needle), "refusal {msg:?} must name {needle:?}")
+                }
+                other => panic!("expected Malformed containing {needle:?}, got {other:?}"),
+            }
+        }
         let mut event = token_event("e1", UsageUnit::InputTokens, 5, SpendCategory::Byok);
-        assert!(event.validate().is_ok());
+        assert_eq!(event.validate(), Ok(()), "the base event is valid");
         event.provider_cost_micro = 9;
-        assert!(event.validate().is_err(), "tokens never smuggle money");
+        refuse(&event, "token event must carry provider_cost 0");
         let mut event = token_event("e2", UsageUnit::InputTokens, 5, SpendCategory::Byok);
         event.quantity = 0;
-        assert!(event.validate().is_err());
+        refuse(&event, "non-zero quantity");
         let mut event = cost_event("e3", 10, SpendCategory::Managed);
         event.quantity = 2;
-        assert!(event.validate().is_err());
+        refuse(&event, "quantity 1");
         let mut event = cost_event("e4", 10, SpendCategory::Managed);
         event.correction_of = Some(UsageEventId::try_new("e0").unwrap());
         event.reconciliation_state = ReconciliationState::Pending;
-        assert!(event.validate().is_err(), "a correction is never pending");
+        refuse(&event, "a correction is never pending");
         let mut event = cost_event("e5", 10, SpendCategory::Managed);
         event.reconciliation_state = ReconciliationState::Corrected;
-        assert!(
-            event.validate().is_err(),
-            "a non-correction is never written corrected"
-        );
+        refuse(&event, "non-correction event can never be corrected");
         let mut event = cost_event("e6", 10, SpendCategory::Managed);
         event.correction_of = Some(UsageEventId::try_new("e6").unwrap());
-        assert!(event.validate().is_err(), "self-correction is refused");
+        refuse(&event, "never correct itself");
     }
 
     #[test]

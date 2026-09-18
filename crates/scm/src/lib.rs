@@ -65,11 +65,61 @@ pub use token::{
     MAX_APP_KEY_PEM_BYTES, MAX_APP_TOKEN_ATTEMPTS,
 };
 pub use webhook::{
-    hmac_sha256_hex, IngestOutcome, VerifiedWebhook, WebhookError, WebhookHeaders, WebhookInbox,
-    WebhookVerifier, DEFAULT_REPLAY_WINDOW_MS, MAX_WEBHOOK_BODY_BYTES,
+    hmac_sha256_hex, installation_of, IngestOutcome, VerifiedWebhook, WebhookError, WebhookHeaders,
+    WebhookInbox, WebhookVerifier, DEFAULT_REPLAY_WINDOW_MS, MAX_WEBHOOK_BODY_BYTES,
 };
 
 /// Convenience constructor for one external-operation identity.
 pub fn try_operation_id(raw: impl Into<String>) -> Result<ExternalOperationId, ScmError> {
     ExternalOperationId::try_new(raw)
+}
+
+/// Documented wall-clock bound for ONE SCM HTTP attempt (send plus full
+/// bounded body materialization). The shared egress client only bounds
+/// connect, so a provider that accepts and then stalls would otherwise pin
+/// the caller — and every retry loop — forever. Retry loops are bounded by
+/// their attempt counts, so total time is bounded by
+/// `attempts × (SCM_HTTP_TIMEOUT_MS + backoff)`.
+pub const SCM_HTTP_TIMEOUT_MS: u64 = 30_000;
+
+/// Execute one raw request under [`SCM_HTTP_TIMEOUT_MS`]; a breach is a
+/// typed [`ScmError::Transport`] naming the call. Policy denials map to
+/// [`ScmError::Forbidden`] exactly like the direct egress mapping.
+pub(crate) async fn execute_raw_bounded(
+    transport: &dyn faktor_provider::egress::HttpTransport,
+    request: faktor_provider::egress::RawRequest,
+    what: &str,
+) -> Result<faktor_provider::egress::RawResponse, ScmError> {
+    execute_raw_bounded_with(
+        transport,
+        request,
+        std::time::Duration::from_millis(SCM_HTTP_TIMEOUT_MS),
+        what,
+    )
+    .await
+}
+
+/// Testable variant of [`execute_raw_bounded`] with an explicit bound.
+pub(crate) async fn execute_raw_bounded_with(
+    transport: &dyn faktor_provider::egress::HttpTransport,
+    request: faktor_provider::egress::RawRequest,
+    bound: std::time::Duration,
+    what: &str,
+) -> Result<faktor_provider::egress::RawResponse, ScmError> {
+    match tokio::time::timeout(
+        bound,
+        faktor_provider::egress::execute_raw(transport, request),
+    )
+    .await
+    {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(faktor_provider::egress::EgressError::Denied { url, .. })) => Err(
+            ScmError::Forbidden(format!("egress to {url} denied by policy")),
+        ),
+        Ok(Err(other)) => Err(ScmError::Transport(other.to_string())),
+        Err(_) => Err(ScmError::Transport(format!(
+            "{what} exceeded its {} ms HTTP bound",
+            bound.as_millis()
+        ))),
+    }
 }

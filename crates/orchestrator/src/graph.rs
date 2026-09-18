@@ -139,6 +139,8 @@ pub enum GraphError {
     Conflict(String),
     #[error("graph not found: {0}")]
     NotFound(String),
+    #[error("graph malformed durable row: {0}")]
+    Malformed(String),
     #[error("graph oversized: {0}")]
     Oversized(String),
     #[error("graph internal: {0}")]
@@ -150,6 +152,7 @@ impl From<faktor_core::Error> for GraphError {
         match e.kind {
             faktor_core::ErrorKind::NotFound => GraphError::NotFound(e.message),
             faktor_core::ErrorKind::Conflict => GraphError::Conflict(e.message),
+            faktor_core::ErrorKind::Malformed => GraphError::Malformed(e.message),
             faktor_core::ErrorKind::Oversized => GraphError::Oversized(e.message),
             _ => GraphError::Internal(format!("{:?}: {}", e.kind, e.message)),
         }
@@ -161,6 +164,7 @@ impl From<ExecError> for GraphError {
         match e {
             ExecError::Conflict(m) => GraphError::Conflict(m),
             ExecError::NotFound(m) => GraphError::NotFound(m),
+            ExecError::Malformed(m) => GraphError::Malformed(m),
             ExecError::Oversized(m) => GraphError::Oversized(m),
             other => GraphError::Internal(other.to_string()),
         }
@@ -178,6 +182,7 @@ impl From<GraphError> for ExecError {
             )),
             GraphError::Conflict(m) => ExecError::Conflict(m),
             GraphError::NotFound(m) => ExecError::NotFound(m),
+            GraphError::Malformed(m) => ExecError::Malformed(m),
             GraphError::Oversized(m) => ExecError::Oversized(m),
             GraphError::Internal(m) => ExecError::Internal(m),
         }
@@ -332,15 +337,21 @@ impl OrchestratorRuntime {
         row: &ChildRuntime,
         plan_step_index: Option<usize>,
     ) -> Result<GraphChildNode, GraphError> {
-        let session = self
-            .manager
-            .get_session(SessionId::new(row.session_id))?
-            .ok_or_else(|| {
-                GraphError::NotFound(format!(
-                    "graph assembly: child {} names missing session {}",
-                    row.child_id, row.session_id
-                ))
-            })?;
+        // The row's session id is DECODED durable data: zero/oversized raw
+        // values must never panic in the id constructor — a malformed row
+        // is a typed refusal naming the child.
+        let session_id = SessionId::try_from(row.session_id).map_err(|e| {
+            GraphError::Malformed(format!(
+                "graph assembly: registry row of child {} carries session_id {}: {}",
+                row.child_id, row.session_id, e.message
+            ))
+        })?;
+        let session = self.manager.get_session(session_id)?.ok_or_else(|| {
+            GraphError::NotFound(format!(
+                "graph assembly: child {} names missing session {}",
+                row.child_id, row.session_id
+            ))
+        })?;
         let steer_events = session
             .orchestrator_ctl_all()
             .map_err(|e| {

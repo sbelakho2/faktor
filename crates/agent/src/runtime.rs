@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::wire_plan::plan_wire_turn_with_prior;
 use crate::EfficiencyFlags;
@@ -454,6 +454,28 @@ pub struct EvidenceQuery {
 /// it (its future is dropped and the package degrades to empty).
 const LEGACY_EVIDENCE_MAX_WAIT: Duration = Duration::from_millis(2000);
 
+/// Fallback bound of the child-park wait (drive boundary) when the operator
+/// configured an unbounded (`0`) wall-clock turn budget. A parked child is
+/// re-driven by the executor on a typed timeout; it is NEVER polled forever.
+const MAX_CHILD_PARK_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// Fallback bound of one queue-runner wait (interrupted turn not yet
+/// continuable / admission still declined) when the turn budget is `0`. The
+/// durable queue head stays pending and a re-kick resumes it; the runner
+/// itself never polls forever.
+const MAX_QUEUE_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// The configured turn budget as a wall deadline, with the given fallback
+/// when the operator opted out of the wall-clock cap (`turn_budget_ms == 0`).
+fn bounded_turn_wait(handle: &faktor_session::SessionHandle, fallback: Duration) -> Duration {
+    let budget = handle.turn_budget_ms();
+    if budget == 0 {
+        fallback
+    } else {
+        Duration::from_millis(budget)
+    }
+}
+
 pub trait EvidenceProvider: Send + Sync {
     fn evidence_for(
         &self,
@@ -844,8 +866,21 @@ async fn semantic_turn_consult(
             Some(SemanticEntityRef::new(workspace, path, entity_id))
         })
         .collect();
+    // The consult is best-effort observability: an op-id allocation failure
+    // degrades to the same Unknown risk as any other consult failure, never
+    // a fabricated zero id and never a failed turn.
+    let op_id = match deps.session.try_next_op_id() {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "op-id allocation failed; semantic consult degraded to unknown"
+            );
+            return Some(SemanticTurnState::unknown(provider_id.to_string()));
+        }
+    };
     let call = SemanticCall::new(
-        deps.session.next_op_id(),
+        op_id,
         handle.id(),
         workspace,
         deps.clock.now_ms(),
@@ -1371,10 +1406,28 @@ pub struct IntegratedRootAttemptOutcome {
     pub verification: Option<IntegratedRootVerification>,
 }
 
+/// The per-session queue-runner gate (boundary-race authority): at most one
+/// runner owns a session's durable queue. Every additional request — a new
+/// queued submit, the executor's settle-path kick after a turn
+/// finishes/cancels, or a recovery kick — ARMS the live runner for exactly
+/// one more BOUNDED pass instead of being dropped. The runner consumes the
+/// armed pass under this gate before releasing it, so a request arriving
+/// while the previous runner is exiting on its wait-budget boundary (the
+/// boundary race) can never leave a durable head without a runner.
+#[derive(Debug, Default, Clone, Copy)]
+struct QueueRunnerGate {
+    /// An additional bounded pass was requested while this gate was held.
+    rerun: bool,
+    /// Bounded passes this runner STARTED (diagnostics/tests: `>= 2` proves
+    /// an armed pass was consumed instead of being lost).
+    passes: u64,
+}
+
 pub struct AgentRuntime {
     deps: Arc<AgentDeps>,
-    /// Sessions with a live queue-runner task (single runner per session).
-    runners: std::sync::Mutex<std::collections::HashSet<SessionId>>,
+    /// Sessions with a live queue-runner task (single runner per session);
+    /// the value is the gate arming state (see [`QueueRunnerGate`]).
+    runners: std::sync::Mutex<std::collections::HashMap<SessionId, QueueRunnerGate>>,
     /// Per-session bounded progress records (stall vs progress, §28):
     /// `{last_output_at, last_progress_at, in_flight_op,
     /// last_op_completed_at}` per live session, fed from op completions,
@@ -1673,7 +1726,7 @@ impl AgentRuntime {
         ));
         Ok(Arc::new(Self {
             deps: Arc::new(deps),
-            runners: std::sync::Mutex::new(std::collections::HashSet::new()),
+            runners: std::sync::Mutex::new(std::collections::HashMap::new()),
             progress: std::sync::Mutex::new(std::collections::HashMap::new()),
             coordination: std::sync::Mutex::new(std::collections::HashMap::new()),
             token_cache: TokenCache::new(),
@@ -2675,7 +2728,13 @@ impl AgentRuntime {
                 // bounded sleep re-scans the durable queue; the cancellation
                 // token ends the park immediately. A crash here is recovered
                 // by the executor's normal re-attach (the drive re-enters and
-                // re-parks until a Resume row exists).
+                // re-parks until a Resume row exists). The park itself is
+                // BOUNDED by the configured turn budget (fallback when the
+                // operator opted out with 0): a child whose Resume never
+                // arrives returns a TYPED timeout so the executor re-drives
+                // it — it is never polled forever.
+                let park_deadline = bounded_turn_wait(handle, MAX_CHILD_PARK_WAIT);
+                let park_started = Instant::now();
                 loop {
                     if cancel.is_cancelled() {
                         return Ok((changed_model, note));
@@ -2708,7 +2767,17 @@ impl AgentRuntime {
                     if resume {
                         break; // the outer scan applies the Resume row
                     }
-                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    let parked_for = park_started.elapsed();
+                    if parked_for >= park_deadline {
+                        return Err(faktor_core::Error::timeout(format!(
+                            "child {} stayed parked (Waiting) for {park_deadline:?} without a Resume \
+                             or Cancel control (parked {parked_for:?}); the executor must re-drive \
+                             the child at this boundary",
+                            handle.id()
+                        )));
+                    }
+                    tokio::time::sleep(Duration::from_millis(150).min(park_deadline - parked_for))
+                        .await;
                 }
                 // Re-scan from the queue head: rows enqueued while parked are
                 // applied at this same boundary, in seq order.
@@ -2896,24 +2965,48 @@ impl AgentRuntime {
     /// The single per-session turn runner (audit round 6): waits for the
     /// active logical turn to finish, then delivers queued prompts one at a
     /// time as new logical turns (each with its own one-TurnCompleted flow).
-    /// Exits when the queue is empty; callers re-kick on the next prompt.
+    /// Exits when the queue is empty (or its bounded wait expires with the
+    /// durable head still pending: the settle path/recovery re-kicks it).
     /// The per-session gate guarantees at most one runner per session.
+    ///
+    /// Boundary-race authority: a caller that arrives while a runner already
+    /// owns the gate ARMS that runner for one more bounded pass instead of
+    /// returning silently. The settle-path kick of a turn that just
+    /// finished/cancelled (and every new queued submit) therefore can never
+    /// be lost against a runner that is exiting exactly as its wait budget
+    /// expires.
     pub async fn run_session_queue(self: &Arc<Self>, session: SessionId) {
         {
             let mut runners = self.runners.lock().unwrap();
-            if !runners.insert(session) {
-                return; // a runner already exists for this session
+            if let Some(gate) = runners.get_mut(&session) {
+                // A live runner owns the session: arm exactly one more
+                // bounded pass. It re-checks the durable head before
+                // releasing the gate, so this request is never dropped.
+                gate.rerun = true;
+                return;
             }
+            runners.insert(session, QueueRunnerGate::default());
         }
         loop {
-            let result = self.run_session_queue_inner(session).await;
-            if let Err(e) = result {
-                tracing::warn!("queue runner for session {session} ended: {e}");
-                break;
+            {
+                let mut runners = self.runners.lock().unwrap();
+                if let Some(gate) = runners.get_mut(&session) {
+                    gate.passes += 1;
+                }
             }
-            // Close the start/exit race (audit round 7): a prompt that queued
-            // between our empty-observation and this gate removal must get a
-            // runner. Final durable re-check before releasing the gate.
+            let result = self.run_session_queue_inner(session).await;
+            if let Err(e) = &result {
+                tracing::warn!("queue runner for session {session} ended: {e}");
+            }
+            // The atomic gate handoff (boundary race): consume an armed pass
+            // under the gate lock. An armed runner runs ONE more bounded pass
+            // (the turn budget, never unbounded polling); otherwise the gate
+            // is released only when the durable re-check saw no pending head
+            // — which closes the start/exit window for a head that queued
+            // (or was recovered) after the pass observed an empty queue. The
+            // durable read happens BEFORE the lock: a kick racing it either
+            // arms this gate (consumed under the lock) or finds the gate
+            // already gone and runs its own loop.
             let pending = self
                 .deps
                 .session
@@ -2922,18 +3015,49 @@ impl AgentRuntime {
                 .flatten()
                 .map(|h| h.queued_prompt_count().unwrap_or(0))
                 .unwrap_or(0);
-            if pending == 0 {
-                break;
+            let mut runners = self.runners.lock().unwrap();
+            let Some(gate) = runners.get_mut(&session) else {
+                return; // only this task removes its own gate
+            };
+            if std::mem::take(&mut gate.rerun) {
+                drop(runners);
+                continue;
             }
-            // A prompt queued in the window: drain it under the same gate.
+            if result.is_ok() && pending > 0 {
+                // A prompt appeared between the pass's empty observation and
+                // this decision: drain it under the same gate (audit round
+                // 7's start/exit race close). A pending head after a TYPED
+                // timeout does not loop here — the settle path/recovery
+                // kick arms or replaces this runner (bounded by the next
+                // pass's budget, never a poll loop).
+                drop(runners);
+                continue;
+            }
+            runners.remove(&session);
+            return;
         }
-        self.runners.lock().unwrap().remove(&session);
     }
 
     async fn run_session_queue_inner(
         self: &Arc<Self>,
         session: SessionId,
     ) -> faktor_core::Result<()> {
+        // Wait budget shared by every CONSECUTIVE non-progressing wait below
+        // (an interrupted turn that is not continuable yet, a declined
+        // admission): a session that never becomes eligible cannot make the
+        // runner poll forever. It is the configured turn budget (fallback
+        // when the operator opted out with 0); every real progress resets it.
+        // On exhaustion the runner returns a TYPED timeout and the durable
+        // queue head stays pending for the next re-kick.
+        let wait_deadline = {
+            let handle = self
+                .deps
+                .session
+                .get_session(session)?
+                .ok_or_else(|| Error::not_found(format!("session {session}")))?;
+            bounded_turn_wait(&handle, MAX_QUEUE_WAIT)
+        };
+        let mut wait_started: Option<Instant> = None;
         loop {
             let handle = self
                 .deps
@@ -2954,17 +3078,36 @@ impl AgentRuntime {
                         && handle.turn_cancellation(record.turn_op_id).is_none()
                     {
                         match self.continue_record(&handle, &record).await {
-                            Ok(_) => continue,
+                            Ok(_) => {
+                                wait_started = None; // progress: fresh budget
+                                continue;
+                            }
                             Err(e) => {
                                 // Not continuable yet (e.g. a durable
                                 // permission waits on the user): back off and
-                                // retry — the durable head stays pending.
+                                // retry — the durable head stays pending. The
+                                // retry is BOUNDED: the turn budget (or the
+                                // fallback) ends the wait with a typed timeout.
                                 tracing::warn!(
                                     session = %session,
                                     turn = %record.turn_op_id,
                                     "queue runner cannot continue interrupted turn: {e}"
                                 );
-                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                let started = *wait_started.get_or_insert_with(Instant::now);
+                                let waited = started.elapsed();
+                                if waited >= wait_deadline {
+                                    return Err(Error::timeout(format!(
+                                        "queue runner of session {session} could not continue \
+                                         interrupted turn {} for {wait_deadline:?} (waited \
+                                         {waited:?}); the durable queue head stays pending and \
+                                         the settle path or recovery re-kicks the runner: {e}",
+                                        record.turn_op_id
+                                    )));
+                                }
+                                tokio::time::sleep(
+                                    Duration::from_millis(200).min(wait_deadline - waited),
+                                )
+                                .await;
                                 continue;
                             }
                         }
@@ -2978,13 +3121,27 @@ impl AgentRuntime {
             let Some(admitted) = handle.admit_next_queued()? else {
                 // Admission declined: either the queue is empty (exit) or
                 // the session is mid-turn (wait for the active logical turn
-                // to end, then re-try — the durable head stays pending).
+                // to end, then re-try — the durable head stays pending). The
+                // wait is BOUNDED: the turn budget (or the fallback) ends it
+                // with a typed timeout instead of polling forever.
                 if handle.queued_prompt_count()? == 0 {
                     return Ok(());
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                let started = *wait_started.get_or_insert_with(Instant::now);
+                let waited = started.elapsed();
+                if waited >= wait_deadline {
+                    return Err(Error::timeout(format!(
+                        "queue runner of session {session} was declined admission for \
+                         {wait_deadline:?} (waited {waited:?}) with {} prompt(s) still queued; \
+                         the durable queue head stays pending and the settle path or recovery \
+                         re-kicks the runner",
+                        handle.queued_prompt_count()?
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(100).min(wait_deadline - waited)).await;
                 continue;
             };
+            wait_started = None; // admitted: the wait (if any) is over
             handle
                 .append_journal_event(
                     faktor_core::event::EventKind::PromptAdmitted,
@@ -3081,6 +3238,20 @@ impl AgentRuntime {
             reports.push(self.recover_session(&h)?);
         }
         Ok(reports)
+    }
+
+    /// Compensation surface for callers outside this file that must preserve
+    /// an already-decided outcome across a failed turn-record close (the
+    /// orchestrator's refused-isolation admission): the close is recorded on
+    /// the durable retry channel (marker + audit) and replayed by the next
+    /// session open. Never a silent discard; never a rewritten outcome.
+    pub fn note_turn_record_close(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        turn_op: OpId,
+        status: &str,
+    ) {
+        self.dw_note_finish_turn_record(handle, turn_op, status, DW_SITE_EXECUTOR_REFUSAL_RECORD);
     }
 
     /// Resolve interrupted tool runs of one session. Returns the rows that
@@ -4584,7 +4755,7 @@ impl AgentRuntime {
                 // terminal site below (failed / completed) with this
                 // identity.
                 let attempt_identity =
-                    ModelCallAttempt::new(op_id, self.deps.session.next_op_id(), attempt)
+                    ModelCallAttempt::new(op_id, self.deps.session.try_next_op_id()?, attempt)
                         .ok_or_else(|| {
                             Error::new(
                                 ErrorKind::Internal,
@@ -6570,7 +6741,7 @@ impl AgentRuntime {
             // FilePostcondition (bytes as written) at execution end and
             // recovery verifies through the workspace file service; until
             // then an interrupted write is an unknown effect.
-            let op_id = self.deps.session.next_op_id();
+            let op_id = self.deps.session.try_next_op_id()?;
             // The session ROW is the single source of the worktree/task
             // identity (v8): a standalone session row defaults to 1/1
             // (documented), an adopted row carries the real ids — the
@@ -7045,7 +7216,12 @@ impl AgentRuntime {
         let base_ctx = faktor_verify::exec::VerificationContext {
             session_id: handle.id().raw(),
             task_id: row.task_id.raw(),
-            operation_id: self.deps.session.next_op_id().raw(),
+            operation_id: self
+                .deps
+                .session
+                .try_next_op_id()
+                .map_err(|e| format!("verification op-id allocation failed: {e}"))?
+                .raw(),
             workspace_id: row.workspace_id.raw(),
             worktree_id: row.worktree_id.raw(),
             root: root.to_path_buf(),
@@ -7284,7 +7460,12 @@ impl AgentRuntime {
                     &note,
                     DW_SITE_ROOT_ATTEMPT_CANCEL,
                 );
-                let fresh = self.deps.session.next_op_id().raw();
+                let fresh = self
+                    .deps
+                    .session
+                    .try_next_op_id()
+                    .map_err(|e| format!("verification op-id allocation failed: {e}"))?
+                    .raw();
                 return self
                     .begin_integrated_root_attempt(
                         handle,
@@ -8527,11 +8708,25 @@ impl AgentRuntime {
         };
         let mut resolved = 0usize;
         for job in rows.iter().filter(|j| j.state.is_open()) {
+            // The claim marker's op id is durable-only metadata: an
+            // allocation failure skips the job loudly (it stays open and is
+            // retried later) instead of fabricating a zero id.
+            let claim_op = match self.deps.session.try_next_op_id() {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "op-id allocation failed; verification job {} left unclaimed",
+                        job.check_id
+                    );
+                    continue;
+                }
+            };
             let claimed = handle.claim_verification_job(
                 task_raw,
                 &job.check_id,
                 attempt.op_id,
-                self.deps.session.next_op_id().raw(),
+                claim_op.raw(),
             );
             let job_row = match claimed {
                 Ok(j) => j,
@@ -8684,10 +8879,22 @@ impl AgentRuntime {
         // ordered attempt record (inline outcomes of the enqueueing turn)
         // + the job rows (background outcomes). The gate below then flows
         // through the EXACT tail of a normal attempt.
-        let goal = self
-            .load_ledger(handle)
-            .map(|l| l.goal.clone())
-            .unwrap_or_default();
+        let goal = match self.load_ledger(handle) {
+            Ok(ledger) => ledger.goal.clone(),
+            Err(e) => {
+                // Infallible verdict path: the corrupt ledger already
+                // recorded its rebuild marker in `load_ledger`; derive the
+                // criteria from the durable task row instead of a silent
+                // empty default.
+                tracing::error!(
+                    session = %handle.id(),
+                    "task ledger unreadable while rebuilding verification results; deriving criteria from the durable task row: {e}"
+                );
+                self.session_task(handle)
+                    .map(|task| task.goal)
+                    .unwrap_or_default()
+            }
+        };
         let AttemptRebuild {
             mirrors,
             results,
@@ -8939,9 +9146,116 @@ impl AgentRuntime {
         handle: &faktor_session::SessionHandle,
     ) -> faktor_core::Result<TaskLedger> {
         match handle.get_task_ledger()? {
-            Some(v) => Ok(serde_json::from_value(v).unwrap_or_default()),
+            Some(v) => match serde_json::from_value(v) {
+                Ok(ledger) => Ok(ledger),
+                Err(e) => {
+                    // A corrupt durable row is NEVER silently defaulted: the
+                    // decode failure surfaces typed, and the retry-on-next-open
+                    // marker makes recovery rebuild the row from the durable
+                    // authorities (typed ledger head + task row + title).
+                    let err = Error::new(
+                        ErrorKind::Malformed,
+                        format!("durable task ledger row undecodable: {e}"),
+                    );
+                    tracing::error!(
+                        session = %handle.id(),
+                        site = DW_SITE_LEDGER_REBUILD,
+                        kind = ?err.kind,
+                        "durable task-ledger row undecodable; recording a retry-on-next-open rebuild marker: {e}"
+                    );
+                    let intent = DurableWriteIntent::RebuildTaskLedger {
+                        reason: truncate(&e.to_string(), 1024),
+                    };
+                    self.record_durable_write_failure(
+                        handle,
+                        DW_SITE_LEDGER_REBUILD,
+                        &intent,
+                        &err,
+                    );
+                    Err(err)
+                }
+            },
             None => Ok(TaskLedger::default()),
         }
+    }
+
+    /// Bounded reconstruction of the legacy `task_ledger` working blob from
+    /// the durable authorities that own each fact: the typed session ledger
+    /// head (goal/plan/decisions/last verification) first, then the typed
+    /// task row and the session title. Used ONLY when the legacy row is
+    /// proven undecodable; every fact stays durably owned by its typed row,
+    /// so a source that cannot be read stays empty (never fabricated) and
+    /// the rebuild is a projection of durable rows, not a new authority.
+    fn rebuild_task_ledger_from_durable(
+        &self,
+        handle: &faktor_session::SessionHandle,
+    ) -> faktor_core::Result<TaskLedger> {
+        let mut ledger = TaskLedger::default();
+        match handle.ledger_view() {
+            Ok(view) => {
+                ledger.goal = truncate(&view.head.goal, 4096);
+                ledger.open_steps = view
+                    .head
+                    .plan_steps
+                    .iter()
+                    .take(64)
+                    .map(|step| truncate(&step.text, 512))
+                    .collect();
+                ledger.decisions = view
+                    .head
+                    .decisions
+                    .iter()
+                    .take(128)
+                    .map(|decision| {
+                        if decision.step.is_empty() {
+                            truncate(&decision.choice, 512)
+                        } else {
+                            truncate(
+                                &format!(
+                                    "{}: {} ({})",
+                                    decision.step, decision.choice, decision.rationale
+                                ),
+                                512,
+                            )
+                        }
+                    })
+                    .collect();
+                if let Some(verify) = &view.head.last_verify {
+                    for check in verify.checks.iter().take(256) {
+                        ledger.tests_run.push(truncate(&check.id, 128));
+                        if !check.passed {
+                            ledger.tests_failed.push(truncate(&check.id, 128));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                // The typed head is the primary authority; when it cannot be
+                // read the rebuild falls back to the task row/title and says
+                // so loudly (never a silent empty projection).
+                tracing::warn!(
+                    session = %handle.id(),
+                    "typed ledger head unreadable during legacy-ledger rebuild; falling back to the task row/title: {e}"
+                );
+            }
+        }
+        if let Some(task) = self.session_task(handle) {
+            if ledger.goal.is_empty() {
+                ledger.goal = truncate(&task.goal, 4096);
+            }
+            if ledger.open_steps.is_empty() {
+                ledger.open_steps = task
+                    .plan
+                    .iter()
+                    .take(64)
+                    .map(|step| truncate(step, 512))
+                    .collect();
+            }
+        }
+        if ledger.goal.is_empty() {
+            ledger.goal = truncate(&handle.title()?, 200);
+        }
+        Ok(ledger)
     }
 
     // -------------------------------------------------------- durable Task
@@ -10636,7 +10950,7 @@ impl AgentRuntime {
                     model: model_name,
                     // The summarizer runs under the compactor contract —
                     // NEVER the agent instructions (P0 audit round 11).
-                    op_id: self.deps.session.next_op_id(),
+                    op_id: self.deps.session.try_next_op_id()?,
                     session_id: handle.id(),
                     cancellation: cancel.child(),
                     summary_timeout: DEFAULT_SUMMARY_TIMEOUT,
@@ -10666,7 +10980,7 @@ impl AgentRuntime {
                         Some(p) => Some(StreamingSummarizer {
                             provider: p,
                             model: d.model.clone(),
-                            op_id: self.deps.session.next_op_id(),
+                            op_id: self.deps.session.try_next_op_id()?,
                             session_id: handle.id(),
                             cancellation: cancel.child(),
                             summary_timeout: DEFAULT_SUMMARY_TIMEOUT,
@@ -11074,13 +11388,15 @@ impl AgentRuntime {
         // is one logical op (the summarizer's) with ONE physical attempt —
         // minted BEFORE the reservation so the reservation and the
         // attempt-keyed provider-call rows share the same attempt id.
-        let attempt_identity = ModelCallAttempt::new(s.op_id, self.deps.session.next_op_id(), 0)
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Internal,
-                    "the compaction attempt op id collided with the summarizer op id",
-                )
-            })?;
+        let attempt_identity =
+            ModelCallAttempt::new(s.op_id, self.deps.session.try_next_op_id()?, 0).ok_or_else(
+                || {
+                    Error::new(
+                        ErrorKind::Internal,
+                        "the compaction attempt op id collided with the summarizer op id",
+                    )
+                },
+            )?;
         let reservation = match self
             .deps
             .budgets
@@ -11231,6 +11547,9 @@ const DW_SITE_GATE_DOWNGRADE_FACT: &str = "finish_logical_turn.downgrade_blocked
 const DW_SITE_GATE_DOWNGRADE_DECISION: &str = "finish_logical_turn.downgrade_refusal_decision";
 const DW_SITE_JOB_RESOLVE_CORRUPT: &str = "execute_attempt_jobs.resolve_corrupt_spec";
 const DW_SITE_JOB_RESOLVE: &str = "execute_attempt_jobs.resolve_job";
+const DW_SITE_LEDGER_REBUILD: &str = "load_ledger.rebuild_corrupt_row";
+const DW_SITE_EXECUTOR_REFUSAL_RECORD: &str =
+    "task_executor.admit_refused_isolation.finish_turn_record";
 const DW_SITE_ROUTE_AFTER_REFUSAL: &str = "apply_gate_to_task_row.refusal_route";
 const DW_SITE_ATTEMPT_RECORD_LOOP_SIGNALS: &str = "create_attempt_record.reset_loop_signals";
 const DW_SITE_RESTORE_GOAL_FACT: &str = "restore_task_rows.goal_fact";
@@ -11291,6 +11610,11 @@ enum DurableWriteIntent {
     RouteTaskState {
         task_id: u64,
         state: String,
+    },
+    /// The legacy `task_ledger` row failed to decode: reconstruct it from
+    /// the durable typed authorities instead of ever defaulting.
+    RebuildTaskLedger {
+        reason: String,
     },
 }
 
@@ -11608,6 +11932,22 @@ impl AgentRuntime {
             DurableWriteIntent::RouteTaskState { task_id, state } => {
                 let state: TaskState = serde_json::from_value(serde_json::json!(state))?;
                 self.route_task_to(handle, TaskId::try_from(*task_id)?, state)?;
+                Ok(())
+            }
+            DurableWriteIntent::RebuildTaskLedger { .. } => {
+                // Dedup: a concurrent writer (or an earlier replay) may have
+                // already landed a decodable row — then the marker is a
+                // no-op. A missing row is likewise nothing to reconstruct.
+                match handle.get_task_ledger()? {
+                    None => return Ok(()),
+                    Some(v) => {
+                        if serde_json::from_value::<TaskLedger>(v).is_ok() {
+                            return Ok(());
+                        }
+                    }
+                }
+                let rebuilt = self.rebuild_task_ledger_from_durable(handle)?;
+                handle.put_task_ledger(serde_json::to_value(&rebuilt)?)?;
                 Ok(())
             }
         }
@@ -13667,13 +14007,32 @@ async fn run_independent_review_call(
     prompt.push_str(
         "\n\nNow respond with ONLY the JSON verdict object described in your instructions.",
     );
-    let op_id = deps.session.next_op_id();
+    let op_id = match deps.session.try_next_op_id() {
+        Ok(id) => id,
+        Err(e) => {
+            return IndependentReviewOutcome::refused(
+                &provider_id,
+                &model,
+                format!("op-id allocation failed for the review call: {e}"),
+            )
+        }
+    };
     // Attempt identity (attempt-accounting audit): the review call is ONE
     // logical op with ONE physical attempt — the attempt rides a fresh
     // attempt op id so its reservation and its attempt-keyed provider-call
     // rows are joinable exactly like every other paid call (a crashed
     // review reservation reconciles from its OWN completed row).
-    let attempt_identity = match ModelCallAttempt::new(op_id, deps.session.next_op_id(), 0) {
+    let attempt_op_id = match deps.session.try_next_op_id() {
+        Ok(id) => id,
+        Err(e) => {
+            return IndependentReviewOutcome::refused(
+                &provider_id,
+                &model,
+                format!("op-id allocation failed for the review attempt: {e}"),
+            )
+        }
+    };
+    let attempt_identity = match ModelCallAttempt::new(op_id, attempt_op_id, 0) {
         Some(a) => a,
         None => {
             return IndependentReviewOutcome::refused(
@@ -16516,7 +16875,7 @@ mod tests {
         // Durable ToolStarted row with VerifyHash recovery, never finished
         // (the "crash").
         let op_meta = OpMeta::new(
-            runtime.deps.session.next_op_id(),
+            runtime.deps.session.try_next_op_id().unwrap(),
             session,
             faktor_core::time::Deadline::at(runtime.deps.clock.now_ms().saturating_add(1000)),
             faktor_core::retry::RetryPolicy::default(),
@@ -17851,6 +18210,309 @@ mod tests {
         let _ = t2.await;
         assert_eq!(handle.queued_prompt_count().unwrap(), 0, "FIFO drain");
         assert_eq!(handle.state().unwrap(), AgentState::ReadyForNextTurn);
+    }
+
+    /// Audit: a session stuck mid-turn (admission declined forever) must not
+    /// make the queue runner poll forever. With a short turn budget the runner
+    /// returns a TYPED timeout, the durable queue head stays pending, and the
+    /// runner gate is released for the next re-kick.
+    #[tokio::test]
+    async fn queue_runner_declined_admission_is_bounded_and_typed() {
+        let (deps, _dir) = deps(
+            scripted_provider(vec![ScriptedResponse::Text("a".into())]),
+            vec![],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        runtime.set_turn_budget_ms(60);
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        // The first prompt is never driven: the machine stays mid-turn
+        // (Preparing) while the second prompt queues durably.
+        let first = runtime.submit(session, "active", &[]).unwrap();
+        assert!(!first.queued);
+        let second = runtime.submit(session, "queued", &[]).unwrap();
+        assert!(second.queued);
+        assert_eq!(handle.queued_prompt_count().unwrap(), 1);
+        let began = Instant::now();
+        let err = runtime
+            .run_session_queue_inner(session)
+            .await
+            .expect_err("a never-eligible session must time out, not poll forever");
+        assert_eq!(err.kind, faktor_core::ErrorKind::Timeout, "{err:?}");
+        assert!(err.message.contains("declined admission"), "{err:?}");
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the wait is bounded by the turn budget"
+        );
+        assert_eq!(
+            handle.queued_prompt_count().unwrap(),
+            1,
+            "the durable queue head is untouched by the timeout"
+        );
+    }
+
+    /// Wait until the LIVE queue runner of `session` has STARTED `passes`
+    /// bounded passes (`0` when no runner is live).
+    async fn wait_for_runner_passes(runtime: &AgentRuntime, session: SessionId, passes: u64) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let current = runtime
+                .runners
+                .lock()
+                .unwrap()
+                .get(&session)
+                .map(|gate| gate.passes)
+                .unwrap_or(0);
+            if current >= passes {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the queue runner never reached pass {passes} (at {current})"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Boundary race (audit): the active turn ends exactly as the runner's
+    /// wait budget expires. A settle-path kick that arrives while the runner
+    /// still holds the gate must ARM it for one more bounded pass instead of
+    /// being dropped — the durable head is claimed by exactly one runner and
+    /// completes exactly once, with no second runner and no lost kick.
+    #[tokio::test]
+    async fn queue_runner_kick_in_budget_boundary_is_armed_and_drains_exactly_once() {
+        let base = Arc::new(scripted_provider(vec![
+            ScriptedResponse::Text("A answer".into()),
+            ScriptedResponse::End,
+        ]));
+        let provider = Arc::new(InspectingProvider::new(base, |_, _| Ok(())));
+        let (deps, _dir) = deps_with(provider.clone(), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        // A short wall budget: the runner's first bounded pass expires while
+        // the active turn is still mid-flight.
+        runtime.set_turn_budget_ms(250);
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        // A is the active logical turn (submitted, not driven); B queues.
+        let receipt_a = runtime.submit(session, "A prompt", &[]).unwrap();
+        assert!(!receipt_a.queued);
+        let _receipt_b = runtime.submit(session, "B prompt", &[]).unwrap();
+        assert_eq!(handle.queued_prompt_count().unwrap(), 1);
+
+        // runner1 owns the gate and waits on the mid-turn session.
+        let runner1 = runtime.clone();
+        let t1 = tokio::spawn(async move { runner1.run_session_queue(session).await });
+        wait_for_runner_passes(&runtime, session, 1).await;
+
+        // The settle-path kick arrives while runner1 is still gated: it must
+        // ARM the live runner, never start a second one and never be lost.
+        let kicker = runtime.clone();
+        kicker.run_session_queue(session).await;
+        assert!(
+            !t1.is_finished(),
+            "the kick must arm the live runner, not replace it"
+        );
+
+        // The first bounded pass expires (A still mid-turn); ONLY the armed
+        // second pass keeps the SAME runner task alive. An unarmed runner
+        // would have exited here and left B pending with no runner.
+        wait_for_runner_passes(&runtime, session, 2).await;
+        assert!(
+            !t1.is_finished(),
+            "the armed pass must keep the same runner alive (kick not lost)"
+        );
+
+        // A ends exactly at the boundary while runner1 is inside its armed
+        // pass; the pass admits B and drives it exactly once.
+        let outcome = runtime
+            .drive_receipt(&handle, receipt_a, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        t1.await.unwrap();
+
+        assert_eq!(handle.queued_prompt_count().unwrap(), 0, "B drained");
+        let counts = handle.queue_status_counts().unwrap();
+        assert_eq!(
+            counts.get("done").and_then(|v| v.as_i64()),
+            Some(1),
+            "B's durable row completed exactly once: {counts}"
+        );
+        assert_eq!(
+            provider.counter.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "A and B each streamed exactly one provider call"
+        );
+        let events = handle.events_range(1, None).unwrap();
+        let prompts = events
+            .iter()
+            .filter(|e| e.kind == faktor_core::event::EventKind::PromptReceived)
+            .count();
+        assert_eq!(prompts, 2, "one PromptReceived per prompt");
+        let turns = events
+            .iter()
+            .filter(|e| e.kind == faktor_core::event::EventKind::TurnCompleted)
+            .count();
+        assert_eq!(turns, 2, "exactly two logical turns completed");
+    }
+
+    /// Adversarial companion: an UNARMED runner still exits at its budget
+    /// boundary (no unbounded polling), leaving the durable head pending —
+    /// and a kick that then finds no runner starts a fresh one (the
+    /// replacement path), which drains the head exactly once once the active
+    /// turn is over.
+    #[tokio::test]
+    async fn queue_runner_timeout_then_kick_starts_a_replacement_and_drains_once() {
+        let base = Arc::new(scripted_provider(vec![ScriptedResponse::Text("A".into())]));
+        let provider = Arc::new(InspectingProvider::new(base, |_, _| Ok(())));
+        let (deps, _dir) = deps_with(provider.clone(), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        runtime.set_turn_budget_ms(40);
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let receipt_a = runtime.submit(session, "A prompt", &[]).unwrap();
+        let _receipt_b = runtime.submit(session, "B prompt", &[]).unwrap();
+        // The unarmed runner exits on its own bounded timeout.
+        let runner1 = runtime.clone();
+        tokio::spawn(async move { runner1.run_session_queue(session).await })
+            .await
+            .unwrap();
+        assert!(
+            !runtime.runners.lock().unwrap().contains_key(&session),
+            "the runner gate is released on the bounded timeout"
+        );
+        assert_eq!(
+            handle.queued_prompt_count().unwrap(),
+            1,
+            "B stays durably pending without a runner"
+        );
+        // A now ends; the settle path kicks: the replacement runner (the
+        // gate is free) claims B exactly once.
+        runtime
+            .drive_receipt(&handle, receipt_a, None)
+            .await
+            .unwrap();
+        let kicker = runtime.clone();
+        kicker.run_session_queue(session).await;
+        assert_eq!(handle.queued_prompt_count().unwrap(), 0, "B drained");
+        assert_eq!(
+            provider.counter.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "A and B each ran exactly once"
+        );
+    }
+
+    /// Audit: an interrupted logical turn whose continuation keeps failing
+    /// (durable permission wait, no live driver) must not make the queue
+    /// runner poll forever — it returns a TYPED timeout and leaves the queue
+    /// head pending.
+    #[tokio::test]
+    async fn queue_runner_uncontinuable_turn_is_bounded_and_typed() {
+        let (deps, _dir) = deps(
+            scripted_provider(vec![ScriptedResponse::Text("a".into())]),
+            vec![],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        runtime.set_turn_budget_ms(60);
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let op = runtime.deps.session.try_next_op_id().unwrap();
+        // Legal durable chain to WaitingForPermission (the tool needs a
+        // permission decision nobody will ever answer), plus the active turn
+        // record of that interrupted turn. No in-process driver exists (the
+        // op was never registered), exactly the post-restart residue shape.
+        for (kind, state) in [
+            (
+                faktor_core::event::EventKind::PromptReceived,
+                AgentState::Preparing,
+            ),
+            (
+                faktor_core::event::EventKind::ContextPrepared,
+                AgentState::BuildingContext,
+            ),
+            (
+                faktor_core::event::EventKind::ModelStarted,
+                AgentState::WaitingForModel,
+            ),
+            (
+                faktor_core::event::EventKind::ModelChunkReceived,
+                AgentState::Streaming,
+            ),
+            (
+                faktor_core::event::EventKind::ToolRequested,
+                AgentState::WaitingForPermission,
+            ),
+        ] {
+            handle.append_event(kind, state, Some(op), None).unwrap();
+        }
+        handle
+            .start_turn_record(op, None, None, "fake", "m", None)
+            .unwrap();
+        let queued = runtime.submit(session, "queued", &[]).unwrap();
+        assert!(queued.queued);
+        assert_eq!(handle.queued_prompt_count().unwrap(), 1);
+        let began = Instant::now();
+        let err = runtime
+            .run_session_queue_inner(session)
+            .await
+            .expect_err("an uncontinuable interrupted turn must time out");
+        assert_eq!(err.kind, faktor_core::ErrorKind::Timeout, "{err:?}");
+        assert!(err.message.contains("could not continue"), "{err:?}");
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the wait is bounded by the turn budget"
+        );
+        assert_eq!(
+            handle.queued_prompt_count().unwrap(),
+            1,
+            "the durable queue head is untouched"
+        );
+    }
+
+    /// Audit: a parked orchestrated child (durable Pause applied, no Resume
+    /// row yet) is BOUNDED by the turn budget. On exhaustion the drive
+    /// boundary returns a typed timeout (the executor re-drives it), and a
+    /// later Resume still ends the park immediately — the bound never
+    /// destroys the durable park state.
+    #[tokio::test]
+    async fn parked_child_wait_is_bounded_and_still_resumable() {
+        let (deps, _dir) = deps(
+            scripted_provider(vec![ScriptedResponse::Text("a".into())]),
+            vec![],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        runtime.set_turn_budget_ms(60);
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        handle
+            .orchestrator_child_identity_put(&faktor_session::child::ChildIdentity::default())
+            .unwrap();
+        handle
+            .orchestrator_ctl_enqueue(faktor_session::child::ChildControl::Pause)
+            .unwrap();
+        let op = runtime.deps.session.try_next_op_id().unwrap();
+        let cancel = faktor_core::cancellation::CancellationToken::new();
+        let mut model = "m".to_string();
+        let began = Instant::now();
+        let err = runtime
+            .drive_boundary_controls(&handle, op, &cancel, &mut model)
+            .await
+            .expect_err("a park without Resume must time out");
+        assert_eq!(err.kind, faktor_core::ErrorKind::Timeout, "{err:?}");
+        assert!(err.message.contains("parked"), "{err:?}");
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the park is bounded by the turn budget"
+        );
+        // The durable park is intact: a Resume row ends it immediately.
+        handle
+            .orchestrator_ctl_enqueue(faktor_session::child::ChildControl::Resume)
+            .unwrap();
+        let mut model2 = "m".to_string();
+        runtime
+            .drive_boundary_controls(&handle, op, &cancel, &mut model2)
+            .await
+            .expect("a pending Resume must end the park");
     }
 
     #[tokio::test]
@@ -19914,7 +20576,7 @@ mod tests {
         let changed = vec!["src/main.c".to_string()];
         let cancel = CancellationToken::new();
         // First call: derives once and enqueues the expensive check.
-        let attempt_op = manager.next_op_id().raw();
+        let attempt_op = manager.try_next_op_id().unwrap().raw();
         let first = runtime
             .verify_integrated_root_attempt(&h, &root, &changed, &[], &cancel, attempt_op)
             .await
@@ -19960,7 +20622,7 @@ mod tests {
         );
         // A newer attempt makes the old op structurally superseded: the
         // consumer starts a FRESH attempt and never consumes the stale one.
-        let newer_op = manager.next_op_id().raw();
+        let newer_op = manager.try_next_op_id().unwrap().raw();
         h.begin_verification_attempt(
             task_id.raw(),
             h.task_revision(task_id).unwrap().raw(),
@@ -25409,7 +26071,7 @@ mod tests {
     }
 
     fn op_meta(m: &Arc<SessionManager>, s: SessionId, recovery: RecoveryStrategy) -> OpMeta {
-        let op = m.next_op_id();
+        let op = m.try_next_op_id().unwrap();
         OpMeta::new(
             op,
             s,
@@ -34368,6 +35030,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn corrupt_task_ledger_row_is_marked_and_reconstructed_on_reopen() {
+        // Adversarial (externally corrupted durable row): an undecodable
+        // legacy `task_ledger` row must NEVER fall back to a silent default.
+        // The decode failure surfaces typed, a durable retry-on-next-open
+        // marker (plus the CrashDetected audit event) records it, and the
+        // next open reconstructs the row from the typed durable authorities.
+        let (deps, dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let manager = runtime.deps().session.clone();
+        let session = new_session(runtime.deps());
+        let h = manager.get_session(session).unwrap().unwrap();
+        // Durable authority to reconstruct from: the typed ledger head goal.
+        h.ledger_goal_set("rebuilt from the typed ledger").unwrap();
+        // The adversary replaces the legacy blob with a JSON array (decodes
+        // as `TaskLedger` never).
+        h.put_task_ledger(serde_json::json!(["not", "a", "ledger"]))
+            .unwrap();
+        let err = runtime
+            .load_ledger(&h)
+            .expect_err("a corrupt ledger row is a surfaced failure, never a silent default");
+        assert_eq!(err.kind, faktor_core::ErrorKind::Malformed, "{err:?}");
+        let root = manager.store().root().to_path_buf();
+        assert_eq!(
+            marker_sites(&root),
+            vec![DW_SITE_LEDGER_REBUILD.to_string()],
+            "exactly the lost ledger decode is compensated"
+        );
+        let marker = marker_json(&marker_files(&root)[0]);
+        assert_eq!(marker["status"], "pending");
+        assert_eq!(marker["intent"]["write"], "rebuild_task_ledger");
+        assert_eq!(marker["session"], serde_json::json!(session.raw()));
+        let audit = h.events_range(1, Some(512)).unwrap();
+        assert!(
+            audit.iter().any(|e| {
+                e.kind == faktor_core::event::EventKind::CrashDetected
+                    && e.payload
+                        .as_ref()
+                        .and_then(|p| p.get("durable_write_failure"))
+                        .and_then(|f| f.get("site"))
+                        .and_then(|s| s.as_str())
+                        == Some(DW_SITE_LEDGER_REBUILD)
+            }),
+            "the durable audit event must name the corrupt ledger site: {audit:?}"
+        );
+        // The raw corrupt blob is still what the store holds until replay
+        // (the failure was NOT papered over with a defaulted ledger).
+        assert!(
+            serde_json::from_value::<TaskLedger>(h.get_task_ledger().unwrap().unwrap()).is_err()
+        );
+        drop(runtime);
+        drop(manager);
+        let manager2 = reopen_manager(&dir);
+        let (deps2, _d2) = deps_sharing_session(
+            manager2.clone(),
+            Arc::new(scripted_provider(vec![ScriptedResponse::End])),
+            vec![],
+        );
+        AgentRuntime::new(deps2).unwrap().recover().unwrap();
+        let h2 = manager2.get_session(session).unwrap().unwrap();
+        let ledger: TaskLedger = serde_json::from_value(h2.get_task_ledger().unwrap().unwrap())
+            .expect("recovery must reconstruct a decodable ledger row");
+        assert_eq!(ledger.goal, "rebuilt from the typed ledger");
+        assert!(
+            marker_files(manager2.store().root()).is_empty(),
+            "the consumed marker is removed after reconstruction"
+        );
+    }
+
+    #[tokio::test]
     async fn provider_failure_unknown_effect_journal_loss_is_marked_and_replayed() {
         // Adversarial: the Unknown-effect provider-failure path marks the
         // running tool rows (already propagated) and journals Failed. The
@@ -34735,7 +35466,7 @@ mod tests {
                 &["src/main.c".to_string()],
                 &[],
                 &CancellationToken::new(),
-                manager.next_op_id().raw(),
+                manager.try_next_op_id().unwrap().raw(),
             )
             .await
             .unwrap();
@@ -34834,7 +35565,7 @@ mod tests {
                 &["src/main.c".to_string()],
                 &[],
                 &CancellationToken::new(),
-                manager.next_op_id().raw(),
+                manager.try_next_op_id().unwrap().raw(),
             )
             .await
             .unwrap();

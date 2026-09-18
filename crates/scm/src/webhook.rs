@@ -21,6 +21,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::error::ScmError;
+use crate::ids::ScmInstallationId;
 use crate::store::{DeliveryClaim, ScmStore};
 
 /// Hard bound on one webhook body: an oversized payload is refused before
@@ -90,6 +91,12 @@ pub enum WebhookError {
     MissingSignature,
     #[error("webhook delivery id header is missing")]
     MissingDeliveryId,
+    /// The delivery authenticated but its payload names an invalid value
+    /// (`installation.id` that is zero, negative, fractional, overflowing or
+    /// non-numeric). Terminal for those bytes: a provider redelivery cannot
+    /// repair them, so this is never retryable.
+    #[error("webhook payload is malformed: {0}")]
+    MalformedPayload(String),
     #[error("webhook signature header is malformed")]
     MalformedSignature,
     #[error("webhook signature does not match")]
@@ -104,6 +111,45 @@ impl From<crate::store::ScmStoreError> for WebhookError {
     fn from(e: crate::store::ScmStoreError) -> Self {
         WebhookError::Store(e.to_string())
     }
+}
+
+impl WebhookError {
+    /// Whether the provider may retry the same delivery unchanged. Only store
+    /// unavailability is transient; every authentication, bounds and payload
+    /// refusal is terminal for those bytes.
+    pub const fn retryable(&self) -> bool {
+        matches!(self, WebhookError::Store(_))
+    }
+}
+
+/// The installation id a webhook payload names (`installation.id`), if any.
+/// A present-but-invalid id (zero, negative, fractional, overflowing or
+/// non-numeric) is a typed [`WebhookError::MalformedPayload`]: it is never
+/// silently dropped and never remapped onto the all-installations sync. A
+/// validly signed non-JSON body or a payload without `installation.id` names
+/// no installation scope (`Ok(None)`).
+pub fn installation_of(body: &[u8]) -> Result<Option<ScmInstallationId>, WebhookError> {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        // A validly signed non-JSON body names no installation scope (the
+        // pre-existing all-installations behavior; never a panic).
+        return Ok(None);
+    };
+    let Some(raw) = json
+        .get("installation")
+        .and_then(|installation| installation.get("id"))
+    else {
+        return Ok(None);
+    };
+    let raw = raw.as_u64().ok_or_else(|| {
+        WebhookError::MalformedPayload(
+            "installation.id must be an unsigned integer within u64 \
+             (zero, negative, fractional, oversized and non-numeric values are refused)"
+                .to_string(),
+        )
+    })?;
+    let id = ScmInstallationId::try_from_raw(raw)
+        .map_err(|e| WebhookError::MalformedPayload(format!("installation.id refused: {e}")))?;
+    Ok(Some(id))
 }
 
 /// One verified delivery (nothing is applied before this exists).
@@ -588,6 +634,56 @@ mod tests {
             WebhookError::StaleTimestamp
         );
         assert!(store.webhook_deliveries(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_installation_id_is_a_typed_terminal_refusal() {
+        assert_eq!(
+            installation_of(br#"{"installation":{"id":7}}"#).unwrap(),
+            Some(ScmInstallationId::new(7))
+        );
+        assert_eq!(
+            installation_of(br#"{"installation":{"id":18446744073709551615}}"#).unwrap(),
+            Some(ScmInstallationId::new(u64::MAX)),
+            "the u64 boundary is a valid installation id"
+        );
+        assert_eq!(installation_of(br#"{"action":"created"}"#).unwrap(), None);
+        assert_eq!(installation_of(b"not-json").unwrap(), None);
+        for body in [
+            br#"{"installation":{"id":0}}"#.as_slice(),
+            br#"{"installation":{"id":-1}}"#,
+            br#"{"installation":{"id":1.5}}"#,
+            br#"{"installation":{"id":18446744073709551616}}"#,
+            br#"{"installation":{"id":"7"}}"#,
+        ] {
+            let err = installation_of(body).unwrap_err();
+            assert!(
+                matches!(err, WebhookError::MalformedPayload(_)),
+                "{body:?} must be a typed malformed payload, got {err:?}"
+            );
+            assert!(!err.retryable(), "malformed {body:?} must never be retried");
+            assert!(err.to_string().contains("installation.id"), "{err}");
+        }
+    }
+
+    #[test]
+    fn webhook_retryability_is_typed_by_variant() {
+        let terminal = [
+            WebhookError::BodyTooLarge,
+            WebhookError::MissingSignature,
+            WebhookError::MissingDeliveryId,
+            WebhookError::MalformedSignature,
+            WebhookError::SignatureMismatch,
+            WebhookError::StaleTimestamp,
+            WebhookError::MalformedPayload("installation.id refused".into()),
+        ];
+        for err in &terminal {
+            assert!(!err.retryable(), "{err:?} must be terminal");
+        }
+        assert!(WebhookError::Store("db down".into()).retryable());
+        assert!(
+            WebhookError::from(crate::store::ScmStoreError::Backend("db down".into())).retryable()
+        );
     }
 
     #[test]

@@ -1771,11 +1771,25 @@ impl OrchestratorRuntime {
 
     /// The real directory of a child's worktree (from the durable rows).
     pub(crate) fn child_worktree_dir(&self, row: &ChildRuntime) -> Result<PathBuf, ExecError> {
+        let workspace_id = WorkspaceId::try_from(row.workspace_id).map_err(|e| {
+            ExecError::Malformed(format!(
+                "child {} registry row carries workspace_id {}: {}",
+                row.child_id, row.workspace_id, e.message
+            ))
+        })?;
+        let worktree_id = WorktreeId::try_from(row.worktree_id).map_err(|e| {
+            ExecError::Malformed(format!(
+                "child {} registry row carries worktree_id {}: {}",
+                row.child_id, row.worktree_id, e.message
+            ))
+        })?;
+        // Worktree ids are bit-cast into the signed column on write: the
+        // inverse cast is the lossless decode.
         let worktrees = self
             .manager
-            .worktrees_of(WorkspaceId::new(row.workspace_id))?
+            .worktrees_of(workspace_id)?
             .into_iter()
-            .filter(|w| w.id as u64 == row.worktree_id)
+            .filter(|w| w.id as u64 == worktree_id.raw())
             .map(|w| PathBuf::from(w.path))
             .collect::<Vec<_>>();
         let dir = worktrees.first().cloned().ok_or_else(|| {
@@ -1844,9 +1858,15 @@ impl OrchestratorRuntime {
     pub fn child_result(&self, child_id: &str) -> Result<ChildResult, ExecError> {
         let (parent, run, child) = self.locate_child(child_id)?;
         let change_set = self.read_change_set_for_child(&parent, &run, &child)?;
+        let child_session = SessionId::try_from(child.session_id).map_err(|e| {
+            ExecError::Malformed(format!(
+                "child {} registry row carries session_id {}: {}",
+                child.child_id, child.session_id, e.message
+            ))
+        })?;
         let summary = self
             .manager
-            .get_session(SessionId::new(child.session_id))?
+            .get_session(child_session)?
             .and_then(|h| h.orchestrator_child_identity_get().ok().flatten())
             .map(|i| i.task_goal)
             .unwrap_or_default();
@@ -2171,7 +2191,12 @@ impl OrchestratorRuntime {
             _ => return Ok(()),
         };
         let owner = self.plan_row(parent, run)?.owner;
-        let workspace = WorkspaceId::new(owner.workspace_id);
+        let workspace = WorkspaceId::try_from(owner.workspace_id).map_err(|e| {
+            ExecError::Malformed(format!(
+                "run {run} plan row carries owner workspace id {}: {}",
+                owner.workspace_id, e.message
+            ))
+        })?;
         let provider_id = provider.id();
         let candidate_revision = format!("{}-candidate-{}", cs.id(), cs.files.len());
         let from_snapshot = SemanticSnapshotId::derive(
@@ -2181,13 +2206,25 @@ impl OrchestratorRuntime {
             provider.version(),
             SEMANTIC_SCHEMA_VERSION,
         );
-        let call = SemanticCall::new(
-            self.manager.next_op_id(),
-            parent,
-            workspace,
-            self.manager.now_ms(),
-            CancellationToken::new(),
-        );
+        let call = match self.manager.try_next_op_id() {
+            Ok(op_id) => SemanticCall::new(
+                op_id,
+                parent,
+                workspace,
+                self.manager.now_ms(),
+                CancellationToken::new(),
+            ),
+            Err(e) => {
+                // The semantic preflight is ADDITIONAL only: an op-id
+                // allocation failure skips it loudly, exactly like a
+                // provider failure, and never fails the merge.
+                tracing::warn!(
+                    error = %e,
+                    "op-id allocation failed; semantic merge preflight skipped"
+                );
+                return Ok(());
+            }
+        };
         let request = SemanticDeltaRequest {
             call,
             workspace,
@@ -2598,6 +2635,14 @@ impl OrchestratorRuntime {
             .manager
             .put_worktree(ws, &dir.to_string_lossy(), &format!("review-{seq}"))
             .map_err(|e| ExecError::Internal(format!("reviewer worktree row: {e}")))?;
+        // Durable SQLite rowid decode: the id is bit-cast losslessly, so
+        // only a structurally invalid zero fails typed.
+        let wt_id = WorktreeId::try_from(wt_raw as u64).map_err(|e| {
+            ExecError::Malformed(format!(
+                "reviewer worktree row for child {reviewer_id} returned id {wt_raw}: {}",
+                e.message
+            ))
+        })?;
         let title = truncate(
             &format!(
                 "review of child {plan_child_id} — {}",
@@ -2616,7 +2661,7 @@ impl OrchestratorRuntime {
             .create_child_session(
                 parent,
                 ws,
-                WorktreeId::new(wt_raw as u64),
+                wt_id,
                 TaskId::new(1),
                 &plan.provider,
                 &plan.default_model,
@@ -2634,7 +2679,7 @@ impl OrchestratorRuntime {
             session_id: session.id().raw(),
             operation_id: 0,
             workspace_id: ws.raw(),
-            worktree_id: wt_raw as u64,
+            worktree_id: wt_id.raw(),
             ownership: ChildOwnership::IsolatedWorktree,
             ownership_paths: Vec::new(),
             state: ChildState::Running,
@@ -3635,6 +3680,91 @@ mod tests {
             assert_eq!(outcome.merged, vec![PathBuf::from("src/a.rs")]);
             assert!(outcome.conflicts.is_empty());
             assert_eq!(parent_bytes(&fixture), b"v2-child");
+        }
+
+        #[test]
+        fn corrupt_child_identity_ids_are_typed_errors_never_panics() {
+            let fixture = build_fixture(faktor_agent::fallback_semantic_registry());
+            let (parent, run, row) = fixture.orch.locate_child("child-0").unwrap();
+            assert_eq!(parent, fixture.parent);
+            assert_eq!(run, "run-1");
+            // Valid row: the worktree directory resolves.
+            assert!(fixture.orch.child_worktree_dir(&row).unwrap().is_dir());
+
+            // Zero workspace/worktree ids: typed Malformed naming the field,
+            // never a panic (`WorkspaceId::new(0)`).
+            for (field, corrupt) in [
+                (
+                    "workspace_id",
+                    (|r: &mut ChildRuntime| r.workspace_id = 0) as fn(&mut ChildRuntime),
+                ),
+                ("worktree_id", |r: &mut ChildRuntime| r.worktree_id = 0),
+            ] {
+                let mut hostile = row.clone();
+                corrupt(&mut hostile);
+                let err = fixture
+                    .orch
+                    .child_worktree_dir(&hostile)
+                    .expect_err(&format!("zero {field} must refuse the worktree lookup"));
+                assert!(matches!(err, ExecError::Malformed(_)), "{err:?}");
+                assert!(err.to_string().contains(field), "{err}");
+            }
+
+            // The fixture's stub registry row carries session_id 0: the
+            // child result must refuse typed instead of panicking in
+            // `SessionId::new(0)`.
+            let err = fixture
+                .orch
+                .child_result("child-0")
+                .expect_err("a zero session id must refuse the child result");
+            assert!(matches!(err, ExecError::Malformed(_)), "{err:?}");
+            assert!(err.to_string().contains("session_id 0"), "{err}");
+        }
+
+        #[test]
+        fn zero_owner_workspace_id_refuses_the_semantic_preflight_typed() {
+            let fixture = build_fixture(registry_with(ScriptedDeltaProvider {
+                new_hash: Some(staged_child_hash()),
+            }));
+            // Overwrite the durable plan row with a zero owner workspace id:
+            // the provider selection is delta-capable, so the preflight
+            // reaches the owner decode and must refuse typed.
+            let plan = crate::TaskPlan {
+                goal: "merge test".into(),
+                non_goals: vec![],
+                constraints: vec![],
+                work_items: vec![],
+            };
+            let owner = OwnerContext {
+                parent_session: fixture.parent,
+                workspace_id: 0,
+                worktree_id: 1,
+                root: fixture.owner_root.clone(),
+            };
+            let config = ExecConfig {
+                run_id: "run-1".into(),
+                ceilings: Ceilings::default(),
+                parent_caps: CapabilitySet::new(),
+                provider: "fake".into(),
+                default_model: "m".into(),
+                isolated_root: fixture.owner_root.join("iso"),
+                crash_seam: None,
+            };
+            fixture
+                .orch
+                .put_plan_row(&plan, &owner, &config, &[])
+                .unwrap();
+            let err = fixture
+                .orch
+                .semantic_merge_preflight(
+                    fixture.parent,
+                    "run-1",
+                    &fixture.cs,
+                    &[PathBuf::from("src/a.rs")],
+                )
+                .expect_err("a zero owner workspace id must refuse the preflight");
+            assert!(matches!(err, ExecError::Malformed(_)), "{err:?}");
+            assert!(err.to_string().contains("workspace id 0"), "{err}");
         }
     }
 }

@@ -215,6 +215,13 @@ pub struct DbActorConfig {
     /// production.
     #[doc(hidden)]
     pub maintenance_fail_for_test: Option<String>,
+    /// Bound on handing ONE coalesced batch to the actor thread. The
+    /// rendezvous handoff succeeds only while the actor is parked receiving;
+    /// an actor stuck in a long/hung store segment must not make the bridge
+    /// retry forever. On exhaustion the batch's callers receive a typed
+    /// [`StoreError::Busy`] and the batch is never silently dropped
+    /// (default 30s; tests use short bounds).
+    pub handoff_deadline: Duration,
 }
 
 impl Default for DbActorConfig {
@@ -227,6 +234,7 @@ impl Default for DbActorConfig {
             panic_after_batches: None,
             maintenance_delay: None,
             maintenance_fail_for_test: None,
+            handoff_deadline: Duration::from_secs(30),
         }
     }
 }
@@ -744,16 +752,32 @@ async fn bridge_main(shared: Arc<ActorShared>, mut rx: mpsc::Receiver<Envelope>)
 }
 
 /// Deliver one batch to the actor thread, respawning the thread if it died.
+///
+/// The handoff is BOUNDED: the rendezvous channel only accepts while the
+/// actor is parked in `recv`, so an actor wedged in a long/hung store segment
+/// would otherwise make this loop retry forever (unbounded latency, unbounded
+/// caller wait, busy CPU). When `DbActorConfig::handoff_deadline` elapses,
+/// every caller in the batch receives a typed [`StoreError::Busy`] timeout,
+/// the relay is dropped so the next batch respawns a fresh actor thread, and
+/// the batch is never silently dropped or retried forever.
 async fn handoff_batch(
     shared: &Arc<ActorShared>,
     relay: &mut Option<std::sync::mpsc::SyncSender<Vec<Envelope>>>,
     mut batch: Vec<Envelope>,
 ) {
+    let deadline = shared
+        .cfg
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .handoff_deadline;
+    let started = Instant::now();
     loop {
         let tx = match relay.as_ref() {
             Some(tx) => tx,
             None => {
-                // Death between batches: spawn a replacement and retry.
+                // Death between batches: spawn a replacement and retry. The
+                // deadline is NOT reset: a thread that cannot be respawned
+                // (or a channel that keeps disconnecting) exhausts it too.
                 *relay = Some(spawn_actor_thread(shared));
                 relay.as_ref().expect("just spawned")
             }
@@ -762,16 +786,49 @@ async fn handoff_batch(
             Ok(()) => return,
             Err(std::sync::mpsc::TrySendError::Full(pending)) => {
                 batch = pending;
+                let elapsed = started.elapsed();
+                if elapsed >= deadline {
+                    *relay = None;
+                    fail_handoff_batch(batch, deadline);
+                    return;
+                }
                 // Actor busy executing: brief non-blocking backoff; the
-                // bounded tokio stage absorbs the pressure.
-                tokio::time::sleep(Duration::from_micros(100)).await;
+                // bounded tokio stage absorbs the pressure. The sleep never
+                // runs past the handoff deadline.
+                tokio::time::sleep(Duration::from_micros(100).min(deadline - elapsed)).await;
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(pending)) => {
                 batch = pending;
+                let elapsed = started.elapsed();
+                if elapsed >= deadline {
+                    *relay = None;
+                    fail_handoff_batch(batch, deadline);
+                    return;
+                }
                 *relay = None;
+                // A failed respawn must not spin: back off within the
+                // remaining handoff budget before the next attempt.
+                tokio::time::sleep(Duration::from_micros(100).min(deadline - elapsed)).await;
             }
         }
     }
+}
+
+/// Refuse a batch the actor never accepted: every caller gets a typed timeout
+/// (never a hang, never a silent drop) and the refusal is loud + counted.
+fn fail_handoff_batch(batch: Vec<Envelope>, deadline: Duration) {
+    let refused = batch.len();
+    for env in batch {
+        let _ = env.reply.send(Err(StoreError::Busy(format!(
+            "db actor handoff timed out after {deadline:?}: the actor accepted no batch \
+             (stuck in a long/hung store segment?); refused {refused} queued write(s)"
+        ))));
+    }
+    tracing::error!(
+        writes = refused,
+        deadline = ?deadline,
+        "db actor handoff deadline exceeded; refused the batch with typed timeouts"
+    );
 }
 
 fn spawn_actor_thread(shared: &Arc<ActorShared>) -> std::sync::mpsc::SyncSender<Vec<Envelope>> {
@@ -984,6 +1041,14 @@ fn execute_batch(
     let mut guard = in_flight.lock().unwrap_or_else(|p| p.into_inner());
     match result {
         Ok(Ok((outcomes, _timing))) => {
+            // Count BEFORE replying: a caller that observes its reply must
+            // also observe the completion in `stats` (otherwise an awaited
+            // write can be followed by a stale `completed` read — a real
+            // observable-order race the maintenance test tripped).
+            shared
+                .stats
+                .completed
+                .fetch_add(op_count as u64, Ordering::Relaxed);
             // The group committed as ONE fsynced transaction: reply per
             // write, preserving per-write errors from the store.
             for (sender, outcome) in guard.drain(..).zip(outcomes) {
@@ -995,6 +1060,10 @@ fn execute_batch(
             }
         }
         Ok(Err(e)) => {
+            shared
+                .stats
+                .completed
+                .fetch_add(op_count as u64, Ordering::Relaxed);
             // Whole-group infrastructure failure (busy timeout / commit
             // error): every write of the batch failed as one transaction.
             let message = format!("db actor batch failed: {e}");
@@ -1003,6 +1072,10 @@ fn execute_batch(
             }
         }
         Err(_) => {
+            shared
+                .stats
+                .completed
+                .fetch_add(op_count as u64, Ordering::Relaxed);
             // A store panic poisoned the writer lock: fatal for every later
             // write (direct or actor), so stop respawning doomed threads.
             shared.fatal.store(true, Ordering::SeqCst);
@@ -1011,17 +1084,9 @@ fn execute_batch(
                     "db actor store segment panicked; actor permanently failed".into(),
                 )));
             }
-            shared
-                .stats
-                .completed
-                .fetch_add(op_count as u64, Ordering::Relaxed);
             return true;
         }
     }
-    shared
-        .stats
-        .completed
-        .fetch_add(op_count as u64, Ordering::Relaxed);
     shared.stats.batches.fetch_add(1, Ordering::Relaxed);
     false
 }
@@ -1926,5 +1991,63 @@ mod tests {
             stats.p95_wait_us
         );
         assert_eq!(stats.max_wait_us, 100);
+    }
+
+    /// Bounded handoff (audit): a rendezvous channel whose receiver stays
+    /// alive but never receives is the exact "actor wedged" shape — every
+    /// `try_send` is `Full` forever. The handoff must exhaust its configured
+    /// deadline, fail EVERY caller with a typed bounded error, and return
+    /// (no infinite retry, no silent drop, no panic). The relay is dropped so
+    /// the next batch respawns a fresh actor thread.
+    #[tokio::test]
+    async fn handoff_deadline_refuses_batch_instead_of_retrying_forever() {
+        let (_d, store, actor) = tmp_actor(DbActorConfig {
+            handoff_deadline: Duration::from_millis(50),
+            ..Default::default()
+        });
+        let sid = new_session(&store);
+        let (tx, _never_receiving) = std::sync::mpsc::sync_channel::<Vec<Envelope>>(0);
+        let mut relay = Some(tx);
+        let mut replies = Vec::new();
+        let mut batch = Vec::new();
+        for i in 0..3 {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            replies.push(reply_rx);
+            batch.push(Envelope {
+                op: ActorOp::AppendEvent {
+                    session_id: sid,
+                    op_id: Some(OpId::new(9_000 + i)),
+                    kind: EventKind::PromptReceived,
+                    state: AgentState::Preparing,
+                    ts_ms: 1,
+                    payload: None,
+                },
+                reply: reply_tx,
+            });
+        }
+        let began = Instant::now();
+        handoff_batch(&actor.shared, &mut relay, batch).await;
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the handoff must be bounded, not an infinite retry"
+        );
+        assert!(
+            relay.is_none(),
+            "the wedged relay is dropped so the next batch uses a fresh actor"
+        );
+        for reply in replies {
+            let err = reply
+                .await
+                .expect("every caller receives a reply")
+                .unwrap_err();
+            assert!(matches!(err, StoreError::Busy(_)), "{err:?}");
+            assert!(err.to_string().contains("handoff timed out"), "{err}");
+        }
+        // The manager-side actor is untouched and still usable: a refusal
+        // never corrupts the actor or the store.
+        assert!(!actor.is_fatal());
+        store
+            .create_session(store.create_workspace("/w2").unwrap(), "t", "p", "m")
+            .expect("the shared store stays usable after a refused handoff");
     }
 }

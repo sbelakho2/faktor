@@ -662,6 +662,10 @@ mod nt {
 
     fn identity_from_handle(handle: HANDLE) -> Option<FileIdentity> {
         let mut info = FILE_ID_INFO::default();
+        // SAFETY: `handle` is a live directory handle borrowed for the call;
+        // `info` is a live, correctly sized `FILE_ID_INFO` and its size is
+        // passed exactly, so the kernel writes stay inside the struct. A
+        // zero return is reported as `None`, never as uninitialized data.
         let ok = unsafe {
             GetFileInformationByHandleEx(
                 handle,
@@ -680,6 +684,10 @@ mod nt {
         handle: HANDLE,
     ) -> Option<windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TAG_INFO> {
         let mut info = windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TAG_INFO::default();
+        // SAFETY: `handle` is a live directory handle borrowed for the call;
+        // `info` is a live, correctly sized `FILE_ATTRIBUTE_TAG_INFO` and
+        // its size is passed exactly, so the kernel writes stay inside the
+        // struct. A zero return is reported as `None`.
         let ok = unsafe {
             GetFileInformationByHandleEx(
                 handle,
@@ -728,6 +736,9 @@ mod nt {
             )
         };
         if handle == INVALID_HANDLE_VALUE {
+            // SAFETY: `GetLastError` reads the calling thread's last-error
+            // slot and takes no arguments; safe to call after the failed
+            // `CreateFileW` above.
             return Err(map_win32(root, unsafe { GetLastError() }));
         }
         // SAFETY: the handle came from CreateFileW with a non-invalid value.
@@ -1202,6 +1213,9 @@ mod nt {
                 )
             };
             if n == 0 {
+                // SAFETY: `GetLastError` reads the calling thread's
+                // last-error slot and takes no arguments; safe after the
+                // failed call above.
                 let code = unsafe { GetLastError() };
                 return Err(Error::internal(format!(
                     "{}: GetFinalPathNameByHandleW failed: win32 error {code}",

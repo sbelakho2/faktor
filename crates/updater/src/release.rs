@@ -44,6 +44,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -556,7 +557,7 @@ pub fn resolve_launch(
 /// On unix the bootstrap IS replaced by the release binary (execve), so the
 /// supervisor observes exactly one live process and the release's own exit
 /// code is the daemon's. On non-unix platforms the child is spawned and its
-/// exit code forwarded.
+/// exit code forwarded under [`RELEASE_FORWARD_CEILING_MS`].
 pub fn launch(
     target: &ReleaseTarget,
     install_root: &Path,
@@ -589,10 +590,56 @@ pub fn launch(
     }
     #[cfg(not(unix))]
     {
-        let status = command.status().map_err(|e| UpdateError::LaunchRefused {
+        let mut child = command.spawn().map_err(|e| UpdateError::LaunchRefused {
             detail: format!("spawn {}: {e}", target.binary.display()),
         })?;
-        Ok(status.code().unwrap_or(3))
+        match wait_bounded(
+            &mut child,
+            Duration::from_millis(RELEASE_FORWARD_CEILING_MS),
+        )? {
+            Some(status) => Ok(status.code().unwrap_or(3)),
+            None => {
+                // The release outlived the forwarding window: it is a
+                // service, not a short-lived child, so the launcher detaches
+                // instead of killing it (zero-orphans is preserved by the
+                // release's own process ownership, not by the launcher).
+                tracing::warn!(
+                    "release {} outlived the {} ms exit-forwarding ceiling; detaching",
+                    target.binary.display(),
+                    RELEASE_FORWARD_CEILING_MS
+                );
+                Ok(0)
+            }
+        }
+    }
+}
+
+/// Documented ceiling on how long the non-unix launcher forwards a release's
+/// exit code before detaching. The wait is bounded so a wedged child can
+/// never pin the launcher forever without observability; a healthy daemon
+/// outliving the ceiling keeps running and the launcher exits 0.
+pub const RELEASE_FORWARD_CEILING_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Poll one child until it exits or `ceiling` elapses. `None` means the child
+/// is still running at the ceiling (the caller decides to detach; this
+/// helper never kills). Platform-neutral so it is unit-testable everywhere.
+#[cfg_attr(unix, allow(dead_code))]
+fn wait_bounded(
+    child: &mut std::process::Child,
+    ceiling: Duration,
+) -> Result<Option<std::process::ExitStatus>, UpdateError> {
+    let deadline = std::time::Instant::now() + ceiling;
+    loop {
+        let status = child.try_wait().map_err(|e| UpdateError::LaunchRefused {
+            detail: format!("wait: {e}"),
+        })?;
+        if let Some(status) = status {
+            return Ok(Some(status));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -676,5 +723,38 @@ mod tests {
         let bad = dir.path().join("bad.json");
         std::fs::write(&bad, b"{not json").unwrap();
         assert!(TrustFile::read(&bad).is_err());
+    }
+
+    /// The non-unix launcher wait is bounded: an exited child yields its
+    /// status exactly, and a child still running at the ceiling yields
+    /// `None` (the caller detaches; this helper never kills).
+    #[cfg(unix)]
+    #[test]
+    fn wait_bounded_returns_status_or_detaches_at_the_ceiling() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 7")
+            .spawn()
+            .unwrap();
+        let status = wait_bounded(&mut child, Duration::from_secs(5))
+            .unwrap()
+            .expect("a child that exits must yield its status");
+        assert_eq!(status.code(), Some(7));
+
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 5")
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(
+            wait_bounded(&mut child, Duration::from_millis(150))
+                .unwrap()
+                .is_none(),
+            "a child outliving the ceiling must be reported as still running"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

@@ -928,18 +928,28 @@ impl IndexService {
         match row {
             Some(row) => match PersistedIndexState::parse(row.state_json.clone(), row.generation) {
                 Ok(p) => refresh_mirror_into(l, p),
-                Err(_) => {
-                    // Corrupt row from an external writer: fail open loudly.
+                Err(e) => {
+                    // Corrupt row from an external writer: fail open loudly —
+                    // and never discard the rewrite of the durable Failed
+                    // marker: the caller retries the reconcile pass with the
+                    // propagated store error (the corrupt row stays the
+                    // durable retry trigger until the rewrite lands).
+                    let message = format!("corrupt persisted index state: {e}");
+                    tracing::error!(
+                        workspace = workspace.raw(),
+                        generation = row.generation,
+                        "refresh_mirror: {message}; rewriting the durable row as Failed"
+                    );
                     let failed = WorkspaceIndexState::Failed {
-                        message: "corrupt persisted index state".into(),
+                        message: truncate(&message, 256),
                     };
                     let failed_json = failed.to_row_json();
-                    let _ = self.inner.store.index_state_put(
+                    self.inner.store.index_state_put(
                         workspace,
                         &failed_json,
                         row.generation.max(0),
                         JOURNAL_CORRUPT,
-                    );
+                    )?;
                     refresh_mirror_into(
                         l,
                         PersistedIndexState {
@@ -2478,6 +2488,53 @@ mod tests {
         assert!(
             gens.iter().any(|g| g == "gen-3.json"),
             "gen-3 published: {gens:?}"
+        );
+    }
+
+    #[test]
+    fn corrupt_row_repair_write_loss_surfaces_and_recovers_on_retry() {
+        // Adversarial (injected store fault): an external writer advances
+        // the durable row with a corrupt payload, and the fail-open rewrite
+        // of the Failed marker fails. The loss must surface as a typed
+        // error (never be discarded), the mirror must not be half-updated,
+        // and the retry must land the repair durably.
+        let _serial = serial();
+        let (_env, store, svc, ws) = first_fixture();
+        pub_view_asserts(&svc, ws, 1);
+        // External writer corrupts the row at a newer generation.
+        store
+            .index_state_put(ws, "{ this is not json !!!", 5, "corrupt")
+            .unwrap();
+        // The repair rewrite aborts on this pass.
+        store
+            .sql_execute(
+                "CREATE TRIGGER idx_fail_corrupt_repair BEFORE INSERT ON index_state \
+                 BEGIN SELECT RAISE(ABORT, 'injected index-state corruption'); END",
+            )
+            .unwrap();
+        let err = svc
+            .refresh_mirror(ws)
+            .expect_err("the dropped repair write must surface, never vanish");
+        assert!(matches!(err, IndexError::Store(_)), "{err:?}");
+        // No half-applied repair: the mirror still carries the last good
+        // generation and the durable corrupt row stays the retry trigger.
+        let (state, gen) = svc.state(ws).unwrap();
+        assert!(matches!(state, St::Ready { generation: 1 }), "{state:?}");
+        assert_eq!(gen, 1);
+        // Retry after the injected failure clears: the fail-open repair
+        // lands durably at the corrupt row's own generation.
+        store
+            .sql_execute("DROP TRIGGER idx_fail_corrupt_repair")
+            .unwrap();
+        svc.refresh_mirror(ws).unwrap();
+        let (state, gen) = svc.state(ws).unwrap();
+        assert!(matches!(state, St::Failed { .. }), "{state:?}");
+        assert_eq!(gen, 5);
+        let log = journal_counts(&store, ws);
+        assert_eq!(
+            log.iter().filter(|(k, _)| k == "corrupt").count(),
+            2,
+            "the external corruption and the landed repair are both journaled: {log:?}"
         );
     }
 

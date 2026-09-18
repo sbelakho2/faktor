@@ -1340,7 +1340,8 @@ fn build_daemon_core(
     // shadow on graceful daemon shutdown.
     let shadows_root = data_dir.join(faktor_orchestrator::runtime::shadow::SHADOWS_DIR_NAME);
     let shadows =
-        faktor_orchestrator::runtime::shadow::ShadowRoots::new(session.clone(), shadows_root);
+        faktor_orchestrator::runtime::shadow::ShadowRoots::new(session.clone(), shadows_root)
+            .map_err(|e| e.to_string())?;
     if let Err(e) = shadows.reconcile() {
         tracing::warn!(error = %e, "shadow reconcile after daemon start");
     }
@@ -1573,6 +1574,70 @@ fn spawn_startup_backup(
     })
 }
 
+/// Bounded graceful window of the daemon's detached orchestrated drives at
+/// shutdown. The registry then aborts and reaps stragglers within its own
+/// [`faktor_orchestrator::runtime::task_executor::TaskDriveRegistry::ABORT_REAP_GRACE`],
+/// so the WHOLE drive drain stays bounded by `grace + ABORT_REAP_GRACE` —
+/// never unbounded, and never a dropped durable write (an aborted drive is
+/// crash-equivalent and resumable from its durable rows).
+const SERVE_DRIVE_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The ONE post-signal daemon shutdown sequence (serve):
+///
+/// 1. abort the post-ready loops (verification executor, SCM re-sync, billing
+///    report schedule) — none of them is a durable-write producer whose
+///    in-flight work is lost, and each re-runs its durable claims at the next
+///    boot;
+/// 2. close the TaskExecutor's drive registry and bounded-drain every
+///    detached drive (the registry's graceful-then-abort contract: give
+///    in-flight drives `grace` to land their record-first durable
+///    writes/settlement, then abort and reap the stragglers within
+///    `ABORT_REAP_GRACE`; an aborted run stays resumable through
+///    `TaskExecutor::resume_run`). This MUST happen while the store and the
+///    shadow service are still alive, so it runs here — before the backup
+///    drain and before `graph` drops;
+/// 3. drain the startup-backup task and the owned Ollama warm-up threads
+///    (bounded), AFTER the drives so the final snapshot observes every
+///    settled durable write.
+///
+/// The returned [`DriveDrainReport`](faktor_orchestrator::runtime::task_executor::DriveDrainReport)
+/// is the testable evidence of the drive drain.
+async fn shutdown_serving_daemon(
+    tasks: &Arc<faktor_orchestrator::runtime::task_executor::TaskExecutor>,
+    verification_executor: tokio::task::JoinHandle<()>,
+    scm_task: Option<tokio::task::JoinHandle<()>>,
+    billing_report_task: Option<tokio::task::JoinHandle<()>>,
+    backup_task: tokio::task::JoinHandle<()>,
+) -> faktor_orchestrator::runtime::task_executor::DriveDrainReport {
+    verification_executor.abort();
+    if let Some(task) = scm_task {
+        task.abort();
+    }
+    if let Some(task) = billing_report_task {
+        task.abort();
+    }
+    let started = std::time::Instant::now();
+    let report = tasks.shutdown_drives(SERVE_DRIVE_SHUTDOWN_GRACE).await;
+    if report.total > 0 || report.unreaped > 0 {
+        tracing::info!(
+            total = report.total,
+            completed = report.completed,
+            aborted = report.aborted,
+            unreaped = report.unreaped,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "orchestrated drive shutdown drain"
+        );
+    }
+    if report.unreaped > 0 {
+        tracing::error!(
+            unreaped = report.unreaped,
+            "drive shutdown could not reap every aborted drive; the durable rows remain the recovery authority"
+        );
+    }
+    drain_startup_backup(backup_task).await;
+    report
+}
+
 /// Shutdown drain for the startup-backup task: waits a bounded window for
 /// the backup to finish (the daemon announced readiness long ago, so the
 /// snapshot is normally long done), then aborts the async wrapper. The
@@ -1591,16 +1656,155 @@ async fn drain_startup_backup(mut backup_task: tokio::task::JoinHandle<()>) {
             backup_task.abort();
         }
     }
+    // The SAME bounded shutdown drain retires the owned Ollama warm-up
+    // threads (audited spawn ownership): bounded join, deterministic runtime
+    // stop inside each thread, never a leaked handle or unbounded wait.
+    let (joined, detached) = drain_ollama_warmups(OLLAMA_WARMUP_DRAIN_GRACE);
+    if joined + detached > 0 {
+        tracing::info!(joined, detached, "ollama warm-up shutdown drain");
+    }
+}
+
+/// The process-wide owner of every detached Ollama warm-up thread.
+///
+/// Audited gap: `warm_ollama` used to `std::thread::spawn` a thread that
+/// owned a private Tokio runtime and DROP its `JoinHandle` — the thread (and
+/// its runtime) leaked until process exit and no shutdown path could bound
+/// it. Each warm-up is now an [`OllamaWarmup`] owner held in this registry:
+/// the thread signals completion through a channel, stops its runtime
+/// deterministically (`Runtime::shutdown_timeout`) before it exits, and the
+/// shutdown drain joins it with a bounded timeout.
+static OLLAMA_WARMUPS: std::sync::OnceLock<std::sync::Mutex<Vec<OllamaWarmup>>> =
+    std::sync::OnceLock::new();
+
+/// Bounded stop of the warm-up's private runtime after the probe returned:
+/// a probe task that somehow lingers cannot outlive its owner's thread (the
+/// blocking runtime shutdown cancels what it can and joins the blocking
+/// pool within the grace).
+const OLLAMA_WARMUP_RUNTIME_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Bounded shutdown join window of the warm-up THREADS (never unbounded).
+const OLLAMA_WARMUP_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One owned Ollama warm-up thread: the retained `JoinHandle` plus the
+/// completion signal of its body. `join_with_timeout` is the ONLY way to
+/// retire it — a dropped owner would recreate the old leak.
+struct OllamaWarmup {
+    handle: Option<std::thread::JoinHandle<()>>,
+    finished: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+impl OllamaWarmup {
+    /// Bounded join: `true` when the body finished (and its runtime was
+    /// stopped) within `timeout`. A panicked body is joined too (its
+    /// completion signal is disconnected, not missing). On timeout the
+    /// thread is left detached — a thread cannot be force-killed — but it is
+    /// a best-effort probe whose own runtime shutdown is already bounded,
+    /// and the daemon never waits unboundedly on shutdown.
+    fn join_with_timeout(self, timeout: std::time::Duration) -> bool {
+        let (Some(handle), Some(finished)) = (self.handle, self.finished) else {
+            return true;
+        };
+        match finished.recv_timeout(timeout) {
+            Ok(()) => {
+                let _ = handle.join();
+                true
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if handle.join().is_err() {
+                    tracing::warn!("ollama warm-up thread panicked (joined)");
+                }
+                true
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+        }
+    }
+}
+
+/// Spawn one named warm-up thread whose body signals completion on exit
+/// (including panic: the wrapper's sender is owned by the thread stack).
+/// `None` when the OS refused the thread (the warm-up is skipped, never a
+/// half-owned handle).
+fn spawn_ollama_warmup_thread(
+    name: &str,
+    body: impl FnOnce() + Send + 'static,
+) -> Option<OllamaWarmup> {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    match std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            body();
+            let _ = done_tx.send(());
+        }) {
+        Ok(handle) => Some(OllamaWarmup {
+            handle: Some(handle),
+            finished: Some(done_rx),
+        }),
+        Err(e) => {
+            tracing::warn!("ollama warm-up thread failed to spawn: {e}");
+            None
+        }
+    }
+}
+
+/// Register one owned warm-up in the process registry (the SAME path
+/// `warm_ollama` uses; tests register seam bodies through it).
+fn register_ollama_warmup(owner: OllamaWarmup) {
+    let registry = OLLAMA_WARMUPS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(owner);
+}
+
+/// Bounded join of an explicit owner set: `(joined, detached)` counts. A
+/// detached owner is logged (its own runtime stop is already bounded).
+fn drain_warmup_owners(owners: Vec<OllamaWarmup>, timeout: std::time::Duration) -> (usize, usize) {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut joined = 0usize;
+    let mut detached = 0usize;
+    for owner in owners {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if owner.join_with_timeout(remaining) {
+            joined += 1;
+        } else {
+            detached += 1;
+            tracing::warn!(
+                "ollama warm-up thread missed the shutdown join window; it stays detached and exits with its own bounded runtime stop"
+            );
+        }
+    }
+    (joined, detached)
+}
+
+/// Shutdown drain of every registered warm-up: takes the registry (idempotent
+/// — a later call finds none) and joins each owner within `timeout` in total.
+/// The daemon's shutdown path reaches this through `drain_startup_backup`,
+/// the one bounded post-ready task drain.
+fn drain_ollama_warmups(timeout: std::time::Duration) -> (usize, usize) {
+    let owners: Vec<OllamaWarmup> = match OLLAMA_WARMUPS.get() {
+        Some(registry) => std::mem::take(
+            &mut *registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        ),
+        None => Vec::new(),
+    };
+    drain_warmup_owners(owners, timeout)
 }
 
 /// Live capability warm-up for one Ollama provider (spec §10): the
 /// concrete Arc is owned by the spawned thread, so probing reaches the
-/// SAME instance the registry serves. Best-effort, never blocks.
+/// SAME instance the registry serves. Best-effort, never blocks; the thread
+/// is OWNED by the process registry and bounded-joined at shutdown
+/// ([`drain_ollama_warmups`]).
 fn warm_ollama(ollama: Arc<faktor_ollama::OllamaProvider>) {
-    std::thread::spawn(move || {
+    let Some(owner) = spawn_ollama_warmup_thread("faktor-ollama-warmup", move || {
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!("ollama warm-up runtime failed: {e}");
+                return;
+            }
         };
         match rt.block_on(ollama.refresh_from_live()) {
             Ok(n) => {
@@ -1610,7 +1814,85 @@ fn warm_ollama(ollama: Arc<faktor_ollama::OllamaProvider>) {
                 tracing::warn!("ollama warm-up failed (defaults stay): {e}");
             }
         }
-    });
+        // Deterministic runtime stop: no probe task outlives its thread.
+        rt.shutdown_timeout(OLLAMA_WARMUP_RUNTIME_STOP_GRACE);
+    }) else {
+        return;
+    };
+    register_ollama_warmup(owner);
+}
+
+/// Adversarial covers of the audited Ollama warm-up ownership gap: the
+/// handle is retained, the bounded join is honored, and the shutdown drain
+/// empties the process registry (idempotently) instead of leaking threads.
+#[cfg(test)]
+mod ollama_warmup_tests {
+    use super::*;
+
+    /// The global registry is process-wide: tests that touch it serialize.
+    static GLOBAL_WARMUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn bounded_join_reports_finished_owners_and_detaches_stragglers() {
+        let fast = spawn_ollama_warmup_thread("faktor-test-warmup-fast", || {}).unwrap();
+        assert!(fast.join_with_timeout(std::time::Duration::from_secs(5)));
+        // A panicked body is finished (its sender disconnected), not a
+        // straggler: the owner is joined, never reported as detached.
+        let panicked = spawn_ollama_warmup_thread("faktor-test-warmup-panic", || {
+            panic!("warm-up body panic (test)");
+        })
+        .unwrap();
+        assert!(panicked.join_with_timeout(std::time::Duration::from_secs(5)));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let slow = spawn_ollama_warmup_thread("faktor-test-warmup-slow", move || {
+            let _ = release_rx.recv();
+        })
+        .unwrap();
+        let started = std::time::Instant::now();
+        assert!(!slow.join_with_timeout(std::time::Duration::from_millis(25)));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "bounded join never waits unboundedly"
+        );
+        // Let the detached thread exit so the test binary holds no runner.
+        let _ = release_tx.send(());
+    }
+
+    #[test]
+    fn shutdown_drain_empties_the_process_registry_within_bound() {
+        let _serial = GLOBAL_WARMUP_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        register_ollama_warmup(
+            spawn_ollama_warmup_thread("faktor-test-warmup-registered", || {}).unwrap(),
+        );
+        let started = std::time::Instant::now();
+        let (joined, detached) = drain_ollama_warmups(std::time::Duration::from_secs(5));
+        assert_eq!(joined, 1);
+        assert_eq!(detached, 0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // Idempotent: the registry was TAKEN, nothing is left to leak.
+        let (joined, detached) = drain_ollama_warmups(std::time::Duration::from_millis(1));
+        assert_eq!((joined, detached), (0, 0));
+    }
+
+    #[test]
+    fn shutdown_drain_never_exceeds_the_bound_for_a_parked_thread() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let parked = spawn_ollama_warmup_thread("faktor-test-warmup-parked", move || {
+            let _ = release_rx.recv();
+        })
+        .unwrap();
+        let started = std::time::Instant::now();
+        let (joined, detached) =
+            drain_warmup_owners(vec![parked], std::time::Duration::from_millis(30));
+        assert_eq!((joined, detached), (0, 1));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the drain stayed bounded"
+        );
+        let _ = release_tx.send(());
+    }
 }
 
 /// Config resolution for `serve` (audit 31): an EXPLICIT --config path must
@@ -1706,6 +1988,53 @@ fn recover_verification_jobs_at_startup(session: &Arc<faktor_session::SessionMan
     }
 }
 
+/// Daemon startup queue-head recovery (boundary race): a killed process can
+/// leave a durable non-terminal prompt-queue row whose active turn already
+/// settled; without a runner the row would wait for the next submit or settle
+/// (durable, but stalled). The durable row itself is the runnable marker
+/// (`Store::sessions_with_pending_queues`), so the executor's recovery entry
+/// starts/arms exactly one bounded runner per session carrying one — never a
+/// new submit, never a second concurrent drive, never an unbounded wait.
+///
+/// Runs BEFORE readiness, after `agent.recover()` and the verification
+/// requeue, with the session store, manager and executor fully open. The
+/// summary is bounded and diagnostic: `recovered` counts the sessions whose
+/// live queue still carried a runnable head when classified; the remainder
+/// had already drained (an idempotent no-op for the kick). A drive registry
+/// that refuses the spawn is logged by the executor itself — those rows stay
+/// durably pending for the next recovery, so nothing is ever lost.
+fn recover_pending_queues_at_startup(graph: &DaemonGraph) {
+    let candidates = match graph.session.store().sessions_with_pending_queues() {
+        Ok(sessions) => sessions,
+        Err(e) => {
+            tracing::warn!("queue recovery scan failed: {e}");
+            return;
+        }
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    let mut recovered = 0usize;
+    for session in &candidates {
+        let runnable = graph
+            .session
+            .get_session(*session)
+            .ok()
+            .flatten()
+            .is_some_and(|handle| handle.queued_prompt_count().unwrap_or(0) > 0);
+        if runnable {
+            recovered += 1;
+        }
+    }
+    graph.tasks.recover_pending_queues();
+    tracing::info!(
+        "queue recovery: {recovered} session(s) with a durable queue head handed to runners, \
+         {} already drained, {} candidate(s)",
+        candidates.len() - recovered,
+        candidates.len()
+    );
+}
+
 /// The daemon verification executor (audit P0-5/26 production wiring): a
 /// background loop that claims Queued durable verification jobs of every
 /// session, executes them through the REAL [`faktor_agent::AgentRuntime`]
@@ -1746,6 +2075,20 @@ fn spawn_verification_executor(graph: &DaemonGraph) -> tokio::task::JoinHandle<(
             }
         }
     })
+}
+
+/// Resolve one ENABLED section's database path. The section's resolver
+/// returns `None` only for a disabled section; reaching this helper with
+/// `None` means the enabled guard and the resolver disagree (a config
+/// combination no `unreachable!` may turn into a startup abort). Refuse with
+/// a typed CONFIG error naming the section, never a panic and never an
+/// implicit fallback path.
+fn enabled_section_db_path(
+    section: &str,
+    resolved: Option<std::path::PathBuf>,
+) -> Result<std::path::PathBuf, String> {
+    resolved
+        .ok_or_else(|| format!("{section} config: the enabled section resolved no database path"))
 }
 
 /// Shared daemon serve core (audit 44 ordering): `agent.recover()` -> bind
@@ -1893,6 +2236,11 @@ async fn serve_impl(
     // daemon are requeued BEFORE the executor can claim anything, so a
     // crashed check is retried rather than lost.
     recover_verification_jobs_at_startup(&session);
+    // Durable queue-head recovery (boundary race): a pending prompt-queue row
+    // whose turn already settled gets its runner now — before bind, so the
+    // first request sees a daemon that has already re-attached every durable
+    // head no new submit would have kicked.
+    recover_pending_queues_at_startup(&graph);
     // Step 17 — the server surface consumes the graph's authorities: the
     // orchestrator and the TaskExecutor of ServerDeps are the SAME
     // instances the graph built (no second execution authority is ever
@@ -1912,24 +2260,24 @@ async fn serve_impl(
     // enabled; its initial sync is backgrounded after readiness below).
     let mut scm_daemon: Option<Arc<crate::scm_daemon::ScmDaemon>> = None;
     if let Some((control_plane_path, scm_path)) = cloud_databases {
-        let control_plane = match control_plane_path {
-            Some(path) => Arc::new(faktor_cloud::ControlPlane::new(
-                Arc::new(
-                    faktor_cloud::SqliteControlPlaneStore::open(&path).map_err(|e| {
-                        format!("cloud control-plane store {}: {e}", path.display())
-                    })?,
-                ),
-                Arc::new(faktor_cloud::SystemClock),
-            )),
-            None => unreachable!("enabled cloud always resolves a control-plane path"),
-        };
-        let scm = match scm_path {
-            Some(path) => {
-                let store = faktor_scm::SqliteScmStore::open(&path)
-                    .map_err(|e| format!("cloud scm store {}: {e}", path.display()))?;
-                Arc::new(store) as Arc<dyn faktor_scm::ScmStore>
-            }
-            None => unreachable!("enabled cloud always resolves an scm path"),
+        let control_plane_path =
+            enabled_section_db_path("cloud control-plane", control_plane_path)?;
+        let control_plane = Arc::new(faktor_cloud::ControlPlane::new(
+            Arc::new(
+                faktor_cloud::SqliteControlPlaneStore::open(&control_plane_path).map_err(|e| {
+                    format!(
+                        "cloud control-plane store {}: {e}",
+                        control_plane_path.display()
+                    )
+                })?,
+            ),
+            Arc::new(faktor_cloud::SystemClock),
+        ));
+        let scm_path = enabled_section_db_path("cloud scm", scm_path)?;
+        let scm = {
+            let store = faktor_scm::SqliteScmStore::open(&scm_path)
+                .map_err(|e| format!("cloud scm store {}: {e}", scm_path.display()))?;
+            Arc::new(store) as Arc<dyn faktor_scm::ScmStore>
         };
         let scm_store = scm.clone();
         deps = deps.with_control_plane(control_plane).with_scm_store(scm);
@@ -1993,12 +2341,12 @@ async fn serve_impl(
             .ok_or_else(|| {
                 "billing config: an enabled section carries a service config".to_string()
             })?;
-        let store = match path {
-            Some(path) => Arc::new(
+        let store = {
+            let path = enabled_section_db_path("billing", path)?;
+            Arc::new(
                 faktor_cloud::SqliteControlPlaneStore::open(&path)
                     .map_err(|e| format!("billing store {}: {e}", path.display()))?,
-            ) as Arc<dyn faktor_cloud::BillingStore>,
-            None => unreachable!("enabled billing always resolves a database path"),
+            ) as Arc<dyn faktor_cloud::BillingStore>
         };
         let service = faktor_cloud::EntitlementService::with_system_clock(store, service_config)
             .map_err(|e| format!("billing service: {e}"))?;
@@ -2088,12 +2436,12 @@ async fn serve_impl(
         let requirements = config_workers
             .requirements()
             .map_err(|e| format!("workers config: {e}"))?;
-        let store = match path {
-            Some(path) => Arc::new(
+        let store = {
+            let path = enabled_section_db_path("workers", path)?;
+            Arc::new(
                 faktor_worker::SqliteWorkerStore::open(&path)
                     .map_err(|e| format!("worker store {}: {e}", path.display()))?,
-            ) as Arc<dyn faktor_worker::WorkerStore>,
-            None => unreachable!("enabled workers always resolves a database path"),
+            ) as Arc<dyn faktor_worker::WorkerStore>
         };
         let plane = faktor_worker::WorkerPlane::with_system_clock(store);
         // Crash recovery before the first request: a lease whose heartbeat
@@ -2293,20 +2641,23 @@ async fn serve_impl(
     // The billing report schedule (post-readiness): one bounded tick per
     // configured interval; every period is reported at most once.
     let billing_report_task = billing_report.map(|runner| tokio::spawn(runner.run()));
-    // Keep the daemon alive; when a shutdown is signaled, DRAIN the backup
-    // task (bounded) before the daemon returns, aborting only the async
-    // wrapper on timeout — a snapshot can never outlive its owning runtime.
+    // Keep the daemon alive; when a shutdown is signaled, close and DRAIN the
+    // TaskExecutor's detached drives (bounded graceful-then-abort), then drain
+    // the backup task (bounded) and the owned Ollama warm-up threads before
+    // the daemon returns. The drive drain runs BEFORE the backup drain so the
+    // final snapshot sees every settled record-first write; a straggler
+    // aborted by the registry stays resumable from its durable rows.
     match shutdown_rx {
         Some(rx) => {
             let _ = rx.await;
-            verification_executor.abort();
-            if let Some(task) = scm_task {
-                task.abort();
-            }
-            if let Some(task) = billing_report_task {
-                task.abort();
-            }
-            drain_startup_backup(backup_task).await;
+            shutdown_serving_daemon(
+                &graph.tasks,
+                verification_executor,
+                scm_task,
+                billing_report_task,
+                backup_task,
+            )
+            .await;
         }
         None => std::future::pending::<()>().await,
     }
@@ -2376,6 +2727,11 @@ async fn acp(data_dir: PathBuf) {
     if let Err(e) = agent.recover() {
         tracing::error!("recovery failed: {e}");
     }
+    // Durable queue-head recovery, exactly like serve: the same order (after
+    // `agent.recover()`, before the first prompt is accepted) over the same
+    // executor, so a killed process's pending durable head is driven without
+    // any new submit.
+    recover_pending_queues_at_startup(&graph);
     // The ACP prompt surface enters the SAME product execution authority the
     // daemon server uses (the graph's ONE TaskExecutor over the ONE session
     // store) — ACP translates its wire prompts, it never drives the agent.
@@ -2710,23 +3066,23 @@ impl AcpBackend for DaemonAcpBackend {
         }
         // Accepted: wait for the turn machine to leave the mid-turn states
         // (the same durable wait the wire prompt path performs), then report
-        // the machine's final state.
+        // the machine's final state. Bounded by the configured turn budget
+        // (fallback when the operator opted out with 0): a never-settling
+        // machine yields a typed timeout instead of polling forever.
+        let settle_deadline = {
+            let budget = self.session.turn_budget_ms();
+            if budget == 0 {
+                TURN_SETTLE_FALLBACK
+            } else {
+                std::time::Duration::from_millis(budget)
+            }
+        };
         let state = tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move {
-                loop {
-                    let handle = match session.get_session(sid) {
-                        Ok(Some(h)) => h,
-                        Ok(None) => return Err(format!("session {sid}")),
-                        Err(e) => return Err(e.message),
-                    };
-                    match handle.state() {
-                        Ok(s) if !faktor_server::native::turn_machine_busy(s) => return Ok(s),
-                        Ok(_) => {}
-                        Err(e) => return Err(e.message),
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                }
-            })
+            tokio::runtime::Handle::current().block_on(await_turn_settled(
+                &session,
+                sid,
+                settle_deadline,
+            ))
         })?;
         Ok(json!({
             "status": "completed",
@@ -2755,6 +3111,63 @@ fn parse_session_id(s: &str) -> Result<SessionId, String> {
         return Err("invalid session id \"0\"".into());
     }
     Ok(SessionId::new(raw))
+}
+
+/// Poll interval of the ACP turn-settle wait.
+const TURN_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Fallback ACP turn-settle deadline when the operator configured an
+/// unbounded (`0`) wall-clock turn budget: the wait is still bounded.
+const TURN_SETTLE_FALLBACK: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Wait for the durable turn machine to leave the mid-turn states, with an
+/// explicit wall deadline. `read` returns the current durable state (or a
+/// typed read error). A machine that never settles (dead executor, lost
+/// wakeup, a stuck driver) exhausts the deadline and returns a TYPED timeout
+/// naming the state last observed — the ACP bridge never polls forever and
+/// never reports a silent success.
+async fn await_settled<F>(
+    mut read: F,
+    deadline: std::time::Duration,
+) -> Result<faktor_core::state::AgentState, String>
+where
+    F: FnMut() -> Result<faktor_core::state::AgentState, String>,
+{
+    let started = std::time::Instant::now();
+    loop {
+        let state = read()?;
+        if !faktor_server::native::turn_machine_busy(state) {
+            return Ok(state);
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= deadline {
+            return Err(format!(
+                "turn did not settle within {deadline:?} (still {state:?} after {elapsed:?})"
+            ));
+        }
+        tokio::time::sleep(TURN_SETTLE_POLL.min(deadline - elapsed)).await;
+    }
+}
+
+/// The session-backed [`await_settled`]: resolves the durable handle on every
+/// poll (a recreated handle is never a stale in-memory state).
+async fn await_turn_settled(
+    session: &Arc<SessionManager>,
+    sid: SessionId,
+    deadline: std::time::Duration,
+) -> Result<faktor_core::state::AgentState, String> {
+    await_settled(
+        || {
+            let handle = match session.get_session(sid) {
+                Ok(Some(h)) => h,
+                Ok(None) => return Err(format!("session {sid}")),
+                Err(e) => return Err(e.message),
+            };
+            handle.state().map_err(|e| e.message)
+        },
+        deadline,
+    )
+    .await
 }
 
 /// The daemon's session-owned terminal authority as the ACP
@@ -4466,7 +4879,8 @@ mod tests {
         let shadows = faktor_orchestrator::runtime::shadow::ShadowRoots::new(
             session.clone(),
             dir.path().join("shadows"),
-        );
+        )
+        .unwrap();
         let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
             &orchestrator,
             session.clone(),
@@ -4866,6 +5280,87 @@ mod tests {
         );
     }
 
+    /// Every enabled-section database open goes through
+    /// `enabled_section_db_path`: a resolver `None` is a TYPED config error
+    /// (never an `unreachable!` startup abort, never a silently created
+    /// fallback database). The disabled section is the only resolver path
+    /// that returns `None`, for all four sections.
+    #[test]
+    fn enabled_sections_resolve_typed_errors_never_panic() {
+        for section in ["cloud control-plane", "cloud scm", "billing", "workers"] {
+            let err = enabled_section_db_path(section, None)
+                .expect_err("an enabled section with no resolved path must refuse");
+            assert!(err.starts_with(&format!("{section} config:")), "{err}");
+            assert!(err.contains("resolved no database path"), "{err}");
+            let path = std::path::PathBuf::from("/tmp/faktor-db");
+            assert_eq!(
+                enabled_section_db_path(section, Some(path.clone())).unwrap(),
+                path
+            );
+        }
+        // The resolvers' None branch is exactly the disabled section for
+        // every one of the four configs the call sites guard.
+        let dir = std::path::Path::new("/data");
+        assert_eq!(
+            config::CloudCfg::default().control_plane_path(dir).unwrap(),
+            None
+        );
+        assert_eq!(config::CloudCfg::default().scm_path(dir).unwrap(), None);
+        assert_eq!(
+            config::BillingCfg::default().billing_path(dir).unwrap(),
+            None
+        );
+        assert_eq!(
+            config::WorkersCfg::default().workers_path(dir).unwrap(),
+            None
+        );
+    }
+
+    /// The ACP turn-settle wait is BOUNDED: a machine that never leaves a
+    /// busy state returns a typed timeout on a short deadline instead of
+    /// polling forever; a settling machine returns its terminal state; a
+    /// durable read error propagates (never a silent success).
+    #[tokio::test]
+    async fn acp_turn_settle_wait_is_bounded_and_typed() {
+        let t0 = std::time::Instant::now();
+        let err = await_settled(
+            || Ok(faktor_core::state::AgentState::Streaming),
+            std::time::Duration::from_millis(40),
+        )
+        .await
+        .expect_err("a never-settling turn must time out");
+        assert!(err.contains("did not settle"), "{err}");
+        assert!(err.contains("Streaming"), "{err}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "the wait must be bounded by the deadline, not by the poll"
+        );
+
+        let mut calls = 0u32;
+        let state = await_settled(
+            || {
+                calls += 1;
+                Ok(if calls < 3 {
+                    faktor_core::state::AgentState::ExecutingTool
+                } else {
+                    faktor_core::state::AgentState::ReadyForNextTurn
+                })
+            },
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state, faktor_core::state::AgentState::ReadyForNextTurn);
+
+        let err = await_settled(
+            || Err("durable read failed".to_string()),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("durable read failed"), "{err}");
+    }
+
     #[test]
     fn serve_config_is_strict_only_for_an_explicit_path() {
         // Audit 31: without --config, defaults (nothing can fail startup);
@@ -5104,7 +5599,7 @@ mod tests {
             .id();
         let handle = manager.get_session(sid).unwrap().unwrap();
         let task = handle.task_id().unwrap();
-        let op = manager.next_op_id().raw();
+        let op = manager.try_next_op_id().unwrap().raw();
         let check = |id: &str| faktor_session::VerificationAttemptCheck {
             check_id: id.into(),
             command: format!("make {id}"),
@@ -5132,10 +5627,20 @@ mod tests {
             .unwrap();
         // One executor died mid-check (Running); one finished (Passed).
         handle
-            .claim_verification_job(task.raw(), "make_test", op, manager.next_op_id().raw())
+            .claim_verification_job(
+                task.raw(),
+                "make_test",
+                op,
+                manager.try_next_op_id().unwrap().raw(),
+            )
             .unwrap();
         handle
-            .claim_verification_job(task.raw(), "make_check", op, manager.next_op_id().raw())
+            .claim_verification_job(
+                task.raw(),
+                "make_check",
+                op,
+                manager.try_next_op_id().unwrap().raw(),
+            )
             .unwrap();
         handle
             .resolve_verification_job(
@@ -5975,6 +6480,514 @@ mod tests {
             .unwrap();
     }
 
+    /// Serve startup queue recovery: a durable pending queue head left by a
+    /// killed process (active turn already aborted, no live runner anywhere)
+    /// is claimed by EXACTLY ONE runner as part of the serve startup
+    /// sequence, with no new submit. The startup-wiring harness configures no
+    /// provider (scripted providers are not a config surface), so the claimed
+    /// head's turn fails closed on the missing model — exactly once; real
+    /// end-to-end execution of a recovered head is proven one layer down
+    /// (`task_executor_tests::relaunch_recovery_drains_a_pending_head_without_a_new_submit`,
+    /// which asserts the provider call count is exactly one).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn serve_startup_drains_a_pending_durable_queue_head_without_a_submit() {
+        use faktor_core::event::EventKind;
+        let dir = tempfile::tempdir().unwrap();
+        // The kill residue: A is the active turn and B queues durably behind
+        // it. Neither is ever driven; A is aborted so the machine is idle and
+        // the pending head B is exactly what startup recovery must find.
+        let session =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        let ws = session.create_workspace("/w").unwrap();
+        let sid = session
+            .create_session(ws, "queue recovery", "fake", "m")
+            .unwrap()
+            .id();
+        let agent = test_agent(session.clone(), ProviderRegistry::new());
+        let receipt_a = agent.submit(sid, "A prompt", &[]).unwrap();
+        let receipt_b = agent.submit(sid, "B prompt", &[]).unwrap();
+        assert!(receipt_b.queued, "B queues behind A");
+        agent.abort_op(sid, Some(receipt_a.op_id)).unwrap();
+        let handle = session.get_session(sid).unwrap().unwrap();
+        assert_eq!(
+            handle.queued_prompt_count().unwrap(),
+            1,
+            "B survives the kill durably"
+        );
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let data_dir = dir.path().to_path_buf();
+        let daemon = tokio::task::spawn(async move {
+            serve_impl(0, data_dir, None, Some(ready_tx), Some(shutdown_rx)).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(60), ready_rx)
+            .await
+            .expect("serve must reach the startup line")
+            .expect("ready signal");
+
+        // Startup recovery hands the head to exactly one runner: the durable
+        // row leaves the non-terminal set, with no submit after the seed.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        while handle.queued_prompt_count().unwrap() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "startup recovery must drain the pending head"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        // Grace window for any duplicate runner to show itself.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            handle.queued_prompt_count().unwrap(),
+            0,
+            "the head stays drained"
+        );
+        let counts = handle.queue_status_counts().unwrap();
+        for status in ["pending", "claimed", "running"] {
+            assert_eq!(counts.get(status), None, "queue row is terminal: {counts}");
+        }
+        let events = handle.events_range(1, None).unwrap();
+        let count = |kind: EventKind| {
+            events
+                .iter()
+                .filter(|e| e.kind == kind && e.op_id == Some(receipt_b.op_id))
+                .count()
+        };
+        assert_eq!(
+            count(EventKind::PromptReceived),
+            1,
+            "B was queued exactly once"
+        );
+        assert_eq!(
+            count(EventKind::PromptAdmitted),
+            1,
+            "B was claimed exactly once"
+        );
+        let terminal = events
+            .iter()
+            .filter(|e| {
+                e.op_id == Some(receipt_b.op_id)
+                    && matches!(e.kind, EventKind::TurnCompleted | EventKind::Failed)
+            })
+            .count();
+        assert_eq!(terminal, 1, "B's one admitted turn ended exactly once");
+
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(30), daemon)
+            .await
+            .expect("daemon must stop on shutdown")
+            .expect("serve_impl returns Ok")
+            .unwrap();
+    }
+
+    /// Kill-relaunch integration: a FIRST full daemon (real graph, real
+    /// executor) leaves B durably queued behind an aborted A, then its drive
+    /// registry is shut down exactly like a process death. The relaunched
+    /// `serve` startup path must claim B exactly once (one admitted turn),
+    /// with no new submit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn serve_startup_recovery_drains_a_killed_daemons_queue_head_on_relaunch() {
+        use faktor_core::event::EventKind;
+        let dir = tempfile::tempdir().unwrap();
+        // First daemon process: real graph, A active, B durably queued behind
+        // it, neither driven.
+        let graph = build_daemon_with_mcp_and_chunks_fast(
+            dir.path(),
+            None,
+            None,
+            graph::SemanticCfg::default(),
+        )
+        .await
+        .unwrap();
+        let session = graph.session.clone();
+        let ws = session.create_workspace("/w").unwrap();
+        let sid = session
+            .create_session(ws, "relaunch recovery", "fake", "m")
+            .unwrap()
+            .id();
+        let receipt_a = graph.agent.submit(sid, "A prompt", &[]).unwrap();
+        let receipt_b = graph.agent.submit(sid, "B prompt", &[]).unwrap();
+        assert!(receipt_b.queued, "B queues behind A");
+        // Kill: the drive registry is closed (every later settle kick is
+        // refused), then the active turn is aborted so A is not resumed and
+        // B's durable row is the only runnable marker left.
+        let report = graph
+            .tasks
+            .shutdown_drives(std::time::Duration::from_millis(50))
+            .await;
+        assert!(
+            report.all_reaped(),
+            "the killed daemon reaped its drives: {report:?}"
+        );
+        graph.agent.abort_op(sid, Some(receipt_a.op_id)).unwrap();
+        assert_eq!(
+            session
+                .get_session(sid)
+                .unwrap()
+                .unwrap()
+                .queued_prompt_count()
+                .unwrap(),
+            1,
+            "B survives the kill durably"
+        );
+        drop(graph);
+
+        // Relaunch through the REAL serve startup path; no new submit.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let data_dir = dir.path().to_path_buf();
+        let daemon = tokio::task::spawn(async move {
+            serve_impl(0, data_dir, None, Some(ready_tx), Some(shutdown_rx)).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(60), ready_rx)
+            .await
+            .expect("serve must reach the startup line")
+            .expect("ready signal");
+        // Observe the relaunched directory through a fresh manager (the
+        // killed one is gone): the head drains with exactly one claim.
+        let observer =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let handle = observer.get_session(sid).unwrap().unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        while handle.queued_prompt_count().unwrap() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "relaunch recovery must drain the killed head"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(handle.queued_prompt_count().unwrap(), 0);
+        let events = handle.events_range(1, None).unwrap();
+        let admitted = events
+            .iter()
+            .filter(|e| e.kind == EventKind::PromptAdmitted && e.op_id == Some(receipt_b.op_id))
+            .count();
+        assert_eq!(admitted, 1, "the relaunched daemon claimed B exactly once");
+        let terminal = events
+            .iter()
+            .filter(|e| {
+                e.op_id == Some(receipt_b.op_id)
+                    && matches!(e.kind, EventKind::TurnCompleted | EventKind::Failed)
+            })
+            .count();
+        assert_eq!(terminal, 1, "B's one admitted turn ended exactly once");
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(30), daemon)
+            .await
+            .expect("daemon must stop on shutdown")
+            .expect("serve_impl returns Ok")
+            .unwrap();
+    }
+
+    /// The residual: the REAL daemon shutdown sequence — the exact function
+    /// serve invokes when its shutdown channel fires — must reap live
+    /// orchestrated drives within the documented bound, leave the drive
+    /// registry empty, and keep the aborted run recoverable from its durable
+    /// rows (the task_executor abort->resume path, driven from the serve
+    /// integration level over the production shadow-carrying executor).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn serve_shutdown_reaps_live_orchestrated_drives_and_keeps_them_resumable() {
+        use faktor_core::id::{TaskId as CoreTaskId, WorktreeId};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Bounded wait for the drive to reach the provider call. Under
+        /// full-suite CPU starvation the OS schedules the drive's progress
+        /// arbitrarily late, so this is a CONDITION wait with an explicit
+        /// generous deadline — never a fixed sleep, never a bound sized for
+        /// an idle machine.
+        const DRIVE_PARK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
+        /// Wall-clock load allowance for observing the drain: the product
+        /// bound (`SERVE_DRIVE_SHUTDOWN_GRACE + ABORT_REAP_GRACE`) is
+        /// enforced by the registry's own deadlines, and scheduler
+        /// starvation stretches wall-clock timers. The starvation-
+        /// independent teeth stay strict: the parked drive is aborted (never
+        /// completed), every drive is reaped, the registry is closed, and
+        /// the durable rows resume.
+        const SHUTDOWN_DRAIN_LOAD_ALLOWANCE: std::time::Duration =
+            std::time::Duration::from_secs(60);
+
+        /// Provider whose model calls PARK until the gate opens: the
+        /// orchestrated child drives stay deterministically in flight across
+        /// the shutdown window, so the drain MUST abort (never just await)
+        /// them.
+        struct GateProvider {
+            caps: ModelCapabilities,
+            opened: tokio::sync::watch::Sender<bool>,
+            entered: Arc<AtomicUsize>,
+            /// Wakes a condition waiter whenever `entered` advances; a
+            /// `notify_one` permit is stored, so a call that entered before
+            /// the wait began can never be missed.
+            entered_notify: tokio::sync::Notify,
+        }
+
+        impl GateProvider {
+            /// Wait, bounded by the explicit `deadline`, until at least
+            /// `at_least` provider calls have entered. Returns `false` only
+            /// when the deadline elapsed.
+            async fn wait_entered(&self, at_least: usize, deadline: std::time::Duration) -> bool {
+                let wait = async {
+                    while self.entered.load(Ordering::SeqCst) < at_least {
+                        self.entered_notify.notified().await;
+                    }
+                };
+                tokio::time::timeout(deadline, wait).await.is_ok()
+            }
+        }
+
+        impl Provider for GateProvider {
+            fn id(&self) -> &str {
+                "gate"
+            }
+
+            fn capabilities(&self, _model: &str) -> ModelCapabilities {
+                self.caps.clone()
+            }
+
+            fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                self.entered_notify.notify_one();
+                let mut rx = self.opened.subscribe();
+                let s = futures::stream::once(async move {
+                    while !*rx.borrow_and_update() {
+                        if rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(ProviderChunk::Text {
+                        text: "done".into(),
+                    })
+                })
+                .chain(futures::stream::once(async { Ok(ProviderChunk::Done) }));
+                Box::pin(s)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (opened, _opened_rx) = tokio::sync::watch::channel(false);
+        let provider = Arc::new(GateProvider {
+            caps: ModelCapabilities {
+                tools: true,
+                parallel_tools: true,
+                ..Default::default()
+            },
+            opened,
+            entered: Arc::new(AtomicUsize::new(0)),
+            entered_notify: tokio::sync::Notify::new(),
+        });
+
+        // A real, shadow-carrying executor over a real store: the SAME
+        // authority set the serve daemon graph builds.
+        let session =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let mut registry = ProviderRegistry::new();
+        registry.try_register(provider.clone()).unwrap();
+        let agent = test_agent(session.clone(), registry);
+        let owner_root = dir.path().join("owner");
+        std::fs::create_dir_all(&owner_root).unwrap();
+        std::fs::write(owner_root.join("a.txt"), b"base").unwrap();
+        let ws = session
+            .create_workspace(owner_root.to_str().unwrap())
+            .unwrap();
+        let wt = WorktreeId::new(
+            session
+                .put_worktree(ws, owner_root.to_str().unwrap(), "main")
+                .unwrap() as u64,
+        );
+        let parent = session
+            .create_session(ws, "serve-shutdown", "gate", "m")
+            .unwrap()
+            .id();
+        session
+            .adopt_identity(parent, wt, CoreTaskId::new(1))
+            .unwrap();
+        let orchestrator =
+            faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
+        let shadows = faktor_orchestrator::runtime::shadow::ShadowRoots::new(
+            session.clone(),
+            dir.path().join("shadows"),
+        )
+        .unwrap();
+        let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
+            &orchestrator,
+            session.clone(),
+            agent.clone(),
+            shadows,
+        );
+
+        // Two work items => a real orchestrated run whose child drives park
+        // inside the provider call.
+        let receipt = tasks
+            .start_task(
+                parent,
+                faktor_orchestrator::runtime::task_executor::TaskRunRequest {
+                    goal: "two-item shutdown run".into(),
+                    work_items: vec![
+                        faktor_orchestrator::WorkItem::new(
+                            "a",
+                            "work a",
+                            faktor_orchestrator::WorkKind::Analysis,
+                        ),
+                        faktor_orchestrator::WorkItem::new(
+                            "b",
+                            "work b",
+                            faktor_orchestrator::WorkKind::Analysis,
+                        ),
+                    ],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            receipt.mode,
+            faktor_orchestrator::runtime::task_executor::TaskRunMode::Orchestrated
+        );
+        let run_id = receipt.run_id.clone();
+        // The drive is live AND parked in the provider: it cannot finish on
+        // its own before shutdown. Wait on the observable park condition
+        // (the provider call entered) with the explicit deadline above —
+        // under full-suite CPU starvation this can take far longer than on
+        // an idle machine, and a fixed 30s window was the last known flake.
+        assert!(
+            provider.wait_entered(1, DRIVE_PARK_DEADLINE).await,
+            "the orchestrated drive never parked within {DRIVE_PARK_DEADLINE:?}"
+        );
+        assert_eq!(
+            tasks.live_drive_count(),
+            1,
+            "the parked drive is owned by the executor registry"
+        );
+        // The durable assignments (the resume entry point) exist BEFORE the
+        // abort.
+        let assignments = faktor_orchestrator::runtime::OrchestratorRuntime::assignment_rows(
+            session.clone(),
+            parent,
+            &run_id,
+        )
+        .expect("assignment rows readable");
+        assert!(
+            !assignments.is_empty(),
+            "durable assignments before shutdown"
+        );
+
+        // The EXACT serve shutdown sequence (the post-ready loop handles are
+        // dummies; the daemon's own loops have dedicated tests). The drain
+        // itself must resolve within the documented product bound plus the
+        // explicit load allowance; a timeout here is a real unbounded-
+        // shutdown failure, never an unbounded test wait.
+        let drain_bound = SERVE_DRIVE_SHUTDOWN_GRACE
+            + faktor_orchestrator::runtime::task_executor::TaskDriveRegistry::ABORT_REAP_GRACE
+            + SHUTDOWN_DRAIN_LOAD_ALLOWANCE;
+        let report = tokio::time::timeout(
+            drain_bound,
+            shutdown_serving_daemon(
+                &tasks,
+                tokio::spawn(std::future::pending::<()>()),
+                None,
+                None,
+                tokio::spawn(async {}),
+            ),
+        )
+        .await
+        .expect("the drive drain must stay within grace + abort/reap + load allowance");
+        assert!(report.total >= 1, "the live drive was owned: {report:?}");
+        assert_eq!(
+            report.completed, 0,
+            "the parked drive must not complete during the grace: {report:?}"
+        );
+        assert!(
+            report.aborted >= 1,
+            "the parked drive was aborted: {report:?}"
+        );
+        assert_eq!(report.unreaped, 0, "every drive reaped: {report:?}");
+        assert_eq!(tasks.live_drive_count(), 0, "registry empty");
+        assert!(tasks.live_drive_runs().is_empty(), "registry empty");
+        assert!(tasks.drives_shutdown(), "the registry is closed");
+
+        // Durable state intact: the assignment rows survive the abort.
+        let after = faktor_orchestrator::runtime::OrchestratorRuntime::assignment_rows(
+            session.clone(),
+            parent,
+            &run_id,
+        )
+        .expect("assignment rows still readable");
+        assert!(!after.is_empty(), "durable assignments survive the abort");
+
+        // CRASH: drop the whole daemon stack and reopen the same data dir —
+        // exactly a daemon restart. The aborted run re-attaches from its
+        // durable rows through the documented recovery entry.
+        drop(tasks);
+        drop(orchestrator);
+        drop(agent);
+        drop(session);
+        let session2 =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let mut registry2 = ProviderRegistry::new();
+        registry2.try_register(provider.clone()).unwrap();
+        let agent2 = test_agent(session2.clone(), registry2);
+        agent2.recover().expect("fresh daemon recovery pass");
+        let orchestrator2 = faktor_orchestrator::runtime::OrchestratorRuntime::new(
+            session2.clone(),
+            agent2.clone(),
+        );
+        let shadows2 = faktor_orchestrator::runtime::shadow::ShadowRoots::new(
+            session2.clone(),
+            dir.path().join("shadows"),
+        )
+        .unwrap();
+        let tasks2 = faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
+            &orchestrator2,
+            session2.clone(),
+            agent2.clone(),
+            shadows2,
+        );
+        let resumed = tasks2
+            .resume_run(
+                parent,
+                &run_id,
+                faktor_orchestrator::runtime::Ceilings::default(),
+                faktor_orchestrator::caps::CapabilitySet::new(),
+                None,
+            )
+            .expect("the aborted run re-attaches from its durable rows");
+        assert_eq!(resumed.run_id, run_id);
+        // Re-attachment is only proven when the re-driven child observably
+        // reaches the provider again: the resumed drive re-parks on the same
+        // closed gate, so it stays owned by the fresh registry.
+        assert!(
+            provider.wait_entered(2, DRIVE_PARK_DEADLINE).await,
+            "the re-attached run never re-parked within {DRIVE_PARK_DEADLINE:?}"
+        );
+        assert_eq!(
+            tasks2.live_drive_count(),
+            1,
+            "the re-attached drive is owned by the fresh registry"
+        );
+        // Reap the re-attached drive too: the second drain owns, aborts and
+        // reaps it exactly like the first.
+        let report2 = tasks2
+            .shutdown_drives(std::time::Duration::from_millis(50))
+            .await;
+        assert!(
+            report2.total >= 1,
+            "the re-attached drive was owned: {report2:?}"
+        );
+        assert_eq!(
+            report2.completed, 0,
+            "the re-parked drive must not complete during the grace: {report2:?}"
+        );
+        assert!(
+            report2.aborted >= 1,
+            "the re-parked drive was aborted: {report2:?}"
+        );
+        assert_eq!(
+            report2.unreaped, 0,
+            "every re-attached drive reaped: {report2:?}"
+        );
+        assert_eq!(tasks2.live_drive_count(), 0);
+    }
+
     #[test]
     fn doctor_plain_passes_on_a_healthy_store_and_fails_on_corruption() {
         let dir = tempfile::tempdir().unwrap();
@@ -6634,7 +7647,7 @@ mod tests {
         m.store()
             .cost_task_cap_set(sid, reservation_task, Some(1_000_000))
             .unwrap();
-        let op = m.next_op_id();
+        let op = m.try_next_op_id().unwrap();
         let granted = m
             .store()
             .cost_reserve(sid, reservation_task, op, 1000, now)
@@ -7843,14 +8856,80 @@ mod tests {
             .to_string()
     }
 
+    /// Native liveness probe of one raw pid. `kill(pid, 0) == 0` means the
+    /// pid exists (a live child OR an unreaped zombie); `EPERM` also means it
+    /// exists — the pid is real but not ours to signal, and on Darwin a group
+    /// of unreaped zombies answers `EPERM`. Only `ESRCH` proves the pid is
+    /// gone. No shell subprocess: a transient spawn failure under full-suite
+    /// load (`EAGAIN`/`ENOMEM`) can never be misread as "the child died", and
+    /// the probe matches the wait's observable state exactly.
+    #[cfg(unix)]
+    fn pid_probe(pid: u32) -> Result<(), i32> {
+        if pid == 0 {
+            return Err(libc::ESRCH);
+        }
+        // SAFETY: signal 0 only probes existence and never delivers a signal;
+        // the pid fits `pid_t` and a recycled/invalid id can at worst report
+        // the wrong liveness, never crash the probe.
+        let r = unsafe { libc::kill(pid as i32, 0) };
+        if r == 0 {
+            return Ok(());
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if errno == libc::EPERM {
+            Ok(())
+        } else {
+            Err(errno)
+        }
+    }
+
     #[cfg(unix)]
     fn pid_alive(pid: u32) -> bool {
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("kill -0 {pid} 2>/dev/null"))
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        pid_probe(pid).is_ok()
+    }
+
+    /// Pins the probe contract the round-trip wait depends on: an UNREAPED
+    /// zombie still owns its pid (the kernel answers `0`/`EPERM`, never
+    /// `ESRCH`), and only the parent's reap turns the pid into `ESRCH`. A
+    /// shell wrapper that merely exited non-zero can never satisfy this.
+    #[cfg(unix)]
+    #[test]
+    fn pid_liveness_probe_requires_esrch_not_a_shell_verdict() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn the probe fixture");
+        let pid = child.id();
+        assert!(pid_alive(pid), "a running child owns its pid");
+        // Observe the exit WITHOUT reaping it: `ps` state `Z` is a zombie.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let out = std::process::Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .expect("ps the fixture");
+            if String::from_utf8_lossy(&out.stdout)
+                .trim_start()
+                .starts_with('Z')
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fixture child must exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            pid_alive(pid),
+            "an unreaped zombie still exists: only ESRCH means gone"
+        );
+        child.wait().expect("reap the fixture");
+        assert_eq!(
+            pid_probe(pid),
+            Err(libc::ESRCH),
+            "after the parent reaps it, the kernel reports ESRCH"
+        );
     }
 
     /// The production wiring end-to-end: an ACP client negotiates
@@ -7909,16 +8988,56 @@ mod tests {
             .to_string();
         assert!(pid > 0, "a real pty pid");
         assert_eq!(created["result"]["sessionId"], json!(sid));
-        assert!(pid_alive(pid), "the pty child is alive after create");
 
+        // OWNERSHIP FIRST: the create-response contract is that the terminal
+        // is already session-owned when the response arrives. Observe that
+        // ownership condition with a bounded wait instead of assuming it; a
+        // response that ever raced its registration fails HERE naming the
+        // exact missing condition.
+        let sid_typed = SessionId::new(sid.parse().unwrap());
+        let ownership_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let rows = loop {
+            let rows = registry.session_rows(sid_typed);
+            if !rows.is_empty() {
+                break rows;
+            }
+            assert!(
+                std::time::Instant::now() < ownership_deadline,
+                "terminal/create returned before its session-owned row was registered"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
         // The row is session-owned in the daemon registry: the durable
         // session id, the operation id and the pid all match the wire.
-        let rows = registry.session_rows(SessionId::new(sid.parse().unwrap()));
         assert_eq!(rows.len(), 1, "one session-owned row: {rows:?}");
         assert_eq!(rows[0].0, tid);
         assert_eq!(rows[0].1.pid, pid);
         assert_eq!(rows[0].1.operation_id.to_string(), ownership);
         assert_eq!(rows[0].1.session_id.to_string(), sid);
+
+        // LIVENESS of the OWNED row, with a bounded wait and never a single
+        // instant sample: only ESRCH (the pid was reaped by the single
+        // reader/reaper) proves the child is gone — 0 and EPERM both mean
+        // the pid still exists (Darwin answers EPERM for unreaped zombies).
+        let alive_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match pid_probe(pid) {
+                Ok(()) => break,
+                Err(libc::ESRCH) => {
+                    let rows = registry.session_rows(sid_typed);
+                    assert!(
+                        std::time::Instant::now() < alive_deadline,
+                        "the owned pty child (pid {pid}) was reaped right after create \
+                         (session rows: {rows:?})"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(errno) => panic!(
+                    "pid {pid} liveness probe failed with errno {errno}; the terminal \
+                     cannot be observed"
+                ),
+            }
+        }
 
         // Input → real tty → terminalOutput frames.
         let (response, updates) = client
@@ -7935,7 +9054,9 @@ mod tests {
             "the real tty output must arrive as terminalOutput frames"
         );
 
-        // Kill takes the real child; the bounded wait proves it.
+        // Kill takes the real child; the bounded wait leaves ONLY when the
+        // kernel reports ESRCH (the pid was reaped), never on a probe-side
+        // verdict. EPERM keeps waiting: the pid still exists.
         let killed = client
             .request(
                 "terminal/kill",
@@ -7944,12 +9065,20 @@ mod tests {
             .await;
         assert_eq!(killed["result"], json!({}), "{killed}");
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        while pid_alive(pid) {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "terminal/kill must terminate the real child"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        loop {
+            match pid_probe(pid) {
+                Err(libc::ESRCH) => break,
+                Ok(()) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "terminal/kill must terminate the real child (pid {pid} still exists)"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(errno) => panic!(
+                    "pid {pid} liveness probe failed with errno {errno}; the kill cannot be observed"
+                ),
+            }
         }
 
         drop(client);

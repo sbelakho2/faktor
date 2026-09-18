@@ -359,13 +359,53 @@ mod tests {
 
     #[test]
     fn fabricated_bogus_inputs_never_panic() {
-        let _ = classify_win32(u32::MAX);
-        let _ = classify_win32(0);
-        let _ = classify_hresult(u32::MAX);
-        let _ = classify_hresult(0x0000_0002);
-        let _ = validate_geometry(0, 0);
-        let _ = validate_geometry(COORD_MAX + 1, COORD_MAX + 1);
-        let _ = quote_cmdline_arg(&"\\\"".repeat(10_000));
-        let _ = build_env_block(&[("k".repeat(200_000), "v".repeat(200_000))]);
+        // Unknown/fabricated win32 codes fall back to a typed Internal, and
+        // an HRESULT that claims SUCCESS on an error path is Internal too —
+        // never a silent "ok".
+        assert_eq!(classify_win32(u32::MAX), ErrorKind::Internal);
+        assert_eq!(classify_win32(0), ErrorKind::Internal);
+        assert_eq!(classify_hresult(u32::MAX), ErrorKind::Internal);
+        assert_eq!(classify_hresult(0x0000_0002), ErrorKind::Internal);
+        assert_eq!(classify_hresult(0x8000_4005), ErrorKind::Internal);
+        // Geometry refuses zero as Malformed and oversize as Oversized.
+        assert_eq!(
+            validate_geometry(0, 0).unwrap_err().kind,
+            ErrorKind::Malformed
+        );
+        assert_eq!(
+            validate_geometry(COORD_MAX + 1, COORD_MAX + 1)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Oversized
+        );
+        // Hostile quoting input stays bounded and still yields a quoted arg
+        // (the helper must not loop, truncate silently or panic).
+        let hostile = "\\\"".repeat(10_000);
+        let quoted = quote_cmdline_arg(&hostile);
+        assert!(quoted.starts_with('"') && quoted.ends_with('"'));
+        assert!(
+            quoted.chars().count() <= hostile.chars().count() * 2 + 2,
+            "quoting must stay within the documented 2N+2 bound"
+        );
+        // A hostile env pair is rendered exactly once, in the documented
+        // `key=value\0` layout with the final terminator NUL: no silent
+        // drop, no duplicated separator.
+        let block = build_env_block(&[("k".repeat(200_000), "v".repeat(200_000))]);
+        assert!(block.ends_with(&[0, 0]));
+        assert_eq!(
+            block.len(),
+            200_000 + 1 + 200_000 + 2,
+            "one entry is key=value plus the double-NUL terminator"
+        );
+        assert_eq!(
+            block.iter().filter(|unit| **unit == 0).count(),
+            2,
+            "the only NULs are the terminator"
+        );
+        let text = String::from_utf16(&block).unwrap();
+        assert!(
+            text.starts_with('k') && text.contains('='),
+            "the entry round-trips as key=value"
+        );
     }
 }

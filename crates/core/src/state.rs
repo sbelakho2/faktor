@@ -2301,8 +2301,20 @@ mod tests {
         // is legal (abort lands the session ready).
         let mut m = StateMachine::new(AgentState::Cancelled);
         m.transition(AgentState::Preparing).unwrap();
+        assert_eq!(m.state(), AgentState::Preparing);
         let mut m = StateMachine::new(AgentState::Cancelled);
         m.transition(AgentState::ReadyForNextTurn).unwrap();
+        assert_eq!(m.state(), AgentState::ReadyForNextTurn);
+        // Cancelled is a turn outcome, not a session end: the terminal
+        // states are unreachable from it, and it is not itself terminal.
+        assert!(!AgentState::Cancelled.is_terminal());
+        let mut m = StateMachine::new(AgentState::Cancelled);
+        assert!(m.transition(AgentState::Completed).is_err());
+        assert_eq!(
+            m.state(),
+            AgentState::Cancelled,
+            "a rejected hop writes nothing"
+        );
     }
 
     #[test]
@@ -2389,8 +2401,11 @@ mod tests {
     #[test]
     fn exhaustive_transition_matrix_is_defined_for_all_states() {
         // Every state must declare an allowed set (even if empty) — no
-        // unhandled states can silently enter the machine.
-        for s in [
+        // unhandled states can silently enter the machine. The matrix is
+        // also checked against the machine's structural invariants: terminal
+        // states have no successors; non-terminal states have at least one;
+        // self-transitions are always idempotent (replay-safe).
+        let states = [
             AgentState::Idle,
             AgentState::Preparing,
             AgentState::BuildingContext,
@@ -2408,10 +2423,36 @@ mod tests {
             AgentState::FailedPermanent,
             AgentState::NeedsUserInput,
             AgentState::Suspended,
-        ] {
-            let _ = s.allowed_transitions();
-            let _ = s.is_terminal();
-            let _ = s.is_active();
+        ];
+        for s in states {
+            let allowed = s.allowed_transitions();
+            if s.is_terminal() {
+                assert!(
+                    allowed.is_empty(),
+                    "{s:?} is terminal but declares successors {allowed:?}"
+                );
+            } else {
+                assert!(
+                    !allowed.is_empty(),
+                    "{s:?} is non-terminal but declares no successor"
+                );
+            }
+            // A self-hop is always accepted and lands on the same state.
+            let mut m = StateMachine::new(s);
+            assert!(
+                m.transition(s).is_ok(),
+                "{s:?} self-transition must be legal"
+            );
+            assert_eq!(m.state(), s, "self-transition must be idempotent");
+            // Every declared edge is actually traversable by the machine.
+            for to in allowed {
+                let mut m = StateMachine::new(s);
+                assert!(
+                    m.transition(*to).is_ok(),
+                    "declared edge {s:?} -> {to:?} must be accepted"
+                );
+                assert_eq!(m.state(), *to);
+            }
         }
     }
 

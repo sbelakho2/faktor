@@ -28,7 +28,7 @@ use std::sync::Arc;
 use faktor_core::model::ModelCapabilities;
 #[cfg(test)]
 use faktor_provider::egress::PolicyCheckedHttpTransport;
-use faktor_provider::egress::{execute_post_json_with_extras, HttpTransport};
+use faktor_provider::egress::{execute_post_json_with_extras, EgressError, HttpTransport};
 use faktor_provider::transport::{
     guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES, PROVIDER_CEILING_MS,
 };
@@ -145,6 +145,105 @@ fn classify_http_status(status: reqwest::StatusCode, body: String) -> ProviderEr
         _ => ProviderErrorKind::BadRequest,
     };
     ProviderError::with_code(kind, status.as_u16().to_string(), body)
+}
+
+/// Hard bound on one classified error body: `Response::text()` would buffer
+/// a hostile endpoint's unbounded body into RAM, so the classifier reads at
+/// most this many bytes (chunked reads, partial body dropped) and appends a
+/// typed truncation note. The status-derived classification is unaffected.
+pub const OPENAI_ERROR_BODY_MAX_BYTES: usize = 64 * 1024;
+
+/// Await response HEADERS under the stream's existing first-byte deadline
+/// (default 60 s), capped by the overall deadline when the operation set
+/// one. The egress client only bounds connect, so without this a server
+/// that accepts and never answers would pin the stream forever. `0` on both
+/// knobs keeps the historical unbounded behavior, but
+/// [`stream_deadlines`] always starts from the documented defaults.
+fn request_head_timeout_ms(deadlines: StreamDeadlines) -> u64 {
+    match (deadlines.first_byte_ms, deadlines.overall_ms) {
+        (0, 0) => 0,
+        (0, overall) => overall,
+        (first, 0) => first,
+        (first, overall) => first.min(overall),
+    }
+}
+
+/// Execute one stream request, bounding the wait for response headers by
+/// [`request_head_timeout_ms`] (a typed `Timeout` on breach).
+async fn execute_with_head_timeout(
+    fut: impl std::future::Future<Output = Result<reqwest::Response, EgressError>>,
+    deadlines: StreamDeadlines,
+) -> Result<reqwest::Response, ProviderError> {
+    let bound_ms = request_head_timeout_ms(deadlines);
+    if bound_ms == 0 {
+        return fut.await.map_err(ProviderError::from);
+    }
+    match tokio::time::timeout(std::time::Duration::from_millis(bound_ms), fut).await {
+        Ok(result) => result.map_err(ProviderError::from),
+        Err(_) => Err(ProviderError::new(
+            ProviderErrorKind::Timeout,
+            format!("openai response headers exceeded the {bound_ms} ms server bound"),
+        )),
+    }
+}
+
+/// Outcome of one bounded error-body read (never a full materialization).
+enum ErrorBodyRead {
+    /// Complete body within the byte cap.
+    Complete(Vec<u8>),
+    /// The byte cap was reached; the rest of the body is dropped.
+    Truncated(Vec<u8>),
+    /// No complete read inside the wall-clock bound.
+    Stalled,
+}
+
+/// Read an error body under a hard BYTE cap and a wall-clock bound: chunked
+/// reads only, at most `cap` bytes retained (the rest is dropped, never
+/// buffered), and a typed note appended when the body was truncated or the
+/// read stalled. The HTTP status still classifies the error.
+async fn read_error_body_bounded(mut resp: reqwest::Response, cap: usize, bound_ms: u64) -> String {
+    let read = async {
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    if out.len().saturating_add(chunk.len()) > cap {
+                        let keep = cap.saturating_sub(out.len());
+                        out.extend_from_slice(&chunk[..keep]);
+                        return ErrorBodyRead::Truncated(out);
+                    }
+                    out.extend_from_slice(&chunk);
+                }
+                Ok(None) | Err(_) => return ErrorBodyRead::Complete(out),
+            }
+        }
+    };
+    let outcome = if bound_ms == 0 {
+        read.await
+    } else {
+        match tokio::time::timeout(std::time::Duration::from_millis(bound_ms), read).await {
+            Ok(outcome) => outcome,
+            Err(_) => ErrorBodyRead::Stalled,
+        }
+    };
+    let (mut text, note) = match outcome {
+        ErrorBodyRead::Complete(bytes) => (String::from_utf8_lossy(&bytes).into_owned(), None),
+        ErrorBodyRead::Truncated(bytes) => (
+            String::from_utf8_lossy(&bytes).into_owned(),
+            Some(format!("[truncated at {cap} bytes]")),
+        ),
+        ErrorBodyRead::Stalled => (
+            String::new(),
+            Some(format!("[body read exceeded the {bound_ms} ms bound]")),
+        ),
+    };
+    if let Some(note) = note {
+        if !text.is_empty() && !text.ends_with(' ') {
+            text.push(' ');
+        }
+        text.push_str(&note);
+    }
+    text
 }
 
 pub struct OpenAiProvider {
@@ -598,19 +697,27 @@ pub fn responses_stream(
         async move {
             let (mut lines, mut pending, mut calls, mut finished) = match stage {
                 Stage::Fresh => {
-                    let resp = execute_post_json_with_extras(
-                        transport.as_ref(),
-                        &url,
-                        headers,
-                        &[],
-                        &body,
+                    let resp = execute_with_head_timeout(
+                        execute_post_json_with_extras(
+                            transport.as_ref(),
+                            &url,
+                            headers,
+                            &[],
+                            &body,
+                        ),
+                        deadlines,
                     )
                     .await;
                     match resp {
                         Ok(r) => {
                             let status = r.status();
                             if !status.is_success() {
-                                let msg = r.text().await.unwrap_or_default();
+                                let msg = read_error_body_bounded(
+                                    r,
+                                    OPENAI_ERROR_BODY_MAX_BYTES,
+                                    request_head_timeout_ms(deadlines),
+                                )
+                                .await;
                                 return Some((Err(classify_http_status(status, msg)), Stage::Done));
                             }
                             let lines: LineStream = Box::pin(guarded_lines(
@@ -621,7 +728,7 @@ pub fn responses_stream(
                             (lines, std::collections::VecDeque::new(), Vec::new(), false)
                         }
                         Err(e) => {
-                            return Some((Err(ProviderError::from(e)), Stage::Done));
+                            return Some((Err(e), Stage::Done));
                         }
                     }
                 }
@@ -1203,19 +1310,27 @@ pub fn openai_stream(
             // Lazily send the request on the first poll.
             let (mut lines, mut accs, mut pending) = match stage {
                 Stage::Fresh => {
-                    let resp = execute_post_json_with_extras(
-                        transport.as_ref(),
-                        &url,
-                        headers,
-                        &extra_headers,
-                        &body,
+                    let resp = execute_with_head_timeout(
+                        execute_post_json_with_extras(
+                            transport.as_ref(),
+                            &url,
+                            headers,
+                            &extra_headers,
+                            &body,
+                        ),
+                        deadlines,
                     )
                     .await;
                     match resp {
                         Ok(r) => {
                             let status = r.status();
                             if !status.is_success() {
-                                let text = r.text().await.unwrap_or_default();
+                                let text = read_error_body_bounded(
+                                    r,
+                                    OPENAI_ERROR_BODY_MAX_BYTES,
+                                    request_head_timeout_ms(deadlines),
+                                )
+                                .await;
                                 return Some((
                                     Err(classify_http_status(status, text)),
                                     Stage::Done,
@@ -1229,7 +1344,7 @@ pub fn openai_stream(
                             (lines, Vec::new(), std::collections::VecDeque::new())
                         }
                         Err(e) => {
-                            return Some((Err(ProviderError::from(e)), Stage::Done));
+                            return Some((Err(e), Stage::Done));
                         }
                     }
                 }
@@ -3623,5 +3738,91 @@ mod tests {
                 ),
             ]
         }
+    }
+
+    /// A raw HTTP/1.1 server that reads the request head, writes `head`
+    /// (empty = never answer headers), streams `body_prefix` bytes, then
+    /// stalls with the connection open — proving reads are wall-clock and
+    /// byte bounded instead of hanging or buffering.
+    async fn stalling_http_server(head: &'static str, body_prefix: usize) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            if !head.is_empty() {
+                let _ = socket.write_all(head.as_bytes()).await;
+            }
+            if body_prefix > 0 {
+                let chunk = vec![b'x'; body_prefix];
+                let _ = socket.write_all(&chunk).await;
+                let _ = socket.flush().await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn error_path_provider(base: String) -> Arc<dyn Provider> {
+        OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None))
+    }
+
+    #[tokio::test]
+    async fn oversize_error_body_is_capped_and_the_status_still_classifies() {
+        let head = "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 1048576\r\n\r\n";
+        let base = stalling_http_server(head, 256 * 1024).await;
+        let mut stream = error_path_provider(base).stream(req("m"));
+        let started = std::time::Instant::now();
+        let item = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("a bounded error-body read must not hang")
+            .expect("exactly one error item");
+        let err = item.expect_err("a 500 must surface as an error");
+        assert_eq!(err.kind, ProviderErrorKind::Server, "{err:?}");
+        assert!(err.message.contains("truncated"), "{}", err.message);
+        assert!(
+            err.message.len() <= OPENAI_ERROR_BODY_MAX_BYTES + 128,
+            "error body kept {} bytes past the cap",
+            err.message.len()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+    }
+
+    #[tokio::test]
+    async fn stalled_error_body_is_bounded_by_the_wall_clock_read_bound() {
+        let head = "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 999\r\n\r\n";
+        let base = stalling_http_server(head, 0).await;
+        let mut request = req("m");
+        request.meta.deadline_ms = 250;
+        let mut stream = error_path_provider(base).stream(request);
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next())
+            .await
+            .expect("a stalled error body must not hang")
+            .expect("one item")
+            .expect_err("429 must surface");
+        assert_eq!(err.kind, ProviderErrorKind::RateLimited, "{err:?}");
+        assert!(err.message.contains("exceeded"), "{}", err.message);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_headers_is_a_typed_timeout() {
+        let base = stalling_http_server("", 0).await;
+        let mut request = req("m");
+        request.meta.deadline_ms = 250;
+        let mut stream = error_path_provider(base).stream(request);
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next())
+            .await
+            .expect("a header stall must not hang")
+            .expect("one item")
+            .expect_err("no response headers is an error");
+        assert_eq!(err.kind, ProviderErrorKind::Timeout, "{err:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }

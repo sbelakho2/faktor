@@ -308,11 +308,17 @@ impl WebhookSink for ScmDaemon {
         headers: &WebhookHeaders,
         body: &[u8],
     ) -> Result<IngestOutcome, WebhookError> {
-        let outcome = self.inbox.ingest(headers, body, SystemClock.now_ms())?;
-        let request = match installation_of(body) {
-            Some(id) => SyncRequest::Installation(ScmInstallationId::new(id)),
+        let now_ms = SystemClock.now_ms();
+        // Authenticate FIRST (signature/replay/bounds), then validate the
+        // payload, then claim: a forged delivery is never influenced by the
+        // body, and a signed-but-malformed payload is refused before any
+        // durable write or queue enqueue.
+        self.inbox.verify(headers, body, now_ms)?;
+        let request = match faktor_scm::installation_of(body)? {
+            Some(id) => SyncRequest::Installation(id),
             None => SyncRequest::All,
         };
+        let outcome = self.inbox.ingest(headers, body, now_ms)?;
         // A duplicate delivery still enqueues the (idempotent) sync: a
         // redelivery after a saturated queue must not lose its sync, and the
         // upserts converge instead of duplicating.
@@ -321,12 +327,6 @@ impl WebhookSink for ScmDaemon {
         })?;
         Ok(outcome)
     }
-}
-
-/// The installation id a webhook payload names (`installation.id`), if any.
-fn installation_of(body: &[u8]) -> Option<u64> {
-    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
-    json.get("installation")?.get("id")?.as_u64()
 }
 
 #[cfg(test)]

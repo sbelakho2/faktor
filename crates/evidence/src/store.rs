@@ -36,6 +36,15 @@ pub enum EvidenceAccessScope {
     /// task-less envelope is shared session/workspace context, visible to
     /// every task of the scope).
     Task(faktor_core::id::TaskId),
+    /// A caller named task id 0 — which can never be a durable task (zero is
+    /// rejected by every id constructor). Only the historic
+    /// [`EvidenceAccessContext::new`] compatibility constructor can produce
+    /// this scope, and it authorizes NOTHING: every comparison denies, so a
+    /// hostile zero can never panic the API boundary and can never be
+    /// remapped onto another identity. Production paths use
+    /// [`EvidenceAccessContext::try_new`], which refuses zero with a typed
+    /// error at construction.
+    InvalidTaskZero,
     /// The authenticated session administrator: sees every task of the
     /// session/workspace. Only an authenticated UI may request this.
     SessionAdmin,
@@ -79,8 +88,18 @@ impl EvidenceAccessContext {
     /// `Some(task)` is the task scope; `None` maps to the EXPLICIT admin
     /// scope (a caller asking for no task boundary must mean admin, never an
     /// accidental wildcard). Production runtime paths use [`Self::for_task`].
+    ///
+    /// A zero task id is NOT a panic and NOT a remap: `Some(0)` yields
+    /// [`EvidenceAccessScope::InvalidTaskZero`], a scope that authorizes
+    /// nothing. The fallible [`Self::try_new`] refuses it with a typed
+    /// [`EvidenceError::Malformed`] instead.
     pub const fn new(session_id: u64, workspace_id: u64, task_id: Option<u64>) -> Self {
         match task_id {
+            Some(0) => Self::scoped(
+                session_id,
+                workspace_id,
+                EvidenceAccessScope::InvalidTaskZero,
+            ),
             Some(task) => Self::scoped(
                 session_id,
                 workspace_id,
@@ -88,6 +107,26 @@ impl EvidenceAccessContext {
             ),
             None => Self::admin(session_id, workspace_id),
         }
+    }
+
+    /// Fallible construction for untrusted/hostile task ids: `Some(0)` is a
+    /// typed [`EvidenceError::Malformed`] naming the task id, never a panic
+    /// and never a silent remap. `None` is the explicit admin scope; every
+    /// non-zero id is the exact task scope.
+    pub fn try_new(
+        session_id: u64,
+        workspace_id: u64,
+        task_id: Option<u64>,
+    ) -> Result<Self, EvidenceError> {
+        let scope = match task_id {
+            Some(task) => {
+                EvidenceAccessScope::Task(faktor_core::id::TaskId::try_from(task).map_err(|e| {
+                    EvidenceError::Malformed(format!("evidence access task id: {e}"))
+                })?)
+            }
+            None => EvidenceAccessScope::SessionAdmin,
+        };
+        Ok(Self::scoped(session_id, workspace_id, scope))
     }
 
     /// The declared scope of this context.
@@ -167,6 +206,8 @@ fn ensure_scope(env: &EvidenceEnvelope, ctx: &EvidenceAccessContext) -> Result<(
             .task_id
             .map(|env_task| env_task == task.raw())
             .unwrap_or(true),
+        // A zero task id names nothing: no envelope is ever visible.
+        EvidenceAccessScope::InvalidTaskZero => false,
         EvidenceAccessScope::SessionAdmin => true,
     };
     if session_ok && workspace_ok && task_ok {
@@ -700,7 +741,7 @@ impl<'a> DurableEvidenceStore<'a> {
     ) -> Result<EvidenceEnvelope, EvidenceError> {
         let digest = blake3::hash(raw.as_bytes());
         let digest_hex = hex(digest.as_bytes());
-        let ctx = EvidenceAccessContext::new(session_id.raw(), workspace_id.raw(), task_id);
+        let ctx = EvidenceAccessContext::try_new(session_id.raw(), workspace_id.raw(), task_id)?;
         if let Some(existing) =
             self.find_scoped_by_backing(&digest_hex, kind, source_revision, &ctx)?
         {
@@ -1375,6 +1416,74 @@ mod tests {
         assert_eq!(store.len(), 2);
         assert!(!store.is_empty());
         assert!(store.contains(EvidenceId(8)));
+    }
+
+    #[test]
+    fn zero_task_id_is_refused_never_panics_never_remaps() {
+        // The legacy Option<u64> constructor must not panic on Some(0): it
+        // yields the structurally inert scope.
+        let zero = EvidenceAccessContext::new(1, 2, Some(0));
+        assert_eq!(zero.scope(), EvidenceAccessScope::InvalidTaskZero);
+        // Zero is NOT remapped onto identity 1 (or any other identity): a
+        // stored envelope whose task is 1 stays invisible.
+        let mut store = MemoryEvidenceStore::new(64);
+        store
+            .insert(
+                envelope(
+                    1,
+                    1,
+                    2,
+                    Some(1),
+                    Compressibility::Aggressive,
+                    BackingCompleteness::Complete,
+                ),
+                None,
+            )
+            .unwrap();
+        let err = store.get_scoped(EvidenceId(1), &zero).unwrap_err();
+        assert!(matches!(err, EvidenceError::AccessDenied(_)), "{err:?}");
+        // Even a task-less envelope is not visible to an invalid scope.
+        store
+            .insert(
+                envelope(
+                    2,
+                    1,
+                    2,
+                    None,
+                    Compressibility::Aggressive,
+                    BackingCompleteness::Complete,
+                ),
+                None,
+            )
+            .unwrap();
+        assert!(store.get_scoped(EvidenceId(2), &zero).is_err());
+        assert!(store.list_scoped_envelopes(&zero, 16).is_empty());
+
+        // The fallible constructor refuses zero with a typed Malformed that
+        // names the task field; valid values are unchanged.
+        let err = EvidenceAccessContext::try_new(1, 2, Some(0)).unwrap_err();
+        assert!(
+            matches!(&err, EvidenceError::Malformed(m) if m.contains("task")),
+            "{err:?}"
+        );
+        assert_eq!(
+            EvidenceAccessContext::try_new(1, 2, Some(3)).unwrap(),
+            EvidenceAccessContext::for_task(1, 2, faktor_core::id::TaskId::new(3))
+        );
+        assert_eq!(
+            EvidenceAccessContext::try_new(1, 2, None).unwrap(),
+            EvidenceAccessContext::admin(1, 2)
+        );
+        assert_eq!(
+            EvidenceAccessContext::try_new(1, 2, Some(3)).unwrap(),
+            EvidenceAccessContext::new(1, 2, Some(3))
+        );
+        assert_eq!(
+            EvidenceAccessContext::try_new(1, 2, Some(u64::MAX))
+                .unwrap()
+                .scope(),
+            EvidenceAccessContext::new(1, 2, Some(u64::MAX)).scope()
+        );
     }
 
     #[test]

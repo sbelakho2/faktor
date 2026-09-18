@@ -52,6 +52,8 @@ use faktor_core::error::Error;
 
 mod ledger;
 
+#[cfg(all(unix, test))]
+pub(crate) use ledger::REAP_MARKER_FILE;
 pub use ledger::{
     Reconciliation, TerminalDisposition, TerminalLedger, TerminalLost, MAX_LEDGER_BYTES,
     MAX_LEDGER_LINES, MAX_OWNER_BYTES,
@@ -231,6 +233,9 @@ pub fn group_exists(pgid: u32) -> bool {
     if pgid == 0 || pgid > i32::MAX as u32 {
         return false;
     }
+    // SAFETY: `pgid` was validated above (non-zero, within `pid_t` range),
+    // so the negation cannot overflow; signal 0 only probes group existence
+    // and never delivers a signal.
     let r = unsafe { libc::kill(-(pgid as libc::pid_t), 0) };
     if r == 0 {
         return true;
@@ -267,12 +272,22 @@ fn linux_start_time(pid: u32) -> Option<u64> {
     }
     path[at..at + 5].copy_from_slice(b"/stat");
 
+    // SAFETY: `path` is a NUL-terminated byte buffer built above from the
+    // fixed `/proc/` prefix, decimal pid digits and `/stat` (no interior
+    // NUL), and it outlives the call. `O_CLOEXEC` keeps the fd out of any
+    // exec; a negative return is handled by the caller.
     let fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
     if fd < 0 {
         return None;
     }
     let mut buf = [0u8; 1024];
+    // SAFETY: `fd` is a valid open descriptor (checked above) and `buf` is a
+    // live stack array for exactly `buf.len()` bytes, so the kernel writes
+    // stay inside the allocation; a non-positive return is rejected below.
     let read = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    // SAFETY: `fd` is owned by this function (returned by `open` above and
+    // not used again), so closing it exactly once is required and cannot
+    // double-close another thread's descriptor.
     unsafe {
         libc::close(fd);
     }
@@ -311,8 +326,15 @@ fn linux_start_time(pid: u32) -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn macos_start_time(pid: u32) -> Option<u64> {
+    // SAFETY: `proc_bsdinfo` is a plain C POD struct whose all-zero bit
+    // pattern is a valid initial value; the kernel fills it via
+    // `proc_pidinfo` before any field is read (and the size check below
+    // rejects a partial fill).
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a live, correctly sized `proc_bsdinfo` and `size`
+    // reports exactly that size, so the kernel writes stay inside the
+    // struct; `pid` is only a scalar argument that the kernel validates.
     let r = unsafe {
         libc::proc_pidinfo(
             pid as libc::c_int,
@@ -335,10 +357,16 @@ fn macos_start_time(pid: u32) -> Option<u64> {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn raw_errno() -> i32 {
     #[cfg(target_os = "linux")]
+    // SAFETY: `__errno_location` returns this thread's live errno slot
+    // pointer for the whole thread lifetime; the immediate read cannot race
+    // another thread (errno is thread-local), and the pointer is non-null.
     unsafe {
         *libc::__errno_location()
     }
     #[cfg(target_os = "macos")]
+    // SAFETY: `__error` returns this thread's live errno slot pointer for the
+    // whole thread lifetime; the immediate read cannot race another thread
+    // (errno is thread-local), and the pointer is non-null.
     unsafe {
         *libc::__error()
     }
@@ -380,17 +408,31 @@ impl GuardianHandle {
     /// supervised children) can inherit the pipe and mask daemon death.
     pub fn spawn(identity: ProcessIdentity) -> Result<Self, Error> {
         let mut fds = [0i32; 2];
+        // SAFETY: `fds` is a live two-element array; `pipe` writes exactly
+        // both descriptors on success, and any non-zero return is refused
+        // before the values are read.
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return Err(Error::internal("guardian pipe failed"));
         }
         for fd in fds {
+            // SAFETY: `fd` is a descriptor returned by the successful `pipe`
+            // above; `F_SETFD` with `FD_CLOEXEC` cannot invalidate it, and
+            // the (ignored) failure only means another close-on-exec race we
+            // do not rely on — fork below does not exec.
             unsafe {
                 libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
         }
+        // SAFETY: called from the runtime with no other guard: the child
+        // branch (pid == 0) touches only the raw syscalls of `guardian_main`
+        // — no allocation, locks, or Rust runtime state — then `_exit`s, so
+        // the classic fork+threads hazards (deadlocks in malloc/at-fork
+        // handlers) do not apply. A negative return is handled below.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             for fd in fds {
+                // SAFETY: both descriptors belong to this failed spawn (the
+                // fork did not happen), so each is closed exactly once here.
                 unsafe {
                     libc::close(fd);
                 }
@@ -399,16 +441,27 @@ impl GuardianHandle {
         }
         if pid == 0 {
             // Guardian child: never runs another line of shared Rust state.
+            // SAFETY: in the child, `fds[1]` (the write end) is a valid
+            // inherited descriptor owned by this process; closing it is
+            // async-signal-safe and required so the guardian cannot keep the
+            // control pipe alive.
             unsafe {
                 libc::close(fds[1]);
             }
             guardian_main(fds[0], identity);
         }
+        // SAFETY: in the parent, `fds[0]` (the read end) is a valid
+        // descriptor owned by this process; it is closed exactly once and
+        // never used again (the child inherited its own copy).
         unsafe {
             libc::close(fds[0]);
         }
         Ok(Self {
             pid,
+            // SAFETY: `fds[1]` is the pipe write end created above, still
+            // open and owned by nothing else (the child closed its inherited
+            // copy in its own address space); `OwnedFd` takes sole ownership
+            // and closes it exactly once on drop.
             control: Some(unsafe { OwnedFd::from_raw_fd(fds[1]) }),
             reaped: false,
         })
@@ -438,6 +491,9 @@ impl GuardianHandle {
         let deadline = Instant::now() + Duration::from_millis(GUARDIAN_REAP_MS);
         loop {
             let mut status = 0;
+            // SAFETY: `self.pid` is our own forked child (fork returned it
+            // and no wait has consumed it: `reaped` guards re-entry), and
+            // `status` is a live stack slot. WNOHANG never blocks.
             let r = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
             if r == self.pid {
                 self.reaped = true;
@@ -455,10 +511,16 @@ impl GuardianHandle {
             if Instant::now() >= deadline {
                 // Still our child after the bound: a wedged guardian is
                 // killed and reaped (safe — waitpid proved it is ours).
+                // SAFETY: the preceding waitpid did not report ECHILD, so
+                // `self.pid` is still our child (not a recycled pid); SIGKILL
+                // to a real child cannot affect any other process.
                 unsafe {
                     libc::kill(self.pid, libc::SIGKILL);
                 }
                 let mut status = 0;
+                // SAFETY: `self.pid` is still our child (just signaled) and
+                // `status` is a live stack slot; the blocking wait reaps it
+                // so no zombie is left behind.
                 let _ = unsafe { libc::waitpid(self.pid, &mut status, 0) };
                 self.reaped = true;
                 return None;
@@ -470,6 +532,9 @@ impl GuardianHandle {
     /// Bounded liveness poll for a reparented guardian; never signals.
     fn poll_reparented_gone(&self) {
         let deadline = Instant::now() + Duration::from_millis(GUARDIAN_REAP_MS);
+        // SAFETY: signal 0 only probes liveness and never delivers a signal;
+        // a zero return means the (possibly recycled) id exists, which only
+        // extends the bounded poll — no kill is ever issued here.
         while unsafe { libc::kill(self.pid, 0) } == 0 {
             if Instant::now() >= deadline {
                 return;
@@ -497,6 +562,14 @@ fn exit_code_of(status: i32) -> Option<i32> {
 /// `fork()` from a possibly multithreaded process, so it may call raw
 /// syscalls only (no allocation, no locks, no Rust runtime).
 fn guardian_main(read_fd: RawFd, identity: ProcessIdentity) -> ! {
+    // SAFETY (single raw-syscall block): this body is reachable ONLY in the
+    // post-fork child, which inherits no locks and uses no allocation, so the
+    // process is effectively single-threaded and no syscall here can
+    // deadlock on shared Rust state. `read_fd` is the control pipe's read end
+    // inherited across fork (valid by construction); every other fd/literal
+    // argument is either produced by a checked syscall inside this block or a
+    // constant, and every result is checked before use — failure paths
+    // `_exit` instead of unwinding.
     unsafe {
         // Detach from the daemon's session/process group: a group signal
         // aimed at the daemon must not take the guardian down before it can

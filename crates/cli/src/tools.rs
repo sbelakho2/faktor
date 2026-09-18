@@ -2276,6 +2276,15 @@ mod tests {
             search_tool(),
             run_command_tool(),
         ] {
+            // Two asserted invariants per tool: no hostile shape is ever
+            // ACCEPTED (Ok would mean fabricated work), and the shape/type
+            // violations are caught by the typed arg parser (at least one
+            // Malformed per tool), not merely by some incidental later
+            // failure. A deserializable-but-harmless shape may still fail
+            // later with another typed kind (e.g. NotFound for a path that
+            // does not exist) — that is evidence of no effect, not of
+            // validation, which the Malformed check pins separately.
+            let mut saw_malformed = false;
             for args in [
                 serde_json::json!({}),
                 serde_json::json!({"path": 42}),
@@ -2284,8 +2293,35 @@ mod tests {
                 serde_json::json!({"path": "x", "content": 7}),
                 serde_json::json!({"command": 7}),
             ] {
-                let _ = (tool.clone().execute)(ctx(&f), args).await;
+                match (tool.clone().execute)(ctx(&f), args.clone()).await {
+                    Err(err) => {
+                        // Every refusal is one of the engine's typed kinds
+                        // and explains itself; a panic-free but untyped
+                        // failure would not pass.
+                        assert!(!err.message.is_empty(), "{} {args}: empty error", tool.name);
+                        assert!(
+                            matches!(
+                                err.kind,
+                                ErrorKind::Malformed
+                                    | ErrorKind::Permission
+                                    | ErrorKind::Oversized
+                                    | ErrorKind::Internal
+                                    | ErrorKind::NotFound
+                            ),
+                            "{} {args}: unexpected kind {:?}",
+                            tool.name,
+                            err.kind
+                        );
+                        saw_malformed |= err.kind == ErrorKind::Malformed;
+                    }
+                    Ok(value) => panic!("{} accepted hostile args {args}: {value:?}", tool.name),
+                }
             }
+            assert!(
+                saw_malformed,
+                "{} must reject arg shape/type violations as Malformed",
+                tool.name
+            );
         }
     }
 

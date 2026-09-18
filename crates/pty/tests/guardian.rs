@@ -77,6 +77,24 @@ fn simulated_daemon_helper() {
             "report pids"
         );
     }
+    // The parent cannot prove "the group was alive at crash time" by looking
+    // after the fact: the guardian can settle the group before the test
+    // thread is scheduled again. The proof is taken HERE, synchronously,
+    // immediately before the simulated crash: both the leader and the
+    // grandchild must be signallable right now. On failure the helper does
+    // not SIGKILL itself, so the test's daemon-was-SIGKILLed assertion fails.
+    unsafe {
+        assert_eq!(
+            libc::kill(pty.pid() as i32, 0),
+            0,
+            "the pty leader must be alive at crash time"
+        );
+        assert_eq!(
+            libc::kill(grandchild, 0),
+            0,
+            "the grandchild must be alive at crash time"
+        );
+    }
     if let Ok(hold_ms) = std::env::var("FAKTOR_PTY_SIM_HOLD_MS") {
         // Control mode: stay alive (holding the control pipe) until the
         // parent SIGKILLs this process.
@@ -99,12 +117,39 @@ fn parse_report(line: &str) -> (i32, i32) {
     (leader, grandchild)
 }
 
+/// Is the recorded process group still a settle-relevant entity?
+///
+/// `kill(-pgid, 0)` semantics: `0` means a member exists; `EPERM` ALSO means
+/// a member exists — on Darwin a group holding only unreaped zombies answers
+/// `EPERM`, so treating that as "gone" would let a waiter observe a settled
+/// group while a member is still unreaped (and reconciliation would then
+/// classify the survivor as `StillAlive`). Only `ESRCH` proves the group has
+/// no member left, live or zombie.
 fn group_alive(pgid: i32) -> bool {
-    unsafe { libc::kill(-pgid, 0) == 0 }
+    if unsafe { libc::kill(-pgid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Same probe semantics for one pid: `EPERM` is "exists, not ours to signal"
+/// — a live target, never a settled one.
 fn pid_alive(pid: i32) -> bool {
-    unsafe { libc::kill(pid, 0) == 0 }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Wait until the process group has NO member left — live or unreaped zombie.
+/// The only observable that authorizes "settled" is `ESRCH`; the bound is an
+/// explicit generous deadline for a wedged guardian, not a sleep to outlast.
+fn wait_group_settled(leader: i32, bound: Duration, what: &str) {
+    let deadline = Instant::now() + bound;
+    while group_alive(leader) {
+        assert!(Instant::now() < deadline, "{what} within {bound:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Bounded read of one `\n`-terminated line from `fd` (poll + read; never
@@ -190,25 +235,18 @@ fn daemon_crash_kills_the_whole_pty_group_and_leaves_no_zombie() {
         .expect("the simulated daemon reports its pids");
     let (leader, grandchild) = parse_report(&line);
     assert!(leader > 0 && grandchild > 0);
-    // The grandchild is in the leader's session/group (setsid leader).
-    assert!(
-        pid_alive(grandchild),
-        "the grandchild must exist when the daemon dies"
-    );
+    // Liveness at crash time is proven inside the helper, immediately before
+    // it SIGKILLs itself (the parent cannot observe that instant reliably).
     let status = daemon.wait().expect("reap the simulated daemon");
     assert_eq!(status.signal(), Some(libc::SIGKILL), "daemon was SIGKILLed");
     // The daemon is gone; the detached session must not outlive it. The
-    // guardian SIGKILLs the recorded group at control-pipe EOF.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while group_alive(leader) || pid_alive(grandchild) {
-        assert!(
-            Instant::now() < deadline,
-            "guardian must kill the whole pty group within the bound"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    // kill(-pgid, 0) succeeds for a ZOMBIE too: ESRCH proves no member —
-    // live or zombie — remains.
+    // guardian SIGKILLs the recorded group at control-pipe EOF. Settled =
+    // ESRCH for the whole group (no live and no unreaped member).
+    wait_group_settled(
+        leader,
+        Duration::from_secs(10),
+        "guardian must kill the whole pty group",
+    );
     unsafe {
         assert_eq!(libc::kill(-leader, 0), -1);
         assert_eq!(
@@ -233,12 +271,13 @@ fn restart_reconciliation_reports_the_lost_terminal_typed_and_never_kills() {
     let status = daemon.wait().expect("reap the simulated daemon");
     assert_eq!(status.signal(), Some(libc::SIGKILL));
     // Wait for the guardian to settle the group, so the restart sees a
-    // terminal that is gone (never a recycled pid).
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while group_alive(leader) {
-        assert!(Instant::now() < deadline, "guardian settles the group");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // terminal that is gone (never a recycled pid): the group probe must
+    // reach ESRCH — zombies included — before reconciliation is meaningful.
+    wait_group_settled(
+        leader,
+        Duration::from_secs(10),
+        "guardian settles the group",
+    );
     // Restarted daemon: open the same durable ledger and reconcile.
     let ledger = TerminalLedger::open(dir.path()).expect("restart ledger open");
     let report = ledger.reconcile().expect("reconcile");
@@ -280,14 +319,11 @@ fn a_healthy_daemon_does_not_trigger_the_guardian() {
         libc::kill(daemon.id() as i32, libc::SIGKILL);
     }
     let _ = daemon.wait();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while group_alive(leader) {
-        assert!(
-            Instant::now() < deadline,
-            "guardian settles after the crash"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_group_settled(
+        leader,
+        Duration::from_secs(10),
+        "guardian settles after the crash",
+    );
 }
 
 #[test]
@@ -298,21 +334,18 @@ fn daemon_group_kill_does_not_take_the_guardian_with_it() {
     let (report, mut daemon) = spawn_simulated_daemon(None, None, true);
     let line = read_line(report.as_raw_fd(), Duration::from_secs(30))
         .expect("the simulated daemon reports its pids");
-    let (leader, grandchild) = parse_report(&line);
+    let (leader, _grandchild) = parse_report(&line);
     let daemon_pgid = daemon.id() as i32;
     unsafe {
         libc::kill(-daemon_pgid, libc::SIGKILL);
     }
     let status = daemon.wait().expect("reap the simulated daemon");
     assert_eq!(status.signal(), Some(libc::SIGKILL));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while group_alive(leader) || pid_alive(grandchild) {
-        assert!(
-            Instant::now() < deadline,
-            "the detached guardian must still kill the pty group"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_group_settled(
+        leader,
+        Duration::from_secs(10),
+        "the detached guardian must still kill the pty group",
+    );
     unsafe {
         assert_eq!(libc::kill(-leader, 0), -1);
         assert_eq!(

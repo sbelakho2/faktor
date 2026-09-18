@@ -3135,7 +3135,17 @@ pub(crate) fn validate_integration_txn(row: &IntegrationTxnRow) -> Result<(), Se
 }
 
 fn check_payload_bytes(payload: &LedgerPayload) -> Result<(), SessionError> {
-    let bytes = json_bytes(&serde_json::to_value(payload).unwrap_or_default());
+    // Never `unwrap_or_default()` here: a defaulted value would be `Null`
+    // (4 bytes) and silently BYPASS the bound this check exists to enforce.
+    // The payload is an in-process typed value; a serialization failure is an
+    // internal invariant break and must refuse the entry loudly.
+    let value = serde_json::to_value(payload).map_err(|e| {
+        SessionError::Internal(format!(
+            "ledger payload of kind {} cannot be serialized for the bound check: {e}",
+            entry_tag_of(payload)
+        ))
+    })?;
+    let bytes = json_bytes(&value);
     if bytes > MAX_LEDGER_ENTRY_BYTES {
         return Err(SessionError::Oversized(format!(
             "ledger entry payload of {bytes} bytes exceeds MAX_LEDGER_ENTRY_BYTES"

@@ -42,23 +42,24 @@ fn webhook_disabled() -> ApiError {
 
 /// Map one typed webhook refusal onto the frozen API error surface. A
 /// verification refusal is an authentication failure (the signature IS the
-/// credential); store unavailability is retryable so the provider
-/// redelivers.
+/// credential); a malformed payload is a terminal client error; store
+/// unavailability is retryable so the provider redelivers. Retryability is
+/// taken from the typed error itself, never re-derived here.
 fn webhook_err(e: WebhookError) -> ApiError {
-    let (code, http_status, retryable) = match &e {
-        WebhookError::BodyTooLarge => ("payload_too_large", 413, false),
+    let (code, http_status) = match &e {
+        WebhookError::BodyTooLarge => ("payload_too_large", 413),
         WebhookError::MissingSignature
         | WebhookError::MalformedSignature
         | WebhookError::SignatureMismatch
-        | WebhookError::StaleTimestamp => ("scm_webhook_unauthorized", 401, false),
-        WebhookError::MissingDeliveryId => ("malformed", 400, false),
-        WebhookError::Store(_) => ("scm_webhook_unavailable", 503, true),
+        | WebhookError::StaleTimestamp => ("scm_webhook_unauthorized", 401),
+        WebhookError::MissingDeliveryId | WebhookError::MalformedPayload(_) => ("malformed", 400),
+        WebhookError::Store(_) => ("scm_webhook_unavailable", 503),
     };
     ApiError {
         code,
         message: e.to_string(),
         http_status,
-        retryable,
+        retryable: e.retryable(),
     }
 }
 

@@ -56,6 +56,17 @@ pub fn empty_evidence_store() -> EvidenceStoreHandle {
 /// worker-plane listener applies the same bound).
 pub(crate) const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
+/// Typed construction refusal of [`ServerDeps::new`]: the embedded host's
+/// session store carries a degenerate data root, so the daemon-owned shadow
+/// root cannot be derived without a silent fallback to a
+/// process-working-directory-relative path. No such fallback exists — the
+/// host must open its store at an explicit data root.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ServerDepsError {
+    #[error("cannot derive the server shadow root from the session store data root: {0}")]
+    DegenerateShadowRoot(#[from] faktor_orchestrator::runtime::shadow::ShadowRootError),
+}
+
 pub struct ServerDeps {
     pub session: Arc<SessionManager>,
     pub agent: Arc<AgentRuntime>,
@@ -164,25 +175,27 @@ impl ServerDeps {
     /// daemon graph's instances through [`ServerDeps::new_with`], so no
     /// second orchestrator/executor is ever constructed in a daemon
     /// lifetime (audit 12/17).
+    ///
+    /// Fails TYPED when the session store carries a degenerate data root: the
+    /// embedded host carries the SAME isolation authority the daemon graph
+    /// does (the shadow service rooted beside the store's data dir), and the
+    /// root derives from the store's EXPLICIT data root
+    /// (`faktor_store::Store::root`, the directory the store was opened at).
+    /// An empty root would derive the bare relative `shadows` path and
+    /// silently write under the process working directory, so it is a typed
+    /// [`ServerDepsError`] instead — there is NO fallback and no embedded
+    /// host or test can inherit a shared `/tmp/faktor-shadows` production
+    /// path.
     pub fn new(
         session: Arc<SessionManager>,
         agent: Arc<AgentRuntime>,
         permissions: Arc<ChannelPermissionRequester>,
-    ) -> Self {
+    ) -> Result<Self, ServerDepsError> {
         let orchestrator =
             faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
-        // The embedded host carries the SAME isolation authority the daemon
-        // graph does: the shadow service rooted beside the store's data dir.
-        // Mutating runs therefore always execute in an isolated candidate —
-        // there is no no-shadow production constructor.
-        let shadows_root = session
-            .store()
-            .path()
-            .parent()
-            .map(|dir| dir.join("shadows"))
-            .unwrap_or_else(|| std::env::temp_dir().join("faktor-shadows"));
+        let shadows_root = session.store().root().join("shadows");
         let shadows =
-            faktor_orchestrator::runtime::shadow::ShadowRoots::new(session.clone(), shadows_root);
+            faktor_orchestrator::runtime::shadow::ShadowRoots::new(session.clone(), shadows_root)?;
         let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
             &orchestrator,
             session.clone(),
@@ -190,7 +203,14 @@ impl ServerDeps {
             shadows,
         );
         let budgets = faktor_session::DurableBudgetLedger::new(session.clone());
-        Self::new_with(session, agent, permissions, orchestrator, tasks, budgets)
+        Ok(Self::new_with(
+            session,
+            agent,
+            permissions,
+            orchestrator,
+            tasks,
+            budgets,
+        ))
     }
 
     /// Assemble the server surface over GRAPH-PROVIDED runtime authorities
@@ -929,6 +949,46 @@ pub(crate) mod tests {
         (deps, snapshots, fs)
     }
 
+    /// The minimal real agent every test `ServerDeps` carries: text-only
+    /// turns, passthrough routing over the caller's registry.
+    fn test_agent_over(
+        session: Arc<SessionManager>,
+        permissions: Arc<ChannelPermissionRequester>,
+        registry: faktor_provider::ProviderRegistry,
+    ) -> Arc<AgentRuntime> {
+        AgentRuntime::new(faktor_agent::AgentDeps {
+            session,
+            providers: Arc::new(registry),
+            chunk_sink: None,
+            permission_requester: permissions,
+            evidence: Arc::new(faktor_agent::NoEvidence),
+            tools: Arc::new(faktor_agent::ToolRegistry::new()),
+            cas: None,
+            workspaces: faktor_fs::WorkspaceFileService::new(),
+            edit: None,
+            snapshots: None,
+            sandbox: None,
+            supervisor: None,
+            verification: faktor_agent::VerificationService::disabled(),
+            model: "m".into(),
+            compaction_model: None,
+            compact_at_usage: 0.65,
+            instructions: "You are a test server agent.".into(),
+            hooks: None,
+            instructions_resolver: faktor_instructions::no_roots_resolver(),
+            routing: faktor_agent::FixedRoutingPolicy::passthrough(),
+            budgets: Arc::new(faktor_session::NoopBudget),
+            clock: Arc::new(faktor_core::time::SystemClock),
+            tool_call_mode: faktor_agent::ToolCallMode::Native,
+            tool_deadline_ms: 2000,
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
+            semantic: faktor_agent::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
+        })
+        .unwrap()
+    }
+
     pub(crate) fn test_deps(root: &std::path::Path) -> ServerDeps {
         test_deps_with(root, vec![])
     }
@@ -956,37 +1016,7 @@ pub(crate) mod tests {
         }
         let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
-        let agent = AgentRuntime::new(faktor_agent::AgentDeps {
-            session: session.clone(),
-            providers: Arc::new(registry),
-            chunk_sink: None,
-            permission_requester: permissions.clone(),
-            evidence: Arc::new(faktor_agent::NoEvidence),
-            tools: Arc::new(faktor_agent::ToolRegistry::new()),
-            cas: None,
-            workspaces: faktor_fs::WorkspaceFileService::new(),
-            edit: None,
-            snapshots: None,
-            sandbox: None,
-            supervisor: None,
-            verification: faktor_agent::VerificationService::disabled(),
-            model: "m".into(),
-            compaction_model: None,
-            compact_at_usage: 0.65,
-            instructions: "You are a test server agent.".into(),
-            hooks: None,
-            instructions_resolver: faktor_instructions::no_roots_resolver(),
-            routing: faktor_agent::FixedRoutingPolicy::passthrough(),
-            budgets: Arc::new(faktor_session::NoopBudget),
-            clock: Arc::new(faktor_core::time::SystemClock),
-            tool_call_mode: faktor_agent::ToolCallMode::Native,
-            tool_deadline_ms: 2000,
-            retry_policy: faktor_core::retry::RetryPolicy::default(),
-            semantic: faktor_agent::fallback_semantic_registry(),
-            context_prior: None,
-            efficiency: Default::default(),
-        })
-        .unwrap();
+        let agent = test_agent_over(session.clone(), permissions.clone(), registry);
         let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
         ServerDeps {
             budgets: faktor_session::DurableBudgetLedger::new(session.clone()),
@@ -1015,6 +1045,60 @@ pub(crate) mod tests {
             retention: None,
             sso: None,
         }
+    }
+
+    /// Removes the CWD-relative store files an empty-root fixture creates
+    /// (on Unix open handles do not block the unlink; any Windows leftover is
+    /// gitignored debris, never a gate failure).
+    struct CwdStoreFileGuard;
+
+    impl Drop for CwdStoreFileGuard {
+        fn drop(&mut self) {
+            for name in ["faktor-plus.db", "faktor-plus.db-wal", "faktor-plus.db-shm"] {
+                let _ = std::fs::remove_file(name);
+            }
+        }
+    }
+
+    /// Residual: `ServerDeps::new` refuses TYPED on a degenerate empty store
+    /// root. `Store::root()` is the directory the store was opened at, so an
+    /// empty root derives the bare relative `shadows` shadow root; the
+    /// constructor must propagate [`ShadowRootError`] instead of letting a
+    /// later shadow write under the process working directory. There is NO
+    /// silent fallback.
+    #[test]
+    fn server_deps_new_refuses_a_degenerate_empty_store_root_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cleanup = CwdStoreFileGuard;
+        let session = SessionManager::open_quick(std::path::PathBuf::new(), dir.path().join("cas"))
+            .expect("the raw store opens at the degenerate root; the refusal is ServerDeps'");
+        assert!(
+            session.store().root().as_os_str().is_empty(),
+            "fixture must carry the empty data root"
+        );
+        let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
+        let agent = test_agent_over(
+            session.clone(),
+            permissions.clone(),
+            faktor_provider::ProviderRegistry::new(),
+        );
+        match ServerDeps::new(session, agent, permissions) {
+            Err(ServerDepsError::DegenerateShadowRoot(
+                faktor_orchestrator::runtime::shadow::ShadowRootError::DegenerateRoot {
+                    root,
+                    reason,
+                },
+            )) => {
+                assert_eq!(
+                    root,
+                    std::path::PathBuf::from("shadows"),
+                    "the refused root is the derived relative `shadows`"
+                );
+                assert!(reason.contains("unanchored"), "{reason}");
+            }
+            Ok(_) => panic!("a degenerate store root must refuse typed, never fall back"),
+        }
+        drop(cleanup);
     }
 
     // ------------------------------------------------------------------
@@ -1395,7 +1479,7 @@ pub(crate) mod tests {
         .unwrap();
         let manager = session.clone();
         let driver = agent.clone();
-        let deps = ServerDeps::new(session, agent, permissions.clone());
+        let deps = ServerDeps::new(session, agent, permissions.clone()).unwrap();
         let token = deps.auth_token.clone();
         let ws = manager.create_workspace("/tmp").unwrap();
         let created = manager.create_session(ws, "t-drive", "fake", "m").unwrap();
@@ -1529,7 +1613,7 @@ pub(crate) mod tests {
         })
         .unwrap();
         let driver = agent.clone();
-        let deps = ServerDeps::new(session.clone(), agent, permissions.clone());
+        let deps = ServerDeps::new(session.clone(), agent, permissions.clone()).unwrap();
         let token = deps.auth_token.clone();
         let ws = session.create_workspace("/tmp").unwrap();
         let created = session.create_session(ws, "t-prefix", "fake", "m").unwrap();
@@ -4684,9 +4768,9 @@ pub(crate) mod tests {
             // A's provider calls: two completed with prefix observations
             // (cacheable-prefix token columns) + one failed row (NULL
             // counters never count).
-            let op1 = manager.next_op_id();
-            let op2 = manager.next_op_id();
-            let op3 = manager.next_op_id();
+            let op1 = manager.try_next_op_id().unwrap();
+            let op2 = manager.try_next_op_id().unwrap();
+            let op3 = manager.try_next_op_id().unwrap();
             ha.settle_usage_with_prefix(
                 op1,
                 "fake",
@@ -4714,7 +4798,7 @@ pub(crate) mod tests {
             ha.record_provider_call(op3, "fake", "m", "failed", None, None, Some("boom"))
                 .unwrap();
             // B's call: completed WITHOUT a prefix observation.
-            let opb = manager.next_op_id();
+            let opb = manager.try_next_op_id().unwrap();
             hb.settle_usage_with_prefix(
                 opb,
                 "fake",
@@ -4753,7 +4837,7 @@ pub(crate) mod tests {
             };
             store.cost_refund(r2, now + 2).unwrap();
             let faktor_store::CostReserveOutcome::Granted(_r3) = store
-                .cost_reserve(a.id(), ta1, manager.next_op_id(), 200, now)
+                .cost_reserve(a.id(), ta1, manager.try_next_op_id().unwrap(), 200, now)
                 .unwrap()
             else {
                 panic!("reserve r3 must be granted");
@@ -5849,7 +5933,7 @@ pub(crate) mod tests {
             .cost_reserve(
                 s.id(),
                 faktor_core::id::TaskId::new(1),
-                manager.next_op_id(),
+                manager.try_next_op_id().unwrap(),
                 60,
                 now,
             )
@@ -5858,7 +5942,7 @@ pub(crate) mod tests {
             .cost_reserve(
                 s.id(),
                 faktor_core::id::TaskId::new(1),
-                manager.next_op_id(),
+                manager.try_next_op_id().unwrap(),
                 500,
                 now,
             )
@@ -6253,7 +6337,8 @@ pub(crate) mod tests {
             let shadows = faktor_orchestrator::runtime::shadow::ShadowRoots::new(
                 manager.clone(),
                 root.join("shadows"),
-            );
+            )
+            .unwrap();
             faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
                 &orchestrator,
                 manager.clone(),

@@ -184,6 +184,11 @@ mod tests {
         c.cwd = Some("/tmp".into());
         c.env = EnvSpec::Explicit(vec![("PATH".into(), "/usr/bin".into())]);
         assert!(validate_spawn_config(&c).is_ok());
+        // Non-vacuity: the same shape poisoned at one field IS refused with
+        // the exact kind, so `is_ok` above cannot pass on a no-op validator.
+        let mut poisoned = c.clone();
+        poisoned.command.clear();
+        assert_eq!(kind(validate_spawn_config(&poisoned)), ErrorKind::Malformed);
         let mut c = cfg();
         c.env = EnvSpec::toolchain();
         assert!(validate_spawn_config(&c).is_ok());
@@ -192,6 +197,10 @@ mod tests {
         c.rows = 65_535;
         c.cols = 65_535;
         assert!(validate_spawn_config(&c).is_ok());
+        // ...but a NUL anywhere is universally refused, even at that size.
+        let mut poisoned = c.clone();
+        poisoned.args = vec!["bad\0arg".into()];
+        assert_eq!(kind(validate_spawn_config(&poisoned)), ErrorKind::Malformed);
     }
 
     #[test]

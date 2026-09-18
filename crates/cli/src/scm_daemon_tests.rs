@@ -338,6 +338,71 @@ async fn webhook_delivery_resyncs_idempotently_and_bad_signatures_never_claim() 
     run.abort();
 }
 
+#[tokio::test]
+async fn webhook_installation_id_hostile_values_are_refused_before_any_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let payloads = dir.path().join("payloads");
+    stage_payload(&payloads, "app.pem", TEST_PRIVATE_KEY.as_bytes());
+    stage_payload(&payloads, "hook.secret", WEBHOOK_SECRET);
+    let store = Arc::new(SqliteScmStore::open(&store_path(dir.path())).unwrap());
+    let transport =
+        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::with_policy(None));
+    let cfg = github_app_cfg("http://127.0.0.1:9");
+    let daemon = build_scm_daemon(&cfg, dir.path(), store.clone(), transport)
+        .unwrap()
+        .expect("enabled github app builds");
+
+    // Zero / negative / fractional / overflow / non-numeric ids are typed
+    // refusals: no panic, no durable claim, no enqueued sync.
+    for (delivery, body) in [
+        (
+            "d-zero",
+            br#"{"installation":{"id":0},"action":"created"}"#.as_slice(),
+        ),
+        (
+            "d-negative",
+            br#"{"installation":{"id":-1},"action":"created"}"#.as_slice(),
+        ),
+        (
+            "d-fraction",
+            br#"{"installation":{"id":1.5},"action":"created"}"#.as_slice(),
+        ),
+        (
+            "d-overflow",
+            br#"{"installation":{"id":18446744073709551616},"action":"created"}"#.as_slice(),
+        ),
+        (
+            "d-string",
+            br#"{"installation":{"id":"7"},"action":"created"}"#.as_slice(),
+        ),
+    ] {
+        let err = daemon
+            .deliver(&signed_webhook(body, delivery), body)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("installation.id"),
+            "{delivery}: {err}"
+        );
+    }
+    assert!(
+        store.webhook_deliveries(10).unwrap().is_empty(),
+        "malformed payloads must be refused before any durable claim"
+    );
+
+    // A valid id is accepted (including the u64 boundary) and claimed once.
+    let body = br#"{"installation":{"id":7},"action":"created"}"#;
+    let outcome = daemon
+        .deliver(&signed_webhook(body, "d-valid"), body)
+        .unwrap();
+    assert!(matches!(outcome, faktor_scm::IngestOutcome::Accepted(_)));
+    let boundary = br#"{"installation":{"id":18446744073709551615}}"#;
+    let outcome = daemon
+        .deliver(&signed_webhook(boundary, "d-max"), boundary)
+        .unwrap();
+    assert!(matches!(outcome, faktor_scm::IngestOutcome::Accepted(_)));
+    assert_eq!(store.webhook_deliveries(10).unwrap().len(), 2);
+}
+
 /// The optional reconcile timer is strict, normalized-on-disabled and
 /// bounded: a disabled section resolves exactly like the absent one, and a
 /// hostile interval is a load refusal, never a silent clamp.

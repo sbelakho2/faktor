@@ -221,13 +221,26 @@ pub fn assert_candidates_identical(
     criteria: &[Criterion],
 ) -> Result<(), TournamentError> {
     let expected: Vec<String> = criteria.iter().map(|c| c.spec.clone()).collect();
-    let expected_bytes = serde_json::to_vec(&expected).unwrap_or_default();
+    // Canonical byte encoding is the drift authority: an encoding failure
+    // must refuse the whole assertion with a typed error. Defaulting to
+    // empty bytes would let a candidate whose checks ALSO fail to encode
+    // compare "equal" and fan out a divergent spec.
+    let expected_bytes = serde_json::to_vec(&expected).map_err(|e| {
+        TournamentError::InvalidCriterion(format!(
+            "derived criterion specs cannot be canonically encoded: {e}"
+        ))
+    })?;
     let mut first_summary: Option<&str> = None;
     for item in items {
         if item.acceptance_checks != expected {
             return Err(TournamentError::VerificationSpecDrift);
         }
-        let bytes = serde_json::to_vec(&item.acceptance_checks).unwrap_or_default();
+        let bytes = serde_json::to_vec(&item.acceptance_checks).map_err(|e| {
+            TournamentError::InvalidCriterion(format!(
+                "candidate item {} acceptance checks cannot be canonically encoded: {e}",
+                item.id
+            ))
+        })?;
         if bytes != expected_bytes {
             return Err(TournamentError::VerificationSpecDrift);
         }

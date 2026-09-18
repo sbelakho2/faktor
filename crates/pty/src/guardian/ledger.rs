@@ -5,7 +5,10 @@
 //! session-owned terminal spawn appends one bounded row carrying the
 //! [`ProcessIdentity`] (pid + platform start-time marker, never a bare pid),
 //! the owner label, and a monotonic row id. A normal shutdown marks the row
-//! `reaped`; a crash leaves it `live`.
+//! `reaped`; a crash leaves it `live`; a `reaped` transition whose ledger
+//! append fails is compensated by a bounded retry marker
+//! (`terminals-reap-pending.ndjson`) that the next `reconcile` consumes, so
+//! the transition is neither silently discarded nor misreported as lost.
 //!
 //! On the next start, [`TerminalLedger::reconcile`] settles every `live` row
 //! and returns it as a typed [`TerminalLost`]. Reconciliation only CLASSIFIES
@@ -50,6 +53,15 @@ const MAX_SETTLED_KEPT: usize = 64;
 
 const LEDGER_VERSION: u32 = 1;
 const LEDGER_FILE: &str = "terminals.ndjson";
+/// Sidecar file of reap transitions whose ledger append failed: bounded
+/// retry-on-next-reconcile markers. Deliberately a SEPARATE file — a full or
+/// unwritable ledger still leaves this compensation channel writable, and a
+/// process death at any instant loses nothing (the ledger row stays `live`
+/// until the marker is consumed).
+pub(crate) const REAP_MARKER_FILE: &str = "terminals-reap-pending.ndjson";
+/// Hard cap on the retry-marker file (bytes); a full marker file refuses
+/// loudly and the live row is still adjudicated by `reconcile`.
+const MAX_REAP_MARKER_BYTES: usize = 64 * 1024;
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -161,6 +173,10 @@ impl LedgerRow {
 pub struct TerminalLedger {
     path: PathBuf,
     lock: Mutex<()>,
+    /// Test-only fault injection: the next `mark_reaped` append fails, so
+    /// the retry-marker fallback is exercised against a real failure path.
+    #[cfg(test)]
+    fail_mark_reaped: std::sync::atomic::AtomicBool,
 }
 
 impl fmt::Debug for TerminalLedger {
@@ -191,6 +207,8 @@ impl TerminalLedger {
         Ok(Self {
             path,
             lock: Mutex::new(()),
+            #[cfg(test)]
+            fail_mark_reaped: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -242,6 +260,12 @@ impl TerminalLedger {
     /// Mark one row `reaped`: the terminal was terminated and collected by
     /// the daemon on the normal path, so restart reconciliation must not
     /// report it. Unknown ids are a no-op (idempotent).
+    ///
+    /// A failed ledger append is NEVER silently discarded: the transition is
+    /// recorded in the bounded retry-marker sidecar under the SAME lock (so
+    /// a concurrent [`TerminalLedger::reconcile`] can never observe the row
+    /// as live-without-marker and report a false `TerminalLost`) and the
+    /// append failure is returned typed so the caller surfaces it.
     pub fn mark_reaped(&self, row_id: &str) -> Result<(), Error> {
         let _guard = self.lock();
         let rows = self.read_rows().0;
@@ -256,7 +280,120 @@ impl TerminalLedger {
             recorded_ms: now_ms(),
             ..existing
         };
-        self.append(&row)
+        self.append_reap_or_mark(&row)
+    }
+
+    /// Test-only arm: the next `mark_reaped` append fails once, exercising
+    /// the retry-marker fallback against a real failure path.
+    #[cfg(test)]
+    pub(crate) fn fail_next_mark_reaped(&self) {
+        self.fail_mark_reaped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Append the `reaped` transition; when the append fails, persist the
+    /// bounded retry marker that `reconcile` consumes. Both outcomes return
+    /// a typed error naming the fix (the caller logs it).
+    fn append_reap_or_mark(&self, row: &LedgerRow) -> Result<(), Error> {
+        let appended = {
+            #[cfg(test)]
+            {
+                if self
+                    .fail_mark_reaped
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    Err(Error::internal("injected mark_reaped append failure"))
+                } else {
+                    self.append(row)
+                }
+            }
+            #[cfg(not(test))]
+            {
+                self.append(row)
+            }
+        };
+        match appended {
+            Ok(()) => Ok(()),
+            Err(append_err) => match self.write_reap_marker(row) {
+                Ok(()) => Err(Error::internal(format!(
+                    "terminal ledger reaped append failed ({}); retry marker recorded for reconcile",
+                    append_err.message
+                ))),
+                Err(marker_err) => Err(Error::internal(format!(
+                    "terminal ledger reaped append failed ({}) and retry marker failed ({}); the live row is adjudicated by reconcile",
+                    append_err.message, marker_err.message
+                ))),
+            },
+        }
+    }
+
+    /// Append one bounded retry marker for a lost `reaped` transition.
+    /// Bounded and typed: an oversized marker file refuses loudly instead of
+    /// growing without limit.
+    fn write_reap_marker(&self, row: &LedgerRow) -> Result<(), Error> {
+        let marker_path = self.path.with_file_name(REAP_MARKER_FILE);
+        if file_len(&marker_path) >= MAX_REAP_MARKER_BYTES {
+            return Err(Error::oversized(
+                "terminal reap-marker file is full; cannot compensate the lost transition",
+            ));
+        }
+        let line = serde_json::json!({
+            "v": 1,
+            "id": row.id,
+            "at_ms": now_ms(),
+        })
+        .to_string();
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&marker_path)
+            .map_err(|e| Error::internal(format!("terminal reap marker open: {e}")))?;
+        f.write_all(line.as_bytes())
+            .and_then(|()| f.write_all(b"\n"))
+            .map_err(|e| Error::internal(format!("terminal reap marker append: {e}")))
+    }
+
+    /// Read the pending retry markers (bounded; undecodable lines are
+    /// ignored — the ledger row itself stays live and `reconcile` still
+    /// adjudicates it).
+    fn read_reap_markers(&self) -> Option<std::collections::HashSet<String>> {
+        let mut ids = std::collections::HashSet::new();
+        let marker_path = self.path.with_file_name(REAP_MARKER_FILE);
+        let mut raw = Vec::new();
+        match File::open(&marker_path) {
+            Ok(f) => {
+                let mut take = f.take((MAX_REAP_MARKER_BYTES + 1) as u64);
+                if take.read_to_end(&mut raw).is_err() || raw.len() > MAX_REAP_MARKER_BYTES {
+                    return None;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(ids),
+            Err(_) => return None,
+        }
+        for line in String::from_utf8_lossy(&raw).lines() {
+            let Ok(marker) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if let Some(id) = marker.get("id").and_then(|id| id.as_str()) {
+                ids.insert(id.to_string());
+            }
+        }
+        Some(ids)
+    }
+
+    /// Consume the retry markers (remove the sidecar). Only called after the
+    /// settled ledger rewrite is durable; a removal failure keeps the
+    /// markers for the next reconcile (idempotent).
+    fn clear_reap_markers(&self) {
+        let marker_path = self.path.with_file_name(REAP_MARKER_FILE);
+        if marker_path.exists() {
+            if let Err(e) = std::fs::remove_file(&marker_path) {
+                tracing::error!(
+                    path = %marker_path.display(),
+                    "terminal reap-marker cleanup failed: {e}"
+                );
+            }
+        }
     }
 
     /// Settle every `live` row exactly once after a restart. Classification
@@ -265,11 +402,33 @@ impl TerminalLedger {
     pub fn reconcile(&self) -> Result<Reconciliation, Error> {
         let _guard = self.lock();
         let (rows, corrupt_lines) = self.read_rows();
+        // Lost reap transitions whose ledger append failed are settled as
+        // `reaped` from their marker — never misreported as `TerminalLost`.
+        // An unreadable/oversized marker file is kept (and surfaced): a
+        // bounded read that failed must never silently consume markers.
+        let (reap_markers, markers_readable) = match self.read_reap_markers() {
+            Some(ids) => (ids, true),
+            None => {
+                tracing::error!(
+                    "terminal reap-marker file is unreadable or exceeds its bound; markers are kept and not consumed this pass"
+                );
+                (std::collections::HashSet::new(), false)
+            }
+        };
+        let mut reclaimed = 0usize;
         let mut lost = Vec::new();
         let mut settled = Vec::with_capacity(rows.len());
         for row in rows {
             if row.state != RowState::Live {
                 settled.push(row);
+                continue;
+            }
+            if reap_markers.contains(&row.id) {
+                reclaimed += 1;
+                settled.push(LedgerRow {
+                    state: RowState::Reaped,
+                    ..row
+                });
                 continue;
             }
             let disposition = classify(&row);
@@ -287,11 +446,23 @@ impl TerminalLedger {
                 ..row
             });
         }
+        if reclaimed > 0 {
+            tracing::warn!(
+                reclaimed,
+                "terminal ledger reap markers reconstructed lost reaped transitions"
+            );
+        }
         let mut settled = compact(settled);
         // Compaction is also the corruption repair: the rewritten file holds
         // only well-formed rows.
         settled.retain(|r| r.state != RowState::Live);
         self.write_rows(&settled)?;
+        // Consume the markers only AFTER the settled ledger rewrite is
+        // durable (a crash before this point replays them idempotently) and
+        // only when the bounded read succeeded (otherwise they are kept).
+        if markers_readable {
+            self.clear_reap_markers();
+        }
         Ok(Reconciliation {
             lost,
             corrupt_lines,
@@ -497,6 +668,56 @@ mod tests {
         assert_eq!(report.lost, vec![], "a reaped terminal is not lost");
         // Settling is exactly-once: a second pass reports nothing either.
         assert_eq!(ledger.reconcile().unwrap().lost, vec![]);
+    }
+
+    #[test]
+    fn lost_reap_transition_is_marked_and_consumed_by_reconcile() {
+        // Adversarial (injected append failure): a `reaped` transition whose
+        // ledger append fails is neither silently lost nor misreported as
+        // `TerminalLost`. The durable retry marker stands in for it, and the
+        // next reconcile settles the row as reaped and consumes the marker.
+        let (_dir, ledger) = ledger();
+        let (mut child, identity) = spawn_group_sleeper();
+        let row = ledger.record_spawn("session:19/task:3", &identity).unwrap();
+        ledger.fail_next_mark_reaped();
+        let err = ledger
+            .mark_reaped(&row)
+            .expect_err("the lost append must surface typed");
+        assert!(err.message.contains("retry marker"), "{err:?}");
+        let marker_path = ledger.path().with_file_name(REAP_MARKER_FILE);
+        assert!(marker_path.exists(), "the durable retry marker is written");
+        // The child is STILL ALIVE here: without the marker, reconcile would
+        // classify the live row and report a false TerminalLost.
+        let report = ledger.reconcile().unwrap();
+        assert!(
+            report.lost.is_empty(),
+            "a compensated reap is never reported lost: {report:?}"
+        );
+        assert!(!marker_path.exists(), "the consumed marker is removed");
+        // The settled row is durably reaped; a second pass reports nothing.
+        assert_eq!(ledger.reconcile().unwrap().lost, vec![]);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn oversized_marker_file_is_kept_not_silently_consumed() {
+        // Adversarial: a marker sidecar beyond the bound must not be
+        // half-read (a truncated read would drop ids) and must not be
+        // consumed; the row is adjudicated by classification instead.
+        let (_dir, ledger) = ledger();
+        let (mut child, identity) = spawn_group_sleeper();
+        ledger.record_spawn("session:23", &identity).unwrap();
+        let marker_path = ledger.path().with_file_name(REAP_MARKER_FILE);
+        std::fs::write(&marker_path, vec![b'x'; MAX_REAP_MARKER_BYTES + 1]).unwrap();
+        let report = ledger.reconcile().unwrap();
+        assert_eq!(report.lost.len(), 1, "the live row is classified honestly");
+        assert!(
+            marker_path.exists(),
+            "an unbounded marker file is never silently consumed"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]

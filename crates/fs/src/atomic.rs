@@ -285,9 +285,40 @@ impl FileState {
 /// be excluded by advisory locks — the CAS digest recheck immediately before
 /// the rename shrinks that window to the rename syscall itself, which is the
 /// strongest guarantee POSIX rename offers (no compare-and-swap rename).
+///
+/// The registry is bounded: idle entries (registry reference only) are
+/// evicted once it grows past [`PATH_LOCK_IDLE_CAP`]. Active entries — an
+/// `Arc` a caller still holds, including one merely waited on — are NEVER
+/// evicted, because eviction would hand a later caller a different mutex for
+/// the same path and break mutual exclusion. The registry can therefore
+/// exceed the idle cap only by the number of in-flight mutations (bounded by
+/// the runtime's workers), never by distinct paths over time.
+pub const PATH_LOCK_IDLE_CAP: usize = 4096;
+
+#[derive(Default)]
+struct PathLockRegistry {
+    locks: HashMap<PathBuf, Arc<Mutex<()>>>,
+}
+
+impl PathLockRegistry {
+    /// Drop every entry no caller can still hold (strong count 1 = only the
+    /// registry references it), so removing it cannot split a per-path lock.
+    /// Returns the number evicted.
+    fn evict_idle(&mut self) -> usize {
+        let before = self.locks.len();
+        self.locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        before - self.locks.len()
+    }
+}
+
+static PATH_LOCKS: OnceLock<Mutex<PathLockRegistry>> = OnceLock::new();
+
+fn path_lock_registry() -> &'static Mutex<PathLockRegistry> {
+    PATH_LOCKS.get_or_init(|| Mutex::new(PathLockRegistry::default()))
+}
+
 fn path_lock(path: &Path) -> Arc<Mutex<()>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-    let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let registry = path_lock_registry();
     let key = path.to_path_buf();
     // Classified: the path-lock registry is a DERIVED cache. A poisoned
     // guard is recovered with the poison flag cleared so one panicking
@@ -297,7 +328,11 @@ fn path_lock(path: &Path) -> Arc<Mutex<()>> {
         registry.clear_poison();
         poisoned.into_inner()
     });
+    if guard.locks.len() >= PATH_LOCK_IDLE_CAP && !guard.locks.contains_key(&key) {
+        guard.evict_idle();
+    }
     guard
+        .locks
         .entry(key)
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
@@ -730,6 +765,83 @@ mod tests {
             names,
             vec!["race.bin".to_string()],
             "temp leaked: {names:?}"
+        );
+    }
+
+    /// The path-lock registry is bounded: idle entries are evicted once it
+    /// grows past the cap, while active entries (held or awaited by a
+    /// caller) are never dropped — eviction would split one path's lock into
+    /// two and break mutual exclusion.
+    #[test]
+    fn idle_path_locks_are_evicted_at_the_bound() {
+        fn registry_len() -> usize {
+            super::path_lock_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .locks
+                .len()
+        }
+        let base = PathBuf::from("/nonexistent/faktor-path-lock-bound");
+        for i in 0..(super::PATH_LOCK_IDLE_CAP + 64) {
+            drop(super::path_lock(&base.join(format!("p{i}"))));
+        }
+        assert!(
+            registry_len() <= super::PATH_LOCK_IDLE_CAP + 64,
+            "idle registry grew past the cap: {}",
+            registry_len()
+        );
+
+        // Same path => same Arc while any caller holds it, even under
+        // eviction pressure from other paths.
+        let held = super::path_lock(&base.join("held"));
+        let guard = held.lock().unwrap();
+        let same = super::path_lock(&base.join("held"));
+        assert!(Arc::ptr_eq(&held, &same), "one path must have ONE lock");
+        for i in 0..(super::PATH_LOCK_IDLE_CAP + 8) {
+            drop(super::path_lock(&base.join(format!("pressure{i}"))));
+        }
+        let same = super::path_lock(&base.join("held"));
+        assert!(
+            Arc::ptr_eq(&held, &same),
+            "a held path lock must never be evicted"
+        );
+        drop(guard);
+    }
+
+    /// Concurrency correctness under eviction pressure: eight threads take
+    /// the same per-path lock around a non-atomic read-modify-write; a split
+    /// lock would lose increments. Pressure inserts of other paths force the
+    /// eviction scan between iterations.
+    #[test]
+    fn concurrent_path_locks_stay_exclusive_under_eviction_pressure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let path = PathBuf::from("/nonexistent/faktor-path-lock-race");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let per_thread = 150usize;
+        let workers: Vec<std::thread::JoinHandle<()>> = (0..8)
+            .map(|t| {
+                let counter = counter.clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..per_thread {
+                        let lock = super::path_lock(&path);
+                        let guard = lock.lock().unwrap();
+                        let value = counter.load(Ordering::SeqCst);
+                        std::thread::yield_now();
+                        counter.store(value + 1, Ordering::SeqCst);
+                        drop(guard);
+                        drop(super::path_lock(&path.with_extension(format!("{t}-{i}"))));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            8 * per_thread,
+            "a split per-path lock lost increments"
         );
     }
 }

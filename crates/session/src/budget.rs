@@ -3191,9 +3191,9 @@ mod tests {
         let (_d, m, ledger) = fresh_ledger();
         let s = session(&m);
         let task = seeded_task(&s, Some(10_000));
-        let logical = m.next_op_id();
-        let a1 = ModelCallAttempt::new(logical, m.next_op_id(), 0).unwrap();
-        let a2 = ModelCallAttempt::new(logical, m.next_op_id(), 1).unwrap();
+        let logical = m.try_next_op_id().unwrap();
+        let a1 = ModelCallAttempt::new(logical, m.try_next_op_id().unwrap(), 0).unwrap();
+        let a2 = ModelCallAttempt::new(logical, m.try_next_op_id().unwrap(), 1).unwrap();
         assert_ne!(a1.attempt_op_id, a2.attempt_op_id);
 
         let r1 = ledger
@@ -3381,9 +3381,9 @@ mod tests {
         let (_d, m, ledger) = fresh_ledger();
         let s = session(&m);
         let task = seeded_task(&s, Some(10_000_000));
-        let logical = m.next_op_id();
-        let a1 = ModelCallAttempt::new(logical, m.next_op_id(), 0).unwrap();
-        let a2 = ModelCallAttempt::new(logical, m.next_op_id(), 1).unwrap();
+        let logical = m.try_next_op_id().unwrap();
+        let a1 = ModelCallAttempt::new(logical, m.try_next_op_id().unwrap(), 0).unwrap();
+        let a2 = ModelCallAttempt::new(logical, m.try_next_op_id().unwrap(), 1).unwrap();
         let r1 = ledger
             .reserve_attempt(s.id, task, a1, 500_000, Some(known_snapshot()))
             .await

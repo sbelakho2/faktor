@@ -71,3 +71,8 @@ blake3.workspace = true
 # orchestrator fact rows, ownerless active turns) by direct SQL against the
 # store file, exactly like the store crate's own corruption tests.
 rusqlite = { version = "0.40", features = ["bundled"] }
+# Test-only: the ACP terminal round-trip probes a real pty child's liveness
+# with kill(pid, 0) directly. The shell probe it replaced could not
+# distinguish ESRCH (gone) from EPERM (exists, not ours) and paid a
+# process-spawn per probe under full-suite load.
+libc = "0.2"

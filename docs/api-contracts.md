@@ -83,13 +83,15 @@ pub enum CasError { Io, NotFound(FileHash), SizeMismatch{..}, HashMismatch(FileH
 
 ```rust
 pub struct Store; // ::open(root: impl Into<PathBuf>, integrity_check: bool)->StoreResult<Store>
-// rows: SessionRow { id, workspace_id, title, provider, model, state, created_ms, updated_ms }
+// rows: SessionRow { id, workspace_id, worktree_id, task_id, title, provider, model, state, lifecycle, created_ms, updated_ms }
 //       MessageRow { id, session_id, seq, role, data: Value, created_ms }
 //       PartRow { id, message_id, kind, data: Value, created_ms }
 //       ToolRunRow { id, session_id, op_id, tool, args: Value, status, started_ms, ended_ms,
-//                    effect_status, recovery: Value, expected_hash: Option<String> }
+//                    effect_status, recovery: Value, expected_hash: Option<String>,
+//                    replay_descriptor: Option<Value>, attempt: i64, postcondition: Option<Value> }
 //       CheckpointRow { id, session_id, sequence, path, before_hash, after_hash,
-//                    after_cas_hash: Option<String>, created_ms, restored_ms }
+//                    after_cas_hash: Option<String>, before_exists: bool, after_exists: bool,
+//                    created_ms, restored_ms }
 //       WorktreeRow { id, workspace_id, path, branch, active }
 pub fn create_workspace(&self, root: &str) -> StoreResult<WorkspaceId>
 pub fn workspace_root(&self, id: WorkspaceId) -> StoreResult<Option<String>>
@@ -164,7 +166,10 @@ pub fn cas(&self) -> Arc<Cas>
 ## faktor-protocol (already implemented, `crates/protocol`)
 
 ```rust
-pub const VERSION: &str; pub const UX_BASELINE: &str;
+// No version constants live here: `VERSION` (crate version) and
+// `UX_BASELINE` are exported by `faktor-core` (crates/core/src/lib.rs).
+// This crate carries the Faktor-owned `ApiError` mapping plus the native
+// conversation/projection shapes below.
 ```
 
 ## faktor-protocol native types (`crates/protocol/src/native.rs`)
@@ -240,11 +245,16 @@ pub struct ToolSpec { name, description, input_schema: Value }
 pub struct RequestMeta { operation_id: OpId, session_id: SessionId, provider, attempt: u32, deadline_ms: u64, cancellation: CancellationToken }
 pub struct GenericAgentRequest { model, system, messages: Vec<RequestMessage>, tools: Vec<ToolSpec>,
     max_output: Option<usize>, reasoning: Option<ReasoningMode>, stream: bool, meta: RequestMeta }
-pub enum ProviderChunk { Text{text}, Reasoning{text}, ToolCall{id,name,input,complete}, Usage{tokens_in,tokens_out}, Done }
+pub struct CanonicalUsage { uncached_input_tokens, cache_read_tokens, cache_write_tokens,
+    output_tokens, reasoning_tokens, reported_cost: Option<ReportedCost>, request_id: Option<String> }
+pub enum ProviderChunk { Text{text}, Reasoning{text}, ToolCall{id,name,input,complete}, Usage(CanonicalUsage), Done }
 pub enum ProviderErrorKind { Network, Timeout, RateLimited, BadRequest, Auth, Server, Cancelled, Malformed }
 pub struct ProviderError { kind, message, retryable, code: Option<String> }
 pub type ProviderStream = Pin<Box<dyn Stream<Item=Result<ProviderChunk, ProviderError>> + Send>>;
-pub trait Provider: Send+Sync { fn id(&self)->&str; fn identity(&self)->ProviderIdentity; fn capabilities(&self, model:&str)->ModelCapabilities; fn stream(&self, req: GenericAgentRequest)->ProviderStream; }
+pub trait Provider: Send+Sync { fn id(&self)->&str; fn identity(&self)->ProviderIdentity; fn capabilities(&self, model:&str)->ModelCapabilities;
+    fn runtime_context_limit(&self, model:&str)->Option<usize>; fn max_image_bytes(&self)->usize;
+    fn document_capable(&self, model:&str)->bool; fn embed(&self, req: EmbeddingRequest)->Result<EmbeddingResponse, ProviderError>;
+    fn stream(&self, req: GenericAgentRequest)->ProviderStream; }
 pub struct ProviderIdentity { pub instance_id: String, pub family: String } // ::new(instance, family), from_family(family)
 // identity() defaults to instance_id == family (one instance per family);
 // the registry keys by identity().instance_id. InstanceProvider::wrap(inner, instance_id)

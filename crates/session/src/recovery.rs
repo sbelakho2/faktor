@@ -400,7 +400,7 @@ mod tests {
         m: &crate::SessionManager,
         recovery: RecoveryStrategy,
     ) -> (OpMeta, OpId) {
-        let op = m.next_op_id();
+        let op = m.try_next_op_id().unwrap();
         let meta = OpMeta::new(
             op,
             s.id(),
@@ -695,7 +695,7 @@ mod tests {
         m.store()
             .start_tool_run(
                 s.id(),
-                m.next_op_id(),
+                m.try_next_op_id().unwrap(),
                 "run_test",
                 serde_json::json!({}),
                 serde_json::json!({ "strategy": "delete_everything" }),
@@ -717,7 +717,7 @@ mod tests {
         m.store()
             .start_tool_run(
                 s.id(),
-                m.next_op_id(),
+                m.try_next_op_id().unwrap(),
                 "write_file",
                 serde_json::json!({}),
                 serde_json::to_value(RecoveryStrategy::VerifyHash {

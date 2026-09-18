@@ -97,7 +97,8 @@ pub use oidc_net::{
     AsyncOidcAdapter, CachedJwksView, ClientAuthMethod, ClientSecret, NetworkOidcAdapter,
     NetworkOidcConfig, DEFAULT_ALLOWED_ALGORITHMS, DEFAULT_DISCOVERY_MAX_AGE_MS,
     DEFAULT_JWKS_MAX_AGE_MS, MAX_ALLOWED_ALGORITHMS, MAX_CACHE_MAX_AGE_MS, MAX_CLIENT_SECRET_BYTES,
-    MAX_CODE_EXCHANGE_INPUT_BYTES, MAX_JWKS_REFETCHES, SUPPORTED_ALGORITHMS,
+    MAX_CODE_EXCHANGE_INPUT_BYTES, MAX_JWKS_REFETCHES, OIDC_NETWORK_TIMEOUT_MS,
+    SUPPORTED_ALGORITHMS,
 };
 pub use rbac::{
     authorize, Action, Denied, Principal, PrincipalSubject, Resource, Role, ALL_ACTIONS,
@@ -120,5 +121,5 @@ pub use store::{
 };
 pub use vendor::{
     BillingVendorAdapter, BillingVendorConfig, ReportOutcome, DEFAULT_REPORT_PATH,
-    MAX_REPORT_ATTEMPTS, MAX_REPORT_PAGES, MAX_REPORT_TASKS,
+    MAX_REPORT_ATTEMPTS, MAX_REPORT_PAGES, MAX_REPORT_TASKS, VENDOR_HTTP_TIMEOUT_MS,
 };

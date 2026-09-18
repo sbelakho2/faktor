@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use faktor_agent::{AgentRuntime, TurnOutcome};
 use faktor_core::attachment::AttachmentId;
 use faktor_core::cancellation::CancellationToken;
-use faktor_core::id::{OpId, SessionId, TaskId, WorktreeId};
+use faktor_core::id::{OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
 use faktor_core::op::{OpMeta, RecoveryStrategy};
 use faktor_core::retry::RetryPolicy;
 use faktor_core::state::AgentState;
@@ -528,6 +528,34 @@ impl ChildRuntime {
     /// Corrupt/hostile rows are a loud typed error — never a fabricated
     /// state.
     pub fn validate_durable(&self) -> Result<(), ExecError> {
+        // Identity ids are decoded durable data: a row with a zero id can
+        // never be silently carried into an id constructor (which rejects
+        // zero by panic for internal callers). Refuse the row typed, naming
+        // the child and the field.
+        if self.session_id == 0 {
+            return Err(ExecError::Malformed(format!(
+                "registry row of child {} carries session_id 0 (a durable row must name a real child session)",
+                self.child_id
+            )));
+        }
+        if self.parent_session_id == 0 {
+            return Err(ExecError::Malformed(format!(
+                "registry row of child {} carries parent_session_id 0",
+                self.child_id
+            )));
+        }
+        if self.workspace_id == 0 {
+            return Err(ExecError::Malformed(format!(
+                "registry row of child {} carries workspace_id 0",
+                self.child_id
+            )));
+        }
+        if self.worktree_id == 0 {
+            return Err(ExecError::Malformed(format!(
+                "registry row of child {} carries worktree_id 0",
+                self.child_id
+            )));
+        }
         match self.blocker_kind.as_deref() {
             None => {}
             Some(raw) if BlockerKind::parse(raw).is_none() => {
@@ -947,7 +975,13 @@ impl OrchestratorRuntime {
     /// `registry_rows` and the server's native projections) must apply it —
     /// the registry JSON is deliberately not rewritten on control changes.
     pub fn derive_child_projection(manager: &Arc<SessionManager>, row: &mut ChildRuntime) {
-        let Ok(Some(handle)) = manager.get_session(SessionId::new(row.session_id)) else {
+        // Pure projection helper: a malformed decoded id (zero) derives
+        // nothing instead of panicking. Durable readers reject such rows
+        // typed at the decode boundary; this is the no-panic backstop.
+        let Ok(session_id) = SessionId::try_from(row.session_id) else {
+            return;
+        };
+        let Ok(Some(handle)) = manager.get_session(session_id) else {
             return;
         };
         if let Ok(ds) = handle.orchestrator_drive_state_get() {
@@ -970,11 +1004,15 @@ impl OrchestratorRuntime {
         manager: Arc<SessionManager>,
         row: &ChildRuntime,
     ) -> faktor_core::Result<faktor_session::child::PresentationState> {
-        let handle = manager
-            .get_session(SessionId::new(row.session_id))?
-            .ok_or_else(|| {
-                faktor_core::Error::not_found(format!("child session {}", row.session_id))
-            })?;
+        let session_id = SessionId::try_from(row.session_id).map_err(|e| {
+            faktor_core::Error::malformed(format!(
+                "child {} registry row carries session_id {}: {}",
+                row.child_id, row.session_id, e.message
+            ))
+        })?;
+        let handle = manager.get_session(session_id)?.ok_or_else(|| {
+            faktor_core::Error::not_found(format!("child session {}", row.session_id))
+        })?;
         handle.child_presentation(&row.child_id)
     }
 
@@ -1311,11 +1349,17 @@ impl OrchestratorRuntime {
                 ));
                 continue;
             }
-            let Some(session) = manager
-                .get_session(SessionId::new(row.session_id))
-                .ok()
-                .flatten()
-            else {
+            let session_id = match SessionId::try_from(row.session_id) {
+                Ok(id) => id,
+                Err(e) => {
+                    violations.push(format!(
+                        "{}: registry row carries invalid session_id {}: {}",
+                        row.child_id, row.session_id, e.message
+                    ));
+                    continue;
+                }
+            };
+            let Some(session) = manager.get_session(session_id).ok().flatten() else {
                 violations.push(format!(
                     "{}: child session {} missing",
                     row.child_id, row.session_id
@@ -1414,14 +1458,18 @@ impl OrchestratorRuntime {
             if let Some(by_id) = wt_paths.get(&ws) {
                 return by_id.get(&wt).cloned();
             }
-            let rows = match store.worktrees_of(faktor_core::id::WorkspaceId::new(ws)) {
+            // The workspace id is decoded durable data: zero is a malformed
+            // row and resolves to no worktree (reported as an orphan issue
+            // by the caller), never a panic.
+            let ws_id = WorkspaceId::try_from(ws).ok()?;
+            let rows = match store.worktrees_of(ws_id) {
                 Ok(rows) => rows,
                 Err(_) => return None,
             };
-            let by_id: std::collections::HashMap<u64, String> = rows
-                .iter()
-                .map(|r| (r.id.max(0) as u64, r.path.clone()))
-                .collect();
+            // Worktree ids are bit-cast into the signed column on write: the
+            // inverse cast is lossless (rowids are positive by construction).
+            let by_id: std::collections::HashMap<u64, String> =
+                rows.iter().map(|r| (r.id as u64, r.path.clone())).collect();
             let hit = by_id.get(&wt).cloned();
             wt_paths.insert(ws, by_id);
             hit
@@ -1772,9 +1820,15 @@ impl OrchestratorRuntime {
         control: ChildControl,
     ) -> Result<ControlAck, ExecError> {
         let row = self.durable_child(child_id)?;
+        let session_id = SessionId::try_from(row.session_id).map_err(|e| {
+            ExecError::Malformed(format!(
+                "child {} registry row carries session_id {}: {}",
+                row.child_id, row.session_id, e.message
+            ))
+        })?;
         let session = self
             .manager
-            .get_session(SessionId::new(row.session_id))?
+            .get_session(session_id)?
             .ok_or_else(|| ExecError::NotFound(format!("child session {}", row.session_id)))?;
         let session_terminal = session.state()?.is_terminal();
         match &control {
@@ -1890,7 +1944,7 @@ impl OrchestratorRuntime {
                 // diverge across a crash/reopen.
                 self.agent
                     .seed_task_budget(
-                        SessionId::new(row.session_id),
+                        session_id,
                         &TaskBudget {
                             max_tokens: Some(max_tokens),
                             max_turns: None,
@@ -2301,9 +2355,15 @@ impl OrchestratorRuntime {
         if row.state.is_terminal() {
             return Ok((row.state, None));
         }
+        let session_id = SessionId::try_from(row.session_id).map_err(|e| {
+            ExecError::Malformed(format!(
+                "child {} registry row carries session_id {}: {}",
+                row.child_id, row.session_id, e.message
+            ))
+        })?;
         let session = self
             .manager
-            .get_session(SessionId::new(row.session_id))?
+            .get_session(session_id)?
             .ok_or_else(|| ExecError::NotFound(format!("child session {}", row.session_id)))?;
         let ds = session.orchestrator_drive_state_get()?;
         if ds.phase == ChildPhase::Waiting {
@@ -2679,8 +2739,16 @@ impl OrchestratorRuntime {
                 if child.is_terminal() && child.state != ChildState::Failed {
                     continue;
                 }
-                let Ok(Some(session)) = self.manager.get_session(SessionId::new(child.session_id))
-                else {
+                let child_session_id = match SessionId::try_from(child.session_id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        return Err(ExecError::Malformed(format!(
+                            "child {} registry row carries session_id {}: {}",
+                            child.child_id, child.session_id, e.message
+                        )));
+                    }
+                };
+                let Ok(Some(session)) = self.manager.get_session(child_session_id) else {
                     continue;
                 };
                 let Ok(pending) = session.orchestrator_ctl_pending() else {
@@ -2868,8 +2936,18 @@ impl OrchestratorRuntime {
         let now = self.manager.now_ms();
         let (workspace_id, worktree_id, ownership_paths) = match mode {
             ChildOwnership::ReadOnlyShared => (
-                exec.owner.workspace_id,
-                exec.owner.worktree_id,
+                WorkspaceId::try_from(exec.owner.workspace_id).map_err(|e| {
+                    ExecError::Malformed(format!(
+                        "owner workspace id {} of run {}: {}",
+                        exec.owner.workspace_id, exec.run_id, e.message
+                    ))
+                })?,
+                WorktreeId::try_from(exec.owner.worktree_id).map_err(|e| {
+                    ExecError::Malformed(format!(
+                        "owner worktree id {} of run {}: {}",
+                        exec.owner.worktree_id, exec.run_id, e.message
+                    ))
+                })?,
                 ownership_paths,
             ),
             // ExclusivePaths means exclusive write authority INSIDE an
@@ -2942,7 +3020,16 @@ impl OrchestratorRuntime {
                     .manager
                     .put_worktree(ws, &dir_str, &format!("orch-{seq}"))
                     .map_err(|e| ExecError::Internal(format!("child worktree row: {e}")))?;
-                (ws.raw(), wt_raw as u64, ownership_paths)
+                // The store's row id is decoded durable data (SQLite rowid,
+                // bit-cast losslessly): only a zero id is structurally
+                // invalid, typed and naming the run item.
+                let wt_id = WorktreeId::try_from(wt_raw as u64).map_err(|e| {
+                    ExecError::Malformed(format!(
+                        "child worktree row of run {} item {} returned id {}: {}",
+                        exec.run_id, item.id, wt_raw, e.message
+                    ))
+                })?;
+                (ws, wt_id, ownership_paths)
             }
         };
         // The declared exclusive path set of a `Paths`-owned child: bound as
@@ -2985,8 +3072,8 @@ impl OrchestratorRuntime {
             kind: item.kind,
             session_id: 0,
             operation_id: 0,
-            workspace_id,
-            worktree_id,
+            workspace_id: workspace_id.raw(),
+            worktree_id: worktree_id.raw(),
             ownership: mode,
             ownership_paths,
             state: ChildState::Running,
@@ -3054,12 +3141,24 @@ impl OrchestratorRuntime {
         let env_id =
             self.bind_child_env(exec.parent_session, &exec.run_id, &row.child_id, &env_root)?;
         row.env_snapshot_id = Some(env_id);
+        let child_workspace = WorkspaceId::try_from(row.workspace_id).map_err(|e| {
+            ExecError::Malformed(format!(
+                "child {} registry row carries workspace_id {}: {}",
+                row.child_id, row.workspace_id, e.message
+            ))
+        })?;
+        let child_worktree = WorktreeId::try_from(row.worktree_id).map_err(|e| {
+            ExecError::Malformed(format!(
+                "child {} registry row carries worktree_id {}: {}",
+                row.child_id, row.worktree_id, e.message
+            ))
+        })?;
         let session = self
             .manager
             .create_child_session(
                 exec.parent_session,
-                faktor_core::id::WorkspaceId::new(row.workspace_id),
-                WorktreeId::new(row.worktree_id),
+                child_workspace,
+                child_worktree,
                 TaskId::new(1),
                 &exec.config.provider,
                 &model,
@@ -3131,10 +3230,19 @@ impl OrchestratorRuntime {
             model,
             observed: self.admission_observed(run_id),
         })?;
-        let op_id = self.manager.next_op_id();
+        let child_session_id = SessionId::try_from(child.session_id).map_err(|e| {
+            ExecError::Malformed(format!(
+                "child {} registry row carries session_id {}: {}",
+                child.child_id, child.session_id, e.message
+            ))
+        })?;
+        let op_id = self
+            .manager
+            .try_next_op_id()
+            .map_err(|e| ExecError::from(faktor_core::Error::from(e)))?;
         let meta = OpMeta::new(
             op_id,
-            SessionId::new(child.session_id),
+            child_session_id,
             Deadline::at(self.manager.now_ms().saturating_add(CHILD_OP_DEADLINE_MS)),
             RetryPolicy::default(),
             CancellationToken::new(),
@@ -3150,7 +3258,7 @@ impl OrchestratorRuntime {
             .canonicalized(&self.exec_root(run_id));
         let agent = self.agent.clone();
         let manager = self.manager.clone();
-        let session_id = SessionId::new(child.session_id);
+        let session_id = child_session_id;
         let prompt = self.child_prompt(run_id, child)?;
         let model_override = child.model_policy.model.clone();
         let max_tokens = child.budget_max_tokens;
@@ -3347,10 +3455,9 @@ fn parent_facts(
 /// authority the registry projection derives from (None when no task row or
 /// an unlimited cap).
 fn child_task_budget_cap(manager: &Arc<SessionManager>, session_id: u64) -> Option<u64> {
-    let handle = manager
-        .get_session(SessionId::new(session_id))
-        .ok()
-        .flatten()?;
+    // Decoded raw id backstop: zero derives nothing, never a panic.
+    let session_id = SessionId::try_from(session_id).ok()?;
+    let handle = manager.get_session(session_id).ok().flatten()?;
     let task_id = handle.task_id().ok()?;
     handle
         .get_task(task_id)
@@ -3362,10 +3469,10 @@ fn child_task_budget_cap(manager: &Arc<SessionManager>, session_id: u64) -> Opti
 /// The child session's durable execution phase (Planning when no drive-state
 /// row exists).
 fn child_execution_phase(manager: &Arc<SessionManager>, session_id: u64) -> ExecutionPhase {
-    manager
-        .get_session(SessionId::new(session_id))
+    // Decoded raw id backstop: zero derives the default, never a panic.
+    SessionId::try_from(session_id)
         .ok()
-        .flatten()
+        .and_then(|id| manager.get_session(id).ok().flatten())
         .and_then(|h| h.orchestrator_drive_state_get().ok())
         .map(|ds| ds.execution_phase)
         .unwrap_or_default()
@@ -4066,9 +4173,15 @@ impl OrchestratorRuntime {
     /// validates first). A missing child session is a no-op (re-attach
     /// validates sessions separately and loudly).
     fn persist_child_runtime_row(&self, row: &ChildRuntime) -> Result<(), ExecError> {
+        let session_id = SessionId::try_from(row.session_id).map_err(|e| {
+            ExecError::Malformed(format!(
+                "child {} registry row carries session_id {}: {}",
+                row.child_id, row.session_id, e.message
+            ))
+        })?;
         let Some(session) = self
             .manager
-            .get_session(SessionId::new(row.session_id))
+            .get_session(session_id)
             .map_err(|e| ExecError::retriable("child session read", e))?
         else {
             return Ok(());
@@ -4093,7 +4206,10 @@ impl OrchestratorRuntime {
     /// authoritative lifecycle transition, so a failure is logged and the
     /// in-memory projection still carries the intended phase.
     fn note_child_phase(&self, row: &ChildRuntime, phase: ExecutionPhase) {
-        let Ok(Some(session)) = self.manager.get_session(SessionId::new(row.session_id)) else {
+        let Ok(session_id) = SessionId::try_from(row.session_id) else {
+            return;
+        };
+        let Ok(Some(session)) = self.manager.get_session(session_id) else {
             return;
         };
         if let Err(e) = session.set_execution_phase(phase) {
@@ -4110,7 +4226,10 @@ impl OrchestratorRuntime {
     /// a reason already open is an idempotent no-op; failures are logged,
     /// never fatal (the durable row already carries the truth).
     fn record_blocker_audit(&self, row: &ChildRuntime, blocker: &ChildBlocker) {
-        let Ok(Some(session)) = self.manager.get_session(SessionId::new(row.session_id)) else {
+        let Ok(session_id) = SessionId::try_from(row.session_id) else {
+            return;
+        };
+        let Ok(Some(session)) = self.manager.get_session(session_id) else {
             return;
         };
         if let Err(e) = session.ledger_child_blocker_opened(blocker) {
@@ -4125,7 +4244,10 @@ impl OrchestratorRuntime {
 
     /// Audit one blocker resolution in the child session's typed ledger.
     fn record_blocker_resolved_audit(&self, row: &ChildRuntime, blocker: &ChildBlocker) {
-        let Ok(Some(session)) = self.manager.get_session(SessionId::new(row.session_id)) else {
+        let Ok(session_id) = SessionId::try_from(row.session_id) else {
+            return;
+        };
+        let Ok(Some(session)) = self.manager.get_session(session_id) else {
             return;
         };
         if let Err(e) = session.ledger_child_blocker_resolved(blocker) {
