@@ -113,6 +113,33 @@ pub struct ExternalLogin {
     pub role: Role,
 }
 
+/// One control-plane session logout result. `already_revoked = true` is the
+/// idempotent replay: the session was revoked by an earlier logout and the
+/// durable row is unchanged.
+#[derive(Debug, Clone)]
+pub struct SessionRevocation {
+    /// The (now revoked) durable session row.
+    pub session: AuthSession,
+    /// `true` when the session was already revoked before this call.
+    pub already_revoked: bool,
+}
+
+/// The recorded (safe, token-free) external-login response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalLoginRecord {
+    user: User,
+    session: AuthSession,
+    role: Role,
+}
+
+/// The recorded (safe) explicit-link response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalIdentityRecord {
+    identity: ExternalIdentity,
+}
+
 /// One membership joined with its user.
 #[derive(Debug, Clone, Serialize)]
 pub struct MemberView {
@@ -230,8 +257,13 @@ impl ControlPlane {
     }
 
     /// Link one external identity subject to a user (idempotent: the same
-    /// (provider, subject) resolves to the same user; a conflicting link is
-    /// refused).
+    /// `(provider, subject)` resolves to the same user; a conflicting link is
+    /// refused `Conflict`, NEVER re-bound).
+    ///
+    /// The existence check and the attach run inside ONE store transaction (a
+    /// fresh, never-replayed key per call), so two concurrent explicit links
+    /// of one subject can never both observe "absent" and write divergent
+    /// owners.
     pub fn link_external_identity(
         &self,
         user: &UserId,
@@ -243,23 +275,39 @@ impl ControlPlane {
                 "external identity provider/subject shape is invalid".into(),
             ));
         }
-        if let Some(existing) = self.store.external_identity(provider, subject)? {
-            if existing.user != *user {
-                return Err(ControlPlaneError::Conflict(
-                    "external identity is already linked to another user".into(),
-                ));
-            }
-            return Ok(existing);
-        }
-        let identity = ExternalIdentity {
-            id: ExternalIdentityId::try_new(Self::new_id("ext"))?,
-            user: user.clone(),
-            provider: provider.to_string(),
-            subject: subject.to_string(),
-            created_ms: self.now_ms(),
-        };
-        self.store.put_external_identity(&identity)?;
-        Ok(identity)
+        let now = self.now_ms();
+        let digest = Self::request_hash(&serde_json::json!({
+            "user": user.as_str(),
+            "provider": provider,
+            "subject": subject,
+        }))?;
+        let outcome = self.store.execute_idempotent(
+            &Self::new_id("link"),
+            "link_external_identity",
+            &digest,
+            now,
+            &mut |tx| {
+                if let Some(existing) = tx.external_identity(provider, subject)? {
+                    if existing.user != *user {
+                        return Err(ControlPlaneError::Conflict(
+                            "external identity is already linked to another user".into(),
+                        ));
+                    }
+                    return Ok(serde_json::json!({ "identity": existing }));
+                }
+                let identity = ExternalIdentity {
+                    id: ExternalIdentityId::try_new(Self::new_id("ext"))?,
+                    user: user.clone(),
+                    provider: provider.to_string(),
+                    subject: subject.to_string(),
+                    created_ms: now,
+                };
+                tx.put_external_identity(&identity)?;
+                Ok(serde_json::json!({ "identity": identity }))
+            },
+        )?;
+        let record: ExternalIdentityRecord = Self::decode_idempotent(outcome.into_response())?;
+        Ok(record.identity)
     }
 
     /// Bootstrap one organization with its first owner. The returned token
@@ -362,23 +410,39 @@ impl ControlPlane {
         })
     }
 
-    /// One SSO/external-identity login: resolve-or-create the user by the
-    /// VERIFIED claims of an IdP, link the external subject, ensure the
-    /// membership and mint ONE control-plane auth session (the plaintext
-    /// token is visible exactly once).
+    /// One SSO/external-identity login: resolve the user by the SUBJECT-FIRST
+    /// identity rule, reconcile the verified claims, ensure the membership and
+    /// mint ONE control-plane auth session (the plaintext token is visible
+    /// exactly once).
     ///
-    /// Semantics (documented, fail closed):
+    /// Semantics (documented, fail closed), all inside ONE store transaction
+    /// (a fresh, never-replayed key per call):
     ///
     /// - the organization must exist and not be deleted (`NotFound`);
-    /// - the email is normalized by the same rule every user row uses; an
-    ///   existing DISABLED user is refused `Unauthorized`;
-    /// - the external `(provider, subject)` link is idempotent; a subject
-    ///   already linked to another user is refused `Conflict` (never
-    ///   re-linked);
+    /// - an EXISTING `(provider, subject)` link is authoritative: the linked
+    ///   user is loaded and validated (a disabled user is refused
+    ///   `Unauthorized`). The subject is NEVER transferred to another account;
+    ///   an explicit attempt to link a bound subject elsewhere is a typed
+    ///   `Conflict`;
+    /// - email reconciliation for a linked user (the explicit default
+    ///   policy): adopt the IdP-asserted email ONLY when the IdP asserts
+    ///   `email_verified` AND the address is free; otherwise keep the
+    ///   recorded email. A verified email that already belongs to a
+    ///   DIFFERENT user is a typed `Conflict`: accounts are never merged
+    ///   implicitly. The operator resolution path is explicit: free the
+    ///   duplicate address (rename/disable/remove the other account) or
+    ///   perform an audited merge outside this path, then retry the login;
+    /// - with NO existing link, the email must be VERIFIED: it resolves an
+    ///   existing user by email or creates one, and the `(provider, subject)`
+    ///   link is attached in the SAME transaction as that
+    ///   resolution/creation, so no window exists for a concurrent login to
+    ///   bind the subject to a different account (an unverified email is
+    ///   refused `Unauthorized` before any row is written);
     /// - an EXISTING membership keeps its role: the IdP mapping authorizes
     ///   joining, never a privilege change of an existing member (role
     ///   changes remain an explicit admin action);
     /// - a new membership is created with the MAPPED role.
+    #[allow(clippy::too_many_arguments)]
     pub fn login_external(
         &self,
         organization: &OrganizationId,
@@ -386,48 +450,152 @@ impl ControlPlane {
         subject: &str,
         email: &str,
         display_name: &str,
+        email_verified: bool,
         mapped_role: Role,
     ) -> Result<ExternalLogin, ControlPlaneError> {
-        let org = self
-            .store
-            .organization(organization)?
-            .filter(|org| !org.deleted)
-            .ok_or_else(|| ControlPlaneError::NotFound("organization not found".into()))?;
-        let (user, _) = self.create_user(email, display_name)?;
-        if user.disabled {
-            return Err(ControlPlaneError::Unauthorized("user is disabled".into()));
+        if provider.is_empty() || provider.len() > 64 || subject.is_empty() || subject.len() > 256 {
+            return Err(ControlPlaneError::Malformed(
+                "external identity provider/subject shape is invalid".into(),
+            ));
         }
-        let _identity = self.link_external_identity(&user.id, provider, subject)?;
-        let membership = match self.store.membership(&org.id, &user.id)? {
-            Some(existing) => existing,
-            None => {
-                let membership = Membership {
-                    id: MembershipId::try_new(Self::new_id("mem"))?,
+        let email = normalize_email(email)?;
+        if display_name.len() > MAX_DISPLAY_NAME_BYTES {
+            return Err(ControlPlaneError::Malformed(
+                "display name is oversized".into(),
+            ));
+        }
+        let now = self.now_ms();
+        let digest = Self::request_hash(&serde_json::json!({
+            "organization": organization.as_str(),
+            "provider": provider,
+            "subject": subject,
+            "email": email,
+            "email_verified": email_verified,
+            "role": mapped_role,
+        }))?;
+        // Set only by this execution's closure (a replay can never
+        // re-present a one-shot token).
+        let mut issued: Option<SecretToken> = None;
+        let outcome = self.store.execute_idempotent(
+            &Self::new_id("login"),
+            "login_external",
+            &digest,
+            now,
+            &mut |tx| {
+                let org = tx
+                    .organization(organization)?
+                    .filter(|org| !org.deleted)
+                    .ok_or_else(|| ControlPlaneError::NotFound("organization not found".into()))?;
+                let user = match tx.external_identity(provider, subject)? {
+                    // Subject-first: an existing link decides the account.
+                    Some(identity) => {
+                        let mut user = tx.user(&identity.user)?.ok_or_else(|| {
+                            ControlPlaneError::Unauthorized(
+                                "external identity user no longer exists".into(),
+                            )
+                        })?;
+                        if user.disabled {
+                            return Err(ControlPlaneError::Unauthorized("user is disabled".into()));
+                        }
+                        // Email reconciliation (the explicit default policy):
+                        // adopt a verified, free email; keep the recorded one
+                        // otherwise.
+                        if email_verified && user.email != email {
+                            if let Some(collision) = tx.user_by_email(&email)? {
+                                if collision.id != user.id {
+                                    return Err(ControlPlaneError::Conflict(format!(
+                                        "verified email {email} already belongs to another \
+                                         user; the external identity keeps its linked account \
+                                         (operator resolution: free the duplicate address or \
+                                         merge the accounts explicitly, never implicitly)"
+                                    )));
+                                }
+                            }
+                            user.email = email.clone();
+                            tx.put_user(&user)?;
+                        }
+                        user
+                    }
+                    // No link yet: resolve/create by the VERIFIED email and
+                    // attach the subject in the same transaction.
+                    None => {
+                        if !email_verified {
+                            return Err(ControlPlaneError::Unauthorized(
+                                "external identity email is not verified".into(),
+                            ));
+                        }
+                        let user = match tx.user_by_email(&email)? {
+                            Some(existing) => existing,
+                            None => {
+                                let user = User {
+                                    id: UserId::try_new(Self::new_id("usr"))?,
+                                    email: email.clone(),
+                                    display_name: display_name.to_string(),
+                                    created_ms: now,
+                                    disabled: false,
+                                };
+                                tx.put_user(&user)?;
+                                user
+                            }
+                        };
+                        if user.disabled {
+                            return Err(ControlPlaneError::Unauthorized("user is disabled".into()));
+                        }
+                        let identity = ExternalIdentity {
+                            id: ExternalIdentityId::try_new(Self::new_id("ext"))?,
+                            user: user.id.clone(),
+                            provider: provider.to_string(),
+                            subject: subject.to_string(),
+                            created_ms: now,
+                        };
+                        tx.put_external_identity(&identity)?;
+                        user
+                    }
+                };
+                let membership = match tx.membership(&org.id, &user.id)? {
+                    Some(existing) => existing,
+                    None => {
+                        let membership = Membership {
+                            id: MembershipId::try_new(Self::new_id("mem"))?,
+                            organization: org.id.clone(),
+                            user: user.id.clone(),
+                            role: mapped_role,
+                            created_ms: now,
+                        };
+                        tx.put_membership(&membership)?;
+                        membership
+                    }
+                };
+                let token = Self::new_token()?;
+                let session = AuthSession {
+                    id: AuthSessionId::try_new(Self::new_id("ses"))?,
                     organization: org.id.clone(),
                     user: user.id.clone(),
-                    role: mapped_role,
-                    created_ms: self.now_ms(),
+                    token_hash: TokenHash::of(token.expose()),
+                    created_ms: now,
+                    expires_ms: now.saturating_add(DEFAULT_SESSION_TTL_MS),
+                    revoked_ms: None,
                 };
-                self.store.put_membership(&membership)?;
-                membership
-            }
-        };
-        let token = Self::new_token()?;
-        let session = AuthSession {
-            id: AuthSessionId::try_new(Self::new_id("ses"))?,
-            organization: org.id.clone(),
-            user: user.id.clone(),
-            token_hash: TokenHash::of(token.expose()),
-            created_ms: self.now_ms(),
-            expires_ms: self.now_ms().saturating_add(DEFAULT_SESSION_TTL_MS),
-            revoked_ms: None,
-        };
-        self.store.put_auth_session(&session)?;
+                tx.put_auth_session(&session)?;
+                issued = Some(token);
+                Ok(serde_json::json!({
+                    "user": user,
+                    "session": session,
+                    "role": membership.role,
+                }))
+            },
+        )?;
+        let record: ExternalLoginRecord = Self::decode_idempotent(outcome.into_response())?;
+        let token = issued.ok_or_else(|| {
+            ControlPlaneError::Backend(
+                "external login replay cannot re-present a one-shot token".into(),
+            )
+        })?;
         Ok(ExternalLogin {
-            user,
-            session,
+            user: record.user,
+            session: record.session,
             token,
-            role: membership.role,
+            role: record.role,
         })
     }
 
@@ -495,6 +663,62 @@ impl ControlPlane {
         Err(ControlPlaneError::Unauthorized(
             "unknown control-plane credential".into(),
         ))
+    }
+
+    /// Revoke ONE control-plane auth session durably (the logout path): the
+    /// presented token must be that session's OWN token, the named session
+    /// must belong to the named organization, and the revocation is written
+    /// to the durable row (`revoked_ms` set), so every later presentation of
+    /// the token is refused by [`Self::authenticate`]. There is no delete
+    /// path that could resurrect a session; the row is the audit trail.
+    ///
+    /// Refusals are typed and leak nothing: a missing session and a foreign
+    /// organization's session are the SAME `NotFound`; a presented
+    /// credential that does not own the named session (including a service
+    /// account token) is `Unauthorized`.
+    ///
+    /// Idempotent: a SECOND logout of an already-revoked session returns
+    /// `already_revoked = true` instead of an error.
+    pub fn revoke_session(
+        &self,
+        organization: &OrganizationId,
+        session_id: &AuthSessionId,
+        token: &str,
+    ) -> Result<SessionRevocation, ControlPlaneError> {
+        if token.is_empty() || token.len() > MAX_TOKEN_BYTES {
+            return Err(ControlPlaneError::Unauthorized(
+                "unknown control-plane credential".into(),
+            ));
+        }
+        let Some(mut session) = self.store.auth_session(session_id)? else {
+            return Err(ControlPlaneError::NotFound(
+                "control-plane session not found".into(),
+            ));
+        };
+        if session.organization != *organization {
+            // Tenant isolation: a foreign session is the same not-found a
+            // missing one answers.
+            return Err(ControlPlaneError::NotFound(
+                "control-plane session not found".into(),
+            ));
+        }
+        if session.token_hash != TokenHash::of(token) {
+            return Err(ControlPlaneError::Unauthorized(
+                "presented credential does not own the named session".into(),
+            ));
+        }
+        if session.revoked_ms.is_some() {
+            return Ok(SessionRevocation {
+                session,
+                already_revoked: true,
+            });
+        }
+        session.revoked_ms = Some(self.now_ms());
+        self.store.put_auth_session(&session)?;
+        Ok(SessionRevocation {
+            session,
+            already_revoked: false,
+        })
     }
 
     /// The caller's identity view (used by `GET /native/identity`).
@@ -568,7 +792,7 @@ impl ControlPlane {
             crate::rbac::PrincipalSubject::ServiceAccount(_) => {
                 return Err(ControlPlaneError::Forbidden(
                     "a service account cannot invite members".into(),
-                ))
+                ));
             }
         };
         let now = self.now_ms();
@@ -651,17 +875,17 @@ impl ControlPlane {
                         InvitationStatus::Accepted => {
                             return Err(ControlPlaneError::Conflict(
                                 "invitation was already accepted".into(),
-                            ))
+                            ));
                         }
                         InvitationStatus::Revoked => {
                             return Err(ControlPlaneError::Conflict(
                                 "invitation was revoked".into(),
-                            ))
+                            ));
                         }
                         InvitationStatus::Expired => {
                             return Err(ControlPlaneError::Conflict(
                                 "invitation has expired".into(),
-                            ))
+                            ));
                         }
                         InvitationStatus::Pending => {}
                     }
@@ -723,15 +947,15 @@ impl ControlPlane {
             InvitationStatus::Accepted => {
                 return Err(ControlPlaneError::Conflict(
                     "an accepted invitation cannot be revoked".into(),
-                ))
+                ));
             }
             InvitationStatus::Revoked => {
                 return Err(ControlPlaneError::Conflict(
                     "invitation was already revoked".into(),
-                ))
+                ));
             }
             InvitationStatus::Expired => {
-                return Err(ControlPlaneError::Conflict("invitation has expired".into()))
+                return Err(ControlPlaneError::Conflict("invitation has expired".into()));
             }
         }
         let mut revoked = invitation;
@@ -910,7 +1134,7 @@ impl ControlPlane {
             crate::rbac::PrincipalSubject::ServiceAccount(_) => {
                 return Err(ControlPlaneError::Forbidden(
                     "a service account cannot request approvals on behalf of a user".into(),
-                ))
+                ));
             }
         };
         let key = Self::validate_idempotency_key(idempotency_key)?;
@@ -981,7 +1205,7 @@ impl ControlPlane {
             crate::rbac::PrincipalSubject::ServiceAccount(_) => {
                 return Err(ControlPlaneError::Forbidden(
                     "a service account cannot decide approvals".into(),
-                ))
+                ));
             }
         };
         let now = self.now_ms();
@@ -1190,6 +1414,59 @@ mod tests {
             cp.authenticate(token.expose()).unwrap_err(),
             ControlPlaneError::Unauthorized(_)
         ));
+    }
+
+    #[test]
+    fn revoke_session_is_durable_idempotent_and_tenant_scoped() {
+        let cp = service();
+        let boot = cp
+            .bootstrap_organization("Acme", "owner@acme.test", "Owner", "k")
+            .unwrap();
+        let token = boot.token.clone().unwrap().expose().to_string();
+        let organization = boot.organization.id.clone();
+        let session_id = boot.session.id.clone();
+        // The owner token does not own a session id that does not exist.
+        let ghost = AuthSessionId::try_new("ses_ghost").unwrap();
+        assert!(matches!(
+            cp.revoke_session(&organization, &ghost, &token)
+                .unwrap_err(),
+            ControlPlaneError::NotFound(_)
+        ));
+        // A FOREIGN organization's session is the same not-found (no leak).
+        let other = cp
+            .bootstrap_organization("Other", "owner@other.test", "Owner", "k2")
+            .unwrap();
+        assert!(matches!(
+            cp.revoke_session(&other.organization.id, &session_id, &token)
+                .unwrap_err(),
+            ControlPlaneError::NotFound(_)
+        ));
+        // A credential that does not own the named session is Unauthorized
+        // (the other owner's token, a random secret, and garbage).
+        let other_token = other.token.clone().unwrap().expose().to_string();
+        for wrong in ["not-a-token", "", other_token.as_str()] {
+            assert!(matches!(
+                cp.revoke_session(&organization, &session_id, wrong)
+                    .unwrap_err(),
+                ControlPlaneError::Unauthorized(_)
+            ));
+        }
+        // First logout: durable revocation; the token dies for authenticate.
+        let first = cp
+            .revoke_session(&organization, &session_id, &token)
+            .unwrap();
+        assert!(!first.already_revoked);
+        assert!(first.session.revoked_ms.is_some());
+        assert!(matches!(
+            cp.authenticate(&token).unwrap_err(),
+            ControlPlaneError::Unauthorized(_)
+        ));
+        // Second logout is the typed idempotent replay, not an error.
+        let second = cp
+            .revoke_session(&organization, &session_id, &token)
+            .unwrap();
+        assert!(second.already_revoked);
+        assert_eq!(second.session.revoked_ms, first.session.revoked_ms);
     }
 
     #[test]
@@ -2096,5 +2373,106 @@ mod crash_and_race_tests {
         assert_eq!(rows(&probe, "cp_membership"), 1);
         assert_eq!(rows(&probe, "cp_auth_session"), 1);
         assert_eq!(rows(&probe, "cp_idempotency"), 1);
+    }
+
+    /// External login: a crash at EVERY statement boundary rolls back the
+    /// user, the external subject link, the membership and the session
+    /// together; the retry completes exactly one logical login (with a fresh
+    /// one-shot token) and no partial subject binding survives.
+    #[test]
+    fn login_crash_matrix_is_one_transaction() {
+        use crate::rbac::PrincipalSubject;
+
+        let base = tempfile::tempdir().unwrap();
+        let clock = Arc::new(ManualClock::new(T0));
+        let mut reached_full_path = false;
+        for k in 1..=12usize {
+            let path = base.path().join(format!("login-{k}.db"));
+            let store = open(&path);
+            let cp = ControlPlane::new(store.clone(), clock.clone());
+            let boot = cp
+                .bootstrap_organization("Acme", "owner@acme.test", "Owner", "boot")
+                .unwrap();
+            let org = boot.organization.id.clone();
+            store.inject_crash_after(k);
+            let attempt = cp.login_external(
+                &org,
+                "idp",
+                "sub-1",
+                "new@acme.test",
+                "New",
+                true,
+                Role::Member,
+            );
+            store.inject_crash_after(usize::MAX);
+            if let Ok(login) = attempt {
+                reached_full_path = true;
+                assert_eq!(login.role, Role::Member, "k={k}");
+                // The one-shot token authenticates the resolved user.
+                let principal = cp.authenticate(login.token.expose()).unwrap();
+                assert_eq!(
+                    principal.subject,
+                    PrincipalSubject::User(login.user.id.clone()),
+                    "k={k}"
+                );
+                assert_eq!(rows(&store, "cp_user"), 2, "k={k}: owner + sso user");
+                assert_eq!(rows(&store, "cp_external_identity"), 1, "k={k}");
+                assert_eq!(rows(&store, "cp_membership"), 2, "k={k}");
+                assert_eq!(rows(&store, "cp_auth_session"), 2, "k={k}");
+                break;
+            }
+            let attempt = attempt.unwrap_err();
+            assert!(
+                matches!(attempt, ControlPlaneError::Backend(_)),
+                "k={k}: {attempt:?}"
+            );
+            let store = open(&path);
+            // No half-bound subject: no user, no link, no membership, no
+            // session (nor any claimed idempotency key).
+            assert!(
+                store.user_by_email("new@acme.test").unwrap().is_none(),
+                "k={k}: a partial SSO user survived"
+            );
+            assert!(
+                store.external_identity("idp", "sub-1").unwrap().is_none(),
+                "k={k}: a partial subject link survived"
+            );
+            assert_eq!(rows(&store, "cp_user"), 1, "k={k}");
+            assert_eq!(rows(&store, "cp_external_identity"), 0, "k={k}");
+            assert_eq!(rows(&store, "cp_membership"), 1, "k={k}");
+            assert_eq!(rows(&store, "cp_auth_session"), 1, "k={k}");
+            // The retry completes the login for real, binding the subject.
+            let cp = ControlPlane::new(store.clone(), clock.clone());
+            let login = cp
+                .login_external(
+                    &org,
+                    "idp",
+                    "sub-1",
+                    "new@acme.test",
+                    "New",
+                    true,
+                    Role::Member,
+                )
+                .unwrap();
+            assert_eq!(
+                cp.authenticate(login.token.expose()).unwrap().subject,
+                PrincipalSubject::User(login.user.id.clone()),
+                "k={k}"
+            );
+            assert_eq!(
+                store
+                    .external_identity("idp", "sub-1")
+                    .unwrap()
+                    .unwrap()
+                    .user,
+                login.user.id,
+                "k={k}"
+            );
+            assert_eq!(rows(&store, "cp_user"), 2, "k={k}");
+            assert_eq!(rows(&store, "cp_external_identity"), 1, "k={k}");
+            assert_eq!(rows(&store, "cp_membership"), 2, "k={k}");
+            assert_eq!(rows(&store, "cp_auth_session"), 2, "k={k}");
+        }
+        assert!(reached_full_path, "the matrix never reached the full path");
     }
 }

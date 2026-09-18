@@ -204,6 +204,15 @@ impl WorkspaceFileService {
     pub fn open_count(&self) -> usize {
         recover_lock(&self.workspaces).len()
     }
+
+    /// The handle registered for `workspace_id`, if open (idle unload
+    /// removes it). A READ-ONLY registry probe: unlike [`Self::open`] it
+    /// never re-registers a workspace or creates a watcher, so callers that
+    /// must act only on service-owned workspaces can refuse a foreign or
+    /// unloaded handle without side effects.
+    pub fn registered_handle(&self, workspace_id: WorkspaceId) -> Option<WorkspaceHandle> {
+        recover_lock(&self.workspaces).get(&workspace_id).cloned()
+    }
 }
 
 #[derive(Clone)]
@@ -3179,7 +3188,7 @@ mod tests {
     /// must cost less than one full canonicalize.
     #[cfg(unix)]
     #[test]
-    #[ignore]
+    #[ignore = "[perf] fd-walk timing bounds (linearity + per-component cost vs canonicalize) — run explicitly"]
     fn perf_fd_walk_within_2x_of_canonicalize() {
         let (_d, _s, h) = fixture();
         let root = h.root().to_path_buf();

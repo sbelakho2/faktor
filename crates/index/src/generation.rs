@@ -25,7 +25,9 @@ use serde::{Deserialize, Serialize};
 use crate::{FileEntry, Symbol, WorkspaceIndex};
 
 /// Format tag of a generation file; bumped on incompatible envelope shapes.
-pub const GENERATION_FILE_FORMAT: u32 = 1;
+/// v2 removed the never-read per-file `tokens`/`size` members (v1 files are
+/// refused loudly and rebuilt, never partially decoded).
+pub const GENERATION_FILE_FORMAT: u32 = 2;
 
 /// One entry of a workspace fingerprint: the identity of a regular file the
 /// walker saw (relative path, size, mtime ms). Compared entry-wise after
@@ -70,10 +72,8 @@ pub struct WorkspaceData {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredFile {
-    pub tokens: Vec<String>,
     pub symbols: Vec<Symbol>,
     pub modified_ms: i64,
-    pub size: u64,
     /// Chunk content hashes (additive; see
     /// [`crate::embedding::chunk_text`]).
     #[serde(default)]
@@ -102,10 +102,8 @@ impl GenerationFile {
                 files.insert(
                     path.clone(),
                     StoredFile {
-                        tokens: e.tokens.clone(),
                         symbols: e.symbols.clone(),
                         modified_ms: e.modified_ms,
-                        size: e.size,
                         chunks: e.chunks.clone(),
                     },
                 );
@@ -172,10 +170,8 @@ impl GenerationFile {
             files.insert(
                 path.clone(),
                 FileEntry {
-                    tokens: f.tokens.clone(),
                     symbols: f.symbols.clone(),
                     modified_ms: f.modified_ms,
-                    size: f.size,
                     chunks: f.chunks.clone(),
                 },
             );
@@ -199,7 +195,22 @@ impl GenerationFile {
             );
         }
         idx.symbols.insert(ws, symbols);
-        idx.token_count = self.data.token_count as usize;
+        // The unique-token cap is enforced at index time; a generation
+        // claiming more is corrupt, never a silently accepted counter that
+        // would disable the cap after a reload.
+        let token_count = usize::try_from(self.data.token_count).map_err(|_| {
+            format!(
+                "generation token_count {} does not fit this platform",
+                self.data.token_count
+            )
+        })?;
+        if token_count > crate::MAX_UNIQUE_TOKENS {
+            return Err(format!(
+                "generation token_count {token_count} exceeds the {} unique-token cap",
+                crate::MAX_UNIQUE_TOKENS
+            ));
+        }
+        idx.token_count = token_count;
         // Persisted vectors are hostile input like everything else in the
         // envelope: invalid shapes are dropped loudly, bounds re-applied.
         idx.embeddings
@@ -295,6 +306,21 @@ mod tests {
         let mut again = GenerationFile::capture(ws, 3, &mat, back.fingerprint);
         again.built_ms = back.built_ms;
         assert_eq!(again.to_bytes().unwrap(), bytes);
+    }
+
+    #[test]
+    fn hostile_token_count_is_refused_at_materialize() {
+        // The unique-token cap is an index-time invariant; a persisted
+        // envelope claiming more is corrupt and must refuse loudly (it
+        // would otherwise disable the cap for every later index_file).
+        let (idx, ws) = sample();
+        let mut env = GenerationFile::capture(ws, 1, &idx, vec![]);
+        env.data.token_count = (crate::MAX_UNIQUE_TOKENS + 1) as u64;
+        let err = env.materialize().unwrap_err();
+        assert!(err.contains("unique-token cap"), "{err}");
+        // Exactly at the cap is still admissible.
+        env.data.token_count = crate::MAX_UNIQUE_TOKENS as u64;
+        assert!(env.materialize().is_ok());
     }
 
     #[test]

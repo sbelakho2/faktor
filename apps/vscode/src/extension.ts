@@ -84,6 +84,18 @@ import {
   withBinding,
 } from './workspaceBinding';
 import { MAX_STEER_CHARS, normalizeSteerText } from './steer';
+import {
+  ControlPlaneAuthSession,
+  ControlPlaneResolution,
+  ControlPlaneScope,
+  controlPlaneAuthSessionValid,
+  controlPlaneScopeValid,
+  controlPlaneTokenForClient,
+  logoutControlPlane,
+  resolveControlPlaneToken,
+  storeControlPlaneToken,
+  watchControlPlaneSecretChanges,
+} from './controlPlaneAuth';
 import { ChatMessage, ChatViewProvider } from './webview';
 
 const HISTORY_PAGE_LIMIT = 100;
@@ -93,6 +105,10 @@ const SESSION_BINDINGS_KEY = 'faktor.sessionBindings';
 const BOARD_PAGE_LIMIT = 100;
 /** One bounded billing usage page per read (the daemon caps at 200). */
 const BILLING_PAGE_LIMIT = 50;
+/** Default cloud control-plane coordinates; both are non-secret. */
+const DEFAULT_CONTROL_PLANE_ENDPOINT = 'https://api.faktor.dev';
+/** The last control-plane notice, so a repeated refusal never spams the chat. */
+let lastControlPlaneNotice: string | null = null;
 
 interface ActiveSession {
   daemon: DaemonHandle | null;
@@ -238,6 +254,304 @@ function reportError(error: unknown): void {
   void vscode.window.showErrorMessage(`Faktor: ${message}`);
 }
 
+// ------------------------------------------------- control-plane credentials
+//
+// The cloud control-plane credential lives in `vscode.SecretStorage` keyed by
+// the (non-secret) endpoint + organization coordinates. The deprecated
+// plaintext `faktor.controlToken` setting is read once for a migration prompt
+// and then deleted; its value is NEVER handed to the native client (the
+// daemon-password `bearerToken` path is separate and unchanged).
+
+function controlPlaneNotice(level: 'info' | 'error', text: string): void {
+  if (lastControlPlaneNotice === text) {
+    return;
+  }
+  lastControlPlaneNotice = text;
+  chatProvider?.postNotice(level, text);
+}
+
+function controlPlaneScope(): ControlPlaneScope | null {
+  const scope: ControlPlaneScope = {
+    endpoint: config('controlPlaneEndpoint', ''),
+    organization: config('controlPlaneOrganization', ''),
+  };
+  return controlPlaneScopeValid(scope) ? scope : null;
+}
+
+async function persistControlPlaneScope(scope: ControlPlaneScope): Promise<void> {
+  const cfg = vscode.workspace.getConfiguration('faktor');
+  await cfg.update('controlPlaneEndpoint', scope.endpoint, vscode.ConfigurationTarget.Global);
+  await cfg.update(
+    'controlPlaneOrganization',
+    scope.organization,
+    vscode.ConfigurationTarget.Global,
+  );
+}
+
+/**
+ * The NON-secret auth-session coordinates of the stored credential. The
+ * logout route's strict body must name the `{organization, session_id}` the
+ * presented token owns; an opaque token cannot be reverse-mapped, so the id
+ * is provisioned with the credential (SSO callback / bootstrap result) and
+ * only ever used for the revoke call.
+ */
+function controlPlaneAuthSession(): ControlPlaneAuthSession | null {
+  const scope = controlPlaneScope();
+  if (scope === null) {
+    return null;
+  }
+  const session: ControlPlaneAuthSession = {
+    organization: scope.organization,
+    sessionId: config('controlPlaneAuthSession', ''),
+  };
+  return controlPlaneAuthSessionValid(session) ? session : null;
+}
+
+async function persistControlPlaneAuthSession(sessionId: string): Promise<void> {
+  await vscode.workspace
+    .getConfiguration('faktor')
+    .update('controlPlaneAuthSession', sessionId, vscode.ConfigurationTarget.Global);
+}
+
+/** The deprecated plaintext setting, behind the migration seam. */
+function legacyPlaintextSetting(): {
+  read(): string | null;
+  clear(): Promise<void>;
+} {
+  return {
+    read: () => {
+      const raw = config('controlToken', '');
+      return typeof raw === 'string' && raw.length > 0 ? raw : null;
+    },
+    clear: async () => {
+      const cfg = vscode.workspace.getConfiguration('faktor');
+      const inspected = cfg.inspect<string>('controlToken');
+      if (inspected?.globalValue !== undefined) {
+        await cfg.update('controlToken', undefined, vscode.ConfigurationTarget.Global);
+      }
+      if (inspected?.workspaceValue !== undefined) {
+        await cfg.update('controlToken', undefined, vscode.ConfigurationTarget.Workspace);
+      }
+    },
+  };
+}
+
+/**
+ * Resolve the (endpoint, organization) coordinates when only the legacy
+ * plaintext credential exists: prompt for them before the migration so the
+ * secret can be keyed, and persist them (non-secret) for the next run.
+ */
+async function ensureControlPlaneScope(hasLegacy: boolean): Promise<ControlPlaneScope | null> {
+  const current = controlPlaneScope();
+  if (current !== null) {
+    return current;
+  }
+  if (!hasLegacy) {
+    return null;
+  }
+  const endpoint = await vscode.window.showInputBox({
+    title: 'Faktor: migrate control-plane credential',
+    prompt: 'Cloud control-plane endpoint the credential belongs to',
+    value: config('controlPlaneEndpoint', '') || DEFAULT_CONTROL_PLANE_ENDPOINT,
+    ignoreFocusOut: true,
+  });
+  if (endpoint === undefined || endpoint.trim().length === 0) {
+    return null;
+  }
+  const organization = await vscode.window.showInputBox({
+    title: 'Faktor: migrate control-plane credential',
+    prompt: 'Organization (or account) id the credential belongs to',
+    value: config('controlPlaneOrganization', ''),
+    ignoreFocusOut: true,
+  });
+  if (organization === undefined || organization.trim().length === 0) {
+    return null;
+  }
+  const scope: ControlPlaneScope = {
+    endpoint: endpoint.trim(),
+    organization: organization.trim(),
+  };
+  await persistControlPlaneScope(scope);
+  return scope;
+}
+
+/**
+ * Resolve the control-plane credential for the running client: secret store
+ * first, one-shot migration of the deprecated plaintext setting, refusal
+ * (never a send) when the migration is declined or impossible.
+ */
+async function applyControlPlaneCredential(
+  client: NativeClient,
+  context: vscode.ExtensionContext,
+): Promise<void> {
+  const plaintext = legacyPlaintextSetting();
+  // The deprecated plaintext value is read ONCE for this resolution; it is
+  // never retained, never sent, and deleted by a successful migration.
+  const legacyToken = plaintext.read();
+  const scope = await ensureControlPlaneScope(legacyToken !== null);
+  let resolution: ControlPlaneResolution;
+  try {
+    resolution = await resolveControlPlaneToken({
+      secrets: context.secrets,
+      plaintext,
+      scope,
+      legacyToken,
+      confirmMigration: async () => {
+        const choice = await vscode.window.showWarningMessage(
+          'Faktor: the control-plane credential is stored in plaintext settings.',
+          {
+            modal: true,
+            detail:
+              'Move it into the OS/IDE secret store now? On migration the plaintext setting is deleted; ' +
+              'until then the value is refused for cloud calls and never sent.',
+          },
+          'Migrate now',
+        );
+        return choice === 'Migrate now';
+      },
+    });
+  } catch (error) {
+    client.setControlToken(null);
+    controlPlaneNotice('error', `control-plane credential unavailable: ${messageOf(error)}`);
+    return;
+  }
+  if (resolution.kind === 'legacy-refused') {
+    client.setControlToken(null);
+    controlPlaneNotice('error', resolution.reason);
+    return;
+  }
+  if (resolution.kind === 'migrated') {
+    controlPlaneNotice('info', 'control-plane credential migrated into the OS/IDE secret store');
+  } else if (resolution.kind === 'secret' && resolution.legacyCleared) {
+    controlPlaneNotice('info', 'deprecated plaintext control-plane credential deleted (secret store wins)');
+  } else {
+    lastControlPlaneNotice = null;
+  }
+  client.setControlToken(controlPlaneTokenForClient(resolution));
+}
+
+/** `Faktor: Sign in to Control Plane` — store the credential securely. */
+async function controlPlaneSignIn(context: vscode.ExtensionContext): Promise<void> {
+  const current = controlPlaneScope();
+  const endpoint = await vscode.window.showInputBox({
+    title: 'Faktor: control-plane sign-in',
+    prompt: 'Cloud control-plane endpoint (non-secret; keys the stored credential)',
+    value: current?.endpoint ?? DEFAULT_CONTROL_PLANE_ENDPOINT,
+    ignoreFocusOut: true,
+  });
+  if (endpoint === undefined || endpoint.trim().length === 0) {
+    return;
+  }
+  const organization = await vscode.window.showInputBox({
+    title: 'Faktor: control-plane sign-in',
+    prompt: 'Organization (or account) id',
+    value: current?.organization ?? '',
+    ignoreFocusOut: true,
+  });
+  if (organization === undefined || organization.trim().length === 0) {
+    return;
+  }
+  const token = await vscode.window.showInputBox({
+    title: 'Faktor: control-plane sign-in',
+    prompt: 'Credential (stored in the OS/IDE secret store, never in settings)',
+    password: true,
+    ignoreFocusOut: true,
+  });
+  if (token === undefined || token.trim().length === 0) {
+    controlPlaneNotice('error', 'no credential entered; nothing was stored');
+    return;
+  }
+  const sessionId = await vscode.window.showInputBox({
+    title: 'Faktor: control-plane sign-in',
+    prompt:
+      'Auth-session id (non-secret; from the SSO callback or the bootstrap result). Needed so sign-out can revoke the ' +
+      'server-side session; leave empty when unknown.',
+    value: config('controlPlaneAuthSession', ''),
+    ignoreFocusOut: true,
+  });
+  if (sessionId === undefined) {
+    controlPlaneNotice('error', 'sign-in cancelled; nothing was stored');
+    return;
+  }
+  const scope: ControlPlaneScope = {
+    endpoint: endpoint.trim(),
+    organization: organization.trim(),
+  };
+  try {
+    await storeControlPlaneToken(context.secrets, legacyPlaintextSetting(), scope, token);
+    await persistControlPlaneScope(scope);
+    await persistControlPlaneAuthSession(sessionId.trim());
+    active.client?.setControlToken(token);
+    lastControlPlaneNotice = null;
+    controlPlaneNotice(
+      'info',
+      `control-plane credential for ${scope.organization} stored in the OS/IDE secret store`,
+    );
+    await refresh();
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+/**
+ * `Faktor: Sign out of Control Plane` — revoke the remote session when the
+ * daemon is reachable AND the non-secret session id is known, then delete the
+ * local secret unconditionally. A refusal is reported as the daemon typed it
+ * (401 not-owner, 404 unknown session, 409 control plane disabled); a 404 is
+ * the route's own not-found, never a "daemon predates the route" story.
+ */
+async function controlPlaneSignOut(context: vscode.ExtensionContext): Promise<void> {
+  const result = await logoutControlPlane({
+    secrets: context.secrets,
+    plaintext: legacyPlaintextSetting(),
+    scope: controlPlaneScope(),
+    session: controlPlaneAuthSession(),
+    revoke: async (_token, session) => {
+      const client = active.client;
+      if (!client) {
+        throw new Error('the daemon is not running, so the control plane is unreachable');
+      }
+      try {
+        await client.revokeControlSession(session.organization, session.sessionId);
+      } catch (error) {
+        if (error instanceof NativeApiError) {
+          if (error.status === 401) {
+            throw new Error(
+              `the stored credential does not own the named auth session, or the session is already revoked ` +
+                `(HTTP 401 ${error.code}); no remote session was revoked`,
+            );
+          }
+          if (error.status === 404) {
+            throw new Error(
+              `the daemon found no auth session ${session.sessionId} under ${session.organization} for this ` +
+                `credential (HTTP 404 ${error.code}); no remote session was revoked`,
+            );
+          }
+          if (error.status === 409) {
+            throw new Error(
+              `the daemon control plane is disabled (HTTP 409 ${error.code}); no remote session was revoked`,
+            );
+          }
+        }
+        throw error;
+      }
+    },
+  });
+  active.client?.setControlToken(null);
+  // The session id is dead with the session (and useless without a stored
+  // credential); clear the non-secret coordinate so a stale id is never
+  // presented for a future credential.
+  await persistControlPlaneAuthSession('');
+  const remote =
+    result.remoteError !== null
+      ? `the remote revoke failed (${result.remoteError}); the local credential was still deleted`
+      : result.hadSecret
+        ? 'the remote session was revoked'
+        : 'no stored credential was found';
+  controlPlaneNotice(result.remoteError === null ? 'info' : 'error', `signed out: ${remote}`);
+  await refresh();
+}
+
 /**
  * The completion-contract block of the cockpit/task card. Step rows come
  * from the daemon when it serves them; otherwise the block is derived from
@@ -353,9 +667,11 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
     const client = new NativeClient({
       baseUrl: daemon.baseUrl,
       bearerToken: daemon.bearerToken,
-      controlToken: config('controlToken', ''),
       fetch: fetchAdapter(),
     });
+    // The control-plane credential is resolved from the OS/IDE secret store
+    // (never from the deprecated plaintext setting) before the first read.
+    await applyControlPlaneCredential(client, context);
     const health = await client.health();
     active.daemon = daemon;
     active.client = client;
@@ -1604,6 +1920,27 @@ export function activate(context: vscode.ExtensionContext): void {
     handle: (message) => handleWebviewMessage(message, context),
   });
 
+  // EXTERNAL SecretStorage changes (another window, the OS keychain UI, an
+  // import) must reach the RUNNING client: `onDidChange` re-runs the same
+  // resolution, so an update replaces the live `x-faktor-control-token` and a
+  // deletion clears it — no daemon restart, no stale credential.
+  const secretWatch = watchControlPlaneSecretChanges({
+    secrets: context.secrets,
+    apply: async () => {
+      const client = active.client;
+      if (client === null) {
+        return;
+      }
+      await applyControlPlaneCredential(client, context);
+      controlPlaneNotice(
+        'info',
+        'the control-plane credential in the OS/IDE secret store changed; the running client uses the updated value',
+      );
+    },
+    onError: (error) =>
+      controlPlaneNotice('error', `control-plane credential refresh failed: ${messageOf(error)}`),
+  });
+
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatProvider, {
       webviewOptions: { retainContextWhenHidden: true },
@@ -1626,12 +1963,19 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand('faktor.cancelTask', () => cancelActiveRun()),
     vscode.commands.registerCommand('faktor.refresh', () => refresh()),
+    vscode.commands.registerCommand('faktor.controlPlaneSignIn', async () => {
+      await controlPlaneSignIn(context);
+    }),
+    vscode.commands.registerCommand('faktor.controlPlaneSignOut', async () => {
+      await controlPlaneSignOut(context);
+    }),
     {
       dispose: store.subscribe((snapshot) => {
         chatProvider?.postSnapshot(snapshot);
         updateStatusBar();
       }),
     },
+    { dispose: () => secretWatch.dispose() },
     { dispose: () => stopServer() },
   );
 

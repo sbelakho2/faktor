@@ -981,14 +981,49 @@ async fn steer_restart_mid_queue_applies_each_durable_message_exactly_once() {
             .await
             .unwrap()
     });
+    // PIN the kill to a provably mid-MODEL-CALL point: the first stream call
+    // parks 30 s before its first chunk, so the abort below cannot land
+    // inside the echo tool run. A kill with a pending tool row is a
+    // DIFFERENT, equally legal outcome — the product refuses to blindly
+    // re-run an UnknownEffect tool (Commandment 6) and ends the child
+    // FailedRecoverable — and that window is NOT what this test pins (fixed
+    // sleeps cannot pin it: scheduler/fsync starvation shifts the kill into
+    // the tool window under load).
+    env.provider.set_per_call_delays(vec![30_000]);
     wait_until(|| env.provider.count() >= 1, 300).await;
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let child_sid = {
+        let rows =
+            OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-steer-crash")
+                .unwrap();
+        assert_eq!(rows.len(), 1);
+        SessionId::new(rows[0].session_id)
+    };
     env.orchestrator
         .steer_child("child-0", "durable note")
         .expect("steer ok");
-    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    // The steer is durable and UNapplied at the kill (read it back — the
+    // durable row is the condition, never a sleep).
+    {
+        let s = env.manager.get_session(child_sid).unwrap().unwrap();
+        let rows = s.orchestrator_ctl_all().unwrap();
+        let steer = rows
+            .iter()
+            .find(|r| matches!(r.control, ChildControl::Steer { .. }))
+            .expect("steer row durable");
+        assert!(!steer.applied(), "steer must be pending at the kill");
+    }
     handle.abort(); // mid-drive kill (drop the executor future)
     let _ = handle.await;
+    // The pinned kill leaves the turn mid-model-call with NO tool run in
+    // flight: exactly the window `recover_session` resumes (a pending tool
+    // row would force FailedRecoverable by design).
+    {
+        let s = env.manager.get_session(child_sid).unwrap().unwrap();
+        assert!(
+            s.pending_tool_runs().unwrap().is_empty(),
+            "the pinned crash must not leave a tool run in flight"
+        );
+    }
     let rows =
         OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-steer-crash")
             .unwrap();

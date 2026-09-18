@@ -587,6 +587,30 @@ class NativeClient(
         )
     )
 
+    /**
+     * Revoke the caller's control-plane session (`POST /native/sso/logout`).
+     * The route needs the daemon password (the bearer this client always
+     * sends) AND the session's own token (`x-faktor-control-token`), plus the
+     * STRICT body `{organization, session_id}` naming the session the token
+     * must own. The session id is a NON-secret coordinate provisioned with
+     * the credential; the token is never derivable from it. Server refusals
+     * are typed: foreign/missing session 404, non-owning token 401, disabled
+     * control plane 409 — the caller reports the refusal and the local
+     * credential is still removed (never a claimed revoke).
+     */
+    fun revokeControlSession(organization: String, sessionId: String) {
+        if (organization.isBlank() || sessionId.isBlank()) {
+            throw NativeProtocolException(
+                "POST /native/sso/logout",
+                "revoking a control-plane session requires the organization and the auth-session id"
+            )
+        }
+        request(
+            "POST", "/native/sso/logout", null,
+            NativeRequests.ssoLogout(organization, sessionId)
+        )
+    }
+
     fun verification(sessionId: String): NativeVerificationView = parseNativeVerificationView(
         request("GET", "/native/session/" + encode(sessionId) + "/verification")
     )

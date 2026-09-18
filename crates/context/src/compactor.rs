@@ -253,7 +253,7 @@ impl EvidenceArchive {
         let mut id_raw = u64::from_be_bytes(hash[..8].try_into().expect("8 bytes"));
         loop {
             let candidate = EvidenceId(id_raw);
-            match self.store.get(candidate) {
+            match self.store.get(candidate)? {
                 Some(stored) if stored.envelope.backing_hash == Some(hash) => {
                     // Exact duplicate: the SAME evidence ref, never a second
                     // copy (audit 70 dedupe at the evidence layer).

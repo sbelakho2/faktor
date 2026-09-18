@@ -806,6 +806,9 @@ private fun assertClientRoutes() {
     daemon.on("POST", "/native/credits/grant") { _, response ->
         response.json(200, CREDIT_GRANT_JSON)
     }
+    daemon.on("POST", "/native/sso/logout") { _, response ->
+        response.json(200, "{\"ok\":true,\"revoked\":true,\"alreadyRevoked\":false}")
+    }
     daemon.on("GET", "/native/session/7/usage") { _, response ->
         response.json(200, SESSION_USAGE_JSON)
     }
@@ -907,6 +910,31 @@ private fun assertClientRoutes() {
             it.method == "GET" && it.path == "/native/identity"
         }
         assertEquals("cp-selftest", claimed.headers["x-faktor-control-token"])
+        // Sign-out names the auth session in the STRICT route body and
+        // presents the session's own token alongside the daemon password.
+        privileged.revokeControlSession("org-local", "ses-1")
+        val logout = daemon.requests.last {
+            it.method == "POST" && it.path == "/native/sso/logout"
+        }
+        assertEquals("Bearer tok", logout.headers["authorization"])
+        assertEquals("cp-selftest", logout.headers["x-faktor-control-token"])
+        assertEquals(
+            "{\"organization\":\"org-local\",\"session_id\":\"ses-1\"}",
+            logout.body
+        )
+        // An incomplete body is refused before it can leave the client.
+        try {
+            privileged.revokeControlSession(" ", "ses-1")
+            fail("a blank organization must be refused")
+        } catch (e: NativeProtocolException) {
+            if (!e.message.orEmpty().contains("auth-session id")) throw e
+        }
+        try {
+            privileged.revokeControlSession("org-local", "")
+            fail("a blank session id must be refused")
+        } catch (e: NativeProtocolException) {
+            if (!e.message.orEmpty().contains("auth-session id")) throw e
+        }
     } finally {
         daemon.stop()
     }

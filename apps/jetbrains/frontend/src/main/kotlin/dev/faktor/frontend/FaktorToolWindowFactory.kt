@@ -21,8 +21,19 @@ class FaktorToolWindowFactory : ToolWindowFactory {
     override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
         val dataDir = resolveDataDir()
         Files.createDirectories(dataDir)
-        val service = FaktorFrontendService(resolveBinary(project), dataDir)
-        val panel = FaktorChatPanel(service)
+        // Parity with the VS Code extension: the control-plane credential is
+        // read from the OS/IDE secret store (PasswordSafe, credential
+        // attributes = service + "endpoint|organization") and handed to the
+        // client; the non-secret coordinates live in project properties.
+        val credentialStore = ControlPlaneCredentialStore(IntelliJPasswordSafeVault())
+        val scopeStore = IntelliJControlPlaneScopeStore(project)
+        val sessionStore = IntelliJControlPlaneSessionStore(project)
+        val service = FaktorFrontendService(
+            resolveBinary(project),
+            dataDir,
+            controlToken = credentialStore.resolve(scopeStore.read())
+        )
+        val panel = FaktorChatPanel(service, credentialStore, scopeStore, sessionStore)
         val content = ContentFactory.getInstance().createContent(panel, "Faktor", false)
         Disposer.register(
             content,

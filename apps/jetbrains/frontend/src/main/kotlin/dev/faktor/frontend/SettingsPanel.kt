@@ -19,7 +19,9 @@ import javax.swing.JButton
 import javax.swing.JComboBox
 import javax.swing.JLabel
 import javax.swing.JPanel
+import javax.swing.JPasswordField
 import javax.swing.JScrollPane
+import javax.swing.JTextField
 import java.awt.event.ActionListener
 
 class SettingsPanel : JPanel(BorderLayout()) {
@@ -28,6 +30,17 @@ class SettingsPanel : JPanel(BorderLayout()) {
         fun onRefreshProviders()
 
         fun onProviderSelectionChanged(provider: String, model: String)
+
+        /** Store ONE control-plane credential in the IDE credential store. */
+        fun onControlPlaneCredential(
+            endpoint: String,
+            organization: String,
+            sessionId: String,
+            token: String
+        )
+
+        /** Sign out: remove the credential from the IDE credential store. */
+        fun onControlPlaneLogout()
     }
 
     private val providerModel = DefaultComboBoxModel<String>()
@@ -50,6 +63,26 @@ class SettingsPanel : JPanel(BorderLayout()) {
 
     private val refreshButton = JButton("Refresh providers")
 
+    // Control-plane credential section: the token field is write-only (it is
+    // never read back from the store and is cleared on every save/logout), so
+    // a credential cannot leak into the panel, a log or a product setting.
+    private val controlPlaneEndpoint = JTextField(24)
+
+    private val controlPlaneOrganization = JTextField(16)
+
+    // The auth-session id is NON-secret: the sign-out route must name the
+    // session the presented token owns, and an opaque token cannot be
+    // reverse-mapped. It is stored with the coordinates, never in PasswordSafe.
+    private val controlPlaneSession = JTextField(16)
+
+    private val controlPlaneToken = JPasswordField(24)
+
+    private val controlPlaneStatus = JLabel("control plane: no credential stored")
+
+    private val saveCredentialButton = JButton("Store credential")
+
+    private val signOutButton = JButton("Sign out")
+
     private var listener: Listener? = null
 
     private var providers: List<NativeProviderInfo> = emptyList()
@@ -68,6 +101,8 @@ class SettingsPanel : JPanel(BorderLayout()) {
         providerCombo.addActionListener(ActionListener { providerChanged() })
         modelCombo.addActionListener(ActionListener { emitSelection() })
         refreshButton.addActionListener { listener?.onRefreshProviders() }
+        saveCredentialButton.addActionListener { submitControlPlaneCredential() }
+        signOutButton.addActionListener { submitControlPlaneLogout() }
         val selectors = JPanel(GridLayout(2, 2, 4, 4))
         selectors.add(JLabel("provider"))
         selectors.add(JLabel("model"))
@@ -80,6 +115,7 @@ class SettingsPanel : JPanel(BorderLayout()) {
         body.add(titledSection("mutation mode (Task composer)", mutationCombo))
         body.add(titledSection("providers", JScrollPane(providerArea)))
         body.add(titledSection("daemon", JScrollPane(daemonArea)))
+        body.add(titledSection("control plane credential", buildControlPlaneSection()))
         body.add(titledSection("actions", actions))
         add(status, BorderLayout.NORTH)
         add(body, BorderLayout.CENTER)
@@ -244,6 +280,94 @@ class SettingsPanel : JPanel(BorderLayout()) {
     fun providerText(): String = providerArea.text
 
     fun daemonText(): String = daemonArea.text
+
+    fun controlPlaneStatusText(): String = controlPlaneStatus.text
+
+    /** Prefill the NON-secret coordinates; the secret is never pre-filled. */
+    fun setControlPlaneScope(scope: ControlPlaneScope?) {
+        if (scope == null) return
+        controlPlaneEndpoint.text = scope.endpoint
+        controlPlaneOrganization.text = scope.organization
+    }
+
+    /** Prefill the NON-secret auth-session id (never the token). */
+    fun setControlPlaneSession(sessionId: String?) {
+        controlPlaneSession.text = sessionId ?: ""
+    }
+
+    fun setControlPlaneStatus(text: String) {
+        controlPlaneStatus.text = text
+    }
+
+    fun controlPlaneEndpointText(): String = controlPlaneEndpoint.text.trim()
+
+    fun controlPlaneOrganizationText(): String = controlPlaneOrganization.text.trim()
+
+    fun controlPlaneSessionText(): String = controlPlaneSession.text.trim()
+
+    fun controlPlaneTokenText(): String = String(controlPlaneToken.password)
+
+    fun clearControlPlaneTokenInput() {
+        controlPlaneToken.text = ""
+    }
+
+    /** Test/embedding input hook; the token is never read back from anywhere. */
+    internal fun enterControlPlaneCredential(
+        endpoint: String,
+        organization: String,
+        sessionId: String,
+        token: String
+    ) {
+        controlPlaneEndpoint.text = endpoint
+        controlPlaneOrganization.text = organization
+        controlPlaneSession.text = sessionId
+        controlPlaneToken.text = token
+    }
+
+    /**
+     * The save gesture: refuses an incomplete credential loudly (never writes
+     * a partial one) and hands the exact values to the listener, which writes
+     * through the credential store. The auth-session id is optional (it only
+     * enables remote sign-out revocation). The token field is cleared on every
+     * accepted submission.
+     */
+    internal fun submitControlPlaneCredential() {
+        val endpoint = controlPlaneEndpointText()
+        val organization = controlPlaneOrganizationText()
+        val sessionId = controlPlaneSessionText()
+        val token = controlPlaneTokenText()
+        if (endpoint.isEmpty() || organization.isEmpty() || token.trim().isEmpty()) {
+            setControlPlaneStatus("control plane: endpoint, organization and credential are required")
+            return
+        }
+        listener?.onControlPlaneCredential(endpoint, organization, sessionId, token)
+        clearControlPlaneTokenInput()
+    }
+
+    internal fun submitControlPlaneLogout() {
+        listener?.onControlPlaneLogout()
+    }
+
+    private fun buildControlPlaneSection(): JPanel {
+        val form = JPanel(GridLayout(0, 2, 4, 4))
+        form.add(JLabel("endpoint"))
+        form.add(controlPlaneEndpoint)
+        form.add(JLabel("organization"))
+        form.add(controlPlaneOrganization)
+        form.add(JLabel("auth session id (non-secret)"))
+        form.add(controlPlaneSession)
+        form.add(JLabel("credential"))
+        form.add(controlPlaneToken)
+        val actions = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
+        actions.add(saveCredentialButton)
+        actions.add(signOutButton)
+        val section = JPanel(GridLayout(0, 1, 0, 4))
+        section.add(JLabel("stored in the IDE credential store; never written to settings"))
+        section.add(form)
+        section.add(actions)
+        section.add(controlPlaneStatus)
+        return section
+    }
 
     private fun providerChanged() {
         refreshModelCombo()

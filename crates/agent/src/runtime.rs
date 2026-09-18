@@ -2781,17 +2781,19 @@ impl AgentRuntime {
         let cancel = receipt.op_meta.cancellation.clone();
         let outcome = self.drive_turn(handle, op_id, cancel, model).await;
         if let Err(e) = &outcome {
-            let _ = handle
-                .append_journal_event(
-                    faktor_core::event::EventKind::Failed,
-                    AgentState::FailedRecoverable,
-                    Some(op_id),
-                    Some(serde_json::json!({ "message": e.message })),
-                )
-                .await;
+            // Cleanup path: the ORIGINAL turn error must reach the caller, so
+            // a failed Failed-journal is recorded (marker + audit) instead.
+            self.dw_note_journal_failed(
+                handle,
+                op_id,
+                AgentState::FailedRecoverable,
+                serde_json::json!({ "message": e.message }),
+                DW_SITE_RECEIPT_JOURNAL,
+            )
+            .await;
             // The interrupted logical turn cannot resume: close its record
             // so no later recovery tries to continue a dead turn.
-            let _ = handle.finish_turn_record(op_id, "failed");
+            self.dw_note_finish_turn_record(handle, op_id, "failed", DW_SITE_RECEIPT_RECORD);
         }
         outcome
     }
@@ -3021,15 +3023,22 @@ impl AgentRuntime {
         let model = admitted.model.clone();
         let outcome = self.drive_turn(handle, admitted.op_id, token, model).await;
         if let Err(e) = &outcome {
-            let _ = handle
-                .append_journal_event(
-                    faktor_core::event::EventKind::Failed,
-                    AgentState::FailedRecoverable,
-                    Some(admitted.op_id),
-                    Some(serde_json::json!({ "message": e.message })),
-                )
-                .await;
-            let _ = handle.finish_turn_record(admitted.op_id, "failed");
+            // Cleanup path: the ORIGINAL turn error must reach the caller, so
+            // a failed Failed-journal is recorded (marker + audit) instead.
+            self.dw_note_journal_failed(
+                handle,
+                admitted.op_id,
+                AgentState::FailedRecoverable,
+                serde_json::json!({ "message": e.message }),
+                DW_SITE_ADMITTED_JOURNAL,
+            )
+            .await;
+            self.dw_note_finish_turn_record(
+                handle,
+                admitted.op_id,
+                "failed",
+                DW_SITE_ADMITTED_RECORD,
+            );
         }
         outcome
     }
@@ -3088,6 +3097,10 @@ impl AgentRuntime {
         handle: &faktor_session::SessionHandle,
     ) -> faktor_core::Result<RecoveryReport> {
         let session_id = handle.id();
+        // Retry-on-next-open FIRST: reconstruct any durable transition a
+        // failed write lost, before this sweep (or any driver) observes the
+        // session.
+        self.replay_durable_write_failures(handle);
         let pending = handle.pending_tool_runs()?;
         let current = handle.state()?;
         let mut report = RecoveryReport {
@@ -3300,7 +3313,14 @@ impl AgentRuntime {
         // FailedRecoverable: the interrupted turn is over — close its record.
         if handle.state()? == AgentState::FailedRecoverable {
             if let Some(rec) = handle.active_turn_record()? {
-                let _ = handle.finish_turn_record(rec.turn_op_id, "failed");
+                // Recovery sweep: failing here would abort the whole sweep on
+                // one record close, so the loss is recorded, not propagated.
+                self.dw_note_finish_turn_record(
+                    handle,
+                    rec.turn_op_id,
+                    "failed",
+                    DW_SITE_RECOVERY_RECORD,
+                );
             }
         }
         report.state = handle.state()?;
@@ -3639,13 +3659,20 @@ impl AgentRuntime {
             | AgentState::Completed
             | AgentState::NeedsUserInput => {
                 // The interrupted turn is over (its effects resolved as
-                // failed/unknown): report the end, never re-drive it.
+                // failed/unknown): report the end, never re-drive it. The
+                // close is recorded, not propagated: the outcome below is the
+                // genuine report and must not be masked by a record failure.
                 let status = if state == AgentState::Cancelled {
                     "cancelled"
                 } else {
                     "failed"
                 };
-                let _ = handle.finish_turn_record(turn_op, status);
+                self.dw_note_finish_turn_record(
+                    handle,
+                    turn_op,
+                    status,
+                    DW_SITE_CONTINUE_RECORD_DONE,
+                );
                 return Ok(TurnOutcome {
                     op_id: turn_op,
                     final_state: state,
@@ -3686,7 +3713,14 @@ impl AgentRuntime {
             )
             .await;
         if outcome.is_err() {
-            let _ = handle.finish_turn_record(turn_op, "failed");
+            // Failure path: the drive's original error is the report; the
+            // record close is recorded, not propagated (marker + audit).
+            self.dw_note_finish_turn_record(
+                handle,
+                turn_op,
+                "failed",
+                DW_SITE_CONTINUE_RECORD_FAILED,
+            );
         }
         outcome
     }
@@ -3794,7 +3828,9 @@ impl AgentRuntime {
                 AgentState::Cancelled => "cancelled",
                 _ => "failed",
             };
-            let _ = handle.finish_turn_record(op_id, status);
+            // Success path: the outcome is the report; a failed close must
+            // not be reported as a failed turn, so it is recorded instead.
+            self.dw_note_finish_turn_record(handle, op_id, status, DW_SITE_DRIVE_RECORD);
         }
         // Op done: completion is progress evidence; the record (with its
         // last_op_completed_at) stays observable until the session ends.
@@ -3909,7 +3945,11 @@ impl AgentRuntime {
         let mut semantic_turn: Option<SemanticTurnState> = None;
         loop {
             if cancel.is_cancelled() {
-                let _ = handle.abort(Some(op_id));
+                // Cancel cleanup: the Cancelled classification is the genuine
+                // outcome and must not be replaced by an abort error (the
+                // abort may race the durable cancel that ended the op), so a
+                // lost abort is recorded (marker + audit) and replayed.
+                self.dw_note_abort(handle, Some(op_id), DW_SITE_DRIVE_ABORT_CANCEL);
                 outcome.final_state = AgentState::Cancelled;
                 return Ok(outcome);
             }
@@ -4384,14 +4424,17 @@ impl AgentRuntime {
                                 message.clone(),
                             ));
                         }
-                        let _ = handle
-                            .append_journal_event(
-                                faktor_core::event::EventKind::Failed,
-                                AgentState::FailedRecoverable,
-                                Some(op_id),
-                                Some(serde_json::json!({ "message": message })),
-                            )
-                            .await;
+                        // Classified end: the specific gate refusal/outcome
+                        // must not be replaced by a journal error, so the
+                        // failed Failed-journal is recorded (marker + audit).
+                        self.dw_note_journal_failed(
+                            handle,
+                            op_id,
+                            AgentState::FailedRecoverable,
+                            serde_json::json!({ "message": message }),
+                            DW_SITE_ROUTING_JOURNAL,
+                        )
+                        .await;
                         return Ok(outcome);
                     }
                 };
@@ -4467,13 +4510,15 @@ impl AgentRuntime {
                 // effective provider/model (per-message override wins),
                 // reasoning variant and tool mode fixed on the turn record.
                 let provider_id = handle.provider()?;
-                let _ = handle.set_turn_envelope(
+                self.guarded_set_turn_envelope(
+                    handle,
                     op_id,
                     &provider_id,
                     &model,
                     None,
                     Some(tool_mode_tag(self.deps.tool_call_mode)),
-                );
+                    DW_SITE_TURN_ENVELOPE,
+                )?;
                 envelope_fixed = true;
             }
 
@@ -4635,14 +4680,16 @@ impl AgentRuntime {
                             ReasonCode::BudgetExceeded,
                             message.clone(),
                         ));
-                        let _ = handle
-                            .append_journal_event(
-                                faktor_core::event::EventKind::Failed,
-                                AgentState::FailedRecoverable,
-                                Some(op_id),
-                                Some(serde_json::json!({ "message": message })),
-                            )
-                            .await;
+                        // Classified end: the budget refusal must not be
+                        // masked by a journal error — record the lost append.
+                        self.dw_note_journal_failed(
+                            handle,
+                            op_id,
+                            AgentState::FailedRecoverable,
+                            serde_json::json!({ "message": message }),
+                            DW_SITE_BUDGET_JOURNAL,
+                        )
+                        .await;
                         return Ok(outcome);
                     }
                     Err(e) => return Err(e.into()),
@@ -4686,14 +4733,16 @@ impl AgentRuntime {
                             ReasonCode::BudgetExceeded,
                             message.clone(),
                         )));
-                        let _ = handle
-                            .append_journal_event(
-                                faktor_core::event::EventKind::Failed,
-                                AgentState::FailedRecoverable,
-                                Some(op_id),
-                                Some(serde_json::json!({ "message": message })),
-                            )
-                            .await;
+                        // Classified end: record the lost Failed-journal
+                        // instead of masking the debit refusal with an error.
+                        self.dw_note_journal_failed(
+                            handle,
+                            op_id,
+                            AgentState::FailedRecoverable,
+                            serde_json::json!({ "message": message }),
+                            DW_SITE_DEBIT_IDENTITY_JOURNAL,
+                        )
+                        .await;
                         return Ok(outcome);
                     }
                 };
@@ -4717,14 +4766,16 @@ impl AgentRuntime {
                         ReasonCode::BudgetExceeded,
                         message.clone(),
                     ));
-                    let _ = handle
-                        .append_journal_event(
-                            faktor_core::event::EventKind::Failed,
-                            AgentState::FailedRecoverable,
-                            Some(op_id),
-                            Some(serde_json::json!({ "message": message })),
-                        )
-                        .await;
+                    // Classified end: record the lost Failed-journal instead
+                    // of masking the refusal with a journal error.
+                    self.dw_note_journal_failed(
+                        handle,
+                        op_id,
+                        AgentState::FailedRecoverable,
+                        serde_json::json!({ "message": message }),
+                        DW_SITE_DEBIT_REFUSED_JOURNAL,
+                    )
+                    .await;
                     return Ok(outcome);
                 }
                 // P0-2: the durable dispatch marker is written immediately
@@ -4799,7 +4850,9 @@ impl AgentRuntime {
                                 // left the process and the provider may have
                                 // billed (settlement/reconciliation later).
                                 debits.close_uncertain();
-                                let _ = handle.abort(Some(op_id));
+                                // Cancel cleanup: recorded (marker + audit),
+                                // never a different error for the Cancelled end.
+                                self.dw_note_abort(handle, Some(op_id), DW_SITE_DRIVE_ABORT_DISPATCH);
                                 outcome.final_state = AgentState::Cancelled;
                                 return Ok(outcome);
                             }
@@ -5241,14 +5294,18 @@ impl AgentRuntime {
             if detector.record_progress(iteration_progress, 8) {
                 outcome.loop_stopped = true;
                 outcome.stalled = true;
-                let _ = handle.append_journal_event(
-                    faktor_core::event::EventKind::Failed,
+                // Classified end: the stall verdict must not be masked by a
+                // journal error — record the lost Failed-journal.
+                self.dw_note_journal_failed(
+                    handle,
+                    op_id,
                     AgentState::FailedRecoverable,
-                    Some(op_id),
-                    Some(serde_json::json!({
+                    serde_json::json!({
                         "message": "stall detected: repeated model iterations produced no new state"
-                    })),
-                ).await;
+                    }),
+                    DW_SITE_STALL_JOURNAL,
+                )
+                .await;
                 outcome.final_state = AgentState::FailedRecoverable;
                 return Ok(outcome);
             }
@@ -5263,14 +5320,18 @@ impl AgentRuntime {
             if self.progress_stalled_evidence(handle.id()) {
                 outcome.loop_stopped = false;
                 outcome.stalled = true;
-                let _ = handle.append_journal_event(
-                    faktor_core::event::EventKind::Failed,
+                // Classified end: the evidence-stall verdict must not be
+                // masked by a journal error — record the lost Failed-journal.
+                self.dw_note_journal_failed(
+                    handle,
+                    op_id,
                     AgentState::FailedRecoverable,
-                    Some(op_id),
-                    Some(serde_json::json!({
+                    serde_json::json!({
                         "message": "stall detected: tool activity without semantic evidence within the silence budget"
-                    })),
-                ).await;
+                    }),
+                    DW_SITE_STALL_EVIDENCE_JOURNAL,
+                )
+                .await;
                 outcome.final_state = AgentState::FailedRecoverable;
                 return Ok(outcome);
             }
@@ -5344,17 +5405,25 @@ impl AgentRuntime {
                     if detector.last_trip_code().is_some() {
                         outcome.stop_reason = Some(OutcomeReason::new(code, detail.to_string()));
                     }
-                    let _ = handle
-                        .append_journal_event(
-                            faktor_core::event::EventKind::Failed,
-                            AgentState::FailedRecoverable,
-                            Some(op_id),
-                            Some(serde_json::json!({ "message": detail })),
-                        )
-                        .await;
+                    // Classified end: the loop verdict must not be masked by a
+                    // journal error — record the lost Failed-journal.
+                    self.dw_note_journal_failed(
+                        handle,
+                        op_id,
+                        AgentState::FailedRecoverable,
+                        serde_json::json!({ "message": detail }),
+                        DW_SITE_LOOP_JOURNAL,
+                    )
+                    .await;
                     // Typed ledger (audit 27): this genuine decision point —
                     // stop-and-replan — is durable history.
-                    handle.ledger_decision("replan", "stop the turn and re-plan", detail)?;
+                    self.guarded_ledger_decision(
+                        handle,
+                        "replan",
+                        "stop the turn and re-plan",
+                        detail,
+                        DW_SITE_LOOP_DECISION,
+                    )?;
                     outcome.final_state = AgentState::FailedRecoverable;
                     return Ok(outcome);
                 }
@@ -5476,7 +5545,7 @@ impl AgentRuntime {
         self.record_memory(handle, op_id, ledger, turn_summary)?;
         // The task finished with genuine work: loop windows close.
         if turn_made_progress(turn_summary) {
-            let _ = handle.reset_loop_signals();
+            self.guarded_reset_loop_signals(handle, DW_SITE_END_LOOP_SIGNALS)?;
         }
         // Verification-tier escalation (audit 54): the configured/default
         // quality for the turn, escalated to Strict when the semantic
@@ -5535,13 +5604,24 @@ impl AgentRuntime {
                         ),
                     )],
                 });
-                let _ = handle.upsert_memory_fact("task_state", "state", "blocked");
+                // Post-TurnCompleted tail: a refused gate's durable mirror
+                // rows must not turn a completed turn into a failed one, so
+                // each lost write is recorded (marker + audit) and replayed.
+                self.dw_note_upsert_memory_fact(
+                    handle,
+                    "task_state",
+                    "state",
+                    "blocked",
+                    DW_SITE_GATE_BUDGET_FACT,
+                );
                 // Typed ledger (audit 27): the budget refusal is a durable
                 // decision with its rationale.
-                let _ = handle.ledger_decision(
+                self.dw_note_ledger_decision(
+                    handle,
                     "completion gate",
                     "refuse VerifiedComplete",
                     "durable task budget exhausted; the gate is blocked until the budget allows",
+                    DW_SITE_GATE_BUDGET_DECISION,
                 );
             }
         }
@@ -5568,13 +5648,24 @@ impl AgentRuntime {
                             ),
                         )],
                     });
-                    let _ = handle.upsert_memory_fact("task_state", "state", "blocked");
+                    // Post-TurnCompleted tail: record, never propagate, so a
+                    // refused gate cannot turn a completed turn into a failed
+                    // one; replay reconstructs the mirror rows.
+                    self.dw_note_upsert_memory_fact(
+                        handle,
+                        "task_state",
+                        "state",
+                        "blocked",
+                        DW_SITE_GATE_CHANGE_FACT,
+                    );
                     // Typed ledger (audit 27): the refusal is a durable
                     // decision with its rationale.
-                    let _ = handle.ledger_decision(
+                    self.dw_note_ledger_decision(
+                        handle,
                         "completion gate",
                         "refuse VerifiedComplete",
                         "the run's changed paths fall outside the task's change budget",
+                        DW_SITE_GATE_CHANGE_DECISION,
                     );
                 }
                 Err(other) => return Err(other.into()),
@@ -5595,12 +5686,22 @@ impl AgentRuntime {
                 self.enforce_criteria_consistency(handle, ledger, gate.clone())?
             {
                 gate = Some(strict_gate);
-                let _ = handle.upsert_memory_fact("task_state", "state", "blocked");
+                // Post-TurnCompleted tail: recorded (marker + audit), never
+                // propagated — the refusal is the genuine outcome.
+                self.dw_note_upsert_memory_fact(
+                    handle,
+                    "task_state",
+                    "state",
+                    "blocked",
+                    DW_SITE_GATE_CRITERIA_BLOCK_FACT,
+                );
                 // Typed ledger (audit 27): the refusal is a durable decision.
-                let _ = handle.ledger_decision(
+                self.dw_note_ledger_decision(
+                    handle,
                     "completion gate",
                     "refuse the completion claim",
                     "durable criteria rows disagree (criteria fact vs typed task row); deterministic re-derivation on a later turn converges",
+                    DW_SITE_GATE_CRITERIA_BLOCK_DECISION,
                 );
             }
         }
@@ -5649,12 +5750,22 @@ impl AgentRuntime {
         }
         if let Some(downgrade) = gate_landed {
             gate = Some(downgrade);
-            let _ = handle.upsert_memory_fact("task_state", "state", "blocked");
+            // Post-TurnCompleted tail: recorded (marker + audit), never
+            // propagated — the typed refusal is the genuine outcome.
+            self.dw_note_upsert_memory_fact(
+                handle,
+                "task_state",
+                "state",
+                "blocked",
+                DW_SITE_GATE_DOWNGRADE_FACT,
+            );
             // Typed ledger (audit 27): the refusal is a durable decision.
-            let _ = handle.ledger_decision(
+            self.dw_note_ledger_decision(
+                handle,
                 "completion gate",
                 "refuse the completion claim",
                 "the typed task row refused the completion proof (typed refusal: revision moved or the row is terminal); a later verification attempt converges with a fresh record",
+                DW_SITE_GATE_DOWNGRADE_DECISION,
             );
         }
         outcome.completion = gate.clone();
@@ -7164,7 +7275,15 @@ impl AgentRuntime {
                     "superseded by the newer verification attempt {:?}",
                     newest.as_ref().map(|a| a.op_id)
                 );
-                let _ = handle.cancel_verification_attempt(task_id.raw(), attempt.op_id, &note);
+                // Supersede cleanup inside a String-error function: recorded
+                // (marker + audit), never masked into a different error.
+                self.dw_note_cancel_verification_attempt(
+                    handle,
+                    task_id.raw(),
+                    attempt.op_id,
+                    &note,
+                    DW_SITE_ROOT_ATTEMPT_CANCEL,
+                );
                 let fresh = self.deps.session.next_op_id().raw();
                 return self
                     .begin_integrated_root_attempt(
@@ -7448,7 +7567,15 @@ impl AgentRuntime {
                 return Err(format!("verification attempt begin refused: {err}"));
             };
             let note = format!("superseded by the root verification attempt {attempt_op}");
-            let _ = handle.cancel_verification_attempt(task_id.raw(), current.op_id, &note);
+            // The retried begin below surfaces its own typed refusal if the
+            // cancel lost jobs; record this supersede write (marker + audit).
+            self.dw_note_cancel_verification_attempt(
+                handle,
+                task_id.raw(),
+                current.op_id,
+                &note,
+                DW_SITE_BEGIN_ATTEMPT_CANCEL,
+            );
             handle
                 .begin_verification_attempt(
                     task_id.raw(),
@@ -7758,8 +7885,16 @@ impl AgentRuntime {
                                  (its content moved; the open jobs were never certified)",
                                 op_id.raw()
                             );
-                            let _ =
-                                handle.cancel_verification_attempt(task_id, attempt.op_id, &note);
+                            // The verdict function is infallible: the supersede
+                            // cancel is recorded (marker + audit), not
+                            // propagated.
+                            self.dw_note_cancel_verification_attempt(
+                                handle,
+                                task_id,
+                                attempt.op_id,
+                                &note,
+                                DW_SITE_SUPERSEDE_CANCEL,
+                            );
                         }
                     }
                     Ok(_) => {
@@ -8174,10 +8309,14 @@ impl AgentRuntime {
                 // turn. The gate records the mid-flight state: Pending,
                 // criteria seeded as usual, task state Verifying.
                 for (id, command) in &unavailable {
-                    let _ = handle.upsert_memory_fact(
+                    // Infallible verdict function: mirror row recorded
+                    // (marker + audit) rather than failing the turn.
+                    self.dw_note_upsert_memory_fact(
+                        handle,
                         "verification",
                         id,
                         &format!("unavailable:{command}"),
+                        DW_SITE_BACKGROUND_FACT,
                     );
                 }
                 let pending_acceptance = faktor_verify::acceptance(&checks, &results);
@@ -8209,19 +8348,28 @@ impl AgentRuntime {
             for check in checks.iter().filter(|c| c.required) {
                 if results.iter().any(|(id, ok)| id == &check.id && !ok) {
                     // Durable fact: kind "verification", key = check id,
-                    // value carries the failed command.
-                    let _ = handle.upsert_memory_fact(
+                    // value carries the failed command. Infallible verdict
+                    // function: recorded (marker + audit), never propagated.
+                    self.dw_note_upsert_memory_fact(
+                        handle,
                         "verification",
                         &check.id,
                         &format!("failed:{}", check.command),
+                        DW_SITE_CHECK_FAILED_FACT,
                     );
                 }
             }
         }
         for (id, command) in &unavailable {
-            // Durable row: the required check exists but could not run.
-            let _ =
-                handle.upsert_memory_fact("verification", id, &format!("unavailable:{}", command));
+            // Durable row: the required check exists but could not run
+            // (recorded, not propagated: this verdict function is infallible).
+            self.dw_note_upsert_memory_fact(
+                handle,
+                "verification",
+                id,
+                &format!("unavailable:{}", command),
+                DW_SITE_CHECK_UNAVAILABLE_FACT,
+            );
         }
         let failed: Vec<OutcomeReason> = checks
             .iter()
@@ -8395,13 +8543,18 @@ impl AgentRuntime {
             let spec = match spec {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = handle.resolve_verification_job(
+                    // Infallible executor loop: a corrupt row must still
+                    // resolve Unavailable, so a lost resolve is recorded
+                    // (marker + audit) and replayed, never dropped.
+                    self.dw_note_resolve_verification_job(
+                        handle,
                         task_raw,
                         &job_row.check_id,
                         attempt.op_id,
                         faktor_session::VerificationJobState::Unavailable,
                         Some(format!("job spec undecodable (corrupt row): {e}")),
                         None,
+                        DW_SITE_JOB_RESOLVE_CORRUPT,
                     );
                     continue;
                 }
@@ -8416,13 +8569,15 @@ impl AgentRuntime {
                 CheckRunStatus::Unavailable => faktor_session::VerificationJobState::Unavailable,
             };
             let result_json = serde_json::to_string(&outcome).ok();
-            let _ = handle.resolve_verification_job(
+            self.dw_note_resolve_verification_job(
+                handle,
                 task_raw,
                 &job_row.check_id,
                 attempt.op_id,
                 state,
                 None,
                 result_json,
+                DW_SITE_JOB_RESOLVE,
             );
         }
         resolved
@@ -8542,10 +8697,14 @@ impl AgentRuntime {
         let changed: Vec<String> = attempt.changed.clone();
         for check in mirrors.iter().filter(|c| c.required) {
             if unavailable.iter().any(|(id, _)| id == &check.id) {
-                let _ = handle.upsert_memory_fact(
+                // Infallible verdict function: recorded (marker + audit), not
+                // propagated.
+                self.dw_note_upsert_memory_fact(
+                    handle,
                     "verification",
                     &check.id,
                     &format!("unavailable:{}", check.command),
+                    DW_SITE_SETTLE_UNAVAILABLE_FACT,
                 );
             }
         }
@@ -8554,10 +8713,14 @@ impl AgentRuntime {
         if acceptance == faktor_verify::Acceptance::Fail {
             for check in mirrors.iter().filter(|c| c.required) {
                 if results.iter().any(|(id, ok)| id == &check.id && !ok) {
-                    let _ = handle.upsert_memory_fact(
+                    // Infallible verdict function: recorded (marker + audit),
+                    // not propagated.
+                    self.dw_note_upsert_memory_fact(
+                        handle,
                         "verification",
                         &check.id,
                         &format!("failed:{}", check.command),
+                        DW_SITE_SETTLE_FAILED_FACT,
                     );
                 }
             }
@@ -8720,7 +8883,15 @@ impl AgentRuntime {
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_else(|| "pending".into());
-        let _ = handle.upsert_memory_fact("task_state", "state", &state);
+        // Best-effort by contract (the verdict callers are infallible): every
+        // lost row is recorded (marker + audit) and replayed on next open.
+        self.dw_note_upsert_memory_fact(
+            handle,
+            "task_state",
+            "state",
+            &state,
+            DW_SITE_GATE_TASK_STATE_FACT,
+        );
         let last = serde_json::json!({
             "status": serde_json::to_value(status).unwrap_or_else(|_| "pending".into()),
             "checks": results.iter().map(|(id, passed)| serde_json::json!({
@@ -8730,7 +8901,13 @@ impl AgentRuntime {
             "changed": changed.iter().take(16).map(|p| truncate(p, 200)).collect::<Vec<_>>(),
         });
         let last = truncate(&serde_json::to_string(&last).unwrap_or_default(), 4000);
-        let _ = handle.upsert_memory_fact("verification", "last", &last);
+        self.dw_note_upsert_memory_fact(
+            handle,
+            "verification",
+            "last",
+            &last,
+            DW_SITE_GATE_LAST_FACT,
+        );
         if let Some(criteria) = criteria {
             let text = criteria_canonical_text(criteria);
             let seeded = handle
@@ -8742,7 +8919,13 @@ impl AgentRuntime {
                 })
                 .unwrap_or(true);
             if !seeded {
-                let _ = handle.upsert_memory_fact("criteria", "0", &text);
+                self.dw_note_upsert_memory_fact(
+                    handle,
+                    "criteria",
+                    "0",
+                    &text,
+                    DW_SITE_GATE_CRITERIA_FACT,
+                );
             }
         }
         // P0-79 site a: the verification/criteria fact rows were written at
@@ -8846,14 +9029,28 @@ impl AgentRuntime {
         if !healed.goal.is_empty()
             && goal_fact.as_deref() != Some(truncate(&healed.goal, 200).as_str())
         {
-            let _ = handle.upsert_memory_fact("task", "goal", &truncate(&healed.goal, 200));
+            // Drive-start fact mirror: the caller can fail safely (a later
+            // drive re-heals), so the write error propagates typed.
+            self.guarded_upsert_memory_fact(
+                handle,
+                "task",
+                "goal",
+                &truncate(&healed.goal, 200),
+                DW_SITE_RESTORE_GOAL_FACT,
+            )?;
         }
         let state_fact = facts
             .iter()
             .find(|(k, key, _)| k == "task_state" && key == "state")
             .map(|(_, _, v)| v.clone());
         if state_fact.as_deref() != Some(&state_str) {
-            let _ = handle.upsert_memory_fact("task_state", "state", &state_str);
+            self.guarded_upsert_memory_fact(
+                handle,
+                "task_state",
+                "state",
+                &state_str,
+                DW_SITE_RESTORE_STATE_FACT,
+            )?;
         }
         if !healed.acceptance_criteria.is_empty() {
             let canonical = criteria_canonical_text(&healed.acceptance_criteria);
@@ -8862,7 +9059,13 @@ impl AgentRuntime {
                 .find(|(k, key, _)| k == "criteria" && key == "0")
                 .map(|(_, _, v)| v.clone());
             if criteria_fact.as_deref() != Some(canonical.as_str()) {
-                let _ = handle.upsert_memory_fact("criteria", "0", &canonical);
+                self.guarded_upsert_memory_fact(
+                    handle,
+                    "criteria",
+                    "0",
+                    &canonical,
+                    DW_SITE_RESTORE_CRITERIA_FACT,
+                )?;
             }
         }
         Ok(())
@@ -9122,8 +9325,15 @@ impl AgentRuntime {
                         // proof): the claim reverts to NeedsVerification —
                         // a later attempt re-certifies the CURRENT revision
                         // with a fresh record (a stale/Failed record never
-                        // poisons that attempt).
-                        let _ = self.route_task_to(handle, task_id, TaskState::NeedsVerification);
+                        // poisons that attempt). The typed refusal above is
+                        // the genuine outcome: record the revert, never
+                        // replace it with a route error.
+                        self.dw_note_route_task_state(
+                            handle,
+                            task_id,
+                            TaskState::NeedsVerification,
+                            DW_SITE_ROUTE_AFTER_REFUSAL,
+                        );
                         Ok(Some(completion_refusal_gate(&err)))
                     }
                 }
@@ -9324,6 +9534,7 @@ impl AgentRuntime {
                 Vec::new()
             };
             let now = self.deps.clock.now_ms();
+            let mut reset_loop_window = false;
             self.with_tracker(handle.id(), |t| {
                 let moved = t.note_failure_fingerprints(&fingerprints);
                 if moved && status == VerificationStatus::Failed {
@@ -9331,7 +9542,7 @@ impl AgentRuntime {
                     // IDENTICAL failing calls; a moved failure state is not
                     // an identical failure — the window must not punish
                     // state-progressing turns (P0-78).
-                    let _ = handle.reset_loop_signals();
+                    reset_loop_window = true;
                     t.note_evidence(now, ProgressEvidence::FailureFingerprintChanged);
                 }
                 if status == VerificationStatus::Passed
@@ -9341,6 +9552,12 @@ impl AgentRuntime {
                 }
                 t.set_last_verification_status(status);
             });
+            if reset_loop_window {
+                // The durable loop-window close must not be lost silently;
+                // this site runs after the record was finalized, so the loss
+                // is recorded (marker + audit), not propagated.
+                self.dw_note_reset_loop_signals(handle, DW_SITE_ATTEMPT_RECORD_LOOP_SIGNALS);
+            }
         }
         Ok(record_id)
     }
@@ -10931,16 +11148,877 @@ impl AgentRuntime {
             }
             AgentState::NeedsUserInput
         };
-        let _ = handle
+        // The classified end (Unknown effects + verification required) must
+        // survive as the report even if the journal write fails: recorded
+        // (marker + audit), never masked into a different error.
+        self.dw_note_journal_failed(
+            handle,
+            op_id,
+            state,
+            serde_json::json!({ "message": e.message }),
+            DW_SITE_PROVIDER_FAILURE_JOURNAL,
+        )
+        .await;
+        outcome.final_state = state;
+        Ok(outcome.clone())
+    }
+}
+
+// ------------------------------------------------- durable-write failure guard
+//
+// POLICY (silent durable-write discard audit): a durable state transition is
+// never silently lost. Callers that can fail safely propagate the write error
+// with `?` (the wrap helpers below); failure/cleanup paths whose original
+// error/outcome must survive route the write through a `dw_note_*` helper,
+// which on failure records the transition in a durable retry-on-next-open
+// MARKER FILE under the session store root, journals a `CrashDetected` audit
+// event and logs a structured `tracing::error!`. Every session open funnels
+// through `recover_session`, whose FIRST step (before any sweep) is
+// [`AgentRuntime::replay_durable_write_failures`] — so a transition lost to a
+// failed write is reconstructed before the session is ever driven again.
+
+/// Directory (under the session store root) holding retry-on-next-open marker
+/// files. Deliberately NOT inside SQLite: a locked/corrupt store still leaves
+/// this channel writable, which is the point of a compensation channel.
+const DURABLE_WRITE_MARKER_DIR: &str = "durable-write-markers";
+/// Hard bound of one marker file (the largest replayed intent is a bounded
+/// verification result JSON; oversized string fields are truncated and the
+/// marker says so).
+const DURABLE_WRITE_MARKER_MAX_BYTES: usize = 256 * 1024;
+/// Bounded marker consumption per open (adversarial defense: a flooded marker
+/// directory degrades loud and bounded, never unbounded).
+const DURABLE_WRITE_MARKER_SCAN_MAX: usize = 256;
+/// Marker replay attempts before the marker is abandoned (surfaced loudly).
+const DURABLE_WRITE_MARKER_MAX_ATTEMPTS: u64 = 8;
+
+// Stable site names of every discard audited (and every sibling discard in
+// this file): a marker/trace always names the write it compensates.
+const DW_SITE_RECEIPT_JOURNAL: &str = "drive_receipt.failed_journal";
+const DW_SITE_RECEIPT_RECORD: &str = "drive_receipt.finish_turn_record";
+const DW_SITE_ADMITTED_JOURNAL: &str = "drive_admitted.failed_journal";
+const DW_SITE_ADMITTED_RECORD: &str = "drive_admitted.finish_turn_record";
+const DW_SITE_RECOVERY_RECORD: &str = "recover_session.finish_turn_record";
+const DW_SITE_CONTINUE_RECORD_DONE: &str = "continue_record.finish_turn_record";
+const DW_SITE_CONTINUE_RECORD_FAILED: &str = "continue_record.failed_record";
+const DW_SITE_DRIVE_RECORD: &str = "drive_turn.finish_turn_record";
+const DW_SITE_ROUTING_JOURNAL: &str = "drive_turn_inner.routing_failed_journal";
+const DW_SITE_BUDGET_JOURNAL: &str = "drive_turn_inner.budget_failed_journal";
+const DW_SITE_DEBIT_IDENTITY_JOURNAL: &str = "drive_turn_inner.debit_identity_journal";
+const DW_SITE_DEBIT_REFUSED_JOURNAL: &str = "drive_turn_inner.debit_refused_journal";
+const DW_SITE_STALL_JOURNAL: &str = "drive_turn_inner.stall_journal";
+const DW_SITE_STALL_EVIDENCE_JOURNAL: &str = "drive_turn_inner.stall_evidence_journal";
+const DW_SITE_LOOP_JOURNAL: &str = "drive_turn_inner.loop_journal";
+const DW_SITE_LOOP_DECISION: &str = "drive_turn_inner.loop_decision";
+const DW_SITE_PROVIDER_FAILURE_JOURNAL: &str = "handle_provider_failure.failed_journal";
+const DW_SITE_SUPERSEDE_CANCEL: &str = "run_turn_verification.supersede_cancel";
+const DW_SITE_ROOT_ATTEMPT_CANCEL: &str = "verify_integrated_root_attempt.supersede_cancel";
+const DW_SITE_BEGIN_ATTEMPT_CANCEL: &str = "begin_integrated_root_attempt.supersede_cancel";
+const DW_SITE_BACKGROUND_FACT: &str = "run_turn_verification.background_fact";
+const DW_SITE_CHECK_FAILED_FACT: &str = "run_turn_verification.check_failed_fact";
+const DW_SITE_CHECK_UNAVAILABLE_FACT: &str = "run_turn_verification.check_unavailable_fact";
+const DW_SITE_SETTLE_UNAVAILABLE_FACT: &str = "settle_verification_jobs.unavailable_fact";
+const DW_SITE_SETTLE_FAILED_FACT: &str = "settle_verification_jobs.failed_fact";
+const DW_SITE_GATE_TASK_STATE_FACT: &str = "persist_gate_facts.task_state";
+const DW_SITE_GATE_LAST_FACT: &str = "persist_gate_facts.verification_last";
+const DW_SITE_GATE_CRITERIA_FACT: &str = "persist_gate_facts.criteria";
+const DW_SITE_GATE_BUDGET_FACT: &str = "finish_logical_turn.budget_blocked_fact";
+const DW_SITE_GATE_BUDGET_DECISION: &str = "finish_logical_turn.budget_refusal_decision";
+const DW_SITE_GATE_CHANGE_FACT: &str = "finish_logical_turn.change_budget_blocked_fact";
+const DW_SITE_GATE_CHANGE_DECISION: &str = "finish_logical_turn.change_budget_refusal_decision";
+const DW_SITE_GATE_CRITERIA_BLOCK_FACT: &str = "finish_logical_turn.criteria_blocked_fact";
+const DW_SITE_GATE_CRITERIA_BLOCK_DECISION: &str = "finish_logical_turn.criteria_refusal_decision";
+const DW_SITE_GATE_DOWNGRADE_FACT: &str = "finish_logical_turn.downgrade_blocked_fact";
+const DW_SITE_GATE_DOWNGRADE_DECISION: &str = "finish_logical_turn.downgrade_refusal_decision";
+const DW_SITE_JOB_RESOLVE_CORRUPT: &str = "execute_attempt_jobs.resolve_corrupt_spec";
+const DW_SITE_JOB_RESOLVE: &str = "execute_attempt_jobs.resolve_job";
+const DW_SITE_ROUTE_AFTER_REFUSAL: &str = "apply_gate_to_task_row.refusal_route";
+const DW_SITE_ATTEMPT_RECORD_LOOP_SIGNALS: &str = "create_attempt_record.reset_loop_signals";
+const DW_SITE_RESTORE_GOAL_FACT: &str = "restore_task_rows.goal_fact";
+const DW_SITE_RESTORE_STATE_FACT: &str = "restore_task_rows.state_fact";
+const DW_SITE_RESTORE_CRITERIA_FACT: &str = "restore_task_rows.criteria_fact";
+const DW_SITE_END_LOOP_SIGNALS: &str = "finish_logical_turn.reset_loop_signals";
+const DW_SITE_TURN_ENVELOPE: &str = "drive_turn_inner.set_turn_envelope";
+const DW_SITE_DRIVE_ABORT_CANCEL: &str = "drive_turn_inner.abort_cancelled";
+const DW_SITE_DRIVE_ABORT_DISPATCH: &str = "drive_turn_inner.abort_after_dispatch";
+
+/// Process-local uniqueness tail of one marker file name.
+static DURABLE_WRITE_MARKER_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The typed intent of one durable write whose failure is compensated by a
+/// retry-on-next-open marker (serde-tagged so every marker is self-describing
+/// and replayable by an older/newer binary's own variant set).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "write", rename_all = "snake_case")]
+enum DurableWriteIntent {
+    /// A `Failed` journal append (plus its paired turn-record close).
+    JournalFailed {
+        op_id: u64,
+        state: String,
+        payload: serde_json::Value,
+    },
+    FinishTurnRecord {
+        turn_op: u64,
+        status: String,
+    },
+    ResolveVerificationJob {
+        task_id: u64,
+        attempt_op: u64,
+        check_id: String,
+        state: String,
+        note: Option<String>,
+        result_json: Option<String>,
+    },
+    CancelVerificationAttempt {
+        task_id: u64,
+        attempt_op: u64,
+        note: String,
+    },
+    UpsertMemoryFact {
+        kind: String,
+        key: String,
+        value: String,
+    },
+    Abort {
+        op_id: Option<u64>,
+    },
+    LedgerDecision {
+        step: String,
+        choice: String,
+        rationale: String,
+    },
+    ResetLoopSignals,
+    RouteTaskState {
+        task_id: u64,
+        state: String,
+    },
+}
+
+impl AgentRuntime {
+    /// Directory of the retry-on-next-open markers (see
+    /// [`DURABLE_WRITE_MARKER_DIR`]).
+    fn durable_marker_dir(&self) -> std::path::PathBuf {
+        self.deps
+            .session
+            .store()
+            .root()
+            .join(DURABLE_WRITE_MARKER_DIR)
+    }
+
+    /// Record ONE failed durable write on a path that cannot propagate the
+    /// error without masking its original error/outcome. Emits the durable
+    /// marker file, the `CrashDetected` audit journal event and the
+    /// structured error log; not even a total store failure is silent.
+    fn record_durable_write_failure(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        site: &'static str,
+        intent: &DurableWriteIntent,
+        err: &faktor_core::Error,
+    ) {
+        tracing::error!(
+            session = %handle.id(),
+            site,
+            kind = ?err.kind,
+            error = %err.message,
+            "durable write failed on a non-propagating path; writing the retry-on-next-open marker"
+        );
+        let at_ms = self.deps.clock.now_ms();
+        let seq = DURABLE_WRITE_MARKER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let key = format!("dw-{at_ms:020}-{seq:012}");
+        let mut marker = serde_json::json!({
+            "status": "pending",
+            "attempts": 0u64,
+            "site": site,
+            "session": handle.id().raw(),
+            "at_ms": at_ms,
+            "error": truncate(&err.message, 1024),
+            "intent": intent,
+        });
+        // Bound the file without corrupting it: heavy diagnostic fields are
+        // dropped first and the marker records that it is truncated.
+        if serde_json::to_vec(&marker)
+            .map(|b| b.len())
+            .unwrap_or(usize::MAX)
+            > DURABLE_WRITE_MARKER_MAX_BYTES
+        {
+            if let Some(fields) = marker.get_mut("intent").and_then(|i| i.as_object_mut()) {
+                fields.insert("result_json".into(), serde_json::Value::Null);
+                if let Some(payload) = fields.get_mut("payload").and_then(|p| p.as_object_mut()) {
+                    let message = payload
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    payload.insert(
+                        "message".into(),
+                        serde_json::Value::String(truncate(&message, 8192)),
+                    );
+                }
+            }
+            marker["truncated"] = serde_json::Value::Bool(true);
+        }
+        let bytes = match serde_json::to_vec(&marker) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(session = %handle.id(), site, "durable-write marker could not be serialized: {e}");
+                Vec::new()
+            }
+        };
+        let dir = self.durable_marker_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::error!(session = %handle.id(), site, dir = %dir.display(), "durable-write marker directory unwritable: {e}");
+        } else if let Err(e) =
+            faktor_fs::atomic::atomic_replace(&dir.join(format!("{key}.json")), &bytes)
+        {
+            tracing::error!(session = %handle.id(), site, dir = %dir.display(), "durable-write marker file unwritable: {e}");
+        }
+        // Existing audit surface: a CrashDetected self-transition carrying a
+        // bounded typed description of the failure (opaque payload kind, no
+        // schema evolution). Best-effort — the marker file above is the
+        // authoritative compensation.
+        let state = match handle.state() {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::error!(session = %handle.id(), site, "durable-write audit marker skipped: session state unreadable: {e}");
+                return;
+            }
+        };
+        let op_id = match intent {
+            DurableWriteIntent::JournalFailed { op_id, .. } => OpId::try_from(*op_id).ok(),
+            DurableWriteIntent::FinishTurnRecord { turn_op, .. } => OpId::try_from(*turn_op).ok(),
+            DurableWriteIntent::ResolveVerificationJob { attempt_op, .. }
+            | DurableWriteIntent::CancelVerificationAttempt { attempt_op, .. } => {
+                OpId::try_from(*attempt_op).ok()
+            }
+            _ => None,
+        };
+        let audit = serde_json::json!({
+            "durable_write_failure": {
+                "site": site,
+                "marker": key,
+                "error": truncate(&err.message, 1024),
+            }
+        });
+        if let Err(e) = handle.force_append_event(
+            faktor_core::event::EventKind::CrashDetected,
+            state,
+            op_id,
+            Some(audit),
+        ) {
+            tracing::error!(session = %handle.id(), site, "durable-write audit marker could not be journaled: {e}");
+        }
+    }
+
+    /// Replay the pending retry-on-next-open markers of ONE session. Called at
+    /// the very top of `recover_session`, so every open path reconstructs a
+    /// lost transition before the session is driven again. Idempotent per
+    /// intent: a marker is removed only after its intent applied (or was
+    /// terminally refused — with a loud diagnostic); a store failure keeps it
+    /// for the next open, bounded by [`DURABLE_WRITE_MARKER_MAX_ATTEMPTS`].
+    fn replay_durable_write_failures(&self, handle: &faktor_session::SessionHandle) {
+        let dir = self.durable_marker_dir();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::error!(session = %handle.id(), dir = %dir.display(), "durable-write marker directory unreadable: {e}");
+                return;
+            }
+        };
+        let mut paths: Vec<std::path::PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        paths.sort();
+        if paths.len() > DURABLE_WRITE_MARKER_SCAN_MAX {
+            tracing::error!(
+                session = %handle.id(),
+                pending = paths.len(),
+                bound = DURABLE_WRITE_MARKER_SCAN_MAX,
+                "durable-write markers exceed the open-time bound; the remainder replay at later opens"
+            );
+        }
+        for path in paths.into_iter().take(DURABLE_WRITE_MARKER_SCAN_MAX) {
+            let raw = match read_bounded_file(&path, DURABLE_WRITE_MARKER_MAX_BYTES) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    tracing::error!(session = %handle.id(), path = %path.display(), "durable-write marker unreadable: {e}");
+                    continue;
+                }
+            };
+            let mut marker: serde_json::Value = match serde_json::from_slice(&raw) {
+                Ok(marker) => marker,
+                Err(e) => {
+                    tracing::error!(session = %handle.id(), path = %path.display(), "durable-write marker corrupt: {e}");
+                    continue;
+                }
+            };
+            if marker
+                .get("session")
+                .and_then(|s| s.as_u64())
+                .is_some_and(|s| s != handle.id().raw())
+            {
+                continue; // another session's marker (replayed at ITS open)
+            }
+            if marker.get("status").and_then(|s| s.as_str()) != Some("pending") {
+                continue;
+            }
+            let site = marker
+                .get("site")
+                .and_then(|s| s.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let attempts = marker.get("attempts").and_then(|a| a.as_u64()).unwrap_or(0) + 1;
+            let intent: Option<DurableWriteIntent> = marker
+                .get("intent")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok());
+            let Some(intent) = intent else {
+                tracing::error!(session = %handle.id(), %site, "durable-write marker carries an unknown intent; abandoning it (surfaced, never silent)");
+                remove_marker_file(&path);
+                continue;
+            };
+            match self.apply_durable_write_intent(handle, &intent) {
+                Ok(()) => {
+                    tracing::warn!(
+                        session = %handle.id(),
+                        %site,
+                        attempts,
+                        "a durable write lost to a failure was reconstructed from its marker"
+                    );
+                    remove_marker_file(&path);
+                }
+                Err(e) if e.kind.is_retryable() && attempts < DURABLE_WRITE_MARKER_MAX_ATTEMPTS => {
+                    marker["attempts"] = serde_json::Value::from(attempts);
+                    marker["error"] = serde_json::Value::String(truncate(&e.message, 1024));
+                    if let Ok(bytes) = serde_json::to_vec(&marker) {
+                        if let Err(write_err) = faktor_fs::atomic::atomic_replace(&path, &bytes) {
+                            tracing::error!(session = %handle.id(), %site, "durable-write marker attempt update failed: {write_err}");
+                        }
+                    }
+                    tracing::error!(session = %handle.id(), %site, attempts, "durable-write marker replay failed (retryable); kept for the next open: {e}");
+                }
+                Err(e) => {
+                    tracing::error!(session = %handle.id(), %site, attempts, "durable-write marker replay terminally refused; abandoning it (surfaced, never silent): {e}");
+                    remove_marker_file(&path);
+                }
+            }
+        }
+    }
+
+    /// Apply one marker intent to durable state. Store errors are retryable
+    /// (the marker stays); any other error means the intended transition is
+    /// no longer reachable/legal (the marker is terminally refused, loudly).
+    fn apply_durable_write_intent(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        intent: &DurableWriteIntent,
+    ) -> Result<(), faktor_core::Error> {
+        match intent {
+            DurableWriteIntent::JournalFailed {
+                op_id,
+                state,
+                payload,
+            } => {
+                let op = OpId::try_from(*op_id)?;
+                let state: AgentState = serde_json::from_value(serde_json::json!(state))?;
+                if !self.op_failure_already_journaled(handle, op)
+                    && (state_is_op_active(handle.state()?)
+                        || handle.active_turn_record()?.map(|r| r.turn_op_id) == Some(op))
+                {
+                    handle.force_append_event(
+                        faktor_core::event::EventKind::Failed,
+                        state,
+                        Some(op),
+                        Some(payload.clone()),
+                    )?;
+                } else {
+                    tracing::warn!(session = %handle.id(), op = %op, "stale failed-journal marker skipped: the turn already ended");
+                }
+                Ok(())
+            }
+            DurableWriteIntent::FinishTurnRecord { turn_op, status } => {
+                handle.finish_turn_record(OpId::try_from(*turn_op)?, status)?;
+                Ok(())
+            }
+            DurableWriteIntent::ResolveVerificationJob {
+                task_id,
+                attempt_op,
+                check_id,
+                state,
+                note,
+                result_json,
+            } => {
+                let jobs = handle.verification_attempt_jobs(*task_id, *attempt_op)?;
+                let Some(job) = jobs.iter().find(|job| job.check_id == *check_id) else {
+                    return Ok(()); // the attempt/job is gone: nothing left to reconstruct
+                };
+                if !job.state.is_open() {
+                    return Ok(()); // a concurrent resolver already landed it
+                }
+                let state: faktor_session::VerificationJobState =
+                    serde_json::from_value(serde_json::json!(state))?;
+                handle.resolve_verification_job(
+                    *task_id,
+                    check_id,
+                    *attempt_op,
+                    state,
+                    note.clone(),
+                    result_json.clone(),
+                )?;
+                Ok(())
+            }
+            DurableWriteIntent::CancelVerificationAttempt {
+                task_id,
+                attempt_op,
+                note,
+            } => {
+                handle.cancel_verification_attempt(*task_id, *attempt_op, note)?;
+                Ok(())
+            }
+            DurableWriteIntent::UpsertMemoryFact { kind, key, value } => {
+                handle.upsert_memory_fact(kind, key, value)?;
+                Ok(())
+            }
+            DurableWriteIntent::Abort { op_id } => {
+                let op = match op_id {
+                    Some(raw) => Some(OpId::try_from(*raw)?),
+                    None => None,
+                };
+                handle.abort(op)?;
+                Ok(())
+            }
+            DurableWriteIntent::LedgerDecision {
+                step,
+                choice,
+                rationale,
+            } => {
+                // Dedup: a write that committed before reporting Err must not
+                // mint a duplicate decision row on replay.
+                if !self.ledger_decision_already_present(handle, step, choice, rationale) {
+                    handle.ledger_decision(step, choice, rationale)?;
+                }
+                Ok(())
+            }
+            DurableWriteIntent::ResetLoopSignals => {
+                handle.reset_loop_signals()?;
+                Ok(())
+            }
+            DurableWriteIntent::RouteTaskState { task_id, state } => {
+                let state: TaskState = serde_json::from_value(serde_json::json!(state))?;
+                self.route_task_to(handle, TaskId::try_from(*task_id)?, state)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// True when the journal's bounded tail already carries the `Failed`
+    /// event of `op` (the write may have committed before reporting Err).
+    fn op_failure_already_journaled(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        op: OpId,
+    ) -> bool {
+        let Ok(Some(last)) = handle.last_event_seq() else {
+            return false;
+        };
+        let from = last.raw().saturating_sub(511).max(1);
+        handle
+            .events_range(from, Some(512))
+            .map(|events| {
+                events
+                    .iter()
+                    .any(|e| e.op_id == Some(op) && e.kind == faktor_core::event::EventKind::Failed)
+            })
+            .unwrap_or(false)
+    }
+
+    /// True when the ledger's bounded tail already carries this typed
+    /// decision (replay dedup: a committed-then-errored write must not mint a
+    /// duplicate decision row).
+    fn ledger_decision_already_present(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        step: &str,
+        choice: &str,
+        rationale: &str,
+    ) -> bool {
+        let rows = match self
+            .deps
+            .session
+            .store()
+            .ledger_entries_desc(handle.id(), None, 256)
+        {
+            Ok(rows) => rows,
+            Err(_) => return false,
+        };
+        rows.iter().any(|row| {
+            row.payload.get("kind").and_then(|k| k.as_str()) == Some("decision")
+                && row.payload.get("step").and_then(|v| v.as_str()) == Some(step)
+                && row.payload.get("choice").and_then(|v| v.as_str()) == Some(choice)
+                && row.payload.get("rationale").and_then(|v| v.as_str()) == Some(rationale)
+        })
+    }
+
+    /// Test-only fault seam: the next guarded write for `site` fails with a
+    /// synthesized store error, so every discard/recovery path is exercised
+    /// against a real failure without corrupting the whole store.
+    fn take_durable_write_fault(&self, site: &str) -> Option<faktor_core::Error> {
+        #[cfg(test)]
+        if durable_faults::take(self.deps.session.store().root(), site) {
+            return Some(faktor_core::Error::new(
+                ErrorKind::Store,
+                format!("injected durable-write failure at `{site}`"),
+            ));
+        }
+        #[cfg(not(test))]
+        let _ = site;
+        None
+    }
+
+    // ---- propagating wrap helpers (caller fails safely; typed error out) --
+
+    fn guarded_upsert_memory_fact(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        kind: &str,
+        key: &str,
+        value: &str,
+        site: &'static str,
+    ) -> faktor_core::Result<()> {
+        if let Some(err) = self.take_durable_write_fault(site) {
+            tracing::error!(session = %handle.id(), site, "durable memory-fact write failed (propagating): {err}");
+            return Err(err);
+        }
+        handle.upsert_memory_fact(kind, key, value).map_err(|err| {
+            tracing::error!(session = %handle.id(), site, "durable memory-fact write failed (propagating): {err}");
+            err
+        })
+    }
+
+    fn guarded_ledger_decision(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        step: &str,
+        choice: &str,
+        rationale: &str,
+        site: &'static str,
+    ) -> faktor_core::Result<()> {
+        if let Some(err) = self.take_durable_write_fault(site) {
+            tracing::error!(session = %handle.id(), site, "durable ledger decision failed (propagating): {err}");
+            return Err(err);
+        }
+        handle
+            .ledger_decision(step, choice, rationale)
+            .map(|_| ())
+            .map_err(|err| {
+                tracing::error!(session = %handle.id(), site, "durable ledger decision failed (propagating): {err}");
+                err
+            })
+    }
+
+    fn dw_note_ledger_decision(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        step: &str,
+        choice: &str,
+        rationale: &str,
+        site: &'static str,
+    ) {
+        let intent = DurableWriteIntent::LedgerDecision {
+            step: step.to_string(),
+            choice: choice.to_string(),
+            rationale: rationale.to_string(),
+        };
+        if let Some(err) = self.take_durable_write_fault(site) {
+            self.record_durable_write_failure(handle, site, &intent, &err);
+            return;
+        }
+        if let Err(err) = handle.ledger_decision(step, choice, rationale) {
+            self.record_durable_write_failure(handle, site, &intent, &err);
+        }
+    }
+
+    fn dw_note_reset_loop_signals(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        site: &'static str,
+    ) {
+        let intent = DurableWriteIntent::ResetLoopSignals;
+        if let Some(err) = self.take_durable_write_fault(site) {
+            self.record_durable_write_failure(handle, site, &intent, &err);
+            return;
+        }
+        if let Err(err) = handle.reset_loop_signals() {
+            self.record_durable_write_failure(handle, site, &intent, &err);
+        }
+    }
+
+    fn guarded_reset_loop_signals(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        site: &'static str,
+    ) -> faktor_core::Result<()> {
+        if let Some(err) = self.take_durable_write_fault(site) {
+            tracing::error!(session = %handle.id(), site, "durable loop-signal reset failed (propagating): {err}");
+            return Err(err);
+        }
+        handle.reset_loop_signals().map_err(|err| {
+            tracing::error!(session = %handle.id(), site, "durable loop-signal reset failed (propagating): {err}");
+            err
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn guarded_set_turn_envelope(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        turn_op: OpId,
+        provider: &str,
+        model: &str,
+        variant: Option<&str>,
+        tool_mode: Option<&str>,
+        site: &'static str,
+    ) -> faktor_core::Result<()> {
+        if let Some(err) = self.take_durable_write_fault(site) {
+            tracing::error!(session = %handle.id(), site, "durable turn-envelope write failed (propagating): {err}");
+            return Err(err);
+        }
+        handle
+            .set_turn_envelope(turn_op, provider, model, variant, tool_mode)
+            .map_err(|err| {
+                tracing::error!(session = %handle.id(), site, "durable turn-envelope write failed (propagating): {err}");
+                err
+            })
+    }
+
+    fn dw_note_abort(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        op_id: Option<OpId>,
+        site: &'static str,
+    ) {
+        let intent = DurableWriteIntent::Abort {
+            op_id: op_id.map(|op| op.raw()),
+        };
+        if let Some(err) = self.take_durable_write_fault(site) {
+            self.record_durable_write_failure(handle, site, &intent, &err);
+            return;
+        }
+        if let Err(err) = handle.abort(op_id) {
+            self.record_durable_write_failure(handle, site, &intent, &err);
+        }
+    }
+
+    // ---- recording wrap helpers (original error/outcome preserved) --------
+
+    async fn dw_note_journal_failed(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        op_id: OpId,
+        state: AgentState,
+        payload: serde_json::Value,
+        site: &'static str,
+    ) {
+        let intent = DurableWriteIntent::JournalFailed {
+            op_id: op_id.raw(),
+            state: state_tag(state),
+            payload: payload.clone(),
+        };
+        if let Some(err) = self.take_durable_write_fault(site) {
+            self.record_durable_write_failure(handle, site, &intent, &err);
+            return;
+        }
+        if let Err(err) = handle
             .append_journal_event(
                 faktor_core::event::EventKind::Failed,
                 state,
                 Some(op_id),
-                Some(serde_json::json!({ "message": e.message })),
+                Some(payload),
             )
-            .await;
-        outcome.final_state = state;
-        Ok(outcome.clone())
+            .await
+        {
+            self.record_durable_write_failure(handle, site, &intent, &err);
+        }
+    }
+
+    fn dw_note_finish_turn_record(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        turn_op: OpId,
+        status: &str,
+        site: &'static str,
+    ) {
+        let intent = DurableWriteIntent::FinishTurnRecord {
+            turn_op: turn_op.raw(),
+            status: status.to_string(),
+        };
+        if let Some(err) = self.take_durable_write_fault(site) {
+            self.record_durable_write_failure(handle, site, &intent, &err);
+            return;
+        }
+        if let Err(err) = handle.finish_turn_record(turn_op, status) {
+            self.record_durable_write_failure(handle, site, &intent, &err);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dw_note_resolve_verification_job(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: u64,
+        check_id: &str,
+        attempt_op: u64,
+        state: faktor_session::VerificationJobState,
+        note: Option<String>,
+        result_json: Option<String>,
+        site: &'static str,
+    ) {
+        let state_tag = serde_json::to_value(state)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "unavailable".into());
+        let intent = DurableWriteIntent::ResolveVerificationJob {
+            task_id,
+            attempt_op,
+            check_id: check_id.to_string(),
+            state: state_tag,
+            note: note.clone(),
+            result_json: result_json.clone(),
+        };
+        if let Some(err) = self.take_durable_write_fault(site) {
+            self.record_durable_write_failure(handle, site, &intent, &err);
+            return;
+        }
+        if let Err(err) =
+            handle.resolve_verification_job(task_id, check_id, attempt_op, state, note, result_json)
+        {
+            self.record_durable_write_failure(handle, site, &intent, &err.into());
+        }
+    }
+
+    fn dw_note_cancel_verification_attempt(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: u64,
+        attempt_op: u64,
+        note: &str,
+        site: &'static str,
+    ) {
+        let intent = DurableWriteIntent::CancelVerificationAttempt {
+            task_id,
+            attempt_op,
+            note: note.to_string(),
+        };
+        if let Some(err) = self.take_durable_write_fault(site) {
+            self.record_durable_write_failure(handle, site, &intent, &err);
+            return;
+        }
+        if let Err(err) = handle.cancel_verification_attempt(task_id, attempt_op, note) {
+            self.record_durable_write_failure(handle, site, &intent, &err.into());
+        }
+    }
+
+    fn dw_note_upsert_memory_fact(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        kind: &str,
+        key: &str,
+        value: &str,
+        site: &'static str,
+    ) {
+        let intent = DurableWriteIntent::UpsertMemoryFact {
+            kind: kind.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+        };
+        if let Some(err) = self.take_durable_write_fault(site) {
+            self.record_durable_write_failure(handle, site, &intent, &err);
+            return;
+        }
+        if let Err(err) = handle.upsert_memory_fact(kind, key, value) {
+            self.record_durable_write_failure(handle, site, &intent, &err);
+        }
+    }
+
+    fn dw_note_route_task_state(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
+        state: TaskState,
+        site: &'static str,
+    ) {
+        let state_name = serde_json::to_value(state)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "needs_verification".into());
+        let intent = DurableWriteIntent::RouteTaskState {
+            task_id: task_id.raw(),
+            state: state_name,
+        };
+        if let Some(err) = self.take_durable_write_fault(site) {
+            self.record_durable_write_failure(handle, site, &intent, &err);
+            return;
+        }
+        if let Err(err) = self.route_task_to(handle, task_id, state) {
+            self.record_durable_write_failure(handle, site, &intent, &err);
+        }
+    }
+}
+
+/// Bounded read of one marker file (the bound is adversarial: a huge file is
+/// refused, never slurped).
+fn read_bounded_file(path: &std::path::Path, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)?;
+    let mut raw = Vec::new();
+    file.take(max_bytes as u64 + 1).read_to_end(&mut raw)?;
+    if raw.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "marker exceeds the bound",
+        ));
+    }
+    Ok(raw)
+}
+
+fn remove_marker_file(path: &std::path::Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        tracing::error!(path = %path.display(), "durable-write marker could not be removed: {e}");
+    }
+}
+
+/// Test-only durable-write fault injection (see
+/// [`AgentRuntime::take_durable_write_fault`]).
+#[cfg(test)]
+pub(crate) mod durable_faults {
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    /// Armed `(store root, site)` pairs: store-scoped so a concurrent test's
+    /// write at the same site (session ids are per-store sequences and can
+    /// collide across temp stores) can never steal another test's fault.
+    fn armed() -> &'static Mutex<HashSet<(PathBuf, String)>> {
+        static ARMED: OnceLock<Mutex<HashSet<(PathBuf, String)>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    /// Arm the next guarded write of the store at `root`, at `site`, to fail
+    /// once.
+    pub fn arm(root: &Path, site: &str) {
+        armed()
+            .lock()
+            .unwrap()
+            .insert((root.to_path_buf(), site.to_string()));
+    }
+
+    pub fn take(root: &Path, site: &str) -> bool {
+        armed()
+            .lock()
+            .unwrap()
+            .remove(&(root.to_path_buf(), site.to_string()))
     }
 }
 
@@ -33123,5 +34201,686 @@ mod tests {
             .await
             .expect("turn");
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    }
+
+    // ---------------------------------------------- durable-write guard tests
+
+    /// The marker files of one store root, deterministic order.
+    fn marker_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let dir = root.join(DURABLE_WRITE_MARKER_DIR);
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        paths.sort();
+        paths
+    }
+
+    fn marker_sites(root: &std::path::Path) -> Vec<String> {
+        marker_files(root)
+            .iter()
+            .map(|path| {
+                let marker: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                marker
+                    .get("site")
+                    .and_then(|site| site.as_str())
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn marker_json(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn reopen_manager(dir: &tempfile::TempDir) -> Arc<SessionManager> {
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_turn_journal_lost_to_corrupt_event_table_is_marked_and_reconstructed() {
+        // Adversarial (corrupt store): a BEFORE INSERT trigger aborts every
+        // event write, so the drive's journal appends fail and the failed-turn
+        // cleanup write fails too. The ORIGINAL drive error must reach the
+        // caller; the fs marker channel (independent of SQLite) records the
+        // transition; once the injected trigger is removed the next open
+        // reconstructs the Failed journal from the marker.
+        let (deps, dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let manager = runtime.deps().session.clone();
+        let session = new_session(runtime.deps());
+        let receipt = runtime.submit(session, "run", &[]).unwrap();
+        let op_id = receipt.op_id;
+        manager
+            .store()
+            .sql_execute(
+                "CREATE TRIGGER dw_test_fail_journal BEFORE INSERT ON event \
+                 BEGIN SELECT RAISE(ABORT, 'injected journal corruption'); END",
+            )
+            .unwrap();
+        let err = runtime
+            .drive_receipt(
+                &manager.get_session(session).unwrap().unwrap(),
+                receipt,
+                None,
+            )
+            .await
+            .expect_err("a corrupt journal must fail the drive loudly");
+        assert!(!err.message.is_empty(), "{err:?}");
+        let root = manager.store().root().to_path_buf();
+        assert_eq!(
+            marker_sites(&root),
+            vec![DW_SITE_RECEIPT_JOURNAL.to_string()],
+            "exactly the lost Failed-journal is compensated"
+        );
+        let marker = marker_json(&marker_files(&root)[0]);
+        assert_eq!(marker["status"], "pending");
+        assert_eq!(marker["intent"]["write"], "journal_failed");
+        assert_eq!(marker["session"], serde_json::json!(session.raw()));
+        // The injected corruption is removed (the store's own rows survive);
+        // reopen + recovery replays the marker.
+        manager
+            .store()
+            .sql_execute("DROP TRIGGER dw_test_fail_journal")
+            .unwrap();
+        drop(runtime);
+        drop(manager);
+        let manager2 = reopen_manager(&dir);
+        let (deps2, _d2) = deps_sharing_session(
+            manager2.clone(),
+            Arc::new(scripted_provider(vec![ScriptedResponse::End])),
+            vec![],
+        );
+        AgentRuntime::new(deps2).unwrap().recover().unwrap();
+        let h2 = manager2.get_session(session).unwrap().unwrap();
+        let events = h2.events_range(1, Some(512)).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.op_id == Some(op_id) && e.kind == faktor_core::event::EventKind::Failed),
+            "the Failed journal was not reconstructed: {events:?}"
+        );
+        assert_eq!(h2.state().unwrap(), AgentState::FailedRecoverable);
+        assert!(h2.active_turn_record().unwrap().is_none());
+        assert!(marker_files(manager2.store().root()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn turn_record_close_loss_is_marked_and_reconstructed_on_reopen() {
+        // Adversarial (injected store fault): a SUCCESSFUL turn whose record
+        // close fails must still report success (never a fabricated failed
+        // turn), mint the durable marker + audit event, and have the record
+        // closed by the replay at the next open.
+        let (deps, dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let manager = runtime.deps().session.clone();
+        let session = new_session(runtime.deps());
+        durable_faults::arm(runtime.deps().session.store().root(), DW_SITE_DRIVE_RECORD);
+        let outcome = runtime.run_turn(session, "hello", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let root = manager.store().root().to_path_buf();
+        assert_eq!(marker_sites(&root), vec![DW_SITE_DRIVE_RECORD.to_string()]);
+        let h = manager.get_session(session).unwrap().unwrap();
+        assert!(
+            h.active_turn_record().unwrap().is_some(),
+            "the lost close left the record active"
+        );
+        let audit = h.events_range(1, Some(512)).unwrap();
+        assert!(
+            audit.iter().any(|e| {
+                e.kind == faktor_core::event::EventKind::CrashDetected
+                    && e.payload
+                        .as_ref()
+                        .and_then(|p| p.get("durable_write_failure"))
+                        .and_then(|f| f.get("site"))
+                        .and_then(|s| s.as_str())
+                        == Some(DW_SITE_DRIVE_RECORD)
+            }),
+            "the durable audit event must name the failed write: {audit:?}"
+        );
+        drop(runtime);
+        drop(manager);
+        let manager2 = reopen_manager(&dir);
+        let (deps2, _d2) = deps_sharing_session(
+            manager2.clone(),
+            Arc::new(scripted_provider(vec![ScriptedResponse::End])),
+            vec![],
+        );
+        AgentRuntime::new(deps2).unwrap().recover().unwrap();
+        let h2 = manager2.get_session(session).unwrap().unwrap();
+        assert!(
+            h2.active_turn_record().unwrap().is_none(),
+            "the marker replayed the record close"
+        );
+        assert!(marker_files(manager2.store().root()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_failure_unknown_effect_journal_loss_is_marked_and_replayed() {
+        // Adversarial: the Unknown-effect provider-failure path marks the
+        // running tool rows (already propagated) and journals Failed. The
+        // journal write fails; the classified NeedsUserInput end must survive
+        // as the report and the journal must be reconstructed on reopen.
+        let (deps, dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let manager = runtime.deps().session.clone();
+        let session = new_session(runtime.deps());
+        let h = manager.get_session(session).unwrap().unwrap();
+        let receipt = h.submit_prompt("crash mid-tool", &[]).unwrap();
+        // The machine claims the tool run through the legal ToolRequested hop
+        // (a bare Preparing -> ExecutingTool hop is refused by the machine).
+        h.force_append_event(
+            faktor_core::event::EventKind::ToolRequested,
+            AgentState::ToolRequested,
+            Some(receipt.op_id),
+            None,
+        )
+        .unwrap();
+        h.start_tool_run(receipt.op_meta.clone(), "boom", serde_json::json!({}))
+            .unwrap();
+        h.force_append_event(
+            faktor_core::event::EventKind::ModelStarted,
+            AgentState::Streaming,
+            Some(receipt.op_id),
+            None,
+        )
+        .unwrap();
+        assert_eq!(h.pending_tool_runs().unwrap().len(), 1);
+        durable_faults::arm(
+            runtime.deps().session.store().root(),
+            DW_SITE_PROVIDER_FAILURE_JOURNAL,
+        );
+        let mut outcome = TurnOutcome {
+            op_id: receipt.op_id,
+            final_state: AgentState::Preparing,
+            turns: 0,
+            compacted: false,
+            loop_stopped: false,
+            stalled: false,
+            queued: false,
+            verification: Vec::new(),
+            acceptance: None,
+            review: None,
+            completion: None,
+            stop_reason: None,
+            semantic_risk: None,
+        };
+        let ended = runtime
+            .handle_provider_failure(
+                &h,
+                receipt.op_id,
+                faktor_provider::ProviderError::new(
+                    faktor_provider::ProviderErrorKind::Server,
+                    "stream died",
+                ),
+                &mut outcome,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ended.final_state,
+            AgentState::NeedsUserInput,
+            "the Unknown-effect classification must survive the lost journal"
+        );
+        assert_eq!(
+            h.pending_tool_runs().unwrap()[0].effect_status,
+            effect_tag(EffectStatus::Unknown)
+        );
+        let root = manager.store().root().to_path_buf();
+        assert_eq!(
+            marker_sites(&root),
+            vec![DW_SITE_PROVIDER_FAILURE_JOURNAL.to_string()]
+        );
+        drop(runtime);
+        drop(manager);
+        let manager2 = reopen_manager(&dir);
+        let (deps2, _d2) = deps_sharing_session(
+            manager2.clone(),
+            Arc::new(scripted_provider(vec![ScriptedResponse::End])),
+            vec![],
+        );
+        AgentRuntime::new(deps2).unwrap().recover().unwrap();
+        let h2 = manager2.get_session(session).unwrap().unwrap();
+        assert!(
+            h2.events_range(1, Some(512)).unwrap().iter().any(|e| {
+                e.op_id == Some(receipt.op_id) && e.kind == faktor_core::event::EventKind::Failed
+            }),
+            "the Unknown-effect Failed journal was not reconstructed"
+        );
+        assert_eq!(h2.state().unwrap(), AgentState::NeedsUserInput);
+        assert!(marker_files(manager2.store().root()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_abort_loss_is_marked_and_replayed() {
+        // Adversarial: the cancellation cleanup's durable abort write fails.
+        // The running tool row must stay running (never a silent claim), the
+        // marker must be durable, and the next open must replay the abort
+        // (ToolCancelled journal + the running row finished as cancelled).
+        let (deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let manager = runtime.deps().session.clone();
+        let session = new_session(runtime.deps());
+        let h = manager.get_session(session).unwrap().unwrap();
+        h.submit_prompt("cancel me", &[]).unwrap();
+        let tool_meta = op_meta(&manager, session, RecoveryStrategy::None);
+        let tool_op = tool_meta.operation_id;
+        h.force_append_event(
+            faktor_core::event::EventKind::ToolRequested,
+            AgentState::ToolRequested,
+            Some(tool_op),
+            None,
+        )
+        .unwrap();
+        h.start_tool_run(tool_meta, "boom", serde_json::json!({}))
+            .unwrap();
+        assert_eq!(h.pending_tool_runs().unwrap().len(), 1);
+        durable_faults::arm(
+            runtime.deps().session.store().root(),
+            DW_SITE_DRIVE_ABORT_CANCEL,
+        );
+        runtime.dw_note_abort(&h, Some(tool_op), DW_SITE_DRIVE_ABORT_CANCEL);
+        assert_eq!(
+            h.pending_tool_runs().unwrap().len(),
+            1,
+            "the lost abort left the row running"
+        );
+        let root = manager.store().root().to_path_buf();
+        assert_eq!(
+            marker_sites(&root),
+            vec![DW_SITE_DRIVE_ABORT_CANCEL.to_string()]
+        );
+        // The next open (same daemon process: the op is still tracked)
+        // replays the abort durably.
+        runtime.recover().unwrap();
+        let h = manager.get_session(session).unwrap().unwrap();
+        assert!(h.pending_tool_runs().unwrap().is_empty());
+        let events = h.events_range(1, Some(512)).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == faktor_core::event::EventKind::ToolCancelled),
+            "the abort was not reconstructed: {events:?}"
+        );
+        assert!(marker_files(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn completion_gate_refusal_rows_lost_are_marked_and_replayed() {
+        // Adversarial: the durable budget refusal mirrors (task_state fact +
+        // typed ledger decision) are written AFTER TurnCompleted. Both writes
+        // fail; the turn must still report the BlockedVerification outcome
+        // (never an Err), and the reopen must replay both mirror writes.
+        let (manager, session, dir) = verified_shared_env();
+        let h = manager.get_session(session).unwrap().unwrap();
+        h.record_provider_call(
+            OpId::new(4242),
+            "fake",
+            "m",
+            "completed",
+            Some(500),
+            Some(200),
+            None,
+        )
+        .unwrap();
+        assert_eq!(h.spent_tokens().unwrap(), 700);
+        let now = h.now_ms();
+        h.create_task(Task {
+            task_id: h.task_id().unwrap(),
+            session_id: session,
+            goal: "gating task".into(),
+            acceptance_criteria: vec![],
+            plan: vec![],
+            attachments: Vec::new(),
+            budget: faktor_session::TaskBudget {
+                max_tokens: Some(10),
+                max_turns: None,
+                spent_tokens: 700,
+                spent_turns: 0,
+            },
+            state: TaskState::Running,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .unwrap();
+        let (turn_deps, _d) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/a.rs", "content": "pub fn a() -> u32 {\n    let base: u32 = 10;\n    let step: u32 = 41;\n    base.saturating_add(step).saturating_add(1)\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            fake_ok(),
+            0.65,
+        );
+        let runtime = AgentRuntime::new(turn_deps).unwrap();
+        // Real store corruption for the decision write (an aborting trigger on
+        // decision inserts); the injected fault covers the fact write. Both
+        // markers must be durable and the completed turn must stay Ok.
+        manager
+            .store()
+            .sql_execute(
+                "CREATE TRIGGER dw_test_fail_ledger_decision BEFORE INSERT ON ledger_entry \
+                 WHEN NEW.entry_type = 'decision' \
+                 BEGIN SELECT RAISE(ABORT, 'injected ledger corruption'); END",
+            )
+            .unwrap();
+        durable_faults::arm(
+            runtime.deps().session.store().root(),
+            DW_SITE_GATE_BUDGET_FACT,
+        );
+        let outcome = runtime
+            .run_turn(session, "write src/a.rs", &[])
+            .await
+            .expect("a lost gate mirror must not fail the completed turn");
+        assert!(matches!(
+            outcome.completion,
+            Some(CompletionGate::BlockedVerification { .. })
+        ));
+        let root = manager.store().root().to_path_buf();
+        let mut sites = marker_sites(&root);
+        sites.sort();
+        let mut expected = vec![
+            DW_SITE_GATE_BUDGET_FACT.to_string(),
+            DW_SITE_GATE_BUDGET_DECISION.to_string(),
+        ];
+        expected.sort();
+        assert_eq!(sites, expected);
+        manager
+            .store()
+            .sql_execute("DROP TRIGGER dw_test_fail_ledger_decision")
+            .unwrap();
+        drop(runtime);
+        drop(manager);
+        let manager2 = reopen_manager(&dir);
+        let (deps2, _d2) =
+            verified_turn_deps(&manager2, vec![ScriptedResponse::End], fake_ok(), 0.65);
+        AgentRuntime::new(deps2).unwrap().recover().unwrap();
+        let h2 = manager2.get_session(session).unwrap().unwrap();
+        let facts = h2.memory_facts().unwrap();
+        assert!(
+            facts.iter().any(|(kind, key, value)| kind == "task_state"
+                && key == "state"
+                && value == "blocked"),
+            "the blocked task_state fact was not replayed: {facts:?}"
+        );
+        let decisions = manager2
+            .store()
+            .ledger_entries_desc(session, None, 64)
+            .unwrap();
+        assert!(
+            decisions.iter().any(|row| {
+                row.payload.get("kind").and_then(|k| k.as_str()) == Some("decision")
+                    && row
+                        .payload
+                        .get("rationale")
+                        .and_then(|r| r.as_str())
+                        .is_some_and(|r| r.contains("durable task budget exhausted"))
+            }),
+            "the budget refusal decision was not replayed: {decisions:?}"
+        );
+        assert!(marker_files(manager2.store().root()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn drive_start_fact_write_failure_propagates_typed_without_marker() {
+        // Adversarial: a drive-start fact mirror the caller CAN fail safely
+        // on propagates the typed store error (no compensation marker — the
+        // failure is loud) and drive_receipt lands the honest failed turn.
+        let (manager, session, _dir) = verified_shared_env();
+        // An EXISTING task row: the drive-start mirror runs its fact writes
+        // only against a row (a first-sighting drive creates the row instead).
+        let h = manager.get_session(session).unwrap().unwrap();
+        let now = h.now_ms();
+        h.create_task(Task {
+            task_id: h.task_id().unwrap(),
+            session_id: session,
+            goal: "gating task".into(),
+            acceptance_criteria: vec![],
+            plan: vec![],
+            attachments: Vec::new(),
+            budget: Default::default(),
+            state: TaskState::Running,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .unwrap();
+        let (turn_deps, _d) = verified_turn_deps(
+            &manager,
+            vec![ScriptedResponse::Text("hi".into()), ScriptedResponse::End],
+            fake_ok(),
+            0.65,
+        );
+        let runtime = AgentRuntime::new(turn_deps).unwrap();
+        durable_faults::arm(
+            runtime.deps().session.store().root(),
+            DW_SITE_RESTORE_STATE_FACT,
+        );
+        let err = runtime
+            .run_turn(session, "hello", &[])
+            .await
+            .expect_err("the lost fact mirror must fail the drive typed");
+        assert!(
+            err.message.contains(DW_SITE_RESTORE_STATE_FACT),
+            "the typed error must name the failed write: {err:?}"
+        );
+        assert!(
+            marker_files(manager.store().root()).is_empty(),
+            "a propagated failure needs no compensation marker"
+        );
+        let h = manager.get_session(session).unwrap().unwrap();
+        assert_eq!(h.state().unwrap(), AgentState::FailedRecoverable);
+        assert!(h.active_turn_record().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn verification_job_resolve_loss_is_marked_and_reconstructed_on_reopen() {
+        // Adversarial: the executor's resolve CAS loses its durable write; the
+        // job must stay open (never a silent pass/fail), the marker must be
+        // durable, and the reopen replay must land the intended resolution.
+        if !std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping resolve-replay test: no make on this host");
+            return;
+        }
+        let (manager, session, dir) = make_background_env("\t@true\n", None);
+        let root = dir.path().join("ws");
+        let (mut deps, _d) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(scripted_provider(vec![ScriptedResponse::End])),
+            vec![real_write_tool()],
+        );
+        deps.verification = real_background_verifier();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let h = manager.get_session(session).unwrap().unwrap();
+        let task_id = h.task_id().unwrap();
+        let now = h.now_ms();
+        h.create_task(Task {
+            task_id,
+            session_id: session,
+            goal: "bg".into(),
+            acceptance_criteria: vec![],
+            plan: vec![],
+            attachments: Vec::new(),
+            budget: Default::default(),
+            state: TaskState::Running,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .unwrap();
+        let attempt = runtime
+            .verify_integrated_root_attempt(
+                &h,
+                &root,
+                &["src/main.c".to_string()],
+                &[],
+                &CancellationToken::new(),
+                manager.next_op_id().raw(),
+            )
+            .await
+            .unwrap();
+        assert!(attempt.pending);
+        durable_faults::arm(runtime.deps().session.store().root(), DW_SITE_JOB_RESOLVE);
+        assert_eq!(runtime.execute_open_verification_jobs(&h).await.unwrap(), 1);
+        let rows = h
+            .verification_attempt_jobs(task_id.raw(), attempt.attempt_op)
+            .unwrap();
+        assert!(
+            rows.iter().any(|job| job.state.is_open()),
+            "the lost resolve left the job open: {rows:?}"
+        );
+        let root_dir = manager.store().root().to_path_buf();
+        assert_eq!(
+            marker_sites(&root_dir),
+            vec![DW_SITE_JOB_RESOLVE.to_string()]
+        );
+        drop(runtime);
+        drop(manager);
+        let manager2 = reopen_manager(&dir);
+        let (mut deps2, _d2) = deps_sharing_session(
+            manager2.clone(),
+            Arc::new(scripted_provider(vec![ScriptedResponse::End])),
+            vec![real_write_tool()],
+        );
+        deps2.verification = real_background_verifier();
+        AgentRuntime::new(deps2).unwrap().recover().unwrap();
+        let h2 = manager2.get_session(session).unwrap().unwrap();
+        let rows = h2
+            .verification_attempt_jobs(task_id.raw(), attempt.attempt_op)
+            .unwrap();
+        assert!(
+            rows.iter().any(|job| job.check_id == "make_test"
+                && job.state == faktor_session::VerificationJobState::Passed),
+            "the resolve was not reconstructed: {rows:?}"
+        );
+        assert!(marker_files(manager2.store().root()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn superseding_cancel_loss_is_marked_and_reconstructed_on_reopen() {
+        // Adversarial: a mutating turn supersedes the still-open verification
+        // attempt; the typed cancel write fails, so the open job must stay
+        // open (never silently certified), the marker must be durable, and
+        // the reopen replay must cancel the superseded attempt's jobs.
+        if !std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping cancel-replay test: no make on this host");
+            return;
+        }
+        let (manager, session, dir) = make_background_env("\t@true\n", None);
+        let root = dir.path().join("ws");
+        let (mut deps, _d) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/main.c",
+                        "content": "int main(void) {\n    return 0;\n}\n"
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ])),
+            vec![real_write_tool()],
+        );
+        deps.verification = real_background_verifier();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let h = manager.get_session(session).unwrap().unwrap();
+        let task_id = h.task_id().unwrap();
+        let now = h.now_ms();
+        h.create_task(Task {
+            task_id,
+            session_id: session,
+            goal: "supersede".into(),
+            acceptance_criteria: vec![],
+            plan: vec![],
+            attachments: Vec::new(),
+            budget: Default::default(),
+            state: TaskState::Running,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .unwrap();
+        let attempt = runtime
+            .verify_integrated_root_attempt(
+                &h,
+                &root,
+                &["src/main.c".to_string()],
+                &[],
+                &CancellationToken::new(),
+                manager.next_op_id().raw(),
+            )
+            .await
+            .unwrap();
+        assert!(attempt.pending, "the first attempt enqueued open jobs");
+        durable_faults::arm(
+            runtime.deps().session.store().root(),
+            DW_SITE_SUPERSEDE_CANCEL,
+        );
+        let outcome = runtime
+            .run_turn(session, "change main.c", &[])
+            .await
+            .unwrap();
+        assert!(
+            outcome.completion.is_some(),
+            "the turn must classify honestly, not fail on the lost cancel"
+        );
+        let rows = h
+            .verification_attempt_jobs(task_id.raw(), attempt.attempt_op)
+            .unwrap();
+        assert!(
+            rows.iter().any(|job| job.state.is_open()),
+            "the lost cancel left the superseded job open: {rows:?}"
+        );
+        assert_eq!(
+            marker_sites(manager.store().root()),
+            vec![DW_SITE_SUPERSEDE_CANCEL.to_string()]
+        );
+        drop(runtime);
+        drop(manager);
+        let manager2 = reopen_manager(&dir);
+        let (mut deps2, _d2) = deps_sharing_session(
+            manager2.clone(),
+            Arc::new(scripted_provider(vec![ScriptedResponse::End])),
+            vec![real_write_tool()],
+        );
+        deps2.verification = real_background_verifier();
+        AgentRuntime::new(deps2).unwrap().recover().unwrap();
+        let h2 = manager2.get_session(session).unwrap().unwrap();
+        let rows = h2
+            .verification_attempt_jobs(task_id.raw(), attempt.attempt_op)
+            .unwrap();
+        assert!(
+            rows.iter()
+                .all(|job| job.state == faktor_session::VerificationJobState::Cancelled),
+            "the supersede cancel was not reconstructed: {rows:?}"
+        );
+        assert!(marker_files(manager2.store().root()).is_empty());
     }
 }

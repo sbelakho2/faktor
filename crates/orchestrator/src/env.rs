@@ -36,9 +36,7 @@ use faktor_instructions::{
     EnvSnapshot, EnvSnapshotError, Instructions, MAX_RULE_BYTES, MAX_SNAPSHOT_TOTAL_BYTES,
 };
 
-use super::merge::{
-    pack_chunks, parent_handle, put_chunks, read_chunks, scan_facts, unpack_chunks,
-};
+use super::merge::{pack_chunks, parent_handle, put_chunks, read_chunks, unpack_chunks};
 use super::*;
 
 /// Durable snapshot row kind (parent session fact space).
@@ -304,22 +302,4 @@ impl OrchestratorRuntime {
         let content = self.read_snapshot_content(parent, &snap)?;
         Instructions::from_snapshot(&snap, &content).map_err(map_env_error)
     }
-}
-
-/// Enumerate the durable env-snapshot rows of one run (bounded scan).
-#[allow(dead_code)]
-pub(crate) fn env_snapshot_rows(
-    manager: &Arc<faktor_session::SessionManager>,
-    parent: SessionId,
-    run_id: &str,
-) -> Result<Vec<(String, String, String)>, ExecError> {
-    let handle = parent_handle(manager, parent)?;
-    let prefix = format!("{run_id}/");
-    let mut out = Vec::new();
-    for (kind, key, value) in scan_facts(&handle)? {
-        if kind == KIND_ENV_SNAPSHOT && key.strip_prefix(&prefix).is_some() {
-            out.push((kind, key, value));
-        }
-    }
-    Ok(out)
 }

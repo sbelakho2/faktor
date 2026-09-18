@@ -298,14 +298,14 @@ impl BillingVendorAdapter {
                                 totals,
                                 attempts: attempt + 1,
                                 idempotent_replay: page.idempotent_replay,
-                            })
+                            });
                         }
                         Err(retry) => (retry.error, retry.retry_after_ms),
                     },
                     Err(EgressError::Denied { url, .. }) => {
                         return Err(ControlPlaneError::Forbidden(format!(
                             "billing vendor egress to {url} denied by policy"
-                        )))
+                        )));
                     }
                     Err(e) => (
                         ControlPlaneError::Backend(format!("billing vendor transport: {e}")),
@@ -416,7 +416,7 @@ impl BillingVendorAdapter {
             Some(other) => {
                 return Err(ControlPlaneError::Malformed(format!(
                     "billing vendor next_cursor has an illegal shape: {other}"
-                )))
+                )));
             }
         };
         let idempotent_replay = json

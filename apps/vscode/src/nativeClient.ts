@@ -3154,7 +3154,7 @@ export class NativeClient {
   readonly baseUrl: string;
   readonly bearerToken: string;
   private readonly fetchImpl: FetchLike;
-  private readonly controlToken: string | null;
+  private controlToken: string | null;
   private readonly timeoutMs: number;
   private readonly maxBodyBytes: number;
 
@@ -3184,6 +3184,16 @@ export class NativeClient {
     }
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+  }
+
+  /**
+   * Replace the control-plane credential this client sends. The extension
+   * calls this after the secret store resolves (or the operator signs in /
+   * out); the daemon-password `bearerToken` is never affected. An
+   * empty/whitespace value clears the header.
+   */
+  setControlToken(value: string | null): void {
+    this.controlToken = value !== null && value.trim().length > 0 ? value : null;
   }
 
   private async request<T>(method: string, path: string, options: RequestOptions<T>): Promise<T> {
@@ -3586,6 +3596,30 @@ export class NativeClient {
   /** The derived entitlement snapshot of the caller's organization. */
   entitlements(): Promise<NativeEntitlements> {
     return this.request('GET', '/native/entitlements', { validate: validateEntitlements });
+  }
+
+  /**
+   * Revoke the caller's control-plane session on the daemon
+   * (`POST /native/sso/logout`). The route requires the daemon password
+   * (`Authorization: Bearer`) AND the session's own token
+   * (`x-faktor-control-token`), plus the STRICT body
+   * `{organization, session_id}` naming the session the token must own
+   * (the daemon is the guard: a foreign/missing session is a typed 404, a
+   * non-owning token a typed 401, a disabled control plane a typed 409).
+   * The caller reports a refusal explicitly and still deletes the local
+   * secret (the remote outcome is never silently claimed as revoked).
+   */
+  async revokeControlSession(organization: string, sessionId: string): Promise<void> {
+    if (organization.trim().length === 0 || sessionId.trim().length === 0) {
+      throw new NativeProtocolError(
+        'POST /native/sso/logout',
+        'revoking a control-plane session requires the organization and the auth-session id',
+      );
+    }
+    await this.request('POST', '/native/sso/logout', {
+      body: { organization, session_id: sessionId },
+      validate: () => undefined,
+    });
   }
 
   /**

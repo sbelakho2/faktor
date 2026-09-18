@@ -2299,6 +2299,19 @@ object NativeRequests {
             .toJson()
 
     /**
+     * The strict sign-out body (`POST /native/sso/logout`): the daemon names
+     * the session the PRESENTED `x-faktor-control-token` must own. The
+     * organization must be the one that token belongs to; the session id is
+     * the non-secret auth-session coordinate (never the token). A typo is a
+     * 400, a foreign/missing session a typed 404.
+     */
+    fun ssoLogout(organization: String, sessionId: String): String =
+        JsonObjectBuilder()
+            .put("organization", organization)
+            .put("session_id", sessionId)
+            .toJson()
+
+    /**
      * One session-owned terminal spawn (`POST /native/session/{id}/terminal`).
      * The strict daemon DTO mirrors `/pty/create`: `{command, args?, cwd?,
      * rows?, cols?}`; a typo is a 400. The session id rides the path, never

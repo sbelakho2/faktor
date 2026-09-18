@@ -90,6 +90,12 @@ enum Command {
         /// Plain mode keeps the bounded quick checks.
         #[arg(long)]
         deep: bool,
+        /// Optional daemon config to also audit: reports the resolved
+        /// `[worker_plane]` deployment-boundary decision (bind, exposure,
+        /// trusted-gateway acknowledgement) and surfaces a refused boundary
+        /// as an issue. Absent = the check is skipped.
+        #[arg(long)]
+        config: Option<String>,
     },
     /// ACP (Agent Client Protocol) stdio agent server over the real daemon
     /// graph. Framed JSON-RPC on stdout ONLY; logs stay on stderr.
@@ -426,8 +432,12 @@ async fn main() {
             )
             .await;
         }
-        Command::Doctor { data_dir, deep } => {
-            doctor(expand(&data_dir), deep).await;
+        Command::Doctor {
+            data_dir,
+            deep,
+            config,
+        } => {
+            doctor(expand(&data_dir), deep, config.map(|c| expand(&c))).await;
         }
         Command::Acp { data_dir } => {
             acp(expand(&data_dir)).await;
@@ -1784,6 +1794,12 @@ async fn serve_impl(
     // /native/workers* route 409 `workers_disabled`, the TaskExecutor
     // placement seam disabled => local execution unchanged).
     let config_workers = config.workers.clone();
+    // The additive `[worker_plane]` section (the worker-plane DEPLOYMENT
+    // BOUNDARY) is captured the same way: disabled by default (no second
+    // socket; the native listener is untouched). When enabled, a dedicated
+    // listener with its own identity is bound under the TLS-or-gateway-only
+    // rules and the typed refusal is raised BEFORE the daemon serves.
+    let config_worker_plane = config.worker_plane.clone();
     // The additive `[enterprise]` section (retention/audit/admin plane) is
     // captured the same way: disabled by default (no enterprise database,
     // every /native/enterprise/* route 409 `enterprise_disabled`, the local
@@ -2216,7 +2232,38 @@ async fn serve_impl(
     // Bind BEFORE readiness and BEFORE any backup work (audit 44): the
     // historic code ran rotate_backup synchronously between recover() and
     // bind, so a slow or cold backup delayed first-request readiness.
-    let handle = faktor_server::serve(deps, port)
+    // The additive `[worker_plane]` deployment boundary: resolve the typed
+    // bind/transport config (a refusal here is a STARTUP refusal naming the
+    // boundary) and bind the dedicated listener BEFORE the native listener,
+    // so a refused boundary never leaves a half-started daemon. The native
+    // listener stays loopback-only and reads none of these keys.
+    let worker_plane_config = config_worker_plane
+        .resolve()
+        .map_err(|e| format!("worker plane config: {e}"))?;
+    // The bounded live chunk stream is drained exactly once, before the deps
+    // envelope is shared between the two listeners.
+    faktor_server::drain_chunk_stream(&mut deps);
+    let deps = std::sync::Arc::new(deps);
+    let _worker_plane_handle = match worker_plane_config {
+        Some(worker_plane_config) => {
+            let handle = faktor_server::serve_worker_plane(deps.clone(), worker_plane_config)
+                .await
+                .map_err(|e| format!("worker plane: {e}"))?;
+            // The audit record of the boundary decision (including the
+            // trusted-gateway acknowledgement, when given).
+            tracing::info!("{}", handle.exposure.audit_line());
+            if handle.exposure.beyond_loopback {
+                tracing::warn!(
+                    "worker plane listens on {} beyond loopback behind an acknowledged trusted gateway ({}); TLS/mTLS terminate at the gateway",
+                    handle.addr,
+                    handle.exposure.audit_line()
+                );
+            }
+            Some(handle)
+        }
+        None => None,
+    };
+    let handle = faktor_server::serve_arc(deps, port)
         .await
         .map_err(|e| format!("failed to bind: {e}"))?;
     // The frozen stdout line; nothing else may be printed. Readiness is now
@@ -3320,8 +3367,8 @@ async fn enterprise_command(
 /// the journal projection consistency checks. Issues are always SURFACED,
 /// never repaired: the only automatic repair is stale-temp-file removal,
 /// documented in [`remove_stale_temp_files`].
-async fn doctor(data_dir: PathBuf, deep: bool) {
-    let report = doctor_run(&data_dir, deep);
+async fn doctor(data_dir: PathBuf, deep: bool, config_path: Option<PathBuf>) {
+    let report = doctor_run_with_config(&data_dir, deep, config_path.as_deref());
     for line in &report.lines {
         println!("{line}");
     }
@@ -3333,9 +3380,25 @@ async fn doctor(data_dir: PathBuf, deep: bool) {
     }
 }
 
+/// The config-free form used by the updater's post-swap health probe and by
+/// the existing tests (no `[worker_plane]` audit).
 fn doctor_run(data_dir: &std::path::Path, deep: bool) -> DoctorReport {
+    doctor_run_with_config(data_dir, deep, None)
+}
+
+/// `doctor [--config <path>]`: the storage checks plus, when an explicit
+/// config is named, the `[worker_plane]` deployment-boundary audit. The
+/// boundary decision (including the `trusted_gateway` acknowledgement) is
+/// surfaced line-by-line; a refused boundary is an ISSUE (the daemon would
+/// refuse to start) and is never repaired.
+fn doctor_run_with_config(
+    data_dir: &std::path::Path,
+    deep: bool,
+    config_path: Option<&std::path::Path>,
+) -> DoctorReport {
     let mut lines: Vec<String> = Vec::new();
     let mut issues = 0usize;
+    doctor_worker_plane_line(config_path, &mut lines, &mut issues);
     match SessionManager::open_quick(data_dir.join("store"), data_dir.join("cas")) {
         Ok(session) => {
             lines.push("store: ok".into());
@@ -3382,7 +3445,275 @@ fn doctor_run(data_dir: &std::path::Path, deep: bool) -> DoctorReport {
             issues += 1;
         }
     }
+    // The additive commercial-database section (P1 durability): runs even when
+    // the main store failed, so a corrupt commercial DB is always named.
+    commercial_db_doctor(data_dir, deep, &mut lines, &mut issues);
     DoctorReport { lines, issues }
+}
+
+/// The `cloud-db` doctor section: every `*.db` under the data dir — top-level
+/// AND nested (bounded depth, deterministic order, symlinks/hidden backup
+/// trees skipped) — is probed READ-ONLY for pragma state, the
+/// writer-recorded durability policy, integrity (quick in plain mode, full in
+/// `--deep`), last verified rotating backup age and pre-migration
+/// restore-point presence. Nothing is repaired; corruption is named (with its
+/// data-root-relative path) and left alone.
+///
+/// The commercial databases are the LOCAL commercial deployment authority:
+/// hosted deployments must move identity/auth/billing/credits/audit/retention
+/// to a transactional service. The first line of the section says so.
+fn commercial_db_doctor(
+    data_dir: &std::path::Path,
+    deep: bool,
+    lines: &mut Vec<String>,
+    issues: &mut usize,
+) {
+    /// Bound on databases probed in one doctor run (the rest are NAMED as
+    /// unprobed and fail the run — a silent truncation could hide one).
+    const MAX_COMMERCIAL_DBS: usize = 32;
+    /// Deepest directory level below the data root a `*.db` is discovered at
+    /// (a file directly under the root is depth 0).
+    const MAX_DB_DEPTH: usize = 3;
+    /// Total integrity-issue lines printed across ALL probed databases (each
+    /// probe keeps its own per-database bound; this is the section bound).
+    const MAX_INTEGRITY_LINES: usize = 128;
+    /// Directory names holding snapshots/blobs, never live authorities:
+    /// probing every copy would consume the bounded probe budget and could
+    /// hide a live database behind its own backups.
+    const SKIP_DB_DIRS: &[&str] = &["backups", "commercial-backups", "cas"];
+    /// Databases whose authority is the commercial control plane: a missing
+    /// durability policy marker here is an issue, not information.
+    const CLOUD_FAMILY: &[&str] = &[
+        "control-plane.db",
+        "billing.db",
+        "enterprise.db",
+        "scm.db",
+        "workers.db",
+        "update.db",
+    ];
+    let dbs = discover_commercial_dbs(data_dir, MAX_DB_DEPTH, SKIP_DB_DIRS);
+    if dbs.is_empty() {
+        return;
+    }
+    lines.push(format!(
+        "cloud-db: {} local commercial database(s) (top-level and nested); LOCAL commercial deployment authority — hosted deployments must move identity/auth/billing/credits/audit/retention to a transactional service",
+        dbs.len()
+    ));
+    if dbs.len() > MAX_COMMERCIAL_DBS {
+        lines.push(format!(
+            "cloud-db: {} database(s) beyond the {MAX_COMMERCIAL_DBS}-database probe budget were NOT probed",
+            dbs.len() - MAX_COMMERCIAL_DBS
+        ));
+        *issues += 1;
+    }
+    let mut integrity_lines_printed = 0usize;
+    let mut integrity_bound_reached = false;
+    for (rel, path) in dbs.into_iter().take(MAX_COMMERCIAL_DBS) {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let report = match faktor_cloud::durability::doctor_probe(&path, deep) {
+            Ok(report) => report,
+            Err(e) => {
+                lines.push(format!("cloud-db {rel}: FAILED ({e})"));
+                *issues += 1;
+                continue;
+            }
+        };
+        let policy_value = |key: &str| {
+            report
+                .policy
+                .as_ref()
+                .and_then(|rows| rows.iter().find(|(k, _)| k == key))
+                .map(|(_, v)| v.as_str())
+        };
+        lines.push(format!(
+            "cloud-db {rel}: journal_mode={} synchronous={} policy={} integrity={} tables={} rows={} digest={}",
+            report.journal_mode,
+            policy_value("synchronous").unwrap_or("unrecorded"),
+            policy_value("policy_version").unwrap_or("unrecorded"),
+            if report.integrity.is_empty() {
+                "ok".to_string()
+            } else {
+                format!("{} issue(s)", report.integrity.len())
+            },
+            report.fingerprint.tables,
+            report.fingerprint.rows,
+            &report.fingerprint.digest[..16.min(report.fingerprint.digest.len())],
+        ));
+        match policy_value("synchronous") {
+            Some("FULL") => {}
+            Some(other) => {
+                lines.push(format!(
+                    "cloud-db {rel}: durability policy is {other}, expected FULL"
+                ));
+                *issues += 1;
+            }
+            None if CLOUD_FAMILY.contains(&name.as_str()) => {
+                lines.push(format!(
+                    "cloud-db {rel}: durability policy marker missing (last opened by pre-policy code?)"
+                ));
+                *issues += 1;
+            }
+            None => {}
+        }
+        for problem in &report.integrity {
+            *issues += 1;
+            if integrity_lines_printed < MAX_INTEGRITY_LINES {
+                lines.push(format!("cloud-db {rel}: integrity: {problem}"));
+                integrity_lines_printed += 1;
+            } else if !integrity_bound_reached {
+                lines.push(format!(
+                    "cloud-db: further integrity issues are counted but not printed at the {MAX_INTEGRITY_LINES}-line output bound"
+                ));
+                integrity_bound_reached = true;
+            }
+        }
+        match &report.last_backup {
+            Some((backup, age)) => lines.push(format!(
+                "cloud-db {rel}: last verified backup {age}s ago ({}) — {} rotating kept",
+                backup.display(),
+                report.backup_count
+            )),
+            None if policy_value("backup_policy") == Some("rotating") => {
+                lines.push(format!(
+                    "cloud-db {rel}: rotating backup policy recorded but no verified backup exists"
+                ));
+                *issues += 1;
+            }
+            None => lines.push(format!("cloud-db {rel}: no rotating backup")),
+        }
+        match &report.migration_restore_point {
+            Some((point, age)) => lines.push(format!(
+                "cloud-db {rel}: migration restore point {age}s old ({})",
+                point.display()
+            )),
+            None => lines.push(format!(
+                "cloud-db {rel}: migration restore point: none recorded"
+            )),
+        }
+    }
+}
+
+/// Every live `*.db` at or below `root`, in a deterministic order: discovery
+/// is breadth-first with a bounded depth, each directory's entries are read
+/// in name order, and the result is sorted by (depth, data-root-relative
+/// path). Symlinks, hidden directories, the named snapshot/blob trees and
+/// in-progress `*.tmp` files are never probed. `rel` is `/`-joined for
+/// stable, platform-independent reporting.
+fn discover_commercial_dbs(
+    root: &std::path::Path,
+    max_depth: usize,
+    skip_dirs: &[&str],
+) -> Vec<(String, std::path::PathBuf)> {
+    let mut found: Vec<(usize, String, std::path::PathBuf)> = Vec::new();
+    let mut frontier: Vec<(std::path::PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = frontier.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut children: Vec<std::fs::DirEntry> = entries.flatten().collect();
+        children.sort_by_key(|entry| entry.file_name());
+        for entry in children {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().to_string();
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                if name.starts_with('.') || skip_dirs.contains(&name.as_str()) {
+                    continue;
+                }
+                if depth < max_depth {
+                    frontier.push((entry.path(), depth + 1));
+                }
+                continue;
+            }
+            if !kind.is_file() || name.contains(".tmp") {
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("db") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            found.push((depth, rel, path));
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    found
+        .into_iter()
+        .map(|(_, rel, path)| (rel, path))
+        .collect()
+}
+
+/// The `[worker_plane]` deployment-boundary audit: records the resolved
+/// exposure decision (including the `trusted_gateway` acknowledgement) in the
+/// doctor report. A refused boundary is an ISSUE — the daemon refuses to
+/// start on it — and is surfaced, never repaired. With no `--config` named
+/// the check is skipped (the config-free doctor path is unchanged).
+fn doctor_worker_plane_line(
+    config_path: Option<&std::path::Path>,
+    lines: &mut Vec<String>,
+    issues: &mut usize,
+) {
+    let Some(path) = config_path else {
+        return;
+    };
+    match config::Config::load(path) {
+        Ok(config) => {
+            let mut boundary_refused = false;
+            match config.worker_plane.resolve() {
+                Ok(None) => {
+                    lines.push("worker plane: disabled ([worker_plane] not enabled)".into());
+                }
+                Ok(Some(bind_config)) => match bind_config.validate() {
+                    Ok(exposure) => {
+                        lines.push(format!("worker plane: {}", exposure.audit_line()));
+                        if exposure.beyond_loopback {
+                            lines.push(format!(
+                                "worker plane: trusted_gateway acknowledgement recorded for {} (TLS/mTLS terminate at the gateway)",
+                                exposure.bind
+                            ));
+                        }
+                    }
+                    Err(refusal) => {
+                        lines.push(format!(
+                            "worker plane: FAILED [{}] {refusal}",
+                            refusal.code()
+                        ));
+                        *issues += 1;
+                        boundary_refused = true;
+                    }
+                },
+                Err(e) => {
+                    lines.push(format!("worker plane: FAILED {e}"));
+                    *issues += 1;
+                    boundary_refused = true;
+                }
+            }
+            // The rest of the config's semantic validation (the boundary
+            // refusal above is already the specific report).
+            if !boundary_refused {
+                if let Err(e) = config.validate() {
+                    lines.push(format!("config validation FAILED: {e}"));
+                    *issues += 1;
+                }
+            }
+        }
+        Err(e) => {
+            lines.push(format!("worker plane: config FAILED ({e})"));
+            *issues += 1;
+        }
+    }
 }
 
 /// `doctor --deep`: the full integrity scan, the CAS verification, the
@@ -3694,10 +4025,6 @@ async fn sessions(data_dir: PathBuf) {
         Err(e) => eprintln!("error: {e}"),
     }
 }
-
-// Keep SessionId referenced for future commands.
-#[allow(dead_code)]
-fn _sid(_: SessionId) {}
 
 #[cfg(test)]
 mod tests {
@@ -5677,6 +6004,391 @@ mod tests {
         let report = doctor_run(garbage.path(), false);
         assert!(report.issues >= 1, "{:?}", report.lines);
         assert!(report.lines.iter().any(|l| l.starts_with("store: FAILED")));
+    }
+
+    /// The additive `doctor --config` worker-plane boundary audit: the
+    /// resolved exposure decision (with the trusted-gateway acknowledgement)
+    /// is reported, and a refused boundary is an ISSUE — never repaired.
+    #[test]
+    fn doctor_reports_the_worker_plane_boundary_and_acknowledgement() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let session =
+                SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
+                    .unwrap();
+            session
+                .create_session(session.create_workspace("/w").unwrap(), "t", "p", "m")
+                .unwrap();
+        }
+        // No --config: no worker-plane line at all (config-free doctor
+        // unchanged).
+        let report = doctor_run(dir.path(), false);
+        assert!(!report
+            .lines
+            .iter()
+            .any(|line| line.starts_with("worker plane:")));
+        assert_eq!(report.issues, 0, "{:?}", report.lines);
+
+        let config = dir.path().join("config.json");
+        // A disabled section is an honest line, not an issue.
+        std::fs::write(&config, r#"{"model": "m"}"#).unwrap();
+        let report = doctor_run_with_config(dir.path(), false, Some(&config));
+        assert!(report
+            .lines
+            .iter()
+            .any(|line| line.contains("worker plane: disabled")));
+        assert_eq!(report.issues, 0, "{:?}", report.lines);
+
+        // A refused boundary is an issue naming the typed refusal code.
+        std::fs::write(
+            &config,
+            r#"{"model": "m", "cloud": {"enabled": true}, "workers": {"enabled": true, "organization": "org_local"}, "worker_plane": {"enabled": true, "bind": "0.0.0.0:8790"}}"#,
+        )
+        .unwrap();
+        let report = doctor_run_with_config(dir.path(), false, Some(&config));
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|line| line.contains("worker plane: FAILED")
+                    && line.contains("worker_plane_boundary_refused")
+                    && line.contains("worker-plane deployment boundary")),
+            "{:?}",
+            report.lines
+        );
+        assert!(report.issues >= 1);
+
+        // Gateway mode: the acknowledgement is recorded (and binds nothing).
+        std::fs::write(
+            &config,
+            r#"{"model": "m", "cloud": {"enabled": true}, "workers": {"enabled": true, "organization": "org_local"}, "worker_plane": {"enabled": true, "bind": "0.0.0.0:8790", "trusted_gateway": true}}"#,
+        )
+        .unwrap();
+        let report = doctor_run_with_config(dir.path(), false, Some(&config));
+        assert!(
+            report.lines.iter().any(|line| line
+                .contains("worker plane: trusted_gateway acknowledgement recorded")),
+            "{:?}",
+            report.lines
+        );
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|line| line.contains("exposure=beyond-loopback")
+                    && line.contains("trusted_gateway=true")),
+            "{:?}",
+            report.lines
+        );
+        assert_eq!(report.issues, 0, "{:?}", report.lines);
+    }
+
+    /// The additive `cloud-db` doctor section (P1 durability): a real
+    /// control-plane database is reported with its writer-recorded
+    /// `synchronous=FULL` policy, integrity, verified backup age and
+    /// migration restore-point presence; the LOCAL-authority caveat is
+    /// printed.
+    #[test]
+    fn doctor_reports_the_commercial_db_section_with_policy_and_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.db");
+        {
+            let store = faktor_cloud::SqliteControlPlaneStore::open(&path).unwrap();
+            let fp = store.fingerprint().unwrap();
+            let backup_dir = faktor_cloud::durability::backup_dir(&path);
+            std::fs::create_dir_all(&backup_dir).unwrap();
+            let backup = backup_dir.join(format!(
+                "control-plane-pre-migration-v4-{}-1.db",
+                std::process::id()
+            ));
+            store.backup_to(&backup).unwrap();
+            faktor_cloud::durability::restore_verify(&backup, &fp).unwrap();
+        }
+        let report = doctor_run(dir.path(), false);
+        assert_eq!(report.issues, 0, "healthy: {:?}", report.lines);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("LOCAL commercial deployment authority")
+                    && l.starts_with("cloud-db:")),
+            "{:?}",
+            report.lines
+        );
+        let section = report
+            .lines
+            .iter()
+            .find(|l| l.starts_with("cloud-db control-plane.db:"))
+            .expect("the section names the database");
+        assert!(section.contains("synchronous=FULL"), "{section}");
+        assert!(section.contains("journal_mode=wal"), "{section}");
+        assert!(section.contains("integrity=ok"), "{section}");
+        assert!(report
+            .lines
+            .iter()
+            .any(|l| l.contains("last verified backup") && l.contains("control-plane")));
+        assert!(report
+            .lines
+            .iter()
+            .any(|l| l.contains("migration restore point") && l.contains("-pre-migration-v4-")));
+    }
+
+    /// A corrupt commercial database fails doctor loudly and the `cloud-db`
+    /// section names it (never silently skipped, never auto-repaired).
+    #[test]
+    fn doctor_fails_loudly_on_a_corrupt_commercial_db_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("control-plane.db"),
+            b"garbage that is not a sqlite database",
+        )
+        .unwrap();
+        let report = doctor_run(dir.path(), false);
+        assert!(report.issues >= 1, "{:?}", report.lines);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.starts_with("cloud-db control-plane.db: FAILED")),
+            "{:?}",
+            report.lines
+        );
+    }
+
+    /// A legacy commercial database with no policy marker is flagged (its
+    /// last writer did not acknowledge with `synchronous = FULL`).
+    #[test]
+    fn doctor_flags_a_cloud_family_db_without_the_policy_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE legacy (id TEXT PRIMARY KEY); PRAGMA journal_mode = WAL;",
+            )
+            .unwrap();
+        }
+        let report = doctor_run(dir.path(), false);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("durability policy marker missing")),
+            "{:?}",
+            report.lines
+        );
+        assert!(report.issues >= 1, "{:?}", report.lines);
+    }
+
+    /// The nested discovery probe: databases below the data root (workspace /
+    /// session / cloud paths) are found with a bounded depth and a stable,
+    /// deterministic order; hidden/backup trees, in-progress temp files and
+    /// paths beyond the depth bound are never probed.
+    #[test]
+    fn doctor_discovers_nested_databases_deterministically_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        // A nested cloud-family database (marker + verified backup) ...
+        let cloud_dir = dir.path().join("cloud-state");
+        std::fs::create_dir_all(&cloud_dir).unwrap();
+        drop(
+            faktor_cloud::SqliteControlPlaneStore::open(&cloud_dir.join("control-plane.db"))
+                .unwrap(),
+        );
+        // ... and a nested SCM store database (its own child backup tree).
+        let scm_dir = dir.path().join("store").join("nested");
+        std::fs::create_dir_all(&scm_dir).unwrap();
+        drop(faktor_scm::SqliteScmStore::open(&scm_dir.join("scm.db")).unwrap());
+        // Below the depth bound: `a/b/c/d/buried.db` (depth 4) is not probed.
+        let deep = dir.path().join("a").join("b").join("c").join("d");
+        std::fs::create_dir_all(&deep).unwrap();
+        {
+            let conn = rusqlite::Connection::open(deep.join("buried.db")).unwrap();
+            conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY);")
+                .unwrap();
+        }
+        // In-progress snapshots are invisible: the name carries `.tmp`.
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        {
+            let conn = rusqlite::Connection::open(scratch.join("half.db.tmp")).unwrap();
+            conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY);")
+                .unwrap();
+        }
+        let rels = |report: &DoctorReport| -> Vec<String> {
+            report
+                .lines
+                .iter()
+                .filter_map(|l| {
+                    let rest = l.strip_prefix("cloud-db ")?;
+                    let (rel, _) = rest.split_once(": journal_mode=")?;
+                    Some(rel.to_string())
+                })
+                .collect()
+        };
+        let first = doctor_run(dir.path(), false);
+        let second = doctor_run(dir.path(), false);
+        let first_rels = rels(&first);
+        assert_eq!(
+            first_rels,
+            rels(&second),
+            "nested discovery order must be deterministic"
+        );
+        assert!(
+            first_rels.contains(&"cloud-state/control-plane.db".to_string()),
+            "{:?}",
+            first.lines
+        );
+        assert!(
+            first_rels.contains(&"store/nested/scm.db".to_string()),
+            "{:?}",
+            first.lines
+        );
+        assert!(
+            !first_rels.iter().any(|rel| rel.contains("buried")),
+            "beyond the depth bound: {:?}",
+            first.lines
+        );
+        assert!(
+            !first_rels.iter().any(|rel| rel.contains("half")),
+            "temp snapshots are not probed: {:?}",
+            first.lines
+        );
+        let nested = first
+            .lines
+            .iter()
+            .find(|l| l.starts_with("cloud-db store/nested/scm.db:"))
+            .expect("the nested store database is named with its relative path");
+        assert!(nested.contains("journal_mode=wal"), "{nested}");
+        assert!(nested.contains("synchronous=FULL"), "{nested}");
+        assert!(nested.contains("integrity=ok"), "{nested}");
+        assert!(
+            first
+                .lines
+                .iter()
+                .any(|l| l.starts_with("cloud-db store/nested/scm.db: last verified backup")),
+            "{:?}",
+            first.lines
+        );
+        assert_eq!(
+            first.issues, 0,
+            "healthy nested databases: {:?}",
+            first.lines
+        );
+    }
+
+    /// A corrupt nested database fails doctor loudly and is named by its
+    /// data-root-relative path (never silently skipped, never auto-repaired).
+    #[test]
+    fn doctor_fails_loudly_on_a_corrupt_nested_db_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("store").join("sessions");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("broken.db"),
+            b"garbage that is not a sqlite database",
+        )
+        .unwrap();
+        let report = doctor_run(dir.path(), false);
+        assert!(report.issues >= 1, "{:?}", report.lines);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.starts_with("cloud-db store/sessions/broken.db: FAILED")),
+            "{:?}",
+            report.lines
+        );
+    }
+
+    /// Doctor reports the SCM / worker / updater stores with their
+    /// writer-recorded policy, integrity, a verified backup age and their
+    /// pre-migration restore point — the three DBs that previously appeared
+    /// as unmarked.
+    #[test]
+    fn doctor_reports_policy_backup_and_restore_points_for_the_three_stores() {
+        let dir = tempfile::tempdir().unwrap();
+        let scm_path = dir.path().join("scm.db");
+        drop(faktor_scm::SqliteScmStore::open(&scm_path).unwrap());
+        let worker_path = dir.path().join("workers.db");
+        drop(faktor_worker::SqliteWorkerStore::open(&worker_path).unwrap());
+        let updater_path = dir.path().join("update.db");
+        drop(faktor_updater::SqliteUpdaterStore::open(&updater_path).unwrap());
+        // Roll each cursor back one version and reopen: the reopen writes a
+        // VERIFIED pre-migration restore point before migrating, exactly the
+        // state doctor must surface.
+        for (path, from_version) in [
+            (&scm_path, 1i64),
+            (&worker_path, 1i64),
+            (&updater_path, 2i64),
+        ] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch(&format!("PRAGMA user_version = {from_version}"))
+                .unwrap();
+            drop(conn);
+        }
+        drop(faktor_scm::SqliteScmStore::open(&scm_path).unwrap());
+        drop(faktor_worker::SqliteWorkerStore::open(&worker_path).unwrap());
+        drop(faktor_updater::SqliteUpdaterStore::open(&updater_path).unwrap());
+        let report = doctor_run(dir.path(), false);
+        for rel in ["scm.db", "workers.db", "update.db"] {
+            let section = report
+                .lines
+                .iter()
+                .find(|l| l.starts_with(&format!("cloud-db {rel}:")))
+                .unwrap_or_else(|| panic!("{rel} is reported: {:?}", report.lines));
+            assert!(section.contains("journal_mode=wal"), "{section}");
+            assert!(section.contains("synchronous=FULL"), "{section}");
+            assert!(section.contains("integrity=ok"), "{section}");
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with(&format!("cloud-db {rel}: last verified backup"))),
+                "{rel} backup age: {:?}",
+                report.lines
+            );
+            assert!(
+                report.lines.iter().any(|l| l
+                    .starts_with(&format!("cloud-db {rel}: migration restore point"))
+                    && l.contains("-pre-migration-v")),
+                "{rel} restore point: {:?}",
+                report.lines
+            );
+        }
+        assert_eq!(report.issues, 0, "{:?}", report.lines);
+    }
+
+    /// The probe budget is a bound, not a silent truncation: databases past
+    /// it are counted, named as unprobed, and the run fails loudly.
+    #[test]
+    fn doctor_bounds_the_database_probe_budget_and_names_the_excess() {
+        let dir = tempfile::tempdir().unwrap();
+        let many = dir.path().join("many");
+        std::fs::create_dir_all(&many).unwrap();
+        for i in 0..33 {
+            let conn = rusqlite::Connection::open(many.join(format!("db-{i:02}.db"))).unwrap();
+            conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY);")
+                .unwrap();
+        }
+        let report = doctor_run(dir.path(), false);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("beyond the 32-database probe budget were NOT probed")),
+            "{:?}",
+            report.lines
+        );
+        assert!(report.issues >= 1, "{:?}", report.lines);
+        // The probed subset itself stays named and healthy.
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.starts_with("cloud-db many/db-00.db:")),
+            "{:?}",
+            report.lines
+        );
     }
 
     #[test]
@@ -7942,10 +8654,11 @@ mod tests {
                     workers_db.exists(),
                     "{label}: an enabled [workers] section must open its durable plane"
                 );
-                // The plane's OWN migration ladder is applied (v1) — the
-                // commercial control-plane user_version is untouched.
+                // The plane's OWN migration ladder is applied (v2: the v1
+                // schema + the durability policy marker) — the commercial
+                // control-plane user_version is untouched.
                 let store = faktor_worker::SqliteWorkerStore::open(&workers_db).unwrap();
-                assert_eq!(faktor_worker::schema_version(&store).unwrap(), 1);
+                assert_eq!(faktor_worker::schema_version(&store).unwrap(), 2);
                 let plane =
                     faktor_worker::WorkerPlane::with_system_clock(std::sync::Arc::new(store));
                 let organization = faktor_cloud::OrganizationId::try_new("org_local").unwrap();

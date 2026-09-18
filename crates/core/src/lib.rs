@@ -95,24 +95,69 @@ impl WorkspaceIdentity {
     }
 }
 
-/// Zero is never a valid identifier; ID newtype constructors assert on 0.
-#[allow(dead_code)]
-pub(crate) fn reject_zero(raw: u64, what: &str) -> u64 {
-    assert!(
-        raw != 0,
-        "faktor-core invariant violated: {what} cannot be 0"
-    );
-    raw
+/// Zero is never a valid identifier; every ID newtype constructor routes
+/// its invariant check through this single authority.
+///
+/// A macro (not a function) because the check must stay callable from the
+/// `const fn` constructors while the panic still names the offending id
+/// TYPE: a shared `const fn` cannot format its message (const-formatting is
+/// unstable) and a shared non-const fn would de-`const` every id
+/// constructor (e.g. the const evidence access-scope builders).
+macro_rules! reject_zero {
+    ($raw:expr, $what:expr $(,)?) => {{
+        let raw = $raw;
+        assert!(
+            raw != 0,
+            concat!("faktor-core invariant violated: ", $what, " cannot be 0")
+        );
+        raw
+    }};
 }
+pub(crate) use reject_zero;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::id::{
+        EventSeq, OpId, ProviderCallId, SessionId, TaskId, TaskRevision, VerificationRecordId,
+        WorkspaceId, WorktreeId,
+    };
 
+    /// Adversarial: every ID constructor must reject zero through the one
+    /// authority, and the panic must name the offending id type (a silent
+    /// zero would violate the id contract at the construction boundary).
     #[test]
-    fn reject_zero_is_enforced() {
-        let panicked = std::panic::catch_unwind(|| reject_zero(0, "test")).is_err();
-        assert!(panicked);
-        assert_eq!(reject_zero(1, "test"), 1);
+    fn every_id_constructor_rejects_zero_and_names_the_type() {
+        macro_rules! assert_zero_rejected {
+            ($($t:ty),+ $(,)?) => {$(
+                let caught = std::panic::catch_unwind(|| <$t>::new(0));
+                let payload = caught.expect_err(concat!(stringify!($t), "::new(0) must panic"));
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                assert!(
+                    msg.contains("cannot be 0") && msg.contains(stringify!($t)),
+                    "panic for {}::new(0) must name the type and the zero violation: {msg}",
+                    stringify!($t)
+                );
+            )+};
+        }
+        assert_zero_rejected!(
+            SessionId,
+            WorkspaceId,
+            WorktreeId,
+            TaskId,
+            VerificationRecordId,
+            TaskRevision,
+            OpId,
+            ProviderCallId,
+            EventSeq,
+        );
+        // The shared authority itself refuses zero and passes non-zero
+        // through unchanged.
+        assert_eq!(reject_zero!(1, "test"), 1);
+        let caught = std::panic::catch_unwind(|| reject_zero!(0, "probe"));
+        assert!(caught.is_err(), "reject_zero!(0) must panic");
     }
 }

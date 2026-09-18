@@ -24,6 +24,7 @@ import * as ts from '../src/taskStart.ts';
 import * as wb from '../src/workspaceBinding.ts';
 import * as px from '../src/pixelAgents.ts';
 import * as cp from '../src/cockpit.ts';
+import * as cpa from '../src/controlPlaneAuth.ts';
 import composerPolicy from '../media/composer-state.js';
 import {
   existsSync,
@@ -4330,6 +4331,414 @@ async function usagePanelTests() {
   });
 }
 
+// ------------------------------------------- control-plane credential store
+//
+// Fake SecretStorage rows + a fake plaintext setting: store/retrieve,
+// one-shot migration (delete the plaintext, store the secret), the refusal
+// path (a declined migration never sends the plaintext) and logout (remote
+// revoke attempted, local secret deleted unconditionally).
+
+class FakeSecretStorage {
+  constructor(rows = new Map()) {
+    this.rows = rows;
+    this.operations = [];
+    this.changeListeners = [];
+  }
+
+  async get(key) {
+    this.operations.push(`get:${key}`);
+    return this.rows.get(key);
+  }
+
+  async store(key, value) {
+    this.operations.push(`store:${key}`);
+    this.rows.set(key, value);
+  }
+
+  async delete(key) {
+    this.operations.push(`delete:${key}`);
+    this.rows.delete(key);
+  }
+
+  /** The structural `vscode.SecretStorage.onDidChange` seam. */
+  onDidChange(listener) {
+    this.changeListeners.push(listener);
+    return {
+      dispose: () => {
+        this.changeListeners = this.changeListeners.filter((entry) => entry !== listener);
+      },
+    };
+  }
+
+  /** An EXTERNAL writer (another window / the keychain UI). */
+  async externalStore(key, value) {
+    this.rows.set(key, value);
+    this.emitChange(key);
+  }
+
+  async externalDelete(key) {
+    this.rows.delete(key);
+    this.emitChange(key);
+  }
+
+  emitChange(key) {
+    for (const listener of this.changeListeners.slice()) {
+      listener({ key });
+    }
+  }
+}
+
+/** Lets chained microtask applies settle before assertions. */
+function settle() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+class FakePlaintextSetting {
+  constructor(value = null) {
+    this.value = value;
+    this.clears = 0;
+  }
+
+  read() {
+    return this.value;
+  }
+
+  async clear() {
+    this.clears += 1;
+    this.value = null;
+  }
+}
+
+const controlPlaneScope = { endpoint: 'https://CP.Example/ ', organization: ' org-1 ' };
+
+async function controlPlaneCredentialTests() {
+  const expectedKey = 'faktor.controlPlaneToken.v1.https%3A%2F%2Fcp.example.org-1';
+
+  await test('the secret key is the endpoint plus organization, never the token', () => {
+    assertEqual(cpa.controlPlaneSecretKey(controlPlaneScope), expectedKey);
+    assert(cpa.controlPlaneScopeValid(controlPlaneScope), 'a valid scope must be recognized');
+    assert(!cpa.controlPlaneScopeValid(null), 'null scope is invalid');
+    assert(!cpa.controlPlaneScopeValid({ endpoint: 'https://x', organization: '   ' }), 'blank org invalid');
+    let threw = false;
+    try {
+      cpa.controlPlaneSecretKey({ endpoint: '', organization: 'o' });
+    } catch {
+      threw = true;
+    }
+    assert(threw, 'an incomplete scope must refuse to mint a secret key');
+  });
+
+  await test('SecretStorage wins and a leftover plaintext copy is deleted, never kept alongside', async () => {
+    const secrets = new FakeSecretStorage(new Map([[expectedKey, 'stored-token']]));
+    const plaintext = new FakePlaintextSetting('legacy-token');
+    let confirmCalls = 0;
+    const resolution = await cpa.resolveControlPlaneToken({
+      secrets,
+      plaintext,
+      scope: controlPlaneScope,
+      legacyToken: plaintext.read(),
+      confirmMigration: async () => {
+        confirmCalls += 1;
+        return true;
+      },
+    });
+    assertEqual(resolution.kind, 'secret');
+    assertEqual(resolution.token, 'stored-token');
+    assertEqual(resolution.legacyCleared, true, 'the leftover plaintext copy must be deleted');
+    assertEqual(plaintext.value, null);
+    assertEqual(confirmCalls, 0, 'no migration prompt when the secret already exists');
+  });
+
+  await test('a plaintext credential migrates once: secret stored, setting deleted', async () => {
+    const secrets = new FakeSecretStorage();
+    const plaintext = new FakePlaintextSetting('cp-legacy-value');
+    const resolution = await cpa.resolveControlPlaneToken({
+      secrets,
+      plaintext,
+      scope: controlPlaneScope,
+      legacyToken: plaintext.read(),
+      confirmMigration: async () => true,
+    });
+    assertEqual(resolution.kind, 'migrated');
+    assertEqual(resolution.token, 'cp-legacy-value');
+    assertEqual(secrets.rows.get(expectedKey), 'cp-legacy-value');
+    assertEqual(plaintext.value, null, 'the plaintext setting must be deleted after migration');
+    assertEqual(plaintext.clears, 1, 'exactly one delete call');
+    assertEqual(cpa.controlPlaneTokenForClient(resolution), 'cp-legacy-value');
+    // A second resolution reads only the secret (no plaintext, no prompt).
+    let prompts = 0;
+    const again = await cpa.resolveControlPlaneToken({
+      secrets,
+      plaintext,
+      scope: controlPlaneScope,
+      legacyToken: plaintext.read(),
+      confirmMigration: async () => {
+        prompts += 1;
+        return true;
+      },
+    });
+    assertEqual(again.kind, 'secret');
+    assertEqual(prompts, 0);
+  });
+
+  await test('a declined migration refuses the plaintext for cloud calls', async () => {
+    const secrets = new FakeSecretStorage();
+    const plaintext = new FakePlaintextSetting('cp-refused-value');
+    const resolution = await cpa.resolveControlPlaneToken({
+      secrets,
+      plaintext,
+      scope: controlPlaneScope,
+      legacyToken: plaintext.read(),
+      confirmMigration: async () => false,
+    });
+    assertEqual(resolution.kind, 'legacy-refused');
+    assertEqual(cpa.controlPlaneTokenForClient(resolution), null, 'a refused plaintext is never returned');
+    assertEqual(secrets.rows.size, 0, 'a declined migration stores nothing');
+    assertEqual(plaintext.value, 'cp-refused-value', 'the operator keeps (and can remove) the setting');
+    assert(
+      !JSON.stringify(resolution).includes('cp-refused-value'),
+      'the refusal may never carry the plaintext value',
+    );
+    // The client built from the refusal sends no header at all.
+    const routes = { 'GET /native/identity': () => jsonResponse(identityJson) };
+    const refused = makeClient(routes, {
+      controlToken: cpa.controlPlaneTokenForClient(resolution) ?? undefined,
+    });
+    await refused.client.identity();
+    assertEqual(
+      findCall(refused.calls, 'GET', '/native/identity').headers['x-faktor-control-token'],
+      undefined,
+      'the refused plaintext must never reach a cloud call',
+    );
+  });
+
+  await test('a plaintext credential without scope coordinates is refused', async () => {
+    const secrets = new FakeSecretStorage();
+    const plaintext = new FakePlaintextSetting('cp-scopeless-value');
+    const resolution = await cpa.resolveControlPlaneToken({
+      secrets,
+      plaintext,
+      scope: null,
+      legacyToken: plaintext.read(),
+      confirmMigration: async () => true,
+    });
+    assertEqual(resolution.kind, 'legacy-refused');
+    assert(resolution.reason.includes('endpoint'), resolution.reason);
+    assertEqual(cpa.controlPlaneTokenForClient(resolution), null);
+    assertEqual(secrets.rows.size, 0);
+  });
+
+  await test('sign-in stores the secret and deletes the plaintext; blank input is refused', async () => {
+    const secrets = new FakeSecretStorage();
+    const plaintext = new FakePlaintextSetting('leftover');
+    const key = await cpa.storeControlPlaneToken(secrets, plaintext, controlPlaneScope, 'signin-token');
+    assertEqual(key, expectedKey);
+    assertEqual(secrets.rows.get(expectedKey), 'signin-token');
+    assertEqual(plaintext.value, null);
+    await assertRejects(
+      () => cpa.storeControlPlaneToken(secrets, plaintext, controlPlaneScope, '   '),
+      (error) => /empty control-plane credential/.test(error.message),
+      'blank credential',
+    );
+    assertEqual(secrets.rows.size, 1, 'a refused blank credential stores nothing');
+  });
+
+  await test('logout sends the real route shape and revokes the exact token; a network error still deletes locally', async () => {
+    const secrets = new FakeSecretStorage(new Map([[expectedKey, 'logout-token']]));
+    const plaintext = new FakePlaintextSetting('leftover');
+    const revoked = [];
+    const ok = await cpa.logoutControlPlane({
+      secrets,
+      plaintext,
+      scope: controlPlaneScope,
+      session: { organization: 'org-1', sessionId: 'ses-1' },
+      revoke: async (token, session) => {
+        revoked.push([token, session.organization, session.sessionId]);
+      },
+    });
+    assertDeepEqual(
+      revoked,
+      [['logout-token', 'org-1', 'ses-1']],
+      'the exact stored token and the non-secret session coordinates are revoke inputs',
+    );
+    assertEqual(ok.remoteRevoked, true);
+    assertEqual(ok.hadSecret, true);
+    assertEqual(secrets.rows.size, 0, 'logout deletes the local secret');
+    assertEqual(plaintext.value, null);
+    // Unreachable control plane: the remote failure is reported but never
+    // keeps the local credential.
+    const failing = new FakeSecretStorage(new Map([[expectedKey, 'token-2']]));
+    const failed = await cpa.logoutControlPlane({
+      secrets: failing,
+      plaintext: new FakePlaintextSetting(null),
+      scope: controlPlaneScope,
+      session: { organization: 'org-1', sessionId: 'ses-1' },
+      revoke: async () => {
+        throw new Error('daemon is not running');
+      },
+    });
+    assertEqual(failed.remoteRevoked, false);
+    assertEqual(failed.remoteError, 'daemon is not running');
+    assertEqual(failing.rows.size, 0, 'a failed remote revoke still deletes the secret');
+    // An opaque token without its session id: the route cannot name the
+    // session, so nothing is claimed and no revoke call is attempted.
+    const unknown = new FakeSecretStorage(new Map([[expectedKey, 'token-3']]));
+    let unknownCalls = 0;
+    const noSession = await cpa.logoutControlPlane({
+      secrets: unknown,
+      plaintext: new FakePlaintextSetting(null),
+      scope: controlPlaneScope,
+      session: null,
+      revoke: async () => {
+        unknownCalls += 1;
+      },
+    });
+    assertEqual(unknownCalls, 0, 'no session id => no named revoke');
+    assertEqual(noSession.remoteRevoked, false);
+    assert(noSession.remoteError.includes('auth-session id'), noSession.remoteError);
+    assertEqual(unknown.rows.size, 0, 'the impossible revoke still deletes the local secret');
+    // No stored credential: no revoke call is attempted.
+    const empty = new FakeSecretStorage();
+    let calls = 0;
+    const none = await cpa.logoutControlPlane({
+      secrets: empty,
+      plaintext: new FakePlaintextSetting(null),
+      scope: controlPlaneScope,
+      session: { organization: 'org-1', sessionId: 'ses-1' },
+      revoke: async () => {
+        calls += 1;
+      },
+    });
+    assertEqual(none.hadSecret, false);
+    assertEqual(calls, 0);
+  });
+
+  await test('the client sends the credentialed header only after a secure resolution', async () => {
+    const routes = {
+      'GET /native/identity': () => jsonResponse(identityJson),
+      'POST /native/sso/logout': () => jsonResponse({ ok: true }),
+    };
+    const { client, calls } = makeClient(routes);
+    await client.identity();
+    assertEqual(
+      findCall(calls, 'GET', '/native/identity').headers['x-faktor-control-token'],
+      undefined,
+      'no credential => no control-plane header',
+    );
+    client.setControlToken('live-token');
+    await client.identity();
+    assertEqual(
+      calls.filter((call) => call.path === '/native/identity').at(-1).headers['x-faktor-control-token'],
+      'live-token',
+    );
+    await client.revokeControlSession('org-1', 'ses-1');
+    const logout = findCall(calls, 'POST', '/native/sso/logout');
+    assertEqual(logout.headers['x-faktor-control-token'], 'live-token');
+    assertEqual(logout.headers.Authorization, 'Bearer selftest-token', 'the daemon password rides Authorization');
+    assertEqual(logout.body.organization, 'org-1');
+    assertEqual(logout.body.session_id, 'ses-1');
+    client.setControlToken(null);
+    await client.identity();
+    assertEqual(
+      calls.filter((call) => call.path === '/native/identity').at(-1).headers['x-faktor-control-token'],
+      undefined,
+      'sign-out clears the header',
+    );
+  });
+
+  await test('revokeControlSession refuses a body the daemon would reject, and a 404 is a typed not-found', async () => {
+    const routes = {
+      'POST /native/sso/logout': (call) =>
+        call.body.session_id === 'ses-missing'
+          ? jsonResponse(
+              { error: { code: 'not_found', message: 'control-plane session not found', retryable: false } },
+              404,
+            )
+          : jsonResponse({ ok: true, revoked: true, alreadyRevoked: false }),
+    };
+    const { client } = makeClient(routes, { controlToken: 'live-token' });
+    await assertRejects(
+      () => client.revokeControlSession('  ', 'ses-1'),
+      (error) => /organization/.test(error.message),
+      'blank organization',
+    );
+    await assertRejects(
+      () => client.revokeControlSession('org-1', ''),
+      (error) => /auth-session id/.test(error.message),
+      'blank session id',
+    );
+    await assertRejects(
+      () => client.revokeControlSession('org-1', 'ses-missing'),
+      (error) => error.status === 404 && error.code === 'not_found',
+      'the route 404 is the typed not-found, never a route-absent story',
+    );
+    // The success path resolves without a body the daemon would refuse.
+    await client.revokeControlSession('org-1', 'ses-1');
+  });
+
+  await test('an external SecretStorage change reaches the running client; removal clears the old token', async () => {
+    const secrets = new FakeSecretStorage(new Map([[expectedKey, 'first-token']]));
+    const plaintext = new FakePlaintextSetting(null);
+    const applied = [];
+    const target = { setControlToken: (value) => applied.push(value) };
+    const errors = [];
+    const watch = cpa.watchControlPlaneSecretChanges({
+      secrets,
+      apply: async () => {
+        const resolution = await cpa.resolveControlPlaneToken({
+          secrets,
+          plaintext,
+          scope: controlPlaneScope,
+          legacyToken: null,
+        });
+        target.setControlToken(cpa.controlPlaneTokenForClient(resolution));
+      },
+      onError: (error) => errors.push(error),
+    });
+    assert(cpa.isControlPlaneSecretKey(expectedKey), 'the key is owned by this module');
+    assert(!cpa.isControlPlaneSecretKey('faktor.controlPlaneEndpoint'), 'settings are not secret keys');
+    // An EXTERNAL write (another window / keychain UI) replaces the live token.
+    await secrets.externalStore(expectedKey, 'second-token');
+    await settle();
+    assertDeepEqual(applied, ['second-token'], 'the external update reached the client');
+    // An EXTERNAL removal clears the old token instead of leaving it live.
+    await secrets.externalDelete(expectedKey);
+    await settle();
+    assertDeepEqual(applied, ['second-token', null], 'the removed secret clears the old token');
+    // Unrelated secret keys never apply.
+    await secrets.externalStore('faktor.unrelated.secret.row', 'x');
+    await settle();
+    assertDeepEqual(applied, ['second-token', null], 'only control-plane keys apply');
+    // A re-stored credential applies again.
+    await secrets.externalStore(expectedKey, 'third-token');
+    await settle();
+    assertDeepEqual(
+      applied,
+      ['second-token', null, 'third-token'],
+      'the watch keeps applying later changes',
+    );
+    // Disposal stops applying.
+    watch.dispose();
+    await secrets.externalStore(expectedKey, 'fourth-token');
+    await settle();
+    assertDeepEqual(applied, ['second-token', null, 'third-token'], 'a disposed watch stops');
+    assertDeepEqual(errors, [], 'no refresh errors on the happy path');
+    // A throwing apply surfaces through onError and the watch stays alive.
+    const failingWatch = cpa.watchControlPlaneSecretChanges({
+      secrets,
+      apply: async () => {
+        throw new Error('resolution failed');
+      },
+      onError: (error) => errors.push(error),
+    });
+    await secrets.externalStore(expectedKey, 'fifth-token');
+    await settle();
+    assertEqual(errors.length, 1);
+    assertEqual(errors[0].message, 'resolution failed');
+    failingWatch.dispose();
+  });
+}
+
 async function main() {
   await validatorAccepts();
   await validatorRejects();
@@ -4351,6 +4760,7 @@ async function main() {
   await acceptanceProofTests();
   await proofSummaryTests();
   await usagePanelTests();
+  await controlPlaneCredentialTests();
   await presentationWebviewTests();
   await tournamentWebviewTests();
   await reducedMotionTests();

@@ -858,7 +858,7 @@ impl AsyncOidcAdapter for NetworkOidcAdapter {
                     _ => {
                         return Err(OidcError::Malformed(format!(
                             "kid {kid:?} carries no RSA n/e components for RS256"
-                        )))
+                        )));
                     }
                 };
                 let components = ring::signature::RsaPublicKeyComponents {
@@ -935,7 +935,7 @@ impl AsyncOidcAdapter for NetworkOidcAdapter {
             _ => {
                 return Err(OidcError::Malformed(
                     "claim \"aud\" is missing or malformed".into(),
-                ))
+                ));
             }
         };
         if !audience.iter().any(|aud| aud == &expected.audience) {

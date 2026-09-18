@@ -130,21 +130,23 @@ pub trait EvidenceStore {
         ctx: &EvidenceAccessContext,
     ) -> Result<StoredEvidence, EvidenceError> {
         let stored = self
-            .get(id)
+            .get(id)?
             .ok_or_else(|| EvidenceError::Malformed(format!("unknown evidence id {id}")))?;
         ensure_scope(&stored.envelope, ctx)?;
         Ok(stored)
     }
 
-    /// Raw, unscoped lookup used by storage internals. Callers acting for a
-    /// session MUST use [`EvidenceStore::get_scoped`].
-    fn get(&self, id: EvidenceId) -> Option<StoredEvidence>;
+    /// Raw, unscoped lookup used by storage internals. A durable read
+    /// failure is PROPAGATED (a missing id is `Ok(None)`, a corrupt or
+    /// unavailable store is a typed `Err` — the two are never conflated).
+    /// Callers acting for a session MUST use [`EvidenceStore::get_scoped`].
+    fn get(&self, id: EvidenceId) -> Result<Option<StoredEvidence>, EvidenceError>;
 
     /// Unscoped existence probe that never materializes backing bytes. The
     /// default implementation is the honest `get`-based fallback; durable
     /// stores override it so a 404/403 decision never pays a CAS read.
     fn exists(&self, id: EvidenceId) -> Result<bool, EvidenceError> {
-        Ok(self.get(id).is_some())
+        Ok(self.get(id)?.is_some())
     }
 
     /// Certification seam: the allocation identity of the sharing authority
@@ -172,9 +174,15 @@ fn ensure_scope(env: &EvidenceEnvelope, ctx: &EvidenceAccessContext) -> Result<(
     }
     Err(EvidenceError::AccessDenied(format!(
         "evidence {} belongs to session {} workspace {} task {}; caller is session {} workspace {} scope {:?}",
-        env.id, env.session_id, env.workspace_id,
-        env.task_id.map(|t| t.to_string()).unwrap_or_else(|| "none".to_string()),
-        ctx.session_id, ctx.workspace_id, ctx.scope,
+        env.id,
+        env.session_id,
+        env.workspace_id,
+        env.task_id
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        ctx.session_id,
+        ctx.workspace_id,
+        ctx.scope,
     )))
 }
 
@@ -314,7 +322,7 @@ impl MemoryEvidenceStore {
         ctx: &EvidenceAccessContext,
     ) -> Result<StoredEvidence, EvidenceError> {
         let stored = self
-            .get(id)
+            .get(id)?
             .ok_or_else(|| EvidenceError::Malformed(format!("unknown evidence id {id}")))?;
         ensure_scope(&stored.envelope, ctx)?;
         Ok(stored.clone())
@@ -425,8 +433,8 @@ impl EvidenceStore for MemoryEvidenceStore {
         Ok(())
     }
 
-    fn get(&self, id: EvidenceId) -> Option<StoredEvidence> {
-        self.entries.get(&id).cloned()
+    fn get(&self, id: EvidenceId) -> Result<Option<StoredEvidence>, EvidenceError> {
+        Ok(self.entries.get(&id).cloned())
     }
 }
 
@@ -630,7 +638,7 @@ impl<'a> DurableEvidenceStore<'a> {
                         EvidenceError::Malformed(format!(
                             "backing {normalized} is recorded but its bytes are absent"
                         ))
-                    })
+                    });
                 }
                 Err(err) => denied = Some(err),
             }
@@ -1189,8 +1197,8 @@ impl EvidenceStore for DurableEvidenceAuthority {
         self.insert_new(&env, backing.as_deref()).map(|_| ())
     }
 
-    fn get(&self, id: EvidenceId) -> Option<StoredEvidence> {
-        DurableEvidenceAuthority::get(self, id).ok().flatten()
+    fn get(&self, id: EvidenceId) -> Result<Option<StoredEvidence>, EvidenceError> {
+        DurableEvidenceAuthority::get(self, id)
     }
 
     fn get_scoped(
@@ -1232,8 +1240,8 @@ impl EvidenceStore for Arc<DurableEvidenceAuthority> {
             .map(|_| ())
     }
 
-    fn get(&self, id: EvidenceId) -> Option<StoredEvidence> {
-        DurableEvidenceAuthority::get(self, id).ok().flatten()
+    fn get(&self, id: EvidenceId) -> Result<Option<StoredEvidence>, EvidenceError> {
+        DurableEvidenceAuthority::get(self, id)
     }
 
     fn get_scoped(
@@ -1362,8 +1370,8 @@ mod tests {
         assert!(store.get_scoped(EvidenceId(8), &owner).is_ok());
 
         // `get` is raw and unscoped; unknown ids are None, not an error.
-        assert!(store.get(EvidenceId(7)).is_some());
-        assert!(store.get(EvidenceId(999)).is_none());
+        assert!(store.get(EvidenceId(7)).unwrap().is_some());
+        assert!(store.get(EvidenceId(999)).unwrap().is_none());
         assert_eq!(store.len(), 2);
         assert!(!store.is_empty());
         assert!(store.contains(EvidenceId(8)));
@@ -1398,7 +1406,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            store.get(EvidenceId(1)).unwrap().backing.as_deref(),
+            store
+                .get(EvidenceId(1))
+                .unwrap()
+                .unwrap()
+                .backing
+                .as_deref(),
             Some(&[0u8; 4][..])
         );
 
@@ -1413,7 +1426,7 @@ mod tests {
         );
         assert!(env.backing_hash.is_some());
         store.insert(env, Some(vec![0u8; 5])).unwrap();
-        let stored = store.get(EvidenceId(2)).unwrap();
+        let stored = store.get(EvidenceId(2)).unwrap().unwrap();
         assert!(
             stored.backing.is_none(),
             "oversized backing must be dropped"
@@ -1435,7 +1448,7 @@ mod tests {
                 Some(vec![1]),
             )
             .unwrap();
-        assert!(store.get(EvidenceId(3)).unwrap().backing.is_none());
+        assert!(store.get(EvidenceId(3)).unwrap().unwrap().backing.is_none());
         store
             .insert(
                 envelope(
@@ -1449,7 +1462,7 @@ mod tests {
                 Some(vec![1]),
             )
             .unwrap();
-        assert!(store.get(EvidenceId(4)).unwrap().backing.is_none());
+        assert!(store.get(EvidenceId(4)).unwrap().unwrap().backing.is_none());
 
         // Truncated capture never retains bytes even when aggressive + small.
         store
@@ -1465,7 +1478,7 @@ mod tests {
                 Some(vec![1]),
             )
             .unwrap();
-        assert!(store.get(EvidenceId(5)).unwrap().backing.is_none());
+        assert!(store.get(EvidenceId(5)).unwrap().unwrap().backing.is_none());
 
         // No backing provided stays None.
         store
@@ -1481,7 +1494,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(store.get(EvidenceId(6)).unwrap().backing.is_none());
+        assert!(store.get(EvidenceId(6)).unwrap().unwrap().backing.is_none());
 
         // Cap zero retains only the empty backing (0 bytes fit by definition).
         let mut zero = MemoryEvidenceStore::new(0);
@@ -1497,7 +1510,7 @@ mod tests {
             Some(vec![1]),
         )
         .unwrap();
-        assert!(zero.get(EvidenceId(1)).unwrap().backing.is_none());
+        assert!(zero.get(EvidenceId(1)).unwrap().unwrap().backing.is_none());
         zero.insert(
             envelope(
                 2,
@@ -1511,7 +1524,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            zero.get(EvidenceId(2)).unwrap().backing.as_deref(),
+            zero.get(EvidenceId(2)).unwrap().unwrap().backing.as_deref(),
             Some(&[][..])
         );
         assert_eq!(zero.backing_cap(), 0);
@@ -1548,7 +1561,12 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, EvidenceError::Refused(_)), "{err:?}");
         assert_eq!(
-            store.get(EvidenceId(1)).unwrap().backing.as_deref(),
+            store
+                .get(EvidenceId(1))
+                .unwrap()
+                .unwrap()
+                .backing
+                .as_deref(),
             Some(&b"first"[..]),
             "the original bytes must survive a duplicate insert"
         );
@@ -2302,6 +2320,58 @@ mod tests {
         ));
         assert!(matches!(
             authority.read_backing_by_digest(&hash.to_hex(), &owner),
+            Err(EvidenceError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn trait_get_propagates_durable_failures_and_keeps_missing_distinct() {
+        let f = durable();
+        let (sid, ws) = scoped_session(&f.store, "/w");
+        let authority = durable_authority(&f, 4096);
+        let stored = authority
+            .insert_new(
+                &durable_envelope(
+                    sid,
+                    ws,
+                    "healthy",
+                    Compressibility::Aggressive,
+                    BackingCompleteness::Complete,
+                ),
+                Some(b"healthy bytes"),
+            )
+            .unwrap();
+        // A corrupt row of the same shape: the compact column is garbage.
+        let mut corrupt_row = f.store.evidence_get(stored.id.0).unwrap().unwrap();
+        corrupt_row.id = 0;
+        corrupt_row.compact_json = "{not-json".into();
+        let corrupt_id = f.store.evidence_insert(&corrupt_row).unwrap();
+
+        let boxed: Box<dyn EvidenceStore + Send + Sync> = Box::new(authority.clone());
+        // Missing stays DISTINCT from failure: Ok(None), never Err.
+        assert!(boxed.get(EvidenceId(999_999)).unwrap().is_none());
+        assert!(boxed.get(stored.id).unwrap().is_some());
+        // A corrupt durable row is a typed Err — `get` must not flatten it
+        // into a missing row.
+        match boxed.get(EvidenceId(corrupt_id)) {
+            Err(EvidenceError::Malformed(message)) => {
+                assert!(message.contains("compact"), "{message}");
+            }
+            other => panic!("corrupt durable row must be a typed Err, got {other:?}"),
+        }
+        // The shared-Arc impl propagates identically.
+        let arc = Arc::new(authority);
+        assert!(matches!(
+            EvidenceStore::get(&arc, EvidenceId(corrupt_id)),
+            Err(EvidenceError::Malformed(_))
+        ));
+        assert!(EvidenceStore::get(&arc, EvidenceId(999_999))
+            .unwrap()
+            .is_none());
+        // get_scoped keeps refusing the same corrupt row (unchanged path).
+        let ctx = EvidenceAccessContext::new(sid.raw(), ws.raw(), Some(7));
+        assert!(matches!(
+            boxed.get_scoped(EvidenceId(corrupt_id), &ctx),
             Err(EvidenceError::Malformed(_))
         ));
     }

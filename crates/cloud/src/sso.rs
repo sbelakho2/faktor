@@ -245,6 +245,7 @@ impl SsoLogin {
                 &membership.subject,
                 &membership.email,
                 &membership.email,
+                claims.email_verified,
                 membership.role,
             )
             .map_err(control_plane_error_into_oidc)?;

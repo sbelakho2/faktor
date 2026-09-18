@@ -44,7 +44,7 @@ pub fn normalize_email(email: &str) -> Result<String, ControlPlaneError> {
         _ => {
             return Err(ControlPlaneError::Malformed(
                 "email must contain exactly one '@'".into(),
-            ))
+            ));
         }
     };
     if local.is_empty() || domain.is_empty() || !domain.contains('.') {

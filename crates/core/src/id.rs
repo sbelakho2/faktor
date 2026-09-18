@@ -3,8 +3,8 @@
 //!
 //! Two construction surfaces exist:
 //! - `SessionId::new` (and its sibling id types) is the internal hot-path
-//!   constructor: `const`, panic-free only for known-valid callers. It
-//!   panics on zero.
+//!   constructor: `const`, panic-free only for known-valid callers. Zero is
+//!   rejected through the one authority `crate::reject_zero`.
 //! - `TryFrom<u64>` (and `From<NonZeroU64>`) is the HOSTILE-INPUT surface:
 //!   an untrusted raw value yields a typed [`crate::Error`] instead of a
 //!   panic, so decoding hostile storage/wire bytes never aborts a task.
@@ -23,12 +23,12 @@ macro_rules! id_type {
             /// Construct from a non-zero raw id (internal hot path).
             ///
             /// # Panics
-            /// Panics when `raw == 0`. Untrusted input must use
-            /// `TryFrom<u64>` so a hostile zero becomes a typed error.
+            /// Panics when `raw == 0` (the shared `crate::reject_zero`
+            /// authority). Untrusted input must use `TryFrom<u64>` so a
+            /// hostile zero becomes a typed error.
             #[inline]
             pub const fn new(raw: u64) -> Self {
-                assert!(raw != 0, concat!(stringify!($name), " cannot be 0"));
-                Self(raw)
+                Self(crate::reject_zero!(raw, stringify!($name)))
             }
 
             #[inline]

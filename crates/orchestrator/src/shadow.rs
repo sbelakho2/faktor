@@ -126,16 +126,28 @@ pub enum ShadowCopyDrift {
     Every,
 }
 
+/// Deterministic test seam of graceful retirement (adversarial tests):
+/// injects one durable-row write failure in [`ShadowRoots::shutdown`].
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowRetireFault {
+    /// The NEXT retirement row write fails once (then the seam disarms).
+    Once,
+}
+
 /// The shadow service: one per daemon data dir. Begins/stages/discards
 /// shadows and keeps their durable registry rows consistent. A graceful
-/// shutdown (Drop or [`ShadowRoots::shutdown`]) removes every shadow dir;
-/// a crash leaves rows that a reopen reconciles deterministically.
+/// shutdown (Drop or [`ShadowRoots::shutdown`]) retires every shadow
+/// record-first; a crash leaves rows/directories that a reopen reconciles
+/// deterministically.
 pub struct ShadowRoots {
     manager: Arc<SessionManager>,
     shadows_root: PathBuf,
     limits: ShadowCopyLimits,
     #[cfg(test)]
     copy_seam: Arc<Mutex<Option<ShadowCopyDrift>>>,
+    #[cfg(test)]
+    retire_fault: Arc<Mutex<Option<ShadowRetireFault>>>,
 }
 
 impl std::fmt::Debug for ShadowRoots {
@@ -170,6 +182,8 @@ impl ShadowRoots {
             limits,
             #[cfg(test)]
             copy_seam: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            retire_fault: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -492,7 +506,13 @@ impl ShadowRoots {
 
     /// Remove the session's shadow directory and durably mark the row
     /// `Discarded` (the row itself stays: a tombstone, never silently
-    /// dropped). Idempotent for a missing directory.
+    /// dropped). Record-first: the durable row reaches `Discarded` BEFORE
+    /// the directory is removed, so a crash can only leave a retired row
+    /// whose directory [`ShadowRoots::reconcile`] removes — never a live row
+    /// with its directory already gone. A directory-removal failure is
+    /// returned typed (the row is already retired; retrying `discard` or
+    /// the next open's reconcile removes the residue). Idempotent for a
+    /// missing directory.
     pub fn discard(&self, session: SessionId) -> Result<(), ExecError> {
         let Some(row) = self
             .manager
@@ -503,13 +523,14 @@ impl ShadowRoots {
                 "session {session} has no shadow row to discard"
             )));
         };
+        self.mark_state(session, ShadowRowState::Discarded)?;
         let dir = PathBuf::from(&row.root);
         if dir.exists() {
             std::fs::remove_dir_all(&dir).map_err(|e| {
                 ExecError::Internal(format!("shadow removal {}: {e}", dir.display()))
             })?;
         }
-        self.mark_state(session, ShadowRowState::Discarded)
+        Ok(())
     }
 
     // ------------------------------------------------------------ lifecycle
@@ -610,30 +631,84 @@ impl ShadowRoots {
         Ok(actions)
     }
 
-    /// Graceful daemon shutdown: remove every shadow directory of every
-    /// live row and mark the rows `Discarded`. Best effort (a shutdown must
-    /// never fail the process); [`ShadowRoots::reconcile`] at the next
-    /// daemon start handles whatever a crash left behind. Also invoked by
+    /// Graceful daemon shutdown: retire every live shadow RECORD-FIRST (the
+    /// durable row reaches `Discarded` BEFORE the directory is removed), so
+    /// a crash at any point leaves either a live row with its directory or a
+    /// retired row whose directory [`ShadowRoots::reconcile`] removes —
+    /// never a live row with its directory already gone (which would force a
+    /// second discard on the next open).
+    ///
+    /// A shutdown must never fail the process, so nothing here returns
+    /// `Err`: every failure is logged AND returned in the report. A
+    /// retirement whose durable write failed keeps its directory for the
+    /// next open's reconcile/retry; a directory that could not be removed is
+    /// retried by reconcile (the row is already retired). Also invoked by
     /// the service's `Drop`.
-    pub fn shutdown(&self) {
-        let Ok(sessions) = self.manager.list_sessions(None) else {
-            return;
+    pub fn shutdown(&self) -> Vec<String> {
+        let mut report: Vec<String> = Vec::new();
+        let sessions = match self.manager.list_sessions(None) {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                let message = format!("shadow shutdown: session list failed: {e}");
+                tracing::warn!(target: "faktor::shadow", "{message}");
+                report.push(message);
+                return report;
+            }
         };
         for handle in sessions {
             let session = handle.id();
             let Ok(Some(row)) = self.manager.shadow_row(session) else {
                 continue;
             };
-            if row.state.is_live() {
-                let dir = PathBuf::from(&row.root);
-                if dir.exists() {
-                    let _ = std::fs::remove_dir_all(&dir);
+            if !row.state.is_live() {
+                continue;
+            }
+            let mut retired = row.clone();
+            retired.state = ShadowRowState::Discarded;
+            if let Err(e) = self.put_retired_row(session, &retired) {
+                let message = format!(
+                    "session {session}: shadow {} retirement not persisted ({e}); directory {} retained for the next open",
+                    row.shadow_id, row.root
+                );
+                tracing::warn!(target: "faktor::shadow", "{message}");
+                report.push(message);
+                continue;
+            }
+            let dir = PathBuf::from(&row.root);
+            if dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&dir) {
+                    let message = format!(
+                        "session {session}: retired shadow {} directory {} not removed ({e}); reconcile retries",
+                        row.shadow_id,
+                        dir.display()
+                    );
+                    tracing::warn!(target: "faktor::shadow", "{message}");
+                    report.push(message);
                 }
-                let mut retired = row;
-                retired.state = ShadowRowState::Discarded;
-                let _ = self.manager.put_shadow_row(session, &retired);
             }
         }
+        report
+    }
+
+    /// Persist one retained retirement row (the durable half of graceful
+    /// retirement). Test-only fault injection through [`ShadowRetireFault`].
+    fn put_retired_row(&self, session: SessionId, row: &ShadowRow) -> Result<(), ExecError> {
+        #[cfg(test)]
+        {
+            let mut guard = self
+                .retire_fault
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if matches!(*guard, Some(ShadowRetireFault::Once)) {
+                *guard = None;
+                return Err(ExecError::Internal(
+                    "shadow retirement row write failed (injected)".into(),
+                ));
+            }
+        }
+        self.manager
+            .put_shadow_row(session, row)
+            .map_err(|e| ExecError::Internal(format!("shadow row write: {e}")))
     }
 
     // ------------------------------------------------------------ internals
@@ -739,6 +814,15 @@ impl ShadowRoots {
             .copy_seam
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(mode);
+    }
+
+    /// Test-only: make the NEXT graceful-retirement row write fail once.
+    #[cfg(test)]
+    pub fn arm_retire_fault(&self) {
+        *self
+            .retire_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ShadowRetireFault::Once);
     }
 
     #[cfg(not(test))]
@@ -931,11 +1015,19 @@ fn reject_escaping_links(base: &Path, max_entries: usize) -> Result<(), ExecErro
 
 impl Drop for ShadowRoots {
     fn drop(&mut self) {
-        // Zero orphans on graceful teardown: remove every shadow of every
-        // live row. Best effort by design (Drop cannot fail); reconcile()
-        // on the next daemon start is the deterministic recovery of a
-        // crash that skipped this.
-        self.shutdown();
+        // Zero orphans on graceful teardown: retire every shadow of every
+        // live row, record-first. Every failure is logged and returned by
+        // `shutdown`; Drop cannot fail the process, so the report's size is
+        // the only thing left to surface here (reconcile() on the next
+        // daemon start settles whatever a crash or a failed removal left).
+        let report = self.shutdown();
+        if !report.is_empty() {
+            tracing::warn!(
+                target: "faktor::shadow",
+                failures = report.len(),
+                "shadow shutdown completed with failures; reconcile will retry at the next open"
+            );
+        }
     }
 }
 

@@ -52,7 +52,12 @@ pub struct Symbol {
 }
 
 const MAX_FILES_PER_WORKSPACE: usize = 100_000;
-#[allow(dead_code)]
+/// Hard cap on the total number of unique postings tokens across every
+/// workspace. Enforcement is bounded and deterministic: while the cap is
+/// reached, tokens already in the postings keep updating but NEW unique
+/// tokens are not admitted (a pathological corpus can never grow the
+/// postings map without limit). Existing postings free capacity again when
+/// their last file is removed.
 const MAX_UNIQUE_TOKENS: usize = 1_000_000;
 /// JS-family walker caps: recursion is truncated past this depth and the
 /// per-file symbol table stops growing past this many entries, so hostile
@@ -89,12 +94,8 @@ fn flush(current: &mut String, out: &mut Vec<String>) {
 
 #[derive(Debug, Default)]
 struct FileEntry {
-    #[allow(dead_code)]
-    tokens: Vec<String>,
     symbols: Vec<Symbol>,
     modified_ms: i64,
-    #[allow(dead_code)]
-    size: u64,
     /// Content hashes of this file's embedded chunks, in chunk order
     /// ([`embedding::chunk_text`] windows). Path/generation independent:
     /// the vector itself lives in the workspace embedding index keyed by
@@ -156,10 +157,8 @@ impl WorkspaceIndex {
 
         let files = self.files.entry(workspace).or_default();
         let entry = FileEntry {
-            tokens: tokens.clone(),
             symbols: symbols.clone(),
             modified_ms,
-            size: bytes.len() as u64,
             chunks,
         };
         files.insert(rel_str.clone(), entry);
@@ -170,10 +169,17 @@ impl WorkspaceIndex {
             *local.entry(t.clone()).or_insert(0) += 1;
         }
         for (t, freq) in local {
-            let map = postings.entry(t.clone()).or_default();
-            let was_empty = map.is_empty();
+            let is_new = !postings.contains_key(&t);
+            if is_new && self.token_count >= MAX_UNIQUE_TOKENS {
+                // Bounded refusal: the unique-token cap is reached, so new
+                // tokens are never admitted. Tokens already present keep
+                // their postings (deterministic, and capacity frees again
+                // when a posting loses its last file).
+                continue;
+            }
+            let map = postings.entry(t).or_default();
             map.insert(rel_str.clone(), freq);
-            if was_empty {
+            if is_new {
                 self.token_count += 1;
             }
         }
@@ -288,7 +294,11 @@ impl WorkspaceIndex {
     /// All indexed paths for a workspace (sorted, bounded by the file cap).
     /// Evict one workspace's postings + symbols (idle-unload, spec §21).
     pub fn remove_workspace(&mut self, workspace: WorkspaceId) {
-        self.postings.remove(&workspace);
+        // The unique-token accounting must follow the postings out: capacity
+        // freed by an idle unload is capacity the cap can admit again.
+        if let Some(postings) = self.postings.remove(&workspace) {
+            self.token_count = self.token_count.saturating_sub(postings.len());
+        }
         self.symbols.remove(&workspace);
         self.files.remove(&workspace);
         self.embeddings.remove(&workspace);
@@ -802,21 +812,6 @@ fn child_text(node: tree_sitter::Node<'_>, kind: &str, text: &str) -> Option<Str
     None
 }
 
-#[allow(dead_code)]
-fn has_test_attr(node: tree_sitter::Node<'_>, text: &str) -> bool {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "attribute_item" {
-            if let Ok(t) = child.utf8_text(text.as_bytes()) {
-                if t.contains("test") {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1284,6 +1279,56 @@ module.exports = Cart;
         assert_eq!(syms[0].name, "beta");
         // Token accounting stays consistent.
         assert!(idx.token_count() >= 1);
+    }
+
+    #[test]
+    fn unique_token_cap_is_enforced_and_frees_capacity() {
+        let mut idx = WorkspaceIndex::new();
+        let ws = WorkspaceId::new(1);
+        idx.index_file(ws, Path::new("a.rs"), b"fn alpha() {}", 100)
+            .unwrap();
+        assert!(idx.token_count() >= 2, "fn + alpha indexed");
+        // Reaching the cap by indexing a million unique tokens would take
+        // unbounded test time; the counter IS the enforcement state, so
+        // drive it directly (private to this module's tests).
+        idx.token_count = MAX_UNIQUE_TOKENS;
+        idx.index_file(ws, Path::new("b.rs"), b"fn brandnewtoken() {}", 101)
+            .unwrap();
+        assert_eq!(idx.token_count(), MAX_UNIQUE_TOKENS, "cap never exceeded");
+        assert!(
+            idx.files_for_token(ws, "brandnewtoken", 10).is_empty(),
+            "a NEW unique token is not admitted while the cap is reached"
+        );
+        // Tokens already in the postings keep updating (bounds, not freeze).
+        idx.index_file(ws, Path::new("c.rs"), b"fn alpha() {}", 102)
+            .unwrap();
+        assert_eq!(idx.files_for_token(ws, "alpha", 10).len(), 2);
+        // Removing the files that carried a token frees capacity again.
+        idx.remove_file(ws, Path::new("a.rs"));
+        idx.remove_file(ws, Path::new("c.rs"));
+        idx.index_file(ws, Path::new("d.rs"), b"fn freshtoken() {}", 103)
+            .unwrap();
+        assert!(
+            !idx.files_for_token(ws, "freshtoken", 10).is_empty(),
+            "capacity freed by removal admits a new unique token"
+        );
+        assert!(idx.token_count() <= MAX_UNIQUE_TOKENS);
+        // An idle unload (remove_workspace) returns every posting's capacity.
+        let removed_tokens = idx.postings.get(&ws).map(|p| p.len()).unwrap_or(0);
+        let before = idx.token_count();
+        idx.remove_workspace(ws);
+        assert_eq!(removed_tokens, 2, "fn + freshtoken");
+        assert_eq!(
+            idx.token_count(),
+            before - removed_tokens,
+            "postings eviction frees capacity"
+        );
+        idx.index_file(ws, Path::new("e.rs"), b"fn anothernew() {}", 104)
+            .unwrap();
+        assert!(
+            !idx.files_for_token(ws, "anothernew", 10).is_empty(),
+            "the unloaded workspace's capacity is reusable"
+        );
     }
 
     #[test]

@@ -376,13 +376,33 @@ fn validate_open_txn(txn: &OpenEditTxn) -> Result<(), Error> {
 }
 
 pub struct EditEngine {
-    #[allow(dead_code)]
     fs: std::sync::Arc<faktor_fs::WorkspaceFileService>,
 }
 
 impl EditEngine {
     pub fn new(fs: std::sync::Arc<faktor_fs::WorkspaceFileService>) -> Self {
         Self { fs }
+    }
+
+    /// The engine edits ONLY workspaces its own service currently owns: the
+    /// service is the daemon's single workspace registry (and its idle-unload
+    /// authority, spec §21), so a handle from a foreign registry — or one the
+    /// service already unloaded — is refused before any read or write. Without
+    /// this guard the service binding would be decorative: any caller could
+    /// edit through a handle the engine's registry never issued.
+    fn require_owned_workspace(&self, workspace: &WorkspaceHandle) -> Result<(), Error> {
+        let owned = self
+            .fs
+            .registered_handle(workspace.workspace_id())
+            .is_some_and(|registered| registered.root() == workspace.root());
+        if owned {
+            Ok(())
+        } else {
+            Err(Error::permission(format!(
+                "workspace {} is not registered with this edit engine's workspace service",
+                workspace.workspace_id()
+            )))
+        }
     }
 
     /// Apply one file transactionally. VALIDATE FIRST, WRITE LAST: every op
@@ -397,6 +417,7 @@ impl EditEngine {
         req: &EditRequest,
         mode: RepairMode,
     ) -> Result<EditOutcome, Error> {
+        self.require_owned_workspace(workspace)?;
         let staged = self.stage_one(workspace, identity, req, mode)?;
         let new_hash = workspace.write_atomic_cas(
             &staged.rel,
@@ -433,6 +454,7 @@ impl EditEngine {
         mode: RepairMode,
         stage_budget: Option<std::time::Duration>,
     ) -> Result<EditBatchOutcome, Error> {
+        self.require_owned_workspace(workspace)?;
         let staged = self.stage_batch(workspace, identity, reqs, mode, stage_budget)?;
         // Test seam: the adversary strikes between validation and commit.
         commit_gap_hook();
@@ -475,6 +497,7 @@ impl EditEngine {
         session: &str,
         stage_budget: Option<std::time::Duration>,
     ) -> Result<PreparedEdit, Error> {
+        self.require_owned_workspace(workspace)?;
         if reqs.is_empty() {
             return Err(Error::malformed(
                 "edit transaction requires at least one file",
@@ -555,6 +578,7 @@ impl EditEngine {
         identity: &WorkspaceIdentity,
         prepared: PreparedEdit,
     ) -> Result<EditTxnResult, Error> {
+        self.require_owned_workspace(workspace)?;
         let run = self.commit_staged(
             workspace,
             identity,
@@ -610,6 +634,7 @@ impl EditEngine {
         resumes: &[EditTxnResume<'_>],
         mode: RepairMode,
     ) -> Result<RecoveryReport, Error> {
+        self.require_owned_workspace(workspace)?;
         workspace.verify_identity(identity)?;
         // Duplicate resumes for one txn id are corruption of the caller.
         let mut seen: HashSet<EditTxnId> = HashSet::new();
@@ -1336,15 +1361,6 @@ struct StagedEdit {
     parse_error: Option<String>,
 }
 
-/// Lookup helper used by tests to fetch tree-sitter grammar info.
-#[allow(dead_code)]
-fn _grammar_names() -> HashMap<&'static str, &'static str> {
-    HashMap::from([
-        ("rust", "tree-sitter-rust"),
-        ("python", "tree-sitter-python"),
-    ])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1380,8 +1396,8 @@ mod tests {
 
     #[test]
     fn hash_mismatch_rejected_before_write() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         fs::write(h.root().join("a.txt"), b"one").unwrap();
         // Model read "one" but the file became "two" (another writer).
         fs::write(h.root().join("a.txt"), b"two").unwrap();
@@ -1399,10 +1415,54 @@ mod tests {
         assert_eq!(fs::read(h.root().join("a.txt")).unwrap(), b"two");
     }
 
+    /// Adversarial: a handle opened by a FOREIGN service (the engine's own
+    /// registry never issued it) is refused before any read, even when the
+    /// workspace id and root match — two registries must never cross-edit,
+    /// and the file keeps its bytes.
     #[test]
-    fn range_edit_applies_and_hashes() {
+    fn foreign_service_handle_refused_before_any_read() {
         let (_d, _s, h, id) = fixture();
         let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        fs::write(h.root().join("a.txt"), b"one").unwrap();
+        let r = req(
+            "a.txt",
+            b"one",
+            vec![EditOp::SearchReplace {
+                before: "one".into(),
+                after: "two".into(),
+            }],
+        );
+        let err = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err}");
+        assert!(err.message.contains("not registered"), "{err}");
+        assert_eq!(fs::read(h.root().join("a.txt")).unwrap(), b"one");
+    }
+
+    /// Adversarial: an idle-unloaded workspace (the service removed the
+    /// registration) is refused through a stale handle before any read.
+    #[test]
+    fn unloaded_workspace_handle_refused_before_any_read() {
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s.clone());
+        fs::write(h.root().join("a.txt"), b"one").unwrap();
+        s.close(WorkspaceId::new(1));
+        let r = req(
+            "a.txt",
+            b"one",
+            vec![EditOp::SearchReplace {
+                before: "one".into(),
+                after: "two".into(),
+            }],
+        );
+        let err = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err}");
+        assert_eq!(fs::read(h.root().join("a.txt")).unwrap(), b"one");
+    }
+
+    #[test]
+    fn range_edit_applies_and_hashes() {
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         fs::write(h.root().join("a.txt"), b"hello world").unwrap();
         let r = req(
             "a.txt",
@@ -1422,8 +1482,8 @@ mod tests {
 
     #[test]
     fn search_replace_unique_ok() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         fs::write(h.root().join("a.txt"), b"fn main() {}\n").unwrap();
         let r = req(
             "a.txt",
@@ -1442,8 +1502,8 @@ mod tests {
 
     #[test]
     fn search_replace_zero_matches_malformed() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         fs::write(h.root().join("a.txt"), b"abc").unwrap();
         let r = req(
             "a.txt",
@@ -1460,8 +1520,8 @@ mod tests {
 
     #[test]
     fn search_replace_multiple_matches_conflict() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         fs::write(h.root().join("a.txt"), b"aaa").unwrap();
         let r = req(
             "a.txt",
@@ -1477,8 +1537,8 @@ mod tests {
 
     #[test]
     fn out_of_bounds_range_malformed() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         fs::write(h.root().join("a.txt"), b"abc").unwrap();
         let r = req(
             "a.txt",
@@ -1496,8 +1556,8 @@ mod tests {
 
     #[test]
     fn split_codepoint_offsets_malformed() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         let content = "aé😀b"; // bytes: a(1) é(2) 😀(4) b(1)
         fs::write(h.root().join("a.txt"), content).unwrap();
         // offset 2 lands inside 'é' (2 bytes: 0xE9 is at 1..3).
@@ -1529,8 +1589,8 @@ mod tests {
 
     #[test]
     fn rust_parse_error_rolls_back_in_rollback_mode() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         let original = b"fn main() {\n    let x = 1;\n    println!(\"{}\", x);\n}\n";
         fs::write(h.root().join("main.rs"), original).unwrap();
         // Break the syntax: delete the closing brace line.
@@ -1554,8 +1614,8 @@ mod tests {
 
     #[test]
     fn rust_parse_error_allow_repair_writes_and_flags() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         let original = b"fn main() {\n    let x = 1;\n}\n";
         fs::write(h.root().join("main.rs"), original).unwrap();
         let r = req(
@@ -1576,8 +1636,8 @@ mod tests {
 
     #[test]
     fn valid_edit_stays_not_suspicious() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         let original = b"fn main() {\n    let x = 1;\n    println!(\"{}\", x);\n}\n";
         fs::write(h.root().join("main.rs"), original).unwrap();
         let r = req(
@@ -1595,8 +1655,8 @@ mod tests {
 
     #[test]
     fn python_parse_check_works() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         let original = b"def f():\n    return 1\n";
         fs::write(h.root().join("f.py"), original).unwrap();
         // Valid edit → not suspicious.
@@ -1621,8 +1681,8 @@ mod tests {
 
     #[test]
     fn unknown_language_skips_parse_check() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         let original = b"<div><span></div>"; // broken HTML
         fs::write(h.root().join("x.html"), original).unwrap();
         let r = req(
@@ -1639,8 +1699,8 @@ mod tests {
 
     #[test]
     fn partial_failure_no_partial_write() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         let original = b"one two three";
         fs::write(h.root().join("a.txt"), original).unwrap();
         // Op 1 valid, op 2 broken: NOTHING may be written.
@@ -1666,8 +1726,8 @@ mod tests {
 
     #[test]
     fn huge_edit_bounded() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         // A 20MB file exceeds the bound → Oversized, never OOM.
         let big = vec![b'x'; 20 * 1024 * 1024];
         fs::write(h.root().join("big.txt"), &big).unwrap();
@@ -1685,8 +1745,8 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_edits_same_file_one_wins() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         let original = b"start\n";
         fs::write(h.root().join("c.txt"), original).unwrap();
         let engine = std::sync::Arc::new(engine);
@@ -1725,8 +1785,8 @@ mod tests {
 
     #[test]
     fn bounded_region_edits() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         let original = b"fn f() {\n    let a = 1;\n    let b = 2;\n}\n";
         fs::write(h.root().join("x.rs"), original).unwrap();
         // Anchor on the fn line; replace the region after it.
@@ -1764,8 +1824,8 @@ mod tests {
 
     #[test]
     fn already_broken_file_not_blamed() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         let broken = b"fn main() { let x = ; }\n";
         fs::write(h.root().join("b.rs"), broken).unwrap();
         // The file is already broken; the edit cannot be flagged for making
@@ -1784,8 +1844,8 @@ mod tests {
 
     #[test]
     fn non_utf8_file_rejected() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         let bytes = vec![0xFF, 0xFE, 0x00, 0x80];
         fs::write(h.root().join("bin.dat"), &bytes).unwrap();
         let r = req(
@@ -1841,8 +1901,8 @@ mod tests {
 
     #[test]
     fn single_file_commit_is_cas_protected_against_mid_edit_writers() {
-        let (dir, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (dir, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         let target = h.root().join("r.txt");
         fs::write(&target, b"model-read-content-1234").unwrap();
         let base = fs::read(&target).unwrap();
@@ -1880,8 +1940,8 @@ mod tests {
 
     #[test]
     fn multi_file_commit_conflict_reports_exact_partial_state() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         fs::write(h.root().join("f1.txt"), b"orig-one").unwrap();
         fs::write(h.root().join("f2.txt"), b"orig-two").unwrap();
         fs::write(h.root().join("f3.txt"), b"orig-three").unwrap();
@@ -1938,8 +1998,8 @@ mod tests {
 
     #[test]
     fn multi_file_stage_failure_aborts_before_any_write() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         fs::write(h.root().join("g1.txt"), b"keep-one").unwrap();
         fs::write(h.root().join("g2.txt"), b"keep-two").unwrap();
         let mk = |name: &str, from: &str, to: &str| {
@@ -1984,8 +2044,8 @@ mod tests {
 
     #[test]
     fn multi_file_budget_expiry_writes_nothing() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         fs::write(h.root().join("b1.txt"), b"before-one").unwrap();
         fs::write(h.root().join("b2.txt"), b"before-two").unwrap();
         let mk = |name: &str, from: &str, to: &str| {
@@ -2032,8 +2092,8 @@ mod tests {
 
     #[test]
     fn multi_file_parse_rollback_aborts_before_any_write() {
-        let (_d, _s, h, id) = fixture();
-        let engine = EditEngine::new(faktor_fs::WorkspaceFileService::new());
+        let (_d, s, h, id) = fixture();
+        let engine = EditEngine::new(s);
         fs::write(
             h.root().join("p1.rs"),
             b"fn ok() {}
@@ -2301,8 +2361,8 @@ mod tests {
         }
     }
 
-    fn engine() -> EditEngine {
-        EditEngine::new(faktor_fs::WorkspaceFileService::new())
+    fn engine(service: &std::sync::Arc<faktor_fs::WorkspaceFileService>) -> EditEngine {
+        EditEngine::new(service.clone())
     }
 
     /// (t1, t2, t3) with base content orig-one/two/three and search-replace
@@ -2381,8 +2441,8 @@ mod tests {
     // skipped=[f3]; durable rows Prepared + Progress + Committed present.
     #[test]
     fn txn_rollforward_conflict_reports_exact_state_and_durable_rows() {
-        let (_d, _s, h, id) = fixture();
-        let engine = engine();
+        let (_d, s, h, id) = fixture();
+        let engine = engine(&s);
         fs::write(h.root().join("f1.txt"), b"orig-one").unwrap();
         fs::write(h.root().join("f2.txt"), b"orig-two").unwrap();
         fs::write(h.root().join("f3.txt"), b"orig-three").unwrap();
@@ -2451,8 +2511,8 @@ mod tests {
     // and idempotent (run recovery twice → identical rows and files).
     #[test]
     fn txn_crash_before_terminal_recovery_replays_and_is_idempotent() {
-        let (_d, _s, h, id) = fixture();
-        let engine = engine();
+        let (_d, s, h, id) = fixture();
+        let engine = engine(&s);
         fs::write(h.root().join("f1.txt"), b"orig-one").unwrap();
         fs::write(h.root().join("f2.txt"), b"orig-two").unwrap();
         fs::write(h.root().join("f3.txt"), b"orig-three").unwrap();
@@ -2542,8 +2602,8 @@ mod tests {
     // external bytes; recovery twice → identical state (no-op).
     #[test]
     fn txn_rollback_restores_committed_and_recovery_is_noop() {
-        let (_d, _s, h, id) = fixture();
-        let engine = engine();
+        let (_d, s, h, id) = fixture();
+        let engine = engine(&s);
         fs::write(h.root().join("f1.txt"), b"orig-one").unwrap();
         fs::write(h.root().join("f2.txt"), b"orig-two").unwrap();
         fs::write(h.root().join("f3.txt"), b"orig-three").unwrap();
@@ -2601,8 +2661,8 @@ mod tests {
     // RolledBack row records rollback_conflicts, nothing is clobbered.
     #[test]
     fn txn_rollback_refuses_when_committed_file_changed_again() {
-        let (_d, _s, h, id) = fixture();
-        let engine = engine();
+        let (_d, s, h, id) = fixture();
+        let engine = engine(&s);
         fs::write(h.root().join("f1.txt"), b"orig-one").unwrap();
         fs::write(h.root().join("f2.txt"), b"orig-two").unwrap();
         fs::write(h.root().join("f3.txt"), b"orig-three").unwrap();
@@ -2654,8 +2714,8 @@ mod tests {
     // every file cleanly; a second recovery is a no-op.
     #[test]
     fn txn_crash_after_prepared_only_replays_cleanly() {
-        let (_d, _s, h, id) = fixture();
-        let engine = engine();
+        let (_d, s, h, id) = fixture();
+        let engine = engine(&s);
         fs::write(h.root().join("f1.txt"), b"orig-one").unwrap();
         fs::write(h.root().join("f2.txt"), b"orig-two").unwrap();
         fs::write(h.root().join("f3.txt"), b"orig-three").unwrap();
@@ -2705,8 +2765,8 @@ mod tests {
     // (d2) Prepared + one Progress: recovery resumes at the second file.
     #[test]
     fn txn_crash_after_first_progress_resumes() {
-        let (_d, _s, h, id) = fixture();
-        let engine = engine();
+        let (_d, s, h, id) = fixture();
+        let engine = engine(&s);
         fs::write(h.root().join("f1.txt"), b"orig-one").unwrap();
         fs::write(h.root().join("f2.txt"), b"orig-two").unwrap();
         fs::write(h.root().join("f3.txt"), b"orig-three").unwrap();
@@ -2748,8 +2808,8 @@ mod tests {
     #[test]
     fn txn_recovery_with_terminal_present_is_noop() {
         for strategy in [EditTxnStrategy::RollForward, EditTxnStrategy::RollBack] {
-            let (_d, _s, h, id) = fixture();
-            let engine = engine();
+            let (_d, s, h, id) = fixture();
+            let engine = engine(&s);
             fs::write(h.root().join("f1.txt"), b"orig-one").unwrap();
             fs::write(h.root().join("f2.txt"), b"orig-two").unwrap();
             fs::write(h.root().join("f3.txt"), b"orig-three").unwrap();
@@ -2810,8 +2870,8 @@ mod tests {
     // NOTHING, and leaves the transaction open (deterministic on rerun).
     #[test]
     fn txn_ambiguous_write_after_crash_needs_recovery_typed() {
-        let (_d, _s, h, id) = fixture();
-        let engine = engine();
+        let (_d, s, h, id) = fixture();
+        let engine = engine(&s);
         fs::write(h.root().join("f1.txt"), b"orig-one").unwrap();
         fs::write(h.root().join("f2.txt"), b"orig-two").unwrap();
         fs::write(h.root().join("f3.txt"), b"orig-three").unwrap();
@@ -2859,18 +2919,18 @@ mod tests {
     // open.
     #[test]
     fn txn_rollback_crash_before_restore_needs_before_content() {
-        let engine = engine();
         let fresh = || {
-            let (d, _s, h, id) = fixture();
+            let (d, s, h, id) = fixture();
+            let engine = EditEngine::new(s);
             fs::write(h.root().join("f1.txt"), b"orig-one").unwrap();
             fs::write(h.root().join("f2.txt"), b"orig-two").unwrap();
             fs::write(h.root().join("f3.txt"), b"orig-three").unwrap();
-            (d, h, id)
+            (d, h, id, engine)
         };
         // Without a provider: typed error, file 1 keeps OUR target bytes
         // (never clobbered), txn stays open.
         {
-            let (d, h, id) = fresh();
+            let (d, h, id, engine) = fresh();
             // Crash after f2's conflict row is journaled (before the
             // roll-back restore).
             let journal = MockJournal {
@@ -2912,7 +2972,7 @@ mod tests {
         // is CAS-restored to orig-one; f2 stays external; f3 untouched; the
         // RolledBack terminal lands; recovery twice = identical.
         {
-            let (_d, h, id) = fresh();
+            let (_d, h, id, engine) = fresh();
             let journal = MockJournal {
                 panic_after_progress: Some(1),
                 ..Default::default()
@@ -2979,8 +3039,8 @@ mod tests {
     // rejected at BEGIN with nothing journaled and nothing written.
     #[test]
     fn txn_oversized_begin_rejects_with_nothing_journaled() {
-        let (_d, _s, h, id) = fixture();
-        let engine = engine();
+        let (_d, s, h, id) = fixture();
+        let engine = engine(&s);
         let journal = MockJournal::default();
         let journal_arc: Arc<dyn EditTxnJournal> = Arc::new(journal.clone());
         // > MAX_TXN_FILES files.
@@ -3087,13 +3147,13 @@ mod tests {
     // transaction stays open.
     #[test]
     fn txn_hostile_progress_rows_error_before_any_write() {
-        let engine = engine();
         let fresh = || {
-            let (d, _s, h, id) = fixture();
+            let (d, s, h, id) = fixture();
+            let engine = EditEngine::new(s);
             fs::write(h.root().join("f1.txt"), b"orig-one").unwrap();
             fs::write(h.root().join("f2.txt"), b"orig-two").unwrap();
             fs::write(h.root().join("f3.txt"), b"orig-three").unwrap();
-            (d, h, id)
+            (d, h, id, engine)
         };
         let mk_refs = |h: &WorkspaceHandle| -> Vec<EditTxnFileRef> {
             ["f1.txt", "f2.txt", "f3.txt"]
@@ -3117,7 +3177,7 @@ mod tests {
             // A progress row whose path does not match the prepared file.
             (23, "does not match prepared file", Some((1, "not-f2.txt"))),
         ] {
-            let (d, h, _id) = fresh();
+            let (d, h, _id, _engine) = fresh();
             let files = mk_refs(&h);
             let mut rows = vec![MockRow::Prepared {
                 txn: EditTxnId::new(txn),
@@ -3154,7 +3214,7 @@ mod tests {
             let _ = d;
         }
         for (journal, needle) in hostiles {
-            let (d, h, id) = fresh();
+            let (d, h, id, engine) = fresh();
             let seeded_len = journal.snapshot().len();
             let reqs = three_file_requests(&h);
             let none = |_p: &str| -> Option<Vec<u8>> { None };
@@ -3180,7 +3240,7 @@ mod tests {
         // A transaction that still needs replay but has NO resume: typed
         // needs-recovery, zero writes, stays open.
         {
-            let (d, h, id) = fresh();
+            let (d, h, id, engine) = fresh();
             let journal = MockJournal::default();
             *journal.rows.lock().expect("poisoned") = vec![MockRow::Prepared {
                 txn: EditTxnId::new(24),
@@ -3205,8 +3265,8 @@ mod tests {
     // commit (apply_many semantics unchanged).
     #[test]
     fn apply_many_and_durable_flow_agree_without_conflicts() {
-        let (_d, _s, h, id) = fixture();
-        let engine = engine();
+        let (_d, s, h, id) = fixture();
+        let engine = engine(&s);
         fs::write(h.root().join("f1.txt"), b"orig-one").unwrap();
         fs::write(h.root().join("f2.txt"), b"orig-two").unwrap();
         let mk = |name: &str, from: &str, to: &str| {

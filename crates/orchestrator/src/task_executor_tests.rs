@@ -501,32 +501,40 @@ async fn single_item_task_matches_the_direct_prompt_path_byte_for_byte() {
 
     wait_until(
         || state_of(&env_a, env_a.parent) == faktor_core::state::AgentState::ReadyForNextTurn,
-        30,
+        240,
     )
     .await;
     wait_until(
         || state_of(&env_b, env_b.parent) == faktor_core::state::AgentState::ReadyForNextTurn,
-        30,
+        240,
     )
     .await;
     // The state transition and the turn-record finalization are two
     // separate durable writes; on slower hosts (Windows CI) one path can
-    // observe ReadyForNextTurn while its record is still `active`. Wait for
-    // BOTH records to converge to the same terminal status before
-    // comparing — stronger than a fixed sleep and environment-independent.
+    // observe ReadyForNextTurn while its record is still `active`. The
+    // record is finalized (`drive_turn` -> `finish_turn_record`) only AFTER
+    // the end-of-turn content sync (`sync_task_row` re-goals the executor
+    // row to the session ledger) and the final gate write, so waiting for a
+    // NON-`active` record is the real quiescent point. Equality alone is
+    // NOT enough: two in-flight records are both `active` from the moment
+    // each prompt is admitted, so an equality-only wait passes before either
+    // drive has synced its row (the executor row still carries the run goal
+    // while the direct path's row already carries the ledger goal).
     {
         let ha = env_a.manager.get_session(env_a.parent).unwrap().unwrap();
         let hb = env_b.manager.get_session(env_b.parent).unwrap().unwrap();
+        let finished =
+            |s: &Option<String>| matches!(s.as_deref(), Some(status) if status != "active");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
         loop {
             let a = ha.turn_record(op_a).unwrap().map(|r| r.status);
             let b = hb.turn_record(receipt_b.op_id).unwrap().map(|r| r.status);
-            if a.is_some() && a == b {
+            if finished(&a) && finished(&b) {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "turn records never converged: a={a:?} b={b:?}"
+                "turn records never reached terminal status: a={a:?} b={b:?}"
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }

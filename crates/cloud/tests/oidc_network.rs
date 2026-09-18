@@ -727,6 +727,66 @@ async fn network_happy_path_caches_discovery_and_mints_a_session() {
     ));
 }
 
+/// The SSO flow is subject-first: an IdP email rename between two callbacks
+/// still logs into the SAME linked user and adopts the new verified email
+/// (the verified claim is what the service policy consumes).
+#[tokio::test]
+async fn sso_email_rename_follows_the_linked_subject() {
+    let provider = Arc::new(MockProvider::new());
+    let clock = Arc::new(ManualClock::new(NOW_MS));
+    let adapter = adapter(provider.clone(), clock.clone());
+    let cp = control_plane(clock.clone());
+    let boot = cp
+        .bootstrap_organization("acme", "owner@acme.test", "Owner", "boot-rename")
+        .unwrap();
+    let org = boot.organization;
+    let login = SsoLogin::new(Arc::new(adapter), clock);
+
+    let started = login
+        .start(&org.id, &sso_ref(), "https://app.example/callback")
+        .await
+        .unwrap();
+    provider.issue_code("code-r1", token_spec(Some(&started.nonce), NOW_MS + 60_000));
+    let first = login
+        .callback(
+            &cp,
+            &org.id,
+            &sso_ref(),
+            "https://app.example/callback",
+            "code-r1",
+            &started.state,
+        )
+        .await
+        .unwrap();
+    let user = first.login.user.id.clone();
+    assert_eq!(first.login.user.email, "user@example.test");
+
+    let started = login
+        .start(&org.id, &sso_ref(), "https://app.example/callback")
+        .await
+        .unwrap();
+    let mut renamed = token_spec(Some(&started.nonce), NOW_MS + 60_000);
+    renamed.email = "renamed@example.test".into();
+    provider.issue_code("code-r2", renamed);
+    let second = login
+        .callback(
+            &cp,
+            &org.id,
+            &sso_ref(),
+            "https://app.example/callback",
+            "code-r2",
+            &started.state,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second.login.user.id, user,
+        "the subject link decides the account"
+    );
+    assert_eq!(second.login.user.email, "renamed@example.test");
+    assert_eq!(second.login.role, Role::Admin);
+}
+
 /// Wrong state, wrong nonce and a swapped redirect URI are refused before any
 /// session exists; the state is consumed exactly once.
 #[tokio::test]
