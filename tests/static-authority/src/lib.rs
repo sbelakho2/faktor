@@ -803,23 +803,146 @@ mod scans {
         );
     }
 
+    /// The construct/spawn markers the bootstrap tightness proof counts:
+    /// [`SPAWN_MARKERS`] minus `CommandExt`. `release.rs` names
+    /// `std::os::unix::process::CommandExt` only to call `exec()`, which
+    /// replaces the process and spawns nothing, so `CommandExt` is not a
+    /// child-owning shape in this file; every other process-`Command`
+    /// marker still fires on production text.
+    const BOOTSTRAP_CONSTRUCT_MARKERS: &[&str] = &[
+        "std::process::Command",
+        "tokio::process::Command",
+        "process::Stdio",
+        "Command::new",
+        "Command::spawn",
+    ];
+
+    /// The exact production construct/spawn site(s) the file-level
+    /// [`SPAWN_BOOTSTRAP_EXEMPT`] may hold — ONE line, the
+    /// hash-then-exec of the digest-verified artifact in `launch()`: on
+    /// unix `execve` replaces this process, on non-unix the `spawn` is
+    /// owned by the bounded `wait_bounded` poll under
+    /// `RELEASE_FORWARD_CEILING_MS`. Test-only children are excluded from
+    /// production text by [`kept_ranges`] exactly as in every other
+    /// production scan, so the `wait_bounded` unit-test fixtures
+    /// (`std::process::Command::new("sh")` inside `#[cfg(test)] mod tests`,
+    /// consumed by a bounded wait or killed+reaped) are invisible here —
+    /// while any NEW production construct/spawn line fires. The sanctioned
+    /// site is pinned by exact text, not a bare count, so the exemption
+    /// cannot absorb a second launch path or an offloaded process runtime;
+    /// a missing site is a stale-exemption error, never a silent pass.
+    const BOOTSTRAP_ALLOWED_SPAWN_SITES: &[&str] =
+        &["let mut command = std::process::Command::new(&target.binary);"];
+
+    /// Offenders for the bootstrap tightness proof: production
+    /// construct/spawn sites not on [`BOOTSTRAP_ALLOWED_SPAWN_SITES`], plus
+    /// a stale-entry error when an allowed site vanished. Separate from
+    /// [`production_spawn_offenders`] because that scan silences the whole
+    /// exempt file; this function is the exemption's teeth.
+    fn bootstrap_spawn_offenders(f: &File<'_>) -> Vec<String> {
+        let sites = find_markers(f, BOOTSTRAP_CONSTRUCT_MARKERS);
+        let mut offenders: Vec<String> = sites
+            .iter()
+            .filter(|(_, text)| !BOOTSTRAP_ALLOWED_SPAWN_SITES.contains(&text.as_str()))
+            .map(|(line, text)| {
+                format!(
+                    "{}:{line}: {text}  [unowned bootstrap construct/spawn; the exemption \
+                     covers exactly one verified exec]",
+                    f.rel
+                )
+            })
+            .collect();
+        for allowed in BOOTSTRAP_ALLOWED_SPAWN_SITES {
+            if !sites.iter().any(|(_, text)| text == allowed) {
+                offenders.push(format!(
+                    "{}: sanctioned bootstrap spawn site is missing: {allowed:?} — \
+                     the file-level exemption is stale and must be re-audited",
+                    f.rel
+                ));
+            }
+        }
+        offenders
+    }
+
     /// Tightness proof for [`SPAWN_BOOTSTRAP_EXEMPT`]: the updater's
-    /// bootstrap launcher may hold exactly ONE spawn site — the
+    /// bootstrap launcher may hold exactly ONE production spawn site — the
     /// hash-then-exec of the verified artifact — so the file-level
-    /// exemption can never hide a growing process runtime.
+    /// exemption can never hide a growing process runtime. `#[cfg(test)]`
+    /// children are excluded by the same production extraction the other
+    /// scans use; they are never shipped and own no production child.
     #[test]
     fn bootstrap_launcher_exemption_covers_exactly_one_spawn_site() {
-        let path = repo_root().join("crates/updater/src/release.rs");
-        let text = std::fs::read_to_string(&path).expect("release.rs readable");
-        let construct_or_spawn = ["Command::new", "Command::spawn", "process::Stdio"];
-        let sites: usize = text
-            .lines()
-            .filter(|l| construct_or_spawn.iter().any(|m| l.contains(m)))
-            .count();
+        let f = load("crates/updater/src/release.rs").expect("release.rs readable");
+        let production_sites = find_markers(&f, BOOTSTRAP_CONSTRUCT_MARKERS);
         assert_eq!(
-            sites, 1,
-            "crates/updater/src/release.rs must hold exactly one construct/spawn site \
-             (the verified exec; the CommandExt exec import is not a spawn)"
+            production_sites.len(),
+            1,
+            "crates/updater/src/release.rs production text must hold exactly one \
+             construct/spawn site (the verified exec; test-gated children are \
+             excluded like every other production scan): {production_sites:?}"
+        );
+        let offenders = bootstrap_spawn_offenders(&f);
+        assert!(
+            offenders.is_empty(),
+            "crates/updater/src/release.rs — bootstrap exemption tightness violations:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// Planted-violation proof for the bootstrap tightness proof: an
+    /// unowned production spawn added to the exempt file MUST fail even
+    /// though [`SPAWN_BOOTSTRAP_EXEMPT`] silences the generic spawn scan,
+    /// while the sanctioned exec line alone passes, a test-gated child
+    /// stays invisible, and a vanished exec is a stale-exemption error.
+    #[test]
+    fn bootstrap_tightness_fires_on_a_planted_unowned_spawn() {
+        let sanctioned = "let mut command = std::process::Command::new(&target.binary);";
+        let planted = format!(
+            "fn launch(target: &ReleaseTarget) {{\n    {sanctioned}\n}}\n\
+             fn smuggled() {{ let _ = std::process::Command::new(\"/bin/sh\"); }}\n"
+        );
+        let f = synthetic_file("crates/updater/src/release.rs", &planted);
+        let offenders = bootstrap_spawn_offenders(&f);
+        assert_eq!(
+            offenders.len(),
+            1,
+            "exactly the planted unowned line must fire: {offenders:?}"
+        );
+        assert!(
+            offenders[0].contains("smuggled") && offenders[0].contains("Command::new"),
+            "the offender must name the planted unowned spawn: {offenders:?}"
+        );
+        // The sanctioned site alone never fires (no false positive).
+        let f = synthetic_file(
+            "crates/updater/src/release.rs",
+            &format!("fn launch(target: &ReleaseTarget) {{\n    {sanctioned}\n}}\n"),
+        );
+        assert!(
+            bootstrap_spawn_offenders(&f).is_empty(),
+            "the documented exec is the one allowed site"
+        );
+        // A test-gated child (the wait_bounded fixtures) is NOT production.
+        let f = synthetic_file(
+            "crates/updater/src/release.rs",
+            &format!(
+                "fn launch(target: &ReleaseTarget) {{\n    {sanctioned}\n}}\n\
+                 #[cfg(test)]\nmod tests {{\n    \
+                 fn t() {{ let _ = std::process::Command::new(\"sh\"); }}\n}}\n"
+            ),
+        );
+        assert!(
+            bootstrap_spawn_offenders(&f).is_empty(),
+            "test-gated children are excluded like every other production scan"
+        );
+        // A missing sanctioned site is a stale exemption, not a pass.
+        let f = synthetic_file(
+            "crates/updater/src/release.rs",
+            "fn launch(_target: &ReleaseTarget) {}\n",
+        );
+        let offenders = bootstrap_spawn_offenders(&f);
+        assert!(
+            offenders.iter().any(|o| o.contains("stale")),
+            "a vanished verified exec must not pass silently: {offenders:?}"
         );
     }
 
@@ -834,8 +957,12 @@ mod scans {
     /// The ONE bootstrap launcher: it digest-verifies the release artifact
     /// and execve()s it BEFORE any daemon (and therefore any supervisor)
     /// exists, so the exec IS the launch contract and cannot be supervised.
-    /// The tightness proof below asserts this file holds exactly ONE spawn
-    /// site, so the exemption can never silently grow.
+    /// The tightness proof
+    /// [`bootstrap_launcher_exemption_covers_exactly_one_spawn_site`]
+    /// asserts the file's production text holds exactly ONE construct/spawn
+    /// site — pinned by exact line, with a planted-violation proof — so the
+    /// exemption can never silently grow (test-gated children are excluded,
+    /// as in every production scan).
     const SPAWN_BOOTSTRAP_EXEMPT: &[&str] = &["crates/updater/src/release.rs"];
 
     const SPAWN_MARKERS: &[&str] = &[

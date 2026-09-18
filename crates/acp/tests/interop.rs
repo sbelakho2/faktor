@@ -2551,9 +2551,58 @@ fn interop_adv_client_decoder_corpus_never_panics() {
     let deep = format!("{}0{}", "[".repeat(5000), "]".repeat(5000));
     corpus.push(format!("Content-Length: {}\r\n\r\n{}", deep.len(), deep).into_bytes());
     for bytes in &corpus {
-        let _ = decode_one(bytes);
+        match decode_one(bytes) {
+            Decode::Done(consumed, value) => {
+                assert!(
+                    consumed > 0 && consumed <= bytes.len(),
+                    "consumed {consumed} must address the frame (len {})",
+                    bytes.len()
+                );
+                // Cross-check against an independent parse of the claimed
+                // body: the decoder must not fabricate or offset a frame.
+                let text = std::str::from_utf8(&bytes[..consumed]).expect("decoded frame is UTF-8");
+                let body = text
+                    .split_once("\r\n\r\n")
+                    .map(|(_, body)| body)
+                    .expect("a Done frame carries its header terminator");
+                assert_eq!(
+                    value,
+                    parse_json(body).expect("a Done body is JSON"),
+                    "decoder body drift"
+                );
+            }
+            Decode::Recoverable(reason, resume) => {
+                assert!(!reason.is_empty(), "a recoverable frame names its reason");
+                assert!(
+                    resume <= bytes.len(),
+                    "resume point {resume} must stay inside the frame (len {})",
+                    bytes.len()
+                );
+            }
+            Decode::NeedMore => {
+                // Incomplete is a legitimate outcome for truncated input;
+                // the exact truncated-frame behavior is pinned below.
+            }
+            Decode::Fatal(reason) => assert!(!reason.is_empty(), "a fatal frame names its reason"),
+        }
         let _ = parse_json(std::str::from_utf8(bytes).unwrap_or(""));
     }
+    // Non-vacuity: a well-formed frame decodes to Done with exact length.
+    let valid = b"Content-Length: 2\r\n\r\n{}";
+    match decode_one(valid) {
+        Decode::Done(consumed, value) => {
+            assert_eq!(consumed, valid.len());
+            assert_eq!(value, J::Obj(vec![]));
+        }
+        Decode::NeedMore => panic!("a complete valid frame must not be NeedMore"),
+        Decode::Recoverable(reason, _) => panic!("a valid frame must not be recoverable: {reason}"),
+        Decode::Fatal(reason) => panic!("a valid frame must not be fatal: {reason}"),
+    }
+    // A truncated valid frame is NeedMore, never Done.
+    assert!(matches!(
+        decode_one(b"Content-Length: 5\r\n\r\nhel"),
+        Decode::NeedMore
+    ));
 }
 
 #[test]

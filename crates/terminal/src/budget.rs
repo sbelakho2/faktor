@@ -955,6 +955,11 @@ mod linux {
         };
         // SAFETY: `prlimit` on a same-uid child we spawned; the pointer is a
         // valid rlimit and the old-limit out pointer is null.
+        // SAFETY: `limit` is a fully initialized `libc::rlimit` with both bounds
+        // set to the caller's documented finite value; `setrlimit` copies from
+        // the reference and only fails with an errno, which is surfaced. The
+        // resource constant is one of the three planned limits and each is valid
+        // on this platform (the plan is built per-platform).
         let r = unsafe {
             match resource {
                 RlimitResource::CpuSeconds => libc::prlimit(

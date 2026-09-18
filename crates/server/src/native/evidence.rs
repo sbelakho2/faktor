@@ -388,7 +388,7 @@ mod tests {
             efficiency: Default::default(),
         })
         .unwrap();
-        let deps = ServerDeps::new(session, agent, permissions);
+        let deps = ServerDeps::new(session, agent, permissions).unwrap();
         AppState {
             deps: std::sync::Arc::new(deps),
             auth: std::sync::Arc::new(std::sync::RwLock::new(None)),

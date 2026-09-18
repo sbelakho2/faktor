@@ -46,6 +46,39 @@ pub const MAX_REPORT_TASKS: usize = 512;
 /// The default vendor report path.
 pub const DEFAULT_REPORT_PATH: &str = "/v1/usage-reports";
 
+/// Documented wall-clock bound for ONE vendor report attempt. The shared
+/// egress client only bounds connect, so a vendor that accepts and then
+/// stalls would otherwise pin the reporting loop forever. Retries are
+/// bounded by the configured attempt count, so one page cannot exceed
+/// `max_attempts × (VENDOR_HTTP_TIMEOUT_MS + backoff)`.
+pub const VENDOR_HTTP_TIMEOUT_MS: u64 = 30_000;
+
+/// Execute one report attempt under [`VENDOR_HTTP_TIMEOUT_MS`]. A policy
+/// denial stays the final `Forbidden`; a breach is a retryable `Backend`
+/// naming the bound.
+async fn execute_raw_bounded(
+    transport: &dyn HttpTransport,
+    request: RawRequest,
+) -> Result<RawResponse, ControlPlaneError> {
+    match tokio::time::timeout(
+        Duration::from_millis(VENDOR_HTTP_TIMEOUT_MS),
+        execute_raw(transport, request),
+    )
+    .await
+    {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(EgressError::Denied { url, .. })) => Err(ControlPlaneError::Forbidden(format!(
+            "billing vendor egress to {url} denied by policy"
+        ))),
+        Ok(Err(e)) => Err(ControlPlaneError::Backend(format!(
+            "billing vendor transport: {e}"
+        ))),
+        Err(_) => Err(ControlPlaneError::Backend(format!(
+            "billing vendor report exceeded the {VENDOR_HTTP_TIMEOUT_MS} ms network bound"
+        ))),
+    }
+}
+
 /// The adapter's strict configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BillingVendorConfig {
@@ -287,7 +320,7 @@ impl BillingVendorAdapter {
             }
             let request = request.bytes_body(body.clone());
             let (error, retry_after_ms): (ControlPlaneError, Option<i64>) =
-                match execute_raw(self.transport.as_ref(), request).await {
+                match execute_raw_bounded(self.transport.as_ref(), request).await {
                     Ok(response) => match self.classify(response, &key)? {
                         Ok(page) => {
                             return Ok(ReportOutcome {
@@ -302,15 +335,10 @@ impl BillingVendorAdapter {
                         }
                         Err(retry) => (retry.error, retry.retry_after_ms),
                     },
-                    Err(EgressError::Denied { url, .. }) => {
-                        return Err(ControlPlaneError::Forbidden(format!(
-                            "billing vendor egress to {url} denied by policy"
-                        )));
-                    }
-                    Err(e) => (
-                        ControlPlaneError::Backend(format!("billing vendor transport: {e}")),
-                        None,
-                    ),
+                    // Policy denials map to the final `Forbidden`; transport
+                    // failures and bound breaches are retryable `Backend`
+                    // errors within the attempt bound.
+                    Err(error) => (error, None),
                 };
             if !report_retryable(&error) || last_attempt {
                 return Err(error);

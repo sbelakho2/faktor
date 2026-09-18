@@ -193,12 +193,25 @@ pub struct EvidenceArchive {
 impl Default for EvidenceArchive {
     fn default() -> Self {
         // Standalone session defaults (ids may never be 0).
-        Self::new(1, 1, None)
+        Self {
+            store: MemoryEvidenceStore::new(EVIDENCE_BACKING_CAP_BYTES),
+            session_id: faktor_core::SessionId::new(1),
+            workspace_id: faktor_core::WorkspaceId::new(1),
+            task_id: None,
+        }
     }
 }
 
 impl EvidenceArchive {
-    pub fn new(session_id: u64, workspace_id: u64, task_id: Option<u64>) -> Self {
+    /// A scoped archive, or a typed refusal when `session_id`/`workspace_id`
+    /// is 0 or `task_id` is `Some(0)`. Zero is never remapped onto another
+    /// identity (the historic `.max(1)` clamp could remap a hostile 0 onto
+    /// identity 1).
+    pub fn new(
+        session_id: u64,
+        workspace_id: u64,
+        task_id: Option<u64>,
+    ) -> Result<Self, EvidenceError> {
         Self::with_backing_cap(
             session_id,
             workspace_id,
@@ -207,20 +220,30 @@ impl EvidenceArchive {
         )
     }
 
+    /// Fallible typed constructor: every zero id is an explicit
+    /// [`EvidenceError::Malformed`] naming the field, never a panic and never
+    /// a silent remap.
     pub fn with_backing_cap(
         session_id: u64,
         workspace_id: u64,
         task_id: Option<u64>,
         backing_cap: usize,
-    ) -> Self {
-        // Identity types refuse 0; a hostile 0 scope is clamped to the
-        // standalone default rather than panicking compaction.
-        Self {
-            store: MemoryEvidenceStore::new(backing_cap),
-            session_id: faktor_core::SessionId::new(session_id.max(1)),
-            workspace_id: faktor_core::WorkspaceId::new(workspace_id.max(1)),
-            task_id,
+    ) -> Result<Self, EvidenceError> {
+        let session_id = faktor_core::SessionId::try_from(session_id)
+            .map_err(|e| EvidenceError::Malformed(format!("evidence archive session_id: {e}")))?;
+        let workspace_id = faktor_core::WorkspaceId::try_from(workspace_id)
+            .map_err(|e| EvidenceError::Malformed(format!("evidence archive workspace_id: {e}")))?;
+        if task_id == Some(0) {
+            return Err(EvidenceError::Malformed(
+                "evidence archive task_id cannot be 0".to_string(),
+            ));
         }
+        Ok(Self {
+            store: MemoryEvidenceStore::new(backing_cap),
+            session_id,
+            workspace_id,
+            task_id,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -502,15 +525,16 @@ impl Compactor {
     }
 
     /// Scope the archive to a session/workspace/task (retrieval then runs
-    /// through the evidence store's scope check).
+    /// through the evidence store's scope check). Zero ids are a typed
+    /// refusal naming the field — never silently remapped.
     pub fn with_evidence_scope(
         mut self,
         session_id: u64,
         workspace_id: u64,
         task_id: Option<u64>,
-    ) -> Self {
-        self.evidence = Mutex::new(EvidenceArchive::new(session_id, workspace_id, task_id));
-        self
+    ) -> Result<Self, EvidenceError> {
+        self.evidence = Mutex::new(EvidenceArchive::new(session_id, workspace_id, task_id)?);
+        Ok(self)
     }
 
     /// Recover from a poisoned lock instead of panicking: the archive
@@ -820,6 +844,62 @@ mod tests {
             open_steps: vec!["s".into()],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn zero_scope_ids_are_typed_refusals_never_remapped() {
+        let err = EvidenceArchive::new(0, 2, None).unwrap_err();
+        assert!(
+            matches!(&err, EvidenceError::Malformed(m) if m.contains("session_id")),
+            "{err:?}"
+        );
+        let err = EvidenceArchive::new(1, 0, None).unwrap_err();
+        assert!(
+            matches!(&err, EvidenceError::Malformed(m) if m.contains("workspace_id")),
+            "{err:?}"
+        );
+        let err = EvidenceArchive::new(1, 1, Some(0)).unwrap_err();
+        assert!(
+            matches!(&err, EvidenceError::Malformed(m) if m.contains("task_id")),
+            "{err:?}"
+        );
+        assert!(EvidenceArchive::with_backing_cap(0, 1, None, 8).is_err());
+
+        // The compactor's scoping seam refuses zero typed, never remaps.
+        assert!(Compactor::deterministic_only()
+            .with_evidence_scope(0, 1, None)
+            .is_err());
+        assert!(Compactor::deterministic_only()
+            .with_evidence_scope(1, 0, None)
+            .is_err());
+        assert!(Compactor::deterministic_only()
+            .with_evidence_scope(1, 1, Some(0))
+            .is_err());
+
+        // Valid values are unchanged, including the archive's scope identity:
+        // a hostile 0 can never be remapped onto identity 1.
+        let mut archive = EvidenceArchive::new(7, 9, Some(3)).unwrap();
+        assert_eq!(
+            archive.access(),
+            EvidenceAccessContext::for_task(7, 9, faktor_core::id::TaskId::new(3))
+        );
+        let ev = archive
+            .archive(EvidenceKind::ProcessLog, "raw output")
+            .unwrap();
+        let stored = archive.retrieve(ev.id).unwrap();
+        assert_eq!(stored.envelope.session_id.raw(), 7);
+        assert_eq!(stored.envelope.workspace_id.raw(), 9);
+        assert_eq!(stored.envelope.task_id, Some(3));
+
+        // The standalone default keeps its documented (1, 1, None) identity.
+        let mut default = EvidenceArchive::default();
+        let ev = default
+            .archive(EvidenceKind::ProcessLog, "standalone")
+            .unwrap();
+        assert_eq!(
+            default.retrieve(ev.id).unwrap().envelope.session_id.raw(),
+            1
+        );
     }
 
     /// The adversary: a "summarizer" that returns the whole history verbatim

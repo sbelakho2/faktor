@@ -931,8 +931,15 @@ impl CandidateWorkspaceService {
     /// Allocate (and create) the daemon-owned isolated root of ONE run:
     /// `<root>/s<session>/<run>`. The run id is validated with the same
     /// charset/bound the durable rows enforce; a hostile id never escapes
-    /// the root. Idempotent for the same (session, run).
+    /// the root. Idempotent for the same (session, run). An UNCONFIGURED
+    /// root (the store was opened without an explicit data root) is a typed
+    /// refusal: a candidate root is NEVER guessed from a fixed temp path.
     pub fn allocate(&self, session: SessionId, run_id: &str) -> Result<PathBuf, ExecError> {
+        if self.root.as_os_str().is_empty() {
+            return Err(ExecError::InvalidPlan(
+                "configuration: candidate run root is unconfigured (the session store was opened without an explicit data root); refusing to allocate an isolated run root".into(),
+            ));
+        }
         if run_id.is_empty()
             || run_id.len() > MAX_RUN_ID_CHARS
             || !run_id.is_ascii()
@@ -948,6 +955,224 @@ impl CandidateWorkspaceService {
         std::fs::create_dir_all(&dir)
             .map_err(|e| ExecError::Internal(format!("candidate run root {dir:?}: {e}")))?;
         Ok(dir)
+    }
+}
+
+/// The runtime OWNER of every detached drive the executor spawns.
+///
+/// Audited gap: the drives dispatched by [`TaskExecutor::start_task`],
+/// [`TaskExecutor::resume_run`] and the bounded shadow watcher were
+/// `tokio::spawn`ed with their `JoinHandle`s dropped — no runtime value
+/// owned them, so a shutdown could neither await nor cancel an in-flight
+/// drive and a drive could outlive every handle the daemon holds. This
+/// registry is that owner: it holds each handle in a [`JoinSet`] (dropping
+/// the registry aborts every remaining drive by `JoinSet` drop semantics),
+/// tracks the run id each live drive serves, and offers a bounded
+/// graceful-then-abort shutdown:
+///
+/// 1. the registry closes synchronously — no drive can start after shutdown
+///    began (`spawn` refuses, and the caller keeps the run's durable rows
+///    resumable instead of pretending it was driven);
+/// 2. in-flight drives get `grace` to finish their record-first durable
+///    writes and settlement;
+/// 3. every straggler is aborted and reaped within [`Self::ABORT_REAP_GRACE`].
+///
+/// An abort is crash-equivalent BY CONSTRUCTION: every drive commits its
+/// durable markers (plan/assignment/registry/settlement rows) BEFORE the
+/// guarded side effect, so a drive cut mid-flight is recovered by
+/// `resume_run`/the deterministic settlement — no durable write is ever
+/// silently dropped, only deferred to the durable recovery authority.
+pub struct TaskDriveRegistry {
+    inner: Mutex<TaskDriveRegistryInner>,
+}
+
+struct TaskDriveRegistryInner {
+    tasks: tokio::task::JoinSet<()>,
+    labels: HashMap<tokio::task::Id, String>,
+    closed: bool,
+}
+
+/// Bounded shutdown outcome of [`TaskDriveRegistry::shutdown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriveDrainReport {
+    /// Drives owned when shutdown began.
+    pub total: usize,
+    /// Drives that finished during the graceful window.
+    pub completed: usize,
+    /// Drives that had to be aborted after the graceful window.
+    pub aborted: usize,
+    /// Aborted drives NOT reaped within
+    /// [`TaskDriveRegistry::ABORT_REAP_GRACE`] (their handles were dropped;
+    /// the durable rows remain the recovery authority).
+    pub unreaped: usize,
+}
+
+impl DriveDrainReport {
+    /// TRUE when every owned drive was reaped within the bound.
+    pub fn all_reaped(&self) -> bool {
+        self.unreaped == 0
+    }
+}
+
+impl Default for TaskDriveRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TaskDriveRegistry {
+    /// Abort/reap bound after the graceful window elapsed.
+    pub const ABORT_REAP_GRACE: Duration = Duration::from_secs(5);
+
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(TaskDriveRegistryInner {
+                tasks: tokio::task::JoinSet::new(),
+                labels: HashMap::new(),
+                closed: false,
+            }),
+        }
+    }
+
+    /// Poison-tolerant guard: the registry is a liveness authority and must
+    /// stay drainable even after a panic elsewhere (the state it protects is
+    /// only handles + labels).
+    fn lock(&self) -> std::sync::MutexGuard<'_, TaskDriveRegistryInner> {
+        self.inner.lock().unwrap_or_else(|poisoned| {
+            self.inner.clear_poison();
+            poisoned.into_inner()
+        })
+    }
+
+    /// Reap every finished drive and its label. A panicked drive is logged
+    /// and reaped like any other, so a panic can never wedge the registry.
+    fn reap_finished(inner: &mut TaskDriveRegistryInner) {
+        while let Some(result) = inner.tasks.try_join_next_with_id() {
+            match result {
+                Ok((id, ())) => {
+                    inner.labels.remove(&id);
+                }
+                Err(e) => {
+                    let label = inner.labels.remove(&e.id()).unwrap_or_default();
+                    if e.is_panic() {
+                        tracing::error!(run = %label, "detached drive task panicked: {e}");
+                    } else {
+                        tracing::warn!(run = %label, "detached drive task was cancelled: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spawn one detached drive owned by this registry. `false` = the
+    /// registry is already shut down: the drive was NOT started and the
+    /// caller must keep the durable run resumable (and free its in-memory
+    /// slot). New work after shutdown is refused, never orphaned.
+    #[must_use]
+    pub fn spawn(
+        &self,
+        run_id: impl Into<String>,
+        drive: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        let label = run_id.into();
+        let mut inner = self.lock();
+        Self::reap_finished(&mut inner);
+        if inner.closed {
+            return false;
+        }
+        let abort = inner.tasks.spawn(drive);
+        inner.labels.insert(abort.id(), label);
+        true
+    }
+
+    /// The number of drives RUNNING right now (finished drives are reaped
+    /// first, so this is a live count, never a completed high-water mark).
+    pub fn live_task_count(&self) -> usize {
+        let mut inner = self.lock();
+        Self::reap_finished(&mut inner);
+        inner.tasks.len()
+    }
+
+    /// The run ids of the currently running drives, sorted (tests/health).
+    pub fn live_run_ids(&self) -> Vec<String> {
+        let mut inner = self.lock();
+        Self::reap_finished(&mut inner);
+        let mut ids: Vec<String> = inner.labels.values().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// TRUE once [`Self::shutdown`] began (new spawns are refused).
+    pub fn is_closed(&self) -> bool {
+        self.lock().closed
+    }
+
+    /// Bounded shutdown: close, give in-flight drives `grace` to finish,
+    /// then abort and reap the stragglers within [`Self::ABORT_REAP_GRACE`].
+    /// Idempotent; a second call finds nothing to drain.
+    pub async fn shutdown(&self, grace: Duration) -> DriveDrainReport {
+        let (mut tasks, mut labels) = {
+            let mut inner = self.lock();
+            inner.closed = true;
+            (
+                std::mem::take(&mut inner.tasks),
+                std::mem::take(&mut inner.labels),
+            )
+        };
+        let total = tasks.len();
+        let mut completed = 0usize;
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            match tokio::time::timeout_at(deadline, tasks.join_next_with_id()).await {
+                Ok(Some(Ok((id, ())))) => {
+                    labels.remove(&id);
+                    completed += 1;
+                }
+                Ok(Some(Err(e))) => {
+                    labels.remove(&e.id());
+                    if e.is_panic() {
+                        tracing::error!("owned drive task reaped with a panic: {e}");
+                    }
+                    completed += 1;
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        let mut aborted = 0usize;
+        let mut unreaped = 0usize;
+        if !tasks.is_empty() {
+            aborted = tasks.len();
+            let mut aborted_runs: Vec<String> = labels.values().cloned().collect();
+            aborted_runs.sort();
+            tracing::warn!(
+                aborted,
+                runs = %aborted_runs.join(","),
+                "drive shutdown grace elapsed; aborting in-flight drives (durable markers keep them resumable)"
+            );
+            tasks.abort_all();
+            let reap_deadline = tokio::time::Instant::now() + Self::ABORT_REAP_GRACE;
+            loop {
+                match tokio::time::timeout_at(reap_deadline, tasks.join_next()).await {
+                    Ok(Some(Ok(()))) | Ok(Some(Err(_))) => {}
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+            unreaped = tasks.len();
+            if unreaped > 0 {
+                tracing::error!(
+                    unreaped,
+                    "drive tasks did not reap after abort; their handles were dropped (durable rows remain the recovery authority)"
+                );
+            }
+        }
+        DriveDrainReport {
+            total,
+            completed,
+            aborted,
+            unreaped,
+        }
     }
 }
 
@@ -998,6 +1223,11 @@ pub struct TaskExecutor {
     /// this executor is byte-identical to the pre-worker-plane executor.
     /// Enabled by the daemon when the `[workers]` section is configured.
     placement: Mutex<WorkerPlacement>,
+    /// The runtime OWNER of every detached drive this executor spawns
+    /// ([`TaskDriveRegistry`]): handles are held (never dropped), live task
+    /// ids are tracked, and [`TaskExecutor::shutdown_drives`] drains them
+    /// with a bounded graceful-then-abort window.
+    drives: Arc<TaskDriveRegistry>,
 }
 
 /// The completion-step wiring of one executor: the configured template
@@ -1102,6 +1332,7 @@ impl TaskExecutor {
             completion_steps: Mutex::new(CompletionStepsWiring::default()),
             settlement_seam: Mutex::new(None),
             placement: Mutex::new(WorkerPlacement::disabled()),
+            drives: Arc::new(TaskDriveRegistry::new()),
         })
     }
 
@@ -1365,17 +1596,15 @@ impl TaskExecutor {
         Ok(Some(runner))
     }
 
-    /// The default candidate-root authority: `<store data dir>/candidate-runs`
-    /// (`store.path()` is `<data dir>/store/faktor-plus.db`), falling back
-    /// to the process temp dir only when the store path has no parent.
+    /// The default candidate-root authority: `<store data root>/candidate-runs`.
+    /// [`faktor_store::Store::root`] is the EXPLICIT data root the store was
+    /// opened at (the directory of `faktor-plus.db`). There is NO fixed
+    /// temp-dir fallback: a degenerate empty root refuses allocation typed
+    /// ([`ExecError::InvalidPlan`]) instead of writing under a shared `/tmp`
+    /// path, so no test or embedded host can ever inherit a production
+    /// temp fallback.
     fn default_run_roots(session: &SessionManager) -> Arc<CandidateWorkspaceService> {
-        let base = session
-            .store()
-            .path()
-            .parent()
-            .map(|dir| dir.join("candidate-runs"))
-            .unwrap_or_else(|| std::env::temp_dir().join("faktor-candidate-runs"));
-        CandidateWorkspaceService::new(base)
+        CandidateWorkspaceService::new(session.store().root().join("candidate-runs"))
     }
 
     /// The ONE candidate-root allocator of this executor: the daemon
@@ -1434,6 +1663,36 @@ impl TaskExecutor {
         self.active
             .lock()
             .map_err(PoisonedAuthority::active_run_lock)
+    }
+
+    /// The number of detached drives this executor currently owns
+    /// (tests/health): finished drives are reaped first, so this is a live
+    /// count.
+    pub fn live_drive_count(&self) -> usize {
+        self.drives.live_task_count()
+    }
+
+    /// The run ids of the detached drives this executor currently owns,
+    /// sorted (tests/health).
+    pub fn live_drive_runs(&self) -> Vec<String> {
+        self.drives.live_run_ids()
+    }
+
+    /// Whether the drive registry is closed (shutdown began): every later
+    /// start/resume is refused typed instead of silently detached.
+    pub fn drives_shutdown(&self) -> bool {
+        self.drives.is_closed()
+    }
+
+    /// Bounded, deterministic shutdown of every detached drive this executor
+    /// owns: close the registry (refusing new drives), give in-flight drives
+    /// `grace` to finish their record-first durable writes/settlement, then
+    /// abort and reap the stragglers within
+    /// [`TaskDriveRegistry::ABORT_REAP_GRACE`]. Shutdown is TERMINAL for the
+    /// executor: an aborted run stays recoverable and is reconstructed from
+    /// its durable rows by a fresh executor (`resume_run`).
+    pub async fn shutdown_drives(&self, grace: Duration) -> DriveDrainReport {
+        self.drives.shutdown(grace).await
     }
 
     /// Adversarial test seam: poison the active-run lock exactly as a
@@ -1619,37 +1878,50 @@ impl TaskExecutor {
         let orch = self.orchestrator.clone();
         let exec = self.clone();
         let run_id_owned = run_id.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = orch
-                .reattach(
-                    parent,
-                    &run_id_owned,
-                    ceilings,
-                    parent_caps,
-                    String::new(),
-                    PathBuf::new(),
-                    crash_seam,
-                )
-                .await
-            {
-                eprintln!("resumed-run re-attach failed for run {run_id_owned}: {e}");
+        // Registry-owned drive: never a dropped JoinHandle (audit spawn
+        // ownership). A closed registry refuses BEFORE the detached future
+        // starts; the durable rows stay resumable and the in-memory slot is
+        // freed, never left dangling behind a receipt nobody drives.
+        let spawned = self.drives.spawn(run_id_owned.clone(), {
+            let run_id_owned = run_id_owned.clone();
+            async move {
+                if let Err(e) = orch
+                    .reattach(
+                        parent,
+                        &run_id_owned,
+                        ceilings,
+                        parent_caps,
+                        String::new(),
+                        PathBuf::new(),
+                        crash_seam,
+                    )
+                    .await
+                {
+                    eprintln!("resumed-run re-attach failed for run {run_id_owned}: {e}");
+                }
+                // A re-attached run settles through the SAME common pass as a
+                // fresh orchestrated run (idempotent: an already-settled run is
+                // a no-op with the same outcome).
+                if let Err(e) = exec
+                    .settle_run(RunSettlement::Orchestrated {
+                        parent,
+                        run_id: run_id_owned.clone(),
+                    })
+                    .await
+                {
+                    eprintln!("resumed-run settlement failed for run {run_id_owned}: {e}");
+                }
+                // Drive finished: free the single-execution slot when it still
+                // names this run.
+                exec.clear_active_if(parent, &run_id_owned);
             }
-            // A re-attached run settles through the SAME common pass as a
-            // fresh orchestrated run (idempotent: an already-settled run is
-            // a no-op with the same outcome).
-            if let Err(e) = exec
-                .settle_run(RunSettlement::Orchestrated {
-                    parent,
-                    run_id: run_id_owned.clone(),
-                })
-                .await
-            {
-                eprintln!("resumed-run settlement failed for run {run_id_owned}: {e}");
-            }
-            // Drive finished: free the single-execution slot when it still
-            // names this run.
-            exec.clear_active_if(parent, &run_id_owned);
         });
+        if !spawned {
+            self.clear_active_if(parent, &run_id_owned);
+            return Err(ExecError::Conflict(format!(
+                "executor is shut down; run '{run_id_owned}' was not re-driven and stays resumable from its durable rows"
+            )));
+        }
         Ok(TaskRunReceipt {
             run_id: run_id.to_string(),
             mode: TaskRunMode::Orchestrated,
@@ -1980,22 +2252,51 @@ impl TaskExecutor {
         let exec = self.clone();
         if receipt.queued {
             let agent = self.agent.clone();
-            tokio::spawn(async move {
+            // Registry-owned drive (audit spawn ownership): the handle is
+            // never dropped. A shut-down registry refuses here; the queue row
+            // and task/run rows are already durable, so the prompt is not
+            // lost — `recover_pending_queues` drains it on the next executor.
+            let spawned = self.drives.spawn(run_id.clone(), async move {
                 agent.run_session_queue(parent).await;
+                // The runner is bounded by the turn budget; when it exits
+                // with the head still pending, the settle path re-kicks it
+                // here (the runtime gate arms a live runner or this spawns a
+                // fresh one — exactly one drive ever claims the head).
+                exec.kick_pending_queue(parent);
                 exec.after_shadowed_drive(parent).await;
             });
+            if !spawned {
+                return Err(ExecError::Conflict(format!(
+                    "executor is shut down; queued run '{run_id}' was recorded durably and resumes on the next executor"
+                )));
+            }
         } else {
             let agent = self.agent.clone();
             let model = req.model.clone();
             let handle2 = self.session.get_session(parent).ok().flatten();
             if let Some(h) = handle2 {
                 let receipt2 = receipt.clone();
-                tokio::spawn(async move {
+                // Registry-owned drive (audit spawn ownership): the handle is
+                // never dropped. The submit already recorded the durable op
+                // row, so a shut-down refusal leaves the turn recoverable.
+                let spawned = self.drives.spawn(run_id.clone(), async move {
                     if let Err(e) = agent.drive_receipt(&h, receipt2, model).await {
                         eprintln!("in-session drive failed for session {parent}: {e}");
                     }
+                    // Settle-path authority (boundary race): the turn just
+                    // finished or was cancelled — a durable queue head that
+                    // was waiting on it must never be left without a runner.
+                    // A live runner is ARMED for one more bounded pass by the
+                    // runtime gate; a dead one is replaced here. A shut-down
+                    // registry leaves the row pending for recovery.
+                    exec.kick_pending_queue(parent);
                     exec.after_shadowed_drive(parent).await;
                 });
+                if !spawned {
+                    return Err(ExecError::Conflict(format!(
+                        "executor is shut down; run '{run_id}' was recorded durably and resumes on the next executor"
+                    )));
+                }
             }
         }
         Ok(TaskRunReceipt {
@@ -2047,7 +2348,12 @@ impl TaskExecutor {
             let _ = handle.abort(Some(receipt.op_id));
             return Err(refusal);
         }
-        let _ = handle.finish_turn_record(receipt.op_id, "failed");
+        // The Failed event above is the durable authority; the record close
+        // is compensated through the agent's retry-on-next-open channel, so
+        // a close that fails here stays surfaced AND replayable instead of
+        // silently leaving a stale active record.
+        self.agent
+            .note_turn_record_close(handle, receipt.op_id, "failed");
         // The durable run row makes the admitted-but-undriven run readable
         // through the exact projection every other run uses (state derives
         // from the settled session/task rows) — a client that holds the
@@ -2206,7 +2512,13 @@ impl TaskExecutor {
             s.child_caps = s.task_caps.clone();
             specs.push(s);
         }
-        let run_id = format!("run-{:016x}", self.session.next_op_id().raw());
+        let run_id = format!(
+            "run-{:016x}",
+            self.session
+                .try_next_op_id()
+                .map_err(|e| ExecError::from(faktor_core::Error::from(e)))?
+                .raw()
+        );
         // P0 no-op policy: the run's disposition is durable BEFORE the run is
         // claimed or any child spawns, so the detached settlement applies the
         // exact policy the caller requested.
@@ -2263,24 +2575,37 @@ impl TaskExecutor {
             crash_seam: req.crash_seam,
         };
         let run_id2 = run_id.clone();
-        tokio::spawn(async move {
-            if let Err(e) = orch.execute_task(plan, owner, config, &specs).await {
-                eprintln!("orchestrated run {run_id2} failed: {e}");
+        // Registry-owned drive (audit spawn ownership): never a dropped
+        // JoinHandle. A shut-down registry refuses BEFORE the drive starts;
+        // the plan/policy/assignment rows stay durable and the in-memory slot
+        // is freed so recovery can re-attach through `resume_run`.
+        let spawned = self.drives.spawn(run_id2.clone(), {
+            let run_id2 = run_id2.clone();
+            async move {
+                if let Err(e) = orch.execute_task(plan, owner, config, &specs).await {
+                    eprintln!("orchestrated run {run_id2} failed: {e}");
+                }
+                // THE post-run settlement (never an await-then-clear): the
+                // aggregate root verification, the accepted contract's steps and
+                // the completion gate all run before the active slot is freed.
+                if let Err(e) = exec
+                    .settle_run(RunSettlement::Orchestrated {
+                        parent,
+                        run_id: run_id2.clone(),
+                    })
+                    .await
+                {
+                    eprintln!("orchestrated-run settlement failed for run {run_id2}: {e}");
+                }
+                exec.clear_active_if(parent, &run_id2);
             }
-            // THE post-run settlement (never an await-then-clear): the
-            // aggregate root verification, the accepted contract's steps and
-            // the completion gate all run before the active slot is freed.
-            if let Err(e) = exec
-                .settle_run(RunSettlement::Orchestrated {
-                    parent,
-                    run_id: run_id2.clone(),
-                })
-                .await
-            {
-                eprintln!("orchestrated-run settlement failed for run {run_id2}: {e}");
-            }
-            exec.clear_active_if(parent, &run_id2);
         });
+        if !spawned {
+            self.clear_active_if(parent, &run_id2);
+            return Err(ExecError::Conflict(format!(
+                "executor is shut down; orchestrated run '{run_id2}' was not driven and stays resumable from its durable rows"
+            )));
+        }
         Ok(TaskRunReceipt {
             run_id,
             mode: TaskRunMode::Orchestrated,
@@ -3659,7 +3984,11 @@ impl TaskExecutor {
             let attempt_op = match read_root_attempt_op(handle, &prepared.run_id)? {
                 Some(op) => op,
                 None => {
-                    let op = self.session.next_op_id().raw();
+                    let op = self
+                        .session
+                        .try_next_op_id()
+                        .map_err(|e| ExecError::from(faktor_core::Error::from(e)))?
+                        .raw();
                     persist_root_attempt_op(handle, &prepared.run_id, op)?;
                     op
                 }
@@ -4830,6 +5159,64 @@ impl TaskExecutor {
         }
     }
 
+    /// Settle-path queue authority (boundary race): a turn of `parent` just
+    /// finished or was cancelled, and its durable queue head must never be
+    /// left without a runner. When the session still carries a non-terminal
+    /// queue row, ensure a runner under THIS registry:
+    ///
+    /// - a LIVE runner is ARMED for one more bounded pass by the runtime's
+    ///   per-session gate (never a second concurrent drive — the head is
+    ///   claimed exactly once);
+    /// - otherwise a fresh registry-owned runner is spawned. The spawned
+    ///   future is cheap when a runner turns out to be live (it only arms).
+    ///
+    /// A shut-down registry refuses the spawn; the durable row IS the
+    /// runnable marker and keeps it pending for
+    /// [`Self::recover_pending_queues`] on the next executor. Bounded by
+    /// construction: a kick never polls, it only starts/arms one runner
+    /// whose own wait is bounded by the turn budget.
+    fn kick_pending_queue(self: &Arc<Self>, parent: SessionId) {
+        let pending = match self.session.get_session(parent) {
+            Ok(Some(handle)) => handle.queued_prompt_count().unwrap_or(0),
+            _ => 0,
+        };
+        if pending == 0 {
+            return;
+        }
+        let agent = self.agent.clone();
+        let spawned = self
+            .drives
+            .spawn(format!("tx-queue-{}", parent.raw()), async move {
+                agent.run_session_queue(parent).await;
+            });
+        if !spawned {
+            tracing::warn!(
+                session = %parent,
+                "queue head pending after its turn settled but the drive registry is \
+                 shut down; the durable row stays pending for recovery"
+            );
+        }
+    }
+
+    /// Startup/relaunch queue recovery (boundary race): every session whose
+    /// durable queue still carries a non-terminal row gets a runner under
+    /// the drive registry — no new submit required. The durable rows ARE
+    /// the runnable marker (`sessions_with_pending_queues`); idempotent, a
+    /// live runner is armed, never duplicated, and a shut-down registry
+    /// leaves the rows pending for the next executor.
+    pub fn recover_pending_queues(self: &Arc<Self>) {
+        let sessions = match self.session.store().sessions_with_pending_queues() {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                tracing::warn!("queue recovery scan failed: {e}");
+                return;
+            }
+        };
+        for session in sessions {
+            self.kick_pending_queue(session);
+        }
+    }
+
     /// Bound of the post-drive shadow watcher: it may retry the durable
     /// finalize for at most this long while the session's shadow row is
     /// still LIVE (a non-terminal task row, or an IntegrationBlocked row
@@ -4853,37 +5240,44 @@ impl TaskExecutor {
     /// next run's deterministic settlement.
     fn watch_shadow_settle(self: &Arc<Self>, parent: SessionId) {
         let exec = self.clone();
-        tokio::spawn(async move {
-            let deadline = Instant::now() + Self::SHADOW_WATCH_DEADLINE;
-            loop {
-                tokio::time::sleep(Self::SHADOW_WATCH_INTERVAL).await;
-                if Instant::now() >= deadline {
-                    return;
-                }
-                let run_id = format!("tx-session-{}", parent.raw());
-                match exec
-                    .settle_run(RunSettlement::InSession { parent, run_id })
-                    .await
-                {
-                    Ok(outcome)
-                        if !matches!(
-                            outcome.finalize.as_ref().map(|f| &f.action),
-                            Some(ShadowFinalizeAction::Retained)
-                                | Some(ShadowFinalizeAction::IntegrationBlocked)
-                        ) =>
+        // Registry-owned watcher (audit spawn ownership): never a dropped
+        // JoinHandle. A shut-down registry refuses the watcher — the durable
+        // settlement on the next run start is the documented backstop.
+        let _ = self
+            .drives
+            .spawn(format!("tx-session-{}", parent.raw()), async move {
+                let deadline = Instant::now() + Self::SHADOW_WATCH_DEADLINE;
+                loop {
+                    tokio::time::sleep(Self::SHADOW_WATCH_INTERVAL).await;
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    let run_id = format!("tx-session-{}", parent.raw());
+                    match exec
+                        .settle_run(RunSettlement::InSession { parent, run_id })
+                        .await
                     {
-                        // Integrated/discarded/no-live-shadow: nothing left
-                        // to watch.
-                        return;
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        eprintln!("shadowed-run watch settlement failed for session {parent}: {e}");
-                        return;
+                        Ok(outcome)
+                            if !matches!(
+                                outcome.finalize.as_ref().map(|f| &f.action),
+                                Some(ShadowFinalizeAction::Retained)
+                                    | Some(ShadowFinalizeAction::IntegrationBlocked)
+                            ) =>
+                        {
+                            // Integrated/discarded/no-live-shadow: nothing left
+                            // to watch.
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!(
+                                "shadowed-run watch settlement failed for session {parent}: {e}"
+                            );
+                            return;
+                        }
                     }
                 }
-            }
-        });
+            });
     }
 
     /// Cancel ONE task run of the session, durably and exactly once:
@@ -5132,7 +5526,13 @@ impl TaskExecutor {
     ) -> Result<TournamentReceipt, ExecError> {
         req.validate()?;
         let criteria = build_tournament_criteria(&req.criteria)?;
-        let tournament_id = format!("tour-{:016x}", self.session.next_op_id().raw());
+        let tournament_id = format!(
+            "tour-{:016x}",
+            self.session
+                .try_next_op_id()
+                .map_err(|e| ExecError::from(faktor_core::Error::from(e)))?
+                .raw()
+        );
         let mut tournament = crate::tournament::Tournament::new(
             &tournament_id,
             "pending-run",
@@ -6402,5 +6802,472 @@ mod completion_contract_executor_tests {
         )
         .unwrap_err();
         assert!(matches!(err, ExecError::Conflict(_)), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod drive_ownership_tests {
+    //! Adversarial covers of the audited spawn-ownership gap: every detached
+    //! drive is owned by [`TaskDriveRegistry`], shutdown aborts/awaits within
+    //! bound and leaves the durable rows recoverable, and a shut-down
+    //! registry refuses new drives instead of orphaning them.
+    //!
+    //! (the suite-level HEAVY_SUITE guard is held across awaits BY DESIGN:
+    //! it serializes the file/CAS/SQLite-heavy executor fixture with the
+    //! other heavy suites.)
+    #![allow(clippy::await_holding_lock)]
+
+    use super::*;
+    use crate::runtime::Ceilings;
+    use crate::test_support::heavy_guard;
+    use faktor_agent::{AgentDeps, NoEvidence, PermissionRequester, ToolCallMode, ToolRegistry};
+    use faktor_core::capability::PermissionDecision;
+    use faktor_core::model::ModelCapabilities;
+    use faktor_core::time::SystemClock;
+    use faktor_provider::{
+        GenericAgentRequest, Provider, ProviderChunk, ProviderRegistry, ProviderStream,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    async fn wait_until(mut cond: impl FnMut() -> bool, timeout_secs: u64) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        while !cond() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "wait_until timed out after {timeout_secs}s"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    // ---------------------------------------------------- registry (unit)
+
+    /// Shutdown must abort and reap every parked drive within bound, empty
+    /// the registry, and refuse any later drive (no post-shutdown orphan).
+    #[tokio::test]
+    async fn drive_registry_shutdown_aborts_reaps_and_refuses_new_work() {
+        let registry = TaskDriveRegistry::new();
+        let entered = Arc::new(AtomicUsize::new(0));
+        for i in 0..3 {
+            let entered = entered.clone();
+            assert!(registry.spawn(format!("run-{i}"), async move {
+                entered.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            }));
+        }
+        assert_eq!(registry.live_task_count(), 3);
+        assert_eq!(registry.live_run_ids(), vec!["run-0", "run-1", "run-2"]);
+        assert!(!registry.is_closed());
+        let started = Instant::now();
+        let report = registry.shutdown(Duration::from_millis(50)).await;
+        assert!(started.elapsed() < Duration::from_secs(5), "bounded drain");
+        assert_eq!(report.total, 3);
+        assert_eq!(report.completed, 0);
+        assert_eq!(report.aborted, 3);
+        assert_eq!(report.unreaped, 0);
+        assert!(report.all_reaped());
+        assert_eq!(registry.live_task_count(), 0);
+        assert!(registry.live_run_ids().is_empty());
+        assert!(registry.is_closed());
+        // A drive handed in after shutdown is REFUSED, never orphaned.
+        let late = Arc::new(AtomicBool::new(false));
+        let late_flag = late.clone();
+        assert!(!registry.spawn("run-late", async move {
+            late_flag.store(true, Ordering::SeqCst);
+        }));
+        assert_eq!(registry.live_task_count(), 0);
+        tokio::task::yield_now().await;
+        assert!(!late.load(Ordering::SeqCst), "refused drive never ran");
+        // Idempotent: a second shutdown drains nothing.
+        let second = registry.shutdown(Duration::from_millis(10)).await;
+        assert_eq!(second.total, 0);
+        assert!(second.all_reaped());
+    }
+
+    /// The graceful window is real: a drive that commits its record-first
+    /// marker inside the window is allowed to land it (no premature abort),
+    /// while a straggler is only aborted AFTER the window elapsed.
+    #[tokio::test]
+    async fn drive_registry_grace_window_is_bounded_and_aborts_only_after_it() {
+        let registry = TaskDriveRegistry::new();
+        let committed = Arc::new(AtomicBool::new(false));
+        let committing = committed.clone();
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        assert!(registry.spawn("run-commits", async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            committing.store(true, Ordering::SeqCst); // durable marker stand-in
+            let _ = held.await; // guarded effect parks
+        }));
+        let started = Instant::now();
+        let report = registry.shutdown(Duration::from_millis(250)).await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "grace window honored"
+        );
+        assert!(
+            committed.load(Ordering::SeqCst),
+            "in-flight durable marker landed before the abort"
+        );
+        assert_eq!(report.completed, 0);
+        assert_eq!(report.aborted, 1);
+        assert_eq!(report.unreaped, 0);
+        drop(release);
+    }
+
+    /// Finished drives are reaped on the next observation: the live count is
+    /// never a completed high-water mark.
+    #[tokio::test]
+    async fn drive_registry_reaps_finished_drives() {
+        let registry = TaskDriveRegistry::new();
+        assert!(registry.spawn("run-quick", async {}));
+        for _ in 0..1000 {
+            if registry.live_task_count() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(registry.live_task_count(), 0);
+        assert!(registry.live_run_ids().is_empty());
+    }
+
+    // --------------------------------------------- executor (integration)
+
+    struct AlwaysAllow;
+    impl PermissionRequester for AlwaysAllow {
+        fn request(
+            &self,
+            _session: SessionId,
+            _permission: &faktor_session::ops::PermissionRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = faktor_core::Result<PermissionDecision>> + Send>,
+        > {
+            Box::pin(async { Ok(PermissionDecision::Allow) })
+        }
+    }
+
+    /// Provider whose model calls PARK until the test opens the gate: the
+    /// drive stays deterministically in flight across shutdown, then serves
+    /// a complete turn to the resumed drive.
+    struct GateProvider {
+        caps: ModelCapabilities,
+        opened: tokio::sync::watch::Sender<bool>,
+        entered: Arc<AtomicUsize>,
+    }
+
+    impl Provider for GateProvider {
+        fn id(&self) -> &str {
+            "gate"
+        }
+
+        fn capabilities(&self, _model: &str) -> ModelCapabilities {
+            self.caps.clone()
+        }
+
+        fn stream(&self, _req: GenericAgentRequest) -> ProviderStream {
+            use futures::StreamExt;
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let mut rx = self.opened.subscribe();
+            let s = futures::stream::once(async move {
+                while !*rx.borrow_and_update() {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+                Ok(ProviderChunk::Text {
+                    text: "done".into(),
+                })
+            })
+            .chain(futures::stream::once(async { Ok(ProviderChunk::Done) }));
+            Box::pin(s)
+        }
+    }
+
+    struct GateEnv {
+        manager: Arc<SessionManager>,
+        agent: Arc<AgentRuntime>,
+        orchestrator: Arc<OrchestratorRuntime>,
+        executor: Arc<TaskExecutor>,
+        parent: SessionId,
+        provider: Arc<GateProvider>,
+    }
+
+    fn read_caps() -> CapabilitySet {
+        CapabilitySet::from_grants([CapabilityGrant::new(
+            LatticeCap::ReadWorkspace,
+            ScopePattern::new(ScopePattern::WILDCARD).expect("wildcard pattern"),
+        )])
+        .expect("wildcard grants are sane")
+    }
+
+    fn gate_provider() -> Arc<GateProvider> {
+        let (opened, _opened_rx) = tokio::sync::watch::channel(false);
+        Arc::new(GateProvider {
+            caps: ModelCapabilities {
+                tools: true,
+                parallel_tools: true,
+                ..Default::default()
+            },
+            opened,
+            entered: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    /// Build the full daemon-side stack over a store root WITHOUT creating a
+    /// session: a reopen of the same root after a "crash" reconstructs the
+    /// graph over the SAME durable rows (the only way the in-memory op
+    /// registry is truly fresh, exactly like a process restart).
+    fn build_gate_stack(
+        root: &std::path::Path,
+        provider: Arc<GateProvider>,
+    ) -> (
+        Arc<SessionManager>,
+        Arc<AgentRuntime>,
+        Arc<OrchestratorRuntime>,
+        Arc<TaskExecutor>,
+    ) {
+        let manager = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
+        let mut registry = ProviderRegistry::new();
+        registry.try_register(provider).unwrap();
+        let agent = AgentRuntime::new(AgentDeps {
+            session: manager.clone(),
+            providers: Arc::new(registry),
+            chunk_sink: None,
+            permission_requester: Arc::new(AlwaysAllow),
+            evidence: Arc::new(NoEvidence),
+            tools: Arc::new(ToolRegistry::new()),
+            cas: None,
+            workspaces: faktor_fs::WorkspaceFileService::new(),
+            edit: None,
+            snapshots: None,
+            sandbox: None,
+            supervisor: None,
+            verification: faktor_agent::VerificationService::disabled(),
+            hooks: None,
+            instructions_resolver: faktor_instructions::no_roots_resolver(),
+            routing: faktor_agent::FixedRoutingPolicy::passthrough(),
+            budgets: Arc::new(faktor_session::NoopBudget),
+            model: "m".into(),
+            compaction_model: None,
+            compact_at_usage: 0.65,
+            instructions: "You are a test agent.".into(),
+            clock: Arc::new(SystemClock),
+            tool_call_mode: ToolCallMode::Native,
+            tool_deadline_ms: 5000,
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
+            semantic: faktor_agent::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
+        })
+        .unwrap();
+        let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
+        let executor = TaskExecutor::new_owner_direct_for_test_harness(
+            &orchestrator,
+            manager.clone(),
+            agent.clone(),
+        );
+        (manager, agent, orchestrator, executor)
+    }
+
+    fn open_gate_env(root: &std::path::Path) -> GateEnv {
+        let provider = gate_provider();
+        let (manager, agent, orchestrator, executor) = build_gate_stack(root, provider.clone());
+        let owner_root = root.join("owner");
+        std::fs::create_dir_all(&owner_root).unwrap();
+        let ws = manager
+            .create_workspace(owner_root.to_str().unwrap())
+            .unwrap();
+        let wt = WorktreeId::new(
+            manager
+                .put_worktree(ws, owner_root.to_str().unwrap(), "main")
+                .unwrap() as u64,
+        );
+        let parent = manager
+            .create_session(ws, "gate-owner", "gate", "m")
+            .unwrap()
+            .id();
+        manager.adopt_identity(parent, wt, TaskId::new(1)).unwrap();
+        GateEnv {
+            manager,
+            agent,
+            orchestrator,
+            executor,
+            parent,
+            provider,
+        }
+    }
+
+    /// The audited end-to-end invariant: a live detached drive is owned by
+    /// the executor; shutdown aborts/awaits it within bound with an empty
+    /// registry; the durable task/run rows survive the abort; and the
+    /// documented crash-recovery entry (`agent.recover()` +
+    /// `agent.continue_turn()`) resumes the SAME recorded turn to a genuine
+    /// end — the abort is crash-equivalent, never durable loss.
+    #[tokio::test]
+    async fn executor_shutdown_aborts_owned_drive_and_crash_recovery_still_resumes() {
+        let _heavy = heavy_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let env = open_gate_env(dir.path());
+        let req = TaskRunRequest {
+            goal: "parked single-item run".to_string(),
+            work_items: vec![WorkItem::new("a", "work a", WorkKind::Analysis)],
+            parent_caps: read_caps(),
+            ..Default::default()
+        };
+        let receipt = env
+            .executor
+            .start_task(env.parent, req)
+            .expect("run starts");
+        assert_eq!(receipt.mode, TaskRunMode::InSession);
+        let run_id = receipt.run_id.clone();
+        let parent = env.parent;
+        wait_until(|| env.executor.live_drive_count() == 1, 30).await;
+        assert_eq!(env.executor.live_drive_runs(), vec![run_id.clone()]);
+        // The provider parks INSIDE the model call: the drive cannot finish.
+        wait_until(|| env.provider.entered.load(Ordering::SeqCst) >= 1, 30).await;
+        let handle = env.manager.get_session(env.parent).unwrap().unwrap();
+        let task_id = handle.task_id().unwrap();
+        let task_before = handle.get_task(task_id).unwrap().expect("durable task row");
+        assert!(!task_before.state.is_terminal());
+
+        let started = Instant::now();
+        let report = env
+            .executor
+            .shutdown_drives(Duration::from_millis(100))
+            .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "shutdown drain stayed bounded"
+        );
+        assert!(report.total >= 1, "the live drive was owned: {report:?}");
+        assert!(
+            report.aborted >= 1,
+            "the parked drive was aborted: {report:?}"
+        );
+        assert_eq!(report.unreaped, 0, "every drive reaped: {report:?}");
+        assert_eq!(env.executor.live_drive_count(), 0);
+        assert!(env.executor.drives_shutdown());
+
+        // No durable state loss: the task row and the receipt-named linkage
+        // row are still exactly there after the abort.
+        let task = handle
+            .get_task(task_id)
+            .unwrap()
+            .expect("task row survives");
+        assert!(!task.state.is_terminal());
+        assert!(
+            handle
+                .memory_facts()
+                .unwrap()
+                .iter()
+                .any(|(kind, key, _)| kind == TASK_RUN_ROW_KIND && key == &run_id),
+            "the durable run linkage row survives the abort"
+        );
+
+        // CRASH: the graph is dropped and REOPENED over the same store —
+        // exactly a daemon restart. (The in-process op registry dies with the
+        // graph, so the reopened runtime sees a genuine interrupted turn, not
+        // a "live in-process driver" fingerprint.)
+        let provider = env.provider.clone();
+        drop(env);
+        let (manager2, agent2, _orchestrator2, _executor2) =
+            build_gate_stack(dir.path(), provider.clone());
+        let _ = provider.opened.send_replace(true);
+        agent2.recover().expect("boot recovery pass");
+        let handle2 = manager2.get_session(parent).unwrap().unwrap();
+        assert!(
+            handle2
+                .events_range(0, Some(400))
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == faktor_core::event::EventKind::CrashDetected),
+            "the interrupted turn is crash residue"
+        );
+
+        // Recovery still resumes: the SAME recorded turn continues to a
+        // genuine end once the provider gate opens.
+        agent2
+            .continue_turn(parent)
+            .await
+            .expect("the interrupted turn resumes");
+        assert!(
+            matches!(
+                handle2.state().unwrap(),
+                faktor_core::state::AgentState::ReadyForNextTurn
+                    | faktor_core::state::AgentState::Completed
+            ),
+            "the resumed turn reached a genuine end"
+        );
+        assert!(
+            handle2
+                .get_task(task_id)
+                .unwrap()
+                .is_some_and(|t| !t.goal.is_empty()),
+            "the durable task row is intact after recovery"
+        );
+    }
+
+    /// Orchestrated counterpart: the run's detached drive is registry-owned;
+    /// after shutdown aborts it, the durable plan + assignment rows survive
+    /// and a FRESH executor's `resume_run` re-attaches (the recovery entry
+    /// point) — the run was never silently dropped.
+    #[tokio::test]
+    async fn executor_shutdown_keeps_orchestrated_run_resumable() {
+        let _heavy = heavy_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let env = open_gate_env(dir.path());
+        let req = TaskRunRequest {
+            goal: "two-item parked run".to_string(),
+            work_items: vec![
+                WorkItem::new("a", "work a", WorkKind::Analysis),
+                WorkItem::new("b", "work b", WorkKind::Analysis),
+            ],
+            parent_caps: read_caps(),
+            ..Default::default()
+        };
+        let receipt = env
+            .executor
+            .start_task(env.parent, req)
+            .expect("run starts");
+        assert_eq!(receipt.mode, TaskRunMode::Orchestrated);
+        let run_id = receipt.run_id.clone();
+        wait_until(|| env.executor.live_drive_count() == 1, 30).await;
+        assert_eq!(env.executor.live_drive_runs(), vec![run_id.clone()]);
+        // Durable plan + assignment rows land BEFORE the first child spawn:
+        // they are the recovery entry point `resume_run` re-attaches to.
+        wait_until(
+            || {
+                !OrchestratorRuntime::assignment_rows(env.manager.clone(), env.parent, &run_id)
+                    .unwrap_or_default()
+                    .is_empty()
+            },
+            30,
+        )
+        .await;
+        let report = env
+            .executor
+            .shutdown_drives(Duration::from_millis(100))
+            .await;
+        assert!(report.total >= 1, "the live drive was owned: {report:?}");
+        assert!(report.aborted >= 1, "{report:?}");
+        assert_eq!(report.unreaped, 0, "{report:?}");
+        assert_eq!(env.executor.live_drive_count(), 0);
+        // The abort cut the drive, NOT the durable markers.
+        assert!(
+            !OrchestratorRuntime::assignment_rows(env.manager.clone(), env.parent, &run_id)
+                .unwrap()
+                .is_empty(),
+            "durable assignments survive the abort"
+        );
+        // A fresh executor re-attaches the same durable run.
+        let executor2 = TaskExecutor::new_owner_direct_for_test_harness(
+            &env.orchestrator,
+            env.manager.clone(),
+            env.agent.clone(),
+        );
+        executor2
+            .resume_run(env.parent, &run_id, Ceilings::default(), read_caps(), None)
+            .expect("re-attach accepted from the surviving durable rows");
+        let _ = executor2.shutdown_drives(Duration::from_millis(50)).await;
+        assert_eq!(executor2.live_drive_count(), 0);
     }
 }

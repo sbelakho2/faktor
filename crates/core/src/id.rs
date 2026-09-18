@@ -202,9 +202,17 @@ mod tests {
         let r: Result<SessionId, _> = serde_json::from_str("-1");
         assert!(r.is_err());
         let r: Result<SessionId, _> = serde_json::from_str("18446744073709551615");
-        // u64::MAX is technically fine as raw bytes; but serialization of a
-        // non-u64-typed payload must fail before that.
-        assert!(r.is_ok() || r.is_err()); // parses as u64; contract allows it
+        // A full-width u64 parses and stays exact: no truncation.
+        assert_eq!(r.unwrap().raw(), u64::MAX);
+        // Zero is the one forbidden raw value, and it is a typed error.
+        let zero: Result<SessionId, _> = serde_json::from_str("0");
+        assert!(zero.is_err(), "zero must never decode into an id");
+        assert!(
+            zero.unwrap_err()
+                .to_string()
+                .contains("SessionId cannot be 0"),
+            "the refusal names the invariant, not a generic decode error"
+        );
     }
 
     #[test]

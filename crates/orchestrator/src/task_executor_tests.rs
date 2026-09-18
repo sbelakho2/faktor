@@ -327,7 +327,8 @@ fn open_env_with_shadows(
     let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
     let shadows_root = root.join("shadows");
     let executor = if shadowed {
-        let shadows = ShadowRoots::new_with_limits(manager.clone(), shadows_root.clone(), limits);
+        let shadows =
+            ShadowRoots::new_with_limits(manager.clone(), shadows_root.clone(), limits).unwrap();
         TaskExecutor::new(&orchestrator, manager.clone(), agent.clone(), shadows)
     } else {
         // Low-level owner-direct suite: the cfg(test) seam (no shadow
@@ -575,6 +576,98 @@ async fn single_item_task_matches_the_direct_prompt_path_byte_for_byte() {
         "the run's own goal lives in the linkage row"
     );
     assert_eq!(decoded.item_ids, vec!["a1".to_string()]);
+}
+
+#[tokio::test]
+async fn refused_isolation_record_close_loss_is_marked_and_reconstructed() {
+    // Adversarial (injected store fault): the refused-isolation admission
+    // already recorded the durable Failed event, but the turn-record close
+    // fails. The typed refusal outcome (receipt + linkage row) must be
+    // preserved, the loss must surface through the agent's durable retry
+    // channel, and the record must be closed by replay at the next open.
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(dir.path(), done_script());
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let req = request(
+        "refused isolation",
+        vec![wi("a1", WorkKind::Analysis, &[])],
+        &env,
+    );
+    // Every turn-record update aborts: the close cannot land.
+    env.manager
+        .store()
+        .sql_execute(
+            "CREATE TRIGGER dw_test_fail_executor_record BEFORE UPDATE ON turn_record \
+             BEGIN SELECT RAISE(ABORT, 'injected turn-record corruption'); END",
+        )
+        .unwrap();
+    let receipt = env
+        .executor
+        .admit_refused_isolation(
+            env.parent,
+            &h,
+            &req,
+            ExecError::Oversized("bounded caps refused the candidate".into()),
+        )
+        .expect("the typed refusal outcome survives the lost record close");
+    assert_eq!(receipt.mode, TaskRunMode::InSession);
+    assert!(!receipt.queued);
+    // The original outcome is preserved: landed FailedRecoverable + linkage row.
+    assert_eq!(
+        state_of(&env, env.parent),
+        faktor_core::state::AgentState::FailedRecoverable
+    );
+    let facts = h.memory_facts().unwrap();
+    assert!(
+        facts
+            .iter()
+            .any(|(kind, key, _)| kind == TASK_RUN_ROW_KIND && key == &receipt.run_id),
+        "the durable linkage row is written despite the lost close"
+    );
+    // Surfaced through the agent's durable marker channel.
+    let root = env.manager.store().root().to_path_buf();
+    let marker_dir = root.join("durable-write-markers");
+    let markers: Vec<std::path::PathBuf> = std::fs::read_dir(&marker_dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(
+        markers.len(),
+        1,
+        "exactly one compensation marker: {markers:?}"
+    );
+    let marker: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&markers[0]).unwrap()).unwrap();
+    assert_eq!(marker["status"], "pending");
+    assert_eq!(marker["intent"]["write"], "finish_turn_record");
+    assert!(
+        marker["site"]
+            .as_str()
+            .is_some_and(|site| site.contains("admit_refused_isolation")),
+        "the marker names the lost site: {marker}"
+    );
+    assert!(
+        h.active_turn_record().unwrap().is_some(),
+        "the lost close left the record active (the loss is not papered over)"
+    );
+    // Recovery: remove the injected corruption; the next open replays it.
+    env.manager
+        .store()
+        .sql_execute("DROP TRIGGER dw_test_fail_executor_record")
+        .unwrap();
+    env.agent.recover().unwrap();
+    assert!(
+        h.active_turn_record().unwrap().is_none(),
+        "the marker replayed the record close"
+    );
+    assert!(
+        std::fs::read_dir(&marker_dir)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true),
+        "the consumed marker is removed"
+    );
 }
 
 #[tokio::test]
@@ -1608,7 +1701,7 @@ fn open_gated_shadow_with(
         .id();
     manager.adopt_identity(parent, wt, TaskId::new(1)).unwrap();
     let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
-    let shadows = ShadowRoots::new(manager.clone(), root.join("shadows"));
+    let shadows = ShadowRoots::new(manager.clone(), root.join("shadows")).unwrap();
     let executor = TaskExecutor::new(
         &orchestrator,
         manager.clone(),
@@ -1965,7 +2058,7 @@ fn crashed_drive_residue_reopens_and_settles_deterministically() {
     rt.block_on(async {
         let manager =
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
-        let shadows = ShadowRoots::new(manager.clone(), dir.path().join("shadows"));
+        let shadows = ShadowRoots::new(manager.clone(), dir.path().join("shadows")).unwrap();
         let row = manager.shadow_row(parent).unwrap().expect("row survives");
         assert_eq!(row.state, ShadowRowState::Active, "crash residue row");
         let residue_dir = std::path::PathBuf::from(&row.root);
@@ -2608,7 +2701,7 @@ fn open_real_tool_env_inner_with_resolver(
     manager.adopt_identity(parent, wt, TaskId::new(1)).unwrap();
     let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
     let executor = if service {
-        let shadows = ShadowRoots::new(manager.clone(), root.join("shadows"));
+        let shadows = ShadowRoots::new(manager.clone(), root.join("shadows")).unwrap();
         TaskExecutor::new(&orchestrator, manager.clone(), agent.clone(), shadows)
     } else {
         TaskExecutor::new_owner_direct_for_test_harness(
@@ -8945,4 +9038,384 @@ async fn remote_completion_refuses_malformed_shapes() {
         env.executor.complete_remote_run(bad_produced).await,
         Err(ExecError::Malformed(_))
     ));
+}
+
+// ------------------------------------------------- queue settle boundary race
+// (audit: no durable pending queue item may be left with no runner)
+
+/// Owner-direct executor over a GATED provider: the active direct turn parks
+/// mid-stream, so the queue runner's budget boundary and the turn's settle
+/// are deterministic.
+struct QueueRaceFix {
+    manager: Arc<SessionManager>,
+    agent: Arc<AgentRuntime>,
+    executor: Arc<TaskExecutor>,
+    gated: Arc<GatedProvider>,
+    parent: SessionId,
+    isolated_root: std::path::PathBuf,
+}
+
+fn open_queue_race(root: &std::path::Path) -> QueueRaceFix {
+    let manager = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
+    let gated = Arc::new(GatedProvider {
+        caps: ModelCapabilities {
+            tools: true,
+            parallel_tools: true,
+            ..Default::default()
+        },
+        gate: Arc::new(tokio::sync::Notify::new()),
+        open: Arc::new(AtomicUsize::new(0)),
+        request_count: AtomicUsize::new(0),
+    });
+    let mut registry = ProviderRegistry::new();
+    registry.try_register(gated.clone()).unwrap();
+    let agent = build_agent(manager.clone(), registry);
+    let owner_root = root.join("owner");
+    std::fs::create_dir_all(&owner_root).unwrap();
+    let ws = manager
+        .create_workspace(owner_root.to_str().unwrap())
+        .unwrap();
+    let wt = WorktreeId::new(
+        manager
+            .put_worktree(ws, owner_root.to_str().unwrap(), "main")
+            .unwrap() as u64,
+    );
+    let parent = manager
+        .create_session(ws, "queue-race", "fake", "m")
+        .unwrap()
+        .id();
+    manager.adopt_identity(parent, wt, TaskId::new(1)).unwrap();
+    let isolated_root = root.join("isolated");
+    std::fs::create_dir_all(&isolated_root).unwrap();
+    let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
+    let executor = TaskExecutor::new_owner_direct_for_test_harness(
+        &orchestrator,
+        manager.clone(),
+        agent.clone(),
+    );
+    QueueRaceFix {
+        manager,
+        agent,
+        executor,
+        gated,
+        parent,
+        isolated_root,
+    }
+}
+
+fn queue_race_request(fix: &QueueRaceFix, goal: &str) -> TaskRunRequest {
+    TaskRunRequest {
+        goal: goal.to_string(),
+        work_items: vec![wi("main", WorkKind::Implementation, &[])],
+        parent_caps: read_caps(),
+        isolated_root: fix.isolated_root.clone(),
+        ..Default::default()
+    }
+}
+
+fn queue_race_state(fix: &QueueRaceFix) -> faktor_core::state::AgentState {
+    fix.manager
+        .get_session(fix.parent)
+        .unwrap()
+        .unwrap()
+        .state()
+        .unwrap()
+}
+
+fn queue_done_count(handle: &faktor_session::SessionHandle) -> i64 {
+    handle
+        .queue_status_counts()
+        .unwrap()
+        .get("done")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+}
+
+/// Relaunch view: a FRESH manager/agent/executor over the same durable store
+/// (process-kill recovery), with per-call scripts.
+fn reopen_queue_executor(
+    root: &std::path::Path,
+    scripts: Vec<Vec<ScriptedResponse>>,
+) -> (Arc<SessionManager>, Arc<TaskExecutor>, Arc<PerCallProvider>) {
+    let manager = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
+    let caps = ModelCapabilities {
+        tools: true,
+        parallel_tools: true,
+        ..Default::default()
+    };
+    let provider = Arc::new(PerCallProvider::new("fake", caps, scripts));
+    let mut registry = ProviderRegistry::new();
+    registry.try_register(provider.clone()).unwrap();
+    let agent = build_agent(manager.clone(), registry);
+    let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
+    let executor = TaskExecutor::new_owner_direct_for_test_harness(
+        &orchestrator,
+        manager.clone(),
+        agent.clone(),
+    );
+    (manager, executor, provider)
+}
+
+/// Boundary race (audit): the active direct turn ends exactly as the queue
+/// runner's wait budget expires. The settle path must be authoritative — the
+/// pending head is claimed by exactly one runner and completes exactly once,
+/// with no submit and no manual kick.
+#[tokio::test]
+async fn settle_path_kicks_a_pending_head_after_the_runner_budget_expired() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let fix = open_queue_race(dir.path());
+    fix.agent.set_turn_budget_ms(150);
+
+    // A: direct in-session run, parked in the provider gate.
+    let receipt_a = fix
+        .executor
+        .start_task(fix.parent, queue_race_request(&fix, "A"))
+        .expect("direct run A");
+    assert!(!receipt_a.queued);
+    // B: queues behind the active A and gets a registry-owned runner.
+    let receipt_b = fix
+        .executor
+        .start_task(fix.parent, queue_race_request(&fix, "B"))
+        .expect("queued run B");
+    assert!(receipt_b.queued, "B must queue behind the active A");
+    let handle = fix.manager.get_session(fix.parent).unwrap().unwrap();
+    assert_eq!(handle.queued_prompt_count().unwrap(), 1);
+
+    // The runner's bounded wait expires while A is still parked: its own
+    // registry drive disappears with B still pending (the stall shape). Its
+    // closure's re-kick may leave ONE replacement registry runner parked on
+    // A; that replacement also expires (nothing kicks the kick), so after
+    // this wait NO runner of any kind exists for B. Only A's settle-path
+    // kick can drain it.
+    let queue_label = format!("tx-queue-{}", fix.parent.raw());
+    wait_until(
+        || {
+            let live = fix.executor.live_drive_runs();
+            !live
+                .iter()
+                .any(|l| l == &receipt_b.run_id || l == &queue_label)
+        },
+        60,
+    )
+    .await;
+    assert_eq!(
+        handle.queued_prompt_count().unwrap(),
+        1,
+        "B is durably pending after the runner's budget expired"
+    );
+
+    // A ends. The settle path (no submit, no manual kick) must give B a
+    // runner; the runtime gate claims the head exactly once.
+    fix.gated.open();
+    wait_until(|| handle.queued_prompt_count().unwrap() == 0, 120).await;
+    assert_eq!(
+        queue_race_state(&fix),
+        faktor_core::state::AgentState::ReadyForNextTurn
+    );
+    assert_eq!(fix.gated.count(), 2, "A and B each streamed exactly once");
+    assert_eq!(
+        queue_done_count(&handle),
+        1,
+        "B's row completed exactly once"
+    );
+    let events = handle.events_range(1, None).unwrap();
+    let prompts = events
+        .iter()
+        .filter(|e| e.kind == faktor_core::event::EventKind::PromptReceived)
+        .count();
+    assert_eq!(prompts, 2, "one PromptReceived per prompt");
+    let turns = events
+        .iter()
+        .filter(|e| e.kind == faktor_core::event::EventKind::TurnCompleted)
+        .count();
+    assert_eq!(turns, 2, "exactly two logical turns completed");
+}
+
+/// Relaunch/recovery after a process kill (audit): a durable pending head is
+/// drained by the recovery kick on a FRESH executor over the same store —
+/// with no new submit.
+#[tokio::test]
+async fn relaunch_recovery_drains_a_pending_head_without_a_new_submit() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let env = open_env(&root, done_script());
+    let parent = env.parent;
+    // A is the active turn; B queues behind it. Neither is ever driven: the
+    // process is killed with B durably pending.
+    let receipt_a = env.agent.submit(parent, "A prompt", &[]).unwrap();
+    assert!(!receipt_a.queued);
+    let receipt_b = env.agent.submit(parent, "B prompt", &[]).unwrap();
+    assert!(receipt_b.queued);
+    // Abort A in-process (its durable turn record is left non-active), then
+    // drop the whole first process view.
+    env.agent.abort_op(parent, Some(receipt_a.op_id)).unwrap();
+    {
+        let handle = env.manager.get_session(parent).unwrap().unwrap();
+        assert_eq!(handle.queued_prompt_count().unwrap(), 1, "B pending");
+    }
+    drop(env);
+
+    // Relaunch: a FRESH manager/agent/executor over the same durable rows.
+    let (manager2, executor2, provider2) = reopen_queue_executor(
+        &root,
+        vec![vec![
+            ScriptedResponse::Text("B done".into()),
+            ScriptedResponse::End,
+        ]],
+    );
+    let handle2 = manager2.get_session(parent).unwrap().unwrap();
+    assert_eq!(
+        handle2.queued_prompt_count().unwrap(),
+        1,
+        "B survived the relaunch durably"
+    );
+    // The recovery entry drains the durable marker without any submit.
+    executor2.recover_pending_queues();
+    wait_until(|| handle2.queued_prompt_count().unwrap() == 0, 120).await;
+    assert_eq!(provider2.count(), 1, "B drove exactly once");
+    assert_eq!(queue_done_count(&handle2), 1);
+    let events = handle2.events_range(1, None).unwrap();
+    let prompts_b = events
+        .iter()
+        .filter(|e| {
+            e.kind == faktor_core::event::EventKind::PromptReceived
+                && e.op_id == Some(receipt_b.op_id)
+        })
+        .count();
+    assert_eq!(prompts_b, 1, "B was admitted exactly once");
+    let turns_b = events
+        .iter()
+        .filter(|e| {
+            e.kind == faktor_core::event::EventKind::TurnCompleted
+                && e.op_id == Some(receipt_b.op_id)
+        })
+        .count();
+    assert_eq!(turns_b, 1, "B completed exactly once");
+}
+
+/// Concurrent settle + queued submit (audit): racing submits and settle
+/// kicks must never execute a prompt twice. Every prompt runs exactly once,
+/// every durable row ends terminal, and the queue is fully drained.
+#[tokio::test]
+async fn concurrent_settle_and_queued_submit_never_double_execute() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let fix = Arc::new(open_queue_race(dir.path()));
+    fix.agent.set_turn_budget_ms(100);
+    let receipt_a = fix
+        .executor
+        .start_task(fix.parent, queue_race_request(&fix, "A"))
+        .expect("direct run A");
+    assert!(!receipt_a.queued);
+    let receipt_b = fix
+        .executor
+        .start_task(fix.parent, queue_race_request(&fix, "B"))
+        .expect("queued run B");
+    assert!(receipt_b.queued);
+    let handle = fix.manager.get_session(fix.parent).unwrap().unwrap();
+    // Let every runner's bounded wait expire first (the stall shape), then
+    // race the settle of A against a queued submit C and a kick storm.
+    let queue_label = format!("tx-queue-{}", fix.parent.raw());
+    wait_until(
+        || {
+            let live = fix.executor.live_drive_runs();
+            !live
+                .iter()
+                .any(|l| l == &receipt_b.run_id || l == &queue_label)
+        },
+        60,
+    )
+    .await;
+
+    let c_fix = fix.clone();
+    let submit_c = tokio::spawn(async move {
+        c_fix
+            .executor
+            .start_task(c_fix.parent, queue_race_request(&c_fix, "C"))
+    });
+    let mut kicks = Vec::new();
+    for _ in 0..4 {
+        let k = fix.clone();
+        kicks.push(tokio::spawn(async move {
+            k.executor.kick_pending_queue(k.parent)
+        }));
+    }
+    // A settles concurrently with the submit/kicks.
+    fix.gated.open();
+    let receipt_c = submit_c.await.unwrap().unwrap();
+    for k in kicks {
+        k.await.unwrap();
+    }
+
+    wait_until(|| handle.queued_prompt_count().unwrap() == 0, 120).await;
+    assert_eq!(
+        fix.gated.count(),
+        3,
+        "A, B and C each streamed exactly once (C queued={})",
+        receipt_c.queued
+    );
+    assert_eq!(queue_done_count(&handle), 2, "B and C both terminal");
+    let events = handle.events_range(1, None).unwrap();
+    let prompts = events
+        .iter()
+        .filter(|e| e.kind == faktor_core::event::EventKind::PromptReceived)
+        .count();
+    assert_eq!(prompts, 3, "one PromptReceived per prompt");
+    let turns = events
+        .iter()
+        .filter(|e| e.kind == faktor_core::event::EventKind::TurnCompleted)
+        .count();
+    assert_eq!(turns, 3, "exactly three logical turns completed");
+}
+
+/// Registry refusal (audit): a settle-path kick that cannot spawn (registry
+/// shut down) must leave the durable head pending and resumable — the next
+/// executor's recovery drains it exactly once.
+#[tokio::test]
+async fn refused_settle_kick_leaves_the_head_resumable_for_recovery() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let env = open_env(&root, done_script());
+    let parent = env.parent;
+    let receipt_a = env.agent.submit(parent, "A prompt", &[]).unwrap();
+    assert!(!receipt_a.queued);
+    let receipt_b = env.agent.submit(parent, "B prompt", &[]).unwrap();
+    assert!(receipt_b.queued);
+    // Crash-equivalent: A's active turn is aborted, B stays pending, and the
+    // drive registry is shut down.
+    env.agent.abort_op(parent, Some(receipt_a.op_id)).unwrap();
+    let report = env
+        .executor
+        .shutdown_drives(Duration::from_millis(50))
+        .await;
+    assert!(report.all_reaped(), "{report:?}");
+    // The refused kick changes nothing durable.
+    env.executor.kick_pending_queue(parent);
+    {
+        let handle = env.manager.get_session(parent).unwrap().unwrap();
+        assert_eq!(
+            handle.queued_prompt_count().unwrap(),
+            1,
+            "a refused kick must leave the durable head pending"
+        );
+    }
+    drop(env);
+
+    // The next executor's recovery drains the very same row.
+    let (manager2, executor2, provider2) = reopen_queue_executor(
+        &root,
+        vec![vec![
+            ScriptedResponse::Text("B done".into()),
+            ScriptedResponse::End,
+        ]],
+    );
+    let handle2 = manager2.get_session(parent).unwrap().unwrap();
+    assert_eq!(handle2.queued_prompt_count().unwrap(), 1);
+    executor2.recover_pending_queues();
+    wait_until(|| handle2.queued_prompt_count().unwrap() == 0, 120).await;
+    assert_eq!(provider2.count(), 1, "B drove exactly once after recovery");
+    assert_eq!(queue_done_count(&handle2), 1);
 }

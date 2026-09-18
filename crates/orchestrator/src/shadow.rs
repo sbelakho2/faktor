@@ -135,6 +135,20 @@ pub enum ShadowRetireFault {
     Once,
 }
 
+/// Typed refusal of [`ShadowRoots::new`] (audit residual): the service is
+/// rooted at a path that cannot be trusted as a daemon-owned shadow root.
+///
+/// The degenerate case is the empty/unanchored derivation: a store opened at
+/// an empty data root yields `PathBuf::new().join("shadows")` = the bare
+/// RELATIVE path `shadows`, which would silently write shadows under the
+/// process working directory. There is NO fallback: the refusal is typed and
+/// the caller must open its store at an explicit data root.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ShadowRootError {
+    #[error("degenerate shadow root {}: {reason}", root.display())]
+    DegenerateRoot { root: PathBuf, reason: &'static str },
+}
+
 /// The shadow service: one per daemon data dir. Begins/stages/discards
 /// shadows and keeps their durable registry rows consistent. A graceful
 /// shutdown (Drop or [`ShadowRoots::shutdown`]) retires every shadow
@@ -161,22 +175,35 @@ impl std::fmt::Debug for ShadowRoots {
 impl ShadowRoots {
     /// A service rooted at `<data dir>/<SHADOWS_DIR_NAME>`. The root is
     /// created on first use; `shadows_root` must never be a user checkout.
-    pub fn new(manager: Arc<SessionManager>, shadows_root: PathBuf) -> Arc<Self> {
+    ///
+    /// Fails TYPED on a degenerate root (empty path, a path with no directory
+    /// component, or an unanchored relative path such as the bare `shadows`
+    /// derived from an empty store root): no silent fallback to a
+    /// process-working-directory-relative shadow root exists. Callers that
+    /// derive the root from a durable data root (`ServerDeps::new`, the CLI
+    /// daemon graph) propagate this refusal instead of writing elsewhere.
+    pub fn new(
+        manager: Arc<SessionManager>,
+        shadows_root: PathBuf,
+    ) -> Result<Arc<Self>, ShadowRootError> {
         Self::new_with_limits(manager, shadows_root, ShadowCopyLimits::default())
     }
 
+    /// [`ShadowRoots::new`] with explicit copy caps: same typed root
+    /// validation, no alternate construction path can bypass it.
     pub fn new_with_limits(
         manager: Arc<SessionManager>,
         shadows_root: PathBuf,
         limits: ShadowCopyLimits,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, ShadowRootError> {
         if limits.max_entries == 0 || limits.max_total_bytes == 0 {
             panic!("shadow copy caps must be >= 1");
         }
         if limits.max_entries > MAX_BASE_ENTRIES {
             panic!("shadow copy entries cap exceeds the base-map cap");
         }
-        Arc::new(Self {
+        validate_shadows_root(&shadows_root)?;
+        Ok(Arc::new(Self {
             manager,
             shadows_root,
             limits,
@@ -184,7 +211,7 @@ impl ShadowRoots {
             copy_seam: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             retire_fault: Arc::new(Mutex::new(None)),
-        })
+        }))
     }
 
     pub fn manager(&self) -> Arc<SessionManager> {
@@ -267,7 +294,13 @@ impl ShadowRoots {
         // hashing the whole tree — the historic unbounded phase that stalled
         // the frozen prompt.
         bounded_base_preflight(&base, &self.limits)?;
-        let shadow_id = format!("sh-{:016x}", self.manager.next_op_id().raw());
+        let shadow_id = format!(
+            "sh-{:016x}",
+            self.manager
+                .try_next_op_id()
+                .map_err(|e| ExecError::from(faktor_core::Error::from(e)))?
+                .raw()
+        );
         let dir = shadows_root
             .join(session.raw().to_string())
             .join(&shadow_id);
@@ -827,6 +860,39 @@ impl ShadowRoots {
 
     #[cfg(not(test))]
     fn check_copy_seam(&self, _owner: &Path, _attempt: usize) {}
+}
+
+/// The root-anchoring contract of [`ShadowRoots::new`]: the shadow root must
+/// name at least one real directory component and, when relative, must carry
+/// a non-empty parent directory. This refuses exactly the degenerate
+/// derivations — an empty path, `.`/`..`/`/`, and the bare `shadows` that
+/// `PathBuf::new().join(SHADOWS_DIR_NAME)` produces from an empty store root
+/// — so a shadow root can never silently resolve under the process working
+/// directory. A caller who genuinely means a CWD-relative root spells it
+/// `./shadows` (parent `.`), which stays accepted.
+fn validate_shadows_root(root: &Path) -> Result<(), ShadowRootError> {
+    use std::path::Component;
+    let reason = if root.as_os_str().is_empty() {
+        Some("the path is empty")
+    } else if !root.components().any(|c| matches!(c, Component::Normal(_))) {
+        Some("the path names no directory")
+    } else if root.is_relative()
+        && match root.parent() {
+            Some(parent) => parent.as_os_str().is_empty(),
+            None => true,
+        }
+    {
+        Some("the relative path is unanchored (no parent directory)")
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => Err(ShadowRootError::DegenerateRoot {
+            root: root.to_path_buf(),
+            reason,
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Map a canonical tree-manifest refusal of the shadow copy onto the typed

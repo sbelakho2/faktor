@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use faktor_provider::egress::{execute_raw, EgressError, HttpTransport, RawRequest, RawResponse};
+use faktor_provider::egress::{HttpTransport, RawRequest, RawResponse};
 use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
 
 use crate::error::ScmError;
@@ -309,21 +309,23 @@ impl GitHubAppTokenSource {
                 .header("user-agent", self.config.user_agent.clone())
                 .header("authorization", format!("Bearer {jwt}"));
             let last_attempt = attempt + 1 >= self.config.max_attempts;
-            let (error, retry_after_ms): (ScmError, Option<i64>) =
-                match execute_raw(self.transport.as_ref(), request).await {
-                    Ok(response) => match self.classify(response) {
-                        Ok(token) => return Ok(token),
-                        Err(retry) => (retry.error, retry.retry_after_ms),
-                    },
-                    // A policy denial is final: retrying cannot change the
-                    // destination decision.
-                    Err(EgressError::Denied { url, .. }) => {
-                        return Err(ScmError::Forbidden(format!(
-                            "egress to {url} denied by policy"
-                        )))
-                    }
-                    Err(e) => (ScmError::Transport(e.to_string()), None),
-                };
+            let (error, retry_after_ms): (ScmError, Option<i64>) = match crate::execute_raw_bounded(
+                self.transport.as_ref(),
+                request,
+                "installation token mint",
+            )
+            .await
+            {
+                Ok(response) => match self.classify(response) {
+                    Ok(token) => return Ok(token),
+                    Err(retry) => (retry.error, retry.retry_after_ms),
+                },
+                // A policy denial is final (the helper maps it to
+                // `Forbidden`); transport/timeout failures are retryable
+                // within the attempt bound, so the mint as a whole cannot
+                // exceed `max_attempts × (bound + backoff)`.
+                Err(e) => (e, None),
+            };
             if !mint_retryable(&error) || last_attempt {
                 return Err(error);
             }
@@ -627,5 +629,38 @@ MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDOdaRv7SIbH6qK
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("super-secret-key-material"));
         assert!(rendered.contains("<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn a_stalled_scm_http_attempt_is_a_typed_timeout_at_the_bound() {
+        // The egress client bounds connect only: a provider that accepts and
+        // then never answers must be cut off at the documented bound, never
+        // pin the caller (or a retry loop) forever.
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let transport = faktor_provider::egress::PolicyCheckedHttpTransport::permissive();
+        let started = std::time::Instant::now();
+        let err = crate::execute_raw_bounded_with(
+            &transport,
+            RawRequest::new("GET", format!("http://{addr}/probe")),
+            std::time::Duration::from_millis(100),
+            "probe",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, ScmError::Transport(m) if m.contains("exceeded")),
+            "{err:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }

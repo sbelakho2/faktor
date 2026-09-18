@@ -43,6 +43,23 @@ use crate::transport::ArtifactFetcher;
 /// compatibility entry is checked against it).
 pub const NATIVE_SCHEMA_SUPPORTED: u32 = 1;
 
+/// Run one blocking filesystem step on the blocking pool. The updater's
+/// install layout operations (digest, publish, staging cleanup) are
+/// synchronous `std::fs` work; executing them directly inside an async fn
+/// would park a Tokio worker for the duration of the disk I/O.
+async fn spawn_blocking_fs<T, F>(what: &str, f: F) -> Result<T, UpdateError>
+where
+    F: FnOnce() -> Result<T, UpdateError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(join) => Err(UpdateError::Install(format!(
+            "{what}: blocking task failed: {join}"
+        ))),
+    }
+}
+
 /// The distribution vocabulary for one host: the certification tooling
 /// derives tokens from `uname` (`darwin`, `arm64`, `x86_64`, `linux`,
 /// `windows`), while `std::env::consts` says `macos`/`aarch64`. Normalizing
@@ -791,7 +808,11 @@ impl Updater {
                 op.updated_ms = now_ms;
                 op.detail = Some(e.to_string());
                 self.store.update(&op)?;
-                let _ = self.layout.clear_staging(op.id.as_str());
+                let layout = self.layout.clone();
+                let op_id = op.id.to_string();
+                let _ =
+                    spawn_blocking_fs("clear failed staging", move || layout.clear_staging(&op_id))
+                        .await;
                 Err(e)
             }
         }
@@ -830,11 +851,23 @@ impl Updater {
                 });
             }
         }
-        self.layout.clear_staging(op_id)?;
+        // Blocking filesystem steps run on the blocking pool: a slow/held
+        // install volume must never park a Tokio worker (and every step
+        // keeps its typed error).
+        let layout = self.layout.clone();
+        let op = op_id.to_string();
+        spawn_blocking_fs("clear stale staging", move || layout.clear_staging(&op)).await?;
         let dir = self.layout.staging_dir_for(op_id);
-        std::fs::create_dir_all(&dir).map_err(|e| {
-            UpdateError::Install(format!("create staging dir {}: {e}", dir.display()))
-        })?;
+        let dir_for_task = dir.clone();
+        spawn_blocking_fs("create staging dir", move || {
+            std::fs::create_dir_all(&dir_for_task).map_err(|e| {
+                UpdateError::Install(format!(
+                    "create staging dir {}: {e}",
+                    dir_for_task.display()
+                ))
+            })
+        })
+        .await?;
         let staged = self.layout.staging_file(op_id, &artifact.name);
         let mut file = tokio::fs::File::create(&staged)
             .await
@@ -852,7 +885,11 @@ impl Updater {
             .map_err(|e| UpdateError::Install(format!("fsync {}: {e}", staged.display())))?;
         drop(file);
 
-        let actual = crate::install::file_digest(&staged)?;
+        let digest_path = staged.clone();
+        let actual = spawn_blocking_fs("digest staged artifact", move || {
+            crate::install::file_digest(&digest_path)
+        })
+        .await?;
         if actual != artifact.sha256 {
             return Err(UpdateError::DigestMismatch {
                 artifact: artifact.name.clone(),
@@ -860,9 +897,16 @@ impl Updater {
                 actual,
             });
         }
-        self.layout
-            .publish_staged(&staged, &artifact.name, &artifact.sha256)?;
-        self.layout.clear_staging(op_id)?;
+        let layout = self.layout.clone();
+        let name = artifact.name.clone();
+        let digest = artifact.sha256.clone();
+        spawn_blocking_fs("publish staged artifact", move || {
+            layout.publish_staged(&staged, &name, &digest).map(|_| ())
+        })
+        .await?;
+        let layout = self.layout.clone();
+        let op = op_id.to_string();
+        spawn_blocking_fs("clear staging", move || layout.clear_staging(&op)).await?;
         Ok(streamed)
     }
 

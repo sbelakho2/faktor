@@ -1622,7 +1622,7 @@ impl Store {
             params![root],
             |r| r.get(0),
         )?;
-        Ok(WorkspaceId::new(id as u64))
+        id_field(&format!("workspace id {id} (root {root:?})"), id)
     }
 
     /// The recorded root path of a workspace; `None` when the workspace id is
@@ -2003,7 +2003,11 @@ impl Store {
             params![session_id.raw() as i64],
             |r| r.get(0),
         )?;
-        let seq = JournalInvariants::next_seq(prev.map(|p| EventSeq::new(p as u64)));
+        let prev_seq = id_field_opt::<EventSeq>(
+            &format!("event journal of session {session_id} MAX(seq)"),
+            prev,
+        )?;
+        let seq = JournalInvariants::next_seq(prev_seq);
         let ts = JournalInvariants::monotonic_ts(
             prev.map(|_| {
                 // Use the previous event's ts for monotonicity.
@@ -2291,7 +2295,10 @@ impl Store {
             params![session_id.raw() as i64],
             |r| r.get::<_, Option<i64>>(0),
         )?;
-        Ok(out.map(|o| EventSeq::new(o as u64)))
+        id_field_opt::<EventSeq>(
+            &format!("event journal of session {session_id} MAX(seq)"),
+            out,
+        )
     }
 
     // ---------------------------------------------------------------- messages
@@ -3061,8 +3068,10 @@ impl Store {
                 missing,
             }));
         }
-        let task_ws_id = WorkspaceId::new(task_ws as u64);
-        let task_wt_id = WorktreeId::new(task_wt as u64);
+        let task_ws_id =
+            id_field::<WorkspaceId>(&format!("session {session_id} workspace_id"), task_ws)?;
+        let task_wt_id =
+            id_field::<WorktreeId>(&format!("session {session_id} worktree_id"), task_wt)?;
         if record.workspace_id != task_ws_id || record.worktree_id != task_wt_id {
             return Ok(Err(TaskCompletionRefusal::WorktreeMismatch {
                 record_id,
@@ -3526,7 +3535,8 @@ impl Store {
             .optional()?
             .flatten();
         match newest {
-            Some(op) => verification_attempt_view(&conn, session_id, task_id, op.max(0) as u64),
+            // Bit-cast: u64 attempt op ids live in the signed column.
+            Some(op) => verification_attempt_view(&conn, session_id, task_id, op as u64),
             None => Ok(None),
         }
     }
@@ -4159,16 +4169,14 @@ impl Store {
     /// The session's single active logical-turn record (at most one exists).
     pub fn active_turn_record(&self, session_id: SessionId) -> StoreResult<Option<TurnRecordRow>> {
         let conn = self.read()?;
-        let out = conn
-            .query_row(
-                "SELECT id, session_id, turn_op_id, queue_seq, prompt_message_id, effective_provider, effective_model, variant, tool_mode, started_at, status, updated_ms
-                 FROM turn_record WHERE session_id = ?1 AND status = 'active'
-                 ORDER BY started_at DESC, id DESC LIMIT 1",
-                params![session_id.raw() as i64],
-                turn_record_map,
-            )
-            .optional()?;
-        Ok(out)
+        query_row_optional(
+            &conn,
+            "SELECT id, session_id, turn_op_id, queue_seq, prompt_message_id, effective_provider, effective_model, variant, tool_mode, started_at, status, updated_ms
+             FROM turn_record WHERE session_id = ?1 AND status = 'active'
+             ORDER BY started_at DESC, id DESC LIMIT 1",
+            params![session_id.raw() as i64],
+            turn_record_map,
+        )
     }
 
     pub fn turn_record_of(
@@ -4177,15 +4185,13 @@ impl Store {
         turn_op_id: OpId,
     ) -> StoreResult<Option<TurnRecordRow>> {
         let conn = self.read()?;
-        let out = conn
-            .query_row(
-                "SELECT id, session_id, turn_op_id, queue_seq, prompt_message_id, effective_provider, effective_model, variant, tool_mode, started_at, status, updated_ms
-                 FROM turn_record WHERE session_id = ?1 AND turn_op_id = ?2",
-                params![session_id.raw() as i64, turn_op_id.raw() as i64],
-                turn_record_map,
-            )
-            .optional()?;
-        Ok(out)
+        query_row_optional(
+            &conn,
+            "SELECT id, session_id, turn_op_id, queue_seq, prompt_message_id, effective_provider, effective_model, variant, tool_mode, started_at, status, updated_ms
+             FROM turn_record WHERE session_id = ?1 AND turn_op_id = ?2",
+            params![session_id.raw() as i64, turn_op_id.raw() as i64],
+            turn_record_map,
+        )
     }
 
     /// Every turn record of a session (oldest first; diagnostics/tests).
@@ -5139,20 +5145,21 @@ impl Store {
 
     pub fn pending_permission(&self, id: i64) -> StoreResult<Option<(SessionId, OpId, String)>> {
         let conn = self.read()?;
-        let out = conn
+        let raw: Option<(i64, i64, String)> = conn
             .query_row(
                 "SELECT session_id, op_id, capability FROM permission WHERE id = ?1 AND decision = 'pending'",
                 params![id],
-                |r| {
-                    Ok((
-                        SessionId::new(r.get::<_, i64>(0)? as u64),
-                        OpId::new(r.get::<_, i64>(1)? as u64),
-                        r.get::<_, String>(2)?,
-                    ))
-                },
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
-            .ok();
-        Ok(out)
+            .optional()?;
+        match raw {
+            Some((session_raw, op_raw, capability)) => Ok(Some((
+                id_field(&format!("permission {id} session_id"), session_raw)?,
+                id_field(&format!("permission {id} op_id"), op_raw)?,
+                capability,
+            ))),
+            None => Ok(None),
+        }
     }
 
     // ---------------------------------------------------------------- prompt queue
@@ -5200,34 +5207,65 @@ impl Store {
         Ok(seq)
     }
 
-    fn queue_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedPrompt> {
-        Ok(QueuedPrompt {
-            queue_seq: r.get(0)?,
-            op_id: OpId::new(r.get::<_, i64>(1)? as u64),
-            prompt: r.get(2)?,
-            files: serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or_default(),
-            model: r.get(4)?,
-            variant: r.get(5)?,
-            agent: r.get(6)?,
-            status: r.get(7)?,
-            requested_at: r.get(8)?,
-        })
-    }
-
     /// Oldest row that is not terminal (pending/claimed/running) — FIFO head.
+    ///
+    /// The persisted `files` JSON is decoded fallibly: a corrupt row is a
+    /// typed [`StoreError::Corrupt`] naming the session/seq, never silently an
+    /// empty file list (nor a swallowed `None`).
     pub fn queue_head(&self, session: SessionId) -> StoreResult<Option<QueuedPrompt>> {
         let conn = self.read()?;
-        let out = conn
+        let raw = conn
             .query_row(
                 "SELECT seq, op_id, prompt, files, model, variant, agent, status, requested_at
                  FROM prompt_queue
                  WHERE session_id = ?1 AND status IN ('pending','claimed','running')
                  ORDER BY seq ASC LIMIT 1",
                 params![session.raw() as i64],
-                Self::queue_row_from,
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                        r.get::<_, String>(7)?,
+                        r.get::<_, i64>(8)?,
+                    ))
+                },
             )
-            .ok();
-        Ok(out)
+            .optional()?;
+        match raw {
+            Some((
+                queue_seq,
+                op_id,
+                prompt,
+                files_json,
+                model,
+                variant,
+                agent,
+                status,
+                requested_at,
+            )) => Ok(Some(QueuedPrompt {
+                queue_seq,
+                op_id: id_field(
+                    &format!("prompt_queue {session} seq {queue_seq} op_id"),
+                    op_id,
+                )?,
+                prompt,
+                files: parse_json(
+                    &format!("prompt_queue {session} seq {queue_seq} files"),
+                    &files_json,
+                )?,
+                model,
+                variant,
+                agent,
+                status,
+                requested_at,
+            })),
+            None => Ok(None),
+        }
     }
 
     /// Count of rows in each durable status (diagnostics).
@@ -5265,7 +5303,7 @@ impl Store {
     ) -> StoreResult<Option<(AdmittedPrompt, i64)>> {
         type QueueHeadRow = (
             i64,
-            OpId,
+            i64,
             String,
             String,
             Option<String>,
@@ -5282,7 +5320,7 @@ impl Store {
                 |r| {
                     Ok((
                         r.get(0)?,
-                        OpId::new(r.get::<_, i64>(1)? as u64),
+                        r.get(1)?,
                         r.get::<_, String>(2)?,
                         r.get::<_, String>(3)?,
                         r.get::<_, Option<String>>(4)?,
@@ -5291,10 +5329,22 @@ impl Store {
                     ))
                 },
             )
-            .ok();
-        let Some((queue_seq, op_id, prompt, files_json, model, variant, agent)) = head else {
+            .optional()?;
+        let Some((queue_seq, op_id_raw, prompt, files_json, model, variant, agent)) = head else {
             return Ok(None);
         };
+        // Decode every persisted column BEFORE the first mutation: a corrupt
+        // row surfaces as a typed `Corrupt` naming the field and the
+        // transaction rolls back without claiming the prompt or materializing
+        // the message.
+        let op_id = id_field(
+            &format!("prompt_queue {session} seq {queue_seq} op_id"),
+            op_id_raw,
+        )?;
+        let files: Vec<String> = parse_json(
+            &format!("prompt_queue {session} seq {queue_seq} files"),
+            &files_json,
+        )?;
         let state: String = tx
             .query_row(
                 "SELECT state FROM session WHERE id = ?1",
@@ -5302,7 +5352,7 @@ impl Store {
                 |r| r.get(0),
             )
             .map_err(|e| StoreError::Migration(format!("session missing: {e}")))?;
-        let state_label: String = serde_json::from_str(&state).unwrap_or_default();
+        let state_label: String = parse_json(&format!("session {session} state"), &state)?;
         if !eligible_states.contains(&state_label.as_str()) {
             return Ok(None);
         }
@@ -5341,7 +5391,7 @@ impl Store {
                 queue_seq,
                 op_id,
                 prompt,
-                files: serde_json::from_str(&files_json).unwrap_or_default(),
+                files,
                 model,
                 variant,
                 agent,
@@ -5371,13 +5421,19 @@ impl Store {
     pub fn queue_op_ids(&self, session: SessionId) -> StoreResult<Vec<OpId>> {
         let conn = self.read()?;
         let mut stmt = conn.prepare(
-            "SELECT op_id FROM prompt_queue
+            "SELECT seq, op_id FROM prompt_queue
              WHERE session_id = ?1 AND status IN ('pending','claimed')",
         )?;
-        let rows = stmt.query_map(params![session.raw() as i64], |r| r.get::<_, i64>(0))?;
+        let rows = stmt.query_map(params![session.raw() as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?;
         let mut out = Vec::new();
-        for v in rows {
-            out.push(OpId::new(v? as u64));
+        for row in rows {
+            let (queue_seq, op_raw) = row?;
+            out.push(id_field(
+                &format!("prompt_queue {session} seq {queue_seq} op_id"),
+                op_raw,
+            )?);
         }
         Ok(out)
     }
@@ -5422,7 +5478,11 @@ impl Store {
         let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
         let mut out = Vec::new();
         for v in rows {
-            out.push(SessionId::new(v? as u64));
+            let raw = v?;
+            out.push(id_field::<SessionId>(
+                &format!("prompt_queue session_id {raw}"),
+                raw,
+            )?);
         }
         Ok(out)
     }
@@ -5806,11 +5866,21 @@ impl Store {
             )?;
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
+                let reservation_id: i64 = row.get(0)?;
                 scan.dangling.push(DanglingReservationRow {
-                    reservation_id: row.get(0)?,
-                    session_id: SessionId::new(row.get::<_, i64>(1)?.max(1) as u64),
-                    task_id: TaskId::new(row.get::<_, i64>(2)?.max(1) as u64),
-                    op_id: OpId::new(row.get::<_, i64>(3)?.max(1) as u64),
+                    reservation_id,
+                    session_id: id_field(
+                        &format!("cost_reservation {reservation_id} session_id"),
+                        row.get::<_, i64>(1)?,
+                    )?,
+                    task_id: id_field(
+                        &format!("cost_reservation {reservation_id} task_id"),
+                        row.get::<_, i64>(2)?,
+                    )?,
+                    op_id: id_field(
+                        &format!("cost_reservation {reservation_id} op_id"),
+                        row.get::<_, i64>(3)?,
+                    )?,
                     predicted_micro: row.get::<_, i64>(4)?.max(0) as u64,
                     status: row.get(5)?,
                 });
@@ -6015,8 +6085,14 @@ impl Store {
             } else {
                 scan.unrecoverable.push(UnrecoverableActiveTurn {
                     record_id,
-                    session_id: SessionId::new(session_id.max(1) as u64),
-                    turn_op_id: OpId::new(turn_op_id.max(1) as u64),
+                    session_id: id_field(
+                        &format!("turn_record {record_id} session_id"),
+                        session_id,
+                    )?,
+                    turn_op_id: id_field(
+                        &format!("turn_record {record_id} turn_op_id"),
+                        turn_op_id,
+                    )?,
                     detail: format!(
                         "active turn record {record_id} of session {session_id} (op {turn_op_id}) has no prompt message row, no prompt-queue row, no journal event and no tool-run row naming it — nothing can recover it after a crash"
                     ),
@@ -6033,7 +6109,8 @@ impl Store {
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            out.push(SessionId::new(row.get::<_, i64>(0)?.max(1) as u64));
+            let raw: i64 = row.get(0)?;
+            out.push(id_field::<SessionId>(&format!("session id {raw}"), raw)?);
         }
         Ok(out)
     }
@@ -6062,8 +6139,12 @@ impl Store {
         let mut rows = stmt.query(params.as_slice())?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
+            let session_raw: i64 = row.get(0)?;
             out.push(MemoryFactRowRef {
-                session_id: SessionId::new(row.get::<_, i64>(0)?.max(1) as u64),
+                session_id: id_field(
+                    &format!("memory_fact session_id {session_raw}"),
+                    session_raw,
+                )?,
                 kind: row.get(1)?,
                 key: row.get(2)?,
                 value: row.get(3)?,
@@ -6158,14 +6239,13 @@ impl Store {
     /// is the numeric generation that row names (0 for NotStarted).
     pub fn index_state_get(&self, workspace_id: WorkspaceId) -> StoreResult<Option<IndexStateRow>> {
         let conn = self.read()?;
-        let out = conn
-            .query_row(
-                "SELECT workspace_id, state_json, generation, updated_ms
-                 FROM index_state WHERE workspace_id = ?1",
-                params![workspace_id.raw() as i64],
-                index_state_map,
-            )
-            .optional()?;
+        let out = query_row_optional(
+            &conn,
+            "SELECT workspace_id, state_json, generation, updated_ms
+             FROM index_state WHERE workspace_id = ?1",
+            params![workspace_id.raw() as i64],
+            index_state_map,
+        )?;
         Ok(out)
     }
 
@@ -6275,12 +6355,10 @@ impl Store {
              FROM index_state_log WHERE workspace_id = ?1
              ORDER BY id DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![workspace_id.raw() as i64, limit.max(0)], |r| {
-            index_state_log_map(r)
-        })?;
+        let mut rows = stmt.query(params![workspace_id.raw() as i64, limit.max(0)])?;
         let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
+        while let Some(row) = rows.next()? {
+            out.push(index_state_log_map(row)?);
         }
         Ok(out)
     }
@@ -6611,20 +6689,22 @@ impl Store {
         reservation_id: i64,
     ) -> StoreResult<Option<(SessionId, String, Option<i64>)>> {
         let conn = self.read()?;
-        let out = conn
-            .query_row(
-                "SELECT session_id, status, dispatched_ms FROM cost_reservation
-                 WHERE reservation_id = ?1",
-                params![reservation_id],
-                |r| {
-                    Ok((
-                        SessionId::new(r.get::<_, i64>(0)?.max(1) as u64),
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<i64>>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
+        let out = query_row_optional(
+            &conn,
+            "SELECT session_id, status, dispatched_ms FROM cost_reservation
+             WHERE reservation_id = ?1",
+            params![reservation_id],
+            |r| {
+                Ok((
+                    id_field(
+                        &format!("cost_reservation {reservation_id} session_id"),
+                        r.get::<_, i64>(0)?,
+                    )?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )?;
         Ok(out)
     }
 
@@ -7361,11 +7441,23 @@ impl Store {
             };
             out.push(CostReservationRow {
                 reservation_id,
-                session_id: SessionId::new(row_session.max(1) as u64),
-                task_id: TaskId::new(row_task.max(1) as u64),
-                op_id: OpId::new(op_id.max(1) as u64),
-                attempt_op_id: attempt_op_id.map(|raw| OpId::new(raw.max(1) as u64)),
-                parent_op_id: parent_op_id.map(|raw| OpId::new(raw.max(1) as u64)),
+                session_id: id_field(
+                    &format!("cost_reservation {reservation_id} session_id"),
+                    row_session,
+                )?,
+                task_id: id_field(
+                    &format!("cost_reservation {reservation_id} task_id"),
+                    row_task,
+                )?,
+                op_id: id_field(&format!("cost_reservation {reservation_id} op_id"), op_id)?,
+                attempt_op_id: id_field_opt(
+                    &format!("cost_reservation {reservation_id} attempt_op_id"),
+                    attempt_op_id,
+                )?,
+                parent_op_id: id_field_opt(
+                    &format!("cost_reservation {reservation_id} parent_op_id"),
+                    parent_op_id,
+                )?,
                 predicted_micro: predicted.max(0) as u64,
                 status,
                 created_ms,
@@ -7914,9 +8006,11 @@ fn evidence_row_map(r: &rusqlite::Row<'_>) -> StoreResult<EvidenceRow> {
     }
     Ok(EvidenceRow {
         id,
-        session_id: SessionId::new(r.get::<_, i64>(1)? as u64),
-        workspace_id: WorkspaceId::new(r.get::<_, i64>(2)? as u64),
-        task_id: r.get::<_, Option<i64>>(3)?.map(|t| t.max(0) as u64),
+        session_id: id_field(&format!("evidence {id} session_id"), r.get::<_, i64>(1)?)?,
+        workspace_id: id_field(&format!("evidence {id} workspace_id"), r.get::<_, i64>(2)?)?,
+        // Optional task id: the writer bit-casts u64 into the signed column,
+        // so the inverse cast round-trips the full range (None stays None).
+        task_id: r.get::<_, Option<i64>>(3)?.map(|t| t as u64),
         kind: r.get(4)?,
         revision,
         provenance_json: r.get(6)?,
@@ -8012,19 +8106,27 @@ fn outcome_stats_row_validate(raw: RawOutcomeStatsRow) -> StoreResult<ModelOutco
     })
 }
 
-fn index_state_map(r: &rusqlite::Row<'_>) -> rusqlite::Result<IndexStateRow> {
+fn index_state_map(r: &rusqlite::Row<'_>) -> StoreResult<IndexStateRow> {
+    let workspace_raw: i64 = r.get(0)?;
     Ok(IndexStateRow {
-        workspace_id: WorkspaceId::new(r.get::<_, i64>(0)? as u64),
+        workspace_id: id_field(
+            &format!("index_state workspace_id {workspace_raw}"),
+            workspace_raw,
+        )?,
         state_json: r.get(1)?,
         generation: r.get(2)?,
         updated_ms: r.get(3)?,
     })
 }
 
-fn index_state_log_map(r: &rusqlite::Row<'_>) -> rusqlite::Result<IndexStateLogRow> {
+fn index_state_log_map(r: &rusqlite::Row<'_>) -> StoreResult<IndexStateLogRow> {
+    let workspace_raw: i64 = r.get(1)?;
     Ok(IndexStateLogRow {
         id: r.get(0)?,
-        workspace_id: WorkspaceId::new(r.get::<_, i64>(1)? as u64),
+        workspace_id: id_field(
+            &format!("index_state_log workspace_id {workspace_raw}"),
+            workspace_raw,
+        )?,
         kind: r.get(2)?,
         state_json: r.get(3)?,
         generation: r.get(4)?,
@@ -9654,7 +9756,7 @@ fn message_map(r: &rusqlite::Row<'_>) -> StoreResult<MessageRow> {
     let id = r.get::<_, i64>(0)?;
     Ok(MessageRow {
         id,
-        session_id: SessionId::new(r.get::<_, i64>(1)? as u64),
+        session_id: id_field(&format!("message {id} session_id"), r.get::<_, i64>(1)?)?,
         seq: r.get(2)?,
         role: r.get(3)?,
         data: parse_json(&format!("message {id} data"), &r.get::<_, String>(4)?)?,
@@ -9663,16 +9765,15 @@ fn message_map(r: &rusqlite::Row<'_>) -> StoreResult<MessageRow> {
 }
 
 fn task_row_map(r: &rusqlite::Row<'_>, session_id: SessionId) -> StoreResult<TaskRow> {
-    let task_id = TaskId::new(r.get::<_, i64>(0)? as u64);
-    let revision_raw: i64 = r.get(12)?;
-    if revision_raw < 1 {
-        // The revision column is DEFAULT 1 and every write bumps it, so a
-        // value below 1 is corruption — refusing beats trusting it (a
-        // revision 0 would silently break the completion CAS).
-        return Err(StoreError::Corrupt(vec![format!(
-            "task {session_id}/{task_id} revision {revision_raw} is below 1"
-        )]));
-    }
+    let task_raw: i64 = r.get(0)?;
+    let task_id = id_field::<TaskId>(&format!("task {session_id}/{task_raw} task_id"), task_raw)?;
+    // The revision column is DEFAULT 1 and every write bumps it: zero is
+    // corruption (a revision 0 would silently break the completion CAS).
+    // Negative raw values are the bit-cast upper half and decode exactly.
+    let revision = id_field::<TaskRevision>(
+        &format!("task {session_id}/{task_id} revision"),
+        r.get::<_, i64>(12)?,
+    )?;
     Ok(TaskRow {
         task_id,
         session_id,
@@ -9690,35 +9791,53 @@ fn task_row_map(r: &rusqlite::Row<'_>, session_id: SessionId) -> StoreResult<Tas
             &r.get::<_, String>(13)?,
         )?,
         max_tokens: r.get::<_, Option<i64>>(5)?.map(|m| m.max(0) as u64),
-        max_turns: r.get::<_, Option<i64>>(6)?.map(|m| m.max(0) as u32),
+        max_turns: match r.get::<_, Option<i64>>(6)? {
+            Some(m) => Some(u32_field(
+                &format!("task {session_id}/{task_id} max_turns"),
+                m,
+            )?),
+            None => None,
+        },
         spent_tokens: r.get::<_, i64>(7)?.max(0) as u64,
-        spent_turns: r.get::<_, i64>(8)?.max(0) as u32,
+        spent_turns: u32_field(
+            &format!("task {session_id}/{task_id} spent_turns"),
+            r.get::<_, i64>(8)?,
+        )?,
         state: parse_json(
             &format!("task {session_id}/{task_id} state"),
             &r.get::<_, String>(9)?,
         )?,
-        revision: TaskRevision::new(revision_raw as u64),
+        revision,
         created_ms: r.get(10)?,
         updated_ms: r.get(11)?,
     })
 }
 
 fn verification_record_map(r: &rusqlite::Row<'_>) -> StoreResult<VerificationRecordRow> {
-    let id = VerificationRecordId::new(r.get::<_, i64>(0)? as u64);
-    let revision_raw: i64 = r.get(2)?;
-    if revision_raw < 1 {
-        // Same corruption contract as task revisions: a record certifying a
-        // revision below 1 could never have been written by the API.
-        return Err(StoreError::Corrupt(vec![format!(
-            "verification_record {id} revision {revision_raw} is below 1"
-        )]));
-    }
+    let id_raw: i64 = r.get(0)?;
+    let id = id_field::<VerificationRecordId>(&format!("verification_record id {id_raw}"), id_raw)?;
+    // Same corruption contract as task revisions: a record certifying a
+    // revision below 1 could never have been written by the API; negative
+    // raw values are the bit-cast upper half and decode exactly.
+    let revision = id_field::<TaskRevision>(
+        &format!("verification_record {id} revision"),
+        r.get::<_, i64>(2)?,
+    )?;
     Ok(VerificationRecordRow {
         id,
-        task_id: TaskId::new(r.get::<_, i64>(1)? as u64),
-        revision: TaskRevision::new(revision_raw as u64),
-        workspace_id: WorkspaceId::new(r.get::<_, i64>(3)? as u64),
-        worktree_id: WorktreeId::new(r.get::<_, i64>(4)? as u64),
+        task_id: id_field(
+            &format!("verification_record {id} task_id"),
+            r.get::<_, i64>(1)?,
+        )?,
+        revision,
+        workspace_id: id_field(
+            &format!("verification_record {id} workspace_id"),
+            r.get::<_, i64>(3)?,
+        )?,
+        worktree_id: id_field(
+            &format!("verification_record {id} worktree_id"),
+            r.get::<_, i64>(4)?,
+        )?,
         tree_hash: r.get(5)?,
         criteria: parse_json(
             &format!("verification_record {id} criteria"),
@@ -9761,13 +9880,18 @@ fn verification_job_map(row: &rusqlite::Row<'_>) -> StoreResult<VerificationJobR
     let session_raw: i64 = row.get(0)?;
     let task_raw: i64 = row.get(1)?;
     let attempt_raw: i64 = row.get(2)?;
-    let revision_raw: i64 = row.get(5)?;
-    if session_raw <= 0 || task_raw <= 0 || attempt_raw <= 0 || revision_raw < 1 {
-        return Err(StoreError::Corrupt(vec![format!(
-            "verification_job row has a non-positive identity \
-             (session {session_raw}, task {task_raw}, attempt {attempt_raw}, revision {revision_raw})"
-        )]));
-    }
+    // Attempt op ids and task revisions are u64 ids bit-cast into the signed
+    // column on write: the inverse cast round-trips the upper half exactly,
+    // while the id constructors still refuse a structurally invalid zero.
+    let attempt_op_id = id_field::<OpId>(
+        &format!("verification_job attempt_op_id {attempt_raw}"),
+        attempt_raw,
+    )?
+    .raw();
+    let task_revision = id_field::<TaskRevision>(
+        &format!("verification_job task_revision {session_raw}/{task_raw}/{attempt_raw}"),
+        row.get::<_, i64>(5)?,
+    )?;
     let check_id: String = row.get(3)?;
     let state: String = row.get(14)?;
     if !VERIFICATION_JOB_STATES.contains(&state.as_str()) {
@@ -9789,12 +9913,15 @@ fn verification_job_map(row: &rusqlite::Row<'_>) -> StoreResult<VerificationJobR
         }
     }
     Ok(VerificationJobRow {
-        session_id: SessionId::new(session_raw as u64),
-        task_id: TaskId::new(task_raw as u64),
-        attempt_op_id: attempt_raw as u64,
+        session_id: id_field(
+            &format!("verification_job session_id {session_raw}"),
+            session_raw,
+        )?,
+        task_id: id_field(&format!("verification_job task_id {task_raw}"), task_raw)?,
+        attempt_op_id,
         check_id,
         ordinal: u32::try_from(row.get::<_, i64>(4)?.max(0)).unwrap_or(u32::MAX),
-        task_revision: TaskRevision::new(revision_raw as u64),
+        task_revision,
         workspace_root: row.get(6)?,
         kind: row.get(7)?,
         command: row.get(8)?,
@@ -9805,9 +9932,10 @@ fn verification_job_map(row: &rusqlite::Row<'_>) -> StoreResult<VerificationJobR
         inline_status,
         state,
         note: row.get(15)?,
-        op_id: row
-            .get::<_, Option<i64>>(16)?
-            .map(|op| u64::try_from(op).unwrap_or(0)),
+        op_id: match row.get::<_, Option<i64>>(16)? {
+            Some(op) => Some(id_field::<OpId>(&format!("verification_job op_id {op}"), op)?.raw()),
+            None => None,
+        },
         environment_fingerprint_json: row.get(17)?,
         created_ms: row.get(18)?,
         updated_ms: row.get(19)?,
@@ -9820,18 +9948,28 @@ fn verification_attempt_map(row: &rusqlite::Row<'_>) -> StoreResult<Verification
     let session_raw: i64 = row.get(0)?;
     let task_raw: i64 = row.get(1)?;
     let attempt_raw: i64 = row.get(2)?;
-    let revision_raw: i64 = row.get(3)?;
-    if session_raw <= 0 || task_raw <= 0 || attempt_raw <= 0 || revision_raw < 1 {
-        return Err(StoreError::Corrupt(vec![format!(
-            "verification_attempt row has a non-positive identity \
-             (session {session_raw}, task {task_raw}, attempt {attempt_raw}, revision {revision_raw})"
-        )]));
-    }
+    // Same bit-cast contract as the verification_job projection: the upper
+    // half of the u64 id space round-trips; zero stays typed corruption.
+    let attempt_op_id = id_field::<OpId>(
+        &format!("verification_attempt attempt_op_id {attempt_raw}"),
+        attempt_raw,
+    )?
+    .raw();
+    let task_revision = id_field::<TaskRevision>(
+        &format!("verification_attempt task_revision {session_raw}/{task_raw}/{attempt_raw}"),
+        row.get::<_, i64>(3)?,
+    )?;
     Ok(VerificationAttemptRow {
-        session_id: SessionId::new(session_raw as u64),
-        task_id: TaskId::new(task_raw as u64),
-        attempt_op_id: attempt_raw as u64,
-        task_revision: TaskRevision::new(revision_raw as u64),
+        session_id: id_field(
+            &format!("verification_attempt session_id {session_raw}"),
+            session_raw,
+        )?,
+        task_id: id_field(
+            &format!("verification_attempt task_id {task_raw}"),
+            task_raw,
+        )?,
+        attempt_op_id,
+        task_revision,
         workspace_root: row.get(4)?,
         environment_fingerprint_json: row.get(5)?,
         created_ms: row.get(6)?,
@@ -9853,7 +9991,10 @@ fn newest_attempt_op(
         )
         .optional()?
         .flatten();
-    Ok(newest.map(|op| op.max(0) as u64))
+    // The column carries u64 op ids bit-cast into i64: the inverse cast is
+    // the lossless decode (a zero attempt names no real row and is refused
+    // by the caller's lookup path, which simply finds nothing).
+    Ok(newest.map(|op| op as u64))
 }
 
 /// Fetch one background job row by identity, or `None`.
@@ -10146,12 +10287,13 @@ fn validate_verification_attempt(
 }
 
 fn session_row_map(r: &rusqlite::Row<'_>) -> StoreResult<SessionRow> {
-    let id = SessionId::new(r.get::<_, i64>(0)? as u64);
+    let id_raw: i64 = r.get(0)?;
+    let id = id_field::<SessionId>(&format!("session id {id_raw}"), id_raw)?;
     Ok(SessionRow {
         id,
-        workspace_id: WorkspaceId::new(r.get::<_, i64>(1)? as u64),
-        worktree_id: WorktreeId::new(r.get::<_, i64>(2)? as u64),
-        task_id: TaskId::new(r.get::<_, i64>(3)? as u64),
+        workspace_id: id_field(&format!("session {id} workspace_id"), r.get::<_, i64>(1)?)?,
+        worktree_id: id_field(&format!("session {id} worktree_id"), r.get::<_, i64>(2)?)?,
+        task_id: id_field(&format!("session {id} task_id"), r.get::<_, i64>(3)?)?,
         title: r.get(4)?,
         provider: r.get(5)?,
         model: r.get(6)?,
@@ -10199,7 +10341,7 @@ fn ledger_entry_map(r: &rusqlite::Row<'_>, session_id: SessionId) -> StoreResult
 }
 
 fn event_map(r: &rusqlite::Row<'_>, session_id: SessionId) -> StoreResult<(Event, i64)> {
-    let seq = EventSeq::new(r.get::<_, i64>(0)? as u64);
+    let seq = id_field::<EventSeq>(&format!("event {session_id} seq"), r.get::<_, i64>(0)?)?;
     let kind_raw = r.get::<_, String>(3)?;
     let kind = kind_from_name(&kind_raw).ok_or_else(|| {
         StoreError::Corrupt(vec![format!(
@@ -10210,7 +10352,10 @@ fn event_map(r: &rusqlite::Row<'_>, session_id: SessionId) -> StoreResult<(Event
         Event {
             seq,
             session_id,
-            op_id: r.get::<_, Option<i64>>(2)?.map(|o| OpId::new(o as u64)),
+            op_id: id_field_opt(
+                &format!("event {session_id}/{seq} op_id"),
+                r.get::<_, Option<i64>>(2)?,
+            )?,
             kind,
             state: parse_json(
                 &format!("event {session_id}/{seq} state"),
@@ -10246,8 +10391,8 @@ fn tool_run_map(r: &rusqlite::Row<'_>) -> StoreResult<ToolRunRow> {
     let id = r.get::<_, i64>(0)?;
     Ok(ToolRunRow {
         id,
-        session_id: SessionId::new(r.get::<_, i64>(1)? as u64),
-        op_id: OpId::new(r.get::<_, i64>(2)? as u64),
+        session_id: id_field(&format!("tool_run {id} session_id"), r.get::<_, i64>(1)?)?,
+        op_id: id_field(&format!("tool_run {id} op_id"), r.get::<_, i64>(2)?)?,
         tool: r.get(3)?,
         args: parse_json(&format!("tool_run {id} args"), &r.get::<_, String>(4)?)?,
         status: r.get(5)?,
@@ -10271,12 +10416,12 @@ fn tool_run_map(r: &rusqlite::Row<'_>) -> StoreResult<ToolRunRow> {
     })
 }
 
-fn turn_record_map(r: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecordRow> {
+fn turn_record_map(r: &rusqlite::Row<'_>) -> StoreResult<TurnRecordRow> {
     let id = r.get::<_, i64>(0)?;
     Ok(TurnRecordRow {
         id,
-        session_id: SessionId::new(r.get::<_, i64>(1)? as u64),
-        turn_op_id: OpId::new(r.get::<_, i64>(2)? as u64),
+        session_id: id_field(&format!("turn_record {id} session_id"), r.get::<_, i64>(1)?)?,
+        turn_op_id: id_field(&format!("turn_record {id} turn_op_id"), r.get::<_, i64>(2)?)?,
         queue_seq: r.get(3)?,
         prompt_message_id: r.get(4)?,
         effective_provider: r.get(5)?,
@@ -10287,6 +10432,57 @@ fn turn_record_map(r: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecordRow> {
         status: r.get(10)?,
         updated_ms: r.get(11)?,
     })
+}
+
+/// Checked narrowing of a persisted non-negative integer column to `u32`.
+/// Every value written through the typed API fits, so one that does not is
+/// corruption: it is refused by field name instead of silently truncated
+/// (`as u32` wraps) or clamped (negative -> 0).
+fn u32_field(ctx: &str, raw: i64) -> StoreResult<u32> {
+    u32::try_from(raw)
+        .map_err(|_| StoreError::Corrupt(vec![format!("{ctx} value {raw} is outside u32")]))
+}
+
+/// Checked decode of one persisted id column into its `u64`-backed newtype.
+///
+/// SQLite has no unsigned integers: every `u64` id is persisted through the
+/// lossless two's-complement `raw as i64` bit cast, so the read side is the
+/// inverse cast (`raw as u64`) and the upper half of the id space round-trips
+/// exactly. The id type's `TryFrom` then rejects structurally invalid values
+/// (zero) as typed [`StoreError::Corrupt`] naming the row and column — never
+/// the `OpId::new(0)` panic or a silently minted `1` under `.max(1)`.
+fn id_field<T>(ctx: &str, raw: i64) -> StoreResult<T>
+where
+    T: TryFrom<u64>,
+    T::Error: std::fmt::Display,
+{
+    T::try_from(raw as u64).map_err(|e| StoreError::Corrupt(vec![format!("{ctx}: {e}")]))
+}
+
+/// Optional variant of [`id_field`] for nullable id columns.
+fn id_field_opt<T>(ctx: &str, raw: Option<i64>) -> StoreResult<Option<T>>
+where
+    T: TryFrom<u64>,
+    T::Error: std::fmt::Display,
+{
+    raw.map(|v| id_field(ctx, v)).transpose()
+}
+
+/// One optional row through a fallible ([`StoreResult`]) mapper. `rusqlite`
+/// offers `query_row` (infallible mapper) and `query_row_and_then` (fallible
+/// mapper, but absence stays an error); this keeps typed mapper errors and
+/// maps SQL `QueryReturnedNoRows` to `None`.
+fn query_row_optional<T>(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+    map: impl FnOnce(&rusqlite::Row<'_>) -> StoreResult<T>,
+) -> StoreResult<Option<T>> {
+    match conn.query_row_and_then(sql, params, map) {
+        Ok(row) => Ok(Some(row)),
+        Err(StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows)) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Fallible JSON parse of persisted data: corrupted or version-skewed rows
@@ -15771,6 +15967,847 @@ mod typed_ledger_tests {
         ));
     }
 
+    #[test]
+    fn corrupt_task_turn_counts_are_typed_field_errors_never_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Pending);
+        {
+            let conn = store.write();
+            conn.execute(
+                "UPDATE task SET max_turns = ?1 WHERE session_id = ?2 AND task_id = 1",
+                params![i64::from(u32::MAX) + 1, s.id.raw() as i64],
+            )
+            .unwrap();
+        }
+        match store.get_task(s.id, TaskId::new(1)) {
+            Err(StoreError::Corrupt(msgs)) => {
+                assert!(
+                    msgs.iter().any(|m| m.contains("max_turns")),
+                    "the refusal must name the max_turns field: {msgs:?}"
+                );
+            }
+            other => panic!("oversize persisted max_turns must be a typed error: {other:?}"),
+        }
+        {
+            let conn = store.write();
+            conn.execute(
+                "UPDATE task SET max_turns = NULL, spent_turns = -1
+                 WHERE session_id = ?1 AND task_id = 1",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        }
+        match store.get_task(s.id, TaskId::new(1)) {
+            Err(StoreError::Corrupt(msgs)) => {
+                assert!(
+                    msgs.iter().any(|m| m.contains("spent_turns")),
+                    "the refusal must name the spent_turns field: {msgs:?}"
+                );
+            }
+            other => panic!("negative persisted spent_turns must be a typed error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn u32_turn_counts_round_trip_without_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let mut row = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Pending);
+        row.max_tokens = Some(i64::MAX as u64);
+        row.max_turns = Some(u32::MAX);
+        row.spent_tokens = i64::MAX as u64;
+        row.spent_turns = u32::MAX;
+        store.upsert_task(&row).unwrap();
+        assert_eq!(
+            store.get_task(s.id, TaskId::new(1)).unwrap(),
+            Some(row),
+            "the u32 extremes must survive the i64 column round-trip exactly"
+        );
+        assert_eq!(
+            store.list_tasks(s.id).unwrap()[0].spent_turns,
+            u32::MAX,
+            "list_tasks shares the checked mapping"
+        );
+    }
+
+    #[test]
+    fn corrupt_queue_row_json_is_refused_typed_never_defaulted() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        store
+            .enqueue_prompt(
+                s.id,
+                OpId::new(1),
+                "hi",
+                &["a.rs".into()],
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+        {
+            let conn = store.write();
+            conn.execute(
+                "UPDATE prompt_queue SET files = 'not json' WHERE session_id = ?1",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        }
+        match store.queue_head(s.id) {
+            Err(StoreError::Corrupt(msgs)) => assert!(
+                msgs.iter().any(|m| m.contains("files")),
+                "the refusal must name the files column: {msgs:?}"
+            ),
+            Err(e) => panic!("corrupt queue files must be a typed Corrupt error, got {e:?}"),
+            Ok(_) => panic!("corrupt queue files must not silently decode or vanish"),
+        }
+        match store.admit_queue_head(s.id, &["idle"], "preparing") {
+            Err(StoreError::Corrupt(msgs)) => assert!(
+                msgs.iter().any(|m| m.contains("files")),
+                "the refusal must name the files column: {msgs:?}"
+            ),
+            other => panic!("admission of a corrupt row must refuse typed: {other:?}"),
+        }
+        let status: String = store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM prompt_queue WHERE session_id = ?1",
+                params![s.id.raw() as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "pending",
+            "a refused admission must not claim the row"
+        );
+        assert!(
+            store.messages_before(s.id, None, 10).unwrap().is_empty(),
+            "a refused admission must not materialize the user message"
+        );
+    }
+
+    /// Assert a read path refused a structurally invalid `op_id` as a typed
+    /// `Corrupt` naming the column and the failure reason.
+    fn assert_corrupt_op_id<T>(outcome: StoreResult<T>, what: &str, needle: &str) {
+        match outcome {
+            Err(StoreError::Corrupt(msgs)) => assert!(
+                msgs.iter()
+                    .any(|m| m.contains("op_id") && m.contains(needle)),
+                "{what}: the refusal must name op_id and {needle:?}: {msgs:?}"
+            ),
+            Err(e) => panic!("{what}: a corrupt op_id must refuse typed, got {e}"),
+            Ok(_) => panic!("{what}: a corrupt op_id must refuse typed, got a decoded value"),
+        }
+    }
+
+    /// Assert a read path refused a corrupt id COLUMN as a typed `Corrupt`
+    /// naming the row and column — never a panic, a wrap or a minted id.
+    fn assert_corrupt_id<T>(outcome: StoreResult<T>, what: &str, column: &str) {
+        match outcome {
+            Err(StoreError::Corrupt(msgs)) => assert!(
+                msgs.iter().any(|m| m.contains(column)),
+                "{what}: the refusal must name {column}: {msgs:?}"
+            ),
+            Err(e) => panic!("{what}: a corrupt {column} must refuse typed, got {e}"),
+            Ok(_) => panic!("{what}: a corrupt {column} must refuse typed, got a decoded value"),
+        }
+    }
+
+    /// Run one raw write with foreign keys OFF, then restore them: corrupting
+    /// a referenced id column behind the typed API's back is exactly the
+    /// hand-corrupted database the read-time decodes must survive.
+    fn corrupt_ignoring_fks(store: &Store, sql: &str, params: &[&dyn rusqlite::ToSql]) {
+        let conn = store.write();
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        conn.execute(sql, params).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+    }
+
+    /// The persisted-id decode class across the id COLUMN types: a zero
+    /// `session.id` (SessionId), `session.workspace_id` (WorkspaceId),
+    /// `task.task_id` (TaskId), `task.revision` (TaskRevision) or
+    /// `event.seq` (EventSeq) could never have been written by the typed API,
+    /// so every read path refuses it as a typed `Corrupt` naming the row and
+    /// column — never `Id::new(0)` panicking or a silent `.max(1)` mint.
+    /// NEGATIVE raw values are the bit-cast upper half of the u64 id space
+    /// (the store writes every id through `raw as i64`), so they must decode
+    /// back to the exact u64 — never be rejected as corruption. Repairing the
+    /// row makes the same read decode it again (valid data round-trips).
+    #[test]
+    fn corrupt_id_columns_refuse_typed_never_panic_or_mint() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let task = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Running);
+
+        // Valid rows round-trip before corruption.
+        assert_eq!(store.session_ids().unwrap(), vec![s.id]);
+        assert_eq!(store.get_session(s.id).unwrap().unwrap().workspace_id, ws);
+        assert_eq!(store.list_tasks(s.id).unwrap()[0].task_id, TaskId::new(1));
+        assert_eq!(
+            store
+                .get_task(s.id, TaskId::new(1))
+                .unwrap()
+                .unwrap()
+                .revision,
+            task.revision
+        );
+        assert_eq!(store.last_event_seq(s.id).unwrap(), Some(EventSeq::new(1)));
+
+        // Zero is structurally invalid for every one of these id types: each
+        // read path refuses it typed, naming the row and column.
+        {
+            // (SessionId) `session.id`, decoded by the unscoped id scan.
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE session SET id = 0 WHERE id = ?1",
+                &[&(s.id.raw() as i64)],
+            );
+            assert_corrupt_id(store.session_ids(), "session_ids", "session");
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE session SET id = ?1 WHERE id = 0",
+                &[&(s.id.raw() as i64)],
+            );
+
+            // (WorkspaceId) `session.workspace_id` via session_row_map.
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE session SET workspace_id = 0 WHERE id = ?1",
+                &[&(s.id.raw() as i64)],
+            );
+            assert_corrupt_id(store.get_session(s.id), "get_session", "workspace_id");
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE session SET workspace_id = ?2 WHERE id = ?1",
+                &[&(s.id.raw() as i64), &(ws.raw() as i64)],
+            );
+
+            // (TaskId) `task.task_id` via the per-session task list.
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE task SET task_id = 0 WHERE session_id = ?1 AND task_id = 1",
+                &[&(s.id.raw() as i64)],
+            );
+            assert_corrupt_id(store.list_tasks(s.id), "list_tasks", "task_id");
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE task SET task_id = 1 WHERE session_id = ?1 AND task_id = 0",
+                &[&(s.id.raw() as i64)],
+            );
+
+            // (TaskRevision) `task.revision` via the single-row read.
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE task SET revision = 0 WHERE session_id = ?1 AND task_id = 1",
+                &[&(s.id.raw() as i64)],
+            );
+            assert_corrupt_id(store.get_task(s.id, TaskId::new(1)), "get_task", "revision");
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE task SET revision = 1 WHERE session_id = ?1 AND task_id = 1",
+                &[&(s.id.raw() as i64)],
+            );
+
+            // (EventSeq) `event.seq` via the journal high-water read.
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE event SET seq = 0 WHERE session_id = ?1 AND seq = 1",
+                &[&(s.id.raw() as i64)],
+            );
+            assert_corrupt_id(store.last_event_seq(s.id), "last_event_seq", "seq");
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE event SET seq = 1 WHERE session_id = ?1 AND seq = 0",
+                &[&(s.id.raw() as i64)],
+            );
+        }
+
+        // The upper half of the u64 id space (negative i64 encodings) decodes
+        // back exactly: u64::MAX (-1), u64::MAX-2 (-3) and 2^63 (i64::MIN).
+        for wanted in [u64::MAX, u64::MAX - 2, 2u64.pow(63)] {
+            let bad = wanted as i64;
+            // (SessionId) `session.id`, decoded by the unscoped id scan.
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE session SET id = ?2 WHERE id = ?1",
+                &[&(s.id.raw() as i64), &bad],
+            );
+            assert_eq!(
+                store.session_ids().unwrap(),
+                vec![SessionId::new(wanted)],
+                "session.id {wanted} must round-trip exactly"
+            );
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE session SET id = ?2 WHERE id = ?1",
+                &[&bad, &(s.id.raw() as i64)],
+            );
+            assert_eq!(store.session_ids().unwrap(), vec![s.id]);
+
+            // (WorkspaceId) `session.workspace_id` via session_row_map.
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE session SET workspace_id = ?2 WHERE id = ?1",
+                &[&(s.id.raw() as i64), &bad],
+            );
+            assert_eq!(
+                store.get_session(s.id).unwrap().unwrap().workspace_id.raw(),
+                wanted,
+                "session.workspace_id {wanted} must round-trip exactly"
+            );
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE session SET workspace_id = ?2 WHERE id = ?1",
+                &[&(s.id.raw() as i64), &(ws.raw() as i64)],
+            );
+
+            // (TaskId) `task.task_id` via the per-session task list.
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE task SET task_id = ?2 WHERE session_id = ?1 AND task_id = 1",
+                &[&(s.id.raw() as i64), &bad],
+            );
+            assert_eq!(
+                store.list_tasks(s.id).unwrap()[0].task_id.raw(),
+                wanted,
+                "task.task_id {wanted} must round-trip exactly"
+            );
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE task SET task_id = ?2 WHERE session_id = ?1 AND task_id = ?3",
+                &[&(s.id.raw() as i64), &1i64, &bad],
+            );
+
+            // (TaskRevision) `task.revision` via the single-row read.
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE task SET revision = ?2 WHERE session_id = ?1 AND task_id = 1",
+                &[&(s.id.raw() as i64), &bad],
+            );
+            assert_eq!(
+                store
+                    .get_task(s.id, TaskId::new(1))
+                    .unwrap()
+                    .unwrap()
+                    .revision
+                    .raw(),
+                wanted,
+                "task.revision {wanted} must round-trip exactly"
+            );
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE task SET revision = 1 WHERE session_id = ?1 AND task_id = 1",
+                &[&(s.id.raw() as i64)],
+            );
+
+            // (EventSeq) `event.seq` via the journal high-water read.
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE event SET seq = ?2 WHERE session_id = ?1 AND seq = 1",
+                &[&(s.id.raw() as i64), &bad],
+            );
+            assert_eq!(
+                store.last_event_seq(s.id).unwrap(),
+                Some(EventSeq::new(wanted)),
+                "event.seq {wanted} must round-trip exactly"
+            );
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE event SET seq = 1 WHERE session_id = ?1 AND seq = ?2",
+                &[&(s.id.raw() as i64), &bad],
+            );
+            assert_eq!(
+                store.last_event_seq(s.id).unwrap(),
+                Some(EventSeq::new(1)),
+                "repairing event.seq restores the journal"
+            );
+        }
+    }
+
+    /// Every u64-backed id type decodes its own full range through the
+    /// SQLite bit-cast: u64::MAX, u64::MAX-2 and 2^63 (i64::MIN as raw) all
+    /// round-trip exactly, while zero stays typed corruption.
+    #[test]
+    fn sql_id_bit_cast_round_trips_every_id_type() {
+        macro_rules! round_trip {
+            ($ty:ty, $raw:expr, $wanted:expr) => {
+                assert_eq!(
+                    id_field::<$ty>("unit-test id column", $raw).unwrap().raw(),
+                    $wanted,
+                    "{} must round-trip {}",
+                    stringify!($ty),
+                    $wanted
+                );
+                assert!(
+                    id_field::<$ty>("unit-test id column", 0).is_err(),
+                    "{} zero must stay typed corruption",
+                    stringify!($ty)
+                );
+            };
+        }
+        for wanted in [u64::MAX, u64::MAX - 2, u64::MAX / 2 + 1] {
+            let raw = wanted as i64;
+            round_trip!(SessionId, raw, wanted);
+            round_trip!(WorkspaceId, raw, wanted);
+            round_trip!(WorktreeId, raw, wanted);
+            round_trip!(TaskId, raw, wanted);
+            round_trip!(TaskRevision, raw, wanted);
+            round_trip!(OpId, raw, wanted);
+            round_trip!(EventSeq, raw, wanted);
+            round_trip!(VerificationRecordId, raw, wanted);
+        }
+    }
+
+    /// Child-table id columns read by UNSCOPED doctor scans (no WHERE on the
+    /// corrupt column, so the decode is really exercised): a zero
+    /// `turn_record.session_id` and `cost_reservation.session_id/task_id`
+    /// refuse typed, negative bit-cast raws decode back to the exact u64, and
+    /// repairing the row re-enables the scan unchanged.
+    #[test]
+    fn corrupt_child_id_columns_refuse_typed_in_unscoped_scans() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let task = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Running);
+        let turn_id = store
+            .start_turn_record(s.id, OpId::new(5), None, None, "p", "m", None)
+            .unwrap();
+        let CostReserveOutcome::Granted(reservation) = store
+            .cost_reserve(s.id, task.task_id, OpId::new(6), 10, now_ms())
+            .unwrap()
+        else {
+            panic!("reservation must be granted");
+        };
+
+        // Baseline: both scans decode the valid rows.
+        assert_eq!(store.all_active_turns().unwrap()[0].session_id, s.id);
+        assert!(store
+            .active_turn_ownership_invariants()
+            .unwrap()
+            .unrecoverable
+            .iter()
+            .any(|row| row.session_id == s.id));
+
+        // Make the reservation dangling (no task row matches it): doctor's
+        // unscoped dangling scan then decodes its id columns directly.
+        corrupt_ignoring_fks(
+            &store,
+            "DELETE FROM task WHERE session_id = ?1 AND task_id = ?2",
+            &[&(s.id.raw() as i64), &(task.task_id.raw() as i64)],
+        );
+        let dangling = store.cost_reservation_invariants().unwrap().dangling;
+        assert_eq!(dangling.len(), 1);
+        assert_eq!(dangling[0].session_id, s.id);
+        assert_eq!(dangling[0].task_id, task.task_id);
+
+        // Zero is structurally invalid: both unscoped scans refuse it typed.
+        corrupt_ignoring_fks(
+            &store,
+            "UPDATE turn_record SET session_id = 0 WHERE id = ?1",
+            &[&turn_id],
+        );
+        assert_corrupt_id(store.all_active_turns(), "all_active_turns", "session_id");
+        assert_corrupt_id(
+            store.active_turn_ownership_invariants(),
+            "active_turn_ownership_invariants",
+            "session_id",
+        );
+        corrupt_ignoring_fks(
+            &store,
+            "UPDATE turn_record SET session_id = ?2 WHERE id = ?1",
+            &[&(s.id.raw() as i64), &turn_id],
+        );
+        corrupt_ignoring_fks(
+            &store,
+            "UPDATE cost_reservation SET session_id = 0 WHERE reservation_id = ?1",
+            &[&reservation],
+        );
+        assert_corrupt_id(
+            store.cost_reservation_invariants(),
+            "cost_reservation_invariants",
+            "session_id",
+        );
+        corrupt_ignoring_fks(
+            &store,
+            "UPDATE cost_reservation SET session_id = ?2 WHERE reservation_id = ?1",
+            &[&(s.id.raw() as i64), &reservation],
+        );
+        corrupt_ignoring_fks(
+            &store,
+            "UPDATE cost_reservation SET task_id = 0 WHERE reservation_id = ?1",
+            &[&reservation],
+        );
+        assert_corrupt_id(
+            store.cost_reservation_invariants(),
+            "cost_reservation_invariants",
+            "task_id",
+        );
+        corrupt_ignoring_fks(
+            &store,
+            "UPDATE cost_reservation SET task_id = ?2 WHERE reservation_id = ?1",
+            &[&(task.task_id.raw() as i64), &reservation],
+        );
+
+        // Negative raw values are the bit-cast upper half: the same scans
+        // decode them back to the exact u64 (u64::MAX, u64::MAX-2, 2^63).
+        for wanted in [u64::MAX, u64::MAX - 2, 2u64.pow(63)] {
+            let bad = wanted as i64;
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE turn_record SET session_id = ?2 WHERE id = ?1",
+                &[&turn_id, &bad],
+            );
+            assert_eq!(
+                store.all_active_turns().unwrap()[0].session_id.raw(),
+                wanted,
+                "turn_record.session_id {wanted} must round-trip exactly"
+            );
+            assert!(store
+                .active_turn_ownership_invariants()
+                .unwrap()
+                .unrecoverable
+                .iter()
+                .any(|row| row.session_id.raw() == wanted));
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE turn_record SET session_id = ?2 WHERE id = ?1",
+                &[&(s.id.raw() as i64), &turn_id],
+            );
+            assert_eq!(store.all_active_turns().unwrap()[0].session_id, s.id);
+
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE cost_reservation SET session_id = ?2 WHERE reservation_id = ?1",
+                &[&reservation, &bad],
+            );
+            let by_session = store.cost_reservation_invariants().unwrap().dangling;
+            assert_eq!(
+                by_session
+                    .iter()
+                    .find(|row| row.reservation_id == reservation)
+                    .unwrap()
+                    .session_id
+                    .raw(),
+                wanted,
+                "cost_reservation.session_id {wanted} must round-trip exactly"
+            );
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE cost_reservation SET session_id = ?2 WHERE reservation_id = ?1",
+                &[&(s.id.raw() as i64), &reservation],
+            );
+
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE cost_reservation SET task_id = ?2 WHERE reservation_id = ?1",
+                &[&reservation, &bad],
+            );
+            let by_task = store.cost_reservation_invariants().unwrap().dangling;
+            assert_eq!(
+                by_task
+                    .iter()
+                    .find(|row| row.reservation_id == reservation)
+                    .unwrap()
+                    .task_id
+                    .raw(),
+                wanted,
+                "cost_reservation.task_id {wanted} must round-trip exactly"
+            );
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE cost_reservation SET task_id = ?2 WHERE reservation_id = ?1",
+                &[&(task.task_id.raw() as i64), &reservation],
+            );
+            let repaired = store.cost_reservation_invariants().unwrap().dangling;
+            assert_eq!(repaired.len(), 1);
+            assert_eq!(repaired[0].task_id, task.task_id);
+        }
+    }
+
+    /// A persisted `prompt_queue.op_id` that is zero can never have been
+    /// written by the typed API: every read path must refuse it as a typed
+    /// `Corrupt` naming the row and column — never panic (`OpId::new(0)`) or
+    /// mint `1`. Negative raw values are the bit-cast upper half and decode
+    /// back to the exact u64 op id.
+    #[test]
+    fn corrupt_queue_op_id_is_refused_typed_never_panics_or_mints() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        store
+            .enqueue_prompt(s.id, OpId::new(7), "first", &[], None, None, None, 1)
+            .unwrap();
+        store
+            .enqueue_prompt(s.id, OpId::new(9), "second", &[], None, None, None, 2)
+            .unwrap();
+
+        // Valid rows round-trip before corruption.
+        let head = store.queue_head(s.id).unwrap().unwrap();
+        assert_eq!((head.queue_seq, head.op_id), (1, OpId::new(7)));
+        assert_eq!(
+            store.queue_op_ids(s.id).unwrap(),
+            vec![OpId::new(7), OpId::new(9)]
+        );
+
+        // Zero is structurally invalid: every read path refuses it typed and
+        // admission changes nothing.
+        {
+            let conn = store.write();
+            conn.execute(
+                "UPDATE prompt_queue SET op_id = 0 WHERE session_id = ?1 AND seq = 1",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        }
+        assert_corrupt_op_id(store.queue_head(s.id), "queue_head", "cannot be 0");
+        assert_corrupt_op_id(store.queue_op_ids(s.id), "queue_op_ids", "cannot be 0");
+        assert_corrupt_op_id(
+            store.admit_queue_head(s.id, &["idle"], "preparing"),
+            "admit_queue_head",
+            "cannot be 0",
+        );
+        let status: String = store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM prompt_queue WHERE session_id = ?1 AND seq = 1",
+                params![s.id.raw() as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "pending",
+            "a refused admission must not claim the row"
+        );
+        assert!(
+            store.messages_before(s.id, None, 10).unwrap().is_empty(),
+            "a refused admission must not materialize the user message"
+        );
+        assert_eq!(
+            store.get_session(s.id).unwrap().unwrap().state,
+            AgentState::Idle,
+            "a refused admission must not move the session"
+        );
+
+        // Negative raw values are the bit-cast upper half: the read paths
+        // decode them back to the exact u64 op ids instead of refusing.
+        for wanted in [u64::MAX, u64::MAX - 2, 2u64.pow(63)] {
+            let bad = wanted as i64;
+            {
+                let conn = store.write();
+                conn.execute(
+                    "UPDATE prompt_queue SET op_id = ?2 WHERE session_id = ?1 AND seq = 1",
+                    params![s.id.raw() as i64, bad],
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                store.queue_head(s.id).unwrap().unwrap().op_id.raw(),
+                wanted,
+                "queue_head op_id {wanted} must round-trip exactly"
+            );
+            assert_eq!(
+                store.queue_op_ids(s.id).unwrap()[0].raw(),
+                wanted,
+                "queue_op_ids {wanted} must round-trip exactly"
+            );
+        }
+
+        // Repair the row: the head still admits exactly once and the queue
+        // then advances to the next row (the fix never wedges the FIFO).
+        {
+            let conn = store.write();
+            conn.execute(
+                "UPDATE prompt_queue SET op_id = ?2 WHERE session_id = ?1 AND seq = 1",
+                params![s.id.raw() as i64, 7i64],
+            )
+            .unwrap();
+        }
+        let (admitted, _) = store
+            .admit_queue_head(s.id, &["idle"], "preparing")
+            .unwrap()
+            .unwrap();
+        assert_eq!((admitted.queue_seq, admitted.op_id), (1, OpId::new(7)));
+        store.mark_queue_status(s.id, 1, "completed").unwrap();
+        let next = store.queue_head(s.id).unwrap().unwrap();
+        assert_eq!(
+            (next.queue_seq, next.op_id),
+            (2, OpId::new(9)),
+            "the queue head advances to the next row"
+        );
+    }
+
+    /// The same persisted `op_id` decode class on the other read paths:
+    /// permission, event, tool_run and turn_record rows with a zero `op_id`
+    /// refuse typed instead of panicking or minting an id, while negative
+    /// bit-cast raws decode back to the exact u64.
+    #[test]
+    fn corrupt_op_id_columns_refuse_typed_across_read_paths() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let pid = store
+            .insert_permission(s.id, OpId::new(3), "fs.write")
+            .unwrap();
+        assert_eq!(
+            store.pending_permission(pid).unwrap().unwrap().1,
+            OpId::new(3)
+        );
+        let trid = store
+            .start_tool_run(
+                s.id,
+                OpId::new(4),
+                "write_file",
+                serde_json::json!({"path": "/a"}),
+                serde_json::json!({"strategy": "verify_hash"}),
+                None,
+                None,
+            )
+            .unwrap();
+        let turid = store
+            .start_turn_record(s.id, OpId::new(5), None, None, "p", "m", None)
+            .unwrap();
+        assert_eq!(
+            store.pending_tool_runs(s.id).unwrap()[0].op_id,
+            OpId::new(4)
+        );
+        assert_eq!(
+            store.active_turn_record(s.id).unwrap().unwrap().turn_op_id,
+            OpId::new(5)
+        );
+        assert_eq!(store.events_range(s.id, 1, None).unwrap()[0].op_id, None);
+
+        // Zero is structurally invalid on every one of these columns.
+        {
+            let conn = store.write();
+            conn.execute(
+                "UPDATE permission SET op_id = 0 WHERE id = ?1",
+                params![pid],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE event SET op_id = 0 WHERE session_id = ?1 AND seq = 1",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+            conn.execute("UPDATE tool_run SET op_id = 0 WHERE id = ?1", params![trid])
+                .unwrap();
+            conn.execute(
+                "UPDATE turn_record SET turn_op_id = 0 WHERE id = ?1",
+                params![turid],
+            )
+            .unwrap();
+        }
+        assert_corrupt_op_id(store.pending_permission(pid), "permission", "cannot be 0");
+        assert_corrupt_op_id(store.events_range(s.id, 1, None), "event", "cannot be 0");
+        assert_corrupt_op_id(store.pending_tool_runs(s.id), "tool_run", "cannot be 0");
+        assert_corrupt_op_id(store.active_turn_record(s.id), "turn_record", "cannot be 0");
+
+        // Negative raw values are the bit-cast upper half: every read path
+        // decodes them back to the exact u64 op id (u64::MAX, -3, 2^63).
+        for wanted in [u64::MAX, u64::MAX - 2, 2u64.pow(63)] {
+            let bad = wanted as i64;
+            {
+                let conn = store.write();
+                conn.execute(
+                    "UPDATE permission SET op_id = ?2 WHERE id = ?1",
+                    params![pid, bad],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE event SET op_id = ?2 WHERE session_id = ?1 AND seq = 1",
+                    params![s.id.raw() as i64, bad],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE tool_run SET op_id = ?2 WHERE id = ?1",
+                    params![trid, bad],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE turn_record SET turn_op_id = ?2 WHERE id = ?1",
+                    params![turid, bad],
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                store.pending_permission(pid).unwrap().unwrap().1.raw(),
+                wanted,
+                "permission op_id {wanted} must round-trip exactly"
+            );
+            assert_eq!(
+                store.events_range(s.id, 1, None).unwrap()[0]
+                    .op_id
+                    .unwrap()
+                    .raw(),
+                wanted,
+                "event op_id {wanted} must round-trip exactly"
+            );
+            assert_eq!(
+                store.pending_tool_runs(s.id).unwrap()[0].op_id.raw(),
+                wanted,
+                "tool_run op_id {wanted} must round-trip exactly"
+            );
+            assert_eq!(
+                store
+                    .active_turn_record(s.id)
+                    .unwrap()
+                    .unwrap()
+                    .turn_op_id
+                    .raw(),
+                wanted,
+                "turn_record turn_op_id {wanted} must round-trip exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_session_state_refuses_admission_typed_without_claiming() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        store
+            .enqueue_prompt(s.id, OpId::new(1), "hi", &[], None, None, None, 1)
+            .unwrap();
+        {
+            let conn = store.write();
+            conn.execute(
+                "UPDATE session SET state = 'not json' WHERE id = ?1",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        }
+        match store.admit_queue_head(s.id, &["idle"], "preparing") {
+            Err(StoreError::Corrupt(msgs)) => assert!(
+                msgs.iter().any(|m| m.contains("state")),
+                "the refusal must name the state column: {msgs:?}"
+            ),
+            other => panic!("corrupt session state must refuse admission typed: {other:?}"),
+        }
+        let status: String = store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM prompt_queue WHERE session_id = ?1",
+                params![s.id.raw() as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "pending",
+            "a refused admission must not claim the row"
+        );
+    }
+
     // ------------------------------------------- v17 attempt-identity ledger
     // (schema v18): refund-after-dispatch is SQL-impossible, reservations and
     // provider-call rows key by attempt_op_id, delivery/cost-basis columns
@@ -17054,11 +18091,18 @@ impl Store {
                     )));
                 }
             }
+            let row_id: i64 = r.get(0)?;
             let attempt_op_id: Option<i64> = r.get(2)?;
             out.push(ProviderCallTaskRow {
-                row_id: r.get(0)?,
-                op_id: OpId::new(r.get::<_, i64>(1)?.max(1) as u64),
-                attempt_op_id: attempt_op_id.map(|id| OpId::new(id.max(1) as u64)),
+                row_id,
+                op_id: id_field(
+                    &format!("provider_call {row_id} op_id"),
+                    r.get::<_, i64>(1)?,
+                )?,
+                attempt_op_id: id_field_opt(
+                    &format!("provider_call {row_id} attempt_op_id"),
+                    attempt_op_id,
+                )?,
                 reservation_id: r.get(3)?,
                 provider: r.get(4)?,
                 model: r.get(5)?,

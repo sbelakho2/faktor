@@ -84,7 +84,18 @@ struct ChildSpawn {
     ledger: Option<(Arc<TerminalLedger>, String)>,
 }
 
+// SAFETY: every field is itself `Send + Sync` (owned fds and pid values,
+// `Arc`-shared mutex/condvar state, atomic stop flag, a join handle, the
+// guardian handle, and the ledger tuple), and all interior mutation goes
+// through `Mutex`/atomics or the owned file descriptors. `Pty` has no
+// thread-affine state, so sharing/moving it across threads cannot race: the
+// reader thread owns the child reads, and teardown is serialized through the
+// shared stop flag and the fd's own close semantics.
 unsafe impl Send for Pty {}
+// SAFETY: shared `&Pty` access only reaches `Mutex`/atomic state and
+// `&self` syscalls on owned descriptors (e.g. non-blocking master reads),
+// which are valid from any thread; no `&self` method mutates borrowed state
+// without the mutex or atomics.
 unsafe impl Sync for Pty {}
 
 impl fmt::Debug for Pty {
@@ -427,7 +438,16 @@ impl Pty {
             guardian.release();
         }
         if let Some((ledger, row)) = self.ledger.take() {
-            let _ = ledger.mark_reaped(&row);
+            if let Err(e) = ledger.mark_reaped(&row) {
+                // The durable row stays live under the bounded retry marker
+                // that the next reconcile consumes; surfaced here, never
+                // silently discarded.
+                tracing::error!(
+                    row = %row,
+                    "terminal ledger reaped transition could not be appended: {}",
+                    e.message
+                );
+            }
         }
     }
 }
@@ -616,6 +636,7 @@ fn reader_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guardian::REAP_MARKER_FILE;
     use crate::ring::RING_MAX_BYTES;
     use crate::EnvSpec;
     use faktor_core::error::ErrorKind;
@@ -815,13 +836,13 @@ mod tests {
     /// Installs the named values and RESTORES the process environment on
     /// Drop: a panicking assertion must never leak test values into other
     /// tests or into the daemon's own environment.
-    struct EnvOverride(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    struct EnvOverride(Vec<(String, Option<std::ffi::OsString>)>);
 
     impl EnvOverride {
-        fn new(entries: &[(&'static str, &str)]) -> Self {
+        fn new(entries: &[(&str, &str)]) -> Self {
             let saved = entries
                 .iter()
-                .map(|(name, _)| (*name, std::env::var_os(name)))
+                .map(|(name, _)| ((*name).to_string(), std::env::var_os(name)))
                 .collect::<Vec<_>>();
             for (name, value) in entries {
                 std::env::set_var(name, value);
@@ -847,12 +868,21 @@ mod tests {
         // PATH + the approved toolchain vars arrive; configured secret
         // names set in the parent never cross (even allowlisted explicitly);
         // an undeclared daemon var never arrives. Host-independent: the
-        // approved values are installed by the test itself (serialized, and
-        // restored on Drop) instead of relying on the runner image.
+        // approved values are UNIQUE per test (tempdir-backed, so parallel
+        // cargo-test processes cannot collide), installed under the env
+        // serial lock, and restored on Drop instead of relying on the
+        // runner image.
         let _serial = ENV_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let cargo_home = home.path().join("cargo-home");
+        let rustup_home = home.path().join("rustup-home");
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        std::fs::create_dir_all(&rustup_home).unwrap();
+        let cargo_home = cargo_home.display().to_string();
+        let rustup_home = rustup_home.display().to_string();
         let _env = EnvOverride::new(&[
-            ("CARGO_HOME", "/tmp/kp-pty-cargo-home"),
-            ("RUSTUP_HOME", "/tmp/kp-pty-rustup-home"),
+            ("CARGO_HOME", cargo_home.as_str()),
+            ("RUSTUP_HOME", rustup_home.as_str()),
             ("FAKTOR_SERVER_PASSWORD", "hunter2"),
             ("OPENAI_API_KEY", "sk-pty-secret"),
             ("TEST_PRIVATE_SECRET", "private"),
@@ -879,11 +909,11 @@ mod tests {
             "PATH must be present and non-empty: {printed:?}"
         );
         for approved in [
-            "CARGO_HOME=/tmp/kp-pty-cargo-home",
-            "RUSTUP_HOME=/tmp/kp-pty-rustup-home",
+            format!("CARGO_HOME={cargo_home}"),
+            format!("RUSTUP_HOME={rustup_home}"),
         ] {
             assert!(
-                printed.contains(approved),
+                printed.contains(&approved),
                 "the authority must forward the approved name {approved}: {printed:?}"
             );
         }
@@ -1018,5 +1048,31 @@ mod tests {
             vec![],
             "a cleanly reaped terminal is never reported lost"
         );
+    }
+
+    #[test]
+    fn lost_reap_marker_from_teardown_is_consumed_by_reconcile() {
+        // Adversarial (injected append failure): teardown's `mark_reaped`
+        // fails, so the transition must live in the durable retry marker
+        // until the next reconcile consumes it — never a silent discard and
+        // never a false TerminalLost on the next daemon start.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(TerminalLedger::open(dir.path()).unwrap());
+        let cfg = sh_cfg("sleep 30");
+        let mut pty = Pty::spawn_recorded(&cfg, &ledger, "session:6/task:2").unwrap();
+        ledger.fail_next_mark_reaped();
+        pty.shutdown();
+        let marker = ledger.path().with_file_name(REAP_MARKER_FILE);
+        assert!(
+            marker.exists(),
+            "the lost reaped transition is compensated durably"
+        );
+        let report = ledger.reconcile().unwrap();
+        assert_eq!(
+            report.lost,
+            vec![],
+            "a compensated reap is never reported lost"
+        );
+        assert!(!marker.exists(), "the consumed marker is removed");
     }
 }

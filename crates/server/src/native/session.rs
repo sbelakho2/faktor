@@ -492,18 +492,35 @@ pub(crate) async fn native_session_abort(
         Err(e) => return api_err(&e),
     }
     let target = match &req.op_id {
-        Some(raw) => match raw.parse::<u64>() {
-            Ok(v) => Some(faktor_core::id::OpId::new(v)),
-            Err(_) => {
-                let e = ApiError {
-                    code: "malformed",
-                    message: format!("invalid op_id {raw:?}"),
-                    http_status: 400,
-                    retryable: false,
-                };
-                return wire_status(e);
+        Some(raw) => {
+            let parsed = match raw.parse::<u64>() {
+                Ok(v) => v,
+                Err(_) => {
+                    let e = ApiError {
+                        code: "malformed",
+                        message: format!("invalid op_id {raw:?}: expected a decimal u64"),
+                        http_status: 400,
+                        retryable: false,
+                    };
+                    return wire_status(e);
+                }
+            };
+            // Hostile request surface: a value that parses as u64 but is
+            // outside the id contract (zero) must be a typed 400 naming the
+            // field, never `OpId::new(parsed)` panicking the request task.
+            match faktor_core::id::OpId::try_from(parsed) {
+                Ok(op) => Some(op),
+                Err(e) => {
+                    let e = ApiError {
+                        code: "malformed",
+                        message: format!("invalid op_id {raw:?}: {e}"),
+                        http_status: 400,
+                        retryable: false,
+                    };
+                    return wire_status(e);
+                }
             }
-        },
+        }
         None => None,
     };
     match state.deps.agent.abort_op(sid, target) {
@@ -1063,5 +1080,130 @@ pub(crate) async fn native_prompt(
         }))
         .into_response(),
         Err(e) => exec_error_response(&e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn abort_state(root: &std::path::Path) -> (AppState, faktor_core::id::SessionId) {
+        let deps = crate::api::tests::test_deps(root);
+        let session = deps.session.clone();
+        let state = AppState {
+            deps: Arc::new(deps),
+            auth: Arc::new(std::sync::RwLock::new(None)),
+            terminal_events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            next_terminal_event_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let ws = session.create_workspace("/tmp").unwrap();
+        let sid = session
+            .create_session(ws, "abort", "fake", "m")
+            .unwrap()
+            .id();
+        (state, sid)
+    }
+
+    async fn abort_request(
+        state: &AppState,
+        sid: faktor_core::id::SessionId,
+        op_id: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", state.deps.auth_token.as_str())
+                .parse()
+                .unwrap(),
+        );
+        let response = native_session_abort(
+            State(state.clone()),
+            headers,
+            Path(sid.to_string()),
+            Ok(Json(NativeAbortRequest {
+                session_id: sid.to_string(),
+                op_id: op_id.map(str::to_string),
+            })),
+        )
+        .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// A hostile `op_id` that parses as a `u64` but violates the id contract
+    /// (zero), or never parses (u64 overflow, negative), must be a typed 400
+    /// naming the field — never `OpId::new(0)` panicking the request task.
+    /// Valid and absent op ids still round-trip.
+    #[tokio::test]
+    async fn native_abort_op_id_validation_never_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = abort_state(dir.path());
+
+        // Valid round-trips: a real queued op id aborts exactly that row,
+        // and the absent "abort everything" form answers OK.
+        state
+            .deps
+            .session
+            .store()
+            .enqueue_prompt(
+                sid,
+                faktor_core::id::OpId::new(7),
+                "q",
+                &[],
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+        let (status, body) = abort_request(&state, sid, Some("7")).await;
+        assert_eq!(status, StatusCode::OK, "valid op_id: {body}");
+        assert_eq!(body["aborted"], serde_json::json!(["7"]), "{body}");
+        let (status, body) = abort_request(&state, sid, None).await;
+        assert_eq!(status, StatusCode::OK, "absent op_id: {body}");
+
+        for raw in ["0", "18446744073709551616", "-1", "-9223372036854775808"] {
+            let (status, body) = abort_request(&state, sid, Some(raw)).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "op_id {raw:?} must be a typed 400: {body}"
+            );
+            let message = body["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("op_id"),
+                "the refusal must name op_id for {raw:?}: {body}"
+            );
+            assert_eq!(body["error"]["code"], "malformed", "{body}");
+        }
+
+        // The session survives the hostile requests: a fresh valid abort
+        // still answers OK afterwards.
+        state
+            .deps
+            .session
+            .store()
+            .enqueue_prompt(
+                sid,
+                faktor_core::id::OpId::new(8),
+                "q",
+                &[],
+                None,
+                None,
+                None,
+                2,
+            )
+            .unwrap();
+        let (status, body) = abort_request(&state, sid, Some("8")).await;
+        assert_eq!(status, StatusCode::OK, "authority stays usable: {body}");
+        assert_eq!(body["aborted"], serde_json::json!(["8"]), "{body}");
     }
 }

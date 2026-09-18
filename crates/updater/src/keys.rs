@@ -137,10 +137,16 @@ mod tests {
 
     #[test]
     fn malformed_key_material_is_refused_not_dropped() {
-        assert!(TrustedKey::from_base64("op", "not base64!!").is_err());
-        assert!(TrustedKey::from_base64("op", &BASE64.encode([0u8; 31])).is_err());
-        assert!(TrustedKey::from_base64("", &public_key(1)).is_err());
-        assert!(TrustedKey::from_base64("op", &public_key(1)).is_ok());
+        // Each hostile input is refused with the message naming the exact
+        // rule, so a broken allowlist cannot be mistaken for a weak key.
+        let not_base64 = TrustedKey::from_base64("op", "not base64!!").unwrap_err();
+        assert!(not_base64.contains("not base64"), "{not_base64}");
+        let short = TrustedKey::from_base64("op", &BASE64.encode([0u8; 31])).unwrap_err();
+        assert!(short.contains("32 raw bytes"), "{short}");
+        let empty_id = TrustedKey::from_base64("", &public_key(1)).unwrap_err();
+        assert!(empty_id.contains("identity"), "{empty_id}");
+        let key = TrustedKey::from_base64("op", &public_key(1)).unwrap();
+        assert_eq!(key.identity(), "op");
         // A 32-byte string that does not decompress to a curve point is a
         // typed config refusal, never an accepted trust anchor.
         let refused = (0u8..=255)
@@ -153,10 +159,14 @@ mod tests {
     #[test]
     fn duplicate_identities_are_refused() {
         let key = TrustedKey::from_base64("op", &public_key(7)).unwrap();
-        assert!(TrustedKeys::new(vec![key.clone()]).is_ok());
-        assert!(TrustedKeys::new(vec![key.clone(), key]).is_err());
+        let single = TrustedKeys::new(vec![key.clone()]).unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(single.identities(), vec!["op"]);
+        let dup = TrustedKeys::new(vec![key.clone(), key]).unwrap_err();
+        assert!(dup.contains("configured twice"), "{dup}");
         assert!(TrustedKeys::empty().is_empty());
         assert!(TrustedKeys::empty().get("op").is_none());
+        assert_eq!(TrustedKeys::empty().len(), 0);
     }
 
     #[test]

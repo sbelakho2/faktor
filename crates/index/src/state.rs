@@ -268,16 +268,23 @@ mod tests {
 
     #[test]
     fn build_failure_journaling_and_resume_are_legal() {
-        b(4).check_transition(
-            4,
-            &WorkspaceIndexState::Failed {
-                message: "io".into(),
-            },
-            4,
-        )
-        .unwrap();
-        // Crash residue: Building{4} resumed as Building{4}.
-        b(4).check_transition(4, &b(4), 4).unwrap();
+        // Building{4} -> Failed is legal and keeps the attempted target.
+        let failed = WorkspaceIndexState::Failed {
+            message: "io".into(),
+        };
+        assert_eq!(b(4).check_transition(4, &failed, 4), Ok(()));
+        // Crash residue: Building{4} resumed as Building{4} (same target).
+        assert_eq!(b(4).check_transition(4, &b(4), 4), Ok(()));
+        // The same resume may never renumber the interrupted target.
+        let err = b(4).check_transition(4, &b(5), 5).unwrap_err();
+        assert!(
+            matches!(err, StateError::Illegal { .. }),
+            "renumbering a crash-resume must be typed illegal: {err:?}"
+        );
+        // A build never jumps straight to Dirty: that edge exists only from
+        // a Ready generation.
+        let err = b(4).check_transition(4, &d(4), 4).unwrap_err();
+        assert!(matches!(err, StateError::Illegal { .. }), "{err:?}");
     }
 
     #[test]

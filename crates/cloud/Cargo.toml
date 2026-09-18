@@ -24,7 +24,7 @@ tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 futures-util.workspace = true
 http = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls", "http2"] }

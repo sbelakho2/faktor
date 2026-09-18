@@ -42,6 +42,38 @@ impl WebhookSink for CountingSink {
     }
 }
 
+/// The daemon's payload discipline in miniature: authenticate, parse
+/// `installation.id`, only then claim. A malformed payload is refused before
+/// the durable claim, exactly like `ScmDaemon::deliver`.
+struct ParsingSink {
+    inbox: WebhookInbox,
+}
+
+impl WebhookSink for ParsingSink {
+    fn deliver(
+        &self,
+        headers: &WebhookHeaders,
+        body: &[u8],
+    ) -> Result<IngestOutcome, WebhookError> {
+        self.inbox.verify(headers, body, NOW_MS)?;
+        faktor_scm::installation_of(body)?;
+        self.inbox.ingest(headers, body, NOW_MS)
+    }
+}
+
+/// A sink failing with one chosen typed refusal (store vs payload).
+struct RefusingSink(WebhookError);
+
+impl WebhookSink for RefusingSink {
+    fn deliver(
+        &self,
+        _headers: &WebhookHeaders,
+        _body: &[u8],
+    ) -> Result<IngestOutcome, WebhookError> {
+        Err(self.0.clone())
+    }
+}
+
 #[tokio::test]
 async fn no_wired_sink_answers_typed_409_without_the_daemon_password() {
     let dir = tempfile::tempdir().unwrap();
@@ -213,4 +245,140 @@ async fn missing_delivery_id_is_400_and_oversized_body_is_413() {
     let resp: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(resp["error"]["code"], "payload_too_large");
     assert!(store.webhook_deliveries(10).unwrap().is_empty());
+}
+
+#[test]
+fn webhook_error_classification_is_frozen_and_retryability_is_typed() {
+    let cases: &[(WebhookError, &str, u16, bool)] = &[
+        (WebhookError::BodyTooLarge, "payload_too_large", 413, false),
+        (
+            WebhookError::MissingSignature,
+            "scm_webhook_unauthorized",
+            401,
+            false,
+        ),
+        (
+            WebhookError::MalformedSignature,
+            "scm_webhook_unauthorized",
+            401,
+            false,
+        ),
+        (
+            WebhookError::SignatureMismatch,
+            "scm_webhook_unauthorized",
+            401,
+            false,
+        ),
+        (
+            WebhookError::StaleTimestamp,
+            "scm_webhook_unauthorized",
+            401,
+            false,
+        ),
+        (WebhookError::MissingDeliveryId, "malformed", 400, false),
+        (
+            WebhookError::MalformedPayload("installation.id refused".into()),
+            "malformed",
+            400,
+            false,
+        ),
+        (
+            WebhookError::Store("db down".into()),
+            "scm_webhook_unavailable",
+            503,
+            true,
+        ),
+    ];
+    for (e, code, status, retryable) in cases {
+        // The typed error is the single retryability authority.
+        assert_eq!(e.retryable(), *retryable, "{e:?}");
+        let api = super::webhook_err(e.clone());
+        assert_eq!(api.code, *code, "{e:?}");
+        assert_eq!(api.http_status, *status, "{e:?}");
+        assert_eq!(api.retryable, *retryable, "{e:?}");
+        assert_eq!(api.message, e.to_string(), "{e:?}");
+    }
+}
+
+#[tokio::test]
+async fn malformed_installation_id_is_400_not_retryable_and_never_claimed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ScmStore> = Arc::new(MemoryScmStore::new());
+    let sink = Arc::new(ParsingSink {
+        inbox: WebhookInbox::new(
+            WebhookVerifier::new(SECRET.to_vec()).unwrap(),
+            store.clone(),
+        ),
+    });
+    let deps = test_deps(dir.path()).with_scm_webhook(sink);
+    let handle = serve(deps, 0).await.unwrap();
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+
+    let body = br#"{"installation":{"id":0},"action":"created"}"#;
+    let resp = client
+        .post(format!("{base}/native/scm/webhook"))
+        .header("x-github-delivery", "delivery-malformed")
+        .header("x-github-event", "installation")
+        .header(
+            "x-hub-signature-256",
+            format!("sha256={}", hmac_sha256_hex(SECRET, body)),
+        )
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let err: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "malformed");
+    assert_eq!(err["error"]["retryable"], false);
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("installation.id"));
+    assert!(
+        store.webhook_deliveries(10).unwrap().is_empty(),
+        "a malformed payload must be refused before any durable claim"
+    );
+
+    // A valid id over the same sink is unchanged: 200 accepted and claimed.
+    let valid = br#"{"installation":{"id":7},"action":"created"}"#;
+    let resp = client
+        .post(format!("{base}/native/scm/webhook"))
+        .header("x-github-delivery", "delivery-valid")
+        .header("x-github-event", "installation")
+        .header(
+            "x-hub-signature-256",
+            format!("sha256={}", hmac_sha256_hex(SECRET, valid)),
+        )
+        .body(valid.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let ok: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(ok["status"], "accepted");
+    assert_eq!(store.webhook_deliveries(10).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn store_failure_is_still_a_retryable_503() {
+    let dir = tempfile::tempdir().unwrap();
+    let deps = test_deps(dir.path()).with_scm_webhook(Arc::new(RefusingSink(WebhookError::Store(
+        "sqlite is busy".into(),
+    ))));
+    let handle = serve(deps, 0).await.unwrap();
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let resp = client
+        .post(format!("{base}/native/scm/webhook"))
+        .header("x-github-delivery", "delivery-store")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+    let err: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "scm_webhook_unavailable");
+    assert_eq!(err["error"]["retryable"], true);
 }

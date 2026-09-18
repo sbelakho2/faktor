@@ -426,7 +426,7 @@ impl SessionHandle {
         } else {
             (true, current)
         };
-        let op_id = self.manager.next_op_id();
+        let op_id = self.manager.try_next_op_id()?;
         // Layered lifetimes (audit 26): ONE logical turn is bounded by the
         // manager's configurable `turn_budget_ms` (default 30 min,
         // [`DEFAULT_TURN_BUDGET_MS`]) — never a 24h ceiling. The task's
@@ -1343,7 +1343,7 @@ pub(crate) mod tests {
                 None,
             )
             .unwrap();
-            let op = m.next_op_id();
+            let op = m.try_next_op_id().unwrap();
             let meta = OpMeta::new(
                 op,
                 s.id(),

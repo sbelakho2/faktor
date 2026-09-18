@@ -22,6 +22,7 @@ use faktor_cloud::{
     AsyncOidcAdapter, ClaimMapping, ClientAuthMethod, ClientSecret, CodeExchangeRequest,
     ControlPlane, FakeOidcAdapter, IdTokenExpectations, ManualClock, MemoryControlPlaneStore,
     NetworkOidcAdapter, NetworkOidcConfig, OidcClaims, OidcError, Role, SsoConfigRef, SsoLogin,
+    OIDC_NETWORK_TIMEOUT_MS,
 };
 use faktor_provider::egress::{EgressError, HttpTransport};
 
@@ -1678,5 +1679,40 @@ async fn extreme_time_claims_are_typed_outcomes_never_overflow() {
     assert_eq!(
         adapter.verify_id_token(&token, &wide).await.unwrap_err(),
         OidcError::Expired
+    );
+}
+
+/// A transport that never resolves: an issuer that accepts and stalls.
+struct StallingTransport;
+
+impl HttpTransport for StallingTransport {
+    fn execute(&self, _req: Request) -> BoxFuture<'_, Result<Response, EgressError>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_issuer_is_a_typed_timeout_at_the_documented_bound() {
+    let adapter = NetworkOidcAdapter::new(
+        Arc::new(StallingTransport),
+        Arc::new(ManualClock::new(NOW_MS)),
+        config(),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let call = tokio::spawn(async move { adapter.discovery(ISSUER).await });
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_millis(
+        OIDC_NETWORK_TIMEOUT_MS + 1_000,
+    ))
+    .await;
+    let err = call.await.unwrap().unwrap_err();
+    assert!(
+        matches!(&err, OidcError::DiscoveryUnavailable(m) if m.contains("network bound")),
+        "{err:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "virtual time only: no real-time hang"
     );
 }

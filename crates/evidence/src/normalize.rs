@@ -1074,6 +1074,10 @@ mod tests {
 
     #[test]
     fn junk_never_panics() {
+        // Panic-freedom is the headline property, but each hostile payload
+        // must also land on a bounded, honest outcome: either the typed
+        // malformed/oversized refusal or a value whose fields respect the
+        // documented caps. Noise must never fabricate an exit code.
         let junk = [
             "\u{0}\u{1}\u{7f}",
             "\u{1F4A5}\u{1F4A5}\u{1F4A5}",
@@ -1086,17 +1090,99 @@ mod tests {
             "path:4294967295:4294967295: info[x]: ok",
             "line with trailing colon:",
         ];
+        let bounded = |ok: bool| assert!(ok, "hostile output must stay within its field cap");
         for raw in junk {
-            let _ = DiagnosticSet::try_from_text(raw);
-            let _ = TestReport::try_from_text(raw);
-            let _ = SearchResults::try_from_text(raw);
-            let _ = ProcessLogSummary::try_from_text(raw);
+            match DiagnosticSet::try_from_text(raw) {
+                Ok(set) => {
+                    for d in &set.diagnostics {
+                        bounded(
+                            d.path.chars().count() <= MAX_FIELD_CHARS
+                                && d.message.chars().count() <= MAX_FIELD_CHARS,
+                        );
+                    }
+                }
+                Err(e) => assert!(
+                    matches!(
+                        e,
+                        EvidenceError::Malformed(_) | EvidenceError::Oversized { .. }
+                    ),
+                    "{raw:?}: {e:?}"
+                ),
+            }
+            match TestReport::try_from_text(raw) {
+                Ok(report) => {
+                    for f in &report.failed {
+                        bounded(
+                            f.name.chars().count() <= MAX_FIELD_CHARS
+                                && f.message.chars().count() <= MAX_FIELD_CHARS,
+                        );
+                    }
+                }
+                Err(e) => assert!(
+                    matches!(
+                        e,
+                        EvidenceError::Malformed(_) | EvidenceError::Oversized { .. }
+                    ),
+                    "{raw:?}: {e:?}"
+                ),
+            }
+            match SearchResults::try_from_text(raw) {
+                Ok(results) => {
+                    for hit in &results.hits {
+                        bounded(
+                            hit.path.chars().count() <= MAX_FIELD_CHARS
+                                && hit.text.chars().count() <= MAX_FIELD_CHARS,
+                        );
+                    }
+                }
+                Err(e) => assert!(
+                    matches!(
+                        e,
+                        EvidenceError::Malformed(_) | EvidenceError::Oversized { .. }
+                    ),
+                    "{raw:?}: {e:?}"
+                ),
+            }
+            let summary = ProcessLogSummary::try_from_text(raw).unwrap();
+            assert!(
+                summary.important_lines.len() <= MAX_IMPORTANT_LINES + 1,
+                "{raw:?}: important lines must stay capped"
+            );
+            assert_eq!(summary.exit, None, "{raw:?}: noise has no exit code");
         }
+        // Pure punctuation noise never fabricates a diagnostic row: the
+        // strict parser refuses it outright (typed Malformed), never a
+        // silently-kept row.
+        for noise in ["::::", "= = =", "----", "\u{0}\u{1}\u{7f}"] {
+            match DiagnosticSet::try_from_text(noise) {
+                Ok(set) => assert!(
+                    set.diagnostics.is_empty(),
+                    "{noise:?} must not fabricate rows"
+                ),
+                Err(EvidenceError::Malformed(_)) => {}
+                Err(other) => panic!("{noise:?}: unexpected {other:?}"),
+            }
+        }
+        // A 200k-char line is truncated at the documented field cap, not kept.
         let huge_line = "x".repeat(200_000);
-        let _ = DiagnosticSet::try_from_text(&huge_line);
-        let _ = TestReport::try_from_text(&huge_line);
-        let _ = SearchResults::try_from_text(&huge_line);
-        let _ = ProcessLogSummary::try_from_text(&huge_line);
+        if let Ok(set) = DiagnosticSet::try_from_text(&huge_line) {
+            assert!(
+                set.field_truncated,
+                "an oversized diagnostic field must be reported truncated"
+            );
+        }
+        if let Ok(results) = SearchResults::try_from_text(&huge_line) {
+            assert!(
+                results.field_truncated,
+                "an oversized search field must be reported truncated"
+            );
+        }
+        assert!(
+            ProcessLogSummary::try_from_text(&huge_line)
+                .unwrap()
+                .field_truncated
+        );
+        assert_eq!(TestReport::try_from_text(&huge_line).unwrap().total, 0);
     }
 
     #[test]

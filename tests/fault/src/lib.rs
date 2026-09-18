@@ -933,7 +933,7 @@ mod accounting_campaign {
             .reserve(
                 acct.session,
                 acct.task,
-                acct.manager.next_op_id(),
+                acct.manager.try_next_op_id().unwrap(),
                 predicted,
                 snapshot,
             )
@@ -1308,7 +1308,7 @@ mod accounting_campaign {
             .reserve(
                 acct.session,
                 acct.task,
-                acct.manager.next_op_id(),
+                acct.manager.try_next_op_id().unwrap(),
                 over,
                 None,
             )
@@ -1333,7 +1333,13 @@ mod accounting_campaign {
         if free >= 1 {
             let r = acct
                 .ledger
-                .reserve(acct.session, acct.task, acct.manager.next_op_id(), 1, None)
+                .reserve(
+                    acct.session,
+                    acct.task,
+                    acct.manager.try_next_op_id().unwrap(),
+                    1,
+                    None,
+                )
                 .await
                 .unwrap();
             acct.ledger.refund(acct.session, r).await.unwrap();

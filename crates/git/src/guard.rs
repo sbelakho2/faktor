@@ -137,8 +137,15 @@ pub fn lease_verdict(owner_pid: u32, owner_created_ms: i64, observed: ObserveRes
 /// enforces that).
 #[cfg(target_os = "macos")]
 fn unix_pid_start_marker(pid: u32) -> String {
+    // SAFETY: `proc_bsdinfo` is a plain C POD struct whose all-zero bit
+    // pattern is a valid initial value; the kernel fills it via
+    // `proc_pidinfo` before any field is read (the size check below rejects
+    // a partial fill).
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a live, correctly sized `proc_bsdinfo` and `size`
+    // reports exactly that size, so the kernel writes stay inside the struct;
+    // `pid` is only a scalar argument that the kernel validates.
     let rc = unsafe {
         libc::proc_pidinfo(
             pid as libc::c_int,
@@ -816,13 +823,18 @@ mod tests {
     #[cfg(windows)]
     const HELPER_TEST: &str = "guard::tests::windows_lease_holder_helper";
 
-    /// Ignored helper process for the Windows multiprocess tests below: it
-    /// acquires the lease, backdates its `started_ms` (so the parent sees an
-    /// "old" but live lease), announces readiness, and holds until killed.
-    /// Driven by path with `--ignored --exact`, never by the normal run.
+    /// NOT a test: a re-exec HELPER PROCESS for the Windows multiprocess
+    /// lease tests below. It acquires the lease, backdates its `started_ms`
+    /// (so the parent sees an "old" but live lease), announces readiness,
+    /// and holds until killed. The `#[test]` + `#[ignore]` attributes exist
+    /// only so `--ignored --exact` can start this process by name; the
+    /// normal test run must never execute it (there is nothing here to
+    /// exercise in-process, and it blocks for two minutes). The
+    /// `[soak]`/`[perf]`/`[visual]`/`[fault]` long-test prefixes do not
+    /// apply: those mark long-running TESTS, and this is not a test.
     #[cfg(windows)]
     #[test]
-    #[ignore = "helper process; driven by the windows multiprocess lease tests"]
+    #[ignore = "re-exec helper process (not a test); driven by the windows multiprocess lease tests"]
     fn windows_lease_holder_helper() {
         let Ok(dir) = std::env::var(HELPER_DIR_ENV) else {
             return;

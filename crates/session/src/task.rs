@@ -577,10 +577,26 @@ impl Criterion {
             semantic_snapshot: self.semantic_snapshot.clone(),
             binding: self.binding.clone(),
         };
-        format!(
-            "{CRITERION_V2_PREFIX}{}",
-            serde_json::to_string(&envelope).unwrap_or_default()
-        )
+        // Never `unwrap_or_default()`: an empty default encodes as the
+        // literal "v2:", which decodes as legacy plain text reading "v2:" —
+        // silent corruption of a durable entry. The envelope is a flat owned
+        // structure (strings/enums/options) whose JSON encoding cannot fail;
+        // if a serde contract break ever makes this reachable, log loudly
+        // and degrade to the criterion's PLAIN TEXT — the documented legacy
+        // representation that keeps the text lossless and the typed metadata
+        // an honest absence, exactly like the over-bound path in
+        // `encoded_entry`.
+        match serde_json::to_string(&envelope) {
+            Ok(json) => format!("{CRITERION_V2_PREFIX}{json}"),
+            Err(err) => {
+                tracing::error!(
+                    criterion = %self.id,
+                    error = %err,
+                    "criterion envelope failed to serialize; persisting its plain legacy text"
+                );
+                self.text.clone()
+            }
+        }
     }
 
     /// The entry to persist for this criterion: the V2 encoding when it fits
@@ -1246,11 +1262,35 @@ pub struct ProofBasis {
     pub evidence_digests: Vec<String>,
 }
 
+/// Monotonic nonce for the (unreachable) proof-basis serialization fault: a
+/// poison digest differs on every fault, so a serialization break can never
+/// make two different bases compare equal (which would authorize a FALSE
+/// proof reuse) — it fails closed instead.
+static PROOF_BASIS_SERIALIZE_FAULTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
 impl ProofBasis {
     /// The canonical digest of this basis (`blake3:` prefixed).
     pub fn digest(&self) -> String {
-        let bytes = serde_json::to_vec(self).unwrap_or_default();
-        format!("blake3:{}", blake3::hash(&bytes).to_hex())
+        match serde_json::to_vec(self) {
+            Ok(bytes) => format!("blake3:{}", blake3::hash(&bytes).to_hex()),
+            Err(err) => {
+                // Never `unwrap_or_default()`: defaulting to empty bytes
+                // would collapse EVERY basis to one constant digest and
+                // silently authorize reuse across different proofs. The flat
+                // owned structure cannot fail to encode; if that invariant
+                // ever breaks, log loudly and mint a unique NON-HEX poison
+                // digest — it can never equal a real digest, so reuse is
+                // refused (fail closed), never falsely allowed.
+                tracing::error!(
+                    error = %err,
+                    "proof basis failed to serialize; minting a non-reusable poison digest"
+                );
+                let nonce =
+                    PROOF_BASIS_SERIALIZE_FAULTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                format!("blake3:encode-error-{nonce:016x}")
+            }
+        }
     }
 
     /// The reserved `env_projection` key carrying the layered effective
@@ -4679,7 +4719,7 @@ mod tests {
         // while it holds budget.
         let ledger = ledger_for(&m);
         let r = ledger
-            .reserve(s.id, tid, m.next_op_id(), 5_000, None)
+            .reserve(s.id, tid, m.try_next_op_id().unwrap(), 5_000, None)
             .await
             .unwrap();
         let (rev, rec) = finish_verifying(&s, tid);
@@ -4725,7 +4765,7 @@ mod tests {
         // it sits open — the conservative close is mark_uncertain (or a
         // settle), never a refund.
         let r = ledger
-            .reserve(s.id, tid, m.next_op_id(), 8_000, None)
+            .reserve(s.id, tid, m.try_next_op_id().unwrap(), 8_000, None)
             .await
             .unwrap();
         ledger.mark_dispatched(s.id, r).await.unwrap();
@@ -4774,7 +4814,13 @@ mod tests {
         // A crashed dispatched attempt with no completed provider row: exact
         // usage unknown — finalize charges the reserved estimate.
         let r = ledger
-            .reserve(s.id, tid, m.next_op_id(), 12_000, Some(snapshot()))
+            .reserve(
+                s.id,
+                tid,
+                m.try_next_op_id().unwrap(),
+                12_000,
+                Some(snapshot()),
+            )
             .await
             .unwrap();
         ledger.mark_dispatched(s.id, r).await.unwrap();
@@ -4804,8 +4850,10 @@ mod tests {
         // that exact usage — 900 input + 100 output tokens x the frozen
         // snapshot (10 micro / 1M tokens x ... pricing snapshot fields are
         // microUSD per MILLION tokens here) — never the 60_000 estimate.
-        let logical = m.next_op_id();
-        let attempt = faktor_core::op::ModelCallAttempt::new(logical, m.next_op_id(), 0).unwrap();
+        let logical = m.try_next_op_id().unwrap();
+        let attempt =
+            faktor_core::op::ModelCallAttempt::new(logical, m.try_next_op_id().unwrap(), 0)
+                .unwrap();
         let r = ledger
             .reserve_attempt(s.id, tid, attempt, 60_000, Some(snapshot()))
             .await
@@ -4860,8 +4908,10 @@ mod tests {
             let ledger = ledger_for(&m);
             // Two crashed dispatched attempts: one with exact usage known,
             // one without.
-            let logical = m.next_op_id();
-            let exact = faktor_core::op::ModelCallAttempt::new(logical, m.next_op_id(), 0).unwrap();
+            let logical = m.try_next_op_id().unwrap();
+            let exact =
+                faktor_core::op::ModelCallAttempt::new(logical, m.try_next_op_id().unwrap(), 0)
+                    .unwrap();
             let r1 = ledger
                 .reserve_attempt(s.id, tid, exact, 60_000, Some(snapshot()))
                 .await
@@ -4883,7 +4933,7 @@ mod tests {
                 .await
                 .unwrap();
             let r2 = ledger
-                .reserve(s.id, tid, m.next_op_id(), 7_000, None)
+                .reserve(s.id, tid, m.try_next_op_id().unwrap(), 7_000, None)
                 .await
                 .unwrap();
             ledger.mark_dispatched(s.id, r2).await.unwrap();

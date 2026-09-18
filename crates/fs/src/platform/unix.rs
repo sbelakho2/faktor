@@ -260,6 +260,11 @@ fn open_root(root: &Path) -> Result<OwnedFd, Error> {
     let c = CString::new(root.as_os_str().as_bytes())
         .map_err(|_| Error::malformed(format!("workspace root {:?} contains a NUL byte", root)))?;
     let flags = O_DIR | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `c` is a NUL-terminated `CString` built from the root path
+    // (creation refused interior NULs), so `open` reads exactly the intended
+    // string. The flags add O_CLOEXEC (no fd leak into children) and
+    // O_NOFOLLOW|O_DIRECTORY (a symlinked/non-directory root is refused
+    // rather than followed); failure is handled below, never assumed.
     let fd = unsafe { libc::open(c.as_ptr(), flags) };
     if fd < 0 {
         let e = io::Error::last_os_error();
@@ -277,6 +282,9 @@ fn open_root(root: &Path) -> Result<OwnedFd, Error> {
             Error::internal(format!("workspace root {}: {e}", root.display()))
         });
     }
+    // SAFETY: `fd` was just returned by the successful `open` above (>= 0)
+    // and is not owned by any other object, so `OwnedFd` takes sole
+    // ownership of a live descriptor and closes it exactly once.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 

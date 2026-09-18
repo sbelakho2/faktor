@@ -68,7 +68,7 @@ protocol instead.
                                      ▼
                     ┌───────────────────────────────────┐
                     │  faktor-server  (HTTP surface)     │  auth: FAKTOR_SERVER_PASSWORD
-                    │  startup line, /native/* routes   │  (Basic | Bearer | x-faktor-server-password)
+                    │  startup line, /native/* routes   │  (Bearer | x-faktor-server-password)
                     └────────────────┬──────────────────┘
                                      │ commands (faktor-session API, synchronous)
                                      ▼
@@ -174,7 +174,7 @@ Crate responsibilities (each crate's module doc is authoritative):
 | `search` | Hybrid retrieval with rank fusion: exact + lexical + symbol (+ optional semantic) fused by reciprocal rank weighted by symbol relevance, lexical score, semantic score, file recency, task affinity; evidence packages retrieved before serious reasoning turns. |
 | `memory` | Long-term structured session memory: durable task state and structured facts (the transcript is *not* memory), compact context render for the semi-stable memory class. |
 | `server` | The HTTP surface of the daemon: Faktor Native Protocol v1 (`docs/native-protocol.md`). The UI connection is disposable: turns run detached from any connection and resume from the journal. |
-| `cli` | `serve` (prints the frozen startup line), `run` (headless one-prompt), `doctor` (self-check: store, CAS, integrity, permissions, providers), `sessions` (list). Logging goes to stderr; stdout is the startup-line contract. |
+| `cli` | `serve` (prints the frozen startup line), `run` (headless one-prompt), `doctor` (self-check: store, CAS, integrity, permissions, providers), `sessions` (list), `acp` (ACP stdio agent server over the real daemon graph), `updater` (signed updater lifecycle, local parity), `enterprise` (retention/audit/admin plane, local parity), `worker` (remote worker-node loop), `bootstrap` (verifies the activated release and execs it), `build` (build report: version, executable sha256, release id/digest). Logging goes to stderr; stdout is the startup-line contract. |
 
 ---
 
@@ -280,15 +280,16 @@ Every significant transition becomes a journal event. The session database
 therefore knows exactly what happened; the rendered conversation is a
 *view derived from the journal*, never the source of truth.
 
-### 5.1 Event kinds (25, frozen — the 24 original + PhaseChanged for interior hops; exactly one TurnCompleted per logical turn)
+### 5.1 Event kinds (27, frozen — the 24 original + PromptAdmitted, PhaseChanged and ReplayStarted; exactly one TurnCompleted per logical turn)
 
 ```
 SessionCreated, PromptReceived, ContextPrepared, ModelStarted,
 ModelChunkReceived, ToolRequested, ToolStarted, FileChanged,
 ToolCompleted, ToolCancelled, CheckpointCreated, ContextCompacted,
 CompactRejected, SubagentStarted, SubagentCompleted, TurnCompleted,
-PermissionGranted, PermissionDenied, CrashDetected, RecoveryApplied,
-SessionEnded, Suspended, Resumed, Failed
+PermissionGranted, PermissionDenied, PromptAdmitted, PhaseChanged,
+ReplayStarted, CrashDetected, RecoveryApplied, SessionEnded, Suspended,
+Resumed, Failed
 ```
 
 ### 5.2 Sequencing and structure
@@ -318,12 +319,16 @@ SessionEnded, Suspended, Resumed, Failed
 - **The text itself is not journaled per chunk.** Chunk text accumulates
   in message *parts* (SQLite JSON rows); the journal records lengths so
   replay can re-derive shape without unbounded journal growth.
-- **Ephemeral/coalesced on the wire:** text deltas, reasoning deltas, and
-  terminal output are reconstructed/coalesced by the SSE pipeline (§11):
-  the `GlobalEventBus` re-diffs stored message parts (`recover_text`) and
-  runs consecutive text deltas through a 50 ms / 8 KiB `DeltaCoalescer`
-  before framing. Terminal output streams as
-  `interactive_terminal_data` frames and is never journaled.
+- **Ephemeral/coalesced in memory only:** live model text and reasoning
+  deltas flow through the agent's bounded `ChunkSink`: a 1024-event mpsc
+  channel; when it is full, consecutive same-(session,message,kind) deltas
+  coalesce into ONE pending frame capped at 64 KiB keeping the newest
+  bytes, and a different stream replaces the pending frame. The server
+  drains that channel eagerly because the client surface is durable and
+  journal-driven — there is no global SSE bus, no `DeltaCoalescer` and no
+  stored-part re-diff (`recover_text`) anywhere in the runtime. Terminal
+  output is reconstructed from the durable `terminal_*` ledger rows and
+  live ring snapshots, never journaled as text.
 
 ### 5.4 Journal validation
 
@@ -682,32 +687,28 @@ hard-coded lists.
   **circuit breaker** per task name (`Closed → Open → HalfOpen` probe);
   budget-busy is a distinct `BudgetBusy` signal, never an error.
 
-### 11.3 SSE surfaces
+### 11.3 Streaming surfaces
 
-- **Per-session:** journal events projected to frozen `SseEvent` frames
-  (`SessionUpdated, MessageCreated, MessagePartUpdated, ToolCallState,
-  PermissionRequested, AgentStateChanged, AgentManagerUpdate,
-  Compaction, Error`); the SSE `id:` cursor **is the event sequence**;
-  resume = `events_after(seq)`.
-- **Global:** `/global/event?after=<n>` serves the `GlobalEvent` envelope
-  over a **bounded ring (4096 frames)**:
-  `{ directory, project, workspace, payload }` where payload is a tagged
-  union (`type` discriminator, snake_case): `session_created,
-  session_turn_open, session_turn_close, session_queue_changed,
-  background_process_updated, interactive_terminal_data,
-  sandbox_status_changed, indexing_status, message_part_updated,
-  session_next_text_delta, session_next_reasoning_delta,
-  session_next_tool_called, session_state_changed, error`.
-- Sessions project in **deterministic session-id order** so the global
-  sequence is append-only; cursors make re-polling idempotent.
-- **Coalescing:** consecutive text deltas run through `DeltaCoalescer`
-  (50 ms window, 8 KiB per-frame cap); text for text_len-only chunk events
-  is recovered by diffing stored message parts (`recover_text`); quiet
-  tails are emitted one window after their last chunk.
-- **Resume semantics:** `after` replays events with id > n; oversized
-  cursors (e.g. u64::MAX) are clamped — the stream stays open, never an
-  error. The UI connection is disposable: turns run detached from any SSE
-  connection and resume from the journal.
+- **Per-session journal SSE:** `GET /native/session/{id}/events?after=<seq>`
+  streams durable journal frames (`id: <seq>`, `event: <kind>`, `data:` the
+  `/native/events` row shape); `after` replays `seq > after` (0 = from the
+  beginning). Catch-up is paged (≤ 256 events per poll), so a reconnect
+  against a huge journal never balloons RAM and resumes exactly from the
+  cursor. While the page is exhausted the stream emits `event: heartbeat`
+  frames (250 ms poll cadence, 5 s SSE keep-alive), so it stays open.
+- **Cursor pages:** `GET /native/events?session=&after=&limit=` serves the
+  same durable read as a strict-DTO page (`hasMore`/`nextCursor`);
+  `GET /native/messages?session=&before=&limit=` pages durable message rows
+  newest first (`hasMore`/`nextBefore`); `GET /native/providers` lists the
+  registered provider instances. There is no global event bus, no
+  `GlobalEvent` envelope and no coalescing layer on the client surface:
+  live provider deltas are an in-process `ChunkSink` the daemon drains, and
+  clients observe durable truth by cursor.
+- **Resume semantics:** `after` replays events with id > n; hostile or
+  oversized cursors are never turned into errors — the stream stays open
+  and the client re-receives from the resulting cursor. The UI connection
+  is disposable: turns run detached from any SSE connection and resume from
+  the journal.
 
 ---
 
@@ -781,8 +782,8 @@ them; soak/perf runs are `#[ignore]`-gated (see §14).
 | Compaction convergence | must land ≤ hard_cap, never grow | compactor tests |
 | Terminal output ring | 200 lines live; artifact spill ≥ 100 MiB | terminal tests |
 | Tool result excerpt | truncated to 2000 chars on the wire | agent runtime |
-| SSE delta coalescing | 50 ms window, 8 KiB/frame cap | server coalesce tests |
-| Global event ring | 4096 frames replay capacity | server global bus |
+| Agent chunk coalescing | 1024-event bounded channel; 64 KiB drop-oldest pending frame | agent `ChunkSink` tests |
+| Journal SSE catch-up page | ≤ 256 events per poll, cursor-resumable | server native SSE tests |
 | Message page | ≤ 200 messages per page, `has_more` | session paging tests |
 | Prompt bound | 512 KiB (max 64 files, 4 KiB path each) | session bounds |
 | Message / part / tool-args / ledger / artifact / verify caps | 1 MiB / 4 MiB / 4 MiB / 1 MiB / 64 MiB / 64 MiB | session bounds |
@@ -859,6 +860,11 @@ cursor-based paging, and the native endpoints under `/native/...` plus the
 projection/catalog surfaces. It is not a compatibility artifact — it
 evolves with the runtime, and its tests are ordinary crate tests.
 
+"v1" is a documentation label, not a wire constant: the code defines no
+native protocol version constant. `faktor-core` exports only `VERSION`
+(the crate version) and `UX_BASELINE`; the contract is the daemon's route
+set plus its strict DTOs.
+
 The **pre-cutover wire-compatibility subsystem was retired by explicit
 owner decision**: the frozen routes, the mirrored DTOs, the fixture corpus,
 the fixture generators/replayers and the compatibility certification lane
@@ -888,3 +894,26 @@ the only rendering implementations.
 - **Error mapping:** `faktor_protocol::error::from_core` maps every
   `faktor-core` error to an `ApiError { code, message, http_status,
   retryable }`.
+
+---
+
+## 17. Daemon configuration (`faktor-plus.json`)
+
+The daemon config file is strict JSON: `config_version` 1 is the only
+accepted version (absent defaults to 1), unknown keys anywhere are parse
+errors, and provider keys are referenced by environment-variable name —
+the runtime never stores secrets. Base sections (`providers`, `mcp`,
+`verification`, `sandbox`, `tasks`, `completion`, `efficiency`,
+`embeddings`) keep their crate docs; the parsed-but-previously-undocumented
+sections are:
+
+| Section | Purpose | Defaults |
+|---|---|---|
+| top-level `semantic` | Additive semantic-provider registry config. Extracted and strictly parsed from the raw document BEFORE the frozen `Config` shape sees it (`serve_config_and_semantic`), so the key never reaches the strict layer. | Absent/`null` keeps `graph::SemanticCfg::default()`: fallback-only registry, optional `max_payload_bytes`/`max_entity_refs` caps, `providers` empty. Unknown keys inside the section fail startup. |
+| `[cloud]` | Commercial control plane (identity/org/RBAC) and the durable SCM store. | `enabled = false` (every control-plane route answers 409 `cloud_disabled`, no database file); `database = control-plane.db`, `scm_database = scm.db`, `payload_dir = payloads`; optional `[cloud.sso]` and `[cloud.github_app]` sub-sections, both disabled by default. |
+| `[billing]` | Commercial metering service: durable usage ledger, entitlements and credits. | `enabled = false` (billing routes answer 409 `billing_disabled`, no billing database); `database = billing.db`; `organization` required when enabled; `account`/`account_name` optional; `managed = true` (Faktor-managed spend may debit credits; `false` = BYOK-only); `default_plan`/`plans`/`managed_providers` are the only feature/limit and managed-provider sources; `[billing.report]` disabled (interval 60 s, period 24 h, catch-up cap 24, attempts cap 5). |
+| `[updater]` | Signed updater/distribution lifecycle: channels, ed25519 operator keys, staged content-addressed installs. | `enabled = false` (409 `updater_disabled`, no `update.db` and no install directory); `channel = stable`; `install_root = install`; `keys` required when enabled (an empty allowlist refuses every manifest); `max_artifact_bytes = 256 MiB` (cap 4 GiB); `clock_skew_ms = 5 min` (cap 1 h); `allow_legacy_manifests_once = false`. |
+| `[workers]` | Remote/VPC worker plane: registration tokens, immutable job generations, leases, heartbeats, placement seam. | `enabled = false` (409 `workers_disabled`, no worker database, local execution unchanged); `database = workers.db`; `organization` required when enabled; `trust_domain` defaults to the organization id; placement requirements `os`/`arch`/`toolchains`/`network`/`region`/`min_cpu_cores`/`min_memory_mb`/`gpu` default empty = any registered worker of the trust domain. |
+| `[worker_plane]` | The deployment boundary of the worker HTTP surface: a SECOND listener with its own identity, separate from the loopback native listener. | `enabled = false` (no second socket); `bind = 127.0.0.1:8790` (a non-loopback bind is refused unless `trusted_gateway = true` acknowledges the gateway); `tls = false` (`true` is a typed startup refusal — no inbound TLS stack is compiled); `auth = worker_tokens` (`gateway_mtls` requires `trusted_gateway`); `bearer` optional transport credential; the daemon password is never accepted on the worker socket. Enabling it requires `[workers] enabled = true`. |
+| `[enterprise]` | Enterprise retention/audit/admin plane: retention classes + guarded GC, append-only audit ledger, deletion jobs, admin settings, layered config. | `enabled = false` (409 `enterprise_disabled`, no enterprise database); `database = enterprise.db`; `organization` required when enabled; `policy`/`preferences` are the local organization-policy and user-preference layers (empty = no layer). |
+| `[worker_node]` | THIS host acting as a remote worker node of a control plane (the client half of `[workers]`). | `enabled = false` (`faktor worker run` refuses typed before any network or filesystem effect); when enabled `worker_id`, `control_plane_url`, `trust_domain` and exactly one of `token`/`token_payload` are required; capability advertisement `os`/`arch`/`toolchains`/`sandbox`/`network`/`region`/`cpu_cores`/`memory_mb`/`gpu`; `payload_dir` defaults to `<data_dir>/worker_payloads`; `discard_workspace_on_success = true`; `iterations` is bounded by the worker crate. |

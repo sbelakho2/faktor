@@ -194,7 +194,9 @@ mod tests {
     fn process_requires_a_tracked_owner_op() {
         let (_d, m) = test_manager();
         let s = session(&m);
-        let err = s.register_process(1, m.next_op_id()).unwrap_err();
+        let err = s
+            .register_process(1, m.try_next_op_id().unwrap())
+            .unwrap_err();
         assert_eq!(err.kind, faktor_core::ErrorKind::NotFound);
     }
 

@@ -137,7 +137,7 @@ async fn cold_start_under_150ms() {
         deps.permission_requester = perm.clone();
         faktor_agent::AgentRuntime::new(deps).unwrap()
     };
-    let deps = faktor_server::ServerDeps::new(session.clone(), agent, perm);
+    let deps = faktor_server::ServerDeps::new(session.clone(), agent, perm).unwrap();
     let t0 = Instant::now();
     let handle = faktor_server::serve(deps, 0).await.unwrap();
     let elapsed = t0.elapsed();

@@ -51,7 +51,8 @@ fn open_fix(limits: ShadowCopyLimits) -> Fix {
         .create_session(ws, "shadow-service", "fake", "m")
         .unwrap()
         .id();
-    let shadows = ShadowRoots::new_with_limits(manager.clone(), dir.path().join("shadows"), limits);
+    let shadows =
+        ShadowRoots::new_with_limits(manager.clone(), dir.path().join("shadows"), limits).unwrap();
     Fix {
         _dir: dir,
         manager,
@@ -614,7 +615,8 @@ fn symlink_escape_from_shadow_copy_rejected() {
         manager.clone(),
         dir.path().join("shadows"),
         default_limits(),
-    );
+    )
+    .unwrap();
     let err = shadows
         .begin_shadow(session, &user)
         .expect_err("escape refused");
@@ -718,7 +720,8 @@ fn zero_caps_refused_at_construction() {
             max_entries: 0,
             max_total_bytes: 1,
         },
-    );
+    )
+    .unwrap();
 }
 
 #[test]
@@ -826,7 +829,7 @@ fn drop_removes_every_live_shadow() {
         fs::create_dir_all(u).unwrap();
         fs::write(u.join("a.txt"), b"alpha").unwrap();
     }
-    let shadows = ShadowRoots::new(manager.clone(), dir.path().join("shadows"));
+    let shadows = ShadowRoots::new(manager.clone(), dir.path().join("shadows")).unwrap();
     let ws_a = manager.create_workspace(user_a.to_str().unwrap()).unwrap();
     let ws_b = manager.create_workspace(user_b.to_str().unwrap()).unwrap();
     let s_a = manager.create_session(ws_a, "a", "fake", "m").unwrap().id();
@@ -931,7 +934,7 @@ fn crash_between_discard_and_persist_reconciles_without_double_discard() {
             .create_session(ws, "crash", "fake", "m")
             .unwrap()
             .id();
-        let shadows = ShadowRoots::new(manager.clone(), dir.path().join("shadows"));
+        let shadows = ShadowRoots::new(manager.clone(), dir.path().join("shadows")).unwrap();
         let shadow = shadows.begin_shadow(session, &user).unwrap();
         shadow_id = shadow.shadow_id.clone();
         // Crash window A (remove-first): the directory is gone but the row
@@ -943,7 +946,7 @@ fn crash_between_discard_and_persist_reconciles_without_double_discard() {
     // The next open reconciles the live row whose directory vanished.
     let manager2 =
         SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
-    let shadows2 = ShadowRoots::new(manager2.clone(), dir.path().join("shadows"));
+    let shadows2 = ShadowRoots::new(manager2.clone(), dir.path().join("shadows")).unwrap();
     let actions = shadows2.reconcile().unwrap();
     assert!(
         actions.iter().any(|a| a.contains("directory gone")),
@@ -1029,7 +1032,7 @@ fn shadow_survives_reopen_with_its_run_base() {
             .create_session(ws, "reopen", "fake", "m")
             .unwrap()
             .id();
-        let shadows = ShadowRoots::new(manager.clone(), dir.path().join("shadows"));
+        let shadows = ShadowRoots::new(manager.clone(), dir.path().join("shadows")).unwrap();
         let shadow = shadows.begin_shadow(session, &user).unwrap();
         // The shadowed drive wrote before the crash...
         fs::write(shadow.root.join("a.txt"), b"agent post-crash state").unwrap();
@@ -1051,7 +1054,7 @@ fn shadow_survives_reopen_with_its_run_base() {
     // The daemon restarts: reopen reads the durable shadow row + dir.
     let manager2 =
         SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
-    let shadows2 = ShadowRoots::new(manager2.clone(), dir.path().join("shadows"));
+    let shadows2 = ShadowRoots::new(manager2.clone(), dir.path().join("shadows")).unwrap();
     let row = manager2.shadow_row(session).unwrap().expect("row survives");
     assert_eq!(row.shadow_id, shadow_id);
     assert_eq!(row.state, ShadowRowState::Active);
@@ -1078,4 +1081,39 @@ fn shadow_survives_reopen_with_its_run_base() {
         Some(run_base_hash.as_str())
     );
     assert_eq!(fs::read(user.join("a.txt")).unwrap(), b"alpha");
+}
+
+/// The residual fixture path: a degenerate/empty shadow root must refuse
+/// TYPED (never silently resolve under the process working directory), and
+/// the refusal must be the exact [`ShadowRootError::DegenerateRoot`] — with
+/// the anchored relative form (`./shadows`) still accepted.
+#[test]
+fn degenerate_shadow_roots_refuse_typed_and_anchored_relative_roots_are_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    // Every degenerate spelling: the empty path, the bare relative `shadows`
+    // (`PathBuf::new().join("shadows")` — the empty-store-root derivation),
+    // and the no-directory-component paths.
+    for degenerate in [
+        PathBuf::new(),
+        PathBuf::from("shadows"),
+        PathBuf::from("."),
+        PathBuf::from(".."),
+        PathBuf::from("/"),
+    ] {
+        match ShadowRoots::new(manager.clone(), degenerate.clone()) {
+            Err(ShadowRootError::DegenerateRoot { root, .. }) => assert_eq!(root, degenerate),
+            Ok(_) => panic!("degenerate root {degenerate:?} must refuse typed, never fall back"),
+        }
+    }
+    // No alternate construction path bypasses the check either.
+    assert!(matches!(
+        ShadowRoots::new_with_limits(manager.clone(), PathBuf::new(), default_limits()),
+        Err(ShadowRootError::DegenerateRoot { .. })
+    ));
+    // The anchored relative form carries a real parent and is accepted (the
+    // service creates it on first use only — construct here is enough).
+    let accepted = ShadowRoots::new(manager.clone(), PathBuf::from("./shadows")).unwrap();
+    assert_eq!(accepted.shadows_root(), Path::new("./shadows"));
 }

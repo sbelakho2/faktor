@@ -5124,3 +5124,136 @@ async fn admission_gate_is_consulted_at_every_gated_boundary_and_never_on_cancel
         other => panic!("expected a typed AdmissionRefused, got {other:?}"),
     }
 }
+
+/// Decoded registry-row identity ids are HOSTILE input: zero in any identity
+/// field is a typed refusal at the decode boundary — never a panic in an id
+/// constructor (`SessionId::new(0)`), never a silently projected row, and
+/// never a fabricated graph node.
+#[tokio::test]
+async fn corrupt_registry_row_identity_ids_are_typed_refusals_never_panics() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(dir.path(), vec![], 0);
+    let parent_handle = env.manager.get_session(env.parent).unwrap().unwrap();
+    let valid = ChildRuntime {
+        child_id: "child-0".into(),
+        parent_session_id: env.parent.raw(),
+        run_id: "run-corrupt".into(),
+        item_id: "impl".into(),
+        kind: WorkKind::Implementation,
+        session_id: 7,
+        operation_id: 0,
+        workspace_id: env.owner.workspace_id,
+        worktree_id: env.owner.worktree_id,
+        ownership: ChildOwnership::ReadOnlyShared,
+        ownership_paths: vec![],
+        state: ChildState::Running,
+        budget_max_tokens: None,
+        permissions: CapabilitySet::new(),
+        model_policy: ModelPolicy::default(),
+        blocker_kind: None,
+        blocker_reason: None,
+        blocker_dependency: None,
+        blocker_resolution: None,
+        last_progress_ms: None,
+        created_ms: 1,
+        updated_ms: 1,
+        base_snapshot_id: None,
+        run_base_snapshot: None,
+        env_snapshot_id: None,
+        execution_phase: ExecutionPhase::default(),
+    };
+
+    // Per identity field: zero fails `validate_durable` typed, naming the
+    // field — while u64::MAX stays a valid, exact id (no truncation).
+    type Corrupt = fn(&mut ChildRuntime);
+    let cases: [(&str, Corrupt); 4] = [
+        ("session_id", |r| r.session_id = 0),
+        ("parent_session_id", |r| r.parent_session_id = 0),
+        ("workspace_id", |r| r.workspace_id = 0),
+        ("worktree_id", |r| r.worktree_id = 0),
+    ];
+    for (field, corrupt) in cases {
+        let mut row = valid.clone();
+        corrupt(&mut row);
+        let err = row
+            .validate_durable()
+            .expect_err(&format!("zero {field} must be refused"));
+        assert!(matches!(err, ExecError::Malformed(_)), "{err:?}");
+        assert!(err.to_string().contains(field), "{err}");
+    }
+    let mut extreme = valid.clone();
+    extreme.session_id = u64::MAX;
+    extreme
+        .validate_durable()
+        .expect("u64::MAX is a valid nonzero id");
+
+    // Valid durable row: decodes and round-trips through the registry read.
+    parent_handle
+        .upsert_memory_fact(
+            REGISTRY_ROW_KIND,
+            "run-corrupt/child-0",
+            &serde_json::to_string(&valid).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-corrupt")
+            .unwrap()
+            .len(),
+        1,
+        "the valid row round-trips"
+    );
+
+    // Corrupt durable row (session_id 0): typed decode refusal, no panic.
+    let mut hostile = valid.clone();
+    hostile.session_id = 0;
+    parent_handle
+        .upsert_memory_fact(
+            REGISTRY_ROW_KIND,
+            "run-corrupt/child-0",
+            &serde_json::to_string(&hostile).unwrap(),
+        )
+        .unwrap();
+    let err = OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-corrupt")
+        .expect_err("a zero session id must be refused at the decode boundary");
+    assert_eq!(err.kind, faktor_core::ErrorKind::Malformed, "{err:?}");
+    assert!(err.message.contains("session_id 0"), "{err:?}");
+
+    // Non-returning projection backstops never panic on the hostile row.
+    let mut projected = hostile.clone();
+    OrchestratorRuntime::derive_child_projection(&env.manager, &mut projected);
+    let err = OrchestratorRuntime::child_presentation(env.manager.clone(), &hostile)
+        .expect_err("child presentation of a malformed row is a typed error");
+    assert_eq!(err.kind, faktor_core::ErrorKind::Malformed, "{err:?}");
+    assert!(err.message.contains("session_id"), "{err:?}");
+    assert!(child_task_budget_cap(&env.manager, 0).is_none());
+    assert_eq!(
+        child_execution_phase(&env.manager, 0),
+        ExecutionPhase::default()
+    );
+
+    // Graph assembly over the same corrupt row: typed GraphError, never a
+    // panic and never a fabricated node.
+    let plan = TaskPlan {
+        goal: "corrupt graph".into(),
+        non_goals: vec![],
+        constraints: vec![],
+        work_items: vec![],
+    };
+    let config = ExecConfig {
+        run_id: "run-corrupt".into(),
+        ceilings: Ceilings::default(),
+        parent_caps: CapabilitySet::new(),
+        provider: "fake".into(),
+        default_model: "m".into(),
+        isolated_root: dir.path().join("iso"),
+        crash_seam: None,
+    };
+    env.orchestrator
+        .put_plan_row(&plan, &env.owner, &config, &[])
+        .unwrap();
+    let err = env
+        .orchestrator
+        .operation_graph_run(env.parent, "run-corrupt")
+        .expect_err("a zero session id must refuse graph assembly");
+    assert!(matches!(err, GraphError::Malformed(_)), "{err:?}");
+}

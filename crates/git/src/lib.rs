@@ -311,6 +311,27 @@ fn empty_meta() -> Meta {
     Meta { worktrees: vec![] }
 }
 
+/// Allocate the next worktree id from the process-wide monotonic counter.
+/// Exhaustion is a TYPED internal error — [`u64::MAX`] has no successor — and
+/// the counter is left untouched, so an id is never wrapped or reused.
+fn allocate_worktree_id(next_id: &std::sync::atomic::AtomicU64) -> Result<WorktreeId, Error> {
+    let raw = next_id
+        .fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |current| current.checked_add(1),
+        )
+        .map_err(|_| {
+            Error::internal("worktree id allocator exhausted: u64::MAX has no successor")
+        })?;
+    WorktreeId::try_from(raw).map_err(|err| {
+        Error::internal(format!(
+            "worktree id allocator returned {raw}: {}",
+            err.message
+        ))
+    })
+}
+
 /// Validated parse: serde + bounded entry count + per-entry bounds. A
 /// hostile or oversized file is `None` (never a partial authority).
 fn parse_meta(bytes: &[u8]) -> Option<Meta> {
@@ -452,6 +473,39 @@ impl WorktreeManager {
         }
     }
 
+    /// Reconcile the allocator with durable metadata ids: the counter is
+    /// advanced (NEVER lowered — in-flight minted-but-unpersisted ids must
+    /// stay reserved) to `max(durable ids)+1`. A durable [`u64::MAX`] id has
+    /// no successor: typed internal error, never a wrap that would reuse an
+    /// id already recorded in the metadata.
+    fn reconcile_next_id(&self, meta: &Meta) -> Result<(), Error> {
+        let Some(max_id) = meta.worktrees.iter().map(|e| e.id).max() else {
+            return Ok(());
+        };
+        let next = max_id.checked_add(1).ok_or_else(|| {
+            Error::internal(format!(
+                "worktree id allocator exhausted: durable metadata carries id {max_id}"
+            ))
+        })?;
+        self.next_id
+            .fetch_max(next, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// One allocator bump for this manager (typed on exhaustion, never a wrap).
+    fn allocate_id(&self) -> Result<WorktreeId, Error> {
+        allocate_worktree_id(&self.next_id)
+    }
+
+    /// Reconcile then log the load. Every load — including a load of
+    /// corrupt/re-discovered/restored metadata — advances the allocator past
+    /// every id the durable file still carries, so a minted id can never
+    /// collide with a recorded one.
+    fn loaded_meta(&self, meta: Meta, diagnostics: Vec<MetaDiagnostic>) -> Result<MetaLoad, Error> {
+        self.reconcile_next_id(&meta)?;
+        Ok(MetaLoad::finish(MetaLoad { meta, diagnostics }, self))
+    }
+
     /// Load the durable metadata with the legacy-name migration. The NEW
     /// name is the sole authority whenever it exists (even corrupt — a
     /// stale legacy copy is never silently resurrected on top of it).
@@ -464,7 +518,7 @@ impl WorktreeManager {
     /// - a CORRUPT legacy file is retained for postmortem, reported as a
     ///   visible diagnostic and treated as empty (recovery is re-discovery
     ///   by the manager — never a silent first boot).
-    fn load_meta_detailed(&self, workspace_root: &Path) -> MetaLoad {
+    fn load_meta_detailed(&self, workspace_root: &Path) -> Result<MetaLoad, Error> {
         let current = meta_path(workspace_root);
         let legacy = legacy_meta_path(workspace_root);
         let mut diagnostics = Vec::new();
@@ -472,18 +526,12 @@ impl WorktreeManager {
             Ok(bytes) => {
                 let Some(meta) = parse_meta(&bytes) else {
                     diagnostics.push(MetaDiagnostic::CorruptCurrent { path: current });
-                    return MetaLoad::finish(
-                        MetaLoad {
-                            meta: empty_meta(),
-                            diagnostics,
-                        },
-                        self,
-                    );
+                    return self.loaded_meta(empty_meta(), diagnostics);
                 };
                 if legacy.exists() {
                     retire_legacy(&legacy, &mut diagnostics);
                 }
-                MetaLoad::finish(MetaLoad { meta, diagnostics }, self)
+                self.loaded_meta(meta, diagnostics)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => match std::fs::read(&legacy) {
                 Ok(bytes) => {
@@ -491,13 +539,7 @@ impl WorktreeManager {
                         diagnostics.push(MetaDiagnostic::CorruptLegacy {
                             path: legacy.clone(),
                         });
-                        return MetaLoad::finish(
-                            MetaLoad {
-                                meta: empty_meta(),
-                                diagnostics,
-                            },
-                            self,
-                        );
+                        return self.loaded_meta(empty_meta(), diagnostics);
                     };
                     match serde_json::to_vec(&meta) {
                         Ok(serialized) => {
@@ -522,27 +564,17 @@ impl WorktreeManager {
                             detail: e.to_string(),
                         }),
                     }
-                    MetaLoad::finish(MetaLoad { meta, diagnostics }, self)
+                    self.loaded_meta(meta, diagnostics)
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => MetaLoad::finish(
-                    MetaLoad {
-                        meta: empty_meta(),
-                        diagnostics,
-                    },
-                    self,
-                ),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.loaded_meta(empty_meta(), diagnostics)
+                }
                 Err(e) => {
                     diagnostics.push(MetaDiagnostic::LegacyUnreadable {
                         path: legacy,
                         detail: e.to_string(),
                     });
-                    MetaLoad::finish(
-                        MetaLoad {
-                            meta: empty_meta(),
-                            diagnostics,
-                        },
-                        self,
-                    )
+                    self.loaded_meta(empty_meta(), diagnostics)
                 }
             },
             Err(e) => {
@@ -550,44 +582,35 @@ impl WorktreeManager {
                     path: current,
                     detail: e.to_string(),
                 });
-                MetaLoad::finish(
-                    MetaLoad {
-                        meta: empty_meta(),
-                        diagnostics,
-                    },
-                    self,
-                )
+                self.loaded_meta(empty_meta(), diagnostics)
             }
         }
     }
 
     /// The metadata only (diagnostics logged once per load).
-    fn load_meta(&self, workspace_root: &Path) -> Meta {
-        self.load_meta_detailed(workspace_root).meta
+    fn load_meta(&self, workspace_root: &Path) -> Result<Meta, Error> {
+        Ok(self.load_meta_detailed(workspace_root)?.meta)
     }
 
-    /// Durable metadata save with CAS discipline (spec §33): a UNIQUE temp
-    /// file name per write (never a shared fixed name — concurrent writers
-    /// cannot interleave into one torn file), then write + flush + fsync the
-    /// file, rename over the final, and fsync the parent directory so the
-    /// rename itself survives a crash. Best-effort by design: metadata loss
-    /// is recoverable by re-discovery, so any failed step logs a warning
-    /// and never fails the surrounding git operation.
-    fn save_meta(&self, workspace_root: &Path, meta: &Meta) {
+    /// Durable metadata write: a UNIQUE temp file name per write (never a
+    /// shared fixed name — concurrent writers cannot interleave into one torn
+    /// file), then write + flush + fsync the file, rename over the final, and
+    /// fsync the parent directory so the rename itself survives a crash.
+    fn write_meta(&self, workspace_root: &Path, meta: &Meta) -> std::io::Result<()> {
         let path = meta_path(workspace_root);
-        let Some(dir) = path.parent() else {
-            return;
-        };
+        let dir = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("metadata path {} has no parent directory", path.display()),
+            )
+        })?;
         if !dir.is_dir() {
-            return;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("metadata directory {} does not exist", dir.display()),
+            ));
         }
-        let bytes = match serde_json::to_vec(meta) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "metadata serialization failed");
-                return;
-            }
-        };
+        let bytes = serde_json::to_vec(meta).map_err(std::io::Error::other)?;
         let tmp = unique_meta_tmp_path(&path);
         if let Err(e) = (|| -> std::io::Result<()> {
             let mut f = std::fs::OpenOptions::new()
@@ -601,9 +624,8 @@ impl WorktreeManager {
             std::fs::rename(&tmp, &path)?;
             Ok(())
         })() {
-            tracing::warn!(path = %path.display(), tmp = %tmp.display(), error = %e, "durable metadata save failed; ownership recoverable by re-discovery");
             let _ = std::fs::remove_file(&tmp); // best-effort cleanup
-            return;
+            return Err(e);
         }
         // fsync the parent directory so the rename is durable (an opened
         // directory fsyncs fine on macOS and Linux).
@@ -617,6 +639,36 @@ impl WorktreeManager {
                 tracing::warn!(dir = %dir.display(), error = %e, "cannot open metadata directory for fsync")
             }
         }
+        Ok(())
+    }
+
+    /// Best-effort durable metadata save (spec §33): metadata loss is
+    /// recoverable by re-discovery, so a failed step logs a warning and never
+    /// fails the surrounding git operation. Idempotent ownership updates
+    /// (transfer/remove/repair) use this; a path that MINTS an id must use
+    /// [`Self::save_meta_strict`] instead so the id is durable before it is
+    /// handed out.
+    fn save_meta(&self, workspace_root: &Path, meta: &Meta) {
+        if let Err(e) = self.write_meta(workspace_root, meta) {
+            tracing::warn!(
+                path = %meta_path(workspace_root).display(),
+                error = %e,
+                "durable metadata save failed; ownership recoverable by re-discovery"
+            );
+        }
+    }
+
+    /// Persist-before-mint: a minted worktree id is only usable/returned
+    /// after the metadata recording it is durable. A failed write is a typed
+    /// internal error, so no caller ever receives an id that a crash could
+    /// hand out again.
+    fn save_meta_strict(&self, workspace_root: &Path, meta: &Meta) -> Result<(), Error> {
+        self.write_meta(workspace_root, meta).map_err(|e| {
+            Error::internal(format!(
+                "durable worktree metadata write to {} failed: {e}",
+                meta_path(workspace_root).display()
+            ))
+        })
     }
 
     fn meta_entry(wt: &Worktree, created_ms: i64) -> MetaEntry {
@@ -1024,6 +1076,13 @@ impl WorktreeManager {
 
     // ---------------------------------------------------------------- worktrees
 
+    /// Create a worktree. The id is RESERVED DURABLY before the git mutation
+    /// and before any hand-off (reserve-before-use): the durable row for
+    /// `(id, path)` lands first, so a crash between mint and persist can
+    /// never hand out — or later re-mint — an id with no durable record. A
+    /// failed git add rolls the reservation back best-effort; a crash before
+    /// the rollback leaves a row that [`Self::repair`] prunes (the path does
+    /// not exist).
     pub async fn create(
         &self,
         workspace_root: &Path,
@@ -1033,43 +1092,57 @@ impl WorktreeManager {
     ) -> Result<Worktree, Error> {
         validate_branch(branch)?;
         validate_name(name)?;
-        let id = self
-            .next_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if id == 0 {
-            return Err(Error::internal("worktree id overflow"));
-        }
         // Canonicalize so recorded paths match git's own absolute output.
         let workspace_root = workspace_root.canonicalize().map_err(|e| {
             Error::not_found(format!("workspace {}: {e}", workspace_root.display()))
         })?;
         let wt_path = workspace_root.join(format!(".worktrees/{name}"));
         let owner_po = ProcessOwner::Session(owner);
-        self.git_mutate_os(
-            &workspace_root,
-            &worktree_add_args(branch, &wt_path),
-            owner_po.clone(),
-        )
-        .await?;
-        let wt = Worktree {
-            id: WorktreeId::new(id),
-            workspace_root: workspace_root.to_path_buf(),
-            path: wt_path,
-            branch: branch.to_string(),
-            owner_session: Some(owner),
+        // Reservation scope: metadata only, no git function runs here.
+        let wt = {
+            let _guard = self.meta_lock.lock().await;
+            let mut meta = self.load_meta(&workspace_root)?;
+            let wt = Worktree {
+                id: self.allocate_id()?,
+                workspace_root: workspace_root.clone(),
+                path: wt_path.clone(),
+                branch: branch.to_string(),
+                owner_session: Some(owner),
+            };
+            // A retry after a crashed create replaces the stale row instead
+            // of stacking a second row for the same path.
+            let key = path_key(&wt.path);
+            meta.worktrees
+                .retain(|e| path_key(Path::new(&e.path)) != key);
+            meta.worktrees.push(Self::meta_entry(
+                &wt,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0),
+            ));
+            self.save_meta_strict(&workspace_root, &meta)?;
+            wt
         };
-        // Durable ownership record (spec §33: transfer changes owner
-        // durably — the git worktree itself has no owner concept).
-        let _guard = self.meta_lock.lock().await;
-        let mut meta = self.load_meta(&workspace_root);
-        meta.worktrees.push(Self::meta_entry(
-            &wt,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0),
-        ));
-        self.save_meta(&workspace_root, &meta);
+        if let Err(e) = self
+            .git_mutate_os(
+                &workspace_root,
+                &worktree_add_args(branch, &wt_path),
+                owner_po,
+            )
+            .await
+        {
+            // The reservation must not outlive a failed creation: drop it
+            // best-effort (repair() prunes a stale row regardless).
+            let _guard = self.meta_lock.lock().await;
+            if let Ok(mut meta) = self.load_meta(&workspace_root) {
+                let key = path_key(&wt_path);
+                meta.worktrees
+                    .retain(|e| path_key(Path::new(&e.path)) != key);
+                self.save_meta(&workspace_root, &meta);
+            }
+            return Err(e);
+        }
         Ok(wt)
     }
 
@@ -1089,7 +1162,7 @@ impl WorktreeManager {
         // and in-memory work here; no git function runs while the metadata
         // lock is held.
         let _guard = self.meta_lock.lock().await;
-        let mut meta = self.load_meta(workspace_root);
+        let mut meta = self.load_meta(workspace_root)?;
         let by_path: std::collections::HashMap<String, MetaEntry> = meta
             .worktrees
             .iter()
@@ -1102,22 +1175,32 @@ impl WorktreeManager {
                      worktrees: &mut Vec<Worktree>,
                      by_path: &std::collections::HashMap<String, MetaEntry>,
                      workspace_root: &Path,
-                     next_id: &std::sync::atomic::AtomicU64| {
+                     next_id: &std::sync::atomic::AtomicU64|
+         -> Result<(), Error> {
             if let Some((path, branch)) = current.take() {
                 let meta_entry = by_path.get(&path_key(Path::new(&path)));
-                let id = meta_entry
-                    .map(|e| e.id)
-                    .unwrap_or_else(|| next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
-                let owner = meta_entry
-                    .and_then(|e| (e.owner_session != 0).then(|| SessionId::new(e.owner_session)));
+                // Durable metadata ids are decoded input: zero/oversized raw
+                // values go through the fallible TryFrom surface and fail
+                // typed naming the row — never a panic and never a wrap.
+                let id = match meta_entry {
+                    Some(e) => WorktreeId::try_from(e.id).map_err(|err| {
+                        Error::malformed(format!(
+                            "worktree metadata entry {:?} carries id {}: {}",
+                            e.path, e.id, err.message
+                        ))
+                    })?,
+                    None => allocate_worktree_id(next_id)?,
+                };
+                let owner = meta_entry.and_then(|e| SessionId::try_from(e.owner_session).ok());
                 worktrees.push(Worktree {
-                    id: WorktreeId::new(id),
+                    id,
                     workspace_root: workspace_root.to_path_buf(),
                     path: PathBuf::from(&path),
                     branch,
                     owner_session: owner,
                 });
             }
+            Ok(())
         };
         for line in out.lines() {
             if let Some(path) = line.strip_prefix("worktree ") {
@@ -1127,7 +1210,7 @@ impl WorktreeManager {
                     &by_path,
                     workspace_root,
                     &self.next_id,
-                );
+                )?;
                 current = Some((path.trim().to_string(), String::new()));
             } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
                 if let Some((_, b)) = current.as_mut() {
@@ -1141,7 +1224,7 @@ impl WorktreeManager {
             &by_path,
             workspace_root,
             &self.next_id,
-        );
+        )?;
         // Record metadata for previously unknown worktrees (stable ids and
         // unowned markers persist across restarts).
         for wt in &worktrees {
@@ -1158,7 +1241,10 @@ impl WorktreeManager {
             }
         }
         if saw_new {
-            self.save_meta(workspace_root, &meta);
+            // Persist-before-handout: the ids just minted for unknown
+            // worktrees must be durable before the caller sees them, so a
+            // crash/restore can never re-mint one of them.
+            self.save_meta_strict(workspace_root, &meta)?;
         }
         Ok(worktrees)
     }
@@ -1899,7 +1985,7 @@ impl WorktreeManager {
         )
         .await?;
         let _guard = self.meta_lock.lock().await;
-        let mut meta = self.load_meta(&wt.workspace_root);
+        let mut meta = self.load_meta(&wt.workspace_root)?;
         let key = path_key(&wt.path);
         meta.worktrees
             .retain(|e| path_key(Path::new(&e.path)) != key);
@@ -1916,7 +2002,7 @@ impl WorktreeManager {
             )));
         }
         let _guard = self.meta_lock.lock().await;
-        let mut meta = self.load_meta(&wt.workspace_root);
+        let mut meta = self.load_meta(&wt.workspace_root)?;
         let key = path_key(&wt.path);
         let mut found = false;
         for e in meta.worktrees.iter_mut() {
@@ -1955,7 +2041,7 @@ impl WorktreeManager {
         // scan decides whether git's own bookkeeping needs pruning (the
         // scan is lock-free; a rename-based metadata save is atomic, and a
         // vanished directory is plain filesystem state).
-        let preliminary = self.load_meta(workspace_root);
+        let preliminary = self.load_meta(workspace_root)?;
         let any_vanished = preliminary
             .worktrees
             .iter()
@@ -1970,7 +2056,7 @@ impl WorktreeManager {
         // Phase 2 — metadata cleanup under the metadata lock only. No git
         // function runs between the lock acquisition and its release.
         let _guard = self.meta_lock.lock().await;
-        let mut meta = self.load_meta(workspace_root);
+        let mut meta = self.load_meta(workspace_root)?;
         let mut repaired = Vec::new();
         meta.worktrees.retain(|e| {
             let path = PathBuf::from(&e.path);
@@ -2815,7 +2901,7 @@ mod tests {
             .expect("create must be recorded durably");
         assert_eq!(entry.owner_session, 7);
         assert_eq!(entry.branch, "feat/cas");
-        let reloaded = mgr.load_meta(&repo);
+        let reloaded = mgr.load_meta(&repo).unwrap();
         assert!(
             reloaded
                 .worktrees
@@ -3647,7 +3733,12 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn fresh_install_uses_only_the_new_metadata_name() {
             let (_d, _sup, mgr, repo) = fixture().await;
-            assert!(mgr.load_meta_detailed(&repo).meta.worktrees.is_empty());
+            assert!(mgr
+                .load_meta_detailed(&repo)
+                .unwrap()
+                .meta
+                .worktrees
+                .is_empty());
             assert!(!meta_path(&repo).exists() && !legacy_meta_path(&repo).exists());
             let wt = mgr
                 .create(&repo, "feat/meta", "wt-meta", SessionId::new(5))
@@ -3658,7 +3749,7 @@ mod tests {
                 !legacy_meta_path(&repo).exists(),
                 "a fresh install must never create the legacy name"
             );
-            let load = mgr.load_meta_detailed(&repo);
+            let load = mgr.load_meta_detailed(&repo).unwrap();
             assert!(load.diagnostics.is_empty(), "{:?}", load.diagnostics);
             assert!(load.meta.worktrees.iter().any(|e| {
                 e.owner_session == 5 && path_key(Path::new(&e.path)) == path_key(&wt.path)
@@ -3667,7 +3758,361 @@ mod tests {
             let found = mgr.discover(&repo).await.unwrap();
             assert!(found.iter().any(|w| path_key(&w.path) == path_key(&wt.path)
                 && w.owner_session == Some(SessionId::new(5))));
-            assert!(mgr.load_meta_detailed(&repo).diagnostics.is_empty());
+            assert!(mgr
+                .load_meta_detailed(&repo)
+                .unwrap()
+                .diagnostics
+                .is_empty());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn zero_metadata_worktree_id_is_a_typed_refusal_never_a_panic() {
+            let (_d, _sup, mgr, repo) = fixture().await;
+            let wt = mgr
+                .create(&repo, "feat/zero", "wt-zero", SessionId::new(3))
+                .await
+                .unwrap();
+            // A durable metadata entry whose id is 0: the worktree/branch
+            // parse of `git worktree list` (keyed by the recorded path) must
+            // refuse typed naming the entry — never panic in
+            // `WorktreeId::new(0)`.
+            write_meta_file(
+                &meta_path(&repo),
+                vec![MetaEntry {
+                    id: 0,
+                    path: path_key(&wt.path),
+                    branch: "feat/zero".into(),
+                    owner_session: 3,
+                    created_ms: 1,
+                }],
+            );
+            let err = mgr.discover(&repo).await.unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Malformed, "{err:?}");
+            assert!(err.message.contains("worktree metadata entry"), "{err}");
+            assert!(err.message.contains("id 0"), "{err}");
+
+            // A valid recorded id round-trips through the SAME parse, and the
+            // recorded owner survives.
+            write_meta_file(
+                &meta_path(&repo),
+                vec![MetaEntry {
+                    id: 9,
+                    path: path_key(&wt.path),
+                    branch: "feat/zero".into(),
+                    owner_session: 3,
+                    created_ms: 1,
+                }],
+            );
+            let found = mgr.discover(&repo).await.unwrap();
+            let found_wt = found
+                .iter()
+                .find(|w| path_key(&w.path) == path_key(&wt.path))
+                .expect("the recorded worktree is discovered");
+            assert_eq!(found_wt.id.raw(), 9);
+            assert_eq!(found_wt.owner_session, Some(SessionId::new(3)));
+            assert!(found.iter().all(|w| w.id.raw() != 0));
+
+            // Negative / i64::MIN stored ids are not even u64 JSON: the file
+            // is corrupt and re-discovery mints fresh nonzero ids (no panic,
+            // no wrapped id).
+            std::fs::write(
+                meta_path(&repo),
+                br#"{"worktrees":[{"id":-9223372036854775808,"path":"/x","branch":"b","owner_session":0,"created_ms":0}]}"#,
+            )
+            .unwrap();
+            let recovered = mgr.discover(&repo).await.unwrap();
+            assert!(
+                recovered.iter().all(|w| w.id.raw() != 0),
+                "re-discovery never mints the contract-invalid zero id"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn reopen_reconciles_next_id_with_durable_meta_ids() {
+            let (_d, sup, _mgr, repo) = fixture().await;
+            // Durable ids far above a fresh allocator (which starts at 1).
+            write_meta_file(
+                &meta_path(&repo),
+                vec![
+                    MetaEntry {
+                        id: 40,
+                        path: "/seed/a".into(),
+                        branch: "a".into(),
+                        owner_session: 0,
+                        created_ms: 0,
+                    },
+                    MetaEntry {
+                        id: 900,
+                        path: "/seed/b".into(),
+                        branch: "b".into(),
+                        owner_session: 0,
+                        created_ms: 0,
+                    },
+                    MetaEntry {
+                        id: 7,
+                        path: "/seed/c".into(),
+                        branch: "c".into(),
+                        owner_session: 0,
+                        created_ms: 0,
+                    },
+                ],
+            );
+            // REOPEN: a brand-new manager must reconcile before minting, so
+            // the first id is max(durable ids)+1 — never a collision.
+            let fresh = WorktreeManager::new(sup.clone());
+            let wt = fresh
+                .create(&repo, "feat/reopen", "wt-reopen", SessionId::new(1))
+                .await
+                .unwrap();
+            assert_eq!(
+                wt.id.raw(),
+                901,
+                "a reopen must mint above every durable id"
+            );
+            let mut ids: Vec<u64> = fresh
+                .load_meta(&repo)
+                .unwrap()
+                .worktrees
+                .iter()
+                .map(|e| e.id)
+                .collect();
+            let total = ids.len();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), total, "durable ids must stay unique: {ids:?}");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn metadata_loss_and_restore_never_reuses_a_recorded_id() {
+            let (_d, sup, mgr, repo) = fixture().await;
+            // A durable high-water mark already recorded: ids 5 and 9.
+            write_meta_file(
+                &meta_path(&repo),
+                vec![
+                    MetaEntry {
+                        id: 5,
+                        path: "/seed/a".into(),
+                        branch: "a".into(),
+                        owner_session: 0,
+                        created_ms: 0,
+                    },
+                    MetaEntry {
+                        id: 9,
+                        path: "/seed/b".into(),
+                        branch: "b".into(),
+                        owner_session: 0,
+                        created_ms: 0,
+                    },
+                ],
+            );
+            let before = mgr
+                .create(&repo, "feat/before", "wt-before", SessionId::new(1))
+                .await
+                .unwrap();
+            assert_eq!(before.id.raw(), 10);
+            let snapshot = std::fs::read(meta_path(&repo)).unwrap();
+            // Metadata LOSS: the durable file vanishes; a fresh manager over
+            // the repo starts from scratch.
+            std::fs::remove_file(meta_path(&repo)).unwrap();
+            let during_loss = WorktreeManager::new(sup.clone());
+            let lost = during_loss
+                .create(&repo, "feat/lost", "wt-lost", SessionId::new(1))
+                .await
+                .unwrap();
+            assert_eq!(lost.id.raw(), 1);
+            // RESTORE the pre-loss snapshot (ids 5, 9, 10 reappear): a
+            // reopen must reconcile against the restored rows before minting
+            // and must never re-mint 1, 5, 9 or 10.
+            std::fs::write(meta_path(&repo), &snapshot).unwrap();
+            let after_restore = WorktreeManager::new(sup.clone());
+            let restored = after_restore
+                .create(&repo, "feat/restored", "wt-restored", SessionId::new(1))
+                .await
+                .unwrap();
+            assert_eq!(
+                restored.id.raw(),
+                11,
+                "a restored id may never be re-minted"
+            );
+            assert_ne!(restored.id, lost.id);
+            let mut ids: Vec<u64> = after_restore
+                .load_meta(&repo)
+                .unwrap()
+                .worktrees
+                .iter()
+                .map(|e| e.id)
+                .collect();
+            let total = ids.len();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), total, "no duplicate id may be minted: {ids:?}");
+            assert!(ids.contains(&11));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn id_overflow_is_a_typed_error_never_a_wrap() {
+            let (_d, sup, mgr, repo) = fixture().await;
+            // (a) A durable id at u64::MAX has no successor: loading (and
+            // therefore minting) must refuse typed, never wrap to 0/1.
+            write_meta_file(
+                &meta_path(&repo),
+                vec![MetaEntry {
+                    id: u64::MAX,
+                    path: "/seed/max".into(),
+                    branch: "max".into(),
+                    owner_session: 0,
+                    created_ms: 0,
+                }],
+            );
+            let err = mgr.load_meta_detailed(&repo).err().unwrap();
+            assert_eq!(err.kind, ErrorKind::Internal, "{err:?}");
+            assert!(err.message.contains("exhausted"), "{err}");
+            let err = mgr.discover(&repo).await.unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Internal, "{err:?}");
+            // (b) The allocator itself at u64::MAX: typed refusal, the
+            // counter stays at the ceiling (never wraps or re-mints).
+            std::fs::remove_file(meta_path(&repo)).unwrap();
+            let fresh = WorktreeManager::new(sup.clone());
+            fresh
+                .next_id
+                .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+            let err = fresh.allocate_id().unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Internal, "{err:?}");
+            assert!(err.message.contains("exhausted"), "{err}");
+            assert_eq!(
+                fresh.next_id.load(std::sync::atomic::Ordering::SeqCst),
+                u64::MAX,
+                "an exhausted allocator must never wrap"
+            );
+            let err = fresh
+                .create(&repo, "feat/max", "wt-max", SessionId::new(1))
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Internal, "{err:?}");
+            assert!(
+                !meta_path(&repo).exists(),
+                "a refused mint must not publish metadata"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn concurrent_mints_are_unique_and_durable() {
+            let (_d, _sup, mgr, repo) = fixture().await;
+            let mut handles = Vec::new();
+            for i in 0..8usize {
+                let mgr = mgr.clone();
+                let repo = repo.clone();
+                handles.push(tokio::spawn(async move {
+                    mgr.create(
+                        &repo,
+                        &format!("feat/cc{i}"),
+                        &format!("wt-cc{i}"),
+                        SessionId::new(1),
+                    )
+                    .await
+                    .unwrap()
+                    .id
+                    .raw()
+                }));
+            }
+            let mut ids = Vec::new();
+            for h in handles {
+                ids.push(h.await.unwrap());
+            }
+            let total = ids.len();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), total, "concurrent mints must be unique: {ids:?}");
+            let mut durable: Vec<u64> = mgr
+                .load_meta(&repo)
+                .unwrap()
+                .worktrees
+                .iter()
+                .map(|e| e.id)
+                .collect();
+            let total = durable.len();
+            durable.sort_unstable();
+            durable.dedup();
+            assert_eq!(
+                durable.len(),
+                total,
+                "durable ids must be unique: {durable:?}"
+            );
+            assert!(ids.iter().all(|id| durable.contains(id)));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn crash_window_reservation_is_never_reused_and_is_pruned() {
+            let (_d, sup, _mgr, repo) = fixture().await;
+            // The exact durable state a crash after reserve-before-use leaves:
+            // an id reserved for a worktree whose git add never ran.
+            let ghost_path = repo.join(".worktrees/ghost");
+            write_meta_file(
+                &meta_path(&repo),
+                vec![MetaEntry {
+                    id: 500,
+                    path: path_key(&ghost_path),
+                    branch: "feat/ghost".into(),
+                    owner_session: 1,
+                    created_ms: 1,
+                }],
+            );
+            let fresh = WorktreeManager::new(sup.clone());
+            let wt = fresh
+                .create(&repo, "feat/live", "wt-live", SessionId::new(1))
+                .await
+                .unwrap();
+            assert_eq!(
+                wt.id.raw(),
+                501,
+                "the reserved id must never be minted twice"
+            );
+            let repaired = fresh.repair(&repo).await.unwrap();
+            assert!(
+                repaired.iter().any(|p| p.contains("ghost")),
+                "the stale reservation must be pruned: {repaired:?}"
+            );
+            let ids: Vec<u64> = fresh
+                .load_meta(&repo)
+                .unwrap()
+                .worktrees
+                .iter()
+                .map(|e| e.id)
+                .collect();
+            assert!(
+                !ids.contains(&500),
+                "pruned reservation still durable: {ids:?}"
+            );
+            assert!(ids.contains(&501));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn failed_create_rolls_back_its_durable_reservation() {
+            let (_d, _sup, mgr, repo) = fixture().await;
+            let first = mgr
+                .create(&repo, "feat/dup", "wt-dup", SessionId::new(1))
+                .await
+                .unwrap();
+            // Same branch, different path: git refuses the add, and the
+            // already-persisted reservation for the doomed path must not
+            // survive as a phantom durable row.
+            let err = mgr
+                .create(&repo, "feat/dup", "wt-dup2", SessionId::new(1))
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Internal, "{err:?}");
+            let meta = mgr.load_meta(&repo).unwrap();
+            assert!(
+                meta.worktrees.iter().all(|e| !e.path.ends_with("wt-dup2")),
+                "a failed git add left a durable reservation: {:?}",
+                meta.worktrees
+            );
+            assert!(meta.worktrees.iter().any(|e| e.path.ends_with("wt-dup")));
+            let next = mgr
+                .create(&repo, "feat/next", "wt-next", SessionId::new(1))
+                .await
+                .unwrap();
+            assert!(next.id.raw() > first.id.raw());
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3681,7 +4126,7 @@ mod tests {
                 .unwrap();
             std::fs::rename(meta_path(&repo), legacy_meta_path(&repo)).unwrap();
             assert!(!meta_path(&repo).exists());
-            let load = mgr.load_meta_detailed(&repo);
+            let load = mgr.load_meta_detailed(&repo).unwrap();
             assert!(
                 load.diagnostics
                     .iter()
@@ -3703,14 +4148,18 @@ mod tests {
             let found = mgr.discover(&repo).await.unwrap();
             assert!(found.iter().any(|w| path_key(&w.path) == path_key(&wt.path)
                 && w.owner_session == Some(SessionId::new(77))));
-            assert!(mgr.load_meta_detailed(&repo).diagnostics.is_empty());
+            assert!(mgr
+                .load_meta_detailed(&repo)
+                .unwrap()
+                .diagnostics
+                .is_empty());
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn corrupt_legacy_metadata_is_visible_and_recovered_by_rediscovery() {
             let (_d, _sup, mgr, repo) = fixture().await;
             std::fs::write(legacy_meta_path(&repo), b"{ this is not json").unwrap();
-            let load = mgr.load_meta_detailed(&repo);
+            let load = mgr.load_meta_detailed(&repo).unwrap();
             assert!(load.meta.worktrees.is_empty());
             assert!(
                 load.diagnostics
@@ -3730,7 +4179,7 @@ mod tests {
             assert!(meta_path(&repo).exists(), "recovery publishes the new name");
             // With a valid new authority the diagnostic is gone and the
             // retained legacy file is retired by the load itself.
-            let after = mgr.load_meta_detailed(&repo);
+            let after = mgr.load_meta_detailed(&repo).unwrap();
             assert!(after.diagnostics.is_empty(), "{:?}", after.diagnostics);
             assert!(!legacy_meta_path(&repo).exists());
         }
@@ -3754,7 +4203,7 @@ mod tests {
             };
             write_meta_file(&legacy_meta_path(&repo), vec![old]);
             write_meta_file(&meta_path(&repo), vec![new]);
-            let load = mgr.load_meta_detailed(&repo);
+            let load = mgr.load_meta_detailed(&repo).unwrap();
             assert_eq!(load.meta.worktrees.len(), 1);
             assert_eq!(
                 load.meta.worktrees[0].owner_session, 9,
@@ -3779,7 +4228,7 @@ mod tests {
             };
             write_meta_file(&legacy_meta_path(&repo), vec![old]);
             std::fs::write(meta_path(&repo), b"corrupt").unwrap();
-            let load = mgr.load_meta_detailed(&repo);
+            let load = mgr.load_meta_detailed(&repo).unwrap();
             assert!(load.meta.worktrees.is_empty());
             assert!(
                 load.diagnostics

@@ -353,6 +353,30 @@ impl HookRegistry {
     /// exactly-once audit record.
     pub fn run_one(&self, spec: &HookSpec, input: &HookInput) -> HookVerdict {
         let started = std::time::Instant::now();
+        // Hostile-input boundary: a present-but-invalid session id (zero,
+        // negative, overflowing, non-numeric) is a TYPED refusal naming the
+        // field — never a panic and never a silent daemon-owner fallback
+        // (an unowned hook child would outlive its session). Audited
+        // exactly once like any other refusal.
+        let owner = match process_owner(input) {
+            Ok(owner) => owner,
+            Err(reason) => {
+                let outcome = HookVerdict::Deny { reason };
+                let duration = started.elapsed().as_millis() as u64;
+                self.audit_push(HookAuditRecord {
+                    hook_id: spec.id.clone(),
+                    event: input.event,
+                    started_ms: now_ms() - duration as i64,
+                    duration_ms: duration,
+                    verdict: verdict_tag(&outcome),
+                    exit_code: None,
+                    stdout_head: String::new(),
+                    stderr_head: String::new(),
+                    failure_policy: spec.failure_policy,
+                });
+                return outcome;
+            }
+        };
         // Typed capability envelope: a hook whose scope exceeds the granted
         // envelope is refused BEFORE any child exists (lattice subset over
         // typed sets — never a string compare). Refusals are audited
@@ -410,7 +434,7 @@ impl HookRegistry {
             args: spec.args.clone(),
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")),
             env: EnvSpec::Explicit(entries),
-            owner: process_owner(input),
+            owner,
             ..Default::default()
         };
         let out = match self.inner.supervisor.run_sync(
@@ -517,15 +541,22 @@ impl Default for HookRegistry {
 
 /// Map the hook input's session id to the supervisor's owner row (audit
 /// P0-40 / zero-orphans): hook children of a session die with the session
-/// via the supervisor's `kill_all_for`. An unparsable id falls back to the
-/// daemon owner (hook children are deadline-bounded in all cases).
-fn process_owner(input: &HookInput) -> ProcessOwner {
+/// via the supervisor's `kill_all_for`. An ABSENT id falls back to the
+/// daemon owner (hook children are deadline-bounded in all cases); a
+/// present id is hostile input and goes through the fallible `TryFrom`
+/// surface — zero, negative, overflow or non-numeric is `Err` naming
+/// `HookInput.session_id`, never a panic and never a silent fallback.
+fn process_owner(input: &HookInput) -> Result<ProcessOwner, String> {
     match &input.session_id {
-        Some(s) => match s.parse::<u64>() {
-            Ok(n) => ProcessOwner::Session(SessionId::new(n)),
-            Err(_) => ProcessOwner::Daemon,
-        },
-        None => ProcessOwner::Daemon,
+        Some(s) => {
+            let raw: u64 = s.parse().map_err(|_| {
+                format!("HookInput.session_id {s:?} is not a valid non-negative integer")
+            })?;
+            let id = SessionId::try_from(raw)
+                .map_err(|e| format!("HookInput.session_id {s:?} is invalid: {}", e.message))?;
+            Ok(ProcessOwner::Session(id))
+        }
+        None => Ok(ProcessOwner::Daemon),
     }
 }
 
@@ -618,6 +649,71 @@ mod tests {
             r.run(HookEvent::PreEdit, &HookInput::default()),
             HookVerdict::Deny { .. }
         ));
+    }
+
+    #[test]
+    fn hostile_session_ids_are_typed_refusals_never_panics() {
+        for hostile in [
+            "0",
+            "-1",
+            "-9223372036854775808",
+            "18446744073709551616",
+            "not-a-number",
+            "",
+        ] {
+            let input = HookInput {
+                session_id: Some(hostile.to_string()),
+                ..Default::default()
+            };
+            let reason =
+                process_owner(&input).expect_err(&format!("{hostile:?} must not map to an owner"));
+            assert!(reason.contains("HookInput.session_id"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn zero_session_id_hook_payload_is_a_typed_refusal() {
+        let r = HookRegistry::new();
+        r.register(HookSpec {
+            id: "ok".into(),
+            command: "sh".into(),
+            args: vec!["-c".into(), "echo '{\"verdict\":\"allow\"}'".into()],
+            events: vec![HookEvent::PreTool],
+            ..Default::default()
+        })
+        .unwrap();
+        let input = HookInput {
+            session_id: Some("0".into()),
+            ..Default::default()
+        };
+        match r.run(HookEvent::PreTool, &input) {
+            HookVerdict::Deny { reason } => {
+                assert!(reason.contains("session_id"), "{reason}");
+                assert!(reason.contains("cannot be 0"), "{reason}");
+            }
+            v => panic!("expected a typed refusal, got {v:?}"),
+        }
+        // The refusal is audited exactly once and no hook child ever ran.
+        let audit = r.audit();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].exit_code, None);
+        assert_eq!(audit[0].stdout_head, "");
+    }
+
+    #[test]
+    fn valid_session_id_round_trips_to_the_session_owner() {
+        let input = HookInput {
+            session_id: Some("42".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            process_owner(&input).unwrap(),
+            ProcessOwner::Session(SessionId::try_from(42).unwrap())
+        );
+        assert_eq!(
+            process_owner(&HookInput::default()).unwrap(),
+            ProcessOwner::Daemon
+        );
     }
 
     #[test]

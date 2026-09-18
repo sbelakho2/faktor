@@ -163,7 +163,14 @@ impl GenerationFile {
                 self.format
             ));
         }
-        let ws = crate::WorkspaceId::new(self.workspace);
+        // Decode validates this too; re-check here so a directly constructed
+        // (non-decoded) envelope can never panic either.
+        let ws = crate::WorkspaceId::try_from(self.workspace).map_err(|e| {
+            format!(
+                "generation file workspace {} is malformed: {e}",
+                self.workspace
+            )
+        })?;
         let mut idx = WorkspaceIndex::new();
         let mut files = HashMap::new();
         for (path, f) in &self.data.files {
@@ -231,6 +238,11 @@ impl GenerationFile {
                 "generation file format {} unsupported (expected {GENERATION_FILE_FORMAT})",
                 file.format
             ));
+        }
+        if file.workspace == 0 {
+            return Err(
+                "generation file workspace 0 is malformed: workspace ids cannot be 0".to_string(),
+            );
         }
         Ok(file)
     }
@@ -333,6 +345,28 @@ mod tests {
         ] {
             assert!(GenerationFile::from_bytes(evil).is_err(), "{evil:?}");
         }
+    }
+
+    #[test]
+    fn zero_workspace_is_refused_at_decode_and_never_panics_in_materialize() {
+        // A serde-decoded generation file claiming workspace 0 must be a
+        // typed refusal at decode (never a WorkspaceId::new panic later).
+        let (idx, ws) = sample();
+        let mut hostile = GenerationFile::capture(ws, 3, &idx, vec![]);
+        hostile.workspace = 0;
+        let bytes = hostile.to_bytes().unwrap();
+        let err = GenerationFile::from_bytes(&bytes).unwrap_err();
+        assert!(err.contains("workspace"), "{err}");
+        // Even a directly constructed (non-decoded) envelope refuses in
+        // materialize instead of panicking.
+        let err = hostile.materialize().unwrap_err();
+        assert!(err.contains("workspace"), "{err}");
+        // Valid envelopes still round-trip and materialize unchanged.
+        let valid = GenerationFile::capture(ws, 3, &idx, vec![]);
+        let bytes = valid.to_bytes().unwrap();
+        let back = GenerationFile::from_bytes(&bytes).unwrap();
+        assert_eq!(back.workspace, ws);
+        assert!(back.materialize().is_ok());
     }
 
     #[test]

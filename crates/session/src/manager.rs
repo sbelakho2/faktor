@@ -146,6 +146,21 @@ impl std::fmt::Debug for SessionManager {
     }
 }
 
+/// Decode one durable `worktree.id` SQLite column into a typed
+/// [`faktor_core::WorktreeId`]: ids are persisted through the lossless
+/// two's-complement `raw as i64` cast, so the read side is `raw as u64` and
+/// the upper half of the id space round-trips exactly. The id constructor
+/// still refuses zero, typed and naming the row context — never a panic and
+/// never a fabricated id.
+fn decode_worktree_id(raw: i64, what: &str) -> Result<faktor_core::WorktreeId, faktor_core::Error> {
+    faktor_core::WorktreeId::try_from(raw as u64).map_err(|e| {
+        faktor_core::Error::malformed(format!(
+            "{what}: worktree row id {raw} is invalid: {}",
+            e.message
+        ))
+    })
+}
+
 impl SessionManager {
     /// Open (creating if needed) the SQLite store at `root` and the CAS at
     /// `cas_root`. `integrity_check: true` refuses to open a corrupt store
@@ -435,9 +450,14 @@ impl SessionManager {
     /// the store's durable global sequence in reserved ranges of
     /// [`OP_ID_RANGE`], so they stay unique and strictly increasing ACROSS
     /// daemon restarts — even when a restart lands in the same millisecond
-    /// or the wall clock jumped backwards. Zero is contractually never
-    /// returned.
-    pub fn next_op_id(&self) -> OpId {
+    /// or the wall clock jumped backwards.
+    ///
+    /// A refill failure of the durable sequence is a TYPED refusal (never a
+    /// panic, never a clock/counter fallback that could collide, never a
+    /// silently reused id, never a contract-invalid zero). The cached range
+    /// is untouched on failure, so the next call retries the reservation;
+    /// the manager stays usable for every other operation.
+    pub fn try_next_op_id(&self) -> Result<OpId, SessionError> {
         // Classified CACHE => REBUILD: the durable op-id sequence is the
         // authority. A poisoned reservation is dropped (remaining = 0) and
         // refilled from the durable sequence below, so a torn in-memory
@@ -453,20 +473,22 @@ impl SessionManager {
             // session), so no session id is semantically meaningful here;
             // the placeholder only satisfies the allocator's future
             // per-session-scope signature. A refill failure means the
-            // durable sequence cannot advance — minting from the clock
-            // would reintroduce exactly the collision this fixes, so a
-            // loud abort is the only safe behavior.
+            // durable sequence cannot advance — minting from the clock or a
+            // bare counter would reintroduce exactly the collision the
+            // durable sequence exists to prevent, so the refusal propagates
+            // as a typed error instead.
             let (start, granted) = self
                 .store
                 .alloc_op_ids(SessionId::new(1), OP_ID_RANGE)
-                .unwrap_or_else(|e| panic!("op-id sequence refill failed: {e}"));
+                .map_err(crate::map_store_err)?;
             cache.next = start;
             cache.remaining = granted;
         }
         let raw = cache.next;
+        let id = OpId::try_from(raw).map_err(SessionError::from)?;
         cache.next += 1;
         cache.remaining -= 1;
-        OpId::new(raw)
+        Ok(id)
     }
 
     /// `doctor`-style health report: store diagnostics + recovery scan.
@@ -717,11 +739,18 @@ impl SessionManager {
             .ok_or_else(|| SessionError::NotFound(format!("session {session}")))?;
         let row = handle.row()?;
         let worktrees = self.worktrees_of(row.workspace_id)?;
-        if let Some(existing) = worktrees
-            .iter()
-            .find(|w| (w.id as u64) == row.worktree_id.raw())
-        {
-            return Ok(faktor_core::WorktreeId::new(existing.id as u64));
+        for w in &worktrees {
+            // Durable id decode: bit-cast upper half round-trips, zero is typed.
+            let id = decode_worktree_id(
+                w.id,
+                &format!(
+                    "session {session} owner worktree lookup under workspace {}",
+                    row.workspace_id
+                ),
+            )?;
+            if id == row.worktree_id {
+                return Ok(id);
+            }
         }
         let root = self.workspace_root(row.workspace_id)?.ok_or_else(|| {
             SessionError::NotFound(format!(
@@ -749,7 +778,13 @@ impl SessionManager {
         } else {
             row.task_id
         };
-        let worktree_id = faktor_core::WorktreeId::new(owned.id as u64);
+        let worktree_id = decode_worktree_id(
+            owned.id,
+            &format!(
+                "session {session} owner worktree adoption under workspace {}",
+                row.workspace_id
+            ),
+        )?;
         self.adopt_identity(session, worktree_id, task_id)?;
         Ok(worktree_id)
     }
@@ -1054,10 +1089,74 @@ mod tests {
         let (_d, m) = tmp_manager();
         let mut seen = std::collections::HashSet::new();
         for _ in 0..10_000 {
-            let id = m.next_op_id();
+            let id = m.try_next_op_id().unwrap();
             assert_ne!(id.raw(), 0, "zero is contractually impossible");
             assert!(seen.insert(id.raw()), "op ids must be unique");
         }
+    }
+
+    /// Audit: a failed durable op-id reservation is a TYPED refusal, never a
+    /// panic that aborts the daemon and never a contract-invalid zero id. The
+    /// manager stays usable for every other operation, and every retry keeps
+    /// returning the same typed refusal (no clock or counter fallback that
+    /// could collide).
+    #[test]
+    fn op_id_allocation_failure_is_typed_and_never_panics() {
+        let (_d, m) = tmp_manager();
+        // Exhaust the durable global sequence: the next refill must fail.
+        let hw = m.store().op_id_seq_high_water().unwrap();
+        let remaining = (i64::MAX as u64) - hw;
+        assert!(remaining > 0);
+        let (_, granted) = m
+            .store()
+            .alloc_op_ids(faktor_core::id::SessionId::new(1), remaining)
+            .unwrap();
+        assert_eq!(granted, remaining, "the whole tail is reserved");
+
+        // Typed refusal naming the exhaustion; the same refusal repeats.
+        let err = m
+            .try_next_op_id()
+            .expect_err("an exhausted sequence must refuse, not panic");
+        assert!(matches!(err, SessionError::Conflict(_)), "{err:?}");
+        assert!(err.to_string().contains("exhausted"), "{err}");
+
+        // The manager stays usable: unrelated durable operations work and
+        // every retry keeps returning the SAME typed refusal.
+        let ws = m.create_workspace("/still-usable").unwrap();
+        let s = m.create_session(ws, "t", "p", "m").unwrap();
+        assert_eq!(s.id().raw(), 1);
+        assert!(m.now_ms() > 0);
+        assert!(m.try_next_op_id().is_err());
+    }
+
+    /// The fallible contract at the SESSION SURFACE: with the durable
+    /// sequence exhausted, prompt submission refuses typed and leaves NO
+    /// durable row carrying the contract-invalid zero op id (no journal
+    /// event, no turn record, no queued prompt).
+    #[test]
+    fn exhausted_sequence_refuses_prompt_submission_typed_without_zero_rows() {
+        let (_d, m) = tmp_manager();
+        let ws = m.create_workspace("/w").unwrap();
+        let s = m.create_session(ws, "t", "p", "m").unwrap();
+        let handle = m.get_session(s.id()).unwrap().unwrap();
+        let hw = m.store().op_id_seq_high_water().unwrap();
+        m.store()
+            .alloc_op_ids(faktor_core::id::SessionId::new(1), (i64::MAX as u64) - hw)
+            .unwrap();
+        let err = handle.submit_prompt("hello", &[]).unwrap_err();
+        assert_eq!(
+            err.kind,
+            faktor_core::ErrorKind::Conflict,
+            "the refusal is the typed sequence error: {err:?}"
+        );
+        assert!(err.message.contains("exhausted"), "{err:?}");
+        // Nothing durable was written: the journal holds only SessionCreated
+        // and no row carries the zero sentinel.
+        let events = m.store().events_range(s.id(), 1, None).unwrap();
+        assert_eq!(events.len(), 1, "no PromptReceived event was written");
+        assert!(events.iter().all(|e| e.op_id != Some(OpId::default())));
+        assert!(m.store().active_turn_record(s.id()).unwrap().is_none());
+        assert!(m.store().queue_head(s.id()).unwrap().is_none());
     }
 
     #[test]
@@ -1076,6 +1175,38 @@ mod tests {
         // Malformed inputs are rejected before touching the store.
         assert!(m.put_worktree(ws, "", "b").is_err());
         assert!(m.put_worktree(ws, "/p", "").is_err());
+    }
+
+    #[test]
+    fn worktree_row_id_decode_is_typed_never_panics_or_wraps() {
+        // The durable id is an i64 column holding the bit-cast of a u64 id:
+        // every raw value except zero round-trips exactly (including the
+        // negative upper half i64::MIN => 2^63 and -1 => u64::MAX), while
+        // zero still fails typed (WorktreeId::new would panic on it).
+        for raw in [u64::MAX, u64::MAX - 2, u64::MAX / 2 + 1, 2u64.pow(63)] {
+            assert_eq!(
+                decode_worktree_id(raw as i64, "unit-test worktree row")
+                    .unwrap()
+                    .raw(),
+                raw,
+                "raw {raw} must round-trip exactly"
+            );
+        }
+        for raw in [0i64, i64::MAX, 7] {
+            let decoded = decode_worktree_id(raw, "unit-test worktree row");
+            if raw > 0 {
+                assert_eq!(
+                    decoded.unwrap().raw(),
+                    raw as u64,
+                    "positive row id {raw} must round-trip"
+                );
+            } else {
+                let err = decoded.expect_err("a zero row id must be refused");
+                assert_eq!(err.kind, faktor_core::ErrorKind::Malformed, "{err:?}");
+                assert!(err.message.contains("worktree row id"), "{err}");
+                assert!(!err.retryable);
+            }
+        }
     }
 
     #[test]
@@ -1670,8 +1801,12 @@ mod tests {
             let second =
                 SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
                     .unwrap();
-            let a: Vec<u64> = (0..1000).map(|_| first.next_op_id().raw()).collect();
-            let b: Vec<u64> = (0..1000).map(|_| second.next_op_id().raw()).collect();
+            let a: Vec<u64> = (0..1000)
+                .map(|_| first.try_next_op_id().unwrap().raw())
+                .collect();
+            let b: Vec<u64> = (0..1000)
+                .map(|_| second.try_next_op_id().unwrap().raw())
+                .collect();
             let mut seen = std::collections::HashSet::new();
             for raw in a.iter().chain(&b) {
                 assert!(seen.insert(*raw), "op id {raw} reused across restarts");
@@ -1697,7 +1832,9 @@ mod tests {
         let (jump_to, max_before) = {
             let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
                 .unwrap();
-            let before: Vec<u64> = (0..300).map(|_| m.next_op_id().raw()).collect();
+            let before: Vec<u64> = (0..300)
+                .map(|_| m.try_next_op_id().unwrap().raw())
+                .collect();
             let hw = m.store().op_id_seq_high_water().unwrap();
             let (start, granted) = m
                 .store()
@@ -1712,7 +1849,9 @@ mod tests {
         };
         let m =
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
-        let after: Vec<u64> = (0..1000).map(|_| m.next_op_id().raw()).collect();
+        let after: Vec<u64> = (0..1000)
+            .map(|_| m.try_next_op_id().unwrap().raw())
+            .collect();
         assert!(
             after.windows(2).all(|w| w[0] < w[1]),
             "ids stay strictly increasing after the jump"
@@ -1734,7 +1873,9 @@ mod tests {
         for _ in 0..8 {
             let m = m.clone();
             handles.push(std::thread::spawn(move || {
-                (0..200).map(|_| m.next_op_id().raw()).collect::<Vec<u64>>()
+                (0..200)
+                    .map(|_| m.try_next_op_id().unwrap().raw())
+                    .collect::<Vec<u64>>()
             }));
         }
         let mut seen = std::collections::HashSet::new();
@@ -1761,7 +1902,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for i in 0..4000 {
             let _alternating = if i % 2 == 0 { s1.id() } else { s2.id() };
-            let raw = m.next_op_id().raw();
+            let raw = m.try_next_op_id().unwrap().raw();
             assert!(raw > last, "ids strictly increase across sessions");
             last = raw;
             assert!(seen.insert(raw), "op id {raw} reused");

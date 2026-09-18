@@ -27,7 +27,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::ChildStdin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,6 +34,13 @@ use std::time::Duration;
 use faktor_core::error::{Error, ErrorKind};
 use faktor_core::id::WorkspaceId;
 use faktor_terminal::{EnvSpec, ProcessOwner, ProcessSupervisor, SpawnConfig};
+
+/// Re-exported delivery-unknown contract (owned by `faktor-mcp`, the framing/
+/// writer sibling): a timed-out frame whose write had already begun can never
+/// be reported as a clean, provably-not-delivered Timeout.
+pub use faktor_mcp::{
+    delivery_unknown, is_delivery_unknown, DeliveryUnknown, FrameGuard, FrameState,
+};
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// Bounded everything: at most this many requests may be awaiting responses.
@@ -69,14 +75,196 @@ pub struct LspConfig {
 }
 
 /// Shared connection state; guarded so the reader thread, drain threads and
-/// async request/notify paths never interleave a write. The stdin is
-/// BUFFERED, so the explicit `flush()` is the real pipe write: a broken or
-/// closed child stdin surfaces there (typed) instead of on some later read.
+/// async request/notify paths never interleave a write. The stdin is owned
+/// by the dedicated writer thread (see [`WriterHandle`]), NEVER written
+/// while this mutex is held: the reader thread needs the mutex, so a
+/// blocking write under it could deadlock the whole client.
 struct LspConn {
     child_pid: u32,
-    stdin: BufWriter<ChildStdin>,
     next_id: u64,
     pending: HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>,
+}
+
+/// Bound on the dedicated stdin writer's queue: a server that stops draining
+/// must never grow client memory or block a caller unboundedly.
+const WRITER_QUEUE_CAP: usize = 64;
+
+/// Documented bound on the synchronous notification write+flush path; a
+/// wedged server turns into a typed timeout instead of an unbounded block.
+const NOTIFY_WRITE_TIMEOUT_MS: u64 = 5_000;
+
+/// One queued stdin frame plus its completion channel.
+enum WriterAck {
+    /// Awaited by the async request path under a deadline.
+    Async(tokio::sync::oneshot::Sender<std::io::Result<()>>),
+    /// Awaited by the synchronous notification path with a bounded
+    /// `recv_timeout` (never under the `conn` mutex).
+    Sync(std::sync::mpsc::SyncSender<std::io::Result<()>>),
+}
+
+struct WriterMsg {
+    bytes: Vec<u8>,
+    ack: WriterAck,
+    /// Shared with the enqueuing caller: the writer skips the frame iff the
+    /// caller cancelled it before the writer's claim CAS.
+    frame: Arc<FrameState>,
+}
+
+/// Handle to the per-client stdin writer thread (bounded FIFO queue).
+#[derive(Clone)]
+struct WriterHandle {
+    tx: std::sync::mpsc::SyncSender<WriterMsg>,
+}
+
+/// Spawn the writer thread owning the child's stdin. A blocked write (server
+/// not draining) blocks only this thread; callers observe a typed refusal
+/// (queue full) or a deadline-bounded completion wait. A frame cancelled
+/// before the writer claims it is skipped whole — cancellation NEVER
+/// reorders the remaining frames.
+fn spawn_stdin_writer<W: Write + Send + 'static>(sink: W) -> WriterHandle {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<WriterMsg>(WRITER_QUEUE_CAP);
+    std::thread::spawn(move || {
+        let mut stdin = BufWriter::new(sink);
+        while let Ok(msg) = rx.recv() {
+            // The claim is the LAST instant cancellation is possible: after
+            // this CAS the frame is irrevocable (bytes may reach the peer),
+            // so a caller that loses the race must surface delivery-unknown,
+            // never a clean Timeout.
+            if !msg.frame.begin_write() {
+                // Cancelled at the caller's deadline before the writer
+                // touched the frame: skip it WHOLE. No byte can reach the
+                // peer and the FIFO order of later frames is unchanged.
+                let skipped = Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "frame cancelled before write",
+                ));
+                match msg.ack {
+                    WriterAck::Async(ack) => {
+                        let _ = ack.send(skipped);
+                    }
+                    WriterAck::Sync(ack) => {
+                        let _ = ack.send(skipped);
+                    }
+                }
+                continue;
+            }
+            let result = stdin.write_all(&msg.bytes).and_then(|()| stdin.flush());
+            match msg.ack {
+                WriterAck::Async(ack) => {
+                    let _ = ack.send(result);
+                }
+                WriterAck::Sync(ack) => {
+                    let _ = ack.send(result);
+                }
+            }
+        }
+    });
+    WriterHandle { tx }
+}
+
+impl WriterHandle {
+    /// Enqueue one wire frame and await its write+flush completion under
+    /// `deadline_at` — no lock held.
+    ///
+    /// Deadline semantics: success means written+flushed; a clean
+    /// [`ErrorKind::Timeout`] means the frame was cancelled BEFORE the
+    /// writer began it (provably not delivered); a
+    /// [`is_delivery_unknown`] error means the writer had already begun the
+    /// write, so the server may still execute the request.
+    async fn write_and_flush(
+        &self,
+        bytes: Vec<u8>,
+        deadline_at: tokio::time::Instant,
+        what: &str,
+    ) -> Result<(), Error> {
+        let frame = FrameState::guarded();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.enqueue(bytes, WriterAck::Async(ack_tx), frame.state().clone(), what)?;
+        match tokio::time::timeout_at(deadline_at, ack_rx).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            // The combined write+flush failure keeps the historical typed
+            // wording the closed-stdin test pins.
+            Ok(Ok(Err(e))) => Err(Error::new(
+                ErrorKind::Network,
+                format!("lsp write {what}: stdin write/flush failed: {e}"),
+            )),
+            Ok(Err(_)) => Err(Error::new(
+                ErrorKind::Network,
+                format!("lsp {what}: stdin writer dropped the completion"),
+            )),
+            Err(_) => {
+                // Deadline hit with no ack. Race the writer for the frame:
+                // winning the CAS proves the frame will be skipped whole
+                // (clean Timeout = not delivered); losing it means the
+                // writer had already begun, so the server may still execute
+                // the request and the outcome must say so.
+                if frame.state().cancel_before_write() {
+                    Err(Error::timeout(format!(
+                        "lsp {what}: stdin write exceeded its deadline (the server is not draining)"
+                    )))
+                } else {
+                    Err(delivery_unknown(&format!("lsp {what}")))
+                }
+            }
+        }
+    }
+
+    /// Synchronous variant for the notification path, bounded by
+    /// [`NOTIFY_WRITE_TIMEOUT_MS`]; never called while holding `conn`.
+    /// Deadline semantics mirror [`WriterHandle::write_and_flush`]: a
+    /// cancelled-before-write notification is a clean not-delivered Timeout,
+    /// while one whose write had begun is delivery-unknown.
+    fn write_and_flush_bounded(
+        &self,
+        bytes: Vec<u8>,
+        bound: Duration,
+        what: &str,
+    ) -> Result<(), Error> {
+        let frame = FrameState::guarded();
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+        self.enqueue(bytes, WriterAck::Sync(ack_tx), frame.state().clone(), what)?;
+        match ack_rx.recv_timeout(bound) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(Error::new(
+                ErrorKind::Network,
+                format!("lsp notify {what}: {e}"),
+            )),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if frame.state().cancel_before_write() {
+                    Err(Error::timeout(format!(
+                        "lsp notify {what} exceeded its {} ms write bound",
+                        bound.as_millis()
+                    )))
+                } else {
+                    Err(delivery_unknown(&format!("lsp notify {what}")))
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Error::new(
+                ErrorKind::Network,
+                format!("lsp notify {what}: stdin writer is gone"),
+            )),
+        }
+    }
+
+    fn enqueue(
+        &self,
+        bytes: Vec<u8>,
+        ack: WriterAck,
+        frame: Arc<FrameState>,
+        what: &str,
+    ) -> Result<(), Error> {
+        match self.tx.try_send(WriterMsg { bytes, ack, frame }) {
+            Ok(()) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => Err(Error::new(
+                ErrorKind::Oversized,
+                format!("lsp {what}: stdin writer queue is full (the server is not draining)"),
+            )),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(Error::new(
+                ErrorKind::Network,
+                format!("lsp {what}: stdin writer is gone"),
+            )),
+        }
+    }
 }
 
 /// Bounded stderr tail in BYTES (recent tail kept for diagnostics). Total
@@ -149,6 +337,7 @@ type Activity = Arc<dyn Fn() + Send + Sync>;
 
 pub struct LspClient {
     conn: Arc<Mutex<LspConn>>,
+    writer: WriterHandle,
     supervisor: Arc<ProcessSupervisor>,
     /// Set when the server's stdout reached EOF (the server exited); new
     /// requests then fail fast instead of hanging until a deadline.
@@ -180,9 +369,9 @@ impl LspClient {
         let spawned = supervisor
             .spawn_detached_with_pipes(proc_cfg)
             .map_err(|e| Error::new(ErrorKind::NotFound, format!("lsp spawn: {e}")))?;
+        let writer = spawn_stdin_writer(spawned.stdin);
         let conn = Arc::new(Mutex::new(LspConn {
             child_pid: spawned.child_pid,
-            stdin: BufWriter::new(spawned.stdin),
             next_id: 1,
             pending: HashMap::new(),
         }));
@@ -204,6 +393,7 @@ impl LspClient {
         }
         Ok(Arc::new(Self {
             conn,
+            writer,
             supervisor,
             exited,
             stderr,
@@ -226,6 +416,9 @@ impl LspClient {
                 format!("lsp server exited before {method}"),
             ));
         }
+        // ONE deadline covers the write AND the response wait: a server that
+        // stops draining can never extend the request past it.
+        let deadline_at = tokio::time::Instant::now() + deadline;
         let (id, request) = {
             let mut conn = recover_lock(&self.conn);
             if conn.pending.len() >= MAX_INFLIGHT_REQUESTS {
@@ -247,29 +440,34 @@ impl LspClient {
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut conn = recover_lock(&self.conn);
-            let wire = format!(
-                "Content-Length: {}\r\n\r\n{}",
-                request.to_string().len(),
-                request
-            );
-            conn.stdin
-                .write_all(wire.as_bytes())
-                .map_err(|e| Error::new(ErrorKind::Network, format!("lsp write: {e}")))?;
-            // Propagate the FLUSH failure BEFORE registering the pending
-            // entry: a closed/broken child stdin is a typed transport error
-            // NOW, never a request that waits out its deadline.
-            conn.stdin.flush().map_err(|e| {
-                Error::new(
-                    ErrorKind::Network,
-                    format!("lsp write {method}: stdin flush failed: {e}"),
-                )
-            })?;
+            // Register BEFORE the frame can reach the server: a fast response
+            // is dispatched by the reader thread, which only takes this mutex
+            // briefly (never across a blocking write).
             conn.pending.insert(id.clone(), tx);
+        }
+        let wire = format!(
+            "Content-Length: {}\r\n\r\n{}",
+            request.to_string().len(),
+            request
+        );
+        // The write+flush runs on the dedicated writer thread; this await is
+        // bounded by the same deadline and holds NO lock. On failure the
+        // pending entry is dropped either way — a cancelled frame can never
+        // be answered, and a delivery-unknown frame is no longer awaited
+        // (its late response is discarded) — while the ERROR itself carries
+        // the difference: clean Timeout vs typed delivery-unknown.
+        if let Err(e) = self
+            .writer
+            .write_and_flush(wire.into_bytes(), deadline_at, method)
+            .await
+        {
+            recover_lock(&self.conn).pending.remove(&id);
+            return Err(e);
         }
         if let Some(a) = &self.activity {
             a();
         }
-        match tokio::time::timeout(deadline, rx).await {
+        match tokio::time::timeout_at(deadline_at, rx).await {
             Ok(Ok(v)) => {
                 if let Some(err) = v.get("error") {
                     return Err(Error::new(
@@ -308,31 +506,22 @@ impl LspClient {
             "method": method,
             "params": params,
         });
-        {
-            let mut conn = recover_lock(&self.conn);
-            let wire = format!(
-                "Content-Length: {}\r\n\r\n{}",
-                notification.to_string().len(),
-                notification
-            );
-            if let Err(e) = conn.stdin.write_all(wire.as_bytes()) {
-                if self.exited.load(Ordering::SeqCst) {
-                    return Ok(()); // the server died mid-write; nothing to notify
-                }
-                return Err(Error::new(
-                    ErrorKind::Network,
-                    format!("lsp notify {method}: {e}"),
-                ));
+        let wire = format!(
+            "Content-Length: {}\r\n\r\n{}",
+            notification.to_string().len(),
+            notification
+        );
+        // The write+flush runs on the dedicated writer thread (never under
+        // `conn`), bounded so a wedged server becomes a typed timeout.
+        if let Err(e) = self.writer.write_and_flush_bounded(
+            wire.into_bytes(),
+            Duration::from_millis(NOTIFY_WRITE_TIMEOUT_MS),
+            method,
+        ) {
+            if self.exited.load(Ordering::SeqCst) {
+                return Ok(()); // the server died mid-write; nothing to notify
             }
-            if let Err(e) = conn.stdin.flush() {
-                if self.exited.load(Ordering::SeqCst) {
-                    return Ok(()); // the server died mid-flush; nothing to notify
-                }
-                return Err(Error::new(
-                    ErrorKind::Network,
-                    format!("lsp notify {method}: stdin flush failed: {e}"),
-                ));
-            }
+            return Err(e);
         }
         if let Some(a) = &self.activity {
             a();
@@ -724,6 +913,13 @@ while True:
         didopen_seen = True
         check(initialized_seen, "didOpen after initialized")
         log("GOT didOpen")
+        if mode == "stops-draining":
+            # Stop reading stdin: the next large write fills the pipe and
+            # blocks the writer thread; the client must return a typed
+            # deadline error instead of deadlocking on the conn mutex.
+            log("STOPPED draining")
+            while True:
+                time.sleep(0.05)
         if mode == "close-stdin":
             # Close our read end of the pipe and keep running: the client's
             # NEXT write/flush must fail typed, not time out. (`os.close` —
@@ -884,14 +1080,23 @@ log("mock exiting")
 
     #[test]
     fn hostile_frames_never_panic() {
-        for garbage in [
-            b"".as_slice(),
-            b"\x00\x01".as_slice(),
-            b"Content-Length: x\r\n\r\n".as_slice(),
-            b"Content-Length: 5\r\n\r\n".as_slice(),
-        ] {
-            let _ = faktor_mcp::parse_frame(garbage);
-        }
+        // Empty and truncated frames are "need more", never errors; garbage
+        // headers are typed errors. None may panic.
+        assert!(matches!(faktor_mcp::parse_frame(b""), Ok(None)));
+        assert!(matches!(
+            faktor_mcp::parse_frame(b"Content-Length: 5\r\n\r\n"),
+            Ok(None)
+        ));
+        assert!(faktor_mcp::parse_frame(b"\x00\x01").is_err());
+        assert!(faktor_mcp::parse_frame(b"Content-Length: x\r\n\r\n").is_err());
+        // A declared length past the 16 MiB bound is refused before any
+        // allocation; a valid frame still parses (non-vacuity control).
+        assert!(faktor_mcp::parse_frame(b"Content-Length: 999999999999\r\n\r\n").is_err());
+        let (consumed, value) = faktor_mcp::parse_frame(b"Content-Length: 2\r\n\r\n{}")
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed, 23);
+        assert_eq!(value, serde_json::json!({}));
     }
 
     /// (i) connect sends initialize with the REAL rootUri and cwd, receives
@@ -1048,6 +1253,356 @@ log("mock exiting")
             "no pending entry may be registered for a failed write"
         );
         mgr.shutdown(ws).await.unwrap();
+    }
+
+    /// A server that answers the handshake, then STOPS draining stdin: a
+    /// large request would previously block the async caller under the
+    /// `conn` mutex while the reader thread waited on the same mutex — a
+    /// deadlock no deadline could cover. The dedicated writer thread must
+    /// turn it into a bounded typed error, leaving the mutex and reader
+    /// thread usable.
+    ///
+    /// Delivery semantics: the writer had already CLAIMED this single frame
+    /// (the queue was empty, so it went straight from the FIFO to the pipe
+    /// and blocked), so the deadline must NOT masquerade as a clean
+    /// not-delivered Timeout — the server may still execute it on resume.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stops_draining_server_is_delivery_unknown_not_a_deadlock() {
+        if !python_available() {
+            eprintln!("python3 missing; skipping");
+            return;
+        }
+        let root_dir = tempdir().unwrap();
+        let root = root_dir.path().to_path_buf();
+        let expected_uri = file_uri(&root);
+        let (_d, sup) = supervisor();
+        let mgr = LspManager::new(sup);
+        let ws = WorkspaceId::new(77);
+        let (cfg, _script) = cfg_with(root.clone(), "stops-draining", &expected_uri);
+        let client = tokio::time::timeout(Duration::from_secs(15), mgr.start(ws, cfg))
+            .await
+            .expect("start timeout")
+            .expect("start failed");
+        client
+            .did_open(&format!("{expected_uri}/a.rs"), "fn a() {}")
+            .unwrap();
+        let tail = wait_for_stderr(&client, "STOPPED draining").await;
+        assert!(tail.contains("STOPPED draining"), "{tail}");
+        let payload = "x".repeat(4 * 1024 * 1024);
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.request(
+                "textDocument/documentSymbol",
+                serde_json::json!({ "pad": payload }),
+                Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("a non-draining server must not hang the caller")
+        .unwrap_err();
+        assert!(
+            is_delivery_unknown(&err),
+            "a claimed-but-unacked write must be delivery-unknown, never a clean Timeout: {err:?}"
+        );
+        assert_ne!(err.kind, ErrorKind::Timeout, "{err:?}");
+        assert!(!err.retryable, "{err:?}");
+        assert!(
+            err.message.contains("may still execute"),
+            "the Display text must name the peer-execution risk: {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the request deadline must cover the write: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            client.conn.lock().unwrap().pending.is_empty(),
+            "the timed-out call must not leave a pending entry"
+        );
+        // The conn mutex and reader thread remain usable (no deadlock).
+        assert!(client.conn.lock().is_ok());
+        drop(mgr);
+    }
+
+    /// Deterministic fake server pipe: the FIRST write blocks until the gate
+    /// opens, then every write is appended to a byte log (delivered frames
+    /// can be parsed back and ordered). Later writes pass straight through —
+    /// a fake server that drains later.
+    struct LspGatedSink {
+        byte_log: Arc<Mutex<Vec<u8>>>,
+        entered: Arc<std::sync::atomic::AtomicBool>,
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Write for LspGatedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.entered.store(true, Ordering::SeqCst);
+            let (open, cv) = &*self.gate;
+            let mut guard = open.lock().unwrap();
+            while !*guard {
+                guard = cv.wait(guard).unwrap();
+            }
+            drop(guard);
+            self.byte_log.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn release_lsp_gate(gate: &Arc<(Mutex<bool>, std::sync::Condvar)>) {
+        let (open, cv) = &**gate;
+        *open.lock().unwrap() = true;
+        cv.notify_all();
+    }
+
+    fn lsp_logical_frame(id: u64, method: &str) -> Vec<u8> {
+        let body = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method}).to_string();
+        format!("Content-Length: {}\r\n\r\n{}", body.len(), body).into_bytes()
+    }
+
+    fn lsp_delivered_ids(bytes: &[u8]) -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let (consumed, value) = faktor_mcp::parse_frame(rest)
+                .expect("recorded bytes must be complete frames")
+                .expect("recorded bytes must hold complete frames");
+            out.push(value["id"].as_u64().expect("frames carry numeric ids"));
+            rest = &rest[consumed..];
+        }
+        out
+    }
+
+    struct LspFakeSink {
+        writer: WriterHandle,
+        byte_log: Arc<Mutex<Vec<u8>>>,
+        entered: Arc<std::sync::atomic::AtomicBool>,
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    fn lsp_sink() -> LspFakeSink {
+        let byte_log = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let writer = spawn_stdin_writer(LspGatedSink {
+            byte_log: byte_log.clone(),
+            entered: entered.clone(),
+            gate: gate.clone(),
+        });
+        LspFakeSink {
+            writer,
+            byte_log,
+            entered,
+            gate,
+        }
+    }
+
+    async fn await_lsp_entered(entered: &Arc<std::sync::atomic::AtomicBool>) {
+        let t0 = std::time::Instant::now();
+        while !entered.load(Ordering::SeqCst) {
+            assert!(
+                t0.elapsed() < Duration::from_secs(5),
+                "the writer never reached the fake server"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Deterministic request path: the claimed frame is delivery-unknown; the
+    /// queued frames are cleanly cancelled and never reach the fake server;
+    /// a live frame keeps FIFO order across the skipped ones.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_timeout_is_clean_only_when_cancelled_before_write() {
+        let sink = lsp_sink();
+        let head = tokio::spawn({
+            let writer = sink.writer.clone();
+            async move {
+                writer
+                    .write_and_flush(
+                        lsp_logical_frame(1, "initialize"),
+                        tokio::time::Instant::now() + Duration::from_millis(150),
+                        "initialize",
+                    )
+                    .await
+            }
+        });
+        await_lsp_entered(&sink.entered).await;
+        for id in 2..=3u64 {
+            let err = sink
+                .writer
+                .write_and_flush(
+                    lsp_logical_frame(id, "queued"),
+                    tokio::time::Instant::now() + Duration::from_millis(50),
+                    "queued",
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Timeout, "frame {id}: {err:?}");
+            assert!(!is_delivery_unknown(&err), "frame {id}: {err:?}");
+        }
+        let head_err = tokio::time::timeout(Duration::from_secs(5), head)
+            .await
+            .expect("head must settle")
+            .expect("head task must not panic")
+            .unwrap_err();
+        assert!(
+            is_delivery_unknown(&head_err) && !head_err.retryable,
+            "the claimed request must be delivery-unknown: {head_err:?}"
+        );
+        let tail = tokio::spawn({
+            let writer = sink.writer.clone();
+            async move {
+                writer
+                    .write_and_flush(
+                        lsp_logical_frame(4, "tail"),
+                        tokio::time::Instant::now() + Duration::from_secs(10),
+                        "tail",
+                    )
+                    .await
+            }
+        });
+        release_lsp_gate(&sink.gate);
+        let tail_result = tokio::time::timeout(Duration::from_secs(5), tail)
+            .await
+            .expect("tail must settle")
+            .expect("tail task must not panic");
+        assert!(tail_result.is_ok(), "{tail_result:?}");
+        let ids = lsp_delivered_ids(&sink.byte_log.lock().unwrap().clone());
+        assert_eq!(
+            ids,
+            vec![1, 4],
+            "cancelled requests must be skipped whole without reordering"
+        );
+    }
+
+    /// Deterministic notification path (synchronous bounded writer): a
+    /// notification queued behind a blocked frame is a clean not-delivered
+    /// Timeout and never reaches the fake server; a notification whose write
+    /// had begun is delivery-unknown; the live one keeps its FIFO place.
+    #[test]
+    fn notification_timeout_is_clean_only_when_cancelled_before_write() {
+        let sink = lsp_sink();
+
+        // Head notification: claimed by the writer, blocked in the fake
+        // server. Its write BEGAN, so its bounded timeout must be
+        // delivery-unknown.
+        let (head_tx, head_rx) = std::sync::mpsc::channel();
+        let head_writer = sink.writer.clone();
+        let head_thread = std::thread::spawn(move || {
+            let result = head_writer.write_and_flush_bounded(
+                lsp_logical_frame(1, "didOpen"),
+                Duration::from_millis(150),
+                "didOpen",
+            );
+            let _ = head_tx.send(result);
+        });
+        let t0 = std::time::Instant::now();
+        while !sink.entered.load(Ordering::SeqCst) {
+            assert!(t0.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Queued notification: still in the FIFO when its bound expires =>
+        // cancelled whole, clean Timeout, never delivered.
+        let queued = sink
+            .writer
+            .write_and_flush_bounded(
+                lsp_logical_frame(2, "didChange"),
+                Duration::from_millis(50),
+                "didChange",
+            )
+            .unwrap_err();
+        assert_eq!(queued.kind, ErrorKind::Timeout, "{queued:?}");
+        assert!(!is_delivery_unknown(&queued), "{queued:?}");
+
+        let head_err = head_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("head notification must settle")
+            .expect_err("the claimed notification cannot be a clean success");
+        assert!(
+            is_delivery_unknown(&head_err) && !head_err.retryable,
+            "a claimed notification must be delivery-unknown: {head_err:?}"
+        );
+        let _ = head_thread.join();
+
+        // Live notification after the cancelled one: delivered, FIFO kept.
+        let (tail_tx, tail_rx) = std::sync::mpsc::channel();
+        let tail_writer = sink.writer.clone();
+        let tail_thread = std::thread::spawn(move || {
+            let _ = tail_tx.send(tail_writer.write_and_flush_bounded(
+                lsp_logical_frame(3, "didSave"),
+                Duration::from_secs(10),
+                "didSave",
+            ));
+        });
+        release_lsp_gate(&sink.gate);
+        let tail_result = tail_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("tail notification must settle");
+        assert!(tail_result.is_ok(), "{tail_result:?}");
+        let _ = tail_thread.join();
+        let ids = lsp_delivered_ids(&sink.byte_log.lock().unwrap().clone());
+        assert_eq!(
+            ids,
+            vec![1, 3],
+            "cancelled notifications must be skipped whole without reordering"
+        );
+    }
+
+    /// The bounded FIFO still refuses with the typed `Oversized` error on
+    /// both writer paths once full (never a blocked caller).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lsp_full_writer_queue_is_a_typed_oversized_refusal() {
+        let sink = lsp_sink();
+        let head = tokio::spawn({
+            let writer = sink.writer.clone();
+            async move {
+                writer
+                    .write_and_flush(
+                        lsp_logical_frame(1, "initialize"),
+                        tokio::time::Instant::now() + Duration::from_secs(30),
+                        "initialize",
+                    )
+                    .await
+            }
+        });
+        await_lsp_entered(&sink.entered).await;
+        for id in 2..(2 + WRITER_QUEUE_CAP as u64) {
+            let (ack_tx, _rx) = std::sync::mpsc::sync_channel(1);
+            sink.writer
+                .tx
+                .try_send(WriterMsg {
+                    bytes: lsp_logical_frame(id, "queued"),
+                    ack: WriterAck::Sync(ack_tx),
+                    frame: Arc::new(FrameState::queued()),
+                })
+                .expect("the bounded FIFO must accept exactly CAP frames");
+        }
+        let async_err = sink
+            .writer
+            .write_and_flush(
+                lsp_logical_frame(999, "overflow"),
+                tokio::time::Instant::now() + Duration::from_millis(200),
+                "overflow",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(async_err.kind, ErrorKind::Oversized, "{async_err:?}");
+        let sync_err = sink
+            .writer
+            .write_and_flush_bounded(
+                lsp_logical_frame(998, "overflow-notify"),
+                Duration::from_millis(200),
+                "overflow-notify",
+            )
+            .unwrap_err();
+        assert_eq!(sync_err.kind, ErrorKind::Oversized, "{sync_err:?}");
+        release_lsp_gate(&sink.gate);
+        let _ = tokio::time::timeout(Duration::from_secs(10), head).await;
     }
 
     /// (iii) shutdown REQUEST receives a response, then the exit

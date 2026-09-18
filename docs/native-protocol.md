@@ -5,6 +5,11 @@ IDE panels are the only clients, and this protocol is optimized around the
 Faktor runtime. Foreign wire compatibility was retired by explicit owner
 decision; nothing here pretends to be it.
 
+"v1" is this document's label for the daemon's own contract, not a runtime
+constant: the code defines no native protocol version constant (the only
+version constants are `faktor-core`'s `VERSION` and `UX_BASELINE`). The
+contract IS the route set and the strict DTOs below.
+
 All endpoints require daemon auth (`Authorization: Bearer
 <FAKTOR_SERVER_PASSWORD>` or `x-faktor-server-password`; the legacy
 per-start token rides the same Bearer header). The pre-cutover `Basic`
@@ -73,17 +78,20 @@ Implemented (this revision of the daemon):
   `{ session: {id,title,provider,model,lifecycle}, state:
   {machine,label,active,terminal}, activeModel?, activeTool?, progress?,
   filesChanged: [...], lastCheckpoint?, verification: [...],
-  contextUsage?, queued: n }`. `activeModel` = the effective
-  provider/model envelope of the current or most recent logical turn
-  (durable turn record; `null` before the first turn). `activeTool` =
+  contextUsage?, prefixStability?, queued: n }`. `activeModel` = the
+  effective provider/model envelope of the current or most recent logical
+  turn (durable turn record; `null` before the first turn). `activeTool` =
   the newest still-running durable tool-run row. `filesChanged` = the
   durable task ledger's changed files. `lastCheckpoint` = newest
   checkpoint row when the daemon runs with a checkpoint service wired,
   else `null`. `verification` = pending tool runs whose effects are
-  `unknown` (recovery `mark_unknown`), capped. `progress` and
-  `contextUsage` are `null` in this revision (no numeric progress
-  channel, and no durable usage read API yet); the machine state and
-  provider-call journal are the source of phase information.
+  `unknown` (recovery `mark_unknown`), capped. `progress` is the session's
+  live bounded progress record (null before the runtime tracked one);
+  `contextUsage` stays `null` in this revision (no durable context-usage
+  read API yet); `prefixStability` is populated from the durable per-call
+  prefix observations once a turn has settled one (null before). The
+  machine state, activeTool and provider-call journal are the source of
+  phase information.
 - `GET /models` — the flat daemon model catalog:
   `[{provider, model, context, maxOutput, tools, parallelTools,
   reasoning, thinking, vision, structuredOutput, embeddings, streaming,
@@ -116,15 +124,19 @@ Implemented (this revision of the daemon):
   page rows); `event: heartbeat` keep-alives carry no id. Catch-up is
   paged (bounded), so a reconnect against a huge journal never balloons
   RAM and resumes exactly from the cursor.
-- `GET /native/usage` — cross-session aggregate of the durable
-  context-usage facts the runtime records (memory facts kind `usage`,
-  keys `budget`/`spent`, integer values): `{sessions, totals:
-  {budget, spent}, perSession: [{sessionId, budget, spent}]}`.
-  `totals` sum every numeric fact across sessions; `perSession` lists
-  only sessions carrying usage facts (non-numeric hostile values are
-  skipped). No runtime path writes those facts yet, so today the totals
-  are honest zeros and the list is empty — the aggregate shape is frozen
-  for the UI; a future audit wires the writer.
+- `GET /native/usage` — cross-session aggregate with two documented
+  layers. The legacy view keeps its frozen shape over the memory facts of
+  kind `usage` (keys `budget`/`spent`): `{sessions, totals: {budget,
+  spent}, perSession: [{sessionId, budget, spent}]}`; no runtime path
+  writes those facts (they exist for simulators/tooling), so when nothing
+  recorded them the totals are honest zeros and the list is empty. The
+  `durable` layer is the AUTHORITATIVE aggregate over persisted rows:
+  provider-call tokens plus prefix observations, task spend, and the
+  cost-reservation groups (`reserved`/`dispatched`, `settled`, `refunded`,
+  `uncertain`); a scan hitting its cap says `truncated: true` instead of
+  pretending to be exact. With `?org=` the route serves the org-isolated
+  Wave 3 billing fold (`since` and `limit` are its strict query
+  parameters; unknown query keys are a 400).
 - `GET /native/session/{id}/turns` — the session's durable turn records,
   newest first: `[{opId, status, provider, model, variant?, toolMode?,
   startedAt, updatedMs, queueSeq?, promptMessageId?}]` (`status` =
@@ -153,15 +165,21 @@ Implemented (this revision of the daemon):
   durable memory facts of kind `verification` (one per failed REQUIRED
   check, recorded at genuine turn ends; `detail` carries
   `failed:<command>`). Bounded; empty arrays when nothing is owed.
-- `GET /native/session/{id}/agents` — background agents owned by the
-  session. Always `[]` in this revision: child sessions appear when
-  orchestration (Agent Manager subagent sessions) lands in the runtime.
-  The route exists so the UI can poll the shape now.
-- `GET /native/session/{id}/terminal` — the session's terminal view:
-  `[{id, pid, alive}]`. Live PTYs have no durable session binding yet, so
-  every live PTY of the daemon is listed (session-scoped ownership is the
-  next wiring step); the path session id is still validated (unknown →
-  404).
+- `GET /native/session/{id}/agents` — the session's real agent listing
+  (path-id form of `/native/agents?session=`): every orchestrated run's
+  children plus the parent's own durable task runs, projected from the
+  `orchestrator_*` and task-run rows. Empty ONLY when the session
+  genuinely has no task run.
+- `GET /native/session/{id}/terminal` — the session's terminal view over
+  the durable session-owned `terminal_*` ledger rows:
+  `[{id, pid, alive, sessionId, taskId, agentId, operationId, spawnedMs,
+  state, ptyId?}]` (`ptyId` only when a live PTY handle of this boot owns
+  the row). The path session id is still validated (unknown → 404). The
+  scoped control routes are `GET /native/terminals?session=`,
+  `GET /native/session/{id}/terminal/events`, output snapshots at
+  `GET /native/session/{id}/terminals/{terminal_id}/output`, spawn at
+  `POST /native/session/{id}/terminal`, and
+  `input`/`resize`/`kill`/`reconcile` posts under the same terminal path.
 - `POST /native/session/{id}/abort` — the native abort
   (`sdk_abort` semantics behind the strict DTO): body
   `{"session_id": <id>, "op_id": <opId>?}` (`op_id` targets one queued
@@ -171,15 +189,21 @@ Implemented (this revision of the daemon):
   its durable row without touching the state machine. Response
   `{aborted: [<opId>...]}`.
 
-Designed; not yet wired (one-line semantics):
+Wired under the daemon-level `/native` prefix (strict DTOs; the daemon
+serves these daemon-level forms only — there are no exact
+`/session/{id}/...` aliases for them):
 
-- `GET /session/{id}/messages?cursor=` — cursor-based message page
-  (`seq > cursor`, newest first, `nextCursor`/`hasMore`).
-- `GET /session/{id}/events?after=` — journal event frames with `seq >
-  after` resume cursors (SSE `id:` = event seq; see §11.3 of the
-  architecture spec).
-- `GET /providers` — provider instances with their auth/endpoint
-  metadata (never secrets).
+- `GET /native/messages?session=<id>&before=<seq>&limit=<n>` — cursor-based
+  message page (`seq < before`, newest first, `hasMore`/`nextBefore`, page
+  cap 200).
+- `GET /native/events?session=<id>&after=<seq>&limit=<n>` — journal event
+  page with `seq > after` resume cursors (SSE `id:` = event seq; see §11.3
+  of the architecture spec; page cap 256).
+- `GET /native/providers` — the registry view of every registered provider:
+  `[{instanceId, family, models: [{model, context, maxOutput, tools,
+  parallelTools, reasoning, thinking, vision, structuredOutput,
+  embeddings, streaming, source}], runtimeContextLimitSupported, health}]`.
+  Auth/endpoint metadata stays in the provider layer and is never emitted.
 
 ## UI-adaptation principle
 

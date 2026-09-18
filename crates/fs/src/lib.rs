@@ -1790,12 +1790,24 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("secret"), "s").unwrap();
         symlink(outside.path(), h.root().join("link")).unwrap();
-        assert!(h.resolve(Path::new("link/secret")).is_err());
-        assert!(h.resolve(Path::new("link")).is_err());
+        // Both the escape THROUGH the link and the link itself are typed
+        // permission refusals, and the outside bytes are never addressed.
+        for evil in [Path::new("link/secret"), Path::new("link")] {
+            let err = h.resolve(evil).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Permission, "{evil:?}: {err:?}");
+        }
         // Inside symlink is fine.
         fs::write(h.root().join("real"), "x").unwrap();
         symlink(h.root().join("real"), h.root().join("alias")).unwrap();
-        assert!(h.resolve(Path::new("alias")).is_ok());
+        let resolved = h.resolve(Path::new("alias")).unwrap();
+        assert!(
+            resolved.ends_with("real"),
+            "an inside symlink resolves to its target: {resolved:?}"
+        );
+        assert!(
+            resolved.starts_with(h.root()),
+            "resolution must stay inside the workspace root"
+        );
     }
 
     #[test]

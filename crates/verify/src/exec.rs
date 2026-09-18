@@ -1163,36 +1163,63 @@ mod tests {
         // One environment authority: a verification child sees PATH and the
         // approved CARGO_HOME value, never a configured secret name (even
         // when the parent carries it), and never an undeclared daemon var.
-        std::env::set_var("CARGO_HOME", "/tmp/kp-verify-cargo");
+        //
+        // Env mutation is process-global: the approved value is tempdir-
+        // unique per test (parallel cargo-test processes cannot collide),
+        // and a drop guard restores the prior values so a panicking
+        // assertion cannot leak them.
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (name, prior) in &self.0 {
+                    match prior {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_home = dir.path().join("cargo-home");
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        let cargo_home = cargo_home.display().to_string();
+        let names = [
+            "CARGO_HOME",
+            "OPENAI_API_KEY",
+            "TEST_PRIVATE_SECRET",
+            "KP_VERIFY_UNDECLARED",
+        ];
+        let _restore = RestoreEnv(
+            names
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect(),
+        );
+        std::env::set_var("CARGO_HOME", &cargo_home);
         std::env::set_var("OPENAI_API_KEY", "sk-verify-secret");
         std::env::set_var("TEST_PRIVATE_SECRET", "private");
         std::env::set_var("KP_VERIFY_UNDECLARED", "must-not-arrive");
-        let dir = tempfile::tempdir().unwrap();
         let ex = AsyncCheckExecutor::default();
         let c = ctx(dir.path(), Duration::from_secs(30));
+        let script = format!(
+            "test -n \"$PATH\" || exit 11; \
+             test \"$CARGO_HOME\" = '{cargo_home}' || exit 12; \
+             test -z \"$OPENAI_API_KEY\" || exit 13; \
+             test -z \"$TEST_PRIVATE_SECRET\" || exit 14; \
+             test -z \"$KP_VERIFY_UNDECLARED\" || exit 15; \
+             echo verify-env-exact"
+        );
         let spec = CheckSpec::new(
             "env-exact",
             CheckKind::Test,
             CheckCategory::Quick,
             "/bin/sh",
-            [
-                "-c",
-                "test -n \"$PATH\" || exit 11; \
-                 test \"$CARGO_HOME\" = /tmp/kp-verify-cargo || exit 12; \
-                 test -z \"$OPENAI_API_KEY\" || exit 13; \
-                 test -z \"$TEST_PRIVATE_SECRET\" || exit 14; \
-                 test -z \"$KP_VERIFY_UNDECLARED\" || exit 15; \
-                 echo verify-env-exact",
-            ],
+            ["-c".to_string(), script],
             true,
         );
         let out = ex.run_check(&spec, &c).await.unwrap();
         assert_eq!(out.status, CheckRunStatus::Passed, "{out:?}");
         assert!(out.summary.unwrap_or_default().contains("verify-env-exact"));
-        std::env::remove_var("CARGO_HOME");
-        std::env::remove_var("OPENAI_API_KEY");
-        std::env::remove_var("TEST_PRIVATE_SECRET");
-        std::env::remove_var("KP_VERIFY_UNDECLARED");
     }
 
     #[test]

@@ -1922,6 +1922,9 @@ fn process_alive(pid: u32) -> bool {
     }
     // kill(pid, 0) probes existence natively (no /bin/ps); zombies count as
     // existing (they are reaped by the caller's waitpid/child.wait).
+    // SAFETY: `pid` was checked non-zero above and fits `i32` (kernel pids
+    // are `pid_t`); signal 0 only probes existence and never delivers a
+    // signal, so a recycled id can at worst report "alive".
     let r = unsafe { libc::kill(pid as i32, 0) };
     if r == -1 {
         let err = std::io::Error::last_os_error();
@@ -1947,6 +1950,9 @@ fn group_gone(pgid: u32) -> bool {
     // purposes — their fds are closed, so a group of zombies cannot hold a
     // pipe; kill() on a zombie-only group succeeds until they are reaped,
     // which merely means we send one harmless extra signal.
+    // SAFETY: `pgid` was validated non-zero above, so the negation cannot be
+    // 0 or overflow; signal 0 only probes group existence and never delivers
+    // a signal (an out-of-range group id can at worst report "not found").
     let r = unsafe { libc::kill(-(pgid as i32), 0) };
     if r == -1 {
         let err = std::io::Error::last_os_error();
@@ -1984,6 +1990,10 @@ fn taskkill_best_effort(pid: u32) {
 fn kill_group(pid: u32, grace_ms: u64) -> Result<(), Error> {
     #[cfg(unix)]
     {
+        // SAFETY: `pid` is the group leader of a supervisor-spawned `setsid`
+        // child (pids fit `pid_t`), so the negative id addresses exactly that
+        // process group; SIGTERM is the cooperative first move and a stale
+        // group id can at worst fail with ESRCH, which the caller handles.
         let sigterm = unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
         if sigterm != 0 {
             return Err(Error::internal(format!("kill TERM {pid}")));
@@ -1996,6 +2006,9 @@ fn kill_group(pid: u32, grace_ms: u64) -> Result<(), Error> {
             std::thread::sleep(Duration::from_millis(10));
         }
         // A stubborn descendant survived SIGTERM: SIGKILL the whole group.
+        // SAFETY: same group id as the SIGTERM above (established by the
+        // supervisor's setsid spawn); SIGKILL is the documented escalation
+        // after the grace window, and the ignored error can only be ESRCH.
         let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
     }
     #[cfg(not(unix))]
@@ -2014,6 +2027,10 @@ fn kill_group(pid: u32, grace_ms: u64) -> Result<(), Error> {
 pub async fn kill_group_async(pid: u32, grace_ms: u64) -> Result<(), Error> {
     #[cfg(unix)]
     {
+        // SAFETY: `pid` is the group leader of a supervisor-spawned `setsid`
+        // child (pids fit `pid_t`), so the negative id addresses exactly that
+        // process group; SIGTERM is the cooperative first move and a stale
+        // group id can at worst fail with ESRCH, which the caller handles.
         let sigterm = unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
         if sigterm != 0 {
             return Err(Error::internal(format!("kill TERM {pid}")));
@@ -2029,6 +2046,9 @@ pub async fn kill_group_async(pid: u32, grace_ms: u64) -> Result<(), Error> {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         // A stubborn descendant survived SIGTERM: SIGKILL the whole group.
+        // SAFETY: same group id as the SIGTERM above (established by the
+        // supervisor's setsid spawn); SIGKILL is the documented escalation
+        // after the grace window, and the ignored error can only be ESRCH.
         let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
     }
     #[cfg(not(unix))]
@@ -2120,6 +2140,9 @@ mod tests {
     fn pid_is_gone(pid: u32) -> bool {
         #[cfg(unix)]
         {
+            // SAFETY: test helper; `pid` comes from a spawned child (non-zero,
+            // fits `pid_t`) and signal 0 only probes liveness — no signal is
+            // delivered, so a recycled id can at worst extend a test poll.
             let r = unsafe { libc::kill(pid as i32, 0) };
             if r == -1 {
                 let err = std::io::Error::last_os_error();
@@ -2330,9 +2353,46 @@ mod tests {
         // toolchain vars arrive; configured secret-shaped names set in the
         // parent never cross, even when the spec would otherwise copy them,
         // and an undeclared daemon var never arrives.
+        //
+        // Env mutation is process-global: the values are UNIQUE per test
+        // (tempdir-backed) so parallel cargo-test processes can never read
+        // each other's paths, and a drop guard restores the prior values so
+        // a panicking assertion cannot leak them into later tests.
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (name, prior) in &self.0 {
+                    match prior {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
         let (_d, sup) = supervisor();
-        std::env::set_var("CARGO_HOME", "/tmp/kp-cargo-home");
-        std::env::set_var("RUSTUP_HOME", "/tmp/kp-rustup-home");
+        let home = tempfile::tempdir().unwrap();
+        let cargo_home = home.path().join("cargo-home");
+        let rustup_home = home.path().join("rustup-home");
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        std::fs::create_dir_all(&rustup_home).unwrap();
+        let cargo_home = cargo_home.display().to_string();
+        let rustup_home = rustup_home.display().to_string();
+        let names = [
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "FAKTOR_SERVER_PASSWORD",
+            "OPENAI_API_KEY",
+            "TEST_PRIVATE_SECRET",
+            "KP_UNDECLARED_DAEMON_VAR",
+        ];
+        let _restore = RestoreEnv(
+            names
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect(),
+        );
+        std::env::set_var("CARGO_HOME", &cargo_home);
+        std::env::set_var("RUSTUP_HOME", &rustup_home);
         std::env::set_var("FAKTOR_SERVER_PASSWORD", "hunter2");
         std::env::set_var("OPENAI_API_KEY", "sk-test-secret");
         std::env::set_var("TEST_PRIVATE_SECRET", "private");
@@ -2352,8 +2412,12 @@ mod tests {
             "PATH must be present and non-empty: {:?}",
             out.stdout_head
         );
-        assert!(out.stdout_head.contains("CARGO_HOME=/tmp/kp-cargo-home"));
-        assert!(out.stdout_head.contains("RUSTUP_HOME=/tmp/kp-rustup-home"));
+        assert!(out
+            .stdout_head
+            .contains(&format!("CARGO_HOME={cargo_home}")));
+        assert!(out
+            .stdout_head
+            .contains(&format!("RUSTUP_HOME={rustup_home}")));
         for secret in [
             "FAKTOR_SERVER_PASSWORD",
             "OPENAI_API_KEY",
@@ -2377,12 +2441,6 @@ mod tests {
             .unwrap();
         assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
         assert!(out.stdout_head.contains("explicit-exact"));
-        std::env::remove_var("CARGO_HOME");
-        std::env::remove_var("RUSTUP_HOME");
-        std::env::remove_var("FAKTOR_SERVER_PASSWORD");
-        std::env::remove_var("OPENAI_API_KEY");
-        std::env::remove_var("TEST_PRIVATE_SECRET");
-        std::env::remove_var("KP_UNDECLARED_DAEMON_VAR");
     }
 
     #[test]
