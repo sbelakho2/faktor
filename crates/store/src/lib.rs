@@ -5417,12 +5417,15 @@ impl Store {
     }
 
     /// Op ids of all non-terminal queue rows for a session (abort(None)
-    /// must durably cancel queued prompts too).
+    /// must durably cancel queued prompts too). `running` rows are included:
+    /// an interrupted admission/drive leaves a running row (`running` counts
+    /// as non-terminal in [`Store::queue_status_counts`]) and abort must be
+    /// able to clear it, never leave it counted forever.
     pub fn queue_op_ids(&self, session: SessionId) -> StoreResult<Vec<OpId>> {
         let conn = self.read()?;
         let mut stmt = conn.prepare(
             "SELECT seq, op_id FROM prompt_queue
-             WHERE session_id = ?1 AND status IN ('pending','claimed')",
+             WHERE session_id = ?1 AND status IN ('pending','claimed','running')",
         )?;
         let rows = stmt.query_map(params![session.raw() as i64], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
@@ -5438,34 +5441,69 @@ impl Store {
         Ok(out)
     }
 
-    /// Durable cancellation of queued rows (abort semantics): pending and
-    /// claimed rows for the given ops become cancelled and are never
-    /// admitted. Returns how many rows were cancelled.
+    /// Durable cancellation of queued rows (abort semantics): pending,
+    /// claimed AND running rows for the given ops become cancelled and are
+    /// never admitted. A `running` row whose drive was interrupted is
+    /// exactly the crash residue abort must be able to clear. Returns how
+    /// many rows were cancelled.
     pub fn cancel_queued_ops(&self, session: SessionId, ops: &[OpId]) -> StoreResult<i64> {
         let conn = self.write();
         let mut n = 0i64;
         for op in ops {
             n += conn.execute(
                 "UPDATE prompt_queue SET status = 'cancelled', completed_at = ?3
-                 WHERE session_id = ?1 AND op_id = ?2 AND status IN ('pending','claimed')",
+                 WHERE session_id = ?1 AND op_id = ?2 AND status IN ('pending','claimed','running')",
                 params![session.raw() as i64, op.raw() as i64, now_ms()],
             )? as i64;
         }
         Ok(n)
     }
 
-    /// Recovery pass: claimed rows that were never executed (crash between
-    /// claim and execution) return to pending so they are re-admitted;
-    /// running rows are left for turn-level recovery. Returns the re-admitted
-    /// count.
+    /// Recovery pass over the durable queue of one session. Two distinct
+    /// crash residues, classified by the DURABLE OWNERSHIP MODEL (the
+    /// `turn_record` of the row's op is the ownership witness):
+    ///
+    /// - `claimed` rows were never driven (crash between claim and drive):
+    ///   they return to `pending` so the head is re-admitted; re-admission
+    ///   upserts the SAME turn record, so the logical turn is never
+    ///   duplicated. Returns that re-admitted count.
+    /// - `running` rows whose op has NO active turn record are rows whose
+    ///   logical turn already ended (the terminal mark was lost to the
+    ///   crash); they are retired to `done` — never re-admitted, which
+    ///   would deliver the same prompt twice.
+    ///
+    /// A `running` row whose op DOES carry an active turn record is the
+    /// interrupted logical turn of that record: it is LEFT running. The
+    /// queue runner resumes the recorded turn (the durable ownership
+    /// witness) and marks the row terminal exactly once after the resume —
+    /// so the row can never spin forever and is never delivered twice.
+    /// Returns the number of claimed rows returned to pending.
     pub fn recover_claimed_queue_rows(&self, session: SessionId) -> StoreResult<i64> {
         let conn = self.write();
-        let n = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        let reclaimed = tx.execute(
             "UPDATE prompt_queue SET status = 'pending', claimed_at = NULL
              WHERE session_id = ?1 AND status = 'claimed'",
             params![session.raw() as i64],
         )? as i64;
-        Ok(n)
+        let retired = tx.execute(
+            "UPDATE prompt_queue SET status = 'done', completed_at = ?2
+             WHERE session_id = ?1 AND status = 'running' AND NOT EXISTS (
+                 SELECT 1 FROM turn_record tr
+                  WHERE tr.session_id = prompt_queue.session_id
+                    AND tr.turn_op_id = prompt_queue.op_id
+                    AND tr.status = 'active')",
+            params![session.raw() as i64, now_ms()],
+        )? as i64;
+        tx.commit()?;
+        if retired > 0 {
+            tracing::warn!(
+                session = %session,
+                rows = retired,
+                "queue recovery retired running rows whose logical turn already ended"
+            );
+        }
+        Ok(reclaimed)
     }
 
     /// All session ids with non-terminal queue rows (startup kick list).
@@ -16644,6 +16682,90 @@ mod typed_ledger_tests {
             (2, OpId::new(9)),
             "the queue head advances to the next row"
         );
+    }
+
+    /// Crash-residue recovery of the durable queue (adversarial): a
+    /// `claimed` row returns to pending (re-admitted later); a `running` row
+    /// whose logical turn already ended (no active turn record) is retired to
+    /// `done` — re-admitting it would deliver the prompt twice; a `running`
+    /// row OWNED by an active turn record is left running for the queue
+    /// runner to resume and consume exactly once; and `abort(None)` can
+    /// cancel every non-terminal row, running rows included.
+    #[test]
+    fn queue_recovery_classifies_running_rows_by_turn_record_ownership() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        // Row 1: admitted but never driven (claimed) — crash between claim
+        // and the first drive.
+        store
+            .enqueue_prompt(s.id, OpId::new(11), "one", &[], None, None, None, 1)
+            .unwrap();
+        // Row 2: admitted, drive started (running) and its turn record is
+        // ACTIVE — the recoverable interrupted turn.
+        store
+            .enqueue_prompt(s.id, OpId::new(12), "two", &[], None, None, None, 2)
+            .unwrap();
+        // Row 3: running with NO active turn record — the turn ended but the
+        // terminal mark was lost. Rows 2 and 3 both run in one pass.
+        store
+            .enqueue_prompt(s.id, OpId::new(13), "three", &[], None, None, None, 3)
+            .unwrap();
+        store
+            .write()
+            .execute(
+                "UPDATE prompt_queue SET status = CASE seq
+                     WHEN 1 THEN 'claimed'
+                     WHEN 2 THEN 'running'
+                     ELSE 'running' END
+                 WHERE session_id = ?1",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        store
+            .start_turn_record(s.id, OpId::new(12), Some(2), None, "p", "m", None)
+            .unwrap();
+
+        let reclaimed = store.recover_claimed_queue_rows(s.id).unwrap();
+        assert_eq!(reclaimed, 1, "the claimed row returns to pending");
+        let statuses: Vec<(i64, String)> = {
+            let conn = store.read().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT seq, status FROM prompt_queue WHERE session_id = ?1 ORDER BY seq")
+                .unwrap();
+            let rows = stmt
+                .query_map(params![s.id.raw() as i64], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            statuses,
+            vec![
+                (1, "pending".to_string()),
+                (2, "running".to_string()),
+                (3, "done".to_string()),
+            ],
+            "claimed -> pending; owned running stays; orphaned running is retired"
+        );
+        // The runnable marker still lists the session (rows 1/2 remain).
+        assert_eq!(
+            store.sessions_with_pending_queues().unwrap(),
+            vec![s.id],
+            "the runnable marker keeps listing the session"
+        );
+        // Idempotent: a second recovery changes nothing.
+        assert_eq!(store.recover_claimed_queue_rows(s.id).unwrap(), 0);
+        // abort(None) semantics: every non-terminal row (pending AND
+        // running) is cancellable through the op-id scan.
+        let ops = store.queue_op_ids(s.id).unwrap();
+        assert_eq!(
+            ops,
+            vec![OpId::new(11), OpId::new(12)],
+            "queue_op_ids covers pending and running rows"
+        );
+        assert_eq!(store.cancel_queued_ops(s.id, &ops).unwrap(), 2);
+        assert!(store.sessions_with_pending_queues().unwrap().is_empty());
+        assert!(store.queue_op_ids(s.id).unwrap().is_empty());
     }
 
     /// The same persisted `op_id` decode class on the other read paths:

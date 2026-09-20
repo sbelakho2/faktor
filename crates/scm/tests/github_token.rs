@@ -192,7 +192,7 @@ fn token_source(
 }
 
 fn installation() -> ScmInstallationId {
-    ScmInstallationId::new(42)
+    ScmInstallationId::try_from_raw(42).unwrap()
 }
 
 /// Decode a JWT and verify its RS256 signature against the test public key.

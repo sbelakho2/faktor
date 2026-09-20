@@ -69,7 +69,8 @@ pub use manifest::{
 pub use release::{
     launch, release_id_for, resolve_launch, running_install_root, running_release, self_digest,
     validate_release_id, LaunchInputs, ReleaseTarget, TrustEntry, TrustFile, INSTALL_ROOT_ENV,
-    LAUNCHER_ROOT_ENV, RELEASE_DIGEST_ENV, RELEASE_ID_ENV, TRUST_FILE_SCHEMA,
+    LAUNCHER_ROOT_ENV, LAUNCH_FORWARD_WINDOW_MS, LAUNCH_POLL_INTERVAL_MS, RELEASE_DIGEST_ENV,
+    RELEASE_ID_ENV, TRUST_FILE_SCHEMA,
 };
 pub use service::{
     ApplyOutcome, CheckOutcome, RecoveryOutcome, ReleaseOutcome, ReleaseRestarter,

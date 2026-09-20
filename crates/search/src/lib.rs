@@ -4,6 +4,19 @@
 //! reciprocal-rank fusion weighted by symbol relevance, lexical score,
 //! semantic score, file recency, and task affinity. Evidence packages are
 //! retrieved automatically before serious reasoning turns (spec §20).
+//!
+//! Fallibility contract (silent-degradation guard): every entry point
+//! validates its query and returns a typed [`ErrorKind::Malformed`] or
+//! [`ErrorKind::Oversized`] error instead of an empty vector, so invalid
+//! input can never be mistaken for "no matches". [`SearchService::semantic`]
+//! refuses typedly without a configured embedder and surfaces provider
+//! failures (timeout, rate limit, transport, malformed/ragged/non-finite
+//! vectors, wrong dimension) unchanged. [`SearchService::fused`] propagates
+//! those failures: a configured-but-failing provider can never masquerade as
+//! a valid lexical/symbol-only result. Semantic retrieval is omitted ONLY
+//! when no embedder is configured — a `Disabled` mode that is explicit in the
+//! API ([`SearchService::semantic_enabled`] returns `false`), never encoded
+//! as zero semantic hits.
 
 use std::sync::{Arc, Mutex};
 
@@ -94,10 +107,11 @@ impl SearchService {
     /// Case-insensitive substring search over indexed file contents? The
     /// inverted index stores tokens; exact search matches the QUERY as a
     /// token or a token prefix, plus full-text substring over paths.
-    pub fn exact(&self, ws: WorkspaceId, needle: &str, limit: usize) -> Vec<Hit> {
-        if self.check_query(needle).is_err() {
-            return vec![];
-        }
+    ///
+    /// Invalid input (blank or over [`MAX_QUERY_BYTES`]) is a typed refusal,
+    /// never `Ok(vec![])`.
+    pub fn exact(&self, ws: WorkspaceId, needle: &str, limit: usize) -> Result<Vec<Hit>, Error> {
+        self.check_query(needle)?;
         let needle_l = needle.to_lowercase();
         let index = recover_lock(&self.index);
         let mut out = Vec::new();
@@ -134,13 +148,13 @@ impl SearchService {
                 .then(a.path.cmp(&b.path))
         });
         out.truncate(limit);
-        out
+        Ok(out)
     }
 
-    pub fn lexical(&self, ws: WorkspaceId, query: &str, limit: usize) -> Vec<Hit> {
-        if self.check_query(query).is_err() {
-            return vec![];
-        }
+    /// Token-frequency search: invalid input is a typed refusal, never
+    /// `Ok(vec![])`.
+    pub fn lexical(&self, ws: WorkspaceId, query: &str, limit: usize) -> Result<Vec<Hit>, Error> {
+        self.check_query(query)?;
         let tokens = faktor_index::tokenize(query);
         let index = recover_lock(&self.index);
         let mut scores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
@@ -168,13 +182,12 @@ impl SearchService {
                 .then(a.path.cmp(&b.path))
         });
         out.truncate(limit);
-        out
+        Ok(out)
     }
 
-    pub fn symbol(&self, ws: WorkspaceId, name: &str, limit: usize) -> Vec<Hit> {
-        if self.check_query(name).is_err() {
-            return vec![];
-        }
+    /// Symbol lookup: invalid input is a typed refusal, never `Ok(vec![])`.
+    pub fn symbol(&self, ws: WorkspaceId, name: &str, limit: usize) -> Result<Vec<Hit>, Error> {
+        self.check_query(name)?;
         let index = recover_lock(&self.index);
         let mut out = Vec::new();
         for (path, sym) in index.symbol_lookup(ws, name, limit) {
@@ -186,9 +199,13 @@ impl SearchService {
             });
         }
         out.truncate(limit);
-        out
+        Ok(out)
     }
 
+    /// Semantic retrieval. Without a configured embedder this is the typed
+    /// `Disabled` refusal (`NotFound`); with one configured, every provider
+    /// failure propagates unchanged — never an empty or lexical-only
+    /// substitute.
     pub fn semantic(&self, ws: WorkspaceId, query: &str, limit: usize) -> Result<Vec<Hit>, Error> {
         self.check_query(query)?;
         let Some(embedder) = &self.embedder else {
@@ -280,36 +297,55 @@ impl SearchService {
             .collect())
     }
 
-    /// Reciprocal-rank fusion over exact/lexical/symbol (+ semantic when
-    /// present). Every ranking is bounded and deterministic; the fused list
-    /// is the ranked evidence package the context compiler consumes.
-    pub fn fused(&self, ws: WorkspaceId, query: &str, limit: usize) -> Vec<Hit> {
-        if self.check_query(query).is_err() {
-            return vec![];
-        }
+    /// Reciprocal-rank fusion over exact/lexical/symbol (+ semantic when a
+    /// provider is configured). Every ranking is bounded and deterministic;
+    /// the fused list is the ranked evidence package the context compiler
+    /// consumes.
+    ///
+    /// Fallible by contract (silent-degradation guard): an invalid query is
+    /// a typed refusal and, when [`SearchService::semantic_enabled`] is
+    /// `true`, any semantic-provider failure propagates unchanged. A
+    /// configured provider is never skipped; the ONLY mode without a
+    /// semantic leg is `Disabled` (no embedder configured), which callers
+    /// can observe explicitly instead of inferring it from zero hits.
+    pub fn fused(&self, ws: WorkspaceId, query: &str, limit: usize) -> Result<Vec<Hit>, Error> {
+        self.check_query(query)?;
         let mut rankings: Vec<(f64, Vec<Hit>)> = Vec::new();
-        rankings.push((2.0, self.symbol(ws, query, limit * 4)));
-        rankings.push((1.5, self.exact(ws, query, limit * 4)));
-        rankings.push((1.0, self.lexical(ws, query, limit * 4)));
-        if self.embedder.is_some() {
-            if let Ok(sem) = self.semantic(ws, query, limit * 4) {
-                rankings.push((0.8, sem));
-            }
+        rankings.push((2.0, self.symbol(ws, query, limit * 4)?));
+        rankings.push((1.5, self.exact(ws, query, limit * 4)?));
+        rankings.push((1.0, self.lexical(ws, query, limit * 4)?));
+        if self.semantic_enabled() {
+            rankings.push((0.8, self.semantic(ws, query, limit * 4)?));
         }
-        fuse(&rankings, limit)
+        Ok(fuse(&rankings, limit))
+    }
+
+    /// Whether a semantic provider is configured.
+    ///
+    /// `false` is the explicit `Disabled` mode: `fused` deliberately omits
+    /// the semantic leg and [`SearchService::semantic`] refuses with a typed
+    /// `NotFound`. `true` means the configured provider is consulted and its
+    /// typed failures propagate out of `fused`/`semantic`.
+    pub fn semantic_enabled(&self) -> bool {
+        self.embedder.is_some()
     }
 
     /// Automatic evidence package (spec §20): concepts from the task, recent
     /// errors, active symbols, changed files. Bounded: ≤ max_hits, snippets
     /// ≤ 400 chars.
+    ///
+    /// Fallible by contract: each concept is retrieved through
+    /// [`SearchService::fused`], so a malformed/oversized concept or a
+    /// configured semantic provider's failure propagates instead of silently
+    /// shrinking the package.
     pub fn evidence_package(
         &self,
         ws: WorkspaceId,
         concepts: &[String],
         max_hits: usize,
-    ) -> Vec<EvidenceHit> {
+    ) -> Result<Vec<EvidenceHit>, Error> {
         if max_hits == 0 {
-            return vec![];
+            return Ok(vec![]);
         }
         let mut out: Vec<EvidenceHit> = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -317,7 +353,7 @@ impl SearchService {
             if out.len() >= max_hits {
                 break;
             }
-            let hits = self.fused(ws, concept, 4);
+            let hits = self.fused(ws, concept, 4)?;
             for hit in hits {
                 if out.len() >= max_hits {
                     break;
@@ -331,7 +367,7 @@ impl SearchService {
                 }
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -568,7 +604,7 @@ mod tests {
         // index generations (the recovered guard is still served) and never
         // panic the search path.
         let svc = SearchService::new(idx.clone(), None);
-        let hits = svc.exact(ws, "parse", 5);
+        let hits = svc.exact(ws, "parse", 5).unwrap();
         assert!(!hits.is_empty());
         assert!(!idx.is_poisoned());
     }
@@ -577,7 +613,7 @@ mod tests {
     fn fused_ranks_symbol_above_lexical_only() {
         let (idx, ws) = corpus();
         let svc = SearchService::new(idx, None);
-        let hits = svc.fused(ws, "Parser", 10);
+        let hits = svc.fused(ws, "Parser", 10).unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0].path, "src/parser.rs");
         assert!(hits[0].symbol.is_some(), "symbol match should rank first");
@@ -587,14 +623,21 @@ mod tests {
     fn semantic_without_embedder_errors_cleanly() {
         let (idx, ws) = corpus();
         let svc = SearchService::new(idx, None);
+        // `Disabled` semantics is explicit in the API, never encoded as an
+        // empty semantic ranking.
+        assert!(!svc.semantic_enabled());
         let err = svc.semantic(ws, "parse", 5).unwrap_err();
         assert!(err.kind == ErrorKind::NotFound);
+        // The fused API stays available: no provider means no semantic leg
+        // (documented `Disabled`), and lexical/symbol evidence still serves.
+        assert!(!svc.fused(ws, "parse", 5).unwrap().is_empty());
     }
 
     #[test]
     fn semantic_with_fake_embedder_contributes_to_fusion() {
         let (idx, ws) = corpus();
         let svc = SearchService::new(idx, Some(Arc::new(KeywordEmbedder)));
+        assert!(svc.semantic_enabled());
         let sem = svc.semantic(ws, "lexer token", 5).unwrap();
         assert!(!sem.is_empty());
         assert_eq!(
@@ -603,7 +646,7 @@ mod tests {
         );
         // Fusion: parser.rs wins the lexical leg (token `token` ×2) while
         // lexer.rs wins the semantic leg; both must be present.
-        let fused = svc.fused(ws, "lexer token", 5);
+        let fused = svc.fused(ws, "lexer token", 5).unwrap();
         assert!(!fused.is_empty());
         let paths: Vec<&str> = fused.iter().map(|h| h.path.as_str()).collect();
         assert!(
@@ -620,26 +663,30 @@ mod tests {
     fn exact_substring_case_insensitive() {
         let (idx, ws) = corpus();
         let svc = SearchService::new(idx, None);
-        let hits = svc.exact(ws, "PARSER", 10);
+        let hits = svc.exact(ws, "PARSER", 10).unwrap();
         assert!(hits.iter().any(|h| h.path.contains("parser.rs")));
-        let hits = svc.exact(ws, "src/lexer", 10);
+        let hits = svc.exact(ws, "src/lexer", 10).unwrap();
         assert!(hits.iter().any(|h| h.path.contains("lexer.rs")));
     }
 
-    /// A configured embedder is untrusted input: malformed responses are
-    /// typed refusals (never a panic, never a silent truncation) and a
-    /// provider error propagates through `semantic` while `fused` degrades
-    /// honestly to the lexical/symbol legs.
+    /// A configured embedder is untrusted input: malformed responses and
+    /// provider failures are typed refusals (never a panic, never a silent
+    /// truncation) that `fused` PROPAGATES unchanged — a provider outage can
+    /// never masquerade as a valid lexical/symbol-only result set.
     #[test]
-    fn malformed_embedder_responses_are_typed_and_fusion_degrades() {
-        struct Bad(EmbedderResponses);
+    fn semantic_provider_failures_surface_through_fused_typed() {
+        #[derive(Clone, Copy)]
         enum EmbedderResponses {
             Empty,
             Short,
             Ragged,
             NonFinite,
-            Failed,
+            DocNonFinite,
+            Timeout,
+            RateLimited,
+            Provider { retryable: bool },
         }
+        struct Bad(EmbedderResponses);
         impl Embedder for Bad {
             fn embed(&self, texts: &[String]) -> Vec<Vec<f32>> {
                 let n = texts.len();
@@ -654,59 +701,110 @@ mod tests {
                         v
                     }
                     EmbedderResponses::NonFinite => vec![vec![f32::NAN]; n],
-                    EmbedderResponses::Failed => {
-                        vec![vec![1.0]; n]
+                    EmbedderResponses::DocNonFinite => {
+                        let mut v = vec![vec![1.0]; n];
+                        if let Some(d) = v.get_mut(1) {
+                            d[0] = f32::INFINITY;
+                        }
+                        v
                     }
+                    EmbedderResponses::Timeout
+                    | EmbedderResponses::RateLimited
+                    | EmbedderResponses::Provider { .. } => vec![vec![1.0]; n],
                 }
             }
             fn try_embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, Error> {
-                if matches!(self.0, EmbedderResponses::Failed) {
-                    return Err(Error::new(
+                match self.0 {
+                    EmbedderResponses::Timeout => {
+                        Err(Error::timeout("embedding provider timed out"))
+                    }
+                    EmbedderResponses::RateLimited => Err(Error::new(
+                        ErrorKind::RateLimited,
+                        "embedding provider rate limited",
+                    )),
+                    EmbedderResponses::Provider { retryable } => Err(Error::new(
                         ErrorKind::Provider {
                             code: "embeddings_unavailable".into(),
-                            retryable: true,
+                            retryable,
                         },
                         "embedding provider refused the request",
-                    ));
+                    )),
+                    _ => Ok(self.embed(texts)),
                 }
-                Ok(self.embed(texts))
             }
         }
         let (idx, ws) = corpus();
-        for (name, case) in [
-            ("empty", EmbedderResponses::Empty),
-            ("short", EmbedderResponses::Short),
-            ("ragged", EmbedderResponses::Ragged),
-            ("non-finite", EmbedderResponses::NonFinite),
-            ("failed", EmbedderResponses::Failed),
-        ] {
-            let svc = SearchService::new(idx.clone(), Some(Arc::new(Bad(case))));
-            let err = svc
-                .semantic(ws, "parse", 5)
-                .expect_err(&format!("{name} must be a typed refusal"));
-            if name != "failed" {
-                assert_eq!(err.kind, ErrorKind::Malformed, "{name}: {err}");
-            }
-            // Fusion never crashes and never loses the lexical/symbol legs.
-            let fused = svc.fused(ws, "parse", 5);
-            assert!(
-                fused.iter().any(|h| h.path == "src/parser.rs"),
-                "{name}: lexical/symbol evidence must survive: {fused:?}"
-            );
-        }
-        // A provider error carries its typed retryable code through.
-        let svc = SearchService::new(idx, Some(Arc::new(Bad(EmbedderResponses::Failed))));
-        let err = svc.semantic(ws, "parse", 5).unwrap_err();
-        assert!(
-            matches!(
-                err.kind,
-                ErrorKind::Provider {
-                    retryable: true,
-                    ..
-                }
+        let cases: Vec<(&str, EmbedderResponses, ErrorKind)> = vec![
+            (
+                "empty-response",
+                EmbedderResponses::Empty,
+                ErrorKind::Malformed,
             ),
-            "{err:?}"
-        );
+            (
+                "short-response",
+                EmbedderResponses::Short,
+                ErrorKind::Malformed,
+            ),
+            (
+                "ragged-vector",
+                EmbedderResponses::Ragged,
+                ErrorKind::Malformed,
+            ),
+            (
+                "non-finite-query",
+                EmbedderResponses::NonFinite,
+                ErrorKind::Malformed,
+            ),
+            (
+                "non-finite-document",
+                EmbedderResponses::DocNonFinite,
+                ErrorKind::Malformed,
+            ),
+            ("timeout", EmbedderResponses::Timeout, ErrorKind::Timeout),
+            (
+                "rate-limited",
+                EmbedderResponses::RateLimited,
+                ErrorKind::RateLimited,
+            ),
+            (
+                "provider-retryable",
+                EmbedderResponses::Provider { retryable: true },
+                ErrorKind::Provider {
+                    code: "embeddings_unavailable".into(),
+                    retryable: true,
+                },
+            ),
+            (
+                "provider-permanent",
+                EmbedderResponses::Provider { retryable: false },
+                ErrorKind::Provider {
+                    code: "embeddings_unavailable".into(),
+                    retryable: false,
+                },
+            ),
+        ];
+        for (name, case, expected) in cases {
+            let svc = SearchService::new(idx.clone(), Some(Arc::new(Bad(case))));
+            let sem_err = svc
+                .semantic(ws, "parse", 5)
+                .expect_err(&format!("{name}: semantic must be a typed refusal"));
+            assert_eq!(sem_err.kind, expected, "{name}: semantic kind");
+            let fused_err = svc.fused(ws, "parse", 5).expect_err(&format!(
+                "{name}: fused must surface the provider error, never a lexical-only result"
+            ));
+            assert_eq!(fused_err.kind, expected, "{name}: fused kind");
+            assert_eq!(
+                fused_err.retryable,
+                expected.is_retryable(),
+                "{name}: retryability must survive the surface"
+            );
+            // The evidence-package entry point propagates too: a configured
+            // provider failure can never silently shrink the package.
+            let pkg_err = svc
+                .evidence_package(ws, &["parse".into()], 4)
+                .expect_err(&format!("{name}: evidence package must propagate"));
+            assert_eq!(pkg_err.kind, expected, "{name}: evidence_package kind");
+        }
     }
 
     #[test]
@@ -724,16 +822,18 @@ mod tests {
         )
         .unwrap();
         let svc = SearchService::new(Arc::new(Mutex::new(idx)), None);
-        assert!(svc.lexical(ws, "ziggurat_vault", 10).is_empty());
-        assert!(svc.symbol(ws, "ziggurat_vault", 10).is_empty());
-        let exact = svc.exact(ws, "ziggurat_vault", 10);
+        assert!(svc.lexical(ws, "ziggurat_vault", 10).unwrap().is_empty());
+        assert!(svc.symbol(ws, "ziggurat_vault", 10).unwrap().is_empty());
+        let exact = svc.exact(ws, "ziggurat_vault", 10).unwrap();
         assert_eq!(exact.len(), 1, "the path is an exact hit: {exact:?}");
-        let fused = svc.fused(ws, "ziggurat_vault", 10);
+        let fused = svc.fused(ws, "ziggurat_vault", 10).unwrap();
         assert!(
             fused.iter().any(|h| h.path == "src/ziggurat_vault.rs"),
             "the exact-only path must survive fusion: {fused:?}"
         );
-        let pkg = svc.evidence_package(ws, &["ziggurat_vault".into()], 4);
+        let pkg = svc
+            .evidence_package(ws, &["ziggurat_vault".into()], 4)
+            .unwrap();
         assert_eq!(pkg.len(), 1);
         assert_eq!(pkg[0].path, "src/ziggurat_vault.rs");
     }
@@ -743,39 +843,83 @@ mod tests {
         let (idx, ws) = corpus();
         let svc = SearchService::new(idx, Some(Arc::new(KeywordEmbedder)));
         let concepts: Vec<String> = (0..100).map(|i| format!("parse token {i}")).collect();
-        let pkg = svc.evidence_package(ws, &concepts, 8);
+        let pkg = svc.evidence_package(ws, &concepts, 8).unwrap();
         assert!(pkg.len() <= 8, "bounded by max_hits");
         assert!(pkg.iter().all(|e| e.snippet.len() <= MAX_SNIPPET_CHARS));
         // Dedup by path.
         let paths: std::collections::HashSet<_> = pkg.iter().map(|e| &e.path).collect();
         assert_eq!(paths.len(), pkg.len());
         // Empty max_hits → empty.
-        assert!(svc.evidence_package(ws, &concepts, 0).is_empty());
+        assert!(svc.evidence_package(ws, &concepts, 0).unwrap().is_empty());
     }
 
+    /// Invalid input is a typed refusal from EVERY entry point — never an
+    /// empty `Ok` that a caller could mistake for "no matches".
     #[test]
-    fn empty_and_hostile_queries() {
+    fn invalid_queries_are_typed_from_every_entry_point() {
         let (idx, ws) = corpus();
-        let svc = SearchService::new(idx, None);
-        assert!(svc.exact(ws, "", 5).is_empty());
-        assert!(svc.lexical(ws, "   ", 5).is_empty());
-        assert!(svc.symbol(ws, "", 5).is_empty());
-        assert!(svc.fused(ws, "", 5).is_empty());
-        // Oversized query → error (or empty for infallible entry points).
+        let svc = SearchService::new(idx.clone(), Some(Arc::new(KeywordEmbedder)));
         let big = "x".repeat(MAX_QUERY_BYTES + 1);
-        assert!(svc.semantic(ws, &big, 5).is_err());
-        assert!(svc.exact(ws, &big, 5).is_empty());
-        // Hostile unicode is safe.
-        let _ = svc.fused(ws, "\u{FFFE}\u{FFFF}😀", 5);
+        for (name, query, expected) in [
+            ("empty", "", ErrorKind::Malformed),
+            ("whitespace", "   \t\n", ErrorKind::Malformed),
+            ("oversized", big.as_str(), ErrorKind::Oversized),
+        ] {
+            assert_eq!(
+                svc.exact(ws, query, 5).unwrap_err().kind,
+                expected,
+                "{name}: exact"
+            );
+            assert_eq!(
+                svc.lexical(ws, query, 5).unwrap_err().kind,
+                expected,
+                "{name}: lexical"
+            );
+            assert_eq!(
+                svc.symbol(ws, query, 5).unwrap_err().kind,
+                expected,
+                "{name}: symbol"
+            );
+            assert_eq!(
+                svc.fused(ws, query, 5).unwrap_err().kind,
+                expected,
+                "{name}: fused"
+            );
+            assert_eq!(
+                svc.semantic(ws, query, 5).unwrap_err().kind,
+                expected,
+                "{name}: semantic"
+            );
+            assert_eq!(
+                svc.evidence_package(ws, &[query.to_string()], 4)
+                    .unwrap_err()
+                    .kind,
+                expected,
+                "{name}: evidence_package"
+            );
+        }
+        // The disabled semantic mode is a typed refusal too, never a silent
+        // empty ranking.
+        let plain = SearchService::new(idx, None);
+        assert_eq!(
+            plain.semantic(ws, "parse", 5).unwrap_err().kind,
+            ErrorKind::NotFound
+        );
+        // Hostile unicode is safe (and valid input is not refused).
+        assert!(svc.fused(ws, "\u{FFFE}\u{FFFF}😀", 5).is_ok());
     }
 
     #[test]
     fn no_index_data_returns_empty() {
         let idx = Arc::new(Mutex::new(WI::new()));
         let svc = SearchService::new(idx, None);
-        assert!(svc.fused(WorkspaceId::new(9), "anything", 5).is_empty());
+        assert!(svc
+            .fused(WorkspaceId::new(9), "anything", 5)
+            .unwrap()
+            .is_empty());
         assert!(svc
             .evidence_package(WorkspaceId::new(9), &["x".into()], 5)
+            .unwrap()
             .is_empty());
     }
 
@@ -783,8 +927,8 @@ mod tests {
     fn fusion_weights_are_stable() {
         let (idx, ws) = corpus();
         let svc = SearchService::new(idx.clone(), Some(Arc::new(KeywordEmbedder)));
-        let a = svc.fused(ws, "parse", 10);
-        let b = svc.fused(ws, "parse", 10);
+        let a = svc.fused(ws, "parse", 10).unwrap();
+        let b = svc.fused(ws, "parse", 10).unwrap();
         assert_eq!(a, b, "fused ranking must be deterministic");
     }
 
@@ -792,10 +936,10 @@ mod tests {
     fn symbol_search_exact_and_prefix() {
         let (idx, ws) = corpus();
         let svc = SearchService::new(idx, None);
-        let hits = svc.symbol(ws, "Parser", 10);
+        let hits = svc.symbol(ws, "Parser", 10).unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0].symbol.as_ref().unwrap().name, "Parser");
-        let hits = svc.symbol(ws, "parse", 10);
+        let hits = svc.symbol(ws, "parse", 10).unwrap();
         assert!(hits.iter().any(|h| h
             .symbol
             .as_ref()
@@ -910,7 +1054,7 @@ mod tests {
             vec!["quantum".to_string(), "quantum".to_string()]
         );
         // Fusion still carries the persisted semantic leg.
-        let fused = svc.fused(ws, "quantum", 5);
+        let fused = svc.fused(ws, "quantum", 5).unwrap();
         assert!(
             fused.iter().any(|h| h.path == "src/ledger.rs"),
             "persisted vectors must fuse: {fused:?}"
@@ -919,12 +1063,17 @@ mod tests {
 
     #[test]
     fn persisted_query_dimension_and_shape_mismatches_are_typed() {
-        // Index model dimension 2, embedder answers 3.
+        // Index model dimension 2, embedder answers 3: the typed refusal is
+        // surfaced by BOTH `semantic` and `fused` — the fused caller can
+        // never receive a lexical-only result instead of the error.
         let (idx, ws) = persisted_corpus(2);
         let svc = SearchService::new(idx.clone(), Some(Arc::new(SpyAxisEmbedder::new(3))));
         let err = svc.semantic(ws, "quantum", 5).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Malformed, "{err}");
         assert!(err.message.contains("dimension"), "{err}");
+        let fused_err = svc.fused(ws, "quantum", 5).unwrap_err();
+        assert_eq!(fused_err.kind, ErrorKind::Malformed, "{fused_err}");
+        assert!(fused_err.message.contains("dimension"), "{fused_err}");
         // A non-finite query vector is a typed refusal.
         struct NonFinite;
         impl Embedder for NonFinite {
@@ -935,6 +1084,8 @@ mod tests {
         let svc = SearchService::new(idx, Some(Arc::new(NonFinite)));
         let err = svc.semantic(ws, "quantum", 5).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Malformed, "{err}");
+        let fused_err = svc.fused(ws, "quantum", 5).unwrap_err();
+        assert_eq!(fused_err.kind, ErrorKind::Malformed, "{fused_err}");
     }
 
     #[test]
@@ -984,7 +1135,7 @@ mod tests {
         )
         .unwrap();
         let svc = SearchService::new(Arc::new(Mutex::new(idx)), None);
-        let hits = svc.lexical(ws, "shared", 10);
+        let hits = svc.lexical(ws, "shared", 10).unwrap();
         assert_eq!(hits.len(), 2);
         // Both are returned; ordering is by freq (equal), stable.
         assert!(hits.iter().any(|h| h.path == "old.rs"));
@@ -998,7 +1149,7 @@ mod tests {
         // A mixed CJK+ASCII query must still retrieve through the ASCII
         // token (CJK is tokenized safely, never panics, never blanks the
         // whole query).
-        let hits = svc.fused(ws, "解析 parse", 5);
+        let hits = svc.fused(ws, "解析 parse", 5).unwrap();
         assert!(!hits.is_empty(), "mixed CJK+ASCII query must retrieve");
         assert!(
             hits.iter().any(|h| h.path.ends_with("parser.rs")),
@@ -1006,13 +1157,15 @@ mod tests {
         );
         // Per-concept evidence: the ASCII concept retrieves real snippets;
         // the pure-CJK concept is handled without fabricating hits.
-        let mixed = svc.evidence_package(ws, &["解析".into(), "parse".into()], 5);
+        let mixed = svc
+            .evidence_package(ws, &["解析".into(), "parse".into()], 5)
+            .unwrap();
         assert!(!mixed.is_empty(), "the ASCII concept must retrieve");
         assert!(mixed.len() <= 5, "evidence stays bounded");
         assert!(mixed
             .iter()
             .all(|e| !e.snippet.is_empty() && e.path.ends_with(".rs")));
-        let cjk_only = svc.evidence_package(ws, &["解析".into()], 5);
+        let cjk_only = svc.evidence_package(ws, &["解析".into()], 5).unwrap();
         assert!(cjk_only.len() <= 5, "a pure-CJK concept stays bounded");
     }
 }

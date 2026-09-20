@@ -28,6 +28,11 @@ faktor-provider.workspace = true
 faktor-cas.workspace = true
 futures.workspace = true
 tempfile.workspace = true
+# Test-only: the queue settle-path kick computes its decision from a durable
+# read; the adversarial test corrupts that read (drops `prompt_queue`) by
+# direct SQL against the store file, exactly like the store crate's own
+# corruption tests.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 # Same windows-sys 0.61.2 revision the workspace already locks

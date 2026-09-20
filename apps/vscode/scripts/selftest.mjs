@@ -27,6 +27,7 @@ import * as cp from '../src/cockpit.ts';
 import * as cpa from '../src/controlPlaneAuth.ts';
 import composerPolicy from '../media/composer-state.js';
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -35,6 +36,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import vm from 'node:vm';
@@ -1420,6 +1422,107 @@ async function stateTests() {
 
 // ---------------------------------------------------------------- 6. daemon
 
+// A fake RELEASE process: writes its pid, serves the real /native/health
+// contract with the bearer claim, and stays up until signalled.
+const FAKE_RELEASE_SOURCE = `#!/usr/bin/env node
+const http = require('node:http');
+const fs = require('node:fs');
+const pidfile = process.env.FAKE_RELEASE_PIDFILE;
+const digest = 'a'.repeat(64);
+const noDigest = process.env.FAKE_RELEASE_NO_DIGEST === '1';
+const version = noDigest ? '9.9.9' : '9.9.9+release.selftest.' + digest;
+const server = http.createServer((req, res) => {
+  if (req.method === 'GET' && req.url === '/native/health' &&
+      req.headers.authorization === 'Bearer ' + process.env.FAKTOR_SERVER_PASSWORD) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, version: version }));
+    return;
+  }
+  res.writeHead(401, { 'content-type': 'application/json' });
+  res.end('{}');
+});
+server.listen(0, '127.0.0.1', () => {
+  if (pidfile) fs.writeFileSync(pidfile, String(process.pid));
+  console.log('faktor server listening on http://127.0.0.1:' + server.address().port);
+});
+`;
+
+// A fake bootstrap LAUNCHER: spawns the release, forwards its stdout, and
+// either exits the moment readiness is seen (the new immediate-exit
+// launcher, optionally announcing the release pid first) or stays resident
+// (the legacy launcher). The announced pid/digest are overridable so tests
+// can point the handshake at a victim pid or a mismatched digest.
+const FAKE_LAUNCHER_SOURCE = `#!/usr/bin/env node
+const { spawn } = require('node:child_process');
+const path = require('node:path');
+const resident = process.env.FAKE_LAUNCHER_MODE === 'resident';
+const announce = process.env.FAKE_LAUNCHER_PIDLINE === '1';
+const announcedPid = process.env.FAKE_LAUNCHER_ANNOUNCE_PID || null;
+const announcedDigest = process.env.FAKE_LAUNCHER_ANNOUNCE_DIGEST || 'a'.repeat(64);
+const release = path.join(__dirname, 'fake-release.cjs');
+const child = spawn(process.execPath, [release], { stdio: ['ignore', 'pipe', 'inherit'] });
+let buf = '';
+let startupSeen = false;
+child.stdout.on('data', (chunk) => {
+  buf += chunk;
+  let idx;
+  while ((idx = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, idx);
+    buf = buf.slice(idx + 1);
+    if (!startupSeen && line.startsWith('faktor server listening on')) {
+      startupSeen = true;
+      if (announce) {
+        console.log('faktor release started pid=' + (announcedPid || child.pid) + ' digest=' + announcedDigest);
+      }
+      console.log(line);
+      if (!resident) {
+        process.exit(0);
+      }
+      continue;
+    }
+    console.log(line);
+  }
+});
+if (resident) {
+  child.on('exit', (code) => process.exit(code === null ? 0 : code));
+}
+`;
+
+function writeExecutable(path, source) {
+  writeFileSync(path, source);
+  chmodSync(path, 0o755);
+}
+
+function releasePidFrom(pidfile) {
+  try {
+    const pid = Number(readFileSync(pidfile, 'utf8').trim());
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+async function waitFor(predicate, timeoutMs, label) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+
+function fakeLauncherTree() {
+  const root = mkdtempSync(join(tmpdir(), 'faktor-launcher-lifecycle-'));
+  const release = join(root, 'fake-release.cjs');
+  const launcher = join(root, 'fake-launcher.cjs');
+  const pidfile = join(root, 'release.pid');
+  writeExecutable(release, FAKE_RELEASE_SOURCE);
+  writeExecutable(launcher, FAKE_LAUNCHER_SOURCE);
+  return { root, launcher, pidfile };
+}
+
 async function daemonTests() {
   await test('daemon resolves an explicit binary path', () => {
     assertEqual(
@@ -1488,6 +1591,280 @@ async function daemonTests() {
     assertEqual(dm.releaseDigestOf('0.9.1'), null);
     assertEqual(dm.releaseDigestOf('0.9.1+release.0.9.1-abcdef123456'), null);
     assertEqual(dm.releaseDigestOf(`0.9.1+release.x.${'A'.repeat(64)}`), null);
+  });
+
+  await test('launcher-exits-early-still-alive: the release pid is tracked, launcher exit is not daemon death', async () => {
+    const { root, launcher, pidfile } = fakeLauncherTree();
+    try {
+      const daemon = await dm.startDaemon({
+        workspaceRoot: '/nonexistent',
+        binaryPath: launcher,
+        resolveReleasePid: () => releasePidFrom(pidfile),
+        env: { FAKE_RELEASE_PIDFILE: pidfile },
+      });
+      const releasePid = releasePidFrom(pidfile);
+      assert(releasePid !== null, 'the fake release must have written its pid');
+      assertEqual(daemon.pid, releasePid, 'the handle must track the RELEASE pid, never the launcher');
+      assert(
+        daemon.launcherPid !== releasePid,
+        `launcher pid ${daemon.launcherPid} must differ from the release pid ${releasePid}`,
+      );
+      await waitFor(
+        () => !dm.processAlive(daemon.launcherPid),
+        5_000,
+        'the immediate-exit launcher to disappear',
+      );
+      assertEqual(await daemon.alive(), true, 'the launcher exiting must not read as daemon death');
+      assert(dm.processAlive(releasePid), 'the release must still be running');
+      dm.stopDaemon(daemon);
+      assertEqual(await daemon.alive(), false, 'a stopped daemon must report not alive');
+      await waitFor(() => !dm.processAlive(releasePid), 5_000, 'the release to exit after stop');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('launcher-exits-early-daemon-dies-detected: release death is reported once the launcher is gone', async () => {
+    const { root, launcher, pidfile } = fakeLauncherTree();
+    try {
+      const daemon = await dm.startDaemon({
+        workspaceRoot: '/nonexistent',
+        binaryPath: launcher,
+        resolveReleasePid: () => releasePidFrom(pidfile),
+        env: { FAKE_RELEASE_PIDFILE: pidfile },
+      });
+      const releasePid = releasePidFrom(pidfile);
+      assert(releasePid !== null, 'the fake release must have written its pid');
+      await waitFor(
+        () => !dm.processAlive(daemon.launcherPid),
+        5_000,
+        'the immediate-exit launcher to disappear',
+      );
+      process.kill(releasePid, 'SIGKILL');
+      await waitFor(() => !dm.processAlive(releasePid), 5_000, 'the release to die');
+      assertEqual(await daemon.alive(), false, 'the RELEASE death must be detected');
+      dm.stopDaemon(daemon);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('stop-terminates-release-not-launcher: stop kills the release, not just a resident launcher', async () => {
+    const { root, launcher, pidfile } = fakeLauncherTree();
+    try {
+      const daemon = await dm.startDaemon({
+        workspaceRoot: '/nonexistent',
+        binaryPath: launcher,
+        resolveReleasePid: () => releasePidFrom(pidfile),
+        env: { FAKE_RELEASE_PIDFILE: pidfile, FAKE_LAUNCHER_MODE: 'resident' },
+      });
+      const releasePid = releasePidFrom(pidfile);
+      assert(releasePid !== null, 'the fake release must have written its pid');
+      assert(dm.processAlive(daemon.launcherPid), 'the legacy launcher must stay resident');
+      assert(
+        releasePid !== daemon.launcherPid,
+        'the release must be a distinct process from the resident launcher',
+      );
+      dm.stopDaemon(daemon);
+      await waitFor(() => !dm.processAlive(releasePid), 5_000, 'the RELEASE to die on stop');
+      await waitFor(
+        () => !dm.processAlive(daemon.launcherPid),
+        5_000,
+        'the resident launcher to exit after its release died',
+      );
+      assertEqual(await daemon.alive(), false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('launcher release-pid handshake line is parsed before the startup line', async () => {
+    const digest = 'a'.repeat(64);
+    const match = dm.RELEASE_PID_LINE.exec(`faktor release started pid=4242 digest=${digest}`);
+    assert(match !== null, 'the frozen handshake line must parse');
+    assertEqual(Number(match[1]), 4242);
+    for (const hostile of [
+      '',
+      `faktor release started pid=4242 digest=${'A'.repeat(64)}`,
+      `faktor release started pid=4242 digest=${'a'.repeat(63)}`,
+      `faktor release started pid=0 digest=${digest}`,
+      `leading noise faktor release started pid=4242 digest=${digest}`,
+      `faktor release started pid=4242 digest=${digest} trailing`,
+    ]) {
+      assertEqual(dm.RELEASE_PID_LINE.exec(hostile), null, `hostile handshake ${JSON.stringify(hostile)}`);
+    }
+
+    const { root, launcher, pidfile } = fakeLauncherTree();
+    try {
+      const daemon = await dm.startDaemon({
+        workspaceRoot: '/nonexistent',
+        binaryPath: launcher,
+        // No resolver injection: only the announced handshake pid can name
+        // the release here (the test seam is deliberately absent).
+        env: { FAKE_RELEASE_PIDFILE: pidfile, FAKE_LAUNCHER_PIDLINE: '1' },
+      });
+      const releasePid = releasePidFrom(pidfile);
+      assert(releasePid !== null, 'the fake release must have written its pid');
+      assertEqual(daemon.pid, releasePid, 'the announced release pid must be tracked');
+      assertEqual(daemon.releaseTrustError, null, 'a matching health digest must be trusted');
+      assert(
+        daemon.pid !== daemon.launcherPid,
+        'the announced release pid must not be the launcher pid',
+      );
+      assertEqual(await daemon.alive(), true);
+      await dm.stopDaemon(daemon);
+      await waitFor(() => !dm.processAlive(releasePid), 5_000, 'the release to exit after stop');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('release handshake digest mismatch: announced pid is refused, never signalled', async () => {
+    const { root, launcher, pidfile } = fakeLauncherTree();
+    const victim = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      stdio: 'ignore',
+    });
+    try {
+      const daemon = await dm.startDaemon({
+        workspaceRoot: '/nonexistent',
+        binaryPath: launcher,
+        env: {
+          FAKE_RELEASE_PIDFILE: pidfile,
+          FAKE_LAUNCHER_PIDLINE: '1',
+          FAKE_LAUNCHER_ANNOUNCE_PID: String(victim.pid),
+          FAKE_LAUNCHER_ANNOUNCE_DIGEST: 'b'.repeat(64),
+        },
+      });
+      const releasePid = releasePidFrom(pidfile);
+      assert(releasePid !== null, 'the fake release must have written its pid');
+      assertEqual(
+        daemon.releaseTrustError?.code,
+        'release_digest_mismatch',
+        'a mismatched handshake digest must be refused typed',
+      );
+      assert(daemon.pid !== victim.pid, 'the refused announced pid must never be adopted');
+      await waitFor(
+        () => !dm.processAlive(daemon.launcherPid),
+        5_000,
+        'the immediate-exit launcher to disappear',
+      );
+      await dm.stopDaemon(daemon);
+      assert(dm.processAlive(victim.pid), 'the refused announced pid must never be signalled');
+      assertEqual(
+        daemon.stopRefusal?.code,
+        'release_digest_mismatch',
+        'stop must report the typed refusal instead of a silent no-op',
+      );
+      assert(dm.processAlive(releasePid), 'the untrusted release must not be killed by this handle');
+      process.kill(releasePid, 'SIGKILL');
+    } finally {
+      victim.kill('SIGKILL');
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('release handshake with no health digest is refused, never adopted', async () => {
+    const { root, launcher, pidfile } = fakeLauncherTree();
+    try {
+      const daemon = await dm.startDaemon({
+        workspaceRoot: '/nonexistent',
+        binaryPath: launcher,
+        env: {
+          FAKE_RELEASE_PIDFILE: pidfile,
+          FAKE_RELEASE_NO_DIGEST: '1',
+          FAKE_LAUNCHER_PIDLINE: '1',
+        },
+      });
+      const releasePid = releasePidFrom(pidfile);
+      assert(releasePid !== null, 'the fake release must have written its pid');
+      assertEqual(
+        daemon.releaseTrustError?.code,
+        'release_digest_absent',
+        'an absent health digest must refuse the announcement',
+      );
+      assert(daemon.pid !== releasePid, 'the unverifiable announced pid must not be adopted');
+      await waitFor(
+        () => !dm.processAlive(daemon.launcherPid),
+        5_000,
+        'the immediate-exit launcher to disappear',
+      );
+      await dm.stopDaemon(daemon);
+      assert(dm.processAlive(releasePid), 'the unverified release must not be signalled');
+      assertEqual(daemon.stopRefusal?.code, 'release_digest_absent');
+      process.kill(releasePid, 'SIGKILL');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('handshake pid disagreeing with the port probe is refused; the probed release wins', async () => {
+    const { root, launcher, pidfile } = fakeLauncherTree();
+    const victim = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      stdio: 'ignore',
+    });
+    try {
+      const daemon = await dm.startDaemon({
+        workspaceRoot: '/nonexistent',
+        binaryPath: launcher,
+        resolveReleasePid: () => releasePidFrom(pidfile),
+        env: {
+          FAKE_RELEASE_PIDFILE: pidfile,
+          FAKE_LAUNCHER_PIDLINE: '1',
+          FAKE_LAUNCHER_ANNOUNCE_PID: String(victim.pid),
+        },
+      });
+      const releasePid = releasePidFrom(pidfile);
+      assert(releasePid !== null, 'the fake release must have written its pid');
+      assertEqual(
+        daemon.releaseTrustError?.code,
+        'release_pid_probe_mismatch',
+        'a probe disagreement must refuse the announcement',
+      );
+      assertEqual(daemon.pid, releasePid, 'the probed, health-verified pid is the release');
+      await dm.stopDaemon(daemon);
+      await waitFor(() => !dm.processAlive(releasePid), 5_000, 'the probed release to be stopped');
+      assert(dm.processAlive(victim.pid), 'the announced victim pid must never be signalled');
+    } finally {
+      victim.kill('SIGKILL');
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('recycled resolved pid: a dead daemon refuses to signal the cached pid', async () => {
+    const { root, launcher, pidfile } = fakeLauncherTree();
+    const victim = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      stdio: 'ignore',
+    });
+    try {
+      const daemon = await dm.startDaemon({
+        workspaceRoot: '/nonexistent',
+        binaryPath: launcher,
+        // Simulates a stale resolution that now names an unrelated process:
+        // the pid is alive but owns no daemon identity.
+        resolveReleasePid: () => victim.pid,
+        env: { FAKE_RELEASE_PIDFILE: pidfile, FAKE_LAUNCHER_MODE: 'resident' },
+      });
+      const releasePid = releasePidFrom(pidfile);
+      assert(releasePid !== null, 'the fake release must have written its pid');
+      assertEqual(daemon.pid, victim.pid, 'the fixture resolves the stale pid');
+      process.kill(releasePid, 'SIGKILL');
+      await waitFor(() => !dm.processAlive(releasePid), 5_000, 'the release to die');
+      const healthDeadline = Date.now() + 5_000;
+      while (Date.now() < healthDeadline && (await daemon.alive())) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assertEqual(await daemon.alive(), false, 'health must stop answering');
+      await dm.stopDaemon(daemon);
+      assert(dm.processAlive(victim.pid), 'a pid without health identity must never be signalled');
+      assertEqual(
+        daemon.stopRefusal?.code,
+        'stop_identity_unverified',
+        'the refusal must be typed',
+      );
+    } finally {
+      victim.kill('SIGKILL');
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 }
 
@@ -4611,6 +4988,57 @@ async function controlPlaneCredentialTests() {
     });
     assertEqual(none.hadSecret, false);
     assertEqual(calls, 0);
+  });
+
+  await test('an external rotation during the in-flight revoke is compare-and-deleted, never erased', async () => {
+    const secrets = new FakeSecretStorage(new Map([[expectedKey, 'old-token']]));
+    const plaintext = new FakePlaintextSetting('leftover');
+    const revoked = [];
+    const result = await cpa.logoutControlPlane({
+      secrets,
+      plaintext,
+      scope: controlPlaneScope,
+      session: { organization: 'org-1', sessionId: 'ses-1' },
+      revoke: async (token) => {
+        revoked.push(token);
+        // The external rotation lands WHILE the revoke is in flight: only the
+        // CAPTURED token may be revoked, and the NEW secret must survive.
+        secrets.rows.set(expectedKey, 'new-token');
+      },
+    });
+    assertDeepEqual(revoked, ['old-token'], 'the captured token is revoked, never the rotated one');
+    assertEqual(result.rotatedDuringLogout, true, 'the rotation is reported typed');
+    assertEqual(result.remoteRevoked, true);
+    assertEqual(secrets.rows.get(expectedKey), 'new-token', 'the new secret is left untouched');
+    assertEqual(plaintext.value, null, 'the plaintext copy is still cleared');
+
+    // A rotation landing after a FAILED revoke leaves the new credential too,
+    // and both outcomes are reported.
+    const failing = new FakeSecretStorage(new Map([[expectedKey, 'old-token']]));
+    const failed = await cpa.logoutControlPlane({
+      secrets: failing,
+      plaintext: new FakePlaintextSetting(null),
+      scope: controlPlaneScope,
+      session: { organization: 'org-1', sessionId: 'ses-1' },
+      revoke: async () => {
+        failing.rows.set(expectedKey, 'newer-token');
+        throw new Error('network down');
+      },
+    });
+    assertEqual(failed.rotatedDuringLogout, true);
+    assertEqual(failed.remoteError, 'network down');
+    assertEqual(failing.rows.get(expectedKey), 'newer-token');
+    // The no-rotation path still deletes exactly the captured credential.
+    const plain = new FakeSecretStorage(new Map([[expectedKey, 'plain-token']]));
+    const removed = await cpa.logoutControlPlane({
+      secrets: plain,
+      plaintext: new FakePlaintextSetting(null),
+      scope: controlPlaneScope,
+      session: { organization: 'org-1', sessionId: 'ses-1' },
+      revoke: async () => {},
+    });
+    assertEqual(removed.rotatedDuringLogout, false);
+    assertEqual(plain.rows.size, 0, 'an unrotated sign-out still deletes locally');
   });
 
   await test('the client sends the credentialed header only after a secure resolution', async () => {

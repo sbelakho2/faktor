@@ -140,6 +140,15 @@ struct ExternalIdentityRecord {
     identity: ExternalIdentity,
 }
 
+/// The recorded (safe) create-user response. A replay reports
+/// `created = false` (the caller did not create the row).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateUserRecord {
+    user: User,
+    created: bool,
+}
+
 /// One membership joined with its user.
 #[derive(Debug, Clone, Serialize)]
 pub struct MemberView {
@@ -231,6 +240,13 @@ impl ControlPlane {
     // ------------------------------------------------------------ identity
 
     /// Create one user (idempotent by email: an existing user is returned).
+    ///
+    /// The existence check and the insert run inside ONE store transaction
+    /// keyed deterministically by the email, so two concurrent callers for the
+    /// same address can never both observe "absent": the loser replays the
+    /// winner's recorded user and answers `(existing, false)`. The recorded
+    /// response holds the winner's `created` flag; a replay always reports
+    /// `created = false` (a replay did not create anything).
     pub fn create_user(
         &self,
         email: &str,
@@ -242,18 +258,34 @@ impl ControlPlane {
                 "display name is oversized".into(),
             ));
         }
-        if let Some(existing) = self.store.user_by_email(&email)? {
-            return Ok((existing, false));
-        }
-        let user = User {
-            id: UserId::try_new(Self::new_id("usr"))?,
-            email,
-            display_name: display_name.to_string(),
-            created_ms: self.now_ms(),
-            disabled: false,
-        };
-        self.store.put_user(&user)?;
-        Ok((user, true))
+        let now = self.now_ms();
+        // The digest covers ONLY the email: the display name of a later call
+        // must not turn the documented existing-user answer into a conflict.
+        let digest = Self::request_hash(&serde_json::json!({ "email": email }))?;
+        let key = format!("create-user-{}", sha256_hex(email.as_bytes()));
+        let email_in_tx = email.clone();
+        let outcome =
+            self.store
+                .execute_idempotent(&key, "create_user", &digest, now, &mut |tx| {
+                    let (user, created) = match tx.user_by_email(&email_in_tx)? {
+                        Some(existing) => (existing, false),
+                        None => {
+                            let user = User {
+                                id: UserId::try_new(Self::new_id("usr"))?,
+                                email: email_in_tx.clone(),
+                                display_name: display_name.to_string(),
+                                created_ms: now,
+                                disabled: false,
+                            };
+                            tx.put_user(&user)?;
+                            (user, true)
+                        }
+                    };
+                    Ok(serde_json::json!({ "user": user, "created": created }))
+                })?;
+        let executed = matches!(outcome, crate::store::IdempotentOutcome::Executed(_));
+        let record: CreateUserRecord = Self::decode_idempotent(outcome.into_response())?;
+        Ok((record.user, executed && record.created))
     }
 
     /// Link one external identity subject to a user (idempotent: the same
@@ -586,9 +618,14 @@ impl ControlPlane {
             },
         )?;
         let record: ExternalLoginRecord = Self::decode_idempotent(outcome.into_response())?;
+        // A login key is FRESH per call (`new_id("login")`), so this operation
+        // can never be a replay: every login mints a new one-shot token. A
+        // deterministic key would be wrong here precisely because a replay
+        // could not re-present the token. The guard is an internal-consistency
+        // check (the invariant "fresh key => closure ran"), not a replay path.
         let token = issued.ok_or_else(|| {
             ControlPlaneError::Backend(
-                "external login replay cannot re-present a one-shot token".into(),
+                "login invariant violated: a fresh per-call key replayed unexpectedly".into(),
             )
         })?;
         Ok(ExternalLogin {
@@ -1880,7 +1917,7 @@ mod crash_and_race_tests {
     use std::sync::{Arc, Barrier};
 
     use super::*;
-    use crate::store::{ControlPlaneStore, SqliteControlPlaneStore};
+    use crate::store::{ControlPlaneStore, MemoryControlPlaneStore, SqliteControlPlaneStore};
 
     const T0: i64 = 1_700_000_000_000;
 
@@ -2075,7 +2112,8 @@ mod crash_and_race_tests {
                     .unwrap();
                 assert_eq!(accepted.status, InvitationStatus::Accepted);
                 assert_eq!(rows(&store, "cp_membership"), 2);
-                assert_eq!(rows(&store, "cp_idempotency"), 3);
+                // boot + invite + create_user + accept.
+                assert_eq!(rows(&store, "cp_idempotency"), 4);
                 break;
             }
             let attempt = attempt.unwrap_err();
@@ -2117,7 +2155,8 @@ mod crash_and_race_tests {
                 .unwrap();
             assert_eq!(replay.id, membership.id, "k={k}");
             assert_eq!(rows(&store, "cp_membership"), 2, "k={k}");
-            assert_eq!(rows(&store, "cp_idempotency"), 3, "k={k}");
+            // boot + invite + create_user + accept.
+            assert_eq!(rows(&store, "cp_idempotency"), 4, "k={k}");
         }
         assert!(reached_full_path, "the matrix never reached the full path");
     }
@@ -2474,5 +2513,138 @@ mod crash_and_race_tests {
             assert_eq!(rows(&store, "cp_auth_session"), 2, "k={k}");
         }
         assert!(reached_full_path, "the matrix never reached the full path");
+    }
+
+    /// Concurrent same-email creates resolve to exactly ONE user: the winner
+    /// creates, the losers replay the recorded answer as `(existing, false)`
+    /// instead of racing a check-then-insert into a unique-email failure.
+    fn concurrent_create_race(services: Vec<Arc<ControlPlane>>) {
+        let barrier = Arc::new(std::sync::Barrier::new(services.len()));
+        let mut handles = Vec::new();
+        for (i, cp) in services.into_iter().enumerate() {
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                cp.create_user("race@acme.test", &format!("Racer {i}"))
+                    .unwrap()
+            }));
+        }
+        let results: Vec<(User, bool)> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        let created = results.iter().filter(|(_, created)| *created).count();
+        assert_eq!(created, 1, "exactly one caller created the user");
+        let winner = results[0].0.id.clone();
+        assert!(
+            results.iter().all(|(user, _)| user.id == winner),
+            "every caller resolved the same user"
+        );
+    }
+
+    #[test]
+    fn concurrent_create_user_races_resolve_to_one_user_on_memory() {
+        let store: Arc<dyn ControlPlaneStore> = Arc::new(MemoryControlPlaneStore::new());
+        let services = (0..4)
+            .map(|_| {
+                Arc::new(ControlPlane::new(
+                    store.clone(),
+                    Arc::new(ManualClock::new(T0)),
+                ))
+            })
+            .collect();
+        concurrent_create_race(services);
+        assert_eq!(store.users(None, 10).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .user_by_email("race@acme.test")
+                .unwrap()
+                .unwrap()
+                .email,
+            "race@acme.test"
+        );
+    }
+
+    #[test]
+    fn concurrent_create_user_races_resolve_to_one_user_on_sqlite() {
+        // Separate connections to ONE file: a real cross-connection race.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.db");
+        let stores: Vec<Arc<SqliteControlPlaneStore>> = (0..4).map(|_| open(&path)).collect();
+        let services = stores
+            .iter()
+            .map(|store| {
+                Arc::new(ControlPlane::new(
+                    store.clone(),
+                    Arc::new(ManualClock::new(T0)),
+                ))
+            })
+            .collect();
+        concurrent_create_race(services);
+        assert_eq!(stores[0].users(None, 10).unwrap().len(), 1);
+        assert_eq!(
+            stores[0]
+                .user_by_email("race@acme.test")
+                .unwrap()
+                .unwrap()
+                .email,
+            "race@acme.test"
+        );
+    }
+
+    /// Bounded idempotency retention across MANY logins: rows accumulate
+    /// (one per login) but the documented prune brings the journal back under
+    /// the count bound, and the store keeps serving logins afterwards.
+    #[test]
+    fn login_idempotency_rows_are_bounded_across_many_logins() {
+        let store = Arc::new(MemoryControlPlaneStore::new());
+        let clock = Arc::new(ManualClock::new(T0));
+        let cp = ControlPlane::new(store.clone(), clock.clone());
+        let boot = cp
+            .bootstrap_organization("Acme", "owner@acme.test", "Owner", "boot")
+            .unwrap();
+        let org = boot.organization.id.clone();
+        for i in 0..(crate::store::MAX_IDEMPOTENCY_ROWS + 20) {
+            cp.login_external(
+                &org,
+                "idp",
+                &format!("sub-{i}"),
+                &format!("user-{i}@acme.test"),
+                "User",
+                true,
+                Role::Member,
+            )
+            .unwrap();
+        }
+        assert!(
+            store.idempotency_count().unwrap() > crate::store::MAX_IDEMPOTENCY_ROWS,
+            "one durable row per login until the prune tick"
+        );
+        let before = store.idempotency_count().unwrap();
+        let removed = store.prune_idempotency(clock.now_ms()).unwrap();
+        assert_eq!(
+            removed,
+            before - crate::store::MAX_IDEMPOTENCY_ROWS,
+            "the prune removes exactly the oldest excess rows"
+        );
+        assert_eq!(
+            store.idempotency_count().unwrap(),
+            crate::store::MAX_IDEMPOTENCY_ROWS
+        );
+        // A fresh login still works after pruning (the journal is not wedged).
+        cp.login_external(
+            &org,
+            "idp",
+            "sub-after-prune",
+            "after@acme.test",
+            "After",
+            true,
+            Role::Member,
+        )
+        .unwrap();
+        assert_eq!(
+            store.idempotency_count().unwrap(),
+            crate::store::MAX_IDEMPOTENCY_ROWS + 1
+        );
     }
 }

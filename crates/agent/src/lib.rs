@@ -1432,33 +1432,255 @@ where
     tokio::task::spawn_blocking(f).await.ok()
 }
 
+/// Hard byte bound of one poll diagnostic message (a hostile provider can
+/// answer an arbitrarily large error string; the diagnostic is truncated at
+/// a char boundary, never stored or logged unbounded).
+const EVIDENCE_POLL_MESSAGE_MAX_BYTES: usize = 512;
+
+/// Typed outcome of one advisory evidence poll. `NoEvidence` is the
+/// provider's honest "nothing matched"; every other variant that is not
+/// `Served` is an EXPLICIT degradation ("retrieval failed") that the
+/// advisory path logs structurally and callers can distinguish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EvidencePollStatus {
+    /// The provider answered under budget with a non-empty package.
+    Served,
+    /// The provider answered successfully with an empty package: an honest
+    /// "no evidence matched", NOT a retrieval failure.
+    NoEvidence,
+    /// The provider returned a typed error under budget.
+    RetrievalFailed {
+        /// Provider code when the provider surfaced one, else the error
+        /// kind name.
+        code: String,
+        /// Whether the provider marked the failure retryable.
+        retryable: bool,
+        /// Bounded provider message.
+        message: String,
+    },
+    /// The provider future panicked, or the poll thread died before it
+    /// could answer.
+    ProviderPanicked { message: String },
+    /// The wall budget fired before the provider answered.
+    TimedOut { budget_ms: u64 },
+    /// The detached poll thread could not be spawned.
+    NotSpawned { message: String },
+}
+
+impl EvidencePollStatus {
+    /// True when the poll degraded for a reason OTHER than the provider
+    /// honestly reporting no matches. An empty package with a degraded
+    /// status is "retrieval failed"; an empty package with `NoEvidence` is
+    /// "nothing matched" — the advisory path never conflates them.
+    pub(crate) fn is_degraded(&self) -> bool {
+        !matches!(self, Self::Served | Self::NoEvidence)
+    }
+}
+
+/// One poll's result: the possibly-empty advisory package plus WHY it is
+/// what it is (see [`EvidencePollStatus`]).
+#[derive(Debug)]
+pub(crate) struct EvidencePollOutcome {
+    pub evidence: Vec<faktor_context::assembler::Evidence>,
+    pub status: EvidencePollStatus,
+}
+
+/// Truncate one diagnostic to [`EVIDENCE_POLL_MESSAGE_MAX_BYTES`] on a char
+/// boundary.
+fn bounded_poll_message(message: &str) -> String {
+    if message.len() <= EVIDENCE_POLL_MESSAGE_MAX_BYTES {
+        return message.to_string();
+    }
+    let mut end = EVIDENCE_POLL_MESSAGE_MAX_BYTES;
+    while end > 0 && !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message[..end].to_string()
+}
+
+/// Map one provider error into the typed status, preserving the provider
+/// code/retryability when the error carries it.
+fn status_from_provider_error(error: faktor_core::Error) -> EvidencePollStatus {
+    let (code, retryable) = match &error.kind {
+        faktor_core::error::ErrorKind::Provider { code, retryable } => (code.clone(), *retryable),
+        kind => (format!("{kind:?}"), error.retryable),
+    };
+    EvidencePollStatus::RetrievalFailed {
+        code,
+        retryable,
+        message: bounded_poll_message(&error.message),
+    }
+}
+
+/// Extract a bounded message from a caught panic payload.
+fn poll_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        bounded_poll_message(s)
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        bounded_poll_message(s)
+    } else {
+        "evidence provider panicked".to_string()
+    }
+}
+
+// Test-observable per-THREAD count of emitted degraded-poll diagnostics.
+// The tracing sink is process-global and cannot be captured
+// deterministically under parallel tests, while diagnostics are emitted on
+// the polling caller's thread (the detached evidence thread never logs):
+// a thread-local counter makes the "loud, never silent" contract
+// assertable without a lock or a global subscriber.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static EVIDENCE_POLL_DEGRADED_DIAGNOSTICS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn evidence_poll_degraded_diagnostics() -> usize {
+    EVIDENCE_POLL_DEGRADED_DIAGNOSTICS.with(|count| count.get())
+}
+
+/// Emit the structured diagnostic of one degraded poll. Loud by contract:
+/// the advisory path may degrade, but "retrieval failed" is NEVER silent.
+fn log_evidence_poll_degrade(status: &EvidencePollStatus, budget: std::time::Duration) {
+    #[cfg(test)]
+    EVIDENCE_POLL_DEGRADED_DIAGNOSTICS.with(|count| count.set(count.get() + 1));
+    let budget_ms = budget.as_millis().min(u64::MAX as u128) as u64;
+    match status {
+        EvidencePollStatus::Served | EvidencePollStatus::NoEvidence => {}
+        EvidencePollStatus::RetrievalFailed {
+            code,
+            retryable,
+            message,
+        } => {
+            tracing::error!(
+                target: "faktor_agent::evidence",
+                status = "retrieval_failed",
+                provider_code = %code,
+                retryable,
+                budget_ms,
+                "advisory evidence poll failed: {} (advisory contract: the turn continues with an empty package, never silently)",
+                message
+            );
+        }
+        EvidencePollStatus::ProviderPanicked { message } => {
+            tracing::error!(
+                target: "faktor_agent::evidence",
+                status = "provider_panicked",
+                budget_ms,
+                "advisory evidence poll panicked: {message} (advisory contract: the turn continues with an empty package, never silently)"
+            );
+        }
+        EvidencePollStatus::TimedOut { budget_ms } => {
+            tracing::warn!(
+                target: "faktor_agent::evidence",
+                status = "timed_out",
+                budget_ms,
+                "advisory evidence poll missed its wall budget (advisory contract: the turn continues with an empty package)"
+            );
+        }
+        EvidencePollStatus::NotSpawned { message } => {
+            tracing::error!(
+                target: "faktor_agent::evidence",
+                status = "not_spawned",
+                budget_ms,
+                "advisory evidence poll could not spawn its detached thread: {message} (advisory contract: the turn continues with an empty package)"
+            );
+        }
+    }
+}
+
 /// Poll one async `EvidenceProvider` on a DETACHED thread and await it
-/// under `budget`: a provider that panics, errors, or simply never yields
-/// degrades to an empty package once the budget fires. The provider's
-/// future is driven on a plain (non-tokio) thread via the captured runtime
-/// handle — never on a runtime worker and never on a tokio blocking-pool
-/// task — so a stuck provider can neither occupy a turn thread nor delay
-/// the drop of the drive's runtime (tokio joins blocking-pool tasks at
-/// shutdown; the detached thread is abandoned instead, and its eventual
-/// completion just fails the dropped oneshot).
+/// under `budget`, returning the typed outcome: a provider that panics,
+/// errors, or simply never yields degrades to an empty package once the
+/// budget fires. The provider's future is driven on a plain (non-tokio)
+/// thread via the captured runtime handle — never on a runtime worker and
+/// never on a tokio blocking-pool task — so a stuck provider can neither
+/// occupy a turn thread nor delay the drop of the drive's runtime (tokio
+/// joins blocking-pool tasks at shutdown; the detached thread is abandoned
+/// instead, and its eventual completion just fails the dropped oneshot).
+///
+/// Degradation is observable by contract: the status distinguishes an
+/// honest [`EvidencePollStatus::NoEvidence`] answer from
+/// [`EvidencePollStatus::RetrievalFailed`] (provider code + retryability),
+/// a panic, a missed budget and a failed spawn. The caller OWNS the
+/// diagnostic: [`poll_evidence_with_wall_budget`] emits the structured
+/// log for the frozen `runtime.rs` call shape; any other caller must
+/// surface a degraded status itself (never swallow it).
+pub(crate) async fn poll_evidence_with_wall_budget_outcome(
+    provider: Arc<dyn EvidenceProvider>,
+    session: SessionId,
+    query: EvidenceQuery,
+    budget: std::time::Duration,
+) -> EvidencePollOutcome {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::runtime::Handle::current();
+    let spawned = std::thread::Builder::new()
+        .name("evidence-poll".to_string())
+        .spawn(move || {
+            // The provider is untrusted input: a panic inside its future is
+            // caught here so the detached thread always answers (dropping
+            // the oneshot silently would hide the failure).
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle.block_on(provider.evidence_for(session, query))
+            }));
+            let _ = tx.send(result);
+        });
+    if let Err(error) = spawned {
+        return EvidencePollOutcome {
+            evidence: Vec::new(),
+            status: EvidencePollStatus::NotSpawned {
+                message: bounded_poll_message(&error.to_string()),
+            },
+        };
+    }
+    let mut evidence = Vec::new();
+    let status = match tokio::time::timeout(budget, rx).await {
+        Ok(Ok(Ok(Ok(package)))) => {
+            if package.is_empty() {
+                EvidencePollStatus::NoEvidence
+            } else {
+                evidence = package;
+                EvidencePollStatus::Served
+            }
+        }
+        Ok(Ok(Ok(Err(error)))) => status_from_provider_error(error),
+        Ok(Ok(Err(payload))) => EvidencePollStatus::ProviderPanicked {
+            message: poll_panic_message(payload.as_ref()),
+        },
+        Ok(Err(_)) => EvidencePollStatus::ProviderPanicked {
+            message: "evidence poll thread died without answering".to_string(),
+        },
+        Err(_) => EvidencePollStatus::TimedOut {
+            budget_ms: budget.as_millis().min(u64::MAX as u128) as u64,
+        },
+    };
+    EvidencePollOutcome { evidence, status }
+}
+
+/// Advisory legacy poll (used when the IndexService cannot be hosted):
+/// returns the evidence package, empty when the provider fails/panics/times
+/// out. This wrapper keeps the frozen `runtime.rs` call shape status-free,
+/// but its advisory contract is explicit and loud:
+///
+/// - an empty package is the SAME input as "no evidence" for the turn (the
+///   advisorship never blocks a turn), and the degradation is NEVER silent:
+///   every degraded [`poll_evidence_with_wall_budget_outcome`] status is
+///   logged here with the provider code/retryability;
+/// - callers that need to distinguish "no evidence" from "retrieval failed"
+///   at the decision boundary must use
+///   [`poll_evidence_with_wall_budget_outcome`] instead.
 pub(crate) async fn poll_evidence_with_wall_budget(
     provider: Arc<dyn EvidenceProvider>,
     session: SessionId,
     query: EvidenceQuery,
     budget: std::time::Duration,
 ) -> Vec<faktor_context::assembler::Evidence> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let handle = tokio::runtime::Handle::current();
-    let _ = std::thread::Builder::new()
-        .name("evidence-poll".to_string())
-        .spawn(move || {
-            let result = handle.block_on(provider.evidence_for(session, query));
-            let _ = tx.send(result);
-        });
-    match tokio::time::timeout(budget, rx).await {
-        Ok(Ok(Ok(evidence))) => evidence,
-        _ => Vec::new(),
+    let outcome = poll_evidence_with_wall_budget_outcome(provider, session, query, budget).await;
+    if outcome.status.is_degraded() {
+        log_evidence_poll_degrade(&outcome.status, budget);
     }
+    outcome.evidence
 }
 
 /// The agent may never match on provider names (Commandment 4). This test
@@ -1529,6 +1751,295 @@ mod no_provider_switching {
         }
         out.push_str(rest);
         out
+    }
+}
+
+// ---------------------------------------------------------------- service
+
+/// Advisory evidence poll (audits 14/26): a provider failure MUST be
+/// observable — typed status plus a structured diagnostic — never a silent
+/// empty package. `NoEvidence` and `RetrievalFailed` are distinguishable,
+/// and the legacy status-free wrapper is only allowed because the typed
+/// path it delegates to logs the degradation loudly.
+#[cfg(test)]
+mod advisory_evidence_poll_tests {
+    use super::*;
+    use faktor_context::assembler::Evidence;
+    use futures::future::BoxFuture;
+
+    fn query() -> EvidenceQuery {
+        EvidenceQuery {
+            prompt: "where is the parser".into(),
+            changed_files: vec!["src/a.rs".into()],
+            failures: vec![],
+        }
+    }
+
+    fn budget() -> std::time::Duration {
+        std::time::Duration::from_millis(500)
+    }
+
+    struct FailingProvider {
+        error: faktor_core::Error,
+    }
+
+    impl EvidenceProvider for FailingProvider {
+        fn evidence_for(
+            &self,
+            _session: SessionId,
+            _query: EvidenceQuery,
+        ) -> BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
+            let error = self.error.clone();
+            Box::pin(async move { Err(error) })
+        }
+    }
+
+    struct EmptyProvider;
+
+    impl EvidenceProvider for EmptyProvider {
+        fn evidence_for(
+            &self,
+            _session: SessionId,
+            _query: EvidenceQuery,
+        ) -> BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    struct ServingProvider;
+
+    impl EvidenceProvider for ServingProvider {
+        fn evidence_for(
+            &self,
+            _session: SessionId,
+            _query: EvidenceQuery,
+        ) -> BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
+            Box::pin(async {
+                Ok(vec![Evidence {
+                    path: "src/a.rs".into(),
+                    snippet: "fn parser()".into(),
+                    score: 0.9,
+                }])
+            })
+        }
+    }
+
+    struct PanickingProvider;
+
+    impl EvidenceProvider for PanickingProvider {
+        fn evidence_for(
+            &self,
+            _session: SessionId,
+            _query: EvidenceQuery,
+        ) -> BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
+            Box::pin(async {
+                panic!("provider exploded mid-poll");
+                #[allow(unreachable_code)]
+                Ok(Vec::new())
+            })
+        }
+    }
+
+    struct HangingProvider;
+
+    impl EvidenceProvider for HangingProvider {
+        fn evidence_for(
+            &self,
+            _session: SessionId,
+            _query: EvidenceQuery,
+        ) -> BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
+            Box::pin(futures::future::pending())
+        }
+    }
+
+    fn session() -> SessionId {
+        SessionId::new(7)
+    }
+
+    #[tokio::test]
+    async fn failing_provider_is_typed_and_logged_loudly_not_silently_empty() {
+        let failing = || {
+            Arc::new(FailingProvider {
+                error: faktor_core::Error::new(
+                    faktor_core::error::ErrorKind::Provider {
+                        code: "e503".into(),
+                        retryable: true,
+                    },
+                    "embedding backend down",
+                ),
+            }) as Arc<dyn EvidenceProvider>
+        };
+        // Typed path: the failure is a status, not an indistinguishable
+        // empty answer.
+        let outcome =
+            poll_evidence_with_wall_budget_outcome(failing(), session(), query(), budget()).await;
+        assert!(outcome.evidence.is_empty());
+        assert_eq!(
+            outcome.status,
+            EvidencePollStatus::RetrievalFailed {
+                code: "e503".into(),
+                retryable: true,
+                message: "embedding backend down".into(),
+            }
+        );
+        assert!(outcome.status.is_degraded());
+        // Legacy path (the frozen runtime.rs call shape): the empty package
+        // is accompanied by a degraded diagnostic, never silent.
+        let before = evidence_poll_degraded_diagnostics();
+        let legacy = poll_evidence_with_wall_budget(failing(), session(), query(), budget()).await;
+        let after = evidence_poll_degraded_diagnostics();
+        assert!(
+            legacy.is_empty(),
+            "the advisory degrade is an empty package"
+        );
+        assert_eq!(
+            after,
+            before + 1,
+            "a retrieval failure must emit exactly one degraded diagnostic"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_answer_is_no_evidence_not_a_retrieval_failure() {
+        let outcome = poll_evidence_with_wall_budget_outcome(
+            Arc::new(EmptyProvider),
+            session(),
+            query(),
+            budget(),
+        )
+        .await;
+        assert!(outcome.evidence.is_empty());
+        assert_eq!(outcome.status, EvidencePollStatus::NoEvidence);
+        assert!(!outcome.status.is_degraded());
+        // An honest empty answer is NOT a degradation: no diagnostic fires.
+        let before = evidence_poll_degraded_diagnostics();
+        let legacy =
+            poll_evidence_with_wall_budget(Arc::new(EmptyProvider), session(), query(), budget())
+                .await;
+        let after = evidence_poll_degraded_diagnostics();
+        assert!(legacy.is_empty());
+        assert_eq!(after, before, "no-evidence is not a retrieval failure");
+    }
+
+    #[tokio::test]
+    async fn serving_provider_returns_the_package_unchanged() {
+        let outcome = poll_evidence_with_wall_budget_outcome(
+            Arc::new(ServingProvider),
+            session(),
+            query(),
+            budget(),
+        )
+        .await;
+        assert_eq!(outcome.status, EvidencePollStatus::Served);
+        assert!(!outcome.status.is_degraded());
+        assert_eq!(outcome.evidence.len(), 1);
+        assert_eq!(outcome.evidence[0].path, "src/a.rs");
+    }
+
+    #[tokio::test]
+    async fn provider_panic_is_caught_and_typed() {
+        let outcome = poll_evidence_with_wall_budget_outcome(
+            Arc::new(PanickingProvider),
+            session(),
+            query(),
+            budget(),
+        )
+        .await;
+        assert!(outcome.evidence.is_empty());
+        match &outcome.status {
+            EvidencePollStatus::ProviderPanicked { message } => {
+                assert!(message.contains("provider exploded"), "{message}");
+            }
+            other => panic!("a panic must be typed, not silent: {other:?}"),
+        }
+        // The legacy path reports it too.
+        let before = evidence_poll_degraded_diagnostics();
+        let legacy = poll_evidence_with_wall_budget(
+            Arc::new(PanickingProvider),
+            session(),
+            query(),
+            budget(),
+        )
+        .await;
+        let after = evidence_poll_degraded_diagnostics();
+        assert!(legacy.is_empty());
+        assert_eq!(after, before + 1, "a provider panic must be reported");
+    }
+
+    #[tokio::test]
+    async fn missed_wall_budget_is_typed_and_never_blocks() {
+        let started = std::time::Instant::now();
+        let before = evidence_poll_degraded_diagnostics();
+        let outcome = poll_evidence_with_wall_budget_outcome(
+            Arc::new(HangingProvider),
+            session(),
+            query(),
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(outcome.evidence.is_empty());
+        assert_eq!(
+            outcome.status,
+            EvidencePollStatus::TimedOut { budget_ms: 20 }
+        );
+        assert!(outcome.status.is_degraded());
+        // The legacy wrapper reports the missed budget as well.
+        let legacy = poll_evidence_with_wall_budget(
+            Arc::new(HangingProvider),
+            session(),
+            query(),
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        let after = evidence_poll_degraded_diagnostics();
+        assert!(legacy.is_empty());
+        assert_eq!(after, before + 1, "a timeout must be reported");
+    }
+
+    #[tokio::test]
+    async fn hostile_provider_message_is_bounded() {
+        let huge = "x".repeat(64 * 1024);
+        let outcome = poll_evidence_with_wall_budget_outcome(
+            Arc::new(FailingProvider {
+                error: faktor_core::Error::new(faktor_core::error::ErrorKind::Internal, huge),
+            }),
+            session(),
+            query(),
+            budget(),
+        )
+        .await;
+        match outcome.status {
+            EvidencePollStatus::RetrievalFailed { message, .. } => {
+                assert!(
+                    message.len() <= EVIDENCE_POLL_MESSAGE_MAX_BYTES,
+                    "{}",
+                    message.len()
+                );
+            }
+            other => panic!("expected a typed retrieval failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_provider_error_kinds_map_to_their_kind_name() {
+        let outcome = poll_evidence_with_wall_budget_outcome(
+            Arc::new(FailingProvider {
+                error: faktor_core::Error::timeout("index busy"),
+            }),
+            session(),
+            query(),
+            budget(),
+        )
+        .await;
+        assert_eq!(
+            outcome.status,
+            EvidencePollStatus::RetrievalFailed {
+                code: "Timeout".into(),
+                retryable: true,
+                message: "index busy".into(),
+            }
+        );
     }
 }
 

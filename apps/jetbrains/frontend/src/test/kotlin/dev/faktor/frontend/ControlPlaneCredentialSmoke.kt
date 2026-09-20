@@ -244,6 +244,76 @@ object ControlPlaneCredentialSmoke {
             assertTrue(!service.controlPlaneTokenConfigured(), "sign-out clears the service token")
         }
 
+        step("sign-out compare-and-delete: a rotation during the in-flight revoke keeps the NEW credential") {
+            val backing = FakePasswordSafe()
+            val credentialStore = ControlPlaneCredentialStore(backing.vault())
+            val scope = ControlPlaneScope("https://cp.example", "org-1")
+            credentialStore.store(scope, "old-token")
+            val scopeStore = FakeScopeStore(scope)
+            val sessionStore = FakeSessionStore("ses-1")
+            val presented = ArrayList<String>()
+            val server = com.sun.net.httpserver.HttpServer.create(
+                java.net.InetSocketAddress("127.0.0.1", 0), 0
+            )
+            server.createContext("/native/health") { exchange ->
+                respondJson(exchange, 200, "{\"ok\":true,\"version\":\"9.9.9\"}")
+            }
+            server.createContext("/native/ready") { exchange ->
+                respondJson(exchange, 200, "{\"ready\":true}")
+            }
+            server.createContext("/native/sso/logout") { exchange ->
+                presented.add(exchange.requestHeaders.getFirst("x-faktor-control-token") ?: "")
+                // The external rotation (another IDE / keychain UI) lands
+                // WHILE the revoke is in flight.
+                backing.rows["Faktor Control Plane|https://cp.example|org-1"] = "rotated-token"
+                respondJson(exchange, 200, "{\"ok\":true,\"revoked\":true,\"alreadyRevoked\":false}")
+            }
+            server.start()
+            val java = Paths.get(
+                System.getProperty("java.home"), "bin",
+                if (System.getProperty("os.name", "").lowercase().contains("win")) "java.exe" else "java"
+            ).toString()
+            val process = ProcessBuilder(java, "-version").start()
+            println("  fake control-plane daemon on ${server.address.port}")
+            val service = FaktorFrontendService(
+                Paths.get("unused"),
+                Paths.get(System.getProperty("java.io.tmpdir"), "faktor-credential-rotate")
+            )
+            try {
+                val connection = dev.faktor.backend.BackendConnection(
+                    server.address.port, "smoke-password", process,
+                    dev.faktor.backend.StdoutSink(process)
+                )
+                service.attachConnection(connection, stopAction = { process.destroyForcibly() })
+                service.setControlToken("old-token")
+                val panel = FaktorChatPanel(service, credentialStore, scopeStore, sessionStore)
+                panel.settingsView().submitControlPlaneLogout()
+                assertEquals(
+                    listOf("old-token"), presented,
+                    "the CAPTURED token must be presented, never the rotated one"
+                )
+                assertEquals(
+                    "rotated-token",
+                    backing.rows["Faktor Control Plane|https://cp.example|org-1"],
+                    "the NEW credential must survive the sign-out"
+                )
+                assertEquals(
+                    "rotated-token", service.currentControlPlaneToken(),
+                    "the NEW credential must stay live"
+                )
+                assertEquals("ses-1", sessionStore.sessionId, "the new session id is not cleared")
+                assertTrue(
+                    panel.settingsView().controlPlaneStatusText().contains("rotated"),
+                    panel.settingsView().controlPlaneStatusText()
+                )
+                panel.shutdown()
+            } finally {
+                service.stop()
+                server.stop(0)
+                process.destroyForcibly()
+            }
+        }
+
         if (args.isNotEmpty()) {
             step("panel sign-out hits /native/sso/logout on the real daemon and clears the credential") {
                 val backing = FakePasswordSafe()
@@ -314,4 +384,12 @@ object ControlPlaneCredentialSmoke {
             println("FAIL $name: ${e.message}")
         }
     }
+}
+
+private fun respondJson(exchange: com.sun.net.httpserver.HttpExchange, status: Int, body: String) {
+    val bytes = body.toByteArray(Charsets.UTF_8)
+    exchange.responseHeaders.add("Content-Type", "application/json")
+    exchange.sendResponseHeaders(status, bytes.size.toLong())
+    exchange.responseBody.use { it.write(bytes) }
+    exchange.close()
 }

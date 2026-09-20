@@ -39,12 +39,15 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use faktor_core::cancellation::CancellationToken;
 use faktor_core::id::WorkspaceId;
 use faktor_fs::{FsEventKind, WorkspaceFileService, WorkspaceHandle};
 use faktor_store::Store;
@@ -256,6 +259,24 @@ struct Inner {
     embedding: Mutex<Option<(Arc<dyn EmbeddingSource>, EmbeddingModel)>>,
     notify: tokio::sync::Notify,
     worker_started: AtomicBool,
+    /// Explicit lifecycle owner of the single reconciliation worker: the
+    /// retained `JoinHandle` + its cancellation token + the health record.
+    /// Owned by the service for the worker's whole life — never a detached
+    /// task and never a dropped handle.
+    worker: Mutex<WorkerSupervisor>,
+    /// True while a blocking reconciliation pass is executing. A pass runs
+    /// on the blocking pool, which cannot be force-killed: this flag makes
+    /// the residual bound of [`IndexService::shutdown_worker`] observable
+    /// (typed, via [`WorkerStatus::pass_in_flight`]) instead of implicit.
+    pass_in_flight: AtomicBool,
+    /// Test-only worker fault seam (per service instance, so worker tests
+    /// never race each other through global state).
+    #[cfg(test)]
+    fault: WorkerFault,
+    /// Test-only override of the shutdown join bound in ms (0 = the
+    /// production 5s bound): drives the `Aborted` path without waiting.
+    #[cfg(test)]
+    shutdown_bound_ms: AtomicU64,
 }
 
 /// The repository index service: durable state machine + generation store +
@@ -343,6 +364,12 @@ impl IndexService {
                 embedding: Mutex::new(None),
                 notify: tokio::sync::Notify::new(),
                 worker_started: AtomicBool::new(false),
+                worker: Mutex::new(WorkerSupervisor::idle()),
+                pass_in_flight: AtomicBool::new(false),
+                #[cfg(test)]
+                fault: WorkerFault::default(),
+                #[cfg(test)]
+                shutdown_bound_ms: AtomicU64::new(0),
             }),
         }))
     }
@@ -409,24 +436,150 @@ impl IndexService {
     /// (idempotent). Requires a tokio runtime context; when none exists the
     /// service keeps working synchronously through
     /// [`IndexService::ensure_ready`] / [`IndexService::reconcile_now`].
+    ///
+    /// The task is explicitly OWNED: its `JoinHandle` is retained by the
+    /// service (see [`WorkerSupervisor`]), [`IndexService::shutdown_worker`]
+    /// cancels and joins it, and [`IndexService::worker_status`] reports its
+    /// state. A panicking pass stops the worker loudly (state
+    /// [`WorkerState::Failed`], started flag cleared) — never an immediate
+    /// respawn; a later explicit call starts a new generation and bumps the
+    /// restart counter.
     pub fn spawn_worker(&self) -> bool {
         let inner = self.inner.clone();
-        if inner
-            .worker_started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return true;
+        let mut reconciled_dead = false;
+        loop {
+            if inner
+                .worker_started
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+            if reconciled_dead {
+                // A concurrent spawner won the flag after we reconciled the
+                // dead generation: it is a live worker, idempotent success.
+                return true;
+            }
+            // The flag is set: a live worker (idempotent success) or a task
+            // body that died without recording a terminal state (e.g. a
+            // panic in the async body itself). Reconcile the latter so the
+            // retry can start a fresh generation instead of wedging on a
+            // dead one.
+            let mut worker = lock_worker_supervisor(&inner);
+            if !reconcile_dead_worker(&mut worker, &inner.worker_started) {
+                return true;
+            }
+            reconciled_dead = true;
         }
         if tokio::runtime::Handle::try_current().is_err() {
             inner.worker_started.store(false, Ordering::Release);
             return false;
         }
         let weak = Arc::downgrade(&inner);
-        tokio::spawn(async move {
-            worker_loop(weak).await;
-        });
+        let mut worker = lock_worker_supervisor(&inner);
+        if worker.handle.is_some() || worker.state != WorkerState::NotStarted {
+            worker.restarts = worker.restarts.saturating_add(1);
+        }
+        worker.generation = worker.generation.wrapping_add(1);
+        let generation = worker.generation;
+        let cancel = CancellationToken::new();
+        worker.cancel = cancel.clone();
+        worker.state = WorkerState::Running;
+        worker.handle = Some(tokio::spawn(worker_loop(weak, cancel, generation)));
         true
+    }
+
+    /// Stop the OWNED reconciliation worker and JOIN it, bounded. Cancellation
+    /// is signalled first so the loop exits at its next cancellation check
+    /// (its waits and `run_pass` observe the token). An in-flight
+    /// `spawn_blocking` pass cannot be force-killed — it is bounded (scan
+    /// caps + build lease) and observes cancellation at the next workspace or
+    /// machine-step boundary.
+    ///
+    /// HONEST RESIDUAL BOUND: cancelling the token ends the OWNED ASYNC TASK
+    /// promptly (a running pass is left on the blocking pool, whose work
+    /// cannot be cancelled), and a `#[tokio::main]` runtime drop WAITS for
+    /// blocking tasks — so the daemon's real exit bound in that window is the
+    /// remaining pass duration, not the five-second shutdown bound. That
+    /// window is reported TYPED via [`WorkerStatus::pass_in_flight`] (logged
+    /// here too) instead of being implicit.
+    pub async fn shutdown_worker(&self) -> WorkerShutdown {
+        /// Bounded join window of the owned worker task.
+        const SHUTDOWN_BOUND: Duration = Duration::from_secs(5);
+        let shutdown_bound = {
+            #[cfg(test)]
+            {
+                let ms = self.inner.shutdown_bound_ms.load(Ordering::Acquire);
+                if ms == 0 {
+                    SHUTDOWN_BOUND
+                } else {
+                    Duration::from_millis(ms)
+                }
+            }
+            #[cfg(not(test))]
+            {
+                SHUTDOWN_BOUND
+            }
+        };
+        let handle = {
+            let mut worker = lock_worker_supervisor(&self.inner);
+            worker.cancel.cancel();
+            self.inner.worker_started.store(false, Ordering::Release);
+            if worker.state == WorkerState::Running {
+                worker.state = WorkerState::Stopped;
+            }
+            worker.handle.take()
+        };
+        let Some(mut handle) = handle else {
+            return WorkerShutdown::NotRunning;
+        };
+        match tokio::time::timeout(shutdown_bound, &mut handle).await {
+            Ok(Ok(())) => WorkerShutdown::Joined,
+            Ok(Err(join_err)) => {
+                // The owned task ended by panic/abort while we waited: it is
+                // still joined (nothing detached) and the failure is
+                // recorded, never discarded.
+                let message = format!("worker task ended with {join_err}");
+                tracing::error!(error = %message, "index reconciliation worker joined with a failure");
+                let mut worker = lock_worker_supervisor(&self.inner);
+                if worker.last_error.is_none() {
+                    worker.last_error = Some(message);
+                }
+                worker.state = WorkerState::Failed;
+                WorkerShutdown::Joined
+            }
+            Err(_) => {
+                handle.abort();
+                let _ = handle.await;
+                let pass_in_flight = self.inner.pass_in_flight.load(Ordering::Acquire);
+                tracing::error!(
+                    bound_ms = shutdown_bound.as_millis() as u64,
+                    pass_in_flight,
+                    "index reconciliation worker did not stop within the bound; its async task \
+                     was aborted and reaped{}",
+                    if pass_in_flight {
+                        " — a blocking pass is STILL RUNNING and sets the real exit bound \
+                         (reported typed via WorkerStatus::pass_in_flight)"
+                    } else {
+                        ""
+                    }
+                );
+                let mut worker = lock_worker_supervisor(&self.inner);
+                worker.state = WorkerState::Stopped;
+                WorkerShutdown::Aborted
+            }
+        }
+    }
+
+    /// Health snapshot of the background reconciliation worker (lifecycle
+    /// state, last error, restart count) for health/doctor surfaces. A task
+    /// body that died without recording a terminal state (a panic outside
+    /// the blocking pass) is reconciled here — a dead worker is never
+    /// reported as `Running`.
+    pub fn worker_status(&self) -> WorkerStatus {
+        let mut worker = lock_worker_supervisor(&self.inner);
+        reconcile_dead_worker(&mut worker, &self.inner.worker_started);
+        worker.status(self.inner.pass_in_flight.load(Ordering::Acquire))
     }
 
     /// The workspace's LIVE shadow root, when a shadowed single-agent drive
@@ -751,6 +904,19 @@ impl IndexService {
     /// and run at most one build. The worker calls this on the blocking
     /// pool; synchronous callers (ensure_ready) call it directly.
     pub fn reconcile_now(&self, workspace: WorkspaceId) -> Result<(), IndexError> {
+        self.reconcile_now_cancellable(workspace, None)
+    }
+
+    /// [`IndexService::reconcile_now`] with an optional cancellation check at
+    /// every machine-step boundary. The worker's pass passes its generation
+    /// token: a shutdown never starts the next step (or the expensive build)
+    /// after the signal, while a build already entered still runs to its own
+    /// bounded end (blocking code cannot be interrupted).
+    fn reconcile_now_cancellable(
+        &self,
+        workspace: WorkspaceId,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), IndexError> {
         // 1. Drain this workspace's watcher channel (lossy by design; all
         // events coalesce into ONE pending flag — a 1000-event storm is one
         // dirty mark and one rebuild).
@@ -778,12 +944,21 @@ impl IndexService {
         }
         // 2. Machine steps (bounded loop; at most one build per call).
         for _ in 0..8 {
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                return Ok(());
+            }
             let next = self.decide_next(workspace)?;
             match next {
                 Next::Idle => return Ok(()),
                 Next::Load => self.load_content(workspace)?,
                 Next::MarkDirty => self.mark_dirty(workspace)?,
                 Next::Claim { target, kind } => {
+                    if cancel.is_some_and(CancellationToken::is_cancelled) {
+                        // Never START the build after the signal: the claim
+                        // stays durable (`Building`) and the next pass or the
+                        // build lease resumes it.
+                        return Ok(());
+                    }
                     if self.claim_build(workspace, target, kind)? {
                         // One claim per reconcile call: run the build
                         // inline (blocking by design; the worker wraps the
@@ -1223,6 +1398,23 @@ impl IndexService {
                 }
             }
         }
+        // Publish invariant (typed embedding status): the exact in-memory
+        // entry captured into the durable envelope here is the one the swap
+        // below installs as the published content, so the live view and the
+        // durable generation always spell the SAME typed build status.
+        // `GenerationFile::capture` persists a default `Unconfigured` record
+        // for an absent entry (it must always be able to name the status),
+        // so a source-less, prior-less build MUST publish that same explicit
+        // `Unconfigured` record — never an absent entry. Otherwise callers
+        // read `embedding_index(ws) == None` as "unconfigured" while the
+        // durable record says `Unconfigured`, and doctor (which reads the
+        // generation file) disagrees with the live view. Absence of the
+        // entry therefore means exactly "no published generation at all"
+        // (the view itself is `None`). Enforced, not merely documented.
+        if scan.index.embedding_index(workspace).is_none() {
+            scan.index
+                .replace_embeddings(workspace, EmbeddingIndex::default());
+        }
         let envelope = GenerationFile::capture(ws_raw, target, &scan.index, scan.fingerprint);
         let bytes = envelope.to_bytes().map_err(|e| IndexError::BuildFailed {
             workspace: ws_raw,
@@ -1421,12 +1613,200 @@ fn truncate(s: &str, max: usize) -> String {
 
 // ------------------------------------------------------------------ worker
 
-/// The background reconciliation worker: ONE task per service. Runs bounded
-/// synchronous passes on the blocking pool; waits for kicks or the poll
-/// cadence between passes. The worker holds only a `Weak` — when the
-/// service is dropped the task exits on the next upgrade.
-async fn worker_loop(weak: std::sync::Weak<Inner>) {
+/// Lifecycle state of the service's single background reconciliation worker
+/// (see [`IndexService::worker_status`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerState {
+    /// No worker has ever been spawned (or spawning was refused: no tokio
+    /// runtime in the caller).
+    NotStarted,
+    /// The owned task is alive.
+    Running,
+    /// The owned task exited cleanly (cancellation / shutdown).
+    Stopped,
+    /// The owned task terminated with a panic; reconciliation no longer runs
+    /// until an explicit kick (attach / [`IndexService::spawn_worker`])
+    /// starts a new generation.
+    Failed,
+}
+
+/// Health snapshot of the background reconciliation worker, for
+/// health/doctor surfaces: lifecycle state, the last failure message, and
+/// how many worker generations were started after the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerStatus {
+    /// Lifecycle state.
+    pub state: WorkerState,
+    /// Last failure (panic) message, when the worker ever failed.
+    pub last_error: Option<String>,
+    /// Worker generations started AFTER the first one. Automatic restarts do
+    /// not exist; every increment is an explicit `spawn_worker` call on a
+    /// terminal service (attach/kick respawn), so the count is bounded by
+    /// external calls, never by an internal loop.
+    pub restarts: u64,
+    /// True while a blocking reconciliation pass is STILL RUNNING. Such a
+    /// pass cannot be force-killed (blocking pool): when
+    /// [`IndexService::shutdown_worker`] reports
+    /// [`WorkerShutdown::Aborted`] this flag tells the operator that the
+    /// real exit bound is still the pass's own duration, not the shutdown
+    /// bound. False for every at-rest state.
+    pub pass_in_flight: bool,
+}
+
+/// Outcome of [`IndexService::shutdown_worker`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerShutdown {
+    /// No owned task was alive (never spawned, or already stopped/failed).
+    NotRunning,
+    /// The owned task was cancelled and joined within the bound; nothing
+    /// remains detached.
+    Joined,
+    /// The task did not exit within the bound and was aborted; its retained
+    /// handle was still awaited, so the owner reports a terminal state. An
+    /// in-flight blocking pass is NOT stopped by this — check
+    /// [`WorkerStatus::pass_in_flight`] for that residual bound.
+    Aborted,
+}
+
+/// Explicit lifecycle owner of the single background reconciliation worker:
+/// the `JoinHandle` is retained for the task's whole life (never dropped
+/// unattached), cancellation is signalled through [`WorkerSupervisor::cancel`],
+/// and the last outcome is recorded for health/doctor.
+struct WorkerSupervisor {
+    /// Worker generation: a worker records its failure only onto the
+    /// generation it was spawned for, so an explicit respawn's fresh state
+    /// can never be clobbered by the dying predecessor.
+    generation: u64,
+    /// Cancellation signal of the CURRENT generation.
+    cancel: CancellationToken,
+    /// Retained handle of the CURRENT generation.
+    handle: Option<tokio::task::JoinHandle<()>>,
+    last_error: Option<String>,
+    state: WorkerState,
+    restarts: u64,
+}
+
+impl WorkerSupervisor {
+    fn idle() -> Self {
+        Self {
+            generation: 0,
+            cancel: CancellationToken::new(),
+            handle: None,
+            last_error: None,
+            state: WorkerState::NotStarted,
+            restarts: 0,
+        }
+    }
+
+    fn status(&self, pass_in_flight: bool) -> WorkerStatus {
+        WorkerStatus {
+            state: self.state,
+            last_error: self.last_error.clone(),
+            restarts: self.restarts,
+            pass_in_flight,
+        }
+    }
+}
+
+/// Reconcile a worker whose async task body already finished while the
+/// started flag still claims a live worker (e.g. the task body panicked
+/// outside the blocking pass, so no `run_pass` `JoinError` handler ran).
+/// The generation is marked [`WorkerState::Failed`], the failure is named,
+/// and the started flag is cleared so an explicit kick can start a fresh
+/// generation. Returns true when a dead-running worker was reconciled.
+fn reconcile_dead_worker(worker: &mut WorkerSupervisor, started: &AtomicBool) -> bool {
+    if worker.state != WorkerState::Running {
+        return false;
+    }
+    let dead = worker
+        .handle
+        .as_ref()
+        .is_some_and(|handle| handle.is_finished());
+    if !dead {
+        return false;
+    }
+    worker.state = WorkerState::Failed;
+    worker.last_error.get_or_insert_with(|| {
+        "worker task terminated without recording a terminal state".to_string()
+    });
+    started.store(false, Ordering::Release);
+    true
+}
+
+/// Lock the worker supervisor with classified POISON recovery. The shutdown
+/// and health paths run during teardown — exactly where a writer panic is
+/// most likely — and must never panic themselves (`expect` would abort the
+/// daemon shutdown). The poisoned guard's inner value is sound (Rust mutexes
+/// never tear their payload), so it is recovered with the poison flag
+/// cleared, the failure is logged, and the supervisor records the failure
+/// (`Failed`, `last_error`) with the started flag released so an explicit
+/// kick can start a fresh generation.
+fn lock_worker_supervisor(inner: &Inner) -> std::sync::MutexGuard<'_, WorkerSupervisor> {
+    match inner.worker.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            inner.worker.clear_poison();
+            let mut guard = poisoned.into_inner();
+            let message = "worker supervisor lock poisoned by a panicking writer".to_string();
+            tracing::error!(
+                error = %message,
+                "index reconciliation worker supervisor lock was poisoned; recovering the inner supervisor state"
+            );
+            if guard.last_error.is_none() {
+                guard.last_error = Some(message);
+            }
+            if guard.state == WorkerState::Running {
+                guard.state = WorkerState::Failed;
+            }
+            inner.worker_started.store(false, Ordering::Release);
+            guard
+        }
+    }
+}
+
+/// Test-only fault seam of the worker body (per service instance, so worker
+/// tests never race each other through global state).
+#[cfg(test)]
+#[derive(Default)]
+struct WorkerFault {
+    /// Count of `run_pass` invocations (the bounded/no-hot-loop assertion).
+    pass_invocations: AtomicU64,
+    /// One-shot: the next pass panics (the `JoinError` fault).
+    panic_next: AtomicBool,
+    /// One-shot: the next pass blocks this many ms on the blocking thread
+    /// (the "in-flight pass outlives the shutdown bound" fault).
+    block_next_ms: AtomicU64,
+}
+
+/// Clears [`Inner::pass_in_flight`] on every exit path, panics included.
+struct PassInFlightGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for PassInFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
+/// The background reconciliation worker: ONE owned task per service. Runs
+/// bounded synchronous passes on the blocking pool; waits for kicks or the
+/// poll cadence between passes.
+///
+/// Failure contract (ownerless-task/panic-loop fix): a panic in a pass is
+/// LOUD and TERMINAL. The old shape
+/// (`spawn_blocking(...).await.unwrap_or(true)`) mapped `JoinError` to
+/// "work remains" and immediately re-ran the pass — a deterministic panic
+/// became an unbounded CPU-burning retry loop whose failure was discarded.
+/// Now the join result is matched explicitly: the panic is logged and
+/// recorded (`state = Failed`, `last_error`, started flag cleared), and the
+/// loop RETURNS. Automatic restart is deliberately absent; a later explicit
+/// kick (`spawn_worker`) starts a new generation.
+async fn worker_loop(weak: std::sync::Weak<Inner>, cancel: CancellationToken, generation: u64) {
     loop {
+        if cancel.is_cancelled() {
+            return;
+        }
         let Some(inner) = weak.upgrade() else {
             return;
         };
@@ -1434,15 +1814,43 @@ async fn worker_loop(weak: std::sync::Weak<Inner>) {
         let service = IndexService {
             inner: inner.clone(),
         };
-        let again = tokio::task::spawn_blocking(move || service.run_pass())
-            .await
-            .unwrap_or(true);
+        let pass_cancel = cancel.clone();
+        let pass = tokio::task::spawn_blocking(move || service.run_pass(&pass_cancel));
+        let again = tokio::select! {
+            joined = pass => match joined {
+                Ok(again) => again,
+                Err(join_err) => {
+                    let message = format!("reconciliation pass panicked: {join_err}");
+                    tracing::error!(
+                        error = %message,
+                        generation,
+                        "index reconciliation worker STOPPED (panicking pass); no automatic restart — a new generation needs an explicit kick"
+                    );
+                    inner.worker_started.store(false, Ordering::Release);
+                    if let Ok(mut worker) = inner.worker.lock() {
+                        if worker.generation == generation {
+                            worker.last_error = Some(message);
+                            worker.state = WorkerState::Failed;
+                        }
+                    }
+                    return;
+                }
+            },
+            _ = cancel.cancelled() => return,
+        };
+        if cancel.is_cancelled() {
+            return;
+        }
         if again {
+            // Work is immediately claimable (a claimed build landed; another
+            // workspace is pending) — continue the same loop. Every FAILURE
+            // path above returns, so this can never spin on a failed pass.
             continue;
         }
         tokio::select! {
             _ = inner.notify.notified() => {}
             _ = tokio::time::sleep(cfg.poll) => {}
+            _ = cancel.cancelled() => return,
         }
     }
 }
@@ -1451,7 +1859,38 @@ impl IndexService {
     /// One blocking pass over every attached workspace, executed by the
     /// worker under `spawn_blocking` (and reusable synchronously). Returns
     /// true when more work is immediately claimable.
-    fn run_pass(&self) -> bool {
+    ///
+    /// `cancel` is the worker generation's token: the pass aborts between
+    /// workspaces (and between machine steps of one workspace), so a
+    /// shutdown never starts new work after the signal. A single in-flight
+    /// scan/build cannot be interrupted (blocking code); it is bounded by the
+    /// scan caps + build lease, keeps the typed
+    /// [`WorkerStatus::pass_in_flight`] flag set until it returns, and is the
+    /// documented residual exit bound of `shutdown_worker`.
+    fn run_pass(&self, cancel: &CancellationToken) -> bool {
+        self.inner.pass_in_flight.store(true, Ordering::Release);
+        let _in_flight = PassInFlightGuard {
+            flag: &self.inner.pass_in_flight,
+        };
+        #[cfg(test)]
+        {
+            self.inner
+                .fault
+                .pass_invocations
+                .fetch_add(1, Ordering::SeqCst);
+            if self.inner.fault.panic_next.swap(false, Ordering::SeqCst) {
+                panic!("fault seam: injected reconciliation-pass panic");
+            }
+            let block_ms = self.inner.fault.block_next_ms.swap(0, Ordering::SeqCst);
+            if block_ms > 0 {
+                // The in-flight-pass fault: this thread is the blocking pool;
+                // a shutdown cannot kill it and must report it.
+                std::thread::sleep(Duration::from_millis(block_ms));
+            }
+        }
+        if cancel.is_cancelled() {
+            return false;
+        }
         let workspaces: Vec<WorkspaceId> = self
             .inner
             .live
@@ -1462,7 +1901,10 @@ impl IndexService {
             .collect();
         let mut work_remains = false;
         for ws in workspaces {
-            if let Err(e) = self.reconcile_now(ws) {
+            if cancel.is_cancelled() {
+                return false;
+            }
+            if let Err(e) = self.reconcile_now_cancellable(ws, Some(cancel)) {
                 tracing::warn!(workspace = ws.raw(), "reconcile pass error: {e}");
                 continue;
             }
@@ -3357,12 +3799,14 @@ mod tests {
 
     // ------------------------------------------------------------ embeddings
 
-    /// Spy embedding source: counts provider calls (one per `embed` batch)
-    /// and records every text it was asked for.
+    /// Spy embedding source: counts provider calls (one per `embed` batch),
+    /// records every text it was asked for, and can be flipped to fail (the
+    /// provider-outage path of a build).
     #[derive(Default)]
     struct CountingSource {
         calls: std::sync::atomic::AtomicUsize,
         texts: std::sync::Mutex<Vec<String>>,
+        fail: std::sync::atomic::AtomicBool,
     }
 
     impl CountingSource {
@@ -3378,6 +3822,12 @@ mod tests {
     impl EmbeddingSource for CountingSource {
         fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, faktor_core::Error> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(faktor_core::Error::new(
+                    faktor_core::error::ErrorKind::Network,
+                    "embedding backend down",
+                ));
+            }
             self.texts.lock().unwrap().extend(texts.iter().cloned());
             Ok(texts
                 .iter()
@@ -3502,5 +3952,591 @@ mod tests {
         let arc = view.index();
         let idx = arc.lock().unwrap();
         assert!(idx.has_embedding_index(ws));
+    }
+
+    /// A provider outage during a generation BUILD is not a clean success:
+    /// the published generation carries a typed Degraded status (reason +
+    /// affected count) visible to callers/health, and a later healthy
+    /// rebuild clears it.
+    #[test]
+    fn embed_provider_failure_is_a_visible_degraded_generation_and_recovery_clears_it() {
+        let _serial = serial();
+        let env = env();
+        write(&env.repo, "src/a.rs", "pub fn alpha() {}\n");
+        write(&env.repo, "src/b.rs", "pub fn beta() {}\n");
+        let fs = faktor_fs::WorkspaceFileService::new();
+        let (_store, svc, ws) = restart(&env, fs, Some(fast_cfg()));
+        let source = Arc::new(CountingSource::default());
+        svc.set_embedding_source(Some(source.clone()), EmbeddingModel::new("m", "r1"));
+        source.fail.store(true, Ordering::SeqCst);
+        let view = svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        assert_eq!(view.generation(), 1);
+        {
+            let arc = view.index();
+            let idx = arc.lock().unwrap();
+            match idx
+                .embedding_index(ws)
+                .expect("the build records its outcome")
+                .build_status()
+            {
+                crate::embedding::EmbeddingBuildStatus::Degraded {
+                    reason, affected, ..
+                } => {
+                    assert_eq!(affected, 2, "both referenced chunks carry no vector");
+                    assert!(reason.contains("embedding backend down"), "{reason}");
+                }
+                other => panic!("a failed embed build must not look complete: {other:?}"),
+            }
+        }
+        drop(view);
+        // Recovery: the provider is healthy again; a rebuild of the whole
+        // referenced set publishes a Complete status (never sticky).
+        source.fail.store(false, Ordering::SeqCst);
+        write(&env.repo, "src/a.rs", "pub fn alpha_changed() {}\n");
+        std::thread::sleep(Duration::from_millis(60));
+        svc.request_build(ws).unwrap();
+        let view = svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        assert!(view.generation() >= 2);
+        {
+            let arc = view.index();
+            let idx = arc.lock().unwrap();
+            assert_eq!(
+                idx.embedding_index(ws).unwrap().build_status(),
+                crate::embedding::EmbeddingBuildStatus::Complete {
+                    embedded: 2,
+                    carried: 0
+                },
+                "a healthy rebuild of the whole referenced set is complete"
+            );
+        }
+    }
+
+    // ------------------------------------- typed-status publish invariant
+    //
+    // The published view and the durable generation must spell the SAME
+    // typed embedding status: `embedding_index(ws) == None` means "no
+    // published generation at all", never "unconfigured". These tests pin
+    // the invariant on every publish path: source-less/prior-less,
+    // healthy, degraded, and reopened-from-disk.
+
+    /// The typed embedding status of the LIVE published view of `generation`
+    /// (fails when the entry is absent: a published generation always
+    /// carries it).
+    fn live_embedding_status(
+        svc: &IndexService,
+        ws: WorkspaceId,
+        generation: u64,
+    ) -> crate::embedding::EmbeddingBuildStatus {
+        let view = svc.view(ws).expect("a published generation view");
+        assert_eq!(
+            view.generation(),
+            generation,
+            "view serves the named generation"
+        );
+        let arc = view.index();
+        let idx = arc.lock().unwrap();
+        idx.embedding_index(ws)
+            .expect("a published generation always carries a typed embedding record")
+            .build_status()
+    }
+
+    /// The typed embedding status of the DURABLE generation file.
+    fn persisted_embedding_status(
+        env: &Env,
+        ws: WorkspaceId,
+        generation: u64,
+    ) -> crate::embedding::EmbeddingBuildStatus {
+        read_generation_file(&generation_file_path(&env.data_root, ws, generation))
+            .expect("published generation file is readable")
+            .data
+            .embeddings
+            .build_status()
+    }
+
+    /// DEFECT GUARD: a source-less, prior-less build must publish the typed
+    /// `Unconfigured` status (the durable envelope has always recorded that
+    /// record); the live view answering `None` while the generation said
+    /// `Unconfigured` was the drift. The typed record never implies usable
+    /// vectors, and a source-less REBUILD (prior carry-over) keeps the same
+    /// typed agreement; a restart re-materializes the same status.
+    #[test]
+    fn sourceless_priorless_build_publishes_unconfigured_matching_the_generation() {
+        let _serial = serial();
+        let env = env();
+        write(&env.repo, "src/a.rs", "pub fn alpha() {}\n");
+        let fs = faktor_fs::WorkspaceFileService::new();
+        let (_store, svc, ws) = restart(&env, fs.clone(), Some(fast_cfg()));
+        // Prior-less: no generation files exist yet; source-less: the
+        // service has no embedding source configured.
+        assert!(svc.embedding_config().is_none());
+        let view = svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        assert_eq!(view.generation(), 1);
+        drop(view);
+        let expected = crate::embedding::EmbeddingBuildStatus::Unconfigured;
+        let live = live_embedding_status(&svc, ws, 1);
+        assert_eq!(live, expected, "a fresh unconfigured build must be typed");
+        assert_eq!(
+            persisted_embedding_status(&env, ws, 1),
+            live,
+            "the durable generation must agree with the live view"
+        );
+        // Typed status != usable vectors: search still takes the lexical
+        // path for this generation.
+        {
+            let arc = svc.view(ws).unwrap().index();
+            let idx = arc.lock().unwrap();
+            assert!(!idx.has_embedding_index(ws));
+        }
+        // A second source-less build carries the typed record through the
+        // prior-carry-over swap path: no drift after a generation swap.
+        write(&env.repo, "src/a.rs", "pub fn alpha_changed() {}\n");
+        std::thread::sleep(Duration::from_millis(60));
+        svc.request_build(ws).unwrap();
+        let view = svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        assert_eq!(view.generation(), 2);
+        drop(view);
+        let live = live_embedding_status(&svc, ws, 2);
+        assert_eq!(live, expected);
+        assert_eq!(persisted_embedding_status(&env, ws, 2), live);
+        // Reopen from disk: the same typed status, never None.
+        drop(svc);
+        let (_store2, svc2, ws2) = restart(&env, fs, Some(fast_cfg()));
+        assert_eq!(ws2, ws);
+        let view = svc2.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        assert_eq!(view.generation(), 2);
+        drop(view);
+        let live = live_embedding_status(&svc2, ws, 2);
+        assert_eq!(live, expected);
+        assert_eq!(persisted_embedding_status(&env, ws, 2), live);
+    }
+
+    /// A healthy build publishes `Complete` (exact embedded/carried counts)
+    /// and a reopen materializes the SAME typed status from the generation.
+    #[test]
+    fn healthy_build_publishes_complete_through_live_and_reopened_views() {
+        let _serial = serial();
+        let env = env();
+        write(&env.repo, "src/a.rs", "pub fn alpha() {}\n");
+        write(&env.repo, "src/b.rs", "pub fn beta() {}\n");
+        let fs = faktor_fs::WorkspaceFileService::new();
+        let (_store, svc, ws) = restart(&env, fs.clone(), Some(fast_cfg()));
+        let source = Arc::new(CountingSource::default());
+        svc.set_embedding_source(Some(source), EmbeddingModel::new("m", "r1"));
+        svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        let expected = crate::embedding::EmbeddingBuildStatus::Complete {
+            embedded: 2,
+            carried: 0,
+        };
+        let live = live_embedding_status(&svc, ws, 1);
+        assert_eq!(live, expected);
+        assert_eq!(persisted_embedding_status(&env, ws, 1), live);
+        // Reopen: the status is materialized from the durable generation,
+        // not recomputed (a reopen re-embeds nothing).
+        drop(svc);
+        let (_store2, svc2, _) = restart(&env, fs, Some(fast_cfg()));
+        svc2.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        let live = live_embedding_status(&svc2, ws, 1);
+        assert_eq!(live, expected);
+        assert_eq!(persisted_embedding_status(&env, ws, 1), live);
+    }
+
+    /// A degraded build publishes `Degraded` with the affected count and the
+    /// bounded reason — visible identically through the live view, the
+    /// durable generation, and a reopened-from-disk view.
+    #[test]
+    fn degraded_build_publishes_degraded_through_live_and_reopened_views() {
+        let _serial = serial();
+        let env = env();
+        write(&env.repo, "src/a.rs", "pub fn alpha() {}\n");
+        write(&env.repo, "src/b.rs", "pub fn beta() {}\n");
+        let fs = faktor_fs::WorkspaceFileService::new();
+        let (_store, svc, ws) = restart(&env, fs.clone(), Some(fast_cfg()));
+        let source = Arc::new(CountingSource::default());
+        svc.set_embedding_source(Some(source.clone()), EmbeddingModel::new("m", "r1"));
+        source.fail.store(true, Ordering::SeqCst);
+        svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        let live = live_embedding_status(&svc, ws, 1);
+        match &live {
+            crate::embedding::EmbeddingBuildStatus::Degraded {
+                reason,
+                affected,
+                embedded,
+                carried,
+                skipped,
+            } => {
+                assert_eq!(*affected, 2, "both referenced chunks are affected");
+                assert_eq!((*embedded, *carried, *skipped), (0, 0, 0));
+                assert!(reason.contains("embedding backend down"), "{reason}");
+            }
+            other => panic!("a failed embed build must be typed Degraded: {other:?}"),
+        }
+        assert_eq!(persisted_embedding_status(&env, ws, 1), live);
+        // Reopen: the degraded status is durable, with the SAME affected
+        // count and reason.
+        drop(svc);
+        let (_store2, svc2, _) = restart(&env, fs, Some(fast_cfg()));
+        svc2.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        let reopened = live_embedding_status(&svc2, ws, 1);
+        assert_eq!(
+            reopened, live,
+            "a restart must not erase or alter the degrade"
+        );
+        assert_eq!(persisted_embedding_status(&env, ws, 1), reopened);
+    }
+
+    /// Absence is reserved for "no published generation at all": an
+    /// attached-but-unbuilt workspace has no view, and the first publish
+    /// installs a typed record that never becomes absent again.
+    #[test]
+    fn embedding_status_is_absent_only_while_no_generation_is_published() {
+        let _serial = serial();
+        let env = env();
+        write(&env.repo, "src/a.rs", "pub fn alpha() {}\n");
+        let fs = faktor_fs::WorkspaceFileService::new();
+        let (_store, svc, ws) = restart(&env, fs, Some(fast_cfg()));
+        svc.attach(ws).unwrap();
+        assert!(
+            svc.view(ws).is_none(),
+            "no published generation -> no view, so no status to read"
+        );
+        assert_eq!(svc.state(ws).unwrap().0, St::NotStarted);
+        svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        assert_eq!(
+            live_embedding_status(&svc, ws, 1),
+            crate::embedding::EmbeddingBuildStatus::Unconfigured
+        );
+        assert!(svc.view(ws).is_some());
+    }
+
+    // ----------------------------------------------- worker ownership (P1)
+    //
+    // These tests use their OWN per-service fault seam, so they need no
+    // `serial()` guard (no global state is touched): inference is exact —
+    // only this service's worker can move its counters.
+
+    /// Bounded await of a worker state.
+    async fn wait_worker_state(
+        svc: &IndexService,
+        want: WorkerState,
+        bound: Duration,
+    ) -> WorkerStatus {
+        let deadline = Instant::now() + bound;
+        loop {
+            let status = svc.worker_status();
+            if status.state == want {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker never reached {want:?}: {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// (a) A panicking pass is CONTAINED: one loud recorded error, the worker
+    /// stops with `started = false`, and the loop neither respawns nor spins
+    /// (the old `unwrap_or(true)` turned the `JoinError` into an immediate
+    /// retry with no sleep).
+    #[tokio::test]
+    async fn worker_panicking_pass_stops_once_and_never_spins() {
+        let (env, _store, svc, ws) = first_fixture();
+        write(&env.repo, "src/lib.rs", "pub fn panicky() -> i64 { 7 }\n");
+        // One-shot fault armed BEFORE the worker exists: the first pass
+        // panics; any respawn (the defect) would run REAL passes afterwards
+        // and grow the invocation counter without bound.
+        svc.inner.fault.panic_next.store(true, Ordering::SeqCst);
+        svc.attach(ws).unwrap();
+        assert!(svc.inner.worker_started.load(Ordering::Acquire));
+        let status = wait_worker_state(&svc, WorkerState::Failed, Duration::from_secs(60)).await;
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("panic"),
+            "the panic must surface as the recorded last error: {status:?}"
+        );
+        assert!(
+            !svc.inner.worker_started.load(Ordering::Acquire),
+            "a failed worker clears the started flag"
+        );
+        assert_eq!(
+            svc.inner.fault.pass_invocations.load(Ordering::SeqCst),
+            1,
+            "exactly one pass ran; a panicking pass must never respawn"
+        );
+        assert_eq!(status.restarts, 0, "no automatic restart generation");
+        // The old code's immediate `continue` would run pass after pass here
+        // (poll 25 ms, a pending build): the counter must stay frozen.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            svc.inner.fault.pass_invocations.load(Ordering::SeqCst),
+            1,
+            "the worker hot-spun after the panic"
+        );
+        assert_eq!(
+            wait_worker_state(&svc, WorkerState::Failed, Duration::from_secs(2))
+                .await
+                .state,
+            WorkerState::Failed
+        );
+        // The failure is contained: the synchronous path still serves.
+        let view = svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        assert_eq!(view.generation(), 1);
+        // `ensure_ready` -> attach explicitly re-kicked ONE new generation;
+        // the restart is counted exactly once and the owner is healthy again.
+        let status = svc.worker_status();
+        assert_eq!(status.state, WorkerState::Running, "{status:?}");
+        assert_eq!(status.restarts, 1, "{status:?}");
+        assert_eq!(svc.shutdown_worker().await, WorkerShutdown::Joined);
+        assert_eq!(svc.worker_status().state, WorkerState::Stopped);
+    }
+
+    /// F7 (adversarial): a writer that panics while holding the worker
+    /// supervisor lock must never make `worker_status`/`shutdown_worker`
+    /// panic — those paths run during teardown, exactly where a writer panic
+    /// is most likely. The poison is recovered (the inner supervisor is
+    /// sound), the failure is recorded (`Failed` + `last_error`, started flag
+    /// cleared), and the shutdown still joins within its bound.
+    #[tokio::test]
+    async fn poisoned_worker_supervisor_lock_is_recovered_never_panics() {
+        let (env, _store, svc, ws) = first_fixture();
+        write(&env.repo, "src/lib.rs", "pub fn poisoned() -> i64 { 1 }\n");
+        svc.attach(ws).unwrap();
+        wait_worker_state(&svc, WorkerState::Running, Duration::from_secs(30)).await;
+        // A concurrent writer panics while holding the supervisor lock.
+        let inner = svc.inner.clone();
+        let panicked = std::thread::spawn(move || {
+            let _guard = inner.worker.lock().unwrap();
+            panic!("fault seam: writer panic while holding the worker supervisor");
+        })
+        .join();
+        assert!(panicked.is_err(), "the writer thread must have panicked");
+        assert!(svc.inner.worker.is_poisoned(), "the lock must be poisoned");
+        // The status path recovers the poisoned guard instead of panicking.
+        let status = svc.worker_status();
+        assert_eq!(status.state, WorkerState::Failed, "{status:?}");
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("poisoned"),
+            "the poison is recorded as the failure: {status:?}"
+        );
+        assert!(
+            !svc.inner.worker_started.load(Ordering::Acquire),
+            "the recovered supervisor releases the started flag"
+        );
+        assert!(
+            !svc.inner.worker.is_poisoned(),
+            "recovery clears the poison flag so later paths are total"
+        );
+        // The shutdown path is total on a poisoned-then-recovered supervisor
+        // (and still joins the OWNED task within the bound).
+        let outcome = tokio::time::timeout(Duration::from_secs(10), svc.shutdown_worker())
+            .await
+            .expect("shutdown must stay bounded after poison recovery");
+        assert!(
+            matches!(outcome, WorkerShutdown::Joined | WorkerShutdown::Aborted),
+            "the owned task must still be joined: {outcome:?}"
+        );
+        assert!(matches!(
+            svc.worker_status().state,
+            WorkerState::Stopped | WorkerState::Failed
+        ));
+    }
+
+    /// F8: the shutdown bound aborts the OWNED ASYNC TASK, but an in-flight
+    /// `spawn_blocking` pass keeps running (it cannot be killed). That
+    /// residual exit bound is reported TYPED via
+    /// [`WorkerStatus::pass_in_flight`] instead of being implicit.
+    #[tokio::test]
+    async fn shutdown_reports_an_in_flight_blocking_pass_typed() {
+        let (env, _store, svc, ws) = first_fixture();
+        write(&env.repo, "src/lib.rs", "pub fn slow() -> i64 { 1 }\n");
+        // The next pass blocks the blocking thread for 1.5s; the shutdown
+        // bound is overridden to 200ms so the Aborted path is reached without
+        // waiting five seconds.
+        svc.inner.fault.block_next_ms.store(1500, Ordering::SeqCst);
+        svc.inner.shutdown_bound_ms.store(200, Ordering::SeqCst);
+        svc.attach(ws).unwrap();
+        // Wait until the pass is actually on the blocking pool.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !svc.worker_status().pass_in_flight {
+            assert!(
+                Instant::now() < deadline,
+                "the blocking pass never started: {:?}",
+                svc.worker_status()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let began = Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), svc.shutdown_worker())
+            .await
+            .expect("the bounded shutdown must resolve");
+        // Either the async task joined promptly on cancellation (the usual
+        // shape: the loop returns at its cancellation check) or it exceeded
+        // the bound and was aborted. Both are bounded; NEITHER stops a
+        // blocking pass already on the pool.
+        assert!(
+            matches!(outcome, WorkerShutdown::Joined | WorkerShutdown::Aborted),
+            "unexpected shutdown outcome: {outcome:?}"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "the shutdown bound itself stays short: {:?}",
+            began.elapsed()
+        );
+        // The typed report: the blocking pass is STILL running, so the real
+        // exit bound is its remaining duration.
+        let status = svc.worker_status();
+        assert_eq!(status.state, WorkerState::Stopped, "{status:?}");
+        assert!(
+            status.pass_in_flight,
+            "the in-flight blocking pass must be reported typed: {status:?}"
+        );
+        // The detached pass finishes on its own; the flag clears and the
+        // pass counter advanced exactly once.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while svc.worker_status().pass_in_flight {
+            assert!(
+                Instant::now() < deadline,
+                "the detached blocking pass never finished"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(svc.inner.fault.pass_invocations.load(Ordering::SeqCst), 1);
+    }
+
+    /// F8: the worker's pass observes its cancellation token at machine-step
+    /// boundaries — a cancelled generation never starts a new claim/build
+    /// (the pass is bounded by the token where blocking code permits).
+    #[tokio::test]
+    async fn cancelled_pass_never_starts_a_claim() {
+        let (env, _store, svc, ws) = first_fixture();
+        write(&env.repo, "src/lib.rs", "pub fn cancelled() -> i64 { 1 }\n");
+        svc.attach(ws).unwrap();
+        // Freeze the worker so the synchronous call below is the only pass.
+        let _ = tokio::time::timeout(Duration::from_secs(5), svc.shutdown_worker()).await;
+        let token = CancellationToken::new();
+        token.cancel();
+        svc.reconcile_now_cancellable(ws, Some(&token)).unwrap();
+        assert!(
+            !svc.worker_status().pass_in_flight,
+            "a synchronous cancelled pass clears its in-flight flag"
+        );
+        assert!(
+            !generation_file_path(&svc.inner.data_root, ws, 1).exists(),
+            "a cancelled pass must not claim/build generation 1"
+        );
+    }
+
+    /// (b)+(c) Cancellation stops the owned worker within a bounded time and
+    /// `shutdown_worker` JOINS it: the owner reports a terminal state, the
+    /// started flag clears, and no detached task keeps passing.
+    #[tokio::test]
+    async fn worker_shutdown_cancels_and_joins_within_bound() {
+        let (env, _store, svc, ws) = first_fixture();
+        write(&env.repo, "src/lib.rs", "pub fn owned() -> i64 { 1 }\n");
+        svc.attach(ws).unwrap();
+        wait_worker_state(&svc, WorkerState::Running, Duration::from_secs(30)).await;
+        // Settle the initial build so the worker sits in its wait path.
+        let view = svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        assert_eq!(view.generation(), 1);
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), svc.shutdown_worker())
+            .await
+            .expect("shutdown must resolve within the bound, never wait unboundedly");
+        assert_eq!(outcome, WorkerShutdown::Joined);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a stopped-at-rest worker joins immediately: {:?}",
+            started.elapsed()
+        );
+        let status = svc.worker_status();
+        assert_eq!(status.state, WorkerState::Stopped, "{status:?}");
+        assert!(!svc.inner.worker_started.load(Ordering::Acquire));
+        assert!(
+            status.last_error.is_none(),
+            "a clean cancellation is not a failure: {status:?}"
+        );
+        // No ghost task: the pass counter is frozen after the join.
+        let frozen = svc.inner.fault.pass_invocations.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            svc.inner.fault.pass_invocations.load(Ordering::SeqCst),
+            frozen,
+            "a detached worker kept passing after the owner reported Joined"
+        );
+        // Idempotent: no owned task left to shut down.
+        assert_eq!(svc.shutdown_worker().await, WorkerShutdown::NotRunning);
+        assert_eq!(svc.worker_status().state, WorkerState::Stopped);
+    }
+
+    /// (d) Restart bookkeeping: `spawn_worker` is idempotent while a
+    /// generation is alive, a terminal generation can be explicitly
+    /// respawned, and every respawn is counted exactly once. There is no
+    /// automatic in-loop restart to budget, by design (a panic returns).
+    #[tokio::test]
+    async fn explicit_restart_is_idempotent_and_counted_once_per_generation() {
+        let (_env, _store, svc, _ws) = first_fixture();
+        assert!(svc.spawn_worker());
+        assert_eq!(svc.worker_status().state, WorkerState::Running);
+        // Idempotent while running: no extra generation, no counter bump.
+        assert!(svc.spawn_worker());
+        assert!(svc.spawn_worker());
+        assert_eq!(svc.worker_status().restarts, 0);
+        assert_eq!(svc.shutdown_worker().await, WorkerShutdown::Joined);
+        assert_eq!(svc.worker_status().state, WorkerState::Stopped);
+        // Explicit respawn after a clean stop: exactly one new generation.
+        assert!(svc.spawn_worker());
+        assert_eq!(svc.worker_status().state, WorkerState::Running);
+        assert_eq!(svc.worker_status().restarts, 1);
+        assert!(svc.spawn_worker());
+        assert_eq!(svc.worker_status().restarts, 1, "still one new generation");
+        assert_eq!(svc.shutdown_worker().await, WorkerShutdown::Joined);
+        assert_eq!(svc.worker_status().restarts, 1);
+        // The owner is terminal and reports it; nothing is detached.
+        assert!(!svc.inner.worker_started.load(Ordering::Acquire));
+        assert_eq!(svc.worker_status().state, WorkerState::Stopped);
+    }
+
+    /// The worker's own async body can panic too (outside the blocking
+    /// pass): the owner must surface `Failed` instead of reporting a dead
+    /// task as `Running`, and the next explicit spawn must self-heal around
+    /// the dead generation.
+    #[tokio::test]
+    async fn worker_async_body_panic_is_reconciled_not_reported_running() {
+        let (_env, _store, svc, _ws) = first_fixture();
+        // Poison the cfg mutex: the worker body panics at its first
+        // `cfg_of` (before any pass), so no `JoinError` reaches the pass
+        // handler and the started flag would otherwise stay set forever.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = svc.inner.cfg.lock().expect("cfg");
+            panic!("poison the cfg mutex");
+        }));
+        assert!(svc.spawn_worker());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            let status = svc.worker_status();
+            if status.state == WorkerState::Failed {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a dead worker body must never stay Running: {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(status.last_error.is_some(), "{status:?}");
+        assert!(!svc.inner.worker_started.load(Ordering::Acquire));
+        // Self-heal: the dead generation no longer owns the flag, so the
+        // explicit spawn starts a new one (counted once); its body re-panics
+        // on the still-poisoned cfg and is reconciled again rather than
+        // wedging the owner forever.
+        assert!(svc.spawn_worker());
+        assert_eq!(svc.worker_status().restarts, 1);
     }
 }

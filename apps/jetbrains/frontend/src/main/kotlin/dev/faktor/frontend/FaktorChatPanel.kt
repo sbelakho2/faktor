@@ -486,8 +486,11 @@ class FaktorChatPanel(
     /**
      * The Settings-panel sign-out path. The remote revoke is attempted FIRST
      * (`POST /native/sso/logout` needs the live token), then the credential
-     * row is removed UNCONDITIONALLY and the live client cleared; the remote
-     * outcome is reported, never fabricated.
+     * row is removed by COMPARE-AND-DELETE: only when it still holds the
+     * exact credential this sign-out captured and revoked. An external
+     * rotation during the in-flight revoke (another IDE / keychain UI) wrote
+     * a NEW credential; that credential is left in place and reported typed,
+     * never erased.
      */
     private fun signOutControlPlane() {
         val store = controlPlaneCredentials
@@ -504,7 +507,25 @@ class FaktorChatPanel(
             )
         val sessionId = controlPlaneSessionStore?.read()
             ?: settingsPanel.controlPlaneSessionText().ifEmpty { null }
-        val remote = revokeRemoteControlPlaneSession(scope.takeIf { it.valid() }, sessionId)
+        // Capture the exact credential (endpoint+organization key and token
+        // value) this sign-out means to revoke and delete.
+        val captured = if (scope.valid()) store.resolve(scope) else null
+        val remote = revokeRemoteControlPlaneSession(scope.takeIf { it.valid() }, sessionId, captured)
+        val current = if (scope.valid()) store.resolve(scope) else null
+        if (captured != null && current != captured) {
+            // The stored credential rotated while the revoke was in flight:
+            // the CAPTURED token was the one revoked, and the NEW credential
+            // must survive and stay live.
+            service.setControlToken(current)
+            settingsPanel.setControlPlaneStatus(
+                "control plane: credential rotated during sign-out; the NEW credential was kept"
+            )
+            appendSystem(
+                "control-plane sign-out: $remote; the credential was rotated by another window during " +
+                    "sign-out, so the NEW credential was left in the IDE credential store and remains active"
+            )
+            return
+        }
         val removed = store.delete(if (scope.valid()) scope else null)
         controlPlaneSessionStore?.write(null)
         settingsPanel.setControlPlaneSession(null)
@@ -529,25 +550,30 @@ class FaktorChatPanel(
     /**
      * The sign-out revoke. The daemon route names the `{organization,
      * session_id}` the presented token must own, so it is attempted ONLY when
-     * the non-secret session id and a live client exist; a refusal is reported
-     * as the daemon typed it (401 non-owner, 404 unknown session, 409 cloud
-     * disabled) and the local credential is removed by the caller either way.
+     * the non-secret session id, a captured credential and a live client
+     * exist; the CAPTURED token is presented (never the client's possibly
+     * rotated one). A refusal is reported as the daemon typed it (401
+     * non-owner, 404 unknown session, 409 cloud disabled).
      */
     private fun revokeRemoteControlPlaneSession(
         scope: ControlPlaneScope?,
-        sessionId: String?
+        sessionId: String?,
+        token: String?
     ): String {
         if (scope == null || sessionId.isNullOrBlank()) {
             return "no auth-session id is known, so the remote session was not revoked"
+        }
+        if (token == null) {
+            return "no stored credential was found, so the remote session was not revoked"
         }
         if (!service.isRunning()) {
             return "the daemon is not running, so the remote session was not revoked"
         }
         return try {
-            service.revokeControlPlaneSession(scope.organization, sessionId)
+            service.revokeControlPlaneSessionWithToken(scope.organization, sessionId, token)
             "the remote session was revoked"
         } catch (e: Exception) {
-            "the remote revoke failed (${e.message}); the local credential was still removed"
+            "the remote revoke failed (${e.message})"
         }
     }
 

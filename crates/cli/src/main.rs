@@ -3,8 +3,12 @@
 //!
 //! `serve --port 0` prints the exact frozen startup line
 //! `faktor server listening on http://127.0.0.1:<port>` so the
-//! extension connects exactly as it did to the old CLI. Nothing else goes to
-//! stdout. Auth comes from the frontend-generated `FAKTOR_SERVER_PASSWORD`
+//! extension connects exactly as it did to the old CLI. When the release
+//! bootstrap launcher started this process it also exported
+//! `FAKTOR_RELEASE_DIGEST`; the daemon then prints the ONE frozen child
+//! attestation line `faktor release digest=<64 lowercase hex>` BEFORE the
+//! startup line (see [`emit_release_digest_attestation`]). Nothing else goes
+//! to stdout. Auth comes from the frontend-generated `FAKTOR_SERVER_PASSWORD`
 //! environment variable; the daemon never prints it.
 
 use std::path::PathBuf;
@@ -1584,11 +1588,31 @@ const SERVE_DRIVE_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::fro
 
 /// The ONE post-signal daemon shutdown sequence (serve):
 ///
-/// 1. abort the post-ready loops (verification executor, SCM re-sync, billing
+/// 1. stop the worker plane (when enabled): the slot hands back the owned
+///    `WorkerPlaneHandle`, which requests graceful shutdown and JOINS its
+///    serve task within
+///    [`faktor_server::worker_plane::WORKER_PLANE_SHUTDOWN_BOUND`] (a
+///    straggler is aborted), so no new remote worker request lands while
+///    the drives drain and no listener task is ever detached. An unexpected
+///    death is logged with its typed code (the same status health and any
+///    placement decision query) and the slot records the typed terminal
+///    state;
+/// 2. stop the graph-hosted repository index reconciliation worker (when
+///    hosted): `IndexService::shutdown_worker` cancels and JOINS the owned
+///    worker within its own bound (a straggler is aborted and awaited), so
+///    no background index pass outlives the daemon or races the drain;
+/// 3. stop the runtime's OWN lazily-hosted repository index worker (when the
+///    runtime ever opened one): `AgentRuntime::shutdown_index_service`
+///    cancels and JOINS the owned worker within the same service bound and
+///    reports the outcome typed. A runtime that never hosted one is an inert
+///    no-op — the accessor never opens the service as a side effect. This is
+///    non-fatal by contract: a typed abort/join failure is logged, never
+///    propagated (the durable rows stay the recovery authority);
+/// 4. abort the post-ready loops (verification executor, SCM re-sync, billing
 ///    report schedule) — none of them is a durable-write producer whose
 ///    in-flight work is lost, and each re-runs its durable claims at the next
 ///    boot;
-/// 2. close the TaskExecutor's drive registry and bounded-drain every
+/// 5. close the TaskExecutor's drive registry and bounded-drain every
 ///    detached drive (the registry's graceful-then-abort contract: give
 ///    in-flight drives `grace` to land their record-first durable
 ///    writes/settlement, then abort and reap the stragglers within
@@ -1596,19 +1620,123 @@ const SERVE_DRIVE_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::fro
 ///    `TaskExecutor::resume_run`). This MUST happen while the store and the
 ///    shadow service are still alive, so it runs here — before the backup
 ///    drain and before `graph` drops;
-/// 3. drain the startup-backup task and the owned Ollama warm-up threads
+/// 6. drain the startup-backup task and the owned Ollama warm-up threads
 ///    (bounded), AFTER the drives so the final snapshot observes every
 ///    settled durable write.
 ///
 /// The returned [`DriveDrainReport`](faktor_orchestrator::runtime::task_executor::DriveDrainReport)
 /// is the testable evidence of the drive drain.
+// Eight explicit owners/tasks is the sequence's whole shape; bundling them
+// into a struct would not make the shutdown contract clearer.
+#[allow(clippy::too_many_arguments)]
 async fn shutdown_serving_daemon(
     tasks: &Arc<faktor_orchestrator::runtime::task_executor::TaskExecutor>,
+    worker_plane: Option<faktor_server::api::WorkerPlaneListener>,
+    index: Option<Arc<faktor_index::IndexService>>,
+    agent: Option<&Arc<AgentRuntime>>,
     verification_executor: tokio::task::JoinHandle<()>,
     scm_task: Option<tokio::task::JoinHandle<()>>,
     billing_report_task: Option<tokio::task::JoinHandle<()>>,
     backup_task: tokio::task::JoinHandle<()>,
 ) -> faktor_orchestrator::runtime::task_executor::DriveDrainReport {
+    // Stop the remote intake first: the slot owns the serve task, so this
+    // is a bounded join, never a detached listener. Health is queried BEFORE
+    // the request so an unexpected death is named, not masked by the stop;
+    // the slot then records the typed terminal state for any later health
+    // read.
+    if let Some(listener) = worker_plane {
+        let taken = listener
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take_for_shutdown();
+        if let Some((handle, health)) = taken {
+            if health.is_unavailable() {
+                tracing::error!("{}", health.health_line());
+            }
+            let terminal = match handle.shutdown().await {
+                Ok(()) => {
+                    tracing::info!("worker plane: stopped (bounded graceful join)");
+                    faktor_server::worker_plane::WorkerPlaneStatus::Stopped
+                }
+                Err(error) => {
+                    tracing::error!(
+                        code = error.code(),
+                        "worker plane: shutdown failed: {error}"
+                    );
+                    faktor_server::worker_plane::WorkerPlaneStatus::Unavailable {
+                        code: error.code(),
+                        message: error.to_string(),
+                    }
+                }
+            };
+            listener
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .record_terminal(terminal);
+        }
+    }
+    // Stop the repository index reconciliation worker (bounded join, before
+    // the drive drain): a background pass must not outlive the daemon or
+    // race the shutdown. `NotRunning` is the honest no-op when the worker
+    // was never started (or already stopped).
+    if let Some(index) = index {
+        let started = std::time::Instant::now();
+        match index.shutdown_worker().await {
+            faktor_index::WorkerShutdown::NotRunning => {}
+            faktor_index::WorkerShutdown::Joined => tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "index reconciliation worker: stopped (bounded graceful join)"
+            ),
+            faktor_index::WorkerShutdown::Aborted => {
+                // F8: the async task was aborted, but a blocking pass cannot
+                // be killed — report the TYPED residual so the operator knows
+                // the real exit bound is the pass's remaining duration.
+                let pass_in_flight = index.worker_status().pass_in_flight;
+                tracing::error!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    pass_in_flight,
+                    "index reconciliation worker: did not stop within the bound; aborted and reaped{}",
+                    if pass_in_flight {
+                        " — a blocking pass is STILL RUNNING and sets the real exit bound"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+    }
+    // Stop the runtime's OWN lazily-hosted index worker (adjacent to the
+    // graph-hosted one, before the drive drain): the runtime has no async
+    // teardown, so this accessor IS its join point. `None` = the runtime
+    // never hosted a service (never opened); the call never opens one.
+    // Non-fatal: an abort/join failure is logged typed, the shutdown
+    // continues, and the durable rows remain the recovery authority.
+    if let Some(agent) = agent {
+        let started = std::time::Instant::now();
+        match agent.shutdown_index_service().await {
+            None => {}
+            Some(faktor_index::WorkerShutdown::NotRunning) => {}
+            Some(faktor_index::WorkerShutdown::Joined) => tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "runtime index worker: stopped (bounded graceful join)"
+            ),
+            Some(faktor_index::WorkerShutdown::Aborted) => {
+                let pass_in_flight = agent
+                    .index_service_worker_status()
+                    .is_some_and(|status| status.pass_in_flight);
+                tracing::error!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    pass_in_flight,
+                    "runtime index worker: did not stop within the bound; aborted and reaped{}",
+                    if pass_in_flight {
+                        " — a blocking pass is STILL RUNNING and sets the real exit bound"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+    }
     verification_executor.abort();
     if let Some(task) = scm_task {
         task.abort();
@@ -1946,6 +2074,96 @@ fn serve_config_and_semantic(
     Ok((config, semantic))
 }
 
+/// Forced-exit code of the SECOND shutdown signal during the drain (`128 +
+/// SIGINT`, the conventional interrupted exit; SIGTERM maps to the same
+/// bounded force-exit since the daemon's own drain is the graceful path).
+const FORCE_EXIT_CODE: i32 = 130;
+
+/// Test-only probe of the force-exit seam: a test cannot let the harness
+/// process exit, so an installed probe receives the code instead. Production
+/// has no probe installed and `std::process::exit` runs.
+#[cfg(test)]
+static FORCE_EXIT_PROBE: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<i32>>> =
+    std::sync::Mutex::new(None);
+
+/// Test-only marker: the FIRST shutdown signal was observed and the drain
+/// (plus the second-signal watchdog) is being entered. Lets the signal tests
+/// synchronize deterministically instead of sleeping.
+#[cfg(test)]
+static SIGNAL_DRAIN_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only count of armed signal waiters (handler registrations that
+/// succeeded). A test delivers a real signal only once the waiter it targets
+/// is armed, so the process can never be killed by an unhandled default.
+#[cfg(test)]
+static SIGNAL_WAITERS_ARMED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Await the next process shutdown signal (SIGTERM or SIGINT). Registration
+/// is process-wide; a registration failure is loud and falls back to
+/// `ctrl_c`, never a panic. The returned label is the signal's name for
+/// structured logs.
+async fn wait_for_shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) {
+            (Ok(mut term), Ok(mut int)) => {
+                #[cfg(test)]
+                SIGNAL_WAITERS_ARMED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::select! {
+                    _ = term.recv() => "SIGTERM",
+                    _ = int.recv() => "SIGINT",
+                }
+            }
+            (term, int) => {
+                let err = term.err().or(int.err());
+                tracing::error!(
+                    error = %err.map(|e| e.to_string()).unwrap_or_default(),
+                    "shutdown signal handlers could not be installed; falling back to ctrl_c"
+                );
+                let _ = tokio::signal::ctrl_c().await;
+                "ctrl_c"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "ctrl_c"
+    }
+}
+
+/// The second-signal force path: the drain is bounded, but an operator who
+/// sends a second SIGTERM/SIGINT asks to stop NOW. The code is reported to
+/// the test probe when one is installed; production exits immediately.
+async fn on_force_signal(signal: &str) {
+    tracing::error!(
+        signal,
+        code = FORCE_EXIT_CODE,
+        "second shutdown signal during the drain; forcing exit"
+    );
+    #[cfg(test)]
+    if let Some(probe) = FORCE_EXIT_PROBE.lock().unwrap().take() {
+        let _ = probe.send(FORCE_EXIT_CODE);
+        return;
+    }
+    std::process::exit(FORCE_EXIT_CODE);
+}
+
+/// Arm the second-signal watchdog. Owned by the daemon's shutdown path: it
+/// lives only while the bounded drain runs and either fires (force exit) or
+/// is dropped when the process ends normally.
+fn spawn_force_exit_watchdog() {
+    tokio::spawn(async move {
+        let signal = wait_for_shutdown_signal().await;
+        on_force_signal(signal).await;
+    });
+}
+
 async fn serve(port: u16, data_dir: PathBuf, config_path: Option<PathBuf>) {
     if let Err(e) = serve_impl(port, data_dir, config_path, None, None).await {
         tracing::error!("{e}");
@@ -1953,39 +2171,109 @@ async fn serve(port: u16, data_dir: PathBuf, config_path: Option<PathBuf>) {
     }
 }
 
+/// Typed summary of the startup verification recovery sweep. Every count is
+/// diagnostic and asserted by tests; a read failure is NEVER silently a
+/// no-op — `unreadable`/`scan_failed` name the durable work left for the
+/// next boot.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct VerificationRecoverySummary {
+    requeued: usize,
+    orphaned: usize,
+    touched: usize,
+    /// Sessions whose durable verification rows could not be read (store
+    /// error, or a listed session whose handle vanished): their rows are
+    /// LEFT AS THEY ARE (durable work) and the failure is logged typed.
+    unreadable: usize,
+    /// The session scan itself failed: nothing could be swept this boot.
+    scan_failed: bool,
+}
+
 /// Daemon startup verification recovery sweep (audit P0-5/26 production
 /// wiring): every session's stale `Running` verification jobs are re-queued
 /// before the executor starts, so a check whose executor died mid-run is
 /// retried honestly — never silently dropped, never a pass. Runs BEFORE
-/// readiness is announced, like every other crash-recovery step.
-fn recover_verification_jobs_at_startup(session: &Arc<faktor_session::SessionManager>) {
+/// readiness is announced, like every other crash-recovery step. A store
+/// error is loud and leaves the durable rows for the next boot; it is never
+/// reported as "nothing to recover".
+fn recover_verification_jobs_at_startup(
+    session: &Arc<faktor_session::SessionManager>,
+) -> VerificationRecoverySummary {
+    let mut summary = VerificationRecoverySummary::default();
     let ids = match session.store().session_ids() {
         Ok(ids) => ids,
         Err(e) => {
-            tracing::error!("verification recovery could not scan sessions: {e}");
-            return;
+            summary.scan_failed = true;
+            tracing::error!(
+                error = %e,
+                "verification recovery could not scan sessions; every durable verification row \
+                 stays for the next boot: {e}"
+            );
+            return summary;
         }
     };
-    let (mut requeued, mut orphaned, mut touched) = (0usize, 0usize, 0usize);
     for sid in ids {
-        let Ok(Some(handle)) = session.get_session(sid) else {
-            continue;
-        };
-        match handle.recover_verification_jobs_after_restart() {
-            Ok(report) if report.requeued + report.orphaned > 0 => {
-                requeued += report.requeued;
-                orphaned += report.orphaned;
-                touched += 1;
+        match session.get_session(sid) {
+            Ok(Some(handle)) => match handle.recover_verification_jobs_after_restart() {
+                Ok(report) if report.requeued + report.orphaned > 0 => {
+                    summary.requeued += report.requeued;
+                    summary.orphaned += report.orphaned;
+                    summary.touched += 1;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    summary.unreadable += 1;
+                    tracing::error!(
+                        session = %sid,
+                        error = %e,
+                        "verification recovery for session {sid} could not read its durable rows; \
+                         they stay for the next boot: {e}"
+                    );
+                }
+            },
+            Ok(None) => {
+                summary.unreadable += 1;
+                tracing::error!(
+                    session = %sid,
+                    "verification recovery found a listed session with no handle (store \
+                     inconsistency); its durable rows could not be swept this boot"
+                );
             }
-            Ok(_) => {}
-            Err(e) => tracing::warn!("verification recovery for session {sid} failed: {e}"),
+            Err(e) => {
+                summary.unreadable += 1;
+                tracing::error!(
+                    session = %sid,
+                    error = %e,
+                    "verification recovery could not open session {sid}; its durable rows stay \
+                     for the next boot: {e}"
+                );
+            }
         }
     }
-    if requeued + orphaned > 0 {
+    if summary.requeued + summary.orphaned > 0 || summary.unreadable > 0 || summary.scan_failed {
         tracing::info!(
-            "verification recovery: {requeued} stale job(s) requeued, {orphaned} orphaned across {touched} session(s)"
+            requeued = summary.requeued,
+            orphaned = summary.orphaned,
+            touched = summary.touched,
+            unreadable = summary.unreadable,
+            scan_failed = summary.scan_failed,
+            "verification recovery settled"
         );
     }
+    summary
+}
+
+/// Typed summary of the startup queue-head recovery.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct QueueRecoverySummary {
+    candidates: usize,
+    /// Sessions whose live queue still carried a runnable head.
+    runnable: usize,
+    /// Sessions whose durable queue state could not be read. They are KICKED
+    /// ANYWAY (a read error is never an empty queue) and logged typed.
+    unreadable: usize,
+    /// The candidate scan itself failed: no kick could be computed here (the
+    /// durable rows stay pending for the next boot).
+    scan_failed: bool,
 }
 
 /// Daemon startup queue-head recovery (boundary race): a killed process can
@@ -1997,42 +2285,74 @@ fn recover_verification_jobs_at_startup(session: &Arc<faktor_session::SessionMan
 /// new submit, never a second concurrent drive, never an unbounded wait.
 ///
 /// Runs BEFORE readiness, after `agent.recover()` and the verification
-/// requeue, with the session store, manager and executor fully open. The
-/// summary is bounded and diagnostic: `recovered` counts the sessions whose
-/// live queue still carried a runnable head when classified; the remainder
-/// had already drained (an idempotent no-op for the kick). A drive registry
-/// that refuses the spawn is logged by the executor itself — those rows stay
-/// durably pending for the next recovery, so nothing is ever lost.
-fn recover_pending_queues_at_startup(graph: &DaemonGraph) {
+/// requeue, with the session store, manager and executor fully open. A store
+/// read error is loud and NEVER classified as "already drained": the session
+/// is handed to the executor's recovery entry anyway (which re-checks and
+/// kicks, never releasing on a read error). A drive registry that refuses
+/// the spawn is logged by the executor itself — those rows stay durably
+/// pending for the next recovery, so nothing is ever lost.
+fn recover_pending_queues_at_startup(graph: &DaemonGraph) -> QueueRecoverySummary {
+    let mut summary = QueueRecoverySummary::default();
     let candidates = match graph.session.store().sessions_with_pending_queues() {
         Ok(sessions) => sessions,
         Err(e) => {
-            tracing::warn!("queue recovery scan failed: {e}");
-            return;
+            summary.scan_failed = true;
+            tracing::error!(
+                error = %e,
+                "queue recovery could not scan sessions; every durable queue row stays pending \
+                 for the next boot: {e}"
+            );
+            return summary;
         }
     };
-    if candidates.is_empty() {
-        return;
-    }
-    let mut recovered = 0usize;
+    summary.candidates = candidates.len();
     for session in &candidates {
-        let runnable = graph
-            .session
-            .get_session(*session)
-            .ok()
-            .flatten()
-            .is_some_and(|handle| handle.queued_prompt_count().unwrap_or(0) > 0);
-        if runnable {
-            recovered += 1;
+        match graph.session.get_session(*session) {
+            Ok(Some(handle)) => match handle.queued_prompt_count() {
+                Ok(count) if count > 0 => summary.runnable += 1,
+                Ok(_) => {}
+                Err(e) => {
+                    summary.unreadable += 1;
+                    summary.runnable += 1;
+                    tracing::error!(
+                        session = %session,
+                        error = %e,
+                        "queue recovery could not read session {session}'s durable queue head; \
+                         treating it as NON-EMPTY and handing it to the runner: {e}"
+                    );
+                }
+            },
+            Ok(None) => {
+                summary.unreadable += 1;
+                tracing::error!(
+                    session = %session,
+                    "queue recovery found a listed session with no handle (store inconsistency); \
+                     its durable queue row stays pending"
+                );
+            }
+            Err(e) => {
+                summary.unreadable += 1;
+                summary.runnable += 1;
+                tracing::error!(
+                    session = %session,
+                    error = %e,
+                    "queue recovery could not open session {session}; handing its durable queue \
+                     head to the runner anyway: {e}"
+                );
+            }
         }
     }
     graph.tasks.recover_pending_queues();
-    tracing::info!(
-        "queue recovery: {recovered} session(s) with a durable queue head handed to runners, \
-         {} already drained, {} candidate(s)",
-        candidates.len() - recovered,
-        candidates.len()
-    );
+    if summary.candidates > 0 || summary.scan_failed {
+        tracing::info!(
+            candidates = summary.candidates,
+            runnable = summary.runnable,
+            unreadable = summary.unreadable,
+            scan_failed = summary.scan_failed,
+            "queue recovery: durable queue heads handed to runners"
+        );
+    }
+    summary
 }
 
 /// The daemon verification executor (audit P0-5/26 production wiring): a
@@ -2043,6 +2363,10 @@ fn recover_pending_queues_at_startup(graph: &DaemonGraph) {
 /// executor a pending attempt would only ever settle on the next genuine
 /// turn; with it, an ordinary background check resolves asynchronously and
 /// the task's completion waits for exactly that result.
+///
+/// Store read errors are logged TYPED and deduplicated (this loop ticks 4x/s;
+/// an unchanged error logs once, a changed one immediately) — a broken store
+/// is never an invisible `continue`.
 fn spawn_verification_executor(graph: &DaemonGraph) -> tokio::task::JoinHandle<()> {
     let session = graph.session.clone();
     let agent = graph.agent.clone();
@@ -2050,21 +2374,76 @@ fn spawn_verification_executor(graph: &DaemonGraph) -> tokio::task::JoinHandle<(
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_scan_error: Option<String> = None;
+        let mut last_open_error: Option<String> = None;
         loop {
             tick.tick().await;
             let ids = match session.store().session_ids() {
-                Ok(ids) => ids,
-                Err(_) => continue,
+                Ok(ids) => {
+                    last_scan_error = None;
+                    ids
+                }
+                Err(e) => {
+                    // Deduplicated loudness: the durable queues are untouched
+                    // and the next tick retries; an unchanged failure logs
+                    // once instead of flooding 4x/s.
+                    let message = e.to_string();
+                    if last_scan_error.as_deref() != Some(message.as_str()) {
+                        tracing::error!(
+                            error = %message,
+                            "verification executor could not scan sessions; durable jobs stay \
+                             queued and the next tick retries: {message}"
+                        );
+                        last_scan_error = Some(message);
+                    }
+                    continue;
+                }
             };
             for sid in ids {
-                let Ok(Some(handle)) = session.get_session(sid) else {
-                    continue;
+                let handle = match session.get_session(sid) {
+                    Ok(Some(handle)) => {
+                        last_open_error = None;
+                        handle
+                    }
+                    Ok(None) => {
+                        let message = format!("session {sid} listed with no handle");
+                        if last_open_error.as_deref() != Some(message.as_str()) {
+                            tracing::error!(
+                                session = %sid,
+                                "verification executor found a listed session with no handle \
+                                 (store inconsistency); its durable jobs stay queued"
+                            );
+                            last_open_error = Some(message);
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        let message = e.to_string();
+                        if last_open_error.as_deref() != Some(message.as_str()) {
+                            tracing::error!(
+                                session = %sid,
+                                error = %message,
+                                "verification executor could not open session {sid} (its durable \
+                                 jobs stay queued): {message}"
+                            );
+                            last_open_error = Some(message);
+                        }
+                        continue;
+                    }
                 };
                 let resolved = match agent.execute_open_verification_jobs(&handle).await {
                     Ok(resolved) => resolved,
                     // No current attempt / unresolvable root: nothing to
-                    // execute (never an error loop).
-                    Err(_) => continue,
+                    // execute (never an error loop). Debug-typed so a real
+                    // refusal is still traceable.
+                    Err(e) => {
+                        tracing::debug!(
+                            session = %sid,
+                            error = %e,
+                            "verification executor found nothing to execute for session {sid}"
+                        );
+                        continue;
+                    }
                 };
                 if resolved == 0 {
                     continue;
@@ -2091,6 +2470,246 @@ fn enabled_section_db_path(
         .ok_or_else(|| format!("{section} config: the enabled section resolved no database path"))
 }
 
+/// The frozen CHILD digest-attestation line the release bootstrap launcher
+/// requires from a non-unix launch before it reports readiness:
+/// `faktor release digest=<64 lowercase hex>`. The launcher's parser
+/// (`faktor_updater::release::CHILD_DIGEST_PREFIX`) mirrors this prefix
+/// because the server cannot depend on the updater's private constants; the
+/// two strings must stay byte-identical.
+const RELEASE_DIGEST_ATTESTATION_PREFIX: &str = "faktor release digest=";
+
+/// The typed outcome of one startup release-digest attestation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReleaseAttestation {
+    /// The bootstrap launcher exported no expected digest (`FAKTOR_RELEASE_DIGEST`
+    /// unset, the unix/direct-start case): nothing was printed.
+    NotRequested,
+    /// Exactly one attestation line carrying the RUNNING binary's digest was
+    /// printed. `matches_expected` is false when the launcher's export differs
+    /// — still the ACTUAL digest (never a lie); the launcher then refuses.
+    Printed { matches_expected: bool },
+    /// No attestation is possible (malformed export or unreadable digest):
+    /// nothing was printed and the loud typed error names why.
+    Unavailable { reason: &'static str },
+}
+
+/// Emit the ONE release-digest attestation line when — and only when — the
+/// release bootstrap launcher exported [`faktor_updater::RELEASE_DIGEST_ENV`]
+/// for this child. The digest is computed with the SAME helper the health
+/// build report uses ([`faktor_updater::self_digest`]: the streamed sha256 of
+/// `current_exe`, i.e. this very binary), never a value copied from the
+/// environment: the launcher accepts readiness only from the child's own
+/// claim, so a mismatch must be observable, never papered over.
+///
+/// Honesty rules:
+/// - a valid-length export is always answered with the ACTUAL digest, even
+///   when it differs from the launcher's expected value, plus a loud typed
+///   `faktor.release_digest.mismatch` error (the launcher refuses the launch);
+/// - an export whose length cannot match a sha256 hex is a malformed request:
+///   nothing is printed (a line the launcher must reject is never minted) and
+///   a loud typed `faktor.release_digest.malformed_expected` error is logged;
+/// - an unreadable self-digest is a loud typed
+///   `faktor.release_digest.unreadable` error and no line.
+///
+/// The line carries no secrets (it is a hash of a public artifact) and is
+/// written to stdout BEFORE the daemon binds/serves: [`serve_impl`] emits it
+/// first and only then the frozen startup line, so a supervisor can never
+/// observe readiness before the child's own digest claim.
+fn emit_release_digest_attestation(
+    out: &mut impl std::io::Write,
+    expected: Option<&str>,
+) -> std::io::Result<ReleaseAttestation> {
+    let Some(expected) = expected else {
+        return Ok(ReleaseAttestation::NotRequested);
+    };
+    let actual = match faktor_updater::self_digest() {
+        Ok(actual) => actual,
+        Err(e) => {
+            tracing::error!(
+                event = "faktor.release_digest.unreadable",
+                "cannot attest the running binary digest ({e}); the bootstrap launcher will refuse this launch"
+            );
+            return Ok(ReleaseAttestation::Unavailable {
+                reason: "self digest unreadable",
+            });
+        }
+    };
+    // The launcher parses exactly one sha256 hex length. An export of another
+    // shape can never be attested honestly: log the typed refusal instead of
+    // printing a line the launcher must reject as no attestation.
+    if expected.len() != actual.len() {
+        tracing::error!(
+            event = "faktor.release_digest.malformed_expected",
+            expected_len = expected.len(),
+            actual_len = actual.len(),
+            "the bootstrap launcher exported a malformed release digest; no attestation is possible"
+        );
+        return Ok(ReleaseAttestation::Unavailable {
+            reason: "malformed expected digest",
+        });
+    }
+    writeln!(out, "{RELEASE_DIGEST_ATTESTATION_PREFIX}{actual}")?;
+    out.flush()?;
+    let matches_expected = actual == expected;
+    if !matches_expected {
+        tracing::error!(
+            event = "faktor.release_digest.mismatch",
+            expected = %expected,
+            actual = %actual,
+            "the running binary does not match the bootstrap-verified release digest; the launcher will refuse this launch"
+        );
+    }
+    Ok(ReleaseAttestation::Printed { matches_expected })
+}
+
+/// Adversarial covers of the daemon-side release digest attestation: the env
+/// gate, the exactly-one-line/actual-digest/ordering contract, the loud typed
+/// mismatch log and the digest-helper reuse proven against the health report.
+#[cfg(test)]
+mod release_attestation_tests {
+    use super::*;
+
+    /// A capturing `MakeWriter` sink for the loud typed error assertions.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` with a thread-local ERROR-level fmt subscriber whose output is
+    /// captured, returning the value and the log text.
+    fn capture_errors<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let sink = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::ERROR)
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, f);
+        let logs = String::from_utf8(
+            sink.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+        .expect("the captured log is UTF-8");
+        (value, logs)
+    }
+
+    /// The unix/direct-start case: no export means NOTHING may appear on
+    /// stdout (the frozen startup line stays the only line).
+    #[test]
+    fn an_unset_export_prints_no_attestation_line() {
+        let mut out = Vec::new();
+        let outcome = emit_release_digest_attestation(&mut out, None).unwrap();
+        assert_eq!(outcome, ReleaseAttestation::NotRequested);
+        assert!(out.is_empty(), "no line when env is unset: {out:?}");
+    }
+
+    /// A requested attestation is EXACTLY one line, 64 lowercase hex, the
+    /// actual running-binary digest, and it precedes the frozen startup line
+    /// (the order [`serve_impl`] writes: attestation, then bind, then the
+    /// startup line that flips readiness).
+    #[test]
+    fn a_requested_export_prints_exactly_one_actual_line_before_readiness() {
+        let actual = faktor_updater::self_digest().expect("the test binary hashes");
+        assert!(
+            faktor_updater::manifest::is_lower_hex(&actual, 64),
+            "the helper yields 64 lowercase hex: {actual}"
+        );
+        let mut out = Vec::new();
+        let outcome = emit_release_digest_attestation(&mut out, Some(&actual)).unwrap();
+        assert_eq!(
+            outcome,
+            ReleaseAttestation::Printed {
+                matches_expected: true
+            }
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text,
+            format!("faktor release digest={actual}\n"),
+            "exactly one line carrying the actual digest"
+        );
+        // Digest-helper reuse: the SAME value the health build report folds
+        // into `self_sha256` (the running-binary digest a supervisor reads).
+        let report = build_report_json(true);
+        assert_eq!(report["self_sha256"].as_str(), Some(actual.as_str()));
+    }
+
+    /// The launcher-refusal path: the export names another digest. The daemon
+    /// still prints the ACTUAL digest (never the expected one), logs the loud
+    /// typed mismatch, and never fabricates an attestation.
+    #[test]
+    fn a_mismatched_export_prints_the_actual_digest_and_logs_loudly() {
+        let actual = faktor_updater::self_digest().expect("the test binary hashes");
+        let expected = "0".repeat(64);
+        assert_ne!(
+            actual, expected,
+            "the fixture must differ from the real hash"
+        );
+        let mut out = Vec::new();
+        let (outcome, logs) =
+            capture_errors(|| emit_release_digest_attestation(&mut out, Some(&expected)).unwrap());
+        assert_eq!(
+            outcome,
+            ReleaseAttestation::Printed {
+                matches_expected: false
+            }
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, format!("faktor release digest={actual}\n"));
+        assert!(
+            !text.contains(&expected),
+            "the expected value is never attested: {text}"
+        );
+        assert!(
+            logs.contains("faktor.release_digest.mismatch"),
+            "the mismatch is a loud typed error: {logs}"
+        );
+        assert!(logs.contains(&expected) && logs.contains(&actual));
+    }
+
+    /// A malformed export can never be answered honestly: no line is minted
+    /// (the launcher would reject it anyway) and the refusal is loud + typed.
+    #[test]
+    fn a_malformed_export_never_prints_a_minted_line() {
+        let mut out = Vec::new();
+        let (outcome, logs) =
+            capture_errors(|| emit_release_digest_attestation(&mut out, Some("abc")).unwrap());
+        assert_eq!(
+            outcome,
+            ReleaseAttestation::Unavailable {
+                reason: "malformed expected digest"
+            }
+        );
+        assert!(out.is_empty(), "no line for a malformed export: {out:?}");
+        assert!(
+            logs.contains("faktor.release_digest.malformed_expected"),
+            "the malformed export is a loud typed error: {logs}"
+        );
+    }
+}
+
 /// Shared daemon serve core (audit 44 ordering): `agent.recover()` -> bind
 /// -> print the frozen startup line -> spawn the gated backup task. A backup
 /// can NEVER delay readiness: the task is spawned only after the startup
@@ -2098,9 +2717,12 @@ fn enabled_section_db_path(
 ///
 /// `ready_tx` fires right after the startup line is printed (test probe for
 /// the "startup line before any backup file exists" ordering guarantee);
-/// `shutdown_rx`, when present, ends the daemon and ABORTS the backup task
-/// first. Production passes neither and then runs until killed, exactly like
-/// the historic `std::future::pending()` tail.
+/// `shutdown_rx`, when present, ends the daemon (the test harness's
+/// deterministic trigger). Production passes `None`: the daemon then waits
+/// for SIGTERM/SIGINT, runs the SAME [`shutdown_serving_daemon`] drain, and
+/// arms a second-signal watchdog that force-exits (code 130) if the operator
+/// insists while the bounded drain is still running. A signal can never kill
+/// the process mid-write without the drain/backup/index joins.
 #[allow(clippy::too_many_arguments)]
 async fn serve_impl(
     port: u16,
@@ -2588,33 +3210,63 @@ async fn serve_impl(
     let worker_plane_config = config_worker_plane
         .resolve()
         .map_err(|e| format!("worker plane config: {e}"))?;
+    // The dedicated listener's daemon-queryable slot (see
+    // [`faktor_server::api::WorkerPlaneListener`]): created BEFORE the deps
+    // envelope is shared and installed with the bound handle before the
+    // native listener starts, so `/native/health` reports the typed worker
+    // plane state (serving / unavailable / stopped / disabled) and never
+    // observes an enabled-but-uninstalled plane.
+    let worker_plane_listener = worker_plane_config
+        .as_ref()
+        .map(|_| faktor_server::api::WorkerPlaneListener::default());
+    if let Some(listener) = &worker_plane_listener {
+        deps = deps.with_worker_plane_listener(listener.clone());
+    }
     // The bounded live chunk stream is drained exactly once, before the deps
     // envelope is shared between the two listeners.
     faktor_server::drain_chunk_stream(&mut deps);
     let deps = std::sync::Arc::new(deps);
-    let _worker_plane_handle = match worker_plane_config {
-        Some(worker_plane_config) => {
-            let handle = faktor_server::serve_worker_plane(deps.clone(), worker_plane_config)
-                .await
-                .map_err(|e| format!("worker plane: {e}"))?;
-            // The audit record of the boundary decision (including the
-            // trusted-gateway acknowledgement, when given).
-            tracing::info!("{}", handle.exposure.audit_line());
-            if handle.exposure.beyond_loopback {
-                tracing::warn!(
-                    "worker plane listens on {} beyond loopback behind an acknowledged trusted gateway ({}); TLS/mTLS terminate at the gateway",
-                    handle.addr,
-                    handle.exposure.audit_line()
-                );
-            }
-            Some(handle)
+    if let Some(worker_plane_config) = worker_plane_config {
+        let handle = faktor_server::serve_worker_plane(deps.clone(), worker_plane_config)
+            .await
+            .map_err(|e| format!("worker plane: {e}"))?;
+        // The audit record of the boundary decision (including the
+        // trusted-gateway acknowledgement, when given).
+        tracing::info!("{}", handle.exposure.audit_line());
+        if handle.exposure.beyond_loopback {
+            tracing::warn!(
+                "worker plane listens on {} beyond loopback behind an acknowledged trusted gateway ({}); TLS/mTLS terminate at the gateway",
+                handle.addr,
+                handle.exposure.audit_line()
+            );
         }
-        None => None,
-    };
+        // The slot OWNS the handle from here on: `/native/health` queries its
+        // typed status, and the shutdown sequence takes it back out for the
+        // bounded join (never a detached listener, never an ownerless task).
+        if let Some(listener) = &worker_plane_listener {
+            listener
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .install(handle);
+        }
+    }
+    // The release digest attestation (non-unix bootstrap readiness; see
+    // [`emit_release_digest_attestation`]) is written BEFORE the native
+    // listener binds/serves, so the child's own digest claim can never follow
+    // the readiness it proves. Only the bootstrap launcher's exported
+    // `FAKTOR_RELEASE_DIGEST` requests it; a directly started daemon (the
+    // unix default) prints nothing here and stdout stays byte-identical.
+    {
+        let requested_release_digest = std::env::var(faktor_updater::RELEASE_DIGEST_ENV).ok();
+        let mut stdout = std::io::stdout().lock();
+        emit_release_digest_attestation(&mut stdout, requested_release_digest.as_deref())
+            .map_err(|e| format!("release digest attestation: {e}"))?;
+    }
     let handle = faktor_server::serve_arc(deps, port)
         .await
         .map_err(|e| format!("failed to bind: {e}"))?;
-    // The frozen stdout line; nothing else may be printed. Readiness is now
+    // The frozen stdout line; nothing else may be printed (the ONE optional
+    // release-digest attestation above precedes it). Readiness is now
     // announced — no backup has run yet and, by construction, cannot have.
     println!("{}", handle.startup_line);
     tracing::info!("faktor serving on {}", handle.addr);
@@ -2641,17 +3293,24 @@ async fn serve_impl(
     // The billing report schedule (post-readiness): one bounded tick per
     // configured interval; every period is reported at most once.
     let billing_report_task = billing_report.map(|runner| tokio::spawn(runner.run()));
-    // Keep the daemon alive; when a shutdown is signaled, close and DRAIN the
-    // TaskExecutor's detached drives (bounded graceful-then-abort), then drain
-    // the backup task (bounded) and the owned Ollama warm-up threads before
-    // the daemon returns. The drive drain runs BEFORE the backup drain so the
-    // final snapshot sees every settled record-first write; a straggler
-    // aborted by the registry stays resumable from its durable rows.
+    // Keep the daemon alive; when a shutdown is signaled, stop the owned
+    // worker-plane listener FIRST (bounded graceful join of its serve task;
+    // an unexpected death is named by the typed health snapshot), stop the
+    // graph-hosted repository index reconciliation worker (bounded join),
+    // close and DRAIN the TaskExecutor's detached drives (bounded
+    // graceful-then-abort), then drain the backup task (bounded) and the
+    // owned Ollama warm-up threads before the daemon returns. The drive
+    // drain runs BEFORE the backup drain so the final snapshot sees every
+    // settled record-first write; a straggler aborted by the registry stays
+    // resumable from its durable rows.
     match shutdown_rx {
         Some(rx) => {
             let _ = rx.await;
             shutdown_serving_daemon(
                 &graph.tasks,
+                worker_plane_listener,
+                graph.index.clone(),
+                Some(&graph.agent),
                 verification_executor,
                 scm_task,
                 billing_report_task,
@@ -2659,7 +3318,27 @@ async fn serve_impl(
             )
             .await;
         }
-        None => std::future::pending::<()>().await,
+        None => {
+            // Production: SIGTERM/SIGINT trigger the SAME drain as the test
+            // harness's shutdown channel. A second signal force-exits (the
+            // drain itself is bounded, this is the operator's escalate).
+            let signal = wait_for_shutdown_signal().await;
+            tracing::info!(signal, "shutdown signal received; draining the daemon");
+            #[cfg(test)]
+            SIGNAL_DRAIN_STARTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            spawn_force_exit_watchdog();
+            shutdown_serving_daemon(
+                &graph.tasks,
+                worker_plane_listener,
+                graph.index.clone(),
+                Some(&graph.agent),
+                verification_executor,
+                scm_task,
+                billing_report_task,
+                backup_task,
+            )
+            .await;
+        }
     }
     Ok(())
 }
@@ -3852,6 +4531,12 @@ fn doctor_run_with_config(
             if deep {
                 deep_doctor(&session, &mut lines, &mut issues);
             }
+            // The additive index-embedding section (plain AND deep): the
+            // typed build status of every published generation, read
+            // read-only from the durable generation files the store's index
+            // state names. Never opens a service, never builds, never
+            // repairs.
+            index_embedding_doctor(&store, &mut lines, &mut issues);
         }
         Err(e) => {
             lines.push(format!("store: FAILED ({e})"));
@@ -3985,11 +4670,20 @@ fn commercial_db_doctor(
             }
         }
         match &report.last_backup {
-            Some((backup, age)) => lines.push(format!(
-                "cloud-db {rel}: last verified backup {age}s ago ({}) — {} rotating kept",
-                backup.display(),
-                report.backup_count
-            )),
+            Some((backup, age)) => {
+                lines.push(format!(
+                    "cloud-db {rel}: last verified backup {age}s ago ({}) — {} rotating kept",
+                    backup.display(),
+                    report.backup_count
+                ));
+                if *age > faktor_cloud::durability::BACKUP_MAX_AGE_SECS {
+                    lines.push(format!(
+                        "cloud-db {rel}: last verified backup is STALE ({age}s old, threshold {}s)",
+                        faktor_cloud::durability::BACKUP_MAX_AGE_SECS
+                    ));
+                    *issues += 1;
+                }
+            }
             None if policy_value("backup_policy") == Some("rotating") => {
                 lines.push(format!(
                     "cloud-db {rel}: rotating backup policy recorded but no verified backup exists"
@@ -4006,6 +4700,15 @@ fn commercial_db_doctor(
             None => lines.push(format!(
                 "cloud-db {rel}: migration restore point: none recorded"
             )),
+        }
+        // A restore point that is missing while required, unopenable, corrupt,
+        // or whose name/content version claims disagree fails doctor LOUDLY,
+        // naming this database (never silently trusted as a way back).
+        if let Some(problem) = &report.migration_restore_point_issue {
+            lines.push(format!(
+                "cloud-db {rel}: migration restore point FAILED verification: {problem}"
+            ));
+            *issues += 1;
         }
     }
 }
@@ -4068,11 +4771,300 @@ fn discover_commercial_dbs(
         .collect()
 }
 
+/// Bound on workspace generation directories probed by one doctor run (the
+/// rest are NAMED as unprobed and fail the run — a silent truncation could
+/// hide a degraded workspace).
+const MAX_DOCTOR_INDEX_WORKSPACES: usize = 32;
+/// Bound on one published generation file read for the embedding build
+/// status. A doctor probe is an interactive check, not a load path: a larger
+/// index is NAMED as unprobed (the daemon itself still serves it).
+const MAX_DOCTOR_INDEX_GENERATION_BYTES: u64 = 64 * 1024 * 1024;
+/// Bound of the persisted degraded reason rendered on one doctor line: a
+/// hostile generation cannot inject newlines or balloon the report.
+const MAX_DOCTOR_INDEX_REASON_CHARS: usize = 160;
+
+/// The minimal slice of a published generation file the doctor decodes: the
+/// envelope identity plus the persisted embedding build record. Every other
+/// (potentially huge) member is skipped by serde without materialization, so
+/// the probe's memory stays bounded no matter how large the published index
+/// is.
+#[derive(serde::Deserialize)]
+struct DoctorGenerationStatus {
+    format: u32,
+    workspace: u64,
+    generation: u64,
+    data: DoctorGenerationData,
+}
+
+#[derive(serde::Deserialize)]
+struct DoctorGenerationData {
+    #[serde(default)]
+    embeddings: DoctorGenerationEmbeddings,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct DoctorGenerationEmbeddings {
+    #[serde(default)]
+    format: u32,
+    #[serde(default)]
+    build: faktor_index::embedding::EmbeddingBuildRecord,
+}
+
+/// The `index embeddings` doctor section: the TYPED build outcome
+/// (`unconfigured` / `complete` / `bounded` / `degraded` with the affected
+/// chunk count and the bounded provider reason) of every workspace's
+/// published generation — the same status
+/// `IndexView::embedding_index(ws).build_status()` exposes to callers, read
+/// here READ-ONLY from the durable generation file named by the store's
+/// published index state. Doctor never builds, repairs or opens an
+/// `IndexService`: it reports what is on disk (or names why it could not).
+/// Bounded: at most [`MAX_DOCTOR_INDEX_WORKSPACES`] workspaces probed (the
+/// excess is named and fails the run), at most one bounded read per
+/// workspace, one output line with a bounded reason.
+fn index_embedding_doctor(
+    store: &faktor_store::Store,
+    lines: &mut Vec<String>,
+    issues: &mut usize,
+) {
+    let Some(index_root) = store.path().parent().map(|p| p.join("index_data")) else {
+        return;
+    };
+    let generations_root = index_root.join("generations");
+    let Ok(entries) = std::fs::read_dir(&generations_root) else {
+        lines.push("index embeddings: no persisted index generations".into());
+        return;
+    };
+    let mut workspace_ids: Vec<u64> = Vec::new();
+    let mut total = 0usize;
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        // Symlinks/special entries are never followed (the index layout names
+        // real numeric directories only).
+        if !kind.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(raw) = name.to_str().and_then(|n| n.parse::<u64>().ok()) else {
+            continue;
+        };
+        if raw == 0 {
+            continue;
+        }
+        total += 1;
+        if workspace_ids.len() < MAX_DOCTOR_INDEX_WORKSPACES {
+            workspace_ids.push(raw);
+        }
+    }
+    if total == 0 {
+        lines.push("index embeddings: no persisted index generations".into());
+        return;
+    }
+    workspace_ids.sort_unstable();
+    lines.push(format!(
+        "index embeddings: {total} workspace(s) with persisted index generations"
+    ));
+    if total > MAX_DOCTOR_INDEX_WORKSPACES {
+        lines.push(format!(
+            "index embeddings: {} workspace(s) beyond the {MAX_DOCTOR_INDEX_WORKSPACES}-workspace probe budget were NOT probed",
+            total - MAX_DOCTOR_INDEX_WORKSPACES
+        ));
+        *issues += 1;
+    }
+    for raw in workspace_ids {
+        let Ok(workspace) = faktor_core::id::WorkspaceId::try_from(raw) else {
+            continue;
+        };
+        let row = match store.index_state_get(workspace) {
+            Ok(row) => row,
+            Err(e) => {
+                lines.push(format!(
+                    "index embeddings: workspace {raw}: durable index state read FAILED ({e})"
+                ));
+                *issues += 1;
+                continue;
+            }
+        };
+        let Some(row) = row else {
+            lines.push(format!(
+                "index embeddings: workspace {raw}: generation data exists with no durable index state"
+            ));
+            *issues += 1;
+            continue;
+        };
+        let generation = match faktor_index::state::PersistedIndexState::parse(
+            row.state_json.clone(),
+            row.generation,
+        ) {
+            Ok(persisted) => match persisted.state {
+                faktor_index::WorkspaceIndexState::Ready { generation }
+                | faktor_index::WorkspaceIndexState::Dirty { generation } => generation,
+                other => {
+                    lines.push(format!(
+                            "index embeddings: workspace {raw}: no published generation (machine state {})",
+                            doctor_index_state_label(&other)
+                        ));
+                    continue;
+                }
+            },
+            Err(e) => {
+                lines.push(format!(
+                    "index embeddings: workspace {raw}: durable index state CORRUPT ({e})"
+                ));
+                *issues += 1;
+                continue;
+            }
+        };
+        let path = generations_root
+            .join(raw.to_string())
+            .join(format!("gen-{generation}.json"));
+        match read_published_embedding_status(&path, raw, generation) {
+            Ok(Some(status)) => {
+                lines.push(format_index_embedding_line(raw, generation, &status));
+            }
+            Ok(None) => {
+                lines.push(format!(
+                    "index embeddings: workspace {raw}: published generation {generation} is missing on disk (torn publish)"
+                ));
+                *issues += 1;
+            }
+            Err(e) => {
+                lines.push(format!(
+                    "index embeddings: workspace {raw}: generation {generation} unreadable: {e}"
+                ));
+                *issues += 1;
+            }
+        }
+    }
+}
+
+/// The stable machine spelling of a persisted index state (doctor output).
+fn doctor_index_state_label(state: &faktor_index::WorkspaceIndexState) -> &'static str {
+    use faktor_index::WorkspaceIndexState as S;
+    match state {
+        S::NotStarted => "not_started",
+        S::Building { .. } => "building",
+        S::Dirty { .. } => "dirty",
+        S::Ready { .. } => "ready",
+        S::Failed { .. } => "failed",
+    }
+}
+
+/// Read one published generation's typed embedding build status. `Ok(None)`
+/// = the file is not present (the caller names it); every other failure is
+/// an error string the caller surfaces as an issue. The decode mirrors the
+/// service's own load checks (format tag, envelope identity) so doctor never
+/// reports a status from bytes the daemon would refuse to serve.
+fn read_published_embedding_status(
+    path: &std::path::Path,
+    raw: u64,
+    generation: u64,
+) -> Result<Option<faktor_index::embedding::EmbeddingBuildStatus>, String> {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("metadata: {e}")),
+    };
+    if meta.len() > MAX_DOCTOR_INDEX_GENERATION_BYTES {
+        return Err(format!(
+            "{} bytes exceeds the {MAX_DOCTOR_INDEX_GENERATION_BYTES}-byte doctor read bound",
+            meta.len()
+        ));
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("open: {e}")),
+    };
+    let decoded: DoctorGenerationStatus = serde_json::from_reader(std::io::BufReader::new(file))
+        .map_err(|e| format!("decode: {e}"))?;
+    if decoded.format != faktor_index::generation::GENERATION_FILE_FORMAT {
+        return Err(format!(
+            "generation file format {} unsupported (expected {})",
+            decoded.format,
+            faktor_index::generation::GENERATION_FILE_FORMAT
+        ));
+    }
+    if decoded.workspace != raw || decoded.generation != generation {
+        return Err(format!(
+            "envelope claims workspace {}/generation {}, expected {raw}/{generation}",
+            decoded.workspace, decoded.generation
+        ));
+    }
+    // Mirror `EmbeddingIndex::sanitize`: another embedding format tag is
+    // "no embeddings", never a fabricated status.
+    if decoded.data.embeddings.format != faktor_index::embedding::EMBEDDING_FORMAT {
+        return Ok(Some(
+            faktor_index::embedding::EmbeddingBuildStatus::Unconfigured,
+        ));
+    }
+    Ok(Some(decoded.data.embeddings.build.status()))
+}
+
+/// One line per workspace: the typed state name is exact (`unconfigured`,
+/// `complete`, `bounded`, `degraded`); a degraded build additionally names
+/// the affected chunk count and the bounded provider reason.
+fn format_index_embedding_line(
+    raw: u64,
+    generation: u64,
+    status: &faktor_index::embedding::EmbeddingBuildStatus,
+) -> String {
+    use faktor_index::embedding::EmbeddingBuildStatus as S;
+    match status {
+        S::Unconfigured => format!(
+            "index embeddings: workspace {raw}: unconfigured (generation {generation}, no embedding source was configured at build time)"
+        ),
+        S::Complete { embedded, carried } => format!(
+            "index embeddings: workspace {raw}: complete (generation {generation}, embedded={embedded}, carried={carried})"
+        ),
+        S::Bounded {
+            embedded,
+            carried,
+            skipped,
+        } => format!(
+            "index embeddings: workspace {raw}: bounded (generation {generation}, embedded={embedded}, carried={carried}, skipped={skipped})"
+        ),
+        S::Degraded {
+            reason,
+            affected,
+            embedded,
+            carried,
+            skipped,
+        } => format!(
+            "index embeddings: workspace {raw}: degraded affected={affected} (generation {generation}, embedded={embedded}, carried={carried}, skipped={skipped}) reason={}",
+            doctor_index_reason_fragment(reason)
+        ),
+    }
+}
+
+/// Bounded one-line rendering of a persisted degraded reason: control
+/// characters (including newlines a hostile generation may carry verbatim)
+/// collapse to spaces so the report stays one line per workspace, and the
+/// length is capped on a char boundary.
+fn doctor_index_reason_fragment(reason: &str) -> String {
+    let mut fragment: String = reason
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_DOCTOR_INDEX_REASON_CHARS)
+        .collect();
+    if reason.chars().count() > MAX_DOCTOR_INDEX_REASON_CHARS {
+        fragment.push('…');
+    }
+    fragment.trim().to_string()
+}
+
 /// The `[worker_plane]` deployment-boundary audit: records the resolved
 /// exposure decision (including the `trusted_gateway` acknowledgement) in the
 /// doctor report. A refused boundary is an ISSUE — the daemon refuses to
 /// start on it — and is surfaced, never repaired. With no `--config` named
 /// the check is skipped (the config-free doctor path is unchanged).
+///
+/// The config goes through the SAME load+validate path serve uses
+/// (`serve_config_and_semantic`: structural strictness, `[semantic]` split,
+/// semantic validation, provider/MCP/embedding/billing/worker bounds). A
+/// config the daemon would refuse is reported as `state=refused` — never as
+/// "enabled" — so the doctor cannot certify a daemon that would not start.
 fn doctor_worker_plane_line(
     config_path: Option<&std::path::Path>,
     lines: &mut Vec<String>,
@@ -4081,16 +5073,21 @@ fn doctor_worker_plane_line(
     let Some(path) = config_path else {
         return;
     };
-    match config::Config::load(path) {
-        Ok(config) => {
-            let mut boundary_refused = false;
+    match serve_config_and_semantic(Some(path.to_path_buf())) {
+        Ok((config, _semantic)) => {
             match config.worker_plane.resolve() {
                 Ok(None) => {
-                    lines.push("worker plane: disabled ([worker_plane] not enabled)".into());
+                    lines.push(
+                        "worker plane: disabled state=disabled enabled=false ([worker_plane] not enabled)"
+                            .into(),
+                    );
                 }
                 Ok(Some(bind_config)) => match bind_config.validate() {
                     Ok(exposure) => {
-                        lines.push(format!("worker plane: {}", exposure.audit_line()));
+                        lines.push(format!(
+                            "worker plane: enabled state=enabled enabled=true {}",
+                            exposure.audit_line()
+                        ));
                         if exposure.beyond_loopback {
                             lines.push(format!(
                                 "worker plane: trusted_gateway acknowledgement recorded for {} (TLS/mTLS terminate at the gateway)",
@@ -4100,30 +5097,52 @@ fn doctor_worker_plane_line(
                     }
                     Err(refusal) => {
                         lines.push(format!(
-                            "worker plane: FAILED [{}] {refusal}",
+                            "worker plane: FAILED state=refused enabled=true code={} {refusal}",
                             refusal.code()
                         ));
                         *issues += 1;
-                        boundary_refused = true;
                     }
                 },
                 Err(e) => {
-                    lines.push(format!("worker plane: FAILED {e}"));
+                    // `resolve()` renders the typed deployment-boundary
+                    // refusal with its stable machine code; any other failure
+                    // is a plain config error (bad bind/auth shape). The
+                    // operator sees which of the two refused the daemon.
+                    let refusal_code = "worker_plane_boundary_refused";
+                    if e.contains(refusal_code) {
+                        lines.push(format!(
+                            "worker plane: FAILED state=refused enabled=true code={refusal_code} {e}"
+                        ));
+                    } else {
+                        lines.push(format!(
+                            "worker plane: FAILED state=failed enabled=true {e}"
+                        ));
+                    }
                     *issues += 1;
-                    boundary_refused = true;
                 }
             }
-            // The rest of the config's semantic validation (the boundary
-            // refusal above is already the specific report).
-            if !boundary_refused {
-                if let Err(e) = config.validate() {
-                    lines.push(format!("config validation FAILED: {e}"));
-                    *issues += 1;
-                }
-            }
+            // The config already went through serve's full validation; the
+            // boundary refusal above is the specific report when there is one.
         }
         Err(e) => {
-            lines.push(format!("worker plane: config FAILED ({e})"));
+            // The daemon REFUSES this config; the worker plane must never be
+            // reported as enabled (the audit's trap: a config serve rejects
+            // still rendered "enabled"). A worker-plane-specific refusal keeps
+            // its stable machine code and its requested-enabled state; any
+            // other config refusal reports the plane as NOT enabled (the
+            // daemon would not open it).
+            const REFUSAL_CODE: &str = "worker_plane_boundary_refused";
+            if e.contains(REFUSAL_CODE) {
+                lines.push(format!(
+                    "worker plane: FAILED state=refused enabled=true code={REFUSAL_CODE} \
+                     (the daemon refuses this config and would not start) {e}"
+                ));
+            } else {
+                lines.push(format!(
+                    "worker plane: FAILED state=refused enabled=false code=config_refused \
+                     (the daemon refuses this config and would not open the worker plane) {e}"
+                ));
+            }
             *issues += 1;
         }
     }
@@ -4727,6 +5746,28 @@ mod tests {
                 configured,
                 "the section must resolve exactly when configured"
             );
+            // Index generation BUILDS would drive the same provider with a
+            // two-input chunk batch (`parse_expr` + `reconcile_accounts`),
+            // racing the scripted one-input query calls below. Wrap the
+            // resolved embedder so only query-time retrieval uses it: this
+            // E2E is about semantic fusion into an ordinary turn, and the
+            // script then has the deterministic one-input/one-candidate
+            // cadence per concept. Persisted-vector retrieval is covered by
+            // the search and evidence crate tests.
+            struct QueryOnlyEmbedder(Arc<dyn faktor_search::Embedder>);
+            impl faktor_search::Embedder for QueryOnlyEmbedder {
+                fn embed(&self, texts: &[String]) -> Vec<Vec<f32>> {
+                    faktor_search::Embedder::embed(self.0.as_ref(), texts)
+                }
+                fn try_embed(
+                    &self,
+                    texts: &[String],
+                ) -> Result<Vec<Vec<f32>>, faktor_core::error::Error> {
+                    faktor_search::Embedder::try_embed(self.0.as_ref(), texts)
+                }
+            }
+            let embedder: Option<Arc<dyn faktor_search::Embedder>> = embedder
+                .map(|e| Arc::new(QueryOnlyEmbedder(e)) as Arc<dyn faktor_search::Embedder>);
 
             let ws = session.create_workspace(root.to_str().unwrap()).unwrap();
             let sid = session.create_session(ws, "idx", "fake", "m").unwrap().id();
@@ -5666,6 +6707,84 @@ mod tests {
             .expect("terminal row");
         assert_eq!(done.state, faktor_session::VerificationJobState::Passed);
     }
+
+    /// F10 (adversarial): a store read failure during the startup
+    /// verification sweep is TYPED and counted — never a silent `continue`
+    /// that looks like "nothing to recover"; the durable rows stay for the
+    /// next boot.
+    #[test]
+    fn startup_verification_recovery_reports_unreadable_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap(),
+        );
+        let ws = manager.create_workspace("/w").unwrap();
+        let _sid = manager
+            .create_session(ws, "recover", "fake", "m")
+            .unwrap()
+            .id();
+        // Healthy baseline: a typed zero, no failure.
+        let healthy = recover_verification_jobs_at_startup(&manager);
+        assert_eq!(healthy, VerificationRecoverySummary::default());
+        assert!(!healthy.scan_failed);
+        // Corrupt the durable verification store under the live manager:
+        // the sweep must report the unreadable session instead of skipping.
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("store").join("faktor-plus.db"))
+                .unwrap();
+            conn.execute_batch("DROP TABLE verification_job").unwrap();
+        }
+        let summary = recover_verification_jobs_at_startup(&manager);
+        assert_eq!(summary.unreadable, 1, "{summary:?}");
+        assert!(!summary.scan_failed, "{summary:?}");
+        assert_eq!(summary.requeued, 0, "{summary:?}");
+    }
+
+    /// F10 (adversarial): the startup queue-head sweep never classifies an
+    /// unreadable/unopenable session as "already drained" — it counts it
+    /// typed (an issue the operator can see) instead of silently skipping.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn startup_queue_recovery_reports_unopenable_rows_instead_of_silence() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = build_daemon(dir.path(), None).unwrap();
+        let ws = graph.session.create_workspace("/w").unwrap();
+        let handle = graph.session.create_session(ws, "t", "fake", "m").unwrap();
+        let op = graph.session.try_next_op_id().unwrap();
+        graph
+            .session
+            .store()
+            .enqueue_prompt(handle.id(), op, "queued", &[], None, None, None, 1)
+            .unwrap();
+        let healthy = recover_pending_queues_at_startup(&graph);
+        assert_eq!(
+            (healthy.candidates, healthy.runnable, healthy.unreadable),
+            (1, 1, 0),
+            "{healthy:?}"
+        );
+        assert!(!healthy.scan_failed, "{healthy:?}");
+        // A durable queue row whose session does not exist (foreign row,
+        // written with FK enforcement off): the sweep lists it as a candidate
+        // but cannot open it — that is reported, never silently "drained".
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("store").join("faktor-plus.db"))
+                .unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+            conn.execute(
+                "INSERT INTO prompt_queue(session_id, seq, op_id, prompt, status, requested_at) \
+                 VALUES (999999, 1, 999999, 'foreign', 'pending', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        }
+        let summary = recover_pending_queues_at_startup(&graph);
+        assert_eq!(summary.candidates, 2, "{summary:?}");
+        assert_eq!(
+            summary.unreadable, 1,
+            "the unopenable foreign row must be reported, not silent: {summary:?}"
+        );
+        assert!(!summary.scan_failed, "{summary:?}");
+    }
     #[test]
     fn daemon_instructions_resolver_reads_the_live_shadow_of_a_shadowed_workspace() {
         // P0-48: while exactly ONE session of the workspace carries a live
@@ -6480,6 +7599,137 @@ mod tests {
             .unwrap();
     }
 
+    /// Serializes the real-signal tests: SIGTERM/SIGINT are delivered to the
+    /// WHOLE process, so concurrent signal tests would cross-consume each
+    /// other's signals (or worse, race an unarmed waiter).
+    static SIGNAL_TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Wait until `count` shutdown-signal waiters are armed (each successful
+    /// SIGTERM/SIGINT registration increments the counter). Bounded.
+    async fn wait_for_armed_signal_waiters(count: u32) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while SIGNAL_WAITERS_ARMED.load(std::sync::atomic::Ordering::SeqCst) < count {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the shutdown-signal waiter was never armed (armed \
+                 {})",
+                SIGNAL_WAITERS_ARMED.load(std::sync::atomic::Ordering::SeqCst)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    fn send_self_signal(signal: i32) {
+        // SAFETY: `kill(2)` with our own pid and a valid signal number; the
+        // signal tests install the tokio handlers BEFORE sending.
+        unsafe {
+            libc::kill(libc::getpid(), signal);
+        }
+    }
+
+    /// Production serve has NO shutdown channel: SIGTERM must trigger the
+    /// SAME full drain (`shutdown_serving_daemon`: worker-plane join, index
+    /// worker join, drive drain, backup drain) and return cleanly — proving
+    /// the production path is no longer `std::future::pending()`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn serve_sigterm_runs_the_full_drain_and_returns_clean() {
+        let _guard = SIGNAL_TEST_GUARD.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = SIGNAL_WAITERS_ARMED.load(std::sync::atomic::Ordering::SeqCst);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let dir2 = dir.path().to_path_buf();
+        let daemon =
+            tokio::task::spawn(
+                async move { serve_impl(0, dir2, None, Some(ready_tx), None).await },
+            );
+        tokio::time::timeout(std::time::Duration::from_secs(30), ready_rx)
+            .await
+            .expect("serve must reach the startup line")
+            .expect("ready signal");
+        wait_for_armed_signal_waiters(baseline + 1).await;
+        send_self_signal(libc::SIGTERM);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), daemon)
+            .await
+            .expect("SIGTERM must trigger the bounded drain, never kill the process")
+            .expect("the serve task must not panic");
+        assert!(
+            result.is_ok(),
+            "the drained daemon returns cleanly: {result:?}"
+        );
+    }
+
+    /// The second signal during the drain takes the FORCE path: it must
+    /// report the force-exit code (the test probe replaces `process::exit`,
+    /// which would kill the harness) while the first signal's bounded drain
+    /// still completes cleanly.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn second_signal_during_the_drain_forces_exit_through_the_probe() {
+        let _guard = SIGNAL_TEST_GUARD.lock().await;
+        SIGNAL_DRAIN_STARTED.store(false, std::sync::atomic::Ordering::SeqCst);
+        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+        *FORCE_EXIT_PROBE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(probe_tx);
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = SIGNAL_WAITERS_ARMED.load(std::sync::atomic::Ordering::SeqCst);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let dir2 = dir.path().to_path_buf();
+        let daemon =
+            tokio::task::spawn(
+                async move { serve_impl(0, dir2, None, Some(ready_tx), None).await },
+            );
+        tokio::time::timeout(std::time::Duration::from_secs(30), ready_rx)
+            .await
+            .expect("serve must reach the startup line")
+            .expect("ready signal");
+        wait_for_armed_signal_waiters(baseline + 1).await;
+        send_self_signal(libc::SIGTERM);
+        // Wait until the drain was entered (the watchdog is then spawned)
+        // and its own signal waiter is armed before escalating.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !SIGNAL_DRAIN_STARTED.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first signal never reached the drain"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        wait_for_armed_signal_waiters(baseline + 2).await;
+        send_self_signal(libc::SIGTERM);
+        let code = tokio::time::timeout(std::time::Duration::from_secs(10), probe_rx)
+            .await
+            .expect("the second signal must take the force path")
+            .expect("the force probe must fire");
+        assert_eq!(code, FORCE_EXIT_CODE);
+        // The probe replaced the process exit: the first signal's drain
+        // still completes cleanly in-process.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), daemon)
+            .await
+            .expect("the drain must still finish")
+            .expect("the serve task must not panic");
+        assert!(
+            result.is_ok(),
+            "the drained daemon returns cleanly: {result:?}"
+        );
+    }
+
+    /// The forced-exit path is reachable through the probe even without a
+    /// serve task (classification seam).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_signal_reports_the_force_exit_code() {
+        let _guard = SIGNAL_TEST_GUARD.lock().await;
+        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+        *FORCE_EXIT_PROBE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(probe_tx);
+        on_force_signal("SIGTERM").await;
+        assert_eq!(probe_rx.await.unwrap(), FORCE_EXIT_CODE);
+    }
+
     /// Serve startup queue recovery: a durable pending queue head left by a
     /// killed process (active turn already aborted, no live runner anywhere)
     /// is claimed by EXACTLY ONE runner as part of the serve startup
@@ -6883,6 +8133,9 @@ mod tests {
             drain_bound,
             shutdown_serving_daemon(
                 &tasks,
+                None,
+                None,
+                None,
                 tokio::spawn(std::future::pending::<()>()),
                 None,
                 None,
@@ -7043,16 +8296,46 @@ mod tests {
         assert_eq!(report.issues, 0, "{:?}", report.lines);
 
         let config = dir.path().join("config.json");
-        // A disabled section is an honest line, not an issue.
+        // A disabled section is an honest line (with its explicit state), not
+        // an issue.
         std::fs::write(&config, r#"{"model": "m"}"#).unwrap();
         let report = doctor_run_with_config(dir.path(), false, Some(&config));
-        assert!(report
-            .lines
-            .iter()
-            .any(|line| line.contains("worker plane: disabled")));
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|line| line.contains("worker plane: disabled")
+                    && line.contains("state=disabled")
+                    && line.contains("enabled=false")),
+            "{:?}",
+            report.lines
+        );
         assert_eq!(report.issues, 0, "{:?}", report.lines);
 
-        // A refused boundary is an issue naming the typed refusal code.
+        // An enabled plane renders enabled/bind/state (the default loopback
+        // bind and the worker-token auth mode are named).
+        std::fs::write(
+            &config,
+            r#"{"model": "m", "cloud": {"enabled": true}, "workers": {"enabled": true, "organization": "org_local"}, "worker_plane": {"enabled": true}}"#,
+        )
+        .unwrap();
+        let report = doctor_run_with_config(dir.path(), false, Some(&config));
+        let enabled_line = report
+            .lines
+            .iter()
+            .find(|line| line.starts_with("worker plane: enabled"))
+            .expect("an enabled section renders its state");
+        assert!(
+            enabled_line.contains("state=enabled")
+                && enabled_line.contains("enabled=true")
+                && enabled_line.contains("bind=127.0.0.1:8790")
+                && enabled_line.contains("auth=worker_tokens"),
+            "{enabled_line}"
+        );
+        assert_eq!(report.issues, 0, "{:?}", report.lines);
+
+        // A refused boundary is an issue naming the typed refusal code and
+        // its refused state.
         std::fs::write(
             &config,
             r#"{"model": "m", "cloud": {"enabled": true}, "workers": {"enabled": true, "organization": "org_local"}, "worker_plane": {"enabled": true, "bind": "0.0.0.0:8790"}}"#,
@@ -7064,6 +8347,8 @@ mod tests {
                 .lines
                 .iter()
                 .any(|line| line.contains("worker plane: FAILED")
+                    && line.contains("state=refused")
+                    && line.contains("enabled=true")
                     && line.contains("worker_plane_boundary_refused")
                     && line.contains("worker-plane deployment boundary")),
             "{:?}",
@@ -7096,27 +8381,61 @@ mod tests {
         assert_eq!(report.issues, 0, "{:?}", report.lines);
     }
 
+    /// F9 (adversarial): a config the DAEMON refuses (semantic validation
+    /// failure) must never be reported as an enabled worker plane — the
+    /// doctor runs serve's own load+validate path and reports the refused
+    /// state with an issue.
+    #[test]
+    fn doctor_refuses_a_config_the_daemon_would_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let session =
+                SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
+                    .unwrap();
+            session
+                .create_session(session.create_workspace("/w").unwrap(), "t", "p", "m")
+                .unwrap();
+        }
+        let config = dir.path().join("config.json");
+        // Duplicate provider ids PARSE but `Config::validate` refuses them:
+        // serve exits with a config error, so the doctor must refuse too.
+        std::fs::write(
+            &config,
+            r#"{"model": "m", "providers": [{"kind": "ollama", "id": "dup"}, {"kind": "ollama", "id": "dup"}], "cloud": {"enabled": true}, "workers": {"enabled": true, "organization": "org_local"}, "worker_plane": {"enabled": true}}"#,
+        )
+        .unwrap();
+        let report = doctor_run_with_config(dir.path(), false, Some(&config));
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|line| line.starts_with("worker plane: FAILED")
+                    && line.contains("state=refused")
+                    && line.contains("config_refused")),
+            "the refused config names the refused state: {:?}",
+            report.lines
+        );
+        assert!(
+            !report
+                .lines
+                .iter()
+                .any(|line| line.starts_with("worker plane: enabled")),
+            "a config the daemon refuses must never report the plane as enabled: {:?}",
+            report.lines
+        );
+        assert!(report.issues >= 1, "{:?}", report.lines);
+    }
     /// The additive `cloud-db` doctor section (P1 durability): a real
     /// control-plane database is reported with its writer-recorded
-    /// `synchronous=FULL` policy, integrity, verified backup age and
-    /// migration restore-point presence; the LOCAL-authority caveat is
+    /// `synchronous=FULL` policy, integrity, verified backup age and its
+    /// SELF-CONSISTENT migration restore point (fresh creation writes a
+    /// verified `-pre-migration-v0-` point); the LOCAL-authority caveat is
     /// printed.
     #[test]
     fn doctor_reports_the_commercial_db_section_with_policy_and_backup() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("control-plane.db");
-        {
-            let store = faktor_cloud::SqliteControlPlaneStore::open(&path).unwrap();
-            let fp = store.fingerprint().unwrap();
-            let backup_dir = faktor_cloud::durability::backup_dir(&path);
-            std::fs::create_dir_all(&backup_dir).unwrap();
-            let backup = backup_dir.join(format!(
-                "control-plane-pre-migration-v4-{}-1.db",
-                std::process::id()
-            ));
-            store.backup_to(&backup).unwrap();
-            faktor_cloud::durability::restore_verify(&backup, &fp).unwrap();
-        }
+        drop(faktor_cloud::SqliteControlPlaneStore::open(&path).unwrap());
         let report = doctor_run(dir.path(), false);
         assert_eq!(report.issues, 0, "healthy: {:?}", report.lines);
         assert!(
@@ -7143,7 +8462,95 @@ mod tests {
         assert!(report
             .lines
             .iter()
-            .any(|l| l.contains("migration restore point") && l.contains("-pre-migration-v4-")));
+            .any(|l| l.contains("migration restore point") && l.contains("-pre-migration-v0-")));
+    }
+
+    /// Doctor fails loudly (naming the DB) when the newest verified rotating
+    /// backup is older than the threshold: a backup that old no longer bounds
+    /// the loss window.
+    #[test]
+    fn doctor_fails_loudly_on_a_stale_rotating_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.db");
+        drop(faktor_cloud::SqliteControlPlaneStore::open(&path).unwrap());
+        let (backup, _) = faktor_cloud::durability::latest_backup(&path)
+            .expect("the first open writes a verified rotating backup");
+        let aged = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(faktor_cloud::durability::BACKUP_MAX_AGE_SECS + 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&backup)
+            .unwrap()
+            .set_modified(aged)
+            .unwrap();
+        let report = doctor_run(dir.path(), false);
+        assert!(report.issues >= 1, "{:?}", report.lines);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.starts_with("cloud-db control-plane.db:") && l.contains("STALE")),
+            "{:?}",
+            report.lines
+        );
+    }
+
+    /// Doctor RE-VERIFIES the restore point and fails loudly (naming the DB)
+    /// when it is missing while the recorded policy requires one, or when its
+    /// content does not match its name's version claim.
+    #[test]
+    fn doctor_fails_loudly_on_missing_or_mislabeled_restore_points() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.db");
+        drop(faktor_cloud::SqliteControlPlaneStore::open(&path).unwrap());
+        let (point, _) =
+            faktor_cloud::durability::latest_migration_backup(&path).expect("v0 restore point");
+        assert!(point
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("-pre-migration-v0-"));
+
+        // Missing while required: doctor fails and names the database.
+        std::fs::remove_file(&point).unwrap();
+        let report = doctor_run(dir.path(), false);
+        assert!(report.issues >= 1, "{:?}", report.lines);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.starts_with("cloud-db control-plane.db:")
+                    && l.contains("migration restore point FAILED verification")
+                    && l.contains("no pre-migration restore point exists")),
+            "{:?}",
+            report.lines
+        );
+
+        // Mislabeled: a full copy of the LIVE (post-migration) database under
+        // a `-pre-migration-v4-` name must fail verification, naming the DB.
+        let backup_dir = faktor_cloud::durability::backup_dir(&path);
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        let mislabeled = backup_dir.join(format!(
+            "control-plane-pre-migration-v4-{}-9.db",
+            std::process::id()
+        ));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            faktor_cloud::durability::backup_to(&conn, &mislabeled).unwrap();
+        }
+        let report = doctor_run(dir.path(), false);
+        assert!(report.issues >= 1, "{:?}", report.lines);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.starts_with("cloud-db control-plane.db:")
+                    && l.contains("migration restore point FAILED verification")
+                    && l.contains("mislabeled")),
+            "{:?}",
+            report.lines
+        );
     }
 
     /// A corrupt commercial database fails doctor loudly and the `cloud-db`
@@ -7402,6 +8809,232 @@ mod tests {
             "{:?}",
             report.lines
         );
+    }
+
+    /// The `index embeddings` doctor section renders the TYPED status of the
+    /// published generation exactly as `IndexView::embedding_index(ws)
+    /// .build_status()` exposes it: a provider-failure fixture renders
+    /// `degraded` with the affected chunk count and the bounded reason, a
+    /// working source renders `complete`, and a build with no configured
+    /// source renders `unconfigured` — never a silent lexical-only success.
+    #[test]
+    fn doctor_reports_the_published_index_embedding_build_status_typed_states() {
+        use faktor_core::error::{Error, ErrorKind};
+        use faktor_index::embedding::{EmbeddingBuildStatus, EmbeddingModel, EmbeddingSource};
+        use faktor_index::IndexService;
+
+        struct FailingSource;
+        impl EmbeddingSource for FailingSource {
+            fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, Error> {
+                Err(Error::new(
+                    ErrorKind::Provider {
+                        code: "embedding_backend_down".into(),
+                        retryable: false,
+                    },
+                    "embedding backend down",
+                ))
+            }
+        }
+        struct WorkingSource;
+        impl EmbeddingSource for WorkingSource {
+            fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, Error> {
+                Ok(texts.iter().map(|_| vec![0.25, 0.5, 0.75, 1.0]).collect())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        // The daemon derives its index data root from the store path; the
+        // doctor reads exactly that root.
+        let index = IndexService::open(
+            session.store(),
+            dir.path().join("store").join("index_data"),
+            faktor_fs::WorkspaceFileService::new(),
+        )
+        .unwrap();
+
+        let build = |name: &str, source: Option<Arc<dyn EmbeddingSource>>| -> u64 {
+            let root = dir.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("lib.rs"), b"pub fn fixture() -> i64 { 1 }\n").unwrap();
+            let ws = session.create_workspace(root.to_str().unwrap()).unwrap();
+            index.set_embedding_source(source, EmbeddingModel::new("fixture-model", "r1"));
+            let view = index
+                .ensure_ready(
+                    ws,
+                    std::time::Instant::now() + std::time::Duration::from_secs(120),
+                )
+                .unwrap();
+            // The fixture asserts the SAME typed chain the doctor renders off
+            // the published generation. A source-less, prior-less build
+            // installs NO embedding map entry in the live view (callers read
+            // that absence as "no embeddings" = unconfigured), while the
+            // persisted generation carries the typed `Unconfigured` record
+            // the doctor reads; both spell the same state.
+            let status = view
+                .index()
+                .lock()
+                .unwrap()
+                .embedding_index(ws)
+                .map(|index| index.build_status())
+                .unwrap_or(EmbeddingBuildStatus::Unconfigured);
+            match name {
+                "degraded_repo" => assert!(
+                    matches!(status, EmbeddingBuildStatus::Degraded { affected: 1, .. }),
+                    "the failing fixture must persist a degraded status: {status:?}"
+                ),
+                "complete_repo" => assert!(
+                    matches!(status, EmbeddingBuildStatus::Complete { embedded: 1, .. }),
+                    "the working fixture must persist a complete status: {status:?}"
+                ),
+                _ => assert_eq!(status, EmbeddingBuildStatus::Unconfigured),
+            }
+            ws.raw()
+        };
+        let degraded = build("degraded_repo", Some(Arc::new(FailingSource)));
+        let complete = build("complete_repo", Some(Arc::new(WorkingSource)));
+        let unconfigured = build("unconfigured_repo", None);
+        drop(index);
+        drop(session);
+
+        let report = doctor_run(dir.path(), false);
+        let line_for = |raw: u64| {
+            report
+                .lines
+                .iter()
+                .find(|l| l.contains(&format!("workspace {raw}:")))
+                .unwrap_or_else(|| panic!("no index line for workspace {raw}: {:?}", report.lines))
+                .clone()
+        };
+        let degraded_line = line_for(degraded);
+        assert!(
+            degraded_line.contains(": degraded affected=1"),
+            "{degraded_line}"
+        );
+        assert!(
+            degraded_line.contains("reason=")
+                && degraded_line.contains("embedding_backend_down")
+                && degraded_line.contains("embedding backend down"),
+            "{degraded_line}"
+        );
+        let complete_line = line_for(complete);
+        assert!(complete_line.contains(": complete"), "{complete_line}");
+        assert!(complete_line.contains("embedded=1"), "{complete_line}");
+        let unconfigured_line = line_for(unconfigured);
+        assert!(
+            unconfigured_line.contains(": unconfigured"),
+            "{unconfigured_line}"
+        );
+        assert_eq!(report.issues, 0, "{:?}", report.lines);
+    }
+
+    /// Doctor never trusts the index data it reads: a corrupt published
+    /// generation is named by workspace and counted as an issue, a numeric
+    /// generation directory with no durable state row is flagged, and
+    /// non-workspace junk (non-numeric names, the reserved id 0) is ignored
+    /// without a line or a panic.
+    #[test]
+    fn doctor_surfaces_corrupt_and_unmanaged_index_generations_without_panicking() {
+        use faktor_index::IndexService;
+
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        let index_root = dir.path().join("store").join("index_data");
+        let index = IndexService::open(
+            session.store(),
+            index_root.clone(),
+            faktor_fs::WorkspaceFileService::new(),
+        )
+        .unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), b"pub fn corrupt_me() -> i64 { 1 }\n").unwrap();
+        let ws = session.create_workspace(root.to_str().unwrap()).unwrap();
+        index
+            .ensure_ready(
+                ws,
+                std::time::Instant::now() + std::time::Duration::from_secs(120),
+            )
+            .unwrap();
+        drop(index);
+        drop(session);
+
+        // Corrupt the published generation's bytes in place (the envelope is
+        // present, the payload is garbage).
+        let gen_dir = index_root.join("generations").join(ws.raw().to_string());
+        let published = std::fs::read_dir(&gen_dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+            .expect("the published generation file exists");
+        std::fs::write(&published, b"{ not a generation").unwrap();
+
+        // A numeric workspace dir with no durable state row, plus junk the
+        // doctor must ignore.
+        std::fs::create_dir_all(index_root.join("generations").join("7777")).unwrap();
+        std::fs::write(index_root.join("generations").join("not-a-workspace"), b"x").unwrap();
+        std::fs::create_dir_all(index_root.join("generations").join("0")).unwrap();
+
+        let report = doctor_run(dir.path(), false);
+        assert!(
+            report.lines.iter().any(|l| l.contains(&format!(
+                "index embeddings: workspace {}: generation 1 unreadable",
+                ws.raw()
+            ))),
+            "{:?}",
+            report.lines
+        );
+        assert!(
+            report.lines.iter().any(|l| l.contains(
+                "index embeddings: workspace 7777: generation data exists with no durable index state"
+            )),
+            "{:?}",
+            report.lines
+        );
+        assert!(
+            !report.lines.iter().any(|l| l.contains("workspace 0:")),
+            "the reserved id 0 must never be probed: {:?}",
+            report.lines
+        );
+        assert!(
+            !report.lines.iter().any(|l| l.contains("not-a-workspace")),
+            "{:?}",
+            report.lines
+        );
+        assert!(report.issues >= 2, "{:?}", report.lines);
+    }
+
+    /// The workspace probe budget is a bound, not a silent truncation:
+    /// generation directories past it are counted, named as unprobed, and
+    /// the run fails loudly.
+    #[test]
+    fn doctor_bounds_the_index_workspace_probe_budget_and_names_the_excess() {
+        let dir = tempfile::tempdir().unwrap();
+        let generations = dir
+            .path()
+            .join("store")
+            .join("index_data")
+            .join("generations");
+        for raw in 1..=33u64 {
+            std::fs::create_dir_all(generations.join(raw.to_string())).unwrap();
+        }
+        let report = doctor_run(dir.path(), false);
+        assert!(
+            report.lines.iter().any(|l| l
+                .contains("index embeddings: 33 workspace(s) with persisted index generations")),
+            "{:?}",
+            report.lines
+        );
+        assert!(
+            report.lines.iter().any(|l| l
+                .contains("1 workspace(s) beyond the 32-workspace probe budget were NOT probed")),
+            "{:?}",
+            report.lines
+        );
+        assert!(report.issues >= 33, "{:?}", report.lines);
     }
 
     #[test]
@@ -9810,6 +11443,286 @@ mod tests {
                 .unwrap();
         }
     }
+
+    /// The `[worker_plane]` serve wiring: the enabled second listener really
+    /// serves (the worker route answers on its own socket), and the daemon's
+    /// shutdown sequence JOINS the owned serve task within the bound — the
+    /// socket is released after `serve_impl` returns Ok, never detached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_plane_listener_is_owned_and_joined_on_daemon_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        // A concrete loopback port for the worker plane (the native listener
+        // prints its own address on the startup line, the worker plane does
+        // not); the probe is dropped so the daemon can bind it.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let worker_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let config = dir.path().join("faktor-plus.json");
+        std::fs::write(
+            &config,
+            format!(
+                r#"{{
+                    "model": "m",
+                    "cloud": {{"enabled": true, "database": "cp.db", "scm_database": "repos.db"}},
+                    "workers": {{
+                        "enabled": true,
+                        "database": "wp.db",
+                        "organization": "org_local",
+                        "trust_domain": "org_local"
+                    }},
+                    "worker_plane": {{"enabled": true, "bind": "127.0.0.1:{worker_port}"}}
+                }}"#
+            ),
+        )
+        .unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let dir2 = dir.path().to_path_buf();
+        let daemon = tokio::task::spawn(async move {
+            serve_impl(0, dir2, Some(config), Some(ready_tx), Some(shutdown_rx)).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(60), ready_rx)
+            .await
+            .expect("serve must reach the startup line")
+            .expect("ready signal");
+        // The worker plane is live on its OWN socket (a malformed body is a
+        // strict-DTO 400, not a connection refusal).
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://127.0.0.1:{worker_port}/native/workers/register"
+            ))
+            .json(&serde_json::json!({ "hostile": true }))
+            .send()
+            .await
+            .expect("the worker-plane listener must answer");
+        assert_eq!(response.status(), 400);
+        // Shutdown joins the owned serve task; the daemon returns Ok.
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(60), daemon)
+            .await
+            .expect("daemon shutdown (worker plane joined)")
+            .expect("serve_impl returns Ok")
+            .unwrap();
+        // The owner completed: the worker-plane listener socket is released.
+        let rebind = std::net::TcpListener::bind(("127.0.0.1", worker_port))
+            .expect("the worker-plane socket must be released after shutdown");
+        drop(rebind);
+    }
+
+    /// The daemon shutdown sequence stops the graph-hosted repository index
+    /// reconciliation worker: with an ACTIVE worker the sequence cancels and
+    /// JOINS it within its bound (no ghost passes left behind — the owner
+    /// reports no task left to join afterwards), and with a worker that was
+    /// never started the sequence is a safe, bounded no-op.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_shutdown_joins_the_graph_index_worker_bounded() {
+        use faktor_index::{IndexService, WorkerShutdown, WorkerState};
+
+        /// Bounded wait for the owned worker to reach a terminal state.
+        async fn wait_state(index: &Arc<IndexService>, want: WorkerState) {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            while index.worker_status().state != want {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the index worker never reached {want:?}: {:?}",
+                    index.worker_status()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        /// One bounded shutdown-sequence run over the shared executor.
+        async fn run_shutdown(
+            tasks: &Arc<faktor_orchestrator::runtime::task_executor::TaskExecutor>,
+            index: &Arc<IndexService>,
+        ) {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                shutdown_serving_daemon(
+                    tasks,
+                    None,
+                    Some(index.clone()),
+                    None,
+                    tokio::spawn(std::future::pending::<()>()),
+                    None,
+                    None,
+                    tokio::spawn(async {}),
+                ),
+            )
+            .await
+            .expect("the shutdown sequence must stay bounded");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("owner");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), b"pub fn indexed() -> i64 { 1 }\n").unwrap();
+        let session =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        let ws = session.create_workspace(root.to_str().unwrap()).unwrap();
+        let index = IndexService::open(
+            session.store(),
+            dir.path().join("index_data"),
+            faktor_fs::WorkspaceFileService::new(),
+        )
+        .unwrap();
+
+        // The drive-drain authority the exact serve shutdown sequence uses
+        // (the same construction `build_daemon` performs).
+        let agent = test_agent(session.clone(), ProviderRegistry::new());
+        let orchestrator =
+            faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
+        let shadows = faktor_orchestrator::runtime::shadow::ShadowRoots::new(
+            session.clone(),
+            dir.path().join("shadows"),
+        )
+        .unwrap();
+        let tasks = Arc::new(
+            faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
+                &orchestrator,
+                session.clone(),
+                agent,
+                shadows,
+            ),
+        );
+
+        // (a) Never started: a safe, bounded no-op (nothing to cancel/join).
+        assert_eq!(index.worker_status().state, WorkerState::NotStarted);
+        run_shutdown(&tasks, &index).await;
+        assert_eq!(index.worker_status().state, WorkerState::NotStarted);
+
+        // (b) Active worker: attach kicks the owned reconciliation worker;
+        // the shutdown sequence joins it within the service bound and the
+        // owner is left terminal — a second shutdown finds nothing detached.
+        index.attach(ws).unwrap();
+        wait_state(&index, WorkerState::Running).await;
+        let started = std::time::Instant::now();
+        run_shutdown(&tasks, &index).await;
+        assert_eq!(
+            index.worker_status().state,
+            WorkerState::Stopped,
+            "the joined worker must be terminal: {:?}",
+            index.worker_status()
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the index worker join must stay within the bound: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            index.shutdown_worker().await,
+            WorkerShutdown::NotRunning,
+            "no detached index task may outlive the shutdown sequence"
+        );
+    }
+
+    /// The daemon shutdown sequence also JOINS the runtime's OWN lazily
+    /// hosted index worker: a runtime that never opened one is an inert,
+    /// bounded no-op (the sequence must not open it as a side effect), and a
+    /// runtime that hosted its service during an ordinary turn leaves no
+    /// ghost worker behind — the owned worker is cancelled and joined within
+    /// the bound, and a repeat accessor call finds nothing detached. The
+    /// sequence stays bounded in both cases.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_shutdown_joins_the_runtime_index_worker_bounded() {
+        use faktor_index::{WorkerShutdown, WorkerState};
+
+        async fn run_shutdown(
+            tasks: &Arc<faktor_orchestrator::runtime::task_executor::TaskExecutor>,
+            agent: &Arc<AgentRuntime>,
+        ) {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                shutdown_serving_daemon(
+                    tasks,
+                    None,
+                    None,
+                    Some(agent),
+                    tokio::spawn(std::future::pending::<()>()),
+                    None,
+                    None,
+                    tokio::spawn(async {}),
+                ),
+            )
+            .await
+            .expect("the shutdown sequence must stay bounded");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), b"pub fn indexed() -> i64 { 1 }\n").unwrap();
+        let session =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        let ws = session.create_workspace(root.to_str().unwrap()).unwrap();
+        let sid = session
+            .create_session(ws, "runtime-index", "fake", "m")
+            .unwrap()
+            .id();
+
+        let mut registry = ProviderRegistry::new();
+        registry
+            .try_register(faktor_provider::InstanceProvider::wrap(
+                Arc::new(AlwaysOk) as Arc<dyn Provider>,
+                "fake",
+            ))
+            .unwrap();
+        let agent = test_agent(session.clone(), registry);
+        let orchestrator =
+            faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
+        let shadows = faktor_orchestrator::runtime::shadow::ShadowRoots::new(
+            session.clone(),
+            dir.path().join("shadows"),
+        )
+        .unwrap();
+        let tasks = Arc::new(
+            faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
+                &orchestrator,
+                session.clone(),
+                agent.clone(),
+                shadows,
+            ),
+        );
+
+        // (a) Never opened: the accessor is the inert `None` and the
+        // shutdown sequence must not open the service it is joining.
+        assert!(agent.index_service_worker_status().is_none());
+        run_shutdown(&tasks, &agent).await;
+        assert!(
+            agent.index_service_worker_status().is_none(),
+            "shutdown must never open the runtime's index service as a side effect"
+        );
+
+        // (b) Opened: an ordinary turn hosts the runtime's IndexService (and
+        // kicks its owned reconciliation worker); the same sequence joins it
+        // and the owner is left terminal, never detached.
+        agent.run_turn(sid, "hello", &[]).await.unwrap();
+        assert!(
+            agent.index_service_worker_status().is_some(),
+            "the turn must have hosted the runtime index service"
+        );
+        let started = std::time::Instant::now();
+        run_shutdown(&tasks, &agent).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the runtime index worker join must stay within the bound: {:?}",
+            started.elapsed()
+        );
+        let status = agent
+            .index_service_worker_status()
+            .expect("the service stays opened once hosted");
+        assert_ne!(
+            status.state,
+            WorkerState::Running,
+            "no ghost runtime index worker may survive the shutdown: {status:?}"
+        );
+        assert_eq!(
+            agent.shutdown_index_service().await,
+            Some(WorkerShutdown::NotRunning),
+            "no detached runtime index task may outlive the shutdown sequence"
+        );
+    }
+
     /// Enterprise-disabled parity: a daemon with `[enterprise] enabled =
     /// false` (and with an absent section) creates NO enterprise database;
     /// an enabled section (which requires `[cloud]`, the principal source)

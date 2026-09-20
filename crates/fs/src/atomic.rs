@@ -136,6 +136,43 @@ pub fn atomic_adopt(tmp: &Path, dest: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// Atomically PUBLISH an already-built temporary DIRECTORY as `dest` (the
+/// directory analogue of [`atomic_adopt`], for writers whose payload is a
+/// complete tree rather than one file). The caller stages the whole tree at a
+/// uniquely-named temp in the same directory; this fsyncs the staged
+/// directory boundary, renames it into place and fsyncs the parent, so a
+/// crash at any point leaves either the previous destination or the WHOLE
+/// new directory — never a partially-populated tree at the real address, and
+/// never a rename whose durability is unconfirmed.
+///
+/// POSIX rename cannot replace a non-empty directory, so replacing an
+/// existing destination is the caller's explicit crash-residue policy
+/// (remove, then adopt): this helper never deletes a destination itself.
+pub fn atomic_adopt_dir(tmp: &Path, dest: &Path) -> Result<(), Error> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| Error::malformed(format!("{} has no parent", dest.display())))?;
+    if !tmp.is_dir() {
+        return Err(Error::malformed(format!(
+            "{} is not a directory",
+            tmp.display()
+        )));
+    }
+    // The directory handle fsync makes the staged entries durable where the
+    // platform supports it (macOS refuses directory fsync with EINVAL, which
+    // `fsync_parent` deliberately ignores, exactly like every other writer).
+    fsync_parent(tmp);
+    fs::rename(tmp, dest).map_err(|e| {
+        Error::internal(format!(
+            "rename {} -> {}: {e}",
+            tmp.display(),
+            dest.display()
+        ))
+    })?;
+    fsync_parent(parent);
+    Ok(())
+}
+
 /// A unique temp path in the same directory as `path`: same filesystem, so
 /// the rename is atomic, and never colliding with concurrent writers.
 /// True when `name` is an internal atomic-write temporary (`<name>.kp-tmp-*`).
@@ -464,6 +501,32 @@ mod tests {
         assert_eq!(names, vec!["f.bin".to_string()], "temp leaked: {names:?}");
         let expected = format!("replace-49-{}", "x".repeat(49));
         assert_eq!(fs::read(&target).unwrap(), expected.as_bytes());
+    }
+
+    /// A staged COMPLETE directory is adopted whole: the destination appears
+    /// with every entry, the temp is gone, and a non-directory temp is
+    /// refused before any rename.
+    #[test]
+    fn adopt_dir_publishes_the_whole_tree_and_refuses_non_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join(".release.tmp-1");
+        fs::create_dir_all(tmp.join("nested")).unwrap();
+        fs::write(tmp.join("faktor"), b"binary").unwrap();
+        fs::write(tmp.join("manifest"), b"signed").unwrap();
+        fs::write(tmp.join("nested/extra"), b"x").unwrap();
+        let dest = dir.path().join("release");
+        atomic_adopt_dir(&tmp, &dest).unwrap();
+        assert!(!tmp.exists(), "the temp tree is renamed, not copied");
+        assert_eq!(fs::read(dest.join("faktor")).unwrap(), b"binary");
+        assert_eq!(fs::read(dest.join("manifest")).unwrap(), b"signed");
+        assert_eq!(fs::read(dest.join("nested/extra")).unwrap(), b"x");
+        // A file temp is never adopted as a directory (no rename happens).
+        let file_tmp = dir.path().join(".release.tmp-2");
+        fs::write(&file_tmp, b"x").unwrap();
+        let other = dir.path().join("other");
+        assert!(atomic_adopt_dir(&file_tmp, &other).is_err());
+        assert!(file_tmp.exists());
+        assert!(!other.exists());
     }
 
     #[test]

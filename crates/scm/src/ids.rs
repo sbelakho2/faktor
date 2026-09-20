@@ -5,6 +5,7 @@
 //! the domain).
 
 use std::fmt;
+use std::num::NonZeroU64;
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -26,20 +27,27 @@ pub const MAX_OPERATION_ID_BYTES: usize = 200;
 pub struct ScmInstallationId(u64);
 
 impl ScmInstallationId {
-    pub const fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-
     pub const fn raw(self) -> u64 {
         self.0
     }
 
-    /// A validated installation id: zero is not a real installation.
+    /// The only raw-`u64` constructor: zero is not a real installation, so
+    /// it is a typed error. Untrusted/decoded values (webhook payloads,
+    /// storage, wire) must enter through here; there is no infallible
+    /// `u64` constructor that could smuggle a zero into the domain.
     pub fn try_from_raw(raw: u64) -> Result<Self, ScmError> {
         if raw == 0 {
             return Err(ScmError::InvalidInput("installation id cannot be 0".into()));
         }
         Ok(Self(raw))
+    }
+}
+
+impl From<NonZeroU64> for ScmInstallationId {
+    /// Infallible constructor from an already-validated non-zero value (the
+    /// type system proves the invariant).
+    fn from(raw: NonZeroU64) -> Self {
+        Self(raw.get())
     }
 }
 
@@ -374,32 +382,75 @@ mod tests {
     use super::*;
 
     fn repo() -> RepositoryRef {
-        RepositoryRef::try_new(ScmInstallationId::new(7), "acme", "widgets").unwrap()
+        RepositoryRef::try_new(
+            ScmInstallationId::try_from_raw(7).unwrap(),
+            "acme",
+            "widgets",
+        )
+        .unwrap()
     }
 
     #[test]
-    fn installation_zero_is_refused() {
-        assert!(ScmInstallationId::try_from_raw(0).is_err());
+    fn installation_zero_is_refused_as_a_typed_error() {
+        match ScmInstallationId::try_from_raw(0) {
+            Err(ScmError::InvalidInput(message)) => {
+                assert!(
+                    message.contains("installation id cannot be 0"),
+                    "the refusal names the invariant: {message}"
+                );
+            }
+            other => panic!("zero must be a typed InvalidInput, got {other:?}"),
+        }
         assert_eq!(ScmInstallationId::try_from_raw(9).unwrap().raw(), 9);
         assert!(serde_json::from_str::<ScmInstallationId>("0").is_err());
         assert_eq!(
             serde_json::from_str::<ScmInstallationId>("12").unwrap(),
-            ScmInstallationId::new(12)
+            ScmInstallationId::try_from_raw(12).unwrap()
+        );
+        // The NonZeroU64 path makes zero unrepresentable in the type system.
+        assert_eq!(
+            ScmInstallationId::from(NonZeroU64::new(5).unwrap()).raw(),
+            5
         );
     }
 
     #[test]
+    fn repository_ref_cannot_observe_a_zero_installation() {
+        // There is no infallible raw-u64 constructor. Every path a zero
+        // could take is either a typed error (try_from_raw / Deserialize)
+        // or non-zero by proof (From<NonZeroU64>).
+        assert!(ScmInstallationId::try_from_raw(0).is_err());
+        let err = serde_json::from_str::<RepositoryRef>(
+            r#"{"installation":0,"owner":"acme","name":"widgets"}"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("installation id cannot be 0"),
+            "hostile zero must be refused before RepositoryRef sees an id: {err}"
+        );
+        let id = ScmInstallationId::from(NonZeroU64::new(1).unwrap());
+        assert_ne!(id.raw(), 0);
+        assert!(RepositoryRef::try_new(id, "acme", "widgets").is_ok());
+    }
+
+    #[test]
     fn repository_segments_are_strictly_validated() {
-        assert!(RepositoryRef::try_new(ScmInstallationId::new(1), "", "x").is_err());
-        assert!(RepositoryRef::try_new(ScmInstallationId::new(1), "a/b", "x").is_err());
-        assert!(RepositoryRef::try_new(ScmInstallationId::new(1), "a", "..").is_err());
-        assert!(RepositoryRef::try_new(ScmInstallationId::new(1), "-a", "x").is_err());
-        assert!(RepositoryRef::try_new(ScmInstallationId::new(1), "a", "x.").is_err());
-        assert!(RepositoryRef::try_new(ScmInstallationId::new(1), "a b", "x").is_err());
-        assert!(RepositoryRef::try_new(ScmInstallationId::new(1), "a", "x".repeat(101)).is_err());
+        let one = ScmInstallationId::try_from_raw(1).unwrap();
+        assert!(RepositoryRef::try_new(one, "", "x").is_err());
+        assert!(RepositoryRef::try_new(one, "a/b", "x").is_err());
+        assert!(RepositoryRef::try_new(one, "a", "..").is_err());
+        assert!(RepositoryRef::try_new(one, "-a", "x").is_err());
+        assert!(RepositoryRef::try_new(one, "a", "x.").is_err());
+        assert!(RepositoryRef::try_new(one, "a b", "x").is_err());
+        assert!(RepositoryRef::try_new(one, "a", "x".repeat(101)).is_err());
         assert_eq!(repo().full_name(), "acme/widgets");
         assert!(repo().same_repository(
-            &RepositoryRef::try_new(ScmInstallationId::new(7), "ACME", "Widgets").unwrap()
+            &RepositoryRef::try_new(
+                ScmInstallationId::try_from_raw(7).unwrap(),
+                "ACME",
+                "Widgets"
+            )
+            .unwrap()
         ));
     }
 

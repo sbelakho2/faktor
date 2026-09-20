@@ -255,7 +255,12 @@ struct Harness {
 }
 
 fn repository() -> RepositoryRef {
-    RepositoryRef::try_new(ScmInstallationId::new(7), "acme", "widgets").unwrap()
+    RepositoryRef::try_new(
+        ScmInstallationId::try_from_raw(7).unwrap(),
+        "acme",
+        "widgets",
+    )
+    .unwrap()
 }
 
 async fn harness_with_store(store: Arc<dyn ScmStore>) -> Harness {

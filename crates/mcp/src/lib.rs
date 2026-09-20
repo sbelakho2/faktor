@@ -204,6 +204,20 @@ struct Conn {
 /// fills and further sends are typed refusals.
 const WRITER_QUEUE_CAP: usize = 64;
 
+/// Join one dedicated OS thread with a hard bound. Returns false when the
+/// thread is still running at the deadline (the caller reports/abandons it);
+/// the handle is consumed either way, matching `JoinHandle::join`.
+pub fn join_thread_bounded(handle: std::thread::JoinHandle<()>, bound: Duration) -> bool {
+    let deadline = std::time::Instant::now() + bound;
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    handle.join().is_ok()
+}
+
 /// One queued stdin frame plus the channel that reports its write+flush
 /// outcome. The write itself happens on the dedicated writer thread, NEVER
 /// on a tokio worker and NEVER under the `conn` mutex (the reader thread
@@ -217,10 +231,25 @@ struct WriterMsg {
 }
 
 /// Handle to the per-server stdin writer thread (bounded queue; ordering is
-/// the queue's FIFO order).
+/// the queue's FIFO order). The thread's JoinHandle is shared behind the
+/// handle (clones share one thread slot) so close/Drop can join it bounded.
 #[derive(Clone)]
 struct WriterHandle {
     tx: std::sync::mpsc::SyncSender<WriterMsg>,
+    thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+}
+
+impl WriterHandle {
+    fn take_thread(&self) -> Option<std::thread::JoinHandle<()>> {
+        recover_lock(&self.thread).take()
+    }
+
+    /// True once the writer thread handle was consumed by a bounded join
+    /// (test/diagnostic accessor).
+    #[cfg(test)]
+    fn thread_joined(&self) -> bool {
+        recover_lock(&self.thread).is_none()
+    }
 }
 
 /// Spawn the writer thread owning the child's stdin. A blocked write (child
@@ -230,7 +259,7 @@ struct WriterHandle {
 /// remaining frames.
 fn spawn_stdin_writer<W: Write + Send + 'static>(sink: W) -> WriterHandle {
     let (tx, rx) = std::sync::mpsc::sync_channel::<WriterMsg>(WRITER_QUEUE_CAP);
-    std::thread::spawn(move || {
+    let thread = std::thread::spawn(move || {
         let mut stdin = BufWriter::new(sink);
         while let Ok(msg) = rx.recv() {
             // The claim is the LAST instant cancellation is possible: after
@@ -251,7 +280,10 @@ fn spawn_stdin_writer<W: Write + Send + 'static>(sink: W) -> WriterHandle {
             let _ = msg.ack.send(result);
         }
     });
-    WriterHandle { tx }
+    WriterHandle {
+        tx,
+        thread: Arc::new(Mutex::new(Some(thread))),
+    }
 }
 
 impl WriterHandle {
@@ -326,6 +358,9 @@ pub struct McpServer {
     conn: Arc<Mutex<Conn>>,
     writer: WriterHandle,
     supervisor: Arc<ProcessSupervisor>,
+    /// The stdout reader thread's JoinHandle: consumed by the bounded join on
+    /// close/Drop (a handle of None means the thread was already joined).
+    reader: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl McpServer {
@@ -366,17 +401,18 @@ impl McpServer {
         // Reader thread: incremental Content-Length framing; responses are
         // dispatched by id; EOF/kill cleans up. The thread owns stdout, so
         // blocking reads can never stall the runtime.
-        {
+        let reader = {
             let conn2 = conn.clone();
             std::thread::spawn(move || {
                 read_loop(conn2, spawned.stdout);
-            });
-        }
+            })
+        };
         let server = Arc::new(Self {
             name: cfg.name.clone(),
             conn,
             writer,
             supervisor,
+            reader: Mutex::new(Some(reader)),
         });
         server.initialize().await?;
         Ok(server)
@@ -584,7 +620,41 @@ impl McpServer {
             .await;
         // Kill via the supervisor (process-group aware).
         let _ = self.supervisor.kill_child_pid(pid, 1000);
+        // Bounded join: the kill closes the child's stdout/stdin, so the
+        // reader sees EOF and the writer's channel disconnects; both threads
+        // end well inside the bound. A thread still alive at the deadline is
+        // reported and abandoned — never silently left unjoined.
+        self.join_threads(Duration::from_millis(1_000)).await;
         Ok(())
+    }
+
+    /// Consume and join the reader AND writer threads with a hard bound.
+    async fn join_threads(&self, bound: Duration) {
+        let reader = {
+            let mut slot = recover_lock(&self.reader);
+            slot.take()
+        };
+        let writer = self.writer.take_thread();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(handle) = reader {
+                if !join_thread_bounded(handle, bound) {
+                    tracing::warn!("mcp stdout reader thread did not stop within the bound");
+                }
+            }
+            if let Some(handle) = writer {
+                if !join_thread_bounded(handle, bound) {
+                    tracing::warn!("mcp stdin writer thread did not stop within the bound");
+                }
+            }
+        })
+        .await;
+    }
+
+    /// True once both dedicated threads were consumed by a bounded join
+    /// (test/diagnostic accessor: false while any handle is still live).
+    #[cfg(test)]
+    fn threads_joined(&self) -> bool {
+        recover_lock(&self.reader).is_none() && self.writer.thread_joined()
     }
 
     pub fn name(&self) -> &str {
@@ -598,7 +668,9 @@ impl McpServer {
 }
 
 impl Drop for McpServer {
-    /// Zero orphans: dropping the client kills the server process.
+    /// Zero orphans: dropping the client kills the server process AND joins
+    /// its two dedicated threads with a hard bound (the kill closes the
+    /// pipes, so the reader reaches EOF and the writer's channel disconnects).
     fn drop(&mut self) {
         let pid = match self.conn.lock() {
             Ok(c) => c.child_pid,
@@ -614,6 +686,18 @@ impl Drop for McpServer {
             frame: Arc::new(FrameState::queued()),
         });
         let _ = self.supervisor.kill_child_pid(pid, 300);
+        let reader = self.reader.lock().ok().and_then(|mut slot| slot.take());
+        let writer = self.writer.take_thread();
+        if let Some(handle) = reader {
+            if !join_thread_bounded(handle, Duration::from_millis(500)) {
+                tracing::warn!("mcp stdout reader thread did not stop within the Drop bound");
+            }
+        }
+        if let Some(handle) = writer {
+            if !join_thread_bounded(handle, Duration::from_millis(500)) {
+                tracing::warn!("mcp stdin writer thread did not stop within the Drop bound");
+            }
+        }
     }
 }
 
@@ -830,6 +914,93 @@ sys.exit(0)
         // The supervisor must have reaped the child (no zombie).
         std::thread::sleep(Duration::from_millis(300));
         assert!(sup.reap().is_empty() || sup.registered() == 0);
+    }
+
+    /// F7: close() joins the reader AND writer threads with a bound and the
+    /// child process is gone; Drop does the same without a graceful close.
+    #[tokio::test]
+    async fn close_and_drop_join_threads_bounded_with_no_lingering_child() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("python3 missing; skipping");
+            return;
+        }
+        // A minimal MCP server that answers every id-bearing frame.
+        let script = r#"
+import sys, json
+
+def read_msg():
+    cl = 0
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        if line.lower().startswith(b"content-length:"):
+            cl = int(line.split(b":")[1])
+    if cl == 0:
+        return {}
+    return json.loads(sys.stdin.buffer.read(cl))
+
+def send(obj):
+    body = json.dumps(obj).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    if isinstance(msg, dict) and "id" in msg:
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+"#;
+        let dir = tempdir().unwrap();
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = ProcessSupervisor::new(cas);
+        let cfg = McpConfig {
+            name: "mock".into(),
+            command: "python3".into(),
+            args: vec!["-c".into(), script.into()],
+            env: vec![],
+        };
+        let server = McpServer::connect(cfg.clone(), sup.clone())
+            .await
+            .expect("initialize handshake completes");
+        let pid = server.conn.lock().unwrap().child_pid;
+        assert!(sup.pid_alive(pid), "server must be alive after connect");
+        server.close().await.unwrap();
+        assert!(
+            server.threads_joined(),
+            "close must join the reader and writer threads"
+        );
+        assert!(!sup.pid_alive(pid), "close must kill the child");
+        std::thread::sleep(Duration::from_millis(100));
+        sup.reap();
+        assert_eq!(sup.registered(), 0, "close must leave no child behind");
+
+        // Drop without close(): the same kill + bounded joins.
+        let dropped = McpServer::connect(
+            McpConfig {
+                name: "mock2".into(),
+                command: cfg.command.clone(),
+                args: cfg.args.clone(),
+                env: vec![],
+            },
+            sup.clone(),
+        )
+        .await
+        .expect("second initialize");
+        let pid2 = dropped.conn.lock().unwrap().child_pid;
+        drop(dropped);
+        assert!(!sup.pid_alive(pid2), "Drop must kill the child");
+        std::thread::sleep(Duration::from_millis(100));
+        sup.reap();
+        assert_eq!(sup.registered(), 0, "Drop must leave no child behind");
     }
 
     #[tokio::test]

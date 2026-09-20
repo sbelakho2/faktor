@@ -253,20 +253,29 @@ export async function resolveControlPlaneToken(
   return { kind: 'migrated', token: legacy, key };
 }
 
-/** One logout outcome: local deletion is unconditional; remote is best-effort. */
+/** One logout outcome: local deletion is compare-and-delete; remote best-effort. */
 export interface ControlPlaneLogoutResult {
   readonly key: string | null;
   readonly hadSecret: boolean;
   readonly remoteRevoked: boolean;
   readonly remoteError: string | null;
   readonly legacyCleared: boolean;
+  /**
+   * True when the stored credential changed while the remote revoke was in
+   * flight (another window/process rotated it). The revoke still targeted the
+   * CAPTURED token, and the NEW secret was left in the store untouched, so a
+   * rotation can never be logged out by a stale sign-out.
+   */
+  readonly rotatedDuringLogout: boolean;
 }
 
 /**
  * Sign out: attempt the control plane's revoke/delete-session route when the
  * daemon is reachable AND the session id is known, then delete the local
- * secret unconditionally (a failed or impossible remote revoke is reported,
- * never swallowed, and never keeps the local copy).
+ * secret ONLY if it still holds the captured token (compare-and-delete). An
+ * external rotation during the in-flight revoke leaves the NEW secret in
+ * place and reports `rotatedDuringLogout`; a failed or impossible remote
+ * revoke is reported, never swallowed, and never keeps a stale local copy.
  */
 export async function logoutControlPlane(options: {
   readonly secrets: SecretStorageLike;
@@ -280,15 +289,20 @@ export async function logoutControlPlane(options: {
   let hadSecret = false;
   let remoteRevoked = false;
   let remoteError: string | null = null;
+  let rotatedDuringLogout = false;
   if (controlPlaneScopeValid(options.scope)) {
     key = controlPlaneSecretKey(options.scope);
-    const token = nonEmpty(await options.secrets.get(key));
-    if (token !== null) {
+    // Capture the exact credential this sign-out means to revoke and delete:
+    // endpoint + organization (the key) and the token value read at this
+    // instant. Never re-read it for the revoke, never delete a different
+    // value.
+    const captured = nonEmpty(await options.secrets.get(key));
+    if (captured !== null) {
       hadSecret = true;
       const session = options.session ?? null;
       if (options.revoke !== undefined && controlPlaneAuthSessionValid(session)) {
         try {
-          await options.revoke(token, session);
+          await options.revoke(captured, session);
           remoteRevoked = true;
         } catch (error) {
           remoteError = error instanceof Error ? error.message : String(error);
@@ -298,9 +312,18 @@ export async function logoutControlPlane(options: {
           'no control-plane auth-session id is known for this credential, so the remote session could not be named ' +
           'and was not revoked (the local secret is still deleted)';
       }
-      await options.secrets.delete(key);
+      // Compare-and-delete: only remove the row when it still holds the
+      // credential this sign-out revoked. A concurrent external rotation
+      // (another window, the OS keychain UI) wrote a NEW value; deleting it
+      // here would revoke/erase a credential the operator just obtained.
+      const current = nonEmpty(await options.secrets.get(key));
+      if (current === captured) {
+        await options.secrets.delete(key);
+      } else {
+        rotatedDuringLogout = true;
+      }
     }
   }
   await options.plaintext.clear();
-  return { key, hadSecret, remoteRevoked, remoteError, legacyCleared: true };
+  return { key, hadSecret, remoteRevoked, remoteError, legacyCleared: true, rotatedDuringLogout };
 }

@@ -959,8 +959,9 @@ mod tests {
         let fp = faktor_cloud::durability::canonical_fingerprint(&conn).unwrap();
         faktor_cloud::durability::restore_verify(newest, &fp).unwrap();
         // Migration restore points are a separate class: never rotated as
-        // rotating backups.
-        faktor_cloud::durability::migration_backup(&conn, &path, 2).unwrap();
+        // rotating backups. The claim must match the live schema version so
+        // the point self-verifies (see `faktor_cloud::durability`).
+        faktor_cloud::durability::migration_backup(&conn, &path, 3).unwrap();
         assert_eq!(
             faktor_cloud::durability::list_rotating_backups(&path).len(),
             faktor_cloud::durability::MAX_BACKUP_FILES

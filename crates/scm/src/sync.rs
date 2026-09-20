@@ -153,7 +153,7 @@ mod tests {
 
     fn installation(id: u64) -> ScmInstallation {
         ScmInstallation {
-            installation_id: ScmInstallationId::new(id),
+            installation_id: ScmInstallationId::try_from_raw(id).unwrap(),
             account_login: "acme".into(),
             account_type: "Organization".into(),
             permissions: vec![("contents".into(), "write".into())],
@@ -163,8 +163,12 @@ mod tests {
 
     fn repository(installation: u64, name: &str) -> ScmRepository {
         ScmRepository {
-            reference: RepositoryRef::try_new(ScmInstallationId::new(installation), "acme", name)
-                .unwrap(),
+            reference: RepositoryRef::try_new(
+                ScmInstallationId::try_from_raw(installation).unwrap(),
+                "acme",
+                name,
+            )
+            .unwrap(),
             full_name: format!("acme/{name}"),
             default_branch: "main".into(),
             private: true,
@@ -286,7 +290,7 @@ mod tests {
         let store: Arc<dyn ScmStore> = Arc::new(MemoryScmStore::new());
         let sync = ScmSync::new(provider(), store.clone(), Arc::new(ManualClock::new(1_000)));
         let report = sync
-            .sync_installation("org:alpha", ScmInstallationId::new(2))
+            .sync_installation("org:alpha", ScmInstallationId::try_from_raw(2).unwrap())
             .await
             .unwrap();
         assert_eq!(
@@ -305,7 +309,10 @@ mod tests {
         );
         assert!(sync.sync_all("").await.is_err());
         assert!(sync
-            .sync_installation("x".repeat(257).as_str(), ScmInstallationId::new(1))
+            .sync_installation(
+                "x".repeat(257).as_str(),
+                ScmInstallationId::try_from_raw(1).unwrap()
+            )
             .await
             .is_err());
     }

@@ -9295,6 +9295,50 @@ async fn relaunch_recovery_drains_a_pending_head_without_a_new_submit() {
     assert_eq!(turns_b, 1, "B completed exactly once");
 }
 
+/// F3 (adversarial): the settle-path kick computes its decision from a
+/// durable read. A READ FAILURE must never be read as "no pending queue"
+/// (which would skip the kick and strand a durable head): it is logged
+/// typed, recorded as a durable retry marker, and the runner is still
+/// spawned.
+#[tokio::test]
+async fn queue_kick_read_failure_is_loud_durable_and_never_skips_the_kick() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let env = open_env(&root, done_script());
+    let parent = env.parent;
+    // A durable head exists: B queues behind the never-driven A.
+    let _receipt_a = env.agent.submit(parent, "A prompt", &[]).unwrap();
+    let receipt_b = env.agent.submit(parent, "B prompt", &[]).unwrap();
+    assert!(receipt_b.queued);
+    // Corrupt the read: drop the prompt_queue table under the live store.
+    {
+        let conn = rusqlite::Connection::open(root.join("store").join("faktor-plus.db")).unwrap();
+        conn.execute_batch("DROP TABLE prompt_queue").unwrap();
+    }
+    // The kick must NOT be skipped on the read error; the error is recorded
+    // as a durable audit marker on the session.
+    env.executor.kick_pending_queue(parent);
+    let handle = env.manager.get_session(parent).unwrap().unwrap();
+    wait_until(
+        || {
+            handle.events_range(1, None).ok().is_some_and(|events| {
+                events.iter().any(|e| {
+                    e.kind == faktor_core::event::EventKind::CrashDetected
+                        && e.payload.as_ref().is_some_and(|p| {
+                            p.get("durable_write_failure")
+                                .and_then(|d| d.get("site"))
+                                .and_then(|s| s.as_str())
+                                == Some("task_executor.kick_pending_queue.read_head")
+                        })
+                })
+            })
+        },
+        30,
+    )
+    .await;
+}
+
 /// Concurrent settle + queued submit (audit): racing submits and settle
 /// kicks must never execute a prompt twice. Every prompt runs exactly once,
 /// every durable row ends terminal, and the queue is fully drained.

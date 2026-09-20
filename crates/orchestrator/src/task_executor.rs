@@ -5176,9 +5176,37 @@ impl TaskExecutor {
     /// construction: a kick never polls, it only starts/arms one runner
     /// whose own wait is bounded by the turn budget.
     fn kick_pending_queue(self: &Arc<Self>, parent: SessionId) {
+        // A store read error is NEVER treated as "no pending queue" (audited):
+        // the kick is not skipped while a durable head may be waiting. An
+        // unreadable head (or handle) is logged typed, recorded as a durable
+        // retry marker on the session, and the runner is spawned anyway — the
+        // runner itself is idempotent (it arms a live runner or exits on an
+        // empty queue), so an over-kick costs nothing while a skipped kick
+        // would strand a queued prompt until the next restart.
         let pending = match self.session.get_session(parent) {
-            Ok(Some(handle)) => handle.queued_prompt_count().unwrap_or(0),
-            _ => 0,
+            Ok(Some(handle)) => match handle.queued_prompt_count() {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(
+                        session = %parent,
+                        error = %e.message,
+                        "queue settle-path kick could not read the durable queue head; treating \
+                         it as NON-EMPTY (the kick is never skipped on a read error): {e}"
+                    );
+                    self.note_queue_kick_read_failure(&handle, &e);
+                    1
+                }
+            },
+            Ok(None) => 0,
+            Err(e) => {
+                tracing::error!(
+                    session = %parent,
+                    error = %e.message,
+                    "queue settle-path kick could not open the session; treating the head as \
+                     NON-EMPTY and kicking anyway: {e}"
+                );
+                1
+            }
         };
         if pending == 0 {
             return;
@@ -5198,6 +5226,45 @@ impl TaskExecutor {
         }
     }
 
+    /// Durable retry marker of a queue-read failure on the settle-path kick:
+    /// a `CrashDetected` self-transition naming the site, so the operator
+    /// surface can see that a kick decision was made on an unreadable head
+    /// (the kick itself still happened). Best-effort by construction.
+    fn note_queue_kick_read_failure(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        err: &faktor_core::Error,
+    ) {
+        const SITE: &str = "task_executor.kick_pending_queue.read_head";
+        let state = match handle.state() {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::error!(
+                    session = %handle.id(),
+                    "queue-kick read-failure audit skipped: session state unreadable: {e}"
+                );
+                return;
+            }
+        };
+        let payload = serde_json::json!({
+            "durable_write_failure": {
+                "site": SITE,
+                "error": err.message.chars().take(1024).collect::<String>(),
+            }
+        });
+        if let Err(e) = handle.force_append_event(
+            faktor_core::event::EventKind::CrashDetected,
+            state,
+            None,
+            Some(payload),
+        ) {
+            tracing::error!(
+                session = %handle.id(),
+                "queue-kick read-failure audit could not be journaled: {e}"
+            );
+        }
+    }
+
     /// Startup/relaunch queue recovery (boundary race): every session whose
     /// durable queue still carries a non-terminal row gets a runner under
     /// the drive registry — no new submit required. The durable rows ARE
@@ -5208,7 +5275,14 @@ impl TaskExecutor {
         let sessions = match self.session.store().sessions_with_pending_queues() {
             Ok(sessions) => sessions,
             Err(e) => {
-                tracing::warn!("queue recovery scan failed: {e}");
+                // Loud and typed: a scan failure means NO session could be
+                // kicked this boot; the durable rows stay pending for the
+                // next recovery and are never reported as drained.
+                tracing::error!(
+                    error = %e,
+                    "queue recovery scan failed; every durable queue row stays pending for the \
+                     next recovery: {e}"
+                );
                 return;
             }
         };

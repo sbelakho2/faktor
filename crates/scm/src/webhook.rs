@@ -640,11 +640,11 @@ mod tests {
     fn malformed_installation_id_is_a_typed_terminal_refusal() {
         assert_eq!(
             installation_of(br#"{"installation":{"id":7}}"#).unwrap(),
-            Some(ScmInstallationId::new(7))
+            Some(ScmInstallationId::try_from_raw(7).unwrap())
         );
         assert_eq!(
             installation_of(br#"{"installation":{"id":18446744073709551615}}"#).unwrap(),
-            Some(ScmInstallationId::new(u64::MAX)),
+            Some(ScmInstallationId::try_from_raw(u64::MAX).unwrap()),
             "the u64 boundary is a valid installation id"
         );
         assert_eq!(installation_of(br#"{"action":"created"}"#).unwrap(), None);

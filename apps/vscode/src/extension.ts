@@ -537,6 +537,22 @@ async function controlPlaneSignOut(context: vscode.ExtensionContext): Promise<vo
       }
     },
   });
+  if (result.rotatedDuringLogout) {
+    // The stored credential rotated while the revoke was in flight: the
+    // revoke targeted the CAPTURED token, and the NEW secret was left
+    // untouched (compare-and-delete). Keep the new credential live instead
+    // of clearing it and reporting a sign-out that never happened.
+    controlPlaneNotice(
+      'error',
+      'signed out: the stored credential was rotated by another window during sign-out, so the NEW credential ' +
+        'was left in the OS/IDE secret store and remains active (the captured token was the one revoked)',
+    );
+    if (active.client) {
+      await applyControlPlaneCredential(active.client, context);
+    }
+    await refresh();
+    return;
+  }
   active.client?.setControlToken(null);
   // The session id is dead with the session (and useless without a stored
   // credential); clear the non-secret coordinate so a stale id is never
@@ -639,7 +655,7 @@ function completionSummaryOf(
 // ------------------------------------------------------------ daemon + session
 
 async function startServer(context: vscode.ExtensionContext): Promise<void> {
-  if (active.daemon && active.daemon.alive() && active.client) {
+  if (active.daemon && (await active.daemon.alive()) && active.client) {
     if (!active.sessionId) {
       await ensureSession(active.client, context);
       startStream();
@@ -651,7 +667,10 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
   const dataDir = config('dataDir', '');
   const installRoot = config('installRoot', '');
   const extraArgs = config<string[]>('extraArgs', []);
-  const startupTimeoutMs = config('startupTimeoutMs', 10_000);
+  // The default exceeds the bootstrap launcher's ~30 s launch window: the
+  // supervisor must not declare failure while the updater launcher may still
+  // be bringing the release to readiness (and may still be adoptable).
+  const startupTimeoutMs = config('startupTimeoutMs', 45_000);
   const daemon = await startDaemon({
     workspaceRoot: workspaceRoot(context),
     binaryPath: binaryPath.length > 0 ? binaryPath : undefined,

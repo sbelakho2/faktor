@@ -454,6 +454,220 @@ pub struct EvidenceQuery {
 /// it (its future is dropped and the package degrades to empty).
 const LEGACY_EVIDENCE_MAX_WAIT: Duration = Duration::from_millis(2000);
 
+// ------------------------------------------------- durable evidence-poll status
+//
+// The advisory evidence poll used to hand the turn only its (possibly
+// empty) package: a provider error/panic/timeout and an honest "nothing
+// matched" answer were the SAME durable fact. The runtime now calls the
+// typed poll ([`crate::poll_evidence_with_wall_budget_outcome`]) and records
+// the typed status in the turn record, bounded, so "retrieval failed" can
+// never be mistaken for "no evidence" after a restart.
+
+/// Schema version of the durable evidence-poll encoding. Decoders refuse an
+/// unknown version instead of guessing a future shape.
+const EVIDENCE_POLL_DURABLE_SCHEMA: u32 = 1;
+
+/// Hard byte bound of ONE durable evidence-poll encoding. The poll itself
+/// already bounds its provider message (lib.rs truncates the adversarial
+/// 64 KiB input to its own 512-byte diagnostic bound); this is the second,
+/// independent ceiling on everything that lands in the turn record, so a
+/// future caller or a hostile provider CODE string can never grow the
+/// archived row past it.
+const EVIDENCE_POLL_DURABLE_MAX_BYTES: usize = 8 * 1024;
+
+/// Per-field cap of the provider message inside the durable encoding
+/// (mirrors the lib.rs in-memory bound).
+const EVIDENCE_POLL_DURABLE_MESSAGE_MAX_BYTES: usize = 512;
+
+/// Per-field cap of the provider code inside the durable encoding. Codes
+/// come from the untrusted provider (`ErrorKind::Provider { code, .. }`)
+/// and are NOT bounded by the poll, so the durable record truncates them
+/// here just like messages.
+const EVIDENCE_POLL_DURABLE_CODE_MAX_BYTES: usize = 512;
+
+/// Canonical durable shape of one [`crate::EvidencePollStatus`]: bounded
+/// JSON whose `status` field is the typed discriminant. `truncated` marks
+/// an encoding whose human message was dropped to respect
+/// [`EVIDENCE_POLL_DURABLE_MAX_BYTES`] (the machine code and retryability
+/// always survive).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DurableEvidencePollStatus {
+    schema: u32,
+    status: String,
+    degraded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retryable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    budget_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    truncated: Option<bool>,
+}
+
+/// Truncate one durable field to `max` bytes on a char boundary.
+fn bounded_durable_field(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+/// The stable machine discriminant of one poll status (the durable
+/// encoding's `status` value; also the tracing `status` field).
+fn evidence_poll_status_code(status: &crate::EvidencePollStatus) -> &'static str {
+    match status {
+        crate::EvidencePollStatus::Served => "served",
+        crate::EvidencePollStatus::NoEvidence => "no_evidence",
+        crate::EvidencePollStatus::RetrievalFailed { .. } => "retrieval_failed",
+        crate::EvidencePollStatus::ProviderPanicked { .. } => "provider_panicked",
+        crate::EvidencePollStatus::TimedOut { .. } => "timed_out",
+        crate::EvidencePollStatus::NotSpawned { .. } => "not_spawned",
+    }
+}
+
+/// Canonical, BOUNDED durable encoding of one poll status: the exact bytes
+/// archived as evidence and surfaced on [`TurnOutcome::evidence_poll`].
+/// Deterministic (fixed field order), so a re-poll of the same turn with the
+/// same status dedupes to the SAME evidence row.
+fn encode_evidence_poll_status(status: &crate::EvidencePollStatus) -> String {
+    let mut durable = DurableEvidencePollStatus {
+        schema: EVIDENCE_POLL_DURABLE_SCHEMA,
+        status: evidence_poll_status_code(status).to_string(),
+        degraded: status.is_degraded(),
+        code: None,
+        retryable: None,
+        message: None,
+        budget_ms: None,
+        truncated: None,
+    };
+    match status {
+        crate::EvidencePollStatus::Served | crate::EvidencePollStatus::NoEvidence => {}
+        crate::EvidencePollStatus::RetrievalFailed {
+            code,
+            retryable,
+            message,
+        } => {
+            durable.code = Some(bounded_durable_field(
+                code,
+                EVIDENCE_POLL_DURABLE_CODE_MAX_BYTES,
+            ));
+            durable.retryable = Some(*retryable);
+            durable.message = Some(bounded_durable_field(
+                message,
+                EVIDENCE_POLL_DURABLE_MESSAGE_MAX_BYTES,
+            ));
+        }
+        crate::EvidencePollStatus::ProviderPanicked { message } => {
+            durable.message = Some(bounded_durable_field(
+                message,
+                EVIDENCE_POLL_DURABLE_MESSAGE_MAX_BYTES,
+            ));
+        }
+        crate::EvidencePollStatus::TimedOut { budget_ms } => {
+            durable.budget_ms = Some(*budget_ms);
+        }
+        crate::EvidencePollStatus::NotSpawned { message } => {
+            durable.message = Some(bounded_durable_field(
+                message,
+                EVIDENCE_POLL_DURABLE_MESSAGE_MAX_BYTES,
+            ));
+        }
+    }
+    let mut encoded = serde_json::to_string(&durable).unwrap_or_default();
+    if encoded.len() > EVIDENCE_POLL_DURABLE_MAX_BYTES {
+        // Defensive only: the per-field caps plus JSON escaping make this
+        // unreachable, but an oversized future field must never grow the
+        // turn record. The typed discriminant, code and retryability
+        // survive; only the human message is dropped.
+        durable.message = None;
+        durable.truncated = Some(true);
+        encoded = serde_json::to_string(&durable).unwrap_or_default();
+    }
+    encoded
+}
+
+/// Reconstruct the typed status from its durable encoding (reopen/diag
+/// path). `None` for an unknown schema, an unknown discriminant or a
+/// malformed payload — never a guess and never a panic (hostile bytes are
+/// just not decodable).
+#[cfg(test)]
+fn decode_evidence_poll_status(encoded: &str) -> Option<crate::EvidencePollStatus> {
+    let durable: DurableEvidencePollStatus = serde_json::from_str(encoded).ok()?;
+    if durable.schema != EVIDENCE_POLL_DURABLE_SCHEMA {
+        return None;
+    }
+    Some(match durable.status.as_str() {
+        "served" => crate::EvidencePollStatus::Served,
+        "no_evidence" => crate::EvidencePollStatus::NoEvidence,
+        "retrieval_failed" => crate::EvidencePollStatus::RetrievalFailed {
+            code: durable.code?,
+            retryable: durable.retryable?,
+            message: durable.message.unwrap_or_default(),
+        },
+        "provider_panicked" => crate::EvidencePollStatus::ProviderPanicked {
+            message: durable.message.unwrap_or_default(),
+        },
+        "timed_out" => crate::EvidencePollStatus::TimedOut {
+            budget_ms: durable.budget_ms?,
+        },
+        "not_spawned" => crate::EvidencePollStatus::NotSpawned {
+            message: durable.message.unwrap_or_default(),
+        },
+        _ => return None,
+    })
+}
+
+/// Emit the runtime's OWN structured diagnostic of one advisory poll
+/// outcome. Loud by contract: the lib.rs wrapper logs only for its own
+/// frozen call shape, and any other caller owns its diagnostic — a degraded
+/// poll is NEVER silent.
+fn log_evidence_poll_outcome(status: &crate::EvidencePollStatus, budget: Duration) {
+    let budget_ms = budget.as_millis().min(u64::MAX as u128) as u64;
+    match status {
+        crate::EvidencePollStatus::Served | crate::EvidencePollStatus::NoEvidence => {}
+        crate::EvidencePollStatus::RetrievalFailed {
+            code,
+            retryable,
+            message,
+        } => tracing::error!(
+            target: "faktor_agent::evidence",
+            status = "retrieval_failed",
+            provider_code = %code,
+            retryable,
+            budget_ms,
+            "advisory evidence poll failed: {} (advisory contract: the turn continues with an empty package; the typed failure is archived durably, never conflated with no-evidence)",
+            message
+        ),
+        crate::EvidencePollStatus::ProviderPanicked { message } => tracing::error!(
+            target: "faktor_agent::evidence",
+            status = "provider_panicked",
+            budget_ms,
+            "advisory evidence poll panicked: {message} (advisory contract: the turn continues with an empty package, never silently)"
+        ),
+        crate::EvidencePollStatus::TimedOut {
+            budget_ms: missed_ms,
+        } => tracing::warn!(
+            target: "faktor_agent::evidence",
+            status = "timed_out",
+            budget_ms = *missed_ms,
+            "advisory evidence poll missed its wall budget (advisory contract: the turn continues with an empty package)"
+        ),
+        crate::EvidencePollStatus::NotSpawned { message } => tracing::error!(
+            target: "faktor_agent::evidence",
+            status = "not_spawned",
+            budget_ms,
+            "advisory evidence poll could not spawn its detached thread: {message} (advisory contract: the turn continues with an empty package)"
+        ),
+    }
+}
+
 /// Fallback bound of the child-park wait (drive boundary) when the operator
 /// configured an unbounded (`0`) wall-clock turn budget. A parked child is
 /// re-driven by the executor on a typed timeout; it is NEVER polled forever.
@@ -464,6 +678,17 @@ const MAX_CHILD_PARK_WAIT: Duration = Duration::from_secs(30 * 60);
 /// durable queue head stays pending and a re-kick resumes it; the runner
 /// itself never polls forever.
 const MAX_QUEUE_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// Bounded extra passes of the queue runner after the durable queue-head
+/// RE-CHECK failed with a store error. The error is never read as "empty":
+/// the gate stays armed and re-checks (with [`QUEUE_HEAD_READ_RETRY_DELAY`]
+/// between attempts) until this bound, then the failure is recorded durably
+/// and loudly and the gate releases so a broken store cannot wedge the
+/// daemon. The durable rows stay pending for the next kick/recovery.
+const MAX_QUEUE_HEAD_READ_RETRIES: u32 = 8;
+
+/// Backoff between queue-head re-check attempts after a store read error.
+const QUEUE_HEAD_READ_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// The configured turn budget as a wall deadline, with the given fallback
 /// when the operator opted out of the wall-clock cap (`turn_budget_ms == 0`).
@@ -1421,6 +1646,13 @@ struct QueueRunnerGate {
     /// Bounded passes this runner STARTED (diagnostics/tests: `>= 2` proves
     /// an armed pass was consumed instead of being lost).
     passes: u64,
+    /// Consecutive durable queue-head READ failures of this gate. A store
+    /// error is never treated as an empty queue: the gate stays armed while
+    /// this counter is under [`MAX_QUEUE_HEAD_READ_RETRIES`], then the runner
+    /// records a durable marker and releases the gate (bounded — a broken
+    /// store must not wedge the daemon). The durable rows stay pending for
+    /// the next kick/recovery.
+    pending_read_failures: u32,
 }
 
 pub struct AgentRuntime {
@@ -1616,6 +1848,16 @@ pub struct TurnOutcome {
     /// never silently safe. `None` = no provider was consulted: every
     /// risk-driven decision keeps today's behavior exactly (parity).
     pub semantic_risk: Option<faktor_semantic::RiskLevel>,
+    /// Bounded, machine-readable diagnostics of the turn's advisory
+    /// evidence poll ([`crate::EvidencePollStatus`] encoded by
+    /// [`encode_evidence_poll_status`], the SAME canonical bytes archived
+    /// durably under `evidence-poll:<turn_op>`). `None` when the legacy
+    /// provider was never polled (the index/cold ladder served). Some
+    /// status makes "retrieval failed / panicked / timed out" at the turn
+    /// boundary distinguish-able from an honest "no evidence" answer; the
+    /// advisory policy still lets the turn proceed either way (a degraded
+    /// poll never fails the turn by itself).
+    pub evidence_poll: Option<String>,
 }
 
 /// The end-of-turn verdict assembled at the two genuine turn ends: the raw
@@ -1941,6 +2183,49 @@ impl AgentRuntime {
                     );
                 }
             }
+        }
+    }
+
+    /// Archive this turn's typed advisory evidence-poll status into the SAME
+    /// durable evidence authority as the producers (schema v21): one
+    /// LOSSLESS [`EvidenceKind::GenericText`] envelope whose body is the
+    /// canonical bounded encoding
+    /// ([`encode_evidence_poll_status`]), so reopening the store
+    /// reconstructs the EXACT typed status — "retrieval failed" and "no
+    /// evidence found" can never collapse into the same durable fact. The
+    /// source revision is per logical turn (`evidence-poll:<turn_op>`), so
+    /// an identical re-poll of that turn dedupes; the provenance is
+    /// [`ProvenanceSource::Verification`] (runtime machinery output, never
+    /// instruction authority). Failures are logged and skipped like every
+    /// producer: durable diagnostics can never fail the turn.
+    fn archive_turn_evidence_poll(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
+        turn_op: OpId,
+        status: &crate::EvidencePollStatus,
+    ) {
+        let workspace_id = handle
+            .identity()
+            .map(|i| i.workspace_id)
+            .unwrap_or_else(|_| WorkspaceId::new(1));
+        let revision = format!("evidence-poll:{turn_op}");
+        let encoded = encode_evidence_poll_status(status);
+        if let Err(err) = self.evidence_authority.archive_text(
+            handle.id(),
+            workspace_id,
+            Some(task_id.raw()),
+            EvidenceKind::GenericText,
+            Some(revision.as_str()),
+            ProvenanceSource::Verification,
+            &encoded,
+            faktor_context::compactor::EVIDENCE_COMPACT_BODY_MAX_BYTES,
+        ) {
+            tracing::warn!(
+                session = %handle.id(),
+                turn_op = %turn_op,
+                "evidence-poll status archive skipped: {err}"
+            );
         }
     }
 
@@ -2416,6 +2701,7 @@ impl AgentRuntime {
                 completion: None,
                 stop_reason: None,
                 semantic_risk: None,
+                evidence_poll: None,
             });
         }
         let handle = self
@@ -2890,8 +3176,19 @@ impl AgentRuntime {
         self.continue_record(&handle, &record).await
     }
 
+    /// Resolve ONE durable permission request. `Allow` journals
+    /// `PermissionGranted` and moves the machine to `ExecutingTool`; `Deny`
+    /// journals `PermissionDenied`. A resolution unparks the logical turn a
+    /// queue runner timed out on (WaitingForPermission is not continuable, so
+    /// the runner's bounded wait expires and releases the gate): this path
+    /// therefore RE-KICKS the session's durable queue when a non-terminal
+    /// head is still waiting, so the queued prompts resume without a new
+    /// submit or restart. The kick is a bounded runner (its own wait budget);
+    /// a read error is never treated as an empty queue (the kick happens, or
+    /// the failure is logged), and without an async runtime the durable head
+    /// stays pending for the next kick/recovery.
     pub fn resolve_permission(
-        &self,
+        self: &Arc<Self>,
         session: SessionId,
         permission_id: i64,
         decision: PermissionDecision,
@@ -2902,6 +3199,48 @@ impl AgentRuntime {
             .get_session(session)?
             .ok_or_else(|| Error::not_found(format!("session {session}")))?;
         handle.resolve_permission(permission_id, decision)?;
+        // A live in-process driver owns the active turn (it handed the
+        // decision to `handle.resolve_permission` itself): nothing is
+        // parked, no kick needed. The kick is for the timed-out/resumed
+        // shape.
+        let live_driver = handle
+            .active_turn_record()
+            .ok()
+            .flatten()
+            .is_some_and(|record| handle.turn_cancellation(record.turn_op_id).is_some());
+        if live_driver {
+            return Ok(());
+        }
+        let pending = match handle.queued_prompt_count() {
+            Ok(pending) => pending,
+            Err(e) => {
+                tracing::error!(
+                    session = %session,
+                    error = %e.message,
+                    "permission resolved but the durable queue head is unreadable; kicking anyway \
+                     (a read error is never an empty queue): {e}"
+                );
+                1
+            }
+        };
+        if pending == 0 {
+            return Ok(());
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                tracing::info!(
+                    session = %session,
+                    "permission resolved with a durable queue head pending; kicking the queue runner"
+                );
+                let runner = self.clone();
+                tokio::spawn(async move { runner.run_session_queue(session).await });
+            }
+            Err(_) => tracing::warn!(
+                session = %session,
+                "permission resolved with a durable queue head pending but no async runtime is \
+                 available; the durable head waits for the next kick/recovery"
+            ),
+        }
         Ok(())
     }
 
@@ -3007,34 +3346,99 @@ impl AgentRuntime {
             // durable read happens BEFORE the lock: a kick racing it either
             // arms this gate (consumed under the lock) or finds the gate
             // already gone and runs its own loop.
-            let pending = self
-                .deps
-                .session
-                .get_session(session)
-                .ok()
-                .flatten()
-                .map(|h| h.queued_prompt_count().unwrap_or(0))
-                .unwrap_or(0);
-            let mut runners = self.runners.lock().unwrap();
-            let Some(gate) = runners.get_mut(&session) else {
-                return; // only this task removes its own gate
+            //
+            // A store READ FAILURE is never an empty queue (audited): it is
+            // loud, keeps the gate armed for a bounded number of extra
+            // passes, records a durable retry marker, and only then — still
+            // loudly — releases the gate so a broken store cannot wedge the
+            // daemon forever. The durable rows stay pending for the next
+            // kick/recovery; no prompt is ever lost to a transient error.
+            let pending: faktor_core::Result<i64> = match self.deps.session.get_session(session) {
+                Ok(Some(handle)) => handle.queued_prompt_count(),
+                Ok(None) => Ok(0),
+                Err(e) => Err(e),
             };
-            if std::mem::take(&mut gate.rerun) {
-                drop(runners);
-                continue;
+            #[cfg(test)]
+            let pending = if durable_faults::take(
+                self.deps.session.store().root(),
+                DW_SITE_QUEUE_HEAD_READ,
+            ) {
+                Err(Error::new(
+                    ErrorKind::Store,
+                    "injected durable queue-head read failure",
+                ))
+            } else {
+                pending
+            };
+            // Decide under the gate lock; NOTHING awaits while the lock is
+            // held (the backoff of a read-failure retry runs after release).
+            enum GateDecision {
+                AnotherPass,
+                Release,
+                Backoff(u32, faktor_core::Error),
+                Exhausted(u32, faktor_core::Error),
             }
-            if result.is_ok() && pending > 0 {
-                // A prompt appeared between the pass's empty observation and
-                // this decision: drain it under the same gate (audit round
-                // 7's start/exit race close). A pending head after a TYPED
-                // timeout does not loop here — the settle path/recovery
-                // kick arms or replaces this runner (bounded by the next
-                // pass's budget, never a poll loop).
-                drop(runners);
-                continue;
+            let decision = {
+                let mut runners = self.runners.lock().unwrap();
+                let Some(gate) = runners.get_mut(&session) else {
+                    return; // only this task removes its own gate
+                };
+                match pending {
+                    Ok(pending) => {
+                        gate.pending_read_failures = 0;
+                        if std::mem::take(&mut gate.rerun) {
+                            GateDecision::AnotherPass
+                        } else if result.is_ok() && pending > 0 {
+                            // A prompt appeared between the pass's empty
+                            // observation and this decision: drain it under
+                            // the same gate (audit round 7's start/exit race
+                            // close). A pending head after a TYPED timeout
+                            // does not loop here — the settle path/recovery
+                            // kick arms or replaces this runner (bounded by
+                            // the next pass's budget, never a poll loop).
+                            GateDecision::AnotherPass
+                        } else {
+                            runners.remove(&session);
+                            GateDecision::Release
+                        }
+                    }
+                    Err(e) => {
+                        gate.pending_read_failures = gate.pending_read_failures.saturating_add(1);
+                        let failures = gate.pending_read_failures;
+                        if failures <= MAX_QUEUE_HEAD_READ_RETRIES {
+                            // Keep the gate ARMED: the durable head is
+                            // unknown, never "empty". One bounded extra pass
+                            // after a short backoff; the gate counter bounds
+                            // the retries.
+                            gate.rerun = true;
+                            GateDecision::Backoff(failures, e)
+                        } else {
+                            gate.pending_read_failures = 0;
+                            GateDecision::Exhausted(failures, e)
+                        }
+                    }
+                }
+            };
+            match decision {
+                GateDecision::AnotherPass => continue,
+                GateDecision::Release => return,
+                GateDecision::Backoff(failures, e) => {
+                    tracing::error!(
+                        session = %session,
+                        failures,
+                        bound = MAX_QUEUE_HEAD_READ_RETRIES,
+                        error = %e.message,
+                        "queue runner could not re-check the durable queue head; \
+                         treating it as NON-EMPTY and keeping the gate armed: {e}"
+                    );
+                    tokio::time::sleep(QUEUE_HEAD_READ_RETRY_DELAY).await;
+                    continue;
+                }
+                GateDecision::Exhausted(failures, e) => {
+                    self.note_queue_head_read_failure(session, failures, &e);
+                    return;
+                }
             }
-            runners.remove(&session);
-            return;
         }
     }
 
@@ -3065,7 +3469,10 @@ impl AgentRuntime {
                 .get_session(session)?
                 .ok_or_else(|| Error::not_found(format!("session {session}")))?;
             // Claimed queue rows from a crashed admission crash back to
-            // pending so the durable head is re-admitted (idempotent).
+            // pending so the durable head is re-admitted (idempotent), and a
+            // `running` row whose logical turn already ended is retired to
+            // `done` (its terminal mark was lost to the crash; re-admitting
+            // it would deliver the same prompt twice).
             handle.recover_queued_rows()?;
             // A mid-flight machine blocks admission: when no LIVE driver owns
             // the active logical turn (post-restart), the residue is an
@@ -3074,42 +3481,59 @@ impl AgentRuntime {
             if handle.queued_prompt_count()? > 0 {
                 if let Some(record) = handle.active_turn_record()? {
                     let state = handle.state()?;
-                    if state_is_op_active(state)
-                        && handle.turn_cancellation(record.turn_op_id).is_none()
-                    {
-                        match self.continue_record(&handle, &record).await {
-                            Ok(_) => {
-                                wait_started = None; // progress: fresh budget
-                                continue;
-                            }
-                            Err(e) => {
-                                // Not continuable yet (e.g. a durable
-                                // permission waits on the user): back off and
-                                // retry — the durable head stays pending. The
-                                // retry is BOUNDED: the turn budget (or the
-                                // fallback) ends the wait with a typed timeout.
-                                tracing::warn!(
-                                    session = %session,
-                                    turn = %record.turn_op_id,
-                                    "queue runner cannot continue interrupted turn: {e}"
-                                );
-                                let started = *wait_started.get_or_insert_with(Instant::now);
-                                let waited = started.elapsed();
-                                if waited >= wait_deadline {
-                                    return Err(Error::timeout(format!(
-                                        "queue runner of session {session} could not continue \
-                                         interrupted turn {} for {wait_deadline:?} (waited \
-                                         {waited:?}); the durable queue head stays pending and \
-                                         the settle path or recovery re-kicks the runner: {e}",
-                                        record.turn_op_id
-                                    )));
+                    if handle.turn_cancellation(record.turn_op_id).is_none() {
+                        if state_is_op_active(state) {
+                            match self.continue_record(&handle, &record).await {
+                                Ok(outcome) => {
+                                    // The active turn record's OWN queue row
+                                    // (when the interrupted turn was an
+                                    // admitted queued prompt) is consumed by
+                                    // this resume: mark it terminal exactly
+                                    // once — a `running`/`claimed`/`pending`
+                                    // row owned by the record must never be
+                                    // re-admitted on top of the resumed turn.
+                                    self.consume_record_queue_row(&handle, &record, &outcome)?;
+                                    wait_started = None; // progress: fresh budget
+                                    continue;
                                 }
-                                tokio::time::sleep(
-                                    Duration::from_millis(200).min(wait_deadline - waited),
-                                )
-                                .await;
-                                continue;
+                                Err(e) => {
+                                    // Not continuable yet (e.g. a durable
+                                    // permission waits on the user): back off and
+                                    // retry — the durable head stays pending. The
+                                    // retry is BOUNDED: the turn budget (or the
+                                    // fallback) ends the wait with a typed timeout.
+                                    tracing::warn!(
+                                        session = %session,
+                                        turn = %record.turn_op_id,
+                                        "queue runner cannot continue interrupted turn: {e}"
+                                    );
+                                    let started = *wait_started.get_or_insert_with(Instant::now);
+                                    let waited = started.elapsed();
+                                    if waited >= wait_deadline {
+                                        return Err(Error::timeout(format!(
+                                            "queue runner of session {session} could not continue \
+                                             interrupted turn {} for {wait_deadline:?} (waited \
+                                             {waited:?}); the durable queue head stays pending and \
+                                             the settle path or recovery re-kicks the runner: {e}",
+                                            record.turn_op_id
+                                        )));
+                                    }
+                                    tokio::time::sleep(
+                                        Duration::from_millis(200).min(wait_deadline - waited),
+                                    )
+                                    .await;
+                                    continue;
+                                }
                             }
+                        } else if let Some(queue_seq) = record.queue_seq {
+                            // The record is still active but the machine is no
+                            // longer op-active: the logical turn is over and
+                            // the record's queue row is bookkeeping residue.
+                            // Retire the row (never re-admit it); the stale
+                            // record itself is swept by the next drive's
+                            // `recover_session`.
+                            handle.mark_queued_status(queue_seq, "done")?;
+                            continue;
                         }
                     }
                 }
@@ -3165,6 +3589,83 @@ impl AgentRuntime {
             if matches!(outcome, Ok(o) if o.final_state == AgentState::Cancelled) {
                 return Ok(());
             }
+        }
+    }
+
+    /// Retire the queue row OWNED by an active turn record after the resumed
+    /// turn reached its end. The row may be `running` (the crash hit the
+    /// drive), `claimed` (crash between claim and the first drive) or
+    /// `pending` (crash recovery returned it); in every case the resumed
+    /// turn IS that row's delivery and the row must never be re-admitted on
+    /// top of it — otherwise the same prompt would be delivered twice. A
+    /// record without a queue row (an immediate prompt) consumes nothing.
+    /// Idempotent: a terminal row is simply rewritten to its terminal state.
+    fn consume_record_queue_row(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        record: &faktor_store::TurnRecordRow,
+        outcome: &TurnOutcome,
+    ) -> faktor_core::Result<()> {
+        let Some(queue_seq) = record.queue_seq else {
+            return Ok(());
+        };
+        let status = if outcome.final_state == AgentState::Cancelled {
+            "cancelled"
+        } else {
+            "done"
+        };
+        handle.mark_queued_status(queue_seq, status)
+    }
+
+    /// The queue runner exhausted its bounded durable queue-head RE-CHECKS
+    /// (store read errors): record the failure on the durable audit surface
+    /// (a `CrashDetected` self-transition naming the site) and release the
+    /// gate loudly. The durable queue rows stay untouched/pending, so the
+    /// next kick or startup recovery drains them — a transient store error
+    /// can never silently drop a queued prompt.
+    fn note_queue_head_read_failure(
+        &self,
+        session: SessionId,
+        failures: u32,
+        err: &faktor_core::Error,
+    ) {
+        tracing::error!(
+            session = %session,
+            failures,
+            error = %err.message,
+            "queue runner exhausted its bounded queue-head re-checks; the durable rows stay \
+             pending and the next kick/recovery drains them"
+        );
+        let Ok(Some(handle)) = self.deps.session.get_session(session) else {
+            return;
+        };
+        let state = match handle.state() {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::error!(
+                    session = %session,
+                    "queue-head read failure audit skipped: session state unreadable: {e}"
+                );
+                return;
+            }
+        };
+        let payload = serde_json::json!({
+            "durable_write_failure": {
+                "site": DW_SITE_QUEUE_HEAD_READ,
+                "failures": failures,
+                "error": truncate(&err.message, 1024),
+            }
+        });
+        if let Err(e) = handle.force_append_event(
+            faktor_core::event::EventKind::CrashDetected,
+            state,
+            None,
+            Some(payload),
+        ) {
+            tracing::error!(
+                session = %session,
+                "queue-head read failure audit could not be journaled: {e}"
+            );
         }
     }
 
@@ -3858,6 +4359,7 @@ impl AgentRuntime {
                     completion: None,
                     stop_reason: None,
                     semantic_risk: None,
+                    evidence_poll: None,
                 });
             }
             AgentState::WaitingForPermission | AgentState::ToolRequested => {
@@ -3925,6 +4427,29 @@ impl AgentRuntime {
                     Some(op),
                     None,
                 )?;
+            }
+            AgentState::ExecutingTool if handle.pending_tool_runs()?.is_empty() => {
+                // The audited permission window: the drive parked on the
+                // durable permission and died BEFORE starting any tool run.
+                // Resolving it with `Allow` lands the machine on ExecutingTool
+                // with nothing to execute; the SAME recorded turn must be
+                // re-planned, so hop back through the documented internal
+                // chain (ExecutingTool -> Validating -> UpdatingMemory ->
+                // WaitingForModel) instead of failing on an illegal
+                // ExecutingTool -> BuildingContext transition. A turn WITH
+                // pending tool runs already replayed them above.
+                for target in [
+                    AgentState::Validating,
+                    AgentState::UpdatingMemory,
+                    AgentState::WaitingForModel,
+                ] {
+                    handle.append_event(
+                        faktor_core::event::EventKind::PhaseChanged,
+                        target,
+                        Some(op),
+                        None,
+                    )?;
+                }
             }
             _ => {}
         }
@@ -4030,6 +4555,7 @@ impl AgentRuntime {
             completion: None,
             stop_reason: None,
             semantic_risk: None,
+            evidence_poll: None,
         };
         // Per-logical-turn accumulation: real steps/failures/files/tests for
         // the durable ledger + memory (audit: only defaults were recorded).
@@ -4114,6 +4640,12 @@ impl AgentRuntime {
         // registered provider answers (or forever, when only the fallback is
         // registered — parity).
         let mut semantic_turn: Option<SemanticTurnState> = None;
+        // The LAST typed status of the legacy advisory evidence poll this
+        // logical turn (drive-local): None while the index/cold ladder
+        // serves, Some once the legacy provider was polled. Re-polling the
+        // same turn with the same status dedupes durably (same revision +
+        // same bytes).
+        let mut evidence_poll_status: Option<crate::EvidencePollStatus> = None;
         loop {
             if cancel.is_cancelled() {
                 // Cancel cleanup: the Cancelled classification is the genuine
@@ -4245,25 +4777,57 @@ impl AgentRuntime {
             // supervisor's, each with its own kill deadline), and the
             // legacy provider is polled on a detached thread under a hard
             // wall budget — a panicking or slow evidence provider degrades
-            // to an empty package instead of blocking the turn.
-            let mut evidence = match self.index_evidence_if_ready(handle, &evidence_query) {
+            // to an empty package instead of blocking the turn. A READY
+            // index generation whose configured embedder fails is different
+            // by contract: the typed provider error surfaces here (no
+            // silent lexical-only substitute).
+            // ADVISORY POLICY (documented; locked by the
+            // `legacy_poll_*_is_durable` tests): a degraded evidence poll
+            // NEVER fails the turn by itself. The poll's package feeds the
+            // turn exactly as the legacy wrapper did (empty on every
+            // degraded status), but the typed status is now a FIRST-CLASS
+            // durable fact: archived with the turn producers below under
+            // `evidence-poll:<turn_op>` and surfaced in
+            // `outcome.evidence_poll` diagnostics. "Retrieval failed" is
+            // therefore never silently equivalent to "no evidence found" —
+            // a policy that already treats missing evidence as failing can
+            // distinguish the two from the durable record.
+            let mut evidence = match self.index_evidence_if_ready(handle, &evidence_query)? {
                 Some(evidence) => evidence,
                 None => match self.cold_evidence_if_unready(handle, &evidence_query).await {
                     Some(evidence) => evidence,
                     None => {
                         // Index hosting failed entirely: the legacy bounded
                         // scan is the documented degrade for that case,
-                        // awaited off the turn thread under a hard wall
+                        // polled off the turn thread under a hard wall
                         // deadline (the runtime's verification-path source
                         // probes keep the pooling API out of this file; the
-                        // helper lives in lib.rs).
-                        crate::poll_evidence_with_wall_budget(
+                        // helper lives in lib.rs). The TYPED outcome is kept
+                        // (status archived; package unchanged).
+                        let crate::EvidencePollOutcome {
+                            evidence: polled,
+                            status,
+                        } = crate::poll_evidence_with_wall_budget_outcome(
                             self.deps.evidence.clone(),
                             handle.id(),
                             evidence_query.clone(),
                             LEGACY_EVIDENCE_MAX_WAIT,
                         )
-                        .await
+                        .await;
+                        log_evidence_poll_outcome(&status, LEGACY_EVIDENCE_MAX_WAIT);
+                        outcome.evidence_poll = Some(encode_evidence_poll_status(&status));
+                        evidence_poll_status = Some(status);
+                        // Compile-time use only (never called): the frozen
+                        // status-free wrapper — and the private diagnostic
+                        // helper it owns in lib.rs — stays the documented
+                        // legacy shape the lib.rs tests pin. The drive now
+                        // owns the typed call, so without this reference
+                        // the wrapper would be dead code in non-test lib
+                        // builds (lib.rs is outside this change's file
+                        // ownership). One poll, one owner: this line never
+                        // polls.
+                        let _ = &crate::poll_evidence_with_wall_budget;
+                        polled
                     }
                 },
             };
@@ -4312,6 +4876,12 @@ impl AgentRuntime {
                 &semantic_evidence,
                 &learning_evidence,
             );
+            // ... and this turn's typed advisory poll status rides the SAME
+            // durable authority: a distinct, losslessly-encoded row (never
+            // conflated with the producers).
+            if let Some(status) = &evidence_poll_status {
+                self.archive_turn_evidence_poll(handle, task_id, op_id, status);
+            }
             // The volatile competition claims of THIS turn (adaptive
             // marginal-information budget): loaded history, produced
             // evidence, semantic/handoff DATA and learning/tool-note DATA.
@@ -10244,37 +10814,117 @@ impl AgentRuntime {
         once.clone()
     }
 
+    /// Stop and JOIN the lazily-hosted repository `IndexService` worker, if
+    /// the service was ever opened. `None` = the service was never requested
+    /// — this accessor NEVER opens it (no side effect) — so an embedder that
+    /// never ran a turn has nothing to join. `Some(outcome)` mirrors
+    /// [`faktor_index::IndexService::shutdown_worker`] exactly:
+    /// [`WorkerShutdown::NotRunning`](faktor_index::WorkerShutdown::NotRunning)
+    /// when no owned task was alive (never spawned, or already stopped/failed
+    /// — the idempotent repeat call),
+    /// [`Joined`](faktor_index::WorkerShutdown::Joined) when the owned task
+    /// was cancelled and joined within the service's own bound, and
+    /// [`Aborted`](faktor_index::WorkerShutdown::Aborted) when it exceeded
+    /// that bound, was aborted, and its retained handle was still awaited —
+    /// nothing is ever detached. An in-flight blocking pass cannot be
+    /// force-killed: it observes cancellation at its next workspace boundary
+    /// and is bounded by the scan caps + build lease.
+    ///
+    /// This is THE join point of the runtime for the index worker: the
+    /// runtime has no async teardown and its `Drop` cannot await (the
+    /// service exposes no synchronous cancel), so a host — the daemon — must
+    /// call this during its own shutdown sequence, before dropping the
+    /// runtime. Safe and bounded when the worker was never started or is
+    /// already stopped.
+    pub async fn shutdown_index_service(&self) -> Option<faktor_index::WorkerShutdown> {
+        let service = self
+            .index_service
+            .get()
+            .and_then(|service| service.clone())?;
+        Some(service.shutdown_worker().await)
+    }
+
+    /// Read-only health snapshot of the lazily-hosted index worker:
+    /// `Some(status)` exactly when the service was ever opened, `None` when
+    /// it was never requested. Never opens the service as a side effect and
+    /// never starts the worker (dead-generation reconciliation inside
+    /// [`faktor_index::IndexService::worker_status`] only records an already
+    /// terminal state).
+    pub fn index_service_worker_status(&self) -> Option<faktor_index::WorkerStatus> {
+        self.index_service
+            .get()
+            .and_then(|service| service.as_ref())
+            .map(|service| service.worker_status())
+    }
+
     /// First-turn evidence swap (audits 30/64): `Some(evidence)` only when
     /// the session's workspace resolves AND the IndexService has a Ready
     /// generation for it. Attaching the workspace kicks the background
     /// reconciliation worker (resume/initial build) but NEVER waits for a
-    /// build; `None` keeps the bounded evidence scan in charge until a
+    /// build; `Ok(None)` keeps the bounded evidence scan in charge until a
     /// Ready generation exists — the fallback scan is retired per workspace
-    /// only then.
+    /// only then. A configured embedder's typed failure is NOT flattened: it
+    /// propagates out of the fused search and fails the turn explicitly.
     fn index_evidence_if_ready(
         &self,
         handle: &faktor_session::SessionHandle,
         query: &EvidenceQuery,
-    ) -> Option<Vec<Evidence>> {
-        let ws = handle.row().ok().map(|r| r.workspace_id)?;
-        let service = self.index_service()?;
-        service.attach(ws).ok()?;
-        let view = service.view(ws)?;
+    ) -> faktor_core::Result<Option<Vec<Evidence>>> {
+        let Some(ws) = handle.row().ok().map(|r| r.workspace_id) else {
+            return Ok(None);
+        };
+        let Some(service) = self.index_service() else {
+            return Ok(None);
+        };
+        match index_attach_for_evidence(&service, ws) {
+            IndexEvidenceAttach::Ready => {}
+            IndexEvidenceAttach::NoReadyGeneration => {
+                // Attached, no published generation yet: the documented
+                // bounded-scan degrade until the worker publishes one.
+                tracing::debug!(
+                    workspace = ws.raw(),
+                    "index has no Ready generation yet; serving the bounded evidence scan"
+                );
+                return Ok(None);
+            }
+            IndexEvidenceAttach::Broken(reason) => {
+                // BROKEN ATTACH is not "not ready": the service could not
+                // attach the workspace at all (hostile/unwritable root,
+                // unknown workspace, poisoned service state). Logged typed so
+                // the degrade is diagnosable; the bounded scan still serves.
+                tracing::warn!(
+                    workspace = ws.raw(),
+                    error = %reason,
+                    "index attach FAILED (distinct from no-ready-generation); serving the \
+                     bounded evidence scan for this workspace: {reason}"
+                );
+                return Ok(None);
+            }
+        }
+        let Some(view) = service.view(ws) else {
+            // The generation retired between the attach check and the view
+            // read: the fallback scan serves.
+            tracing::debug!(
+                workspace = ws.raw(),
+                "index generation retired after attach; serving the bounded evidence scan"
+            );
+            return Ok(None);
+        };
         if query.prompt.len() > INDEX_EVIDENCE_MAX_PROMPT_BYTES {
-            return Some(Vec::new());
+            return Ok(Some(Vec::new()));
         }
         let concepts = Self::evidence_concepts(query);
         if concepts.is_empty() {
-            return Some(Vec::new());
+            return Ok(Some(Vec::new()));
         }
         // The CONFIGURED embedder (resolved from `[embeddings]` and exposed
         // by the evidence provider) fuses the semantic leg; `None` keeps
-        // lexical/symbol-only retrieval. A configured-but-failing embedder
-        // degrades inside `fused` exactly like the cold path — the turn
-        // never breaks on embeddings.
+        // lexical/symbol-only retrieval (explicit `Disabled` semantics).
+        // A configured-but-failing embedder propagates its typed error —
+        // retrieval NEVER silently substitutes lexical-only evidence.
         let search = faktor_search::SearchService::new(view.index(), self.deps.evidence.embedder());
-        let hits = search.evidence_package(ws, &concepts, INDEX_EVIDENCE_MAX_HITS);
-        Some(
+        let hits = search.evidence_package(ws, &concepts, INDEX_EVIDENCE_MAX_HITS)?;
+        Ok(Some(
             hits.into_iter()
                 .enumerate()
                 .map(|(i, h)| Evidence {
@@ -10283,7 +10933,7 @@ impl AgentRuntime {
                     score: 1.0 / (1.0 + i as f64),
                 })
                 .collect(),
-        )
+        ))
     }
 
     /// Cheap cold evidence while no Ready generation exists (P0-30): the
@@ -11506,6 +12156,27 @@ const DURABLE_WRITE_MARKER_MAX_BYTES: usize = 256 * 1024;
 const DURABLE_WRITE_MARKER_SCAN_MAX: usize = 256;
 /// Marker replay attempts before the marker is abandoned (surfaced loudly).
 const DURABLE_WRITE_MARKER_MAX_ATTEMPTS: u64 = 8;
+/// Bounded create retries when a marker file name collides (two processes
+/// sharing one store root can produce the same clock-ms + seq base; the name
+/// also carries pid + a random tag, and creation is `create_new` — an existing
+/// marker is NEVER overwritten).
+const DURABLE_WRITE_MARKER_CREATE_ATTEMPTS: usize = 8;
+/// Total files allowed in the marker directory before GC consumes the OLDEST
+/// terminal/unreadable markers. Pending markers are NEVER deleted by GC.
+const DURABLE_WRITE_MARKER_DIR_MAX: usize = 4096;
+/// Test-only override of the directory bound (0 = the production bound).
+#[cfg(test)]
+pub(crate) static DURABLE_WRITE_MARKER_DIR_MAX_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Page size of the durable replay dedup scans (journal events / ledger
+/// rows). The scans are COMPLETE (down to the first row), never a fixed
+/// tail window, so a committed-then-errored write followed by arbitrary
+/// later activity can never replay as a duplicate.
+const DW_DEDUP_PAGE: u64 = 512;
+/// Hard page bound of one replay dedup scan. Beyond it the scan stops with a
+/// LOUD error and reports "already present" — a duplicate row is worse than
+/// a skipped redundant append (the durable record itself stays authoritative).
+const DW_DEDUP_MAX_PAGES: u32 = 4096;
 
 // Stable site names of every discard audited (and every sibling discard in
 // this file): a marker/trace always names the write it compensates.
@@ -11559,10 +12230,148 @@ const DW_SITE_END_LOOP_SIGNALS: &str = "finish_logical_turn.reset_loop_signals";
 const DW_SITE_TURN_ENVELOPE: &str = "drive_turn_inner.set_turn_envelope";
 const DW_SITE_DRIVE_ABORT_CANCEL: &str = "drive_turn_inner.abort_cancelled";
 const DW_SITE_DRIVE_ABORT_DISPATCH: &str = "drive_turn_inner.abort_after_dispatch";
+/// Queue runner: the durable queue-head RE-CHECK failed (a store read error).
+/// Never treated as an empty queue; recorded as a durable retry marker when
+/// the bounded retries are exhausted.
+const DW_SITE_QUEUE_HEAD_READ: &str = "run_session_queue.pending_head_read";
 
 /// Process-local uniqueness tail of one marker file name.
 static DURABLE_WRITE_MARKER_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// Directory bound actually in force (test override or production bound).
+fn durable_write_marker_dir_max() -> usize {
+    #[cfg(test)]
+    {
+        let overridden =
+            DURABLE_WRITE_MARKER_DIR_MAX_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if overridden > 0 {
+            return overridden;
+        }
+    }
+    DURABLE_WRITE_MARKER_DIR_MAX
+}
+
+/// Random-ish uniqueness tag of one marker name: pid + a `RandomState`-keyed
+/// hash of the clock and sequence. The name must never rely on the clock
+/// alone — two processes sharing one store root can observe the same
+/// millisecond.
+fn marker_random_tag(at_ms: i64, seq: u64) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_i32(std::process::id() as i32);
+    hasher.write_i64(at_ms);
+    hasher.write_u64(seq);
+    hasher.finish()
+}
+
+/// Create a NEW marker file and write `bytes` into it; an existing file at
+/// the candidate name is NEVER overwritten — `create_new` is the collision
+/// detector, and a collision retries a fresh suffix (bounded). A partial
+/// write is removed before the error is returned (a half-written marker is
+/// worse than none).
+fn write_marker_file(
+    dir: &std::path::Path,
+    key: &str,
+    bytes: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    for attempt in 0..DURABLE_WRITE_MARKER_CREATE_ATTEMPTS {
+        let filename = if attempt == 0 {
+            format!("{key}.json")
+        } else {
+            format!("{key}-{attempt}.json")
+        };
+        let path = dir.join(filename);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(e);
+                }
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "marker name `{key}` collided {DURABLE_WRITE_MARKER_CREATE_ATTEMPTS} times; \
+             refusing to overwrite an existing marker"
+        ),
+    ))
+}
+
+/// Bound the marker directory: when it holds more than
+/// [`durable_write_marker_dir_max`] files, consume the OLDEST terminal
+/// (non-pending, unreadable or corrupt) markers, loudly, until the bound is
+/// met. Pending markers are NEVER deleted here — if only pending work
+/// remains over the bound, that is a loud error, not a silent loss.
+fn gc_durable_write_markers(dir: &std::path::Path) {
+    let bound = durable_write_marker_dir_max();
+    let entries: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_file())
+            .collect(),
+        Err(_) => return,
+    };
+    if entries.len() <= bound {
+        return;
+    }
+    let mut rows: Vec<(std::time::SystemTime, std::path::PathBuf, bool)> = entries
+        .into_iter()
+        .map(|path| {
+            let mtime = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let pending = std::fs::read(&path)
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+                .and_then(|marker| {
+                    marker
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .map(|status| status == "pending")
+                })
+                .unwrap_or(false);
+            (mtime, path, pending)
+        })
+        .collect();
+    rows.sort_by_key(|(mtime, _, _)| *mtime);
+    let mut remaining = rows.len();
+    for (_, path, pending) in rows {
+        if remaining <= bound {
+            break;
+        }
+        if pending {
+            continue; // durable work is never GC'd
+        }
+        tracing::warn!(
+            path = %path.display(),
+            bound,
+            "durable-write marker directory is over its bound; consuming the oldest terminal marker"
+        );
+        if std::fs::remove_file(&path).is_ok() {
+            remaining -= 1;
+        }
+    }
+    if remaining > bound {
+        tracing::error!(
+            remaining,
+            bound,
+            "durable-write marker directory is still over its bound; only pending markers remain \
+             (they are never deleted — the flood is surfaced, not silently dropped)"
+        );
+    }
+}
 
 /// The typed intent of one durable write whose failure is compensated by a
 /// retry-on-next-open marker (serde-tagged so every marker is self-describing
@@ -11649,7 +12458,15 @@ impl AgentRuntime {
         );
         let at_ms = self.deps.clock.now_ms();
         let seq = DURABLE_WRITE_MARKER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let key = format!("dw-{at_ms:020}-{seq:012}");
+        // pid + random tag: two processes sharing one store root can observe
+        // the same clock millisecond and per-process seq, so the name alone
+        // must not decide identity (and `write_marker_file` refuses to
+        // overwrite when even the full name collides).
+        let key = format!(
+            "dw-{at_ms:020}-{seq:012}-{:08x}-{:016x}",
+            std::process::id(),
+            marker_random_tag(at_ms, seq)
+        );
         let mut marker = serde_json::json!({
             "status": "pending",
             "attempts": 0u64,
@@ -11692,10 +12509,8 @@ impl AgentRuntime {
         let dir = self.durable_marker_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
             tracing::error!(session = %handle.id(), site, dir = %dir.display(), "durable-write marker directory unwritable: {e}");
-        } else if let Err(e) =
-            faktor_fs::atomic::atomic_replace(&dir.join(format!("{key}.json")), &bytes)
-        {
-            tracing::error!(session = %handle.id(), site, dir = %dir.display(), "durable-write marker file unwritable: {e}");
+        } else if let Err(e) = write_marker_file(&dir, &key, &bytes) {
+            tracing::error!(session = %handle.id(), site, dir = %dir.display(), "durable-write marker file unwritable or collided: {e}");
         }
         // Existing audit surface: a CrashDetected self-transition carrying a
         // bounded typed description of the failure (opaque payload kind, no
@@ -11755,6 +12570,9 @@ impl AgentRuntime {
             .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
             .collect();
         paths.sort();
+        // Bound the directory before scanning it: oldest terminal markers are
+        // consumed first, pending work is never touched.
+        gc_durable_write_markers(&dir);
         if paths.len() > DURABLE_WRITE_MARKER_SCAN_MAX {
             tracing::error!(
                 session = %handle.id(),
@@ -11767,14 +12585,18 @@ impl AgentRuntime {
             let raw = match read_bounded_file(&path, DURABLE_WRITE_MARKER_MAX_BYTES) {
                 Ok(raw) => raw,
                 Err(e) => {
-                    tracing::error!(session = %handle.id(), path = %path.display(), "durable-write marker unreadable: {e}");
+                    // Retained (never deleted): unreadable markers are
+                    // evidence; the directory bound is what contains them.
+                    tracing::error!(session = %handle.id(), path = %path.display(), "durable-write marker unreadable; retaining it: {e}");
                     continue;
                 }
             };
             let mut marker: serde_json::Value = match serde_json::from_slice(&raw) {
                 Ok(marker) => marker,
                 Err(e) => {
-                    tracing::error!(session = %handle.id(), path = %path.display(), "durable-write marker corrupt: {e}");
+                    // Retained: a corrupt marker is surfaced loudly and never
+                    // silently discarded; GC consumes it only over the bound.
+                    tracing::error!(session = %handle.id(), path = %path.display(), "durable-write marker corrupt; retaining it for inspection: {e}");
                     continue;
                 }
             };
@@ -11785,8 +12607,37 @@ impl AgentRuntime {
             {
                 continue; // another session's marker (replayed at ITS open)
             }
-            if marker.get("status").and_then(|s| s.as_str()) != Some("pending") {
-                continue;
+            let status = marker
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            match status.as_str() {
+                "pending" => {}
+                // Terminal bookkeeping states: the intent already landed (or
+                // was terminally refused and surfaced before). CONSUME it —
+                // it is never replayed and never lingers silently.
+                "applied" | "done" | "abandoned" | "refused" | "cancelled" => {
+                    tracing::info!(
+                        session = %handle.id(),
+                        path = %path.display(),
+                        %status,
+                        "durable-write marker is in a terminal state; consuming it (never replayed)"
+                    );
+                    remove_marker_file(&path);
+                    continue;
+                }
+                other => {
+                    // Unknown states are NOT silently skipped: surfaced and
+                    // retained (GC bounds them), never replayed.
+                    tracing::error!(
+                        session = %handle.id(),
+                        path = %path.display(),
+                        status = other,
+                        "durable-write marker carries an UNKNOWN status; retaining it, never replaying it"
+                    );
+                    continue;
+                }
             }
             let site = marker
                 .get("site")
@@ -11794,6 +12645,7 @@ impl AgentRuntime {
                 .unwrap_or("unknown")
                 .to_string();
             let attempts = marker.get("attempts").and_then(|a| a.as_u64()).unwrap_or(0) + 1;
+            let marker_at_ms = marker.get("at_ms").and_then(|a| a.as_i64()).unwrap_or(0);
             let intent: Option<DurableWriteIntent> = marker
                 .get("intent")
                 .cloned()
@@ -11803,7 +12655,7 @@ impl AgentRuntime {
                 remove_marker_file(&path);
                 continue;
             };
-            match self.apply_durable_write_intent(handle, &intent) {
+            match self.apply_durable_write_intent(handle, &intent, marker_at_ms) {
                 Ok(()) => {
                     tracing::warn!(
                         session = %handle.id(),
@@ -11834,10 +12686,27 @@ impl AgentRuntime {
     /// Apply one marker intent to durable state. Store errors are retryable
     /// (the marker stays); any other error means the intended transition is
     /// no longer reachable/legal (the marker is terminally refused, loudly).
+    ///
+    /// Every intent carries a DURABLE dedup witness so the crash window
+    /// "the write committed, then reported Err, then the process died" can
+    /// never replay as a duplicate:
+    /// - `JournalFailed`: a complete paged scan of the op's journal (never a
+    ///   fixed tail window).
+    /// - `LedgerDecision`: a complete paged scan of the ledger.
+    /// - `CancelVerificationAttempt`: the attempt's job rows (nothing open =>
+    ///   already terminal).
+    /// - `Abort`: the active turn record / durable queue rows, plus the
+    ///   marker's own timestamp (a turn STARTED AFTER the intent is never
+    ///   aborted by it).
+    /// - `ResolveVerificationJob`: `job.state.is_open()`.
+    /// - `FinishTurnRecord` / `UpsertMemoryFact` / `ResetLoopSignals` /
+    ///   `RouteTaskState` / `RebuildTaskLedger`: naturally idempotent
+    ///   operations (a rewrite cannot mint a second logical result).
     fn apply_durable_write_intent(
         &self,
         handle: &faktor_session::SessionHandle,
         intent: &DurableWriteIntent,
+        intent_at_ms: i64,
     ) -> Result<(), faktor_core::Error> {
         match intent {
             DurableWriteIntent::JournalFailed {
@@ -11898,6 +12767,29 @@ impl AgentRuntime {
                 attempt_op,
                 note,
             } => {
+                // Durable dedup: the attempt's job rows are the witness. An
+                // attempt with no open job (or no rows at all) was already
+                // cancelled/resolved — cancelling again would journal a
+                // second, spurious cancellation.
+                let jobs = handle.verification_attempt_jobs(*task_id, *attempt_op)?;
+                if jobs.is_empty() {
+                    tracing::warn!(
+                        session = %handle.id(),
+                        task = *task_id,
+                        attempt_op = *attempt_op,
+                        "stale cancel-verification marker skipped: the attempt has no job rows left"
+                    );
+                    return Ok(());
+                }
+                if !jobs.iter().any(|job| job.state.is_open()) {
+                    tracing::warn!(
+                        session = %handle.id(),
+                        task = *task_id,
+                        attempt_op = *attempt_op,
+                        "stale cancel-verification marker skipped: every job of the attempt is already terminal"
+                    );
+                    return Ok(());
+                }
                 handle.cancel_verification_attempt(*task_id, *attempt_op, note)?;
                 Ok(())
             }
@@ -11910,6 +12802,42 @@ impl AgentRuntime {
                     Some(raw) => Some(OpId::try_from(*raw)?),
                     None => None,
                 };
+                // Durable dedup by intent identity: the abort already took
+                // effect when no durable witness covers the intent's target —
+                // an active turn record, a durable queue row, or an OPEN tool
+                // run row of that op. An abort(None) whose active turn STARTED
+                // AFTER the marker is a stale intent that must never kill a
+                // LATER turn.
+                let active = handle.active_turn_record()?;
+                let queued = self
+                    .deps
+                    .session
+                    .store()
+                    .queue_op_ids(handle.id())
+                    .map_err(|e| Error::new(ErrorKind::Store, e.to_string()))?;
+                let pending_tools = handle.pending_tool_runs()?;
+                let already_effective = match op {
+                    Some(op) => {
+                        let covered_by_record = active.as_ref().map(|r| r.turn_op_id) == Some(op);
+                        let covered_by_queue = queued.contains(&op);
+                        let covered_by_tool = pending_tools.iter().any(|row| row.op_id == op);
+                        !covered_by_record && !covered_by_queue && !covered_by_tool
+                    }
+                    None => match &active {
+                        Some(record) if record.started_at >= intent_at_ms => true,
+                        _ => active.is_none() && queued.is_empty() && pending_tools.is_empty(),
+                    },
+                };
+                if already_effective {
+                    tracing::warn!(
+                        session = %handle.id(),
+                        op = ?op,
+                        intent_at_ms,
+                        "stale abort marker skipped: the intent is already effective durably \
+                         (no turn/queue row left, or the active turn started after the intent)"
+                    );
+                    return Ok(());
+                }
                 handle.abort(op)?;
                 Ok(())
             }
@@ -11953,30 +12881,74 @@ impl AgentRuntime {
         }
     }
 
-    /// True when the journal's bounded tail already carries the `Failed`
+    /// True when the journal ALREADY carries a `kind` event of `op` (the write
+    /// may have committed before reporting Err). COMPLETE, paged backward
+    /// scan of the durable journal — never a fixed tail window. A read
+    /// failure or the page bound reports `true` (conservative: never risk a
+    /// duplicate) with a loud error.
+    fn journal_has_event(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        op: OpId,
+        kind: faktor_core::event::EventKind,
+    ) -> faktor_core::Result<bool> {
+        let Some(last) = handle.last_event_seq()? else {
+            return Ok(false);
+        };
+        let mut hi = last.raw();
+        let mut pages = 0u32;
+        loop {
+            let from = hi.saturating_sub(DW_DEDUP_PAGE - 1).max(1);
+            let events = handle.events_range(from, Some(DW_DEDUP_PAGE))?;
+            if events.iter().any(|e| e.op_id == Some(op) && e.kind == kind) {
+                return Ok(true);
+            }
+            if events.is_empty() || from == 1 {
+                return Ok(false);
+            }
+            hi = from - 1;
+            pages += 1;
+            if pages >= DW_DEDUP_MAX_PAGES {
+                tracing::error!(
+                    session = %handle.id(),
+                    op = %op,
+                    pages,
+                    bound = DW_DEDUP_MAX_PAGES,
+                    "durable replay dedup scan exceeded its page bound; treating the event as \
+                     already present (a duplicate is worse than a skipped redundant append)"
+                );
+                return Ok(true);
+            }
+        }
+    }
+
+    /// True when the journal's COMPLETE history already carries the `Failed`
     /// event of `op` (the write may have committed before reporting Err).
     fn op_failure_already_journaled(
         &self,
         handle: &faktor_session::SessionHandle,
         op: OpId,
     ) -> bool {
-        let Ok(Some(last)) = handle.last_event_seq() else {
-            return false;
-        };
-        let from = last.raw().saturating_sub(511).max(1);
-        handle
-            .events_range(from, Some(512))
-            .map(|events| {
-                events
-                    .iter()
-                    .any(|e| e.op_id == Some(op) && e.kind == faktor_core::event::EventKind::Failed)
-            })
-            .unwrap_or(false)
+        match self.journal_has_event(handle, op, faktor_core::event::EventKind::Failed) {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::error!(
+                    session = %handle.id(),
+                    op = %op,
+                    error = %e.message,
+                    "durable replay dedup could not scan the journal; skipping the append to \
+                     avoid a duplicate: {e}"
+                );
+                true
+            }
+        }
     }
 
-    /// True when the ledger's bounded tail already carries this typed
+    /// True when the ledger's COMPLETE history already carries this typed
     /// decision (replay dedup: a committed-then-errored write must not mint a
-    /// duplicate decision row).
+    /// duplicate decision row). Paged backward over the durable ledger —
+    /// never a fixed tail window; a read failure or the page bound reports
+    /// `true` (conservative) with a loud error.
     fn ledger_decision_already_present(
         &self,
         handle: &faktor_session::SessionHandle,
@@ -11984,21 +12956,50 @@ impl AgentRuntime {
         choice: &str,
         rationale: &str,
     ) -> bool {
-        let rows = match self
-            .deps
-            .session
-            .store()
-            .ledger_entries_desc(handle.id(), None, 256)
-        {
-            Ok(rows) => rows,
-            Err(_) => return false,
-        };
-        rows.iter().any(|row| {
-            row.payload.get("kind").and_then(|k| k.as_str()) == Some("decision")
-                && row.payload.get("step").and_then(|v| v.as_str()) == Some(step)
-                && row.payload.get("choice").and_then(|v| v.as_str()) == Some(choice)
-                && row.payload.get("rationale").and_then(|v| v.as_str()) == Some(rationale)
-        })
+        let store = self.deps.session.store();
+        let mut before: Option<i64> = None;
+        let mut pages = 0u32;
+        loop {
+            let rows = match store.ledger_entries_desc(handle.id(), before, DW_DEDUP_PAGE) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!(
+                        session = %handle.id(),
+                        error = %e,
+                        "durable replay dedup could not scan the ledger; skipping the append to \
+                         avoid a duplicate: {e}"
+                    );
+                    return true;
+                }
+            };
+            if rows.is_empty() {
+                return false;
+            }
+            if rows.iter().any(|row| {
+                row.payload.get("kind").and_then(|k| k.as_str()) == Some("decision")
+                    && row.payload.get("step").and_then(|v| v.as_str()) == Some(step)
+                    && row.payload.get("choice").and_then(|v| v.as_str()) == Some(choice)
+                    && row.payload.get("rationale").and_then(|v| v.as_str()) == Some(rationale)
+            }) {
+                return true;
+            }
+            let short_page = rows.len() < DW_DEDUP_PAGE as usize;
+            before = rows.last().map(|row| row.seq);
+            pages += 1;
+            if short_page {
+                return false;
+            }
+            if pages >= DW_DEDUP_MAX_PAGES {
+                tracing::error!(
+                    session = %handle.id(),
+                    pages,
+                    bound = DW_DEDUP_MAX_PAGES,
+                    "durable replay ledger dedup scan exceeded its page bound; treating the \
+                     decision as already present (a duplicate is worse)"
+                );
+                return true;
+            }
+        }
     }
 
     /// Test-only fault seam: the next guarded write for `site` fails with a
@@ -12333,33 +13334,86 @@ fn remove_marker_file(path: &std::path::Path) {
 /// [`AgentRuntime::take_durable_write_fault`]).
 #[cfg(test)]
 pub(crate) mod durable_faults {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
 
-    /// Armed `(store root, site)` pairs: store-scoped so a concurrent test's
-    /// write at the same site (session ids are per-store sequences and can
-    /// collide across temp stores) can never steal another test's fault.
-    fn armed() -> &'static Mutex<HashSet<(PathBuf, String)>> {
-        static ARMED: OnceLock<Mutex<HashSet<(PathBuf, String)>>> = OnceLock::new();
-        ARMED.get_or_init(|| Mutex::new(HashSet::new()))
+    /// Armed `(store root, site)` pairs with the remaining number of fires:
+    /// store-scoped so a concurrent test's write at the same site (session
+    /// ids are per-store sequences and can collide across temp stores) can
+    /// never steal another test's fault.
+    fn armed() -> &'static Mutex<HashMap<(PathBuf, String), u32>> {
+        static ARMED: OnceLock<Mutex<HashMap<(PathBuf, String), u32>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
     /// Arm the next guarded write of the store at `root`, at `site`, to fail
     /// once.
     pub fn arm(root: &Path, site: &str) {
+        arm_repeat(root, site, 1);
+    }
+
+    /// Arm the next `times` guarded operations at `site` to fail (bounded
+    /// retry/backoff paths).
+    pub fn arm_repeat(root: &Path, site: &str, times: u32) {
         armed()
             .lock()
             .unwrap()
-            .insert((root.to_path_buf(), site.to_string()));
+            .insert((root.to_path_buf(), site.to_string()), times.max(1));
     }
 
     pub fn take(root: &Path, site: &str) -> bool {
+        let mut map = armed().lock().unwrap();
+        let key = (root.to_path_buf(), site.to_string());
+        match map.get_mut(&key) {
+            None => false,
+            Some(remaining) => {
+                let fire = *remaining > 0;
+                *remaining = remaining.saturating_sub(1);
+                if *remaining == 0 {
+                    map.remove(&key);
+                }
+                fire
+            }
+        }
+    }
+
+    /// Disarm the fault at `site` (test cleanup after a bounded-retry
+    /// assertion: the remaining fires must not leak into a later stage).
+    pub fn disarm(root: &Path, site: &str) {
         armed()
             .lock()
             .unwrap()
-            .remove(&(root.to_path_buf(), site.to_string()))
+            .remove(&(root.to_path_buf(), site.to_string()));
     }
+}
+
+/// Outcome of attaching a workspace for first-turn index evidence. The
+/// distinction matters: a BROKEN ATTACH (hostile root, unknown workspace,
+/// poisoned service) is a diagnosable failure, while NO READY GENERATION is
+/// the documented "worker still building" degrade — both keep the bounded
+/// evidence scan, but only one is a warning worth surfacing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IndexEvidenceAttach {
+    Ready,
+    NoReadyGeneration,
+    Broken(String),
+}
+
+/// Attach `workspace` to the index service and classify the outcome. Pure
+/// observation: attaching only kicks the reconciliation worker and never
+/// waits for a build.
+fn index_attach_for_evidence(
+    service: &faktor_index::IndexService,
+    workspace: WorkspaceId,
+) -> IndexEvidenceAttach {
+    if let Err(e) = service.attach(workspace) {
+        return IndexEvidenceAttach::Broken(e.to_string());
+    }
+    if service.view(workspace).is_none() {
+        return IndexEvidenceAttach::NoReadyGeneration;
+    }
+    IndexEvidenceAttach::Ready
 }
 
 /// Weak-but-honest summarizer: emits the ledger render. The compactor's hard
@@ -26378,6 +27432,501 @@ mod tests {
         assert_eq!(completed, 2);
     }
 
+    /// F12: a BROKEN index attach must be distinguished from "no Ready
+    /// generation" — both keep the bounded evidence scan, but the failure is
+    /// typed and logged instead of silently flattened into `Ok(None)`.
+    #[test]
+    fn index_attach_failure_is_distinguished_from_no_ready_generation() {
+        let dir = fresh_store_dir();
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let (deps, _keep) =
+            deps_sharing_session(manager.clone(), Arc::new(scripted_provider(vec![])), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let service = runtime.index_service().expect("index service hosted");
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn probe() -> i64 { 1 }\n").unwrap();
+        let ws = manager.create_workspace(root.to_str().unwrap()).unwrap();
+        // Attached but nothing published yet: the documented degrade.
+        assert_eq!(
+            index_attach_for_evidence(&service, ws),
+            IndexEvidenceAttach::NoReadyGeneration
+        );
+        // A workspace with no durable row: the ATTACH itself fails — a
+        // different, diagnosable outcome.
+        match index_attach_for_evidence(&service, WorkspaceId::new(424_242)) {
+            IndexEvidenceAttach::Broken(reason) => {
+                assert!(reason.contains("424242"), "{reason}");
+            }
+            other => panic!("a broken attach must never be 'not ready': {other:?}"),
+        }
+        // A published generation flips the same classification to Ready.
+        let view = service
+            .ensure_ready(ws, Instant::now() + Duration::from_secs(20))
+            .expect("generation 1 builds");
+        assert_eq!(view.generation(), 1);
+        assert_eq!(
+            index_attach_for_evidence(&service, ws),
+            IndexEvidenceAttach::Ready
+        );
+    }
+
+    /// Queue-row crash residue, `running` window (adversarial): a queued
+    /// prompt whose row was marked `running` and whose turn record is active
+    /// when the process dies must be RESUMED as the same recorded turn and
+    /// its row consumed exactly once — never re-admitted (double delivery),
+    /// never spun forever (the old `queued_prompt_count` counted `running`).
+    /// A second boot must be a clean no-op (no repeated spin).
+    #[tokio::test]
+    async fn running_queue_row_crash_residue_is_resumed_and_consumed_exactly_once() {
+        let dir = fresh_store_dir();
+        let session: SessionId;
+        let op_a: OpId;
+        let op_b: OpId;
+        {
+            let manager1 =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let (deps1, _keep) = deps_sharing_session(
+                manager1.clone(),
+                Arc::new(scripted_provider(vec![
+                    ScriptedResponse::Text("A answer".into()),
+                    ScriptedResponse::End,
+                ])),
+                vec![],
+            );
+            let runtime1 = AgentRuntime::new(deps1).unwrap();
+            let ws = manager1.create_workspace("/w").unwrap();
+            let handle = manager1.create_session(ws, "t", "fake", "m").unwrap();
+            session = handle.id();
+            // A is the active turn; B queues behind it.
+            let ra = handle.submit_prompt("task A", &[]).unwrap();
+            op_a = ra.op_id;
+            let rb = handle.submit_prompt("task B", &[]).unwrap();
+            assert!(rb.queued);
+            op_b = rb.op_id;
+            // Drive A to its end (B stays pending).
+            let outcome = runtime1.drive_receipt(&handle, ra, None).await.unwrap();
+            assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+            // CRASH WINDOW: B is admitted (record active, message
+            // materialized) and marked `running`, then the drive dies before
+            // the terminal mark.
+            let admitted = handle.admit_next_queued().unwrap().unwrap();
+            assert_eq!(admitted.op_id, op_b);
+            handle
+                .mark_queued_status(admitted.queue_seq, "running")
+                .unwrap();
+            assert_eq!(handle.queued_prompt_count().unwrap(), 1);
+            assert_eq!(handle.state().unwrap(), AgentState::Preparing);
+            drop(runtime1);
+        }
+        // Restart: recovery must RESUME the recorded turn of the running row
+        // (not re-admit B) and consume the row exactly once.
+        let provider = Arc::new(scripted_provider(vec![
+            ScriptedResponse::Text("B answer".into()),
+            ScriptedResponse::End,
+        ]));
+        let (deps2, _keep2) = reopen_runtime(&dir, provider.clone(), vec![]);
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let handle2 = runtime2
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            runtime2
+                .deps()
+                .session
+                .store()
+                .sessions_with_pending_queues()
+                .unwrap(),
+            vec![session],
+            "the crashed row is the runnable marker before recovery"
+        );
+        runtime2.run_session_queue(session).await;
+        assert_eq!(handle2.queued_prompt_count().unwrap(), 0, "queue drained");
+        let records = handle2.turn_records().unwrap();
+        assert_eq!(records.len(), 2, "one record per logical turn (never 3)");
+        assert_eq!(records[0].turn_op_id, op_a);
+        assert_eq!(records[0].status, "completed");
+        assert_eq!(records[1].turn_op_id, op_b);
+        assert_eq!(records[1].status, "completed");
+        let events = handle2.events_range(1, None).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == faktor_core::event::EventKind::PromptReceived
+                    && e.op_id == Some(op_b))
+                .count(),
+            1,
+            "B received exactly one prompt"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == faktor_core::event::EventKind::PromptAdmitted
+                    && e.op_id == Some(op_b))
+                .count(),
+            0,
+            "the running row's turn was RESUMED, never re-admitted"
+        );
+        assert!(
+            runtime2
+                .deps()
+                .session
+                .store()
+                .sessions_with_pending_queues()
+                .unwrap()
+                .is_empty(),
+            "no row is left for the next boot"
+        );
+        assert_eq!(
+            provider.script.lock().unwrap().len(),
+            0,
+            "B's turn consumed exactly one provider script"
+        );
+        let events_after_first_boot = handle2.events_range(1, None).unwrap().len();
+        // Second boot: nothing to do, no provider call, no spin.
+        runtime2.run_session_queue(session).await;
+        assert_eq!(
+            provider.script.lock().unwrap().len(),
+            0,
+            "the second boot must not drive anything again"
+        );
+        assert_eq!(
+            handle2.events_range(1, None).unwrap().len(),
+            events_after_first_boot,
+            "the second boot appends no journal event"
+        );
+    }
+
+    /// Queue-row crash residue, orphaned `running` window (adversarial): a
+    /// `running` row whose logical turn already ended (no active turn
+    /// record) must be retired to `done` by recovery — never re-admitted
+    /// (which would deliver the same prompt twice), never counted forever.
+    /// `abort(None)` must be able to clear a running row too.
+    #[tokio::test]
+    async fn orphaned_running_queue_row_is_retired_and_abortable() {
+        let dir = fresh_store_dir();
+        let session: SessionId;
+        {
+            let manager1 =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let (deps1, _keep) = deps_sharing_session(
+                manager1.clone(),
+                Arc::new(scripted_provider(vec![])),
+                vec![],
+            );
+            let _runtime1 = AgentRuntime::new(deps1).unwrap();
+            let ws = manager1.create_workspace("/w").unwrap();
+            let handle = manager1.create_session(ws, "t", "fake", "m").unwrap();
+            session = handle.id();
+            // A queued row admitted and marked running, but its logical turn
+            // already ended (no active turn record): the terminal mark was
+            // lost to the crash.
+            let op = manager1.try_next_op_id().unwrap();
+            manager1
+                .store()
+                .enqueue_prompt(session, op, "task B", &[], None, None, None, 1)
+                .unwrap();
+            let seq = manager1
+                .store()
+                .queue_head(session)
+                .unwrap()
+                .unwrap()
+                .queue_seq;
+            handle.mark_queued_status(seq, "running").unwrap();
+            assert!(handle.active_turn_record().unwrap().is_none());
+            assert_eq!(handle.queued_prompt_count().unwrap(), 1);
+            drop(_runtime1);
+        }
+        let provider = Arc::new(scripted_provider(vec![
+            ScriptedResponse::Text("must never run".into()),
+            ScriptedResponse::End,
+        ]));
+        let (deps2, _keep2) = reopen_runtime(&dir, provider.clone(), vec![]);
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let handle2 = runtime2
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+        runtime2.run_session_queue(session).await;
+        assert_eq!(
+            provider.script.lock().unwrap().len(),
+            2,
+            "the orphaned running row must never be re-admitted"
+        );
+        assert_eq!(handle2.queued_prompt_count().unwrap(), 0);
+        assert!(runtime2
+            .deps()
+            .session
+            .store()
+            .sessions_with_pending_queues()
+            .unwrap()
+            .is_empty());
+
+        // abort(None) coverage: a running row is cancellable.
+        let dir2 = fresh_store_dir();
+        let manager =
+            SessionManager::open(dir2.path().join("store"), dir2.path().join("cas"), true).unwrap();
+        let (deps3, _keep3) =
+            deps_sharing_session(manager.clone(), Arc::new(scripted_provider(vec![])), vec![]);
+        let runtime3 = AgentRuntime::new(deps3).unwrap();
+        let ws = manager.create_workspace("/w").unwrap();
+        let handle = manager.create_session(ws, "t", "fake", "m").unwrap();
+        let active = handle.submit_prompt("active", &[]).unwrap();
+        let op = manager.try_next_op_id().unwrap();
+        manager
+            .store()
+            .enqueue_prompt(handle.id(), op, "queued", &[], None, None, None, 1)
+            .unwrap();
+        handle
+            .mark_queued_status(
+                manager
+                    .store()
+                    .queue_head(handle.id())
+                    .unwrap()
+                    .unwrap()
+                    .queue_seq,
+                "running",
+            )
+            .unwrap();
+        assert_eq!(handle.queued_prompt_count().unwrap(), 1);
+        let receipt = runtime3.abort_op(handle.id(), None).unwrap();
+        assert!(receipt.contains(&active.op_id) && receipt.contains(&op));
+        assert_eq!(
+            handle.queued_prompt_count().unwrap(),
+            0,
+            "abort(None) clears a running row"
+        );
+        assert!(manager
+            .store()
+            .sessions_with_pending_queues()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// F3: a transient store READ FAILURE on the queue runner's durable
+    /// re-check is never an empty queue. The gate stays armed, retries
+    /// (bounded), and the retried pass drains the durable head — the prompt
+    /// is not dropped and the runner is not released on the error.
+    #[tokio::test]
+    async fn queue_head_read_failure_recheck_keeps_gate_armed_then_drains() {
+        let dir = fresh_store_dir();
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let provider = Arc::new(scripted_provider(vec![
+            ScriptedResponse::Text("answer".into()),
+            ScriptedResponse::End,
+        ]));
+        let (deps, _keep) = deps_sharing_session(manager.clone(), provider.clone(), vec![]);
+        let runtime = Arc::new(AgentRuntime::new(deps).unwrap());
+        let ws = manager.create_workspace("/w").unwrap();
+        let handle = manager.create_session(ws, "t", "fake", "m").unwrap();
+        let op = manager.try_next_op_id().unwrap();
+        manager
+            .store()
+            .enqueue_prompt(handle.id(), op, "queued", &[], None, None, None, 1)
+            .unwrap();
+        assert_eq!(handle.queued_prompt_count().unwrap(), 1);
+        durable_faults::arm(manager.store().root(), DW_SITE_QUEUE_HEAD_READ);
+        runtime.run_session_queue(handle.id()).await;
+        assert_eq!(
+            provider.script.lock().unwrap().len(),
+            0,
+            "the retried pass must drain the durable queue head (no prompt dropped)"
+        );
+        assert_eq!(handle.queued_prompt_count().unwrap(), 0);
+    }
+
+    /// F3 (adversarial): a PERSISTENT queue-head read failure must not be
+    /// read as "empty" (which would release the gate immediately) and must
+    /// not spin forever. The runner retries a bounded number of passes,
+    /// leaves the durable row pending (it is never dropped), and records the
+    /// exhausted retries as a durable audit marker.
+    #[tokio::test]
+    async fn queue_head_read_failure_is_bounded_loud_and_leaves_rows_pending() {
+        let dir = fresh_store_dir();
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let (deps, _keep) =
+            deps_sharing_session(manager.clone(), Arc::new(scripted_provider(vec![])), vec![]);
+        let runtime = Arc::new(AgentRuntime::new(deps).unwrap());
+        runtime.set_turn_budget_ms(60);
+        let ws = manager.create_workspace("/w").unwrap();
+        let handle = manager.create_session(ws, "t", "fake", "m").unwrap();
+        let op = manager.try_next_op_id().unwrap();
+        manager
+            .store()
+            .enqueue_prompt(handle.id(), op, "queued", &[], None, None, None, 1)
+            .unwrap();
+        // Mid-turn without a turn record: admission declines for the whole
+        // pass, so the pass ends in its bounded typed timeout and the gate
+        // re-check is what the fault targets.
+        let active = manager.try_next_op_id().unwrap();
+        handle
+            .append_event(
+                faktor_core::event::EventKind::PromptReceived,
+                AgentState::Preparing,
+                Some(active),
+                Some(serde_json::json!({ "queued": false })),
+            )
+            .unwrap();
+        durable_faults::arm_repeat(manager.store().root(), DW_SITE_QUEUE_HEAD_READ, u32::MAX);
+        let began = Instant::now();
+        runtime.run_session_queue(handle.id()).await;
+        let elapsed = began.elapsed();
+        durable_faults::disarm(manager.store().root(), DW_SITE_QUEUE_HEAD_READ);
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the retry loop is bounded (took {elapsed:?})"
+        );
+        assert_eq!(
+            handle.queued_prompt_count().unwrap(),
+            1,
+            "the durable queue head is never dropped by a read failure"
+        );
+        let events = handle.events_range(1, None).unwrap();
+        assert!(
+            events.iter().any(|e| {
+                e.kind == faktor_core::event::EventKind::CrashDetected
+                    && e.payload.as_ref().is_some_and(|p| {
+                        p.get("durable_write_failure")
+                            .and_then(|d| d.get("site"))
+                            .and_then(|s| s.as_str())
+                            == Some(DW_SITE_QUEUE_HEAD_READ)
+                    })
+            }),
+            "the exhausted retries leave a durable audit marker naming the site"
+        );
+    }
+
+    /// F4: a turn parked on a durable permission makes the queue runner
+    /// exhaust its bounded wait (typed timeout). Resolving the permission
+    /// must RE-KICK the queue through the same bounded runner — without a
+    /// new submit — and the queued prompt must be delivered exactly once.
+    #[tokio::test]
+    async fn resolve_permission_rekicks_a_queue_parked_on_the_durable_permission() {
+        let dir = fresh_store_dir();
+        let session: SessionId;
+        let perm_id: i64;
+        let op_a: OpId;
+        let op_b: OpId;
+        {
+            let manager1 =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let (deps1, _keep) = deps_sharing_session(
+                manager1.clone(),
+                Arc::new(scripted_provider(vec![])),
+                vec![],
+            );
+            let runtime1 = AgentRuntime::new(deps1).unwrap();
+            let ws = manager1.create_workspace("/w").unwrap();
+            let handle = manager1.create_session(ws, "t", "fake", "m").unwrap();
+            session = handle.id();
+            let ra = handle.submit_prompt("task A", &[]).unwrap();
+            op_a = ra.op_id;
+            // Walk the machine to Streaming with the documented legal chain
+            // (the state the real drive is in when it requests a permission).
+            for (kind, state) in [
+                (
+                    faktor_core::event::EventKind::ContextPrepared,
+                    AgentState::BuildingContext,
+                ),
+                (
+                    faktor_core::event::EventKind::ModelStarted,
+                    AgentState::WaitingForModel,
+                ),
+                (
+                    faktor_core::event::EventKind::ModelChunkReceived,
+                    AgentState::Streaming,
+                ),
+            ] {
+                handle.append_event(kind, state, Some(op_a), None).unwrap();
+            }
+            // The turn parks on a durable permission (exactly what the drive
+            // does at its permission hop) and B queues behind it.
+            let perm = handle
+                .request_permission(
+                    ra.op_id,
+                    &Capability::ExecuteShell {
+                        command: "rm".into(),
+                    },
+                )
+                .unwrap();
+            perm_id = perm.id;
+            let rb = handle.submit_prompt("task B", &[]).unwrap();
+            op_b = rb.op_id;
+            assert!(rb.queued);
+            assert_eq!(handle.state().unwrap(), AgentState::WaitingForPermission);
+            drop(runtime1);
+        }
+        let provider = Arc::new(scripted_provider(vec![
+            ScriptedResponse::Text("A answer".into()),
+            ScriptedResponse::End,
+            ScriptedResponse::Text("B answer".into()),
+            ScriptedResponse::End,
+        ]));
+        let (deps2, _keep2) = reopen_runtime(&dir, provider.clone(), vec![]);
+        let runtime2 = Arc::new(AgentRuntime::new(deps2).unwrap());
+        runtime2.set_turn_budget_ms(150);
+        let handle2 = runtime2
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle2.queued_prompt_count().unwrap(), 1);
+        // The runner cannot continue a permission-parked turn: bounded typed
+        // timeout, durable head untouched.
+        let err = runtime2
+            .run_session_queue_inner(session)
+            .await
+            .expect_err("a permission-parked turn is not continuable");
+        assert_eq!(err.kind, ErrorKind::Timeout, "{err:?}");
+        assert_eq!(handle2.queued_prompt_count().unwrap(), 1, "still parked");
+        // Resolve the permission: this path must re-kick the SAME queue.
+        runtime2
+            .resolve_permission(session, perm_id, PermissionDecision::Allow)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while handle2.queued_prompt_count().unwrap() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "resolving the permission must re-kick and drain the queue"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            provider.script.lock().unwrap().len(),
+            0,
+            "A resumed and B delivered (one script each)"
+        );
+        let events = handle2.events_range(1, None).unwrap();
+        for (op, label) in [(op_a, "A"), (op_b, "B")] {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.kind == faktor_core::event::EventKind::PromptReceived
+                        && e.op_id == Some(op))
+                    .count(),
+                1,
+                "{label} received exactly one prompt"
+            );
+        }
+        let records = handle2.turn_records().unwrap();
+        assert!(
+            records.iter().all(|r| r.status != "active"),
+            "every logical turn ended: {records:?}"
+        );
+    }
+
     #[tokio::test]
     async fn idempotent_tool_interrupted_replays_exactly_once() {
         // Requirement 2a: an idempotent tool interrupted before completion
@@ -30226,6 +31775,470 @@ mod tests {
                 "hostile evidence must degrade to an empty package, got: {system}"
             );
         }
+    }
+
+    // ------------------------------- durable typed evidence-poll status
+    //
+    // The advisory poll used to hand the turn only its package, so a failed
+    // retrieval and an honest "no evidence" answer were the SAME durable
+    // fact. These tests drive the real loop with a BLOCKED index root (the
+    // documented degrade to `deps.evidence`) and read every typed status back
+    // from the durable evidence authority: each outcome is distinct, bounded
+    // and survives a store reopen, while the advisory policy leaves the turn
+    // itself untouched.
+
+    /// Legacy evidence provider that always fails with the given error.
+    struct FailingEvidence {
+        error: Error,
+    }
+
+    impl EvidenceProvider for FailingEvidence {
+        fn evidence_for(
+            &self,
+            _s: SessionId,
+            _q: EvidenceQuery,
+        ) -> futures::future::BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
+            let error = self.error.clone();
+            Box::pin(async move { Err(error) })
+        }
+    }
+
+    /// Legacy evidence provider that honestly answers "nothing matched".
+    struct EmptyEvidence;
+
+    impl EvidenceProvider for EmptyEvidence {
+        fn evidence_for(
+            &self,
+            _s: SessionId,
+            _q: EvidenceQuery,
+        ) -> futures::future::BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+    }
+
+    /// Legacy evidence provider that SERVES the given package byte-for-byte.
+    struct ServingEvidence {
+        package: Vec<Evidence>,
+    }
+
+    impl EvidenceProvider for ServingEvidence {
+        fn evidence_for(
+            &self,
+            _s: SessionId,
+            _q: EvidenceQuery,
+        ) -> futures::future::BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
+            let package = self.package.clone();
+            Box::pin(async move { Ok(package) })
+        }
+    }
+
+    /// Deps for one legacy-poll drive: the given model provider, a BLOCKED
+    /// index root (so every turn degrades to `deps.evidence`), and one
+    /// workspace/session whose prompt changes no files (the cold path yields
+    /// nothing, so the legacy poll is the turn's only evidence provider).
+    fn poll_drive_deps(
+        provider: Arc<dyn faktor_provider::Provider>,
+        evidence: Arc<dyn EvidenceProvider>,
+    ) -> (AgentDeps, tempfile::TempDir, SessionId, WorkspaceId, TaskId) {
+        let (mut deps, dir) = deps_with(provider, vec![]);
+        std::fs::write(
+            dir.path().join("store").join("index_data"),
+            b"not a directory",
+        )
+        .unwrap();
+        let ws_root = dir.path().join("repo");
+        std::fs::create_dir_all(ws_root.join("src")).unwrap();
+        std::fs::write(
+            ws_root.join("src").join("lib.rs"),
+            "pub fn balance_account() -> i64 { 42 }\n",
+        )
+        .unwrap();
+        let ws = deps
+            .session
+            .create_workspace(ws_root.to_str().unwrap())
+            .unwrap();
+        let sid = deps
+            .session
+            .create_session(ws, "ev-poll", "fake", "m")
+            .unwrap()
+            .id();
+        deps.evidence = evidence;
+        let task_id = deps
+            .session
+            .get_session(sid)
+            .unwrap()
+            .unwrap()
+            .task_id()
+            .unwrap();
+        (deps, dir, sid, ws, task_id)
+    }
+
+    /// Every durable typed poll status archived for the task scope, decoded
+    /// through the canonical encoding.
+    fn archived_poll_statuses(
+        authority: &DurableEvidenceAuthority,
+        sid: SessionId,
+        ws: WorkspaceId,
+        task_id: TaskId,
+    ) -> Vec<crate::EvidencePollStatus> {
+        let ctx = faktor_context::compiler::EvidenceAccessContext::new(
+            sid.raw(),
+            ws.raw(),
+            Some(task_id.raw()),
+        );
+        authority
+            .list_scoped_envelopes(&ctx, 64)
+            .unwrap()
+            .into_iter()
+            .filter(|env| {
+                env.kind == EvidenceKind::GenericText
+                    && env
+                        .source_revision
+                        .as_deref()
+                        .is_some_and(|revision| revision.starts_with("evidence-poll:"))
+            })
+            .map(|env| {
+                decode_evidence_poll_status(&env.compact.body)
+                    .expect("a durable poll status must decode")
+            })
+            .collect()
+    }
+
+    fn one_text_turn() -> Vec<ScriptedResponse> {
+        vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_poll_retrieval_failure_is_durable_and_not_no_evidence() {
+        let (deps, _dir, sid, ws, task_id) = poll_drive_deps(
+            Arc::new(scripted_provider(one_text_turn())),
+            Arc::new(FailingEvidence {
+                error: Error::new(
+                    ErrorKind::Provider {
+                        code: "E_INDEX_OFFLINE".into(),
+                        retryable: true,
+                    },
+                    "index shard offline",
+                ),
+            }),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime.run_turn(sid, "inspect", &[]).await.unwrap();
+        // Documented advisory policy: a degraded poll never fails the turn
+        // by itself.
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let expected = crate::EvidencePollStatus::RetrievalFailed {
+            code: "E_INDEX_OFFLINE".into(),
+            retryable: true,
+            message: "index shard offline".into(),
+        };
+        // The turn diagnostics carry the typed failure...
+        let diagnostic = outcome
+            .evidence_poll
+            .as_deref()
+            .expect("the polled turn must carry poll diagnostics");
+        assert_eq!(
+            decode_evidence_poll_status(diagnostic),
+            Some(expected.clone())
+        );
+        // ... and so does the durable record (the same canonical bytes),
+        // which is a DIFFERENT fact from an honest empty answer.
+        let durable = archived_poll_statuses(runtime.evidence_authority(), sid, ws, task_id);
+        assert_eq!(durable, vec![expected]);
+        assert!(durable[0].is_degraded());
+        assert_ne!(
+            encode_evidence_poll_status(&durable[0]),
+            encode_evidence_poll_status(&crate::EvidencePollStatus::NoEvidence),
+            "a failed retrieval must never encode identically to no evidence"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_poll_empty_result_is_durable_no_evidence() {
+        let (deps, _dir, sid, ws, task_id) = poll_drive_deps(
+            Arc::new(scripted_provider(one_text_turn())),
+            Arc::new(EmptyEvidence),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime.run_turn(sid, "inspect", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(
+            decode_evidence_poll_status(outcome.evidence_poll.as_deref().unwrap()),
+            Some(crate::EvidencePollStatus::NoEvidence)
+        );
+        let durable = archived_poll_statuses(runtime.evidence_authority(), sid, ws, task_id);
+        assert_eq!(durable, vec![crate::EvidencePollStatus::NoEvidence]);
+        assert!(
+            !durable[0].is_degraded(),
+            "an honest empty answer is NOT a degradation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_poll_panic_is_durable_provider_panicked() {
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (deps, _dir, sid, ws, task_id) = poll_drive_deps(
+            Arc::new(scripted_provider(one_text_turn())),
+            Arc::new(PanickingEvidence {
+                started: started.clone(),
+            }),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime.run_turn(sid, "inspect", &[]).await.unwrap();
+        assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        match decode_evidence_poll_status(outcome.evidence_poll.as_deref().unwrap()) {
+            Some(crate::EvidencePollStatus::ProviderPanicked { message }) => {
+                assert!(message.contains("adversarial"), "{message}");
+            }
+            other => panic!("expected ProviderPanicked, got {other:?}"),
+        }
+        let durable = archived_poll_statuses(runtime.evidence_authority(), sid, ws, task_id);
+        assert!(
+            matches!(
+                durable.as_slice(),
+                [crate::EvidencePollStatus::ProviderPanicked { .. }]
+            ),
+            "{durable:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_poll_timeout_is_durable_timed_out() {
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (deps, _dir, sid, ws, task_id) = poll_drive_deps(
+            Arc::new(scripted_provider(one_text_turn())),
+            Arc::new(ParkedEvidence {
+                started: started.clone(),
+            }),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime.run_turn(sid, "inspect", &[]).await.unwrap();
+        assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let expected = crate::EvidencePollStatus::TimedOut {
+            budget_ms: LEGACY_EVIDENCE_MAX_WAIT.as_millis() as u64,
+        };
+        assert_eq!(
+            decode_evidence_poll_status(outcome.evidence_poll.as_deref().unwrap()),
+            Some(expected.clone())
+        );
+        let durable = archived_poll_statuses(runtime.evidence_authority(), sid, ws, task_id);
+        assert_eq!(durable, vec![expected]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_poll_served_keeps_ranking_and_is_durable_served() {
+        let captured: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook = {
+            let captured = captured.clone();
+            move |_n: usize, req: &GenericAgentRequest| -> Result<(), String> {
+                captured.lock().unwrap().push(req.system.clone());
+                Ok(())
+            }
+        };
+        let inspected: Arc<dyn faktor_provider::Provider> = Arc::new(InspectingProvider::new(
+            Arc::new(scripted_provider(one_text_turn())),
+            hook,
+        ));
+        let (deps, _dir, sid, ws, task_id) = poll_drive_deps(
+            inspected,
+            Arc::new(ServingEvidence {
+                package: vec![
+                    Evidence {
+                        path: "svc/low".into(),
+                        snippet: "low hit".into(),
+                        score: 0.2,
+                    },
+                    Evidence {
+                        path: "svc/high".into(),
+                        snippet: "high hit".into(),
+                        score: 0.9,
+                    },
+                ],
+            }),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime.run_turn(sid, "inspect", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        // The served package reaches the model with its ranking intact
+        // (highest score first) — the typed poll changed no ordering.
+        let systems = captured.lock().unwrap();
+        assert_eq!(systems.len(), 1, "one wire request for the turn");
+        let system = &systems[0];
+        let high = system
+            .find("### svc/high")
+            .unwrap_or_else(|| panic!("served evidence missing: {system}"));
+        let low = system
+            .find("### svc/low")
+            .unwrap_or_else(|| panic!("served evidence missing: {system}"));
+        assert!(high < low, "highest score must render first: {system}");
+        // The durable status is Served, never degraded.
+        assert_eq!(
+            decode_evidence_poll_status(outcome.evidence_poll.as_deref().unwrap()),
+            Some(crate::EvidencePollStatus::Served)
+        );
+        let durable = archived_poll_statuses(runtime.evidence_authority(), sid, ws, task_id);
+        assert_eq!(durable, vec![crate::EvidencePollStatus::Served]);
+        assert!(!durable[0].is_degraded());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_poll_hostile_status_fields_are_bounded_durably() {
+        let (deps, _dir, sid, ws, task_id) = poll_drive_deps(
+            Arc::new(scripted_provider(one_text_turn())),
+            Arc::new(FailingEvidence {
+                error: Error::new(
+                    ErrorKind::Provider {
+                        code: "C".repeat(64 * 1024),
+                        retryable: false,
+                    },
+                    "m".repeat(64 * 1024),
+                ),
+            }),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime.run_turn(sid, "inspect", &[]).await.unwrap();
+        let diagnostic = outcome.evidence_poll.as_deref().unwrap();
+        assert!(
+            diagnostic.len() <= EVIDENCE_POLL_DURABLE_MAX_BYTES,
+            "the turn diagnostic must be bounded, got {} bytes",
+            diagnostic.len()
+        );
+        let ctx = faktor_context::compiler::EvidenceAccessContext::new(
+            sid.raw(),
+            ws.raw(),
+            Some(task_id.raw()),
+        );
+        let bodies: Vec<String> = runtime
+            .evidence_authority()
+            .list_scoped_envelopes(&ctx, 64)
+            .unwrap()
+            .into_iter()
+            .filter(|env| {
+                env.kind == EvidenceKind::GenericText
+                    && env
+                        .source_revision
+                        .as_deref()
+                        .is_some_and(|revision| revision.starts_with("evidence-poll:"))
+            })
+            .map(|env| env.compact.body)
+            .collect();
+        assert_eq!(bodies.len(), 1);
+        assert!(
+            bodies[0].len() <= EVIDENCE_POLL_DURABLE_MAX_BYTES,
+            "the durable row must be bounded, got {} bytes",
+            bodies[0].len()
+        );
+        match decode_evidence_poll_status(&bodies[0]) {
+            Some(crate::EvidencePollStatus::RetrievalFailed {
+                code,
+                retryable,
+                message,
+            }) => {
+                assert!(!retryable, "retryability survives truncation");
+                assert!(code.len() <= EVIDENCE_POLL_DURABLE_CODE_MAX_BYTES);
+                assert!(message.len() <= EVIDENCE_POLL_DURABLE_MESSAGE_MAX_BYTES);
+            }
+            other => panic!("expected a bounded RetrievalFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn durable_poll_encoding_round_trips_and_bounds_multibyte_fields() {
+        let status = crate::EvidencePollStatus::RetrievalFailed {
+            code: "K".repeat(EVIDENCE_POLL_DURABLE_CODE_MAX_BYTES + 16),
+            retryable: true,
+            message: "\u{e9}".repeat(EVIDENCE_POLL_DURABLE_MESSAGE_MAX_BYTES),
+        };
+        let encoded = encode_evidence_poll_status(&status);
+        assert!(encoded.len() <= EVIDENCE_POLL_DURABLE_MAX_BYTES);
+        match decode_evidence_poll_status(&encoded) {
+            Some(crate::EvidencePollStatus::RetrievalFailed {
+                code,
+                retryable,
+                message,
+            }) => {
+                assert!(retryable);
+                assert_eq!(code.len(), EVIDENCE_POLL_DURABLE_CODE_MAX_BYTES);
+                assert!(message.len() <= EVIDENCE_POLL_DURABLE_MESSAGE_MAX_BYTES);
+                assert!(message.is_char_boundary(message.len()));
+            }
+            other => panic!("expected a bounded RetrievalFailed, got {other:?}"),
+        }
+        // Hostile bytes never panic and never become a typed status.
+        assert!(decode_evidence_poll_status("").is_none());
+        assert!(decode_evidence_poll_status("not json").is_none());
+        assert!(decode_evidence_poll_status(
+            "{\"schema\":999,\"status\":\"served\",\"degraded\":false}"
+        )
+        .is_none());
+        assert!(decode_evidence_poll_status(
+            "{\"schema\":1,\"status\":\"made_up\",\"degraded\":true}"
+        )
+        .is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_poll_status_survives_store_reopen() {
+        let (deps, dir, sid, ws, task_id) = poll_drive_deps(
+            Arc::new(scripted_provider(one_text_turn())),
+            Arc::new(FailingEvidence {
+                error: Error::new(
+                    ErrorKind::Provider {
+                        code: "E_REOPEN".into(),
+                        retryable: false,
+                    },
+                    "provider died mid-retrieval",
+                ),
+            }),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime.run_turn(sid, "inspect", &[]).await.unwrap();
+        let canonical = outcome
+            .evidence_poll
+            .clone()
+            .expect("poll diagnostics on the polled turn");
+        drop(runtime);
+        // A fresh manager over the SAME store directory: the archived row is
+        // the durable truth, not an in-memory artifact.
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let authority =
+            DurableEvidenceAuthority::for_store(manager.store(), EVIDENCE_BACKING_CAP_BYTES);
+        let durable = archived_poll_statuses(&authority, sid, ws, task_id);
+        assert_eq!(
+            durable,
+            vec![crate::EvidencePollStatus::RetrievalFailed {
+                code: "E_REOPEN".into(),
+                retryable: false,
+                message: "provider died mid-retrieval".into(),
+            }]
+        );
+        let ctx = faktor_context::compiler::EvidenceAccessContext::new(
+            sid.raw(),
+            ws.raw(),
+            Some(task_id.raw()),
+        );
+        let bodies: Vec<String> = authority
+            .list_scoped_envelopes(&ctx, 64)
+            .unwrap()
+            .into_iter()
+            .filter(|env| {
+                env.kind == EvidenceKind::GenericText
+                    && env
+                        .source_revision
+                        .as_deref()
+                        .is_some_and(|revision| revision.starts_with("evidence-poll:"))
+            })
+            .map(|env| env.compact.body)
+            .collect();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(
+            bodies[0], canonical,
+            "the reopened row must be byte-identical to the turn diagnostic"
+        );
     }
 
     #[tokio::test]
@@ -34901,6 +36914,408 @@ mod tests {
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
     }
 
+    /// Write one raw marker file (tests fabricate markers exactly like the
+    /// production writer does).
+    fn write_raw_marker(dir: &std::path::Path, name: &str, value: &serde_json::Value) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(name),
+            serde_json::to_vec(value).expect("marker serializes"),
+        )
+        .unwrap();
+    }
+
+    /// F6 (adversarial): marker files are created with `create_new` and a
+    /// pid+random name tail — an existing marker is NEVER overwritten, even
+    /// when the base name is identical (two processes sharing a store root).
+    #[test]
+    fn marker_files_never_overwrite_on_name_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = write_marker_file(dir.path(), "dw-base", b"one").unwrap();
+        let second = write_marker_file(dir.path(), "dw-base", b"two").unwrap();
+        assert_ne!(
+            first, second,
+            "a colliding marker name must never overwrite the existing file"
+        );
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
+        assert_eq!(std::fs::read(&second).unwrap(), b"two");
+        // The production name tail varies per call even at the same
+        // millisecond (pid + RandomState-seeded tag).
+        assert_ne!(marker_random_tag(42, 1), marker_random_tag(42, 1));
+    }
+
+    /// F11 (adversarial): markers are handled PER STATE — terminal states are
+    /// consumed, unknown states and corrupt files are surfaced and retained,
+    /// pending markers replay — and the directory is bounded by consuming
+    /// the oldest terminal markers while pending work is NEVER deleted.
+    #[tokio::test]
+    async fn marker_states_are_handled_and_the_directory_is_bounded() {
+        let (deps, _dir) = deps(scripted_provider(vec![]), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let manager = runtime.deps().session.clone();
+        let session = new_session(runtime.deps());
+        let handle = manager.get_session(session).unwrap().unwrap();
+        let root = manager.store().root().to_path_buf();
+        let marker_dir = root.join(DURABLE_WRITE_MARKER_DIR);
+        std::fs::create_dir_all(&marker_dir).unwrap();
+
+        // Corrupt file: retained (never silently deleted or replayed).
+        std::fs::write(marker_dir.join("dw-0-corrupt.json"), b"{not json").unwrap();
+        // Unknown status: retained, never replayed.
+        write_raw_marker(
+            &marker_dir,
+            "dw-1-unknown.json",
+            &serde_json::json!({
+                "status": "weird",
+                "session": session.raw(),
+                "at_ms": 1,
+                "intent": {"write": "reset_loop_signals"},
+            }),
+        );
+        // Terminal status: consumed, never replayed.
+        write_raw_marker(
+            &marker_dir,
+            "dw-2-applied.json",
+            &serde_json::json!({
+                "status": "applied",
+                "session": session.raw(),
+                "at_ms": 2,
+                "intent": {"write": "reset_loop_signals"},
+            }),
+        );
+        runtime.replay_durable_write_failures(&handle);
+        let names: Vec<String> = marker_files(&root)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.contains("corrupt")),
+            "a corrupt marker is retained: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("unknown")),
+            "an unknown status is retained: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("applied")),
+            "a terminal marker is consumed: {names:?}"
+        );
+
+        // Directory bound: with the bound overridden to 2, GC consumes the
+        // oldest terminal marker, keeps every pending marker (durable work),
+        // and is loud afterwards.
+        DURABLE_WRITE_MARKER_DIR_MAX_OVERRIDE.store(2, std::sync::atomic::Ordering::Relaxed);
+        for i in 0..3 {
+            write_raw_marker(
+                &marker_dir,
+                &format!("dw-pending-{i}.json"),
+                &serde_json::json!({
+                    "status": "pending",
+                    "session": session.raw(),
+                    "at_ms": 10 + i,
+                    "attempts": 0,
+                    "site": "test",
+                    "intent": {"write": "reset_loop_signals"},
+                }),
+            );
+        }
+        gc_durable_write_markers(&marker_dir);
+        DURABLE_WRITE_MARKER_DIR_MAX_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+        let files = marker_files(&root);
+        let pending_left = files
+            .iter()
+            .filter(|p| p.file_name().unwrap().to_string_lossy().contains("pending"))
+            .count();
+        assert_eq!(
+            pending_left, 3,
+            "pending markers are never deleted by the directory GC: {:?}",
+            files
+        );
+    }
+
+    /// F5 (adversarial, >old-window): a `JournalFailed` marker whose original
+    /// event is FAR beyond the old 512-event tail (2400 later legal events)
+    /// must not replay as a duplicate Failed event.
+    #[tokio::test]
+    async fn failed_journal_replay_dedups_beyond_the_old_window() {
+        let (deps, _dir) = deps(scripted_provider(vec![]), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let manager = runtime.deps().session.clone();
+        let session = new_session(runtime.deps());
+        let handle = manager.get_session(session).unwrap().unwrap();
+        let receipt = runtime.submit(session, "run", &[]).unwrap();
+        let op = receipt.op_id;
+        // The logical turn's record stays ACTIVE (the crash window: the
+        // journal write landed, its record close is part of the same intent).
+        handle
+            .start_turn_record(op, None, None, "fake", "m", None)
+            .unwrap();
+        handle
+            .force_append_event(
+                faktor_core::event::EventKind::Failed,
+                AgentState::FailedRecoverable,
+                Some(op),
+                Some(serde_json::json!({"message": "injected"})),
+            )
+            .unwrap();
+        // 2400 legal events afterwards: the old 512-event window can never
+        // see the original Failed event.
+        for i in 0..600u64 {
+            let filler = OpId::new(9_000_000 + i);
+            for (kind, state) in [
+                (
+                    faktor_core::event::EventKind::PromptReceived,
+                    AgentState::Preparing,
+                ),
+                (
+                    faktor_core::event::EventKind::ContextPrepared,
+                    AgentState::BuildingContext,
+                ),
+                (
+                    faktor_core::event::EventKind::ModelStarted,
+                    AgentState::WaitingForModel,
+                ),
+                (
+                    faktor_core::event::EventKind::Failed,
+                    AgentState::FailedRecoverable,
+                ),
+            ] {
+                let payload = (kind == faktor_core::event::EventKind::Failed)
+                    .then(|| serde_json::json!({ "message": "filler failure" }));
+                handle
+                    .append_event(kind, state, Some(filler), payload)
+                    .unwrap();
+            }
+        }
+        let before = handle
+            .events_range(1, None)
+            .unwrap()
+            .iter()
+            .filter(|e| e.op_id == Some(op) && e.kind == faktor_core::event::EventKind::Failed)
+            .count();
+        assert_eq!(before, 1);
+        let root = manager.store().root().to_path_buf();
+        write_raw_marker(
+            &root.join(DURABLE_WRITE_MARKER_DIR),
+            "dw-dedup-journal.json",
+            &serde_json::json!({
+                "status": "pending",
+                "attempts": 0,
+                "site": "test.dedup",
+                "session": session.raw(),
+                "at_ms": 1,
+                "intent": {
+                    "write": "journal_failed",
+                    "op_id": op.raw(),
+                    "state": "FailedRecoverable",
+                    "payload": {"message": "injected"},
+                },
+            }),
+        );
+        runtime.replay_durable_write_failures(&handle);
+        let after = handle
+            .events_range(1, None)
+            .unwrap()
+            .iter()
+            .filter(|e| e.op_id == Some(op) && e.kind == faktor_core::event::EventKind::Failed)
+            .count();
+        assert_eq!(
+            after, 1,
+            "the >window duplicate must never be journaled (complete paged dedup)"
+        );
+    }
+
+    /// F5 (adversarial, >old-window): a `LedgerDecision` marker whose
+    /// original row is beyond the old 256-row tail (600 later rows) must not
+    /// mint a duplicate decision row.
+    #[tokio::test]
+    async fn ledger_decision_replay_dedups_beyond_the_old_window() {
+        let (deps, _dir) = deps(scripted_provider(vec![]), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let manager = runtime.deps().session.clone();
+        let session = new_session(runtime.deps());
+        let handle = manager.get_session(session).unwrap().unwrap();
+        handle
+            .ledger_decision("step-dup", "choose A", "because")
+            .unwrap();
+        for i in 0..600u32 {
+            handle
+                .ledger_decision(&format!("filler-{i}"), "x", "y")
+                .unwrap();
+        }
+        let root = manager.store().root().to_path_buf();
+        write_raw_marker(
+            &root.join(DURABLE_WRITE_MARKER_DIR),
+            "dw-dedup-ledger.json",
+            &serde_json::json!({
+                "status": "pending",
+                "attempts": 0,
+                "site": "test.dedup",
+                "session": session.raw(),
+                "at_ms": 1,
+                "intent": {
+                    "write": "ledger_decision",
+                    "step": "step-dup",
+                    "choice": "choose A",
+                    "rationale": "because",
+                },
+            }),
+        );
+        runtime.replay_durable_write_failures(&handle);
+        let rows = manager
+            .store()
+            .ledger_entries(session, None, 10_000)
+            .unwrap();
+        let matches = rows
+            .iter()
+            .filter(|row| {
+                row.payload.get("kind").and_then(|k| k.as_str()) == Some("decision")
+                    && row.payload.get("step").and_then(|v| v.as_str()) == Some("step-dup")
+                    && row.payload.get("choice").and_then(|v| v.as_str()) == Some("choose A")
+                    && row.payload.get("rationale").and_then(|v| v.as_str()) == Some("because")
+            })
+            .count();
+        assert_eq!(
+            matches, 1,
+            "the >window duplicate must never mint a second decision row"
+        );
+    }
+
+    /// F5 (adversarial): an `Abort` marker whose target turn STARTED AFTER
+    /// the intent must never kill a later turn; an Abort that is genuinely
+    /// still effective applies exactly once.
+    #[tokio::test]
+    async fn abort_replay_dedups_by_intent_time() {
+        let (deps, _dir) = deps(scripted_provider(vec![]), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let manager = runtime.deps().session.clone();
+        let session = new_session(runtime.deps());
+        let handle = manager.get_session(session).unwrap().unwrap();
+        let _receipt = runtime.submit(session, "later turn", &[]).unwrap();
+        let record = handle.active_turn_record().unwrap().unwrap();
+        let root = manager.store().root().to_path_buf();
+        let marker_dir = root.join(DURABLE_WRITE_MARKER_DIR);
+        // Stale intent (fired BEFORE this turn started): must be skipped.
+        write_raw_marker(
+            &marker_dir,
+            "dw-abort-stale.json",
+            &serde_json::json!({
+                "status": "pending",
+                "attempts": 0,
+                "site": "test.dedup",
+                "session": session.raw(),
+                "at_ms": record.started_at - 1000,
+                "intent": {"write": "abort", "op_id": null},
+            }),
+        );
+        runtime.replay_durable_write_failures(&handle);
+        assert_eq!(
+            handle.active_turn_record().unwrap().map(|r| r.turn_op_id),
+            Some(record.turn_op_id),
+            "a stale abort intent must never kill a later turn"
+        );
+        assert_eq!(
+            handle.state().unwrap(),
+            AgentState::Preparing,
+            "the stale intent leaves the later turn running"
+        );
+        // Fresh intent (fired AFTER this turn started): applies.
+        write_raw_marker(
+            &marker_dir,
+            "dw-abort-fresh.json",
+            &serde_json::json!({
+                "status": "pending",
+                "attempts": 0,
+                "site": "test.dedup",
+                "session": session.raw(),
+                "at_ms": record.started_at + 1000,
+                "intent": {"write": "abort", "op_id": null},
+            }),
+        );
+        runtime.replay_durable_write_failures(&handle);
+        assert_eq!(
+            handle.state().unwrap(),
+            AgentState::ReadyForNextTurn,
+            "the effective abort applies exactly once"
+        );
+    }
+
+    /// F5: `CancelVerificationAttempt` replay is deduped by the attempt's own
+    /// job rows — an open job is cancelled exactly once, and a stale marker
+    /// (the crash-after-commit window) is skipped, never a second spurious
+    /// cancellation.
+    #[tokio::test]
+    async fn cancel_verification_attempt_replay_dedups_on_open_jobs() {
+        let (deps, _dir) = deps(scripted_provider(vec![]), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let manager = runtime.deps().session.clone();
+        let session = new_session(runtime.deps());
+        let handle = manager.get_session(session).unwrap().unwrap();
+        let task = handle.task_id().unwrap();
+        let op = manager.try_next_op_id().unwrap().raw();
+        let check = |id: &str| faktor_session::VerificationAttemptCheck {
+            check_id: id.into(),
+            command: format!("make {id}"),
+            inline: None,
+        };
+        let job = |id: &str| faktor_session::VerificationJobInput {
+            check_id: id.into(),
+            kind: "test".into(),
+            command: format!("make {id}"),
+            program: "make".into(),
+            args: vec![id.into()],
+            spec_json: "{}".into(),
+            budget_ms: 10_000,
+        };
+        handle
+            .begin_verification_attempt(
+                task.raw(),
+                1,
+                op,
+                "/w",
+                &[],
+                &[check("make_test")],
+                &[job("make_test")],
+            )
+            .unwrap();
+        let root = manager.store().root().to_path_buf();
+        let marker_dir = root.join(DURABLE_WRITE_MARKER_DIR);
+        let marker = |note: &str| {
+            serde_json::json!({
+                "status": "pending",
+                "attempts": 0,
+                "site": "test.dedup",
+                "session": session.raw(),
+                "at_ms": 1,
+                "intent": {
+                    "write": "cancel_verification_attempt",
+                    "task_id": task.raw(),
+                    "attempt_op": op,
+                    "note": note,
+                },
+            })
+        };
+        write_raw_marker(&marker_dir, "dw-cancel-1.json", &marker("first"));
+        runtime.replay_durable_write_failures(&handle);
+        let jobs = handle.verification_attempt_jobs(task.raw(), op).unwrap();
+        assert!(
+            jobs.iter().all(|job| !job.state.is_open()),
+            "the open job is cancelled: {jobs:?}"
+        );
+        // The crash-window duplicate: every job is terminal, so the replay
+        // must skip the second cancellation and consume the marker.
+        write_raw_marker(&marker_dir, "dw-cancel-2.json", &marker("second"));
+        runtime.replay_durable_write_failures(&handle);
+        let after = handle.verification_attempt_jobs(task.raw(), op).unwrap();
+        assert!(after.iter().all(|job| !job.state.is_open()), "{after:?}");
+        assert!(
+            marker_files(&root)
+                .iter()
+                .all(|path| !path.to_string_lossy().contains("cancel")),
+            "both markers are consumed"
+        );
+    }
+
     fn reopen_manager(dir: &tempfile::TempDir) -> Arc<SessionManager> {
         SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap()
     }
@@ -35147,6 +37562,7 @@ mod tests {
             completion: None,
             stop_reason: None,
             semantic_risk: None,
+            evidence_poll: None,
         };
         let ended = runtime
             .handle_provider_failure(
@@ -35613,5 +38029,156 @@ mod tests {
             "the supersede cancel was not reconstructed: {rows:?}"
         );
         assert!(marker_files(manager2.store().root()).is_empty());
+    }
+
+    // ---- Index worker lifecycle exposure (daemon-shutdown join point).
+
+    /// The accessor pair is inert before the lazily-hosted service ever
+    /// opens: `None` for a never-opened runtime, and neither the status read
+    /// nor the shutdown call opens it as a side effect.
+    #[tokio::test]
+    async fn index_worker_shutdown_is_a_no_op_when_the_service_was_never_opened() {
+        let (deps, _dir) = deps(scripted_provider(vec![]), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        assert!(
+            runtime.index_service.get().is_none(),
+            "the index service must start unopened"
+        );
+        assert!(runtime.index_service_worker_status().is_none());
+        assert_eq!(runtime.shutdown_index_service().await, None);
+        assert!(runtime.index_service_worker_status().is_none());
+        assert!(
+            runtime.index_service.get().is_none(),
+            "status/shutdown must never open the index service as a side effect"
+        );
+        assert_eq!(
+            runtime.shutdown_index_service().await,
+            None,
+            "a second call stays the inert no-op, never a panic"
+        );
+    }
+
+    /// An opened service with a LIVE worker is cancelled and joined within
+    /// the service bound, reports typed success, and the repeat call is the
+    /// idempotent `NotRunning` — no task is ever detached. The status
+    /// accessor does not start the worker either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_worker_shutdown_joins_an_active_worker_and_is_idempotent() {
+        let (deps, dir) = deps(scripted_provider(vec![]), vec![]);
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), b"[package]\nname = \"x\"\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), b"pub fn f() -> u32 {\n    1\n}\n").unwrap();
+        let ws = deps
+            .session
+            .create_workspace(root.to_str().unwrap())
+            .unwrap();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let service = runtime.index_service().expect("IndexService hosted");
+        // Opened but untouched: the read-only accessor must not spawn.
+        assert_eq!(
+            runtime.index_service_worker_status().map(|s| s.state),
+            Some(faktor_index::WorkerState::NotStarted),
+            "the status accessor must not start the worker"
+        );
+        service.attach(ws).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while service.worker_status().state != faktor_index::WorkerState::Running {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "attach must kick the owned worker: {:?}",
+                service.worker_status()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            runtime.index_service_worker_status().map(|s| s.state),
+            Some(faktor_index::WorkerState::Running)
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(
+            runtime.shutdown_index_service().await,
+            Some(faktor_index::WorkerShutdown::Joined),
+            "an active worker must be cancelled and joined, never detached"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the join must stay within the service bound: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            runtime.index_service_worker_status().map(|s| s.state),
+            Some(faktor_index::WorkerState::Stopped)
+        );
+        assert_eq!(
+            runtime.shutdown_index_service().await,
+            Some(faktor_index::WorkerShutdown::NotRunning),
+            "the second call must be the idempotent terminal no-op"
+        );
+        assert_eq!(
+            runtime.index_service_worker_status().map(|s| s.state),
+            Some(faktor_index::WorkerState::Stopped)
+        );
+    }
+
+    /// Shutdown racing an in-flight reconciliation pass: cancelling mid-pass
+    /// never panics and never leaves a ghost worker — the outcome is the
+    /// typed `Joined` (cancellation observed at a workspace boundary) or
+    /// `Aborted` (pass outlived the bound, aborted and still awaited); the
+    /// owner is terminal afterwards and a repeat call reports `NotRunning`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_worker_shutdown_during_an_in_flight_pass_is_terminal_and_bounded() {
+        let (deps, dir) = deps(scripted_provider(vec![]), vec![]);
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), b"[package]\nname = \"x\"\n").unwrap();
+        for i in 0..50 {
+            std::fs::write(
+                root.join(format!("src/f{i}.rs")),
+                format!("pub fn f{i}() -> u32 {{\n    {i}\n}}\n"),
+            )
+            .unwrap();
+        }
+        let ws = deps
+            .session
+            .create_workspace(root.to_str().unwrap())
+            .unwrap();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let service = runtime.index_service().expect("IndexService hosted");
+        service.attach(ws).unwrap();
+        // Race the shutdown against the pass the attach kicked (and force a
+        // fresh generation if the first already died): never await the pass
+        // first, so the cancel lands while it may still be running.
+        assert!(
+            service.spawn_worker(),
+            "a tokio context must start the owned worker"
+        );
+        let started = std::time::Instant::now();
+        let outcome = runtime.shutdown_index_service().await;
+        assert!(
+            matches!(
+                outcome,
+                Some(faktor_index::WorkerShutdown::Joined)
+                    | Some(faktor_index::WorkerShutdown::Aborted)
+            ),
+            "shutdown racing a pass must be a typed join/abort: {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "shutdown must stay bounded: {:?}",
+            started.elapsed()
+        );
+        let status = runtime
+            .index_service_worker_status()
+            .expect("the service stays opened");
+        assert_ne!(
+            status.state,
+            faktor_index::WorkerState::Running,
+            "no ghost worker may survive the shutdown: {status:?}"
+        );
+        assert_eq!(
+            runtime.shutdown_index_service().await,
+            Some(faktor_index::WorkerShutdown::NotRunning)
+        );
     }
 }

@@ -12,11 +12,11 @@ use faktor_cloud::billing::{
 };
 use faktor_cloud::{
     Admission, AdmissionBoundary, AdmissionRequest, BillingAccount, BillingAccountId,
-    BillingConfig, BillingStore, CreditAppendRefusal, CreditEntry, CreditEntryId, CreditKind,
-    DurableSpendRow, EntitlementExceeded, EntitlementService, InFlightKind, ManualClock,
-    MemoryBillingStore, ObservedUsage, OrganizationId, PlanConfig, ReconciliationState,
-    SpendCategory, SqliteControlPlaneStore, Subscription, SubscriptionId, SubscriptionStatus,
-    UsageEvent, UsageEventId, UsageUnit, CAUSE_SUBSCRIPTION_ACTIVE,
+    BillingConfig, BillingStore, BillingStoreError, CreditAppend, CreditAppendRefusal, CreditEntry,
+    CreditEntryId, CreditKind, DurableSpendRow, EntitlementExceeded, EntitlementService,
+    InFlightKind, ManualClock, MemoryBillingStore, ObservedUsage, OrganizationId, PlanConfig,
+    ReconciliationState, SpendCategory, SqliteControlPlaneStore, Subscription, SubscriptionId,
+    SubscriptionStatus, UsageEvent, UsageEventId, UsageUnit, CAUSE_SUBSCRIPTION_ACTIVE,
 };
 
 fn org(id: &str) -> OrganizationId {
@@ -804,6 +804,70 @@ fn credit_refusals_are_typed_and_write_nothing() {
         assert_eq!(
             store.credit_balance(&organization).unwrap().balance_micro(),
             100
+        );
+    }
+}
+
+#[test]
+fn credit_idempotency_identity_includes_account_and_usage_event_on_both_stores() {
+    // The same idempotency key is only "the same request" when kind, amount,
+    // reference, billing_account_id AND usage_event_id all match. A different
+    // account or usage event under one key is a typed conflict, never a silent
+    // Duplicate that would drop a second account's ledger entry.
+    let mem = MemoryBillingStore::new();
+    let dir = tempfile::tempdir().unwrap();
+    let sqlite = SqliteControlPlaneStore::open(&dir.path().join("b.sqlite")).unwrap();
+    let organization = org("org_a");
+    let entry = |id: &str, account_id: &str, event: Option<&str>| CreditEntry {
+        id: CreditEntryId::try_new(id).unwrap(),
+        organization: organization.clone(),
+        billing_account_id: account(account_id),
+        kind: CreditKind::Grant,
+        amount_micro: 100,
+        reference: None,
+        usage_event_id: event.map(|e| UsageEventId::try_new(e).unwrap()),
+        reason: "seed".into(),
+        occurred_at_ms: 1,
+        idempotency_key: Some("same-request-key".into()),
+    };
+    for store in [&mem as &dyn BillingStore, &sqlite as &dyn BillingStore] {
+        assert_eq!(
+            store
+                .append_credit_entry(&entry("crd_1", "acct_1", None))
+                .unwrap(),
+            CreditAppend::Appended
+        );
+        // Byte-identical request (account and usage event included): replay.
+        assert_eq!(
+            store
+                .append_credit_entry(&entry("crd_1b", "acct_1", None))
+                .unwrap(),
+            CreditAppend::Duplicate
+        );
+        // Same key, DIFFERENT account: a conflict, not a duplicate.
+        assert_eq!(
+            store
+                .append_credit_entry(&entry("crd_2", "acct_2", None))
+                .unwrap_err(),
+            BillingStoreError::Credit(CreditAppendRefusal::IdempotencyConflict(
+                "same-request-key".into()
+            )),
+            "a different billing account under one key must conflict"
+        );
+        // Same key, DIFFERENT usage event: also a conflict.
+        assert_eq!(
+            store
+                .append_credit_entry(&entry("crd_3", "acct_1", Some("uev_1")))
+                .unwrap_err(),
+            BillingStoreError::Credit(CreditAppendRefusal::IdempotencyConflict(
+                "same-request-key".into()
+            )),
+            "a different usage event under one key must conflict"
+        );
+        assert_eq!(
+            store.credit_balance(&organization).unwrap().granted_micro,
+            100,
+            "the refused requests wrote nothing"
         );
     }
 }

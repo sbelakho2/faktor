@@ -60,6 +60,21 @@ where
     }
 }
 
+/// The durable, never-silent note about a post-failure staging cleanup:
+/// empty when the directory was removed, otherwise naming the cleanup
+/// failure. The original download error stays the RETURNED typed error; the
+/// cleanup failure is appended to the operation row's durable detail and
+/// logged, so it can never be discarded.
+fn staging_cleanup_note(cleanup: &Result<(), UpdateError>) -> String {
+    match cleanup {
+        Ok(()) => String::new(),
+        Err(e) => {
+            tracing::warn!("failed update step: the staging directory cleanup failed: {e}");
+            format!("; additionally the failed step's staging directory could not be removed: {e}")
+        }
+    }
+}
+
 /// The distribution vocabulary for one host: the certification tooling
 /// derives tokens from `uname` (`darwin`, `arm64`, `x86_64`, `linux`,
 /// `windows`), while `std::env::consts` says `macos`/`aarch64`. Normalizing
@@ -444,7 +459,7 @@ impl Updater {
     fn with_launch_release(&self, pointer: InstallPointer) -> Result<InstallPointer, UpdateError> {
         match self
             .layout
-            .release_id_if_materialized(&pointer.version, &pointer.digest)
+            .release_id_if_materialized(&pointer.version, &pointer.digest)?
         {
             Some(release_id) => pointer.with_release_id(Some(release_id)),
             None => Ok(pointer),
@@ -804,15 +819,19 @@ impl Updater {
                 })
             }
             Err(e) => {
-                op.status = UpdateOpStatus::Failed;
-                op.updated_ms = now_ms;
-                op.detail = Some(e.to_string());
-                self.store.update(&op)?;
                 let layout = self.layout.clone();
                 let op_id = op.id.to_string();
-                let _ =
+                let cleanup =
                     spawn_blocking_fs("clear failed staging", move || layout.clear_staging(&op_id))
                         .await;
+                // The download failure stays the returned typed error; the
+                // cleanup failure is durable evidence in the row (never a
+                // silently discarded `let _ =`).
+                let cleanup_note = staging_cleanup_note(&cleanup);
+                op.status = UpdateOpStatus::Failed;
+                op.updated_ms = now_ms;
+                op.detail = Some(format!("{e}{cleanup_note}"));
+                self.store.update(&op)?;
                 Err(e)
             }
         }
@@ -1168,11 +1187,12 @@ impl Updater {
             .download_and_publish(&op.id.to_string(), &artifact)
             .await
         {
+            let cleanup = self.layout.clear_staging(op.id.as_str());
+            let cleanup_note = staging_cleanup_note(&cleanup);
             op.status = UpdateOpStatus::Failed;
             op.updated_ms = now_ms;
-            op.detail = Some(e.to_string());
+            op.detail = Some(format!("{e}{cleanup_note}"));
             self.store.update(&op)?;
-            let _ = self.layout.clear_staging(op.id.as_str());
             return Err(e);
         }
 
@@ -1438,12 +1458,13 @@ impl Updater {
             })?;
             self.layout.install_launcher(&current)?;
         }
-        let binary = self.layout.materialize_release(
+        self.layout.materialize_release(
             &release_id,
             &artifact.name,
             &stage.digest,
             manifest_bytes,
         )?;
+        let binary = self.layout.release_binary(&release_id);
         Ok(ReleaseStageOutcome {
             stage,
             release_id,
@@ -1966,6 +1987,25 @@ impl Updater {
                     });
                 }
             }
+            // Re-authenticate + re-check the anti-rollback floor on recovery:
+            // the signed manifest must still verify and bind this pointer, and
+            // a durable high-water mark that moved past the interrupted
+            // operation's generation (a concurrent admission between crash and
+            // recovery) makes resuming it a rollback. Either failure forces
+            // verification — recovery never claims Applied on stale authority.
+            if let Err(reason) = self.reauthenticate_recovered_release(op, &target) {
+                op.status = UpdateOpStatus::Unverified;
+                op.updated_ms = now_ms;
+                op.detail = Some(format!(
+                    "recovery refused to resume the interrupted activation: {reason}; \
+                     verification forced"
+                ));
+                self.store.update(op)?;
+                return Ok(RecoveryOutcome::NeedsVerification {
+                    op_id: op.id.to_string(),
+                    detail: reason,
+                });
+            }
             match self.probe.probe(&self.layout, &target) {
                 Ok(()) => {
                     // A resumed authorized downgrade must also complete the
@@ -2001,7 +2041,26 @@ impl Updater {
                     })
                 }
                 Err(e) => {
-                    let previous = self.previous_pointer(op)?;
+                    let previous = match self.previous_pointer(op) {
+                        Ok(previous) => previous,
+                        Err(previous_error) => {
+                            // The previous release cannot be verified for a
+                            // restore: never fabricate a "restored" success —
+                            // force verification (fail closed).
+                            op.status = UpdateOpStatus::Unverified;
+                            op.updated_ms = now_ms;
+                            op.detail = Some(format!(
+                                "recovered: the interrupted swap failed its probe ({e}) and the \
+                                 previous release could not be verified for restore \
+                                 ({previous_error}); verification forced"
+                            ));
+                            self.store.update(op)?;
+                            return Ok(RecoveryOutcome::NeedsVerification {
+                                op_id: op.id.to_string(),
+                                detail: previous_error.to_string(),
+                            });
+                        }
+                    };
                     let restored = self.restore_previous(&previous, &e.to_string());
                     op.status = UpdateOpStatus::RolledBack;
                     op.updated_ms = now_ms;
@@ -2069,6 +2128,24 @@ impl Updater {
         let current = self.layout.read_pointer()?;
         let target_digest = op.after_digest.clone().unwrap_or_default();
         if current.as_ref().map(|p| p.digest.as_str()) == Some(target_digest.as_str()) {
+            // The restored pointer must still be an AUTHENTICATED release:
+            // resuming the rollback is never honest when the target's signed
+            // manifest no longer verifies or binds the pointer.
+            if let Some(target) = current.as_ref() {
+                if let Err(reason) = self.reauthenticate_recovered_release(op, target) {
+                    op.status = UpdateOpStatus::Unverified;
+                    op.updated_ms = now_ms;
+                    op.detail = Some(format!(
+                        "the rollback target is in place but it no longer re-authenticates: \
+                         {reason}; verification forced"
+                    ));
+                    self.store.update(op)?;
+                    return Ok(RecoveryOutcome::NeedsVerification {
+                        op_id: op.id.to_string(),
+                        detail: reason,
+                    });
+                }
+            }
             op.status = UpdateOpStatus::RolledBack;
             op.updated_ms = now_ms;
             op.detail = Some("recovered: the rollback target is in place".into());
@@ -2087,6 +2164,90 @@ impl Updater {
                 detail: "the pointer does not name the interrupted rollback's target".into(),
             })
         }
+    }
+
+    /// Re-authenticate one release pointer left by a crash before recovery may
+    /// resume it as Applied/RolledBack: the signed manifest stored next to the
+    /// binary must still verify against the operator allowlist, must still
+    /// name the pointer's version/channel/digest, and (outside an explicitly
+    /// authorized downgrade) the durable anti-rollback high-water mark must
+    /// not have moved past the interrupted operation's signed generation. Any
+    /// failure is a typed reason string; recovery then forces verification
+    /// instead of claiming the activation succeeded on stale authority.
+    fn reauthenticate_recovered_release(
+        &self,
+        op: &UpdateOperation,
+        target: &InstallPointer,
+    ) -> Result<(), String> {
+        let Some(release_id) = target.release_id.as_deref() else {
+            return Ok(());
+        };
+        let manifest_path = self.layout.release_manifest(release_id);
+        let bytes = std::fs::read(&manifest_path).map_err(|e| {
+            format!(
+                "the signed release manifest {} is unreadable: {e}",
+                manifest_path.display()
+            )
+        })?;
+        let signed =
+            manifest::verify_manifest_at_launch(&bytes, &self.config.keys).map_err(|e| {
+                format!("the signed release manifest for {release_id} no longer verifies: {e}")
+            })?;
+        if signed.version != target.version {
+            return Err(format!(
+                "the signed manifest names version {} but the pointer names {}",
+                signed.version, target.version
+            ));
+        }
+        let manifest_channel = signed.channel.to_string();
+        if manifest_channel != target.channel {
+            return Err(format!(
+                "the signed manifest names channel {manifest_channel} but the pointer names {}",
+                target.channel
+            ));
+        }
+        if !signed
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.sha256 == target.digest)
+        {
+            return Err(format!(
+                "the pointer digest {} does not appear in the signed manifest for {release_id}",
+                target.digest
+            ));
+        }
+        if let Some(recorded) = op.release_generation {
+            if signed.release_generation() != recorded {
+                return Err(format!(
+                    "the signed manifest carries generation {} but the operation records {recorded}",
+                    signed.release_generation()
+                ));
+            }
+        }
+        // An authorized downgrade is the ONE path admitted below the floor; it
+        // completes the deferred floor reset after its probe (see the caller),
+        // so it is exempt from the floor check here.
+        if op.kind != UpdateOpKind::Downgrade {
+            let channel = op
+                .channel
+                .clone()
+                .unwrap_or_else(|| self.config.channel.to_string());
+            let high_water = self
+                .store
+                .high_water(&channel)
+                .map_err(|e| format!("the high-water read for channel {channel:?} failed: {e}"))?
+                .map(|mark| mark.generation)
+                .unwrap_or(0);
+            let offered = op.release_generation.unwrap_or(0);
+            if offered < high_water {
+                return Err(format!(
+                    "the durable high-water mark of channel {channel:?} moved to {high_water}, \
+                     above the interrupted operation's generation {offered}; resuming it would be \
+                     a rollback"
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn previous_pointer(

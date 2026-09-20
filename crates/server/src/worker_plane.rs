@@ -50,9 +50,19 @@
 //! [`WorkerPlaneExposure::audit_line`] is logged at startup (so the gateway
 //! acknowledgement is recorded in the daemon's audit log) and reported by
 //! `faktor doctor --config`.
+//!
+//! The listener is an OWNED async task: [`WorkerPlaneHandle`] holds its
+//! `JoinHandle` plus the one-shot shutdown signal, the task records its
+//! terminal disposition in a daemon-queryable [`WorkerPlaneStatus`] BEFORE the
+//! handle completes (a dead socket can never look alive), and
+//! [`WorkerPlaneHandle::shutdown`] joins the task within a fixed bound. The
+//! production serve future is never `.ok()`-discarded, and dropping the
+//! handle aborts the task rather than detaching it.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::http::header;
 use axum::middleware::Next;
@@ -267,7 +277,8 @@ impl WorkerPlaneBindConfig {
     }
 }
 
-/// A worker-plane startup failure: the boundary refusal or the socket bind.
+/// A worker-plane failure: the boundary refusal, the socket bind, the accept
+/// loop, or the owned serve task ending without a result.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerPlaneServeError {
     #[error("{0}")]
@@ -277,16 +288,324 @@ pub enum WorkerPlaneServeError {
         bind: SocketAddr,
         source: std::io::Error,
     },
+    /// The accept/serve loop returned an error (the production future is
+    /// never `.ok()`-discarded: the typed error is recorded in the handle's
+    /// health status and returned by [`WorkerPlaneHandle::shutdown`]).
+    #[error("worker plane serve {bind}: {source}")]
+    Serve {
+        bind: SocketAddr,
+        source: std::io::Error,
+    },
+    /// The serve task ended without a typed serve result: it panicked, or it
+    /// was aborted/cancelled out from under its owner.
+    #[error("worker plane task {bind} ended without a typed result: {detail}")]
+    Task { bind: SocketAddr, detail: String },
+    /// The bounded graceful-shutdown join elapsed; the straggler was aborted
+    /// and reaped, so shutdown was still bounded.
+    #[error(
+        "worker plane shutdown for {bind} exceeded the bounded {bound:?} join; \
+         the serve task was aborted"
+    )]
+    ShutdownTimeout {
+        bind: SocketAddr,
+        bound: std::time::Duration,
+    },
 }
 
-/// The live handle of the worker-plane listener.
+impl WorkerPlaneServeError {
+    /// The stable machine code of the failure (the same code recorded in
+    /// [`WorkerPlaneStatus::Unavailable`]).
+    pub const fn code(&self) -> &'static str {
+        match self {
+            WorkerPlaneServeError::Boundary(refusal) => refusal.code(),
+            WorkerPlaneServeError::Bind { .. } => "worker_plane_bind_failed",
+            WorkerPlaneServeError::Serve { .. } => "worker_plane_serve_failed",
+            WorkerPlaneServeError::Task { .. } => "worker_plane_task_failed",
+            WorkerPlaneServeError::ShutdownTimeout { .. } => "worker_plane_shutdown_timeout",
+        }
+    }
+}
+
+/// Bound on the worker plane's graceful-shutdown join: the owned serve task
+/// is joined within this window (a straggler is aborted), so shutdown is
+/// never unbounded.
+pub const WORKER_PLANE_SHUTDOWN_BOUND: Duration = Duration::from_secs(5);
+/// Bound on reaping the serve task after the graceful window elapsed.
+pub const WORKER_PLANE_ABORT_REAP_BOUND: Duration = Duration::from_secs(1);
+
+/// The daemon-queryable liveness snapshot of the worker plane.
+///
+/// The owned serve task records ONE terminal snapshot when it ends; until
+/// then the plane is [`WorkerPlaneStatus::Serving`]. An unexpected end is
+/// ALWAYS [`WorkerPlaneStatus::Unavailable`] carrying the typed error code —
+/// a dead remote-worker socket can never masquerade as a live one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerPlaneStatus {
+    /// The listener task is alive: requests are accepted.
+    Serving,
+    /// The task ended before any graceful-shutdown request. The plane is
+    /// UNAVAILABLE; `code` is the typed [`WorkerPlaneServeError::code`] (or
+    /// `worker_plane_task_died` for a panic/abort) and `message` names the
+    /// cause.
+    Unavailable { code: &'static str, message: String },
+    /// The task ended after (and because of) a graceful-shutdown request.
+    Stopped,
+}
+
+impl WorkerPlaneStatus {
+    /// `true` only while the listener task is alive and accepting requests.
+    pub fn is_alive(&self) -> bool {
+        matches!(self, WorkerPlaneStatus::Serving)
+    }
+
+    /// `true` when the plane died unexpectedly (never for a clean stop).
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, WorkerPlaneStatus::Unavailable { .. })
+    }
+
+    /// The stable machine code of an unavailable plane (the typed error's
+    /// code); `None` while serving or after a clean stop.
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            WorkerPlaneStatus::Unavailable { code, .. } => Some(code),
+            WorkerPlaneStatus::Serving | WorkerPlaneStatus::Stopped => None,
+        }
+    }
+
+    /// One bounded health/audit line for the daemon log.
+    pub fn health_line(&self) -> String {
+        match self {
+            WorkerPlaneStatus::Serving => "worker plane: serving".to_string(),
+            WorkerPlaneStatus::Stopped => "worker plane: stopped".to_string(),
+            WorkerPlaneStatus::Unavailable { code, message } => {
+                format!("worker plane: UNAVAILABLE [{code}] {message}")
+            }
+        }
+    }
+}
+
+/// The shared owner state of one worker-plane serve task: the one-shot
+/// graceful shutdown signal plus the terminal status recorded exactly once by
+/// the task itself.
 #[derive(Debug)]
+struct WorkerPlaneShared {
+    shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    shutdown_requested: AtomicBool,
+    terminal: Mutex<Option<WorkerPlaneStatus>>,
+}
+
+impl WorkerPlaneShared {
+    fn new(shutdown: tokio::sync::oneshot::Sender<()>) -> Self {
+        Self {
+            shutdown: Mutex::new(Some(shutdown)),
+            shutdown_requested: AtomicBool::new(false),
+            terminal: Mutex::new(None),
+        }
+    }
+
+    /// Request graceful shutdown. Idempotent: the first call wins and sends
+    /// the one-shot signal; every later call is a no-op. (A send failure only
+    /// means the task already ended — its result is surfaced by the join.)
+    fn request_shutdown(&self) -> bool {
+        if self.shutdown_requested.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        let sender = self
+            .shutdown
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
+        true
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::SeqCst)
+    }
+
+    /// Record the single terminal status (first writer wins; the serve task
+    /// records exactly once, before its `JoinHandle` completes).
+    fn record(&self, status: WorkerPlaneStatus) {
+        let mut slot = self
+            .terminal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_none() {
+            *slot = Some(status);
+        }
+    }
+
+    fn terminal(&self) -> Option<WorkerPlaneStatus> {
+        self.terminal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+/// The live handle of the worker-plane listener: it OWNS the serve task's
+/// `JoinHandle<Result<(), WorkerPlaneServeError>>` (never dropped or
+/// detached) plus the one-shot graceful-shutdown signal.
+///
+/// The task records its terminal disposition in the shared status BEFORE its
+/// `JoinHandle` completes, so [`WorkerPlaneHandle::status`] always names an
+/// unexpected death typed — the owning daemon can never mistake a dead
+/// worker socket for a live one.
 pub struct WorkerPlaneHandle {
     pub addr: SocketAddr,
-    /// Dropping (or sending on) this ends the worker-plane listener.
-    pub shutdown: tokio::sync::oneshot::Sender<()>,
     /// The validated exposure decision this listener was started with.
     pub exposure: WorkerPlaneExposure,
+    task: Option<tokio::task::JoinHandle<Result<(), WorkerPlaneServeError>>>,
+    shared: Arc<WorkerPlaneShared>,
+}
+
+impl std::fmt::Debug for WorkerPlaneHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerPlaneHandle")
+            .field("addr", &self.addr)
+            .field("exposure", &self.exposure)
+            .field("status", &self.status())
+            .field("owns_task", &self.task.is_some())
+            .finish()
+    }
+}
+
+impl WorkerPlaneHandle {
+    /// Request graceful shutdown of the listener. Idempotent: returns `true`
+    /// exactly once (the call that initiated the shutdown) and `false` when
+    /// shutdown was already requested. The owned task is joined (bounded) by
+    /// [`WorkerPlaneHandle::shutdown`].
+    pub fn request_shutdown(&self) -> bool {
+        self.shared.request_shutdown()
+    }
+
+    /// `true` only while the owned serve task is alive and accepting
+    /// requests.
+    pub fn is_alive(&self) -> bool {
+        self.status().is_alive()
+    }
+
+    /// The typed liveness snapshot the daemon queries for placement/health
+    /// decisions (see [`WorkerPlaneStatus`]). A recorded terminal result wins;
+    /// a task that ended without recording (panic/abort) is reported
+    /// [`WorkerPlaneStatus::Unavailable`] with `worker_plane_task_died`, never
+    /// silently as stopped.
+    pub fn status(&self) -> WorkerPlaneStatus {
+        if let Some(status) = self.shared.terminal() {
+            return status;
+        }
+        let finished = match &self.task {
+            Some(task) => task.is_finished(),
+            None => true,
+        };
+        if !finished {
+            return WorkerPlaneStatus::Serving;
+        }
+        if self.shared.shutdown_requested() {
+            WorkerPlaneStatus::Stopped
+        } else {
+            WorkerPlaneStatus::Unavailable {
+                code: "worker_plane_task_died",
+                message: format!(
+                    "worker plane serve task for {} ended without a typed result (panic or abort)",
+                    self.addr
+                ),
+            }
+        }
+    }
+
+    /// Signal graceful shutdown and JOIN the owned serve task.
+    ///
+    /// - Bounded: the join waits at most [`WORKER_PLANE_SHUTDOWN_BOUND`]; a
+    ///   straggler is aborted and reaped within [`WORKER_PLANE_ABORT_REAP_BOUND`].
+    /// - Idempotent: requesting shutdown twice is a no-op (the signal is
+    ///   one-shot); a handle whose task already ended joins immediately.
+    /// - A clean graceful stop maps to `Ok(())`; a bind/serve error (including
+    ///   an unexpected death that happened BEFORE the request), a panicked/
+    ///   aborted task, or an elapsed join bound is surfaced as the typed
+    ///   [`WorkerPlaneServeError`] — never `.ok()`-discarded.
+    pub async fn shutdown(mut self) -> Result<(), WorkerPlaneServeError> {
+        let bind = self.addr;
+        self.request_shutdown();
+        let mut task = self
+            .task
+            .take()
+            .expect("the worker-plane task is owned until shutdown consumes the handle");
+        match tokio::time::timeout(WORKER_PLANE_SHUTDOWN_BOUND, &mut task).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(error),
+            Ok(Err(join_error)) => Err(WorkerPlaneServeError::Task {
+                bind,
+                detail: join_error.to_string(),
+            }),
+            Err(_elapsed) => {
+                task.abort();
+                let _ = tokio::time::timeout(WORKER_PLANE_ABORT_REAP_BOUND, &mut task).await;
+                Err(WorkerPlaneServeError::ShutdownTimeout {
+                    bind,
+                    bound: WORKER_PLANE_SHUTDOWN_BOUND,
+                })
+            }
+        }
+    }
+}
+
+impl Drop for WorkerPlaneHandle {
+    fn drop(&mut self) {
+        // Terminal health is read BEFORE the shutdown request so an
+        // unexpected death is never masked as a requested stop.
+        let status = self.status();
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        if status.is_unavailable() {
+            tracing::error!("{}", status.health_line());
+        }
+        // Synchronous fallback so the listener task can never outlive its
+        // owner: request graceful shutdown, then abort. Callers that need the
+        // graceful drain call `shutdown().await`.
+        self.request_shutdown();
+        if !task.is_finished() {
+            task.abort();
+        }
+    }
+}
+
+/// Spawn the OWNED serve task: it maps the serve future's `io::Error` into
+/// the typed [`WorkerPlaneServeError::Serve`], records the terminal
+/// disposition in the handle's shared status, and returns the typed result to
+/// its owner (`WorkerPlaneHandle::shutdown`). The production serve future is
+/// never `.ok()`-discarded.
+fn spawn_worker_plane_task<F>(
+    bind: SocketAddr,
+    shared: Arc<WorkerPlaneShared>,
+    serve: F,
+) -> tokio::task::JoinHandle<Result<(), WorkerPlaneServeError>>
+where
+    F: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let result = serve
+            .await
+            .map_err(|source| WorkerPlaneServeError::Serve { bind, source });
+        let status = match &result {
+            Ok(()) if shared.shutdown_requested() => WorkerPlaneStatus::Stopped,
+            Ok(()) => WorkerPlaneStatus::Unavailable {
+                code: "worker_plane_serve_ended",
+                message: format!(
+                    "worker plane serve for {bind} completed without a shutdown request"
+                ),
+            },
+            Err(error) => WorkerPlaneStatus::Unavailable {
+                code: error.code(),
+                message: error.to_string(),
+            },
+        };
+        shared.record(status);
+        result
+    })
 }
 
 /// Bind and serve the dedicated worker-plane listener over the SAME
@@ -312,19 +631,72 @@ pub async fn serve_worker_plane(
         })?;
     let app = worker_plane_router(deps, config.bearer.clone());
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
+    let shared = Arc::new(WorkerPlaneShared::new(shutdown_tx));
+    // The handle OWNS this task: its result is recorded in `shared` and
+    // returned to `shutdown()`; nothing is discarded here.
+    let task = spawn_worker_plane_task(addr, Arc::clone(&shared), async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async {
+            .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
             })
             .await
-            .ok();
     });
     Ok(WorkerPlaneHandle {
         addr,
-        shutdown: shutdown_tx,
         exposure,
+        task: Some(task),
+        shared,
     })
+}
+
+/// Test seams for the ownership/health contract. These exercise the SAME
+/// recording wrapper the production task uses (`spawn_worker_plane_task`),
+/// never a parallel code path.
+#[cfg(test)]
+impl WorkerPlaneHandle {
+    /// A handle whose serve task fails immediately with `source`: unexpected
+    /// termination must be recorded typed and surfaced by `shutdown`.
+    pub(crate) fn failing_serve_for_test(
+        addr: SocketAddr,
+        exposure: WorkerPlaneExposure,
+        source: std::io::Error,
+    ) -> WorkerPlaneHandle {
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let shared = Arc::new(WorkerPlaneShared::new(shutdown_tx));
+        let task = spawn_worker_plane_task(addr, Arc::clone(&shared), async move { Err(source) });
+        WorkerPlaneHandle {
+            addr,
+            exposure,
+            task: Some(task),
+            shared,
+        }
+    }
+
+    /// Abort the owned serve task out from under the handle (an external
+    /// kill), so the health snapshot must name the death.
+    pub(crate) fn abort_task_for_test(&self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+
+    /// A detached probe of the shared owner state, so a test can observe the
+    /// recorded terminal snapshot AFTER `shutdown` consumed the handle.
+    pub(crate) fn probe_for_test(&self) -> WorkerPlaneStatusProbe {
+        WorkerPlaneStatusProbe(Arc::clone(&self.shared))
+    }
+}
+
+/// Test-only detached view of a handle's shared owner state.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct WorkerPlaneStatusProbe(Arc<WorkerPlaneShared>);
+
+#[cfg(test)]
+impl WorkerPlaneStatusProbe {
+    pub(crate) fn terminal(&self) -> Option<WorkerPlaneStatus> {
+        self.0.terminal()
+    }
 }
 
 /// The dedicated worker-plane router: the four worker-token routes ONLY.

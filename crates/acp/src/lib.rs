@@ -2324,15 +2324,37 @@ impl Engine {
     ) -> TurnOutcome {
         match self {
             Engine::Sync(backend) => {
-                // Blocking call, same thread-context contract as before.
-                let result = backend.prompt(session_id, &job.text);
-                if token.is_cancelled() {
-                    TurnOutcome::Cancelled
-                } else {
-                    match result {
-                        Ok(value) => TurnOutcome::Completed(value),
-                        Err(message) => TurnOutcome::Failed(message),
-                    }
+                // The blocking call runs on the blocking pool, NOT on the
+                // async worker, and the caller races it against the session
+                // token: a cancel returns `cancelled` at once while the
+                // backend's own `abort` hook (fired by the cancel path) is
+                // what actually stops the work. A backend that ignores both
+                // is still bounded by its contract (must not block
+                // indefinitely).
+                let backend = backend.clone();
+                let session = session_id.to_string();
+                let text = job.text.clone();
+                let blocking = tokio::task::spawn_blocking(move || backend.prompt(&session, &text));
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => TurnOutcome::Cancelled,
+                    result = blocking => match result {
+                        Ok(Ok(value)) => {
+                            if token.is_cancelled() {
+                                TurnOutcome::Cancelled
+                            } else {
+                                TurnOutcome::Completed(value)
+                            }
+                        }
+                        Ok(Err(message)) => {
+                            if token.is_cancelled() {
+                                TurnOutcome::Cancelled
+                            } else {
+                                TurnOutcome::Failed(message)
+                            }
+                        }
+                        Err(join) => TurnOutcome::Failed(format!("sync prompt task failed: {join}")),
+                    },
                 }
             }
             Engine::Stream(backend) => {
@@ -2723,25 +2745,51 @@ impl AcpServer {
             }
         }
 
-        // Wind-down: cancel every running turn, kill every session-owned
-        // terminal (pumps cancelled, process trees killed) before the writer
-        // queues close, fail every outstanding server→client request with
-        // Closed, drop our queue handles, then join dispatcher and writer
-        // (bounded by shutdown_timeout).
-        registry.cancel_all();
-        outstanding.drain();
-        terminals.shutdown().await;
-        drop(request_tx);
-        drop(main_tx);
-        drop(lane_tx);
-        drop(framing_tx);
-
+        // Wind-down: close the registry, cancel every running turn, fail
+        // every outstanding server→client request with Closed, kill every
+        // session-owned terminal (pumps cancelled, process trees killed)
+        // under an explicit bound, drop our queue handles, then ABORT+join
+        // every outstanding task (operation turns, dispatcher, writer) so
+        // nothing can write after `serve_connection` returns.
         let mut result = match reader_error {
             Some(e) => Err(e),
             None => Ok(()),
         };
         let timeout = config.shutdown_timeout;
-        match tokio::time::timeout(timeout, dispatcher_handle).await {
+        registry.cancel_all();
+        outstanding.drain();
+        match tokio::time::timeout(timeout, terminals.shutdown()).await {
+            Ok(()) => {}
+            Err(_elapsed) => {
+                tracing::warn!(
+                    timeout_ms = timeout.as_millis(),
+                    "acp: terminal shutdown exceeded its bound"
+                );
+                if result.is_ok() {
+                    result = Err(format!(
+                        "terminal shutdown exceeded its {}ms bound",
+                        timeout.as_millis()
+                    ));
+                }
+            }
+        }
+        drop(request_tx);
+        drop(main_tx);
+        drop(lane_tx);
+        drop(framing_tx);
+
+        // Operation tasks: the registry knows every spawned turn. Aborting
+        // before joining guarantees no post-shutdown write, even for a
+        // backend that ignored cancellation.
+        if !registry.join_turns(timeout).await && result.is_ok() {
+            result = Err(format!(
+                "prompt tasks did not stop within {}ms and were aborted",
+                timeout.as_millis()
+            ));
+        }
+
+        let mut dispatcher_handle = dispatcher_handle;
+        match tokio::time::timeout(timeout, &mut dispatcher_handle).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(e))) => {
                 if result.is_ok() {
@@ -2754,10 +2802,19 @@ impl AcpServer {
                 }
             }
             Err(_elapsed) => {
+                dispatcher_handle.abort();
+                let _ = dispatcher_handle.await;
                 tracing::warn!("acp: dispatcher task did not stop within shutdown timeout");
+                if result.is_ok() {
+                    result = Err(format!(
+                        "dispatcher task was aborted after {}ms",
+                        timeout.as_millis()
+                    ));
+                }
             }
         }
-        match tokio::time::timeout(timeout, writer_handle).await {
+        let mut writer_handle = writer_handle;
+        match tokio::time::timeout(timeout, &mut writer_handle).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(e))) => {
                 // A writer IO failure is the connection's real error.
@@ -2769,7 +2826,15 @@ impl AcpServer {
                 }
             }
             Err(_elapsed) => {
+                writer_handle.abort();
+                let _ = writer_handle.await;
                 tracing::warn!("acp: writer task did not stop within shutdown timeout");
+                if result.is_ok() {
+                    result = Err(format!(
+                        "writer task was aborted after {}ms",
+                        timeout.as_millis()
+                    ));
+                }
             }
         }
         result
@@ -3729,9 +3794,12 @@ fn authenticate_response(id: RequestId, params: &Value) -> Vec<u8> {
 
 /// Per-session bookkeeping: one active turn (plus one queued prompt) per
 /// session; idle entries are evicted first once `max_sessions` is hit.
+/// `turns` tracks every spawned operation task so the connection wind-down
+/// can abort/join them (no task outlives `serve_connection`).
 #[derive(Clone)]
 struct Registry {
     inner: Arc<Mutex<RegistryInner>>,
+    turns: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 struct RegistryInner {
@@ -3739,6 +3807,9 @@ struct RegistryInner {
     order: VecDeque<String>,
     max_sessions: usize,
     active_turns: usize,
+    /// Set by `cancel_all` (connection wind-down): no NEW turn may be
+    /// admitted and a finished turn never promotes its queued prompt.
+    closed: bool,
 }
 
 impl Registry {
@@ -3749,7 +3820,9 @@ impl Registry {
                 order: VecDeque::new(),
                 max_sessions,
                 active_turns: 0,
+                closed: false,
             })),
+            turns: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -3757,6 +3830,39 @@ impl Registry {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Track one spawned turn task; finished handles are pruned first so the
+    /// list stays bounded by the genuinely live tasks.
+    fn track_turn(&self, handle: tokio::task::JoinHandle<()>) {
+        let mut turns = self
+            .turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        turns.retain(|h| !h.is_finished());
+        turns.push(handle);
+    }
+
+    /// Abort and join every tracked turn task with an overall bound. Returns
+    /// false when at least one task was still running at the deadline (it was
+    /// aborted first, so it can never write again).
+    async fn join_turns(&self, bound: Duration) -> bool {
+        let handles: Vec<tokio::task::JoinHandle<()>> = {
+            let mut turns = self
+                .turns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            turns.drain(..).collect()
+        };
+        let deadline = tokio::time::Instant::now() + bound;
+        let mut all_stopped = true;
+        for handle in handles {
+            handle.abort();
+            if tokio::time::timeout_at(deadline, handle).await.is_err() {
+                all_stopped = false;
+            }
+        }
+        all_stopped
     }
 
     fn cancel(&self, session_id: &str) -> bool {
@@ -3774,8 +3880,12 @@ impl Registry {
         }
     }
 
+    /// Wind-down: close the registry (no new turns, no queued-prompt
+    /// promotion) and fire every active token. Tracked tasks are then
+    /// aborted/joined by [`Registry::join_turns`].
     fn cancel_all(&self) {
-        let inner = self.lock();
+        let mut inner = self.lock();
+        inner.closed = true;
         for state in inner.sessions.values() {
             if let Some(active) = &state.active {
                 active.token.cancel();
@@ -3787,9 +3897,13 @@ impl Registry {
     /// `Start(job, token)`: the caller must run the turn on a fresh
     /// operation task; `Queued`: runs after the active turn's terminal
     /// response; `Busy`: queue depth already full; `Full`: the server's
-    /// per-session capacity is exhausted (no idle entries left to evict).
+    /// per-session capacity is exhausted (no idle entries left to evict);
+    /// `Closed`: the connection is winding down.
     fn admit(&self, session_id: &str, job: PromptJob) -> Admit {
         let mut inner = self.lock();
+        if inner.closed {
+            return Admit::Closed;
+        }
         // Make room for a new entry first (never evicts active turns).
         if !inner.sessions.contains_key(session_id) {
             inner.order.push_back(session_id.to_string());
@@ -3864,9 +3978,17 @@ impl Registry {
 
     /// Terminal handoff after the operation task enqueued the turn's
     /// terminal response: promote the queued prompt (fresh token) or park
-    /// the session as idle. Returns the job to run next, if any.
+    /// the session as idle. Returns the job to run next, if any. A closed
+    /// registry never promotes: the wind-down drops every queued prompt.
     fn finish(&self, session_id: &str, token: &CancelToken) -> Option<(PromptJob, CancelToken)> {
         let mut inner = self.lock();
+        if inner.closed {
+            if let Some(state) = inner.sessions.get_mut(session_id) {
+                state.active = None;
+            }
+            inner.active_turns = inner.active_turns.saturating_sub(1);
+            return None;
+        }
         let state = inner.sessions.get_mut(session_id)?;
         let active = state.active.as_mut()?;
         if active.token != *token {
@@ -3895,6 +4017,8 @@ enum Admit {
     Busy,
     /// Per-session capacity exhausted (bounded resource refusal).
     Full,
+    /// The connection is winding down: no new work is admitted.
+    Closed,
 }
 
 fn require_session_id(params: &Value) -> Result<String, ServerError> {
@@ -4002,6 +4126,10 @@ async fn dispatch_prompt(
             let frame = error_frame(id, SESSION_LIMIT, MSG_SESSION_LIMIT, None);
             send_checked(main_tx, frame).await
         }
+        Admit::Closed => {
+            let frame = internal_error_frame(id, "the connection is shutting down".to_string());
+            send_checked(main_tx, frame).await
+        }
     }
 }
 
@@ -4018,7 +4146,8 @@ fn spawn_turn(
     token: CancelToken,
 ) {
     let main_tx_2 = main_tx.clone();
-    std::mem::drop(tokio::spawn(async move {
+    let tracked = registry.clone();
+    let handle = tokio::spawn(async move {
         // The only per-session work in flight: run the turn, enqueue its
         // terminal response, then promote the queued prompt (if any).
         // A panicking backend must not leave the prompt unanswered.
@@ -4055,7 +4184,10 @@ fn spawn_turn(
                 next_token,
             );
         }
-    }));
+    });
+    // Tracked so the connection wind-down can abort/join every operation
+    // task: no task outlives `serve_connection`.
+    tracked.track_turn(handle);
 }
 
 /// Terminal frame for one prompt turn: the official `stopReason` result,

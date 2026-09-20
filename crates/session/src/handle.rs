@@ -615,7 +615,11 @@ impl SessionHandle {
             .map_err(SessionError::from)?)
     }
 
-    /// Recovery: claimed rows crash back to pending (re-admit later).
+    /// Recovery: claimed rows crash back to pending (re-admit later); a
+    /// `running` row whose logical turn already ended (no active turn
+    /// record) is retired to `done` — a running row still owned by an
+    /// active turn record is left for the queue runner to resume and
+    /// consume exactly once.
     pub fn recover_queued_rows(&self) -> faktor_core::Result<i64> {
         Ok(self
             .manager
@@ -675,7 +679,8 @@ impl SessionHandle {
             None => self.ops().all(),
         };
         // abort(None) also durably cancels every queued prompt of the
-        // session (pending/claimed rows).
+        // session (pending/claimed/running rows — a running row whose drive
+        // was interrupted is crash residue abort must clear too).
         let queued_ids = if op_id.is_none() {
             self.manager
                 .store()

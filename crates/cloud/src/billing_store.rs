@@ -265,6 +265,7 @@ impl From<CloudStoreError> for BillingStoreError {
         match e {
             CloudStoreError::Backend(m) => BillingStoreError::Backend(m),
             CloudStoreError::Malformed(m) => BillingStoreError::Malformed(m),
+            CloudStoreError::Conflict(m) => BillingStoreError::Malformed(m),
         }
     }
 }
@@ -445,6 +446,8 @@ fn claim_credit(
             if existing.entry.kind == entry.kind
                 && existing.entry.amount_micro == entry.amount_micro
                 && existing.entry.reference == entry.reference
+                && existing.entry.billing_account_id == entry.billing_account_id
+                && existing.entry.usage_event_id == entry.usage_event_id
             {
                 return Ok(CreditAppend::Duplicate);
             }
@@ -903,6 +906,10 @@ fn encode<T: Serialize>(value: &T) -> Result<String, BillingStoreError> {
         .map_err(|e| BillingStoreError::Malformed(format!("billing row encode: {e}")))
 }
 
+/// One matched `credit_entry` idempotency row: (id, kind, amount_micro,
+/// reference, billing_account_id, usage_event_id).
+type CreditEntryKeyRow = (String, String, i64, Option<String>, String, Option<String>);
+
 impl SqliteControlPlaneStore {
     /// Run one credit append inside an IMMEDIATE transaction: the balance is
     /// re-derived from the durable rows and the guards applied before the
@@ -915,19 +922,31 @@ impl SqliteControlPlaneStore {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(backend)?;
         if let Some(key) = &entry.idempotency_key {
-            let existing: Option<(String, String, i64, Option<String>)> = tx
+            let existing: Option<CreditEntryKeyRow> = tx
                 .query_row(
-                    "SELECT id, kind, amount_micro, reference FROM credit_entry
+                    "SELECT id, kind, amount_micro, reference, billing_account_id, usage_event_id
+                     FROM credit_entry
                      WHERE organization_id = ?1 AND idempotency_key = ?2",
                     params![entry.organization.as_str(), key],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(backend)?;
-            if let Some((_id, kind, amount, reference)) = existing {
+            if let Some((_id, kind, amount, reference, account, usage_event)) = existing {
                 let same = kind == entry.kind.as_str()
                     && amount as u64 == entry.amount_micro
-                    && reference.as_deref() == entry.reference.as_ref().map(|r| r.as_str());
+                    && reference.as_deref() == entry.reference.as_ref().map(|r| r.as_str())
+                    && account == entry.billing_account_id.as_str()
+                    && usage_event.as_deref() == entry.usage_event_id.as_ref().map(|u| u.as_str());
                 if same {
                     tx.commit().map_err(backend)?;
                     return Ok(CreditAppend::Duplicate);
