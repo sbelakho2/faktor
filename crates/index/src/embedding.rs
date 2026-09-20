@@ -65,7 +65,11 @@ pub const MAX_EMBEDDING_SCAN_TEXT_BYTES: usize = 8 * 1024 * 1024;
 /// own batching/retries (the CLI's `ProviderEmbedder` already bounds batches
 /// and follows the configured retry policy); the index validates every
 /// response before persisting it and degrades (never fails the build) when
-/// the source errors or answers a hostile shape.
+/// the source errors or answers a hostile shape. Every degradation is TYPED
+/// and observable — the affected chunk count and the bounded provider error
+/// are recorded in [`EmbeddingStats`] and persisted on the generation's
+/// [`EmbeddingIndex::build_status`] (`Degraded`) — never a silent
+/// lexical-only success.
 pub trait EmbeddingSource: Send + Sync {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, Error>;
 }
@@ -99,6 +103,167 @@ pub struct EmbeddingRecord {
     pub vector: Vec<f32>,
 }
 
+/// Hard byte bound of the persisted degraded-build reason (a hostile
+/// generation file cannot smuggle an unbounded string into memory or logs).
+pub const EMBEDDING_BUILD_REASON_MAX_BYTES: usize = 512;
+
+/// Why one build-time source call produced no vectors. Recorded (never
+/// fatal): the build still publishes, but the outcome is typed and
+/// observable instead of silently lexical-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbedFailure {
+    /// The source returned a typed error.
+    Source {
+        /// Provider code when the source surfaced one, else the error kind.
+        code: String,
+        /// Whether the source marked the failure retryable.
+        retryable: bool,
+        /// Bounded provider message.
+        message: String,
+    },
+    /// The source panicked; the build catches it (the source is untrusted
+    /// input to the build).
+    Panicked,
+}
+
+impl EmbedFailure {
+    /// Typed construction from the provider error, preserving the provider
+    /// code/retryability when the error carries it.
+    pub fn from_error(error: Error) -> Self {
+        let (code, retryable) = match &error.kind {
+            ErrorKind::Provider { code, retryable } => (code.clone(), *retryable),
+            kind => (format!("{kind:?}"), error.retryable),
+        };
+        Self::Source {
+            code,
+            retryable,
+            message: bounded_build_reason(&error.message),
+        }
+    }
+
+    /// Bounded one-line description for stats/status/logs.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Source {
+                code,
+                retryable,
+                message,
+            } => format!("embedding source failed: code={code} retryable={retryable}: {message}"),
+            Self::Panicked => "embedding source panicked".to_string(),
+        }
+    }
+}
+
+/// Truncate one diagnostic to [`EMBEDDING_BUILD_REASON_MAX_BYTES`] on a
+/// char boundary.
+pub fn bounded_build_reason(reason: &str) -> String {
+    if reason.len() <= EMBEDDING_BUILD_REASON_MAX_BYTES {
+        return reason.to_string();
+    }
+    let mut end = EMBEDDING_BUILD_REASON_MAX_BYTES;
+    while end > 0 && !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_string()
+}
+
+/// Persisted outcome of the embedding pass that produced an
+/// [`EmbeddingIndex`]: enough to distinguish a complete build from one
+/// that could not embed (provider error, affected count, skipped bound).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingBuildRecord {
+    /// A source was configured when the pass ran.
+    #[serde(default)]
+    pub source_configured: bool,
+    /// The source failed or answered a hostile shape.
+    #[serde(default)]
+    pub degraded: bool,
+    /// Bounded provider error/diagnostic of the failure.
+    #[serde(default)]
+    pub reason: String,
+    /// Referenced chunks that carry NO vector because of the failure.
+    #[serde(default)]
+    pub affected: usize,
+    /// Vectors embedded in this pass.
+    #[serde(default)]
+    pub embedded: usize,
+    /// Prior vectors carried forward untouched.
+    #[serde(default)]
+    pub carried: usize,
+    /// Referenced chunks the per-build bound deferred to the next build.
+    #[serde(default)]
+    pub skipped: usize,
+    /// Source calls made in this pass (retries live inside the source).
+    #[serde(default)]
+    pub calls: usize,
+}
+
+/// Typed view of [`EmbeddingBuildRecord`] for callers/health: the index
+/// generation itself carries whether its vectors are complete, bounded by
+/// the per-build cap, degraded by a source failure — or never attempted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbeddingBuildStatus {
+    /// No source configured when the pass ran: lexical/symbol-only by
+    /// design, not a degradation.
+    Unconfigured,
+    /// Every referenced chunk carries a vector for the active identity.
+    Complete { embedded: usize, carried: usize },
+    /// No source failure: the per-build bound deferred `skipped` chunks to
+    /// the next build, so this generation is intentionally (not
+    /// accidentally) partial.
+    Bounded {
+        embedded: usize,
+        carried: usize,
+        skipped: usize,
+    },
+    /// The source failed or answered a hostile shape: `affected` referenced
+    /// chunks carry no vector in this generation, and `reason` names the
+    /// bounded provider error/diagnostic.
+    Degraded {
+        reason: String,
+        affected: usize,
+        embedded: usize,
+        carried: usize,
+        skipped: usize,
+    },
+}
+
+impl EmbeddingBuildStatus {
+    /// True only for an actual embed failure (never for the honest
+    /// unconfigured/bounded outcomes).
+    pub fn is_degraded(&self) -> bool {
+        matches!(self, Self::Degraded { .. })
+    }
+}
+
+impl EmbeddingBuildRecord {
+    pub fn status(&self) -> EmbeddingBuildStatus {
+        if !self.source_configured {
+            return EmbeddingBuildStatus::Unconfigured;
+        }
+        if self.degraded {
+            return EmbeddingBuildStatus::Degraded {
+                reason: self.reason.clone(),
+                affected: self.affected,
+                embedded: self.embedded,
+                carried: self.carried,
+                skipped: self.skipped,
+            };
+        }
+        if self.skipped > 0 {
+            return EmbeddingBuildStatus::Bounded {
+                embedded: self.embedded,
+                carried: self.carried,
+                skipped: self.skipped,
+            };
+        }
+        EmbeddingBuildStatus::Complete {
+            embedded: self.embedded,
+            carried: self.carried,
+        }
+    }
+}
+
 /// The per-workspace persisted embedding index: the ACTIVE identity plus
 /// every record keyed by (content_hash, model_id, model_revision,
 /// dimension).
@@ -112,6 +277,14 @@ pub struct EmbeddingIndex {
     /// Active dimension; `0` = none observed yet.
     #[serde(default)]
     pub dimension: u32,
+    /// Build-time embedding outcome that produced this index. Persisted
+    /// with the generation so a build that could not embed is NEVER
+    /// mistaken for a complete one by callers/health
+    /// (see [`EmbeddingIndex::build_status`]). Raw bounded fields with
+    /// serde defaults: an old or hostile generation can only produce a
+    /// bounded status, never a load failure.
+    #[serde(default)]
+    pub build: EmbeddingBuildRecord,
     /// key = [`embedding_key`] of the record.
     #[serde(default)]
     pub records: BTreeMap<String, EmbeddingRecord>,
@@ -124,6 +297,7 @@ impl Default for EmbeddingIndex {
             model_id: String::new(),
             model_revision: String::new(),
             dimension: 0,
+            build: EmbeddingBuildRecord::default(),
             records: BTreeMap::new(),
         }
     }
@@ -187,6 +361,20 @@ pub fn chunk_text(text: &str) -> Vec<&str> {
 }
 
 impl EmbeddingIndex {
+    /// The typed build outcome recorded when this index was produced.
+    /// Callers/health read this to distinguish a complete generation from
+    /// one whose build could not embed (never a silent lexical-only swap).
+    pub fn build_status(&self) -> EmbeddingBuildStatus {
+        self.build.status()
+    }
+
+    /// Record the typed build outcome (the reason is bounded here so no
+    /// construction path can persist an unbounded diagnostic).
+    pub fn set_build(&mut self, mut build: EmbeddingBuildRecord) {
+        build.reason = bounded_build_reason(&build.reason);
+        self.build = build;
+    }
+
     pub fn len(&self) -> usize {
         self.records.len()
     }
@@ -406,13 +594,23 @@ impl EmbeddingIndex {
                 .map(|record| record.dimension)
                 .unwrap_or(0);
         }
+        // The persisted build record is informational but untrusted: bound
+        // its reason so a hostile generation cannot smuggle an unbounded
+        // string into memory or logs. A record of an unknown shape still
+        // maps to a typed status — never a load failure.
+        if self.build.reason.len() > EMBEDDING_BUILD_REASON_MAX_BYTES {
+            self.build.reason = bounded_build_reason(&self.build.reason);
+        }
         self.prune();
         self
     }
 }
 
-/// Outcome of one [`apply_embeddings`] pass (observability/tests).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// Outcome of one [`apply_embeddings`] pass (observability/tests). The
+/// typed build outcome is also persisted onto the index itself
+/// ([`EmbeddingIndex::build_status`]) so a degraded build survives the
+/// generation swap.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EmbeddingStats {
     /// Prior vectors carried forward unchanged (never re-embedded).
     pub carried: usize,
@@ -425,12 +623,41 @@ pub struct EmbeddingStats {
     /// The source failed or answered a hostile shape; the build published
     /// without (some) vectors.
     pub degraded: bool,
+    /// Referenced chunks left WITHOUT a vector by the failure (`0` when the
+    /// pass completed; the bound-deferred remainder is `skipped`).
+    pub failed: usize,
+    /// Bounded provider error/diagnostic when `degraded`.
+    pub degraded_reason: Option<String>,
+}
+
+impl EmbeddingStats {
+    fn mark_degraded(&mut self, affected: usize, reason: impl Into<String>) {
+        self.degraded = true;
+        self.failed = self.failed.saturating_add(affected);
+        self.degraded_reason = Some(bounded_build_reason(&reason.into()));
+    }
+
+    fn build_record(&self, source_configured: bool) -> EmbeddingBuildRecord {
+        EmbeddingBuildRecord {
+            source_configured,
+            degraded: self.degraded,
+            reason: self.degraded_reason.clone().unwrap_or_default(),
+            affected: self.failed,
+            embedded: self.embedded,
+            carried: self.carried,
+            skipped: self.skipped,
+            calls: self.calls,
+        }
+    }
 }
 
 /// Reuse prior vectors for every referenced chunk whose content hash
-/// matches, embed the rest through `source` (when configured), and persist
+/// matches, embed the rest through `source` (when configured), and install
 /// the result into `index`. Never fails the build: an embedding outage
-/// degrades to lexical/symbol-only retrieval.
+/// degrades to lexical/symbol-only retrieval. The degradation is NEVER
+/// silent: the typed outcome is recorded on the persisted index
+/// ([`EmbeddingIndex::build_status`]) and logged loudly with the bounded
+/// provider error and the affected chunk count.
 ///
 /// `chunks` is the scanned chunk text per path (already bounded); `prior`
 /// is the previously published embedding index (in memory or reloaded from
@@ -443,13 +670,45 @@ pub fn apply_embeddings(
     chunks: &[(String, Vec<String>)],
     source: Option<&dyn EmbeddingSource>,
 ) -> EmbeddingStats {
+    let (stats, mut fresh) = apply_embeddings_pass(prior, model, chunks, source);
+    let record = stats.build_record(source.is_some());
+    if let EmbeddingBuildStatus::Degraded {
+        reason,
+        affected,
+        skipped,
+        ..
+    } = record.status()
+    {
+        tracing::error!(
+            workspace = workspace.raw(),
+            affected,
+            skipped,
+            embedded = stats.embedded,
+            carried = stats.carried,
+            calls = stats.calls,
+            "index embedding build DEGRADED: {} referenced chunks carry no vector ({reason}); the generation is published for lexical/symbol retrieval",
+            affected
+        );
+    }
+    fresh.set_build(record);
+    index.replace_embeddings(workspace, fresh);
+    stats
+}
+
+/// The bounded work of one build pass: carries matching prior vectors into
+/// a FRESH identity-scoped index (records of a different model/revision can
+/// never survive, and records of unreferenced chunks cannot linger), embeds
+/// the missing chunks and records the typed outcome. Returns the stats plus
+/// the index the caller installs — degraded or not, the build publishes.
+fn apply_embeddings_pass(
+    prior: Option<&EmbeddingIndex>,
+    model: &EmbeddingModel,
+    chunks: &[(String, Vec<String>)],
+    source: Option<&dyn EmbeddingSource>,
+) -> (EmbeddingStats, EmbeddingIndex) {
     let mut stats = EmbeddingStats::default();
-    // The build installs a FRESH identity-scoped store: records of a
-    // different model/revision can never survive, and records of chunks no
-    // longer referenced cannot linger.
     let mut fresh = EmbeddingIndex::default();
     fresh.set_identity(&model.model_id, &model.revision);
-    index.replace_embeddings(workspace, fresh);
 
     // Referenced chunks: hash -> text (first occurrence wins, so duplicates
     // across files share one vector).
@@ -474,55 +733,51 @@ pub fn apply_embeddings(
                 {
                     continue;
                 }
-                if index
-                    .put_embedding(workspace, hash, record.vector.clone())
-                    .is_ok()
-                {
+                if fresh.put(hash, record.vector.clone()).is_ok() {
                     stats.carried += 1;
                 }
             }
         }
     }
 
-    let missing: Vec<(String, String)> = referenced
+    let mut missing: Vec<(String, String)> = referenced
         .iter()
-        .filter(|(hash, _)| index.embedding_vector(workspace, hash).is_none())
+        .filter(|(hash, _)| fresh.active_vector(hash).is_none())
         .map(|(hash, text)| (hash.clone(), text.clone()))
         .collect();
-    let mut missing = missing;
     if missing.len() > MAX_EMBED_CHUNKS_PER_BUILD {
         stats.skipped += missing.len() - MAX_EMBED_CHUNKS_PER_BUILD;
         missing.truncate(MAX_EMBED_CHUNKS_PER_BUILD);
     }
     let Some(source) = source else {
-        return stats;
+        return (stats, fresh);
     };
     if missing.is_empty() {
-        return stats;
+        return (stats, fresh);
     }
 
-    let carried_dimension = index.embedding_dimension(workspace);
+    let carried_dimension = fresh.dimension;
     match embed_batch(source, &missing, &mut stats) {
-        Some(vectors) => {
+        Ok(vectors) => {
             let dimension = match vectors.first().map(|v| v.len()) {
                 Some(d) if d > 0 && d <= MAX_EMBEDDING_DIMENSIONS => d,
                 _ => {
-                    tracing::warn!(
-                        "embedding source answered a zero/invalid dimension; build degrades"
+                    stats.mark_degraded(
+                        missing.len(),
+                        "embedding source answered a zero/invalid dimension",
                     );
-                    stats.degraded = true;
-                    return stats;
+                    return (stats, fresh);
                 }
             };
             let uniform = vectors
                 .iter()
                 .all(|v| v.len() == dimension && v.iter().all(|c| c.is_finite()));
             if !uniform {
-                tracing::warn!(
-                    "embedding source answered a ragged/non-finite batch; build degrades"
+                stats.mark_degraded(
+                    missing.len(),
+                    "embedding source answered a ragged/non-finite batch",
                 );
-                stats.degraded = true;
-                return stats;
+                return (stats, fresh);
             }
             if carried_dimension != 0 && carried_dimension as usize != dimension {
                 // Same identity answered a NEW dimension: every carried
@@ -533,20 +788,22 @@ pub fn apply_embeddings(
                     new = dimension,
                     "embedding dimension changed; re-embedding the corpus"
                 );
-                index.purge_embeddings(workspace);
+                fresh.purge_active_identity();
                 stats.carried = 0;
-                let all: Vec<(String, String)> = referenced
+                let mut all: Vec<(String, String)> = referenced
                     .iter()
                     .map(|(hash, text)| (hash.clone(), text.clone()))
                     .collect();
-                let mut all = all;
                 if all.len() > MAX_EMBED_CHUNKS_PER_BUILD {
                     stats.skipped += all.len() - MAX_EMBED_CHUNKS_PER_BUILD;
                     all.truncate(MAX_EMBED_CHUNKS_PER_BUILD);
                 }
-                let Some(vectors) = embed_batch(source, &all, &mut stats) else {
-                    stats.degraded = true;
-                    return stats;
+                let vectors = match embed_batch(source, &all, &mut stats) {
+                    Ok(vectors) => vectors,
+                    Err(failure) => {
+                        stats.mark_degraded(all.len(), failure.describe());
+                        return (stats, fresh);
+                    }
                 };
                 let dimension = vectors.first().map(|v| v.len()).unwrap_or(0);
                 let uniform = dimension > 0
@@ -555,55 +812,58 @@ pub fn apply_embeddings(
                         v.len() == dimension && v.iter().all(|component| component.is_finite())
                     });
                 if !uniform {
-                    tracing::warn!(
-                        "embedding source answered an invalid re-embed batch; build degrades"
+                    stats.mark_degraded(
+                        all.len(),
+                        "embedding source answered an invalid re-embed batch",
                     );
-                    stats.degraded = true;
-                    return stats;
+                    return (stats, fresh);
                 }
-                stats.embedded += store_vectors(index, workspace, &all, vectors);
+                stats.embedded += store_vectors(&mut fresh, &all, vectors);
             } else {
-                stats.embedded += store_vectors(index, workspace, &missing, vectors);
+                stats.embedded += store_vectors(&mut fresh, &missing, vectors);
             }
         }
-        None => stats.degraded = true,
+        Err(failure) => stats.mark_degraded(missing.len(), failure.describe()),
     }
-    stats
+    (stats, fresh)
 }
 
-/// One bounded source call: `None` (degraded) on any error/refusal, never a
+/// One bounded source call: `Err` (degraded) on any error/refusal, never a
 /// panic — the source is untrusted input to the build.
 fn embed_batch(
     source: &dyn EmbeddingSource,
     batch: &[(String, String)],
     stats: &mut EmbeddingStats,
-) -> Option<Vec<Vec<f32>>> {
+) -> Result<Vec<Vec<f32>>, EmbedFailure> {
     let texts: Vec<String> = batch.iter().map(|(_, text)| text.clone()).collect();
     stats.calls += 1;
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source.embed(&texts))) {
-        Ok(Ok(vectors)) => Some(vectors),
-        Ok(Err(e)) => {
-            tracing::warn!("embedding source failed (retrieval degrades to lexical/symbol): {e}");
-            None
+        Ok(Ok(vectors)) => Ok(vectors),
+        Ok(Err(error)) => {
+            let failure = EmbedFailure::from_error(error);
+            tracing::warn!(
+                "embedding source failed (build degrades to lexical/symbol): {}",
+                failure.describe()
+            );
+            Err(failure)
         }
         Err(_) => {
-            tracing::warn!("embedding source panicked (retrieval degrades to lexical/symbol)");
-            None
+            tracing::warn!("embedding source panicked (build degrades to lexical/symbol)");
+            Err(EmbedFailure::Panicked)
         }
     }
 }
 
-/// Store validated vectors, skipping none/failing ones individually; the
-/// count actually persisted is returned.
+/// Store validated vectors into the fresh index, skipping none/failing ones
+/// individually; the count actually persisted is returned.
 fn store_vectors(
-    index: &mut WorkspaceIndex,
-    workspace: WorkspaceId,
+    index: &mut EmbeddingIndex,
     batch: &[(String, String)],
     vectors: Vec<Vec<f32>>,
 ) -> usize {
     let mut stored = 0usize;
     for ((hash, _), vector) in batch.iter().zip(vectors) {
-        if index.put_embedding(workspace, hash, vector).is_ok() {
+        if index.put(hash, vector).is_ok() {
             stored += 1;
         }
     }
@@ -902,9 +1162,204 @@ mod tests {
         );
         assert!(stats.degraded);
         assert_eq!(stats.embedded, 0);
+        assert_eq!(stats.failed, 1, "the affected chunk is counted");
+        assert!(stats.degraded_reason.is_some());
         assert!(!index.has_embedding_index(ws));
+        // The typed outcome is persisted on the generation: not a clean
+        // success.
+        assert!(index
+            .embedding_index(ws)
+            .expect("the build records its outcome")
+            .build_status()
+            .is_degraded());
         // The lexical index is untouched by the embedding outage.
         assert_eq!(index.files_for_token(ws, "gamma", 10).len(), 1);
+    }
+
+    /// A source that panics on every call: hostile input to the build.
+    struct PanickingSource;
+
+    impl EmbeddingSource for PanickingSource {
+        fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, Error> {
+            panic!("embedding backend exploded");
+        }
+    }
+
+    #[test]
+    fn source_failure_is_a_typed_persisted_degraded_status_with_affected_count() {
+        let ws = WorkspaceId::new(1);
+        let alpha = "pub fn alpha() {}\n";
+        let beta = "pub fn beta() {}\n";
+        let mut index = index_one(ws, "src/a.rs", alpha);
+        index
+            .index_file(ws, Path::new("src/b.rs"), beta.as_bytes(), 0)
+            .unwrap();
+        let source = SpySource::new(2);
+        source.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let chunks = vec![
+            ("src/a.rs".into(), vec![alpha.into()]),
+            ("src/b.rs".into(), vec![beta.into()]),
+        ];
+        let model = EmbeddingModel::new("m", "r1");
+        let stats = apply_embeddings(&mut index, ws, None, &model, &chunks, Some(&source));
+        assert!(stats.degraded);
+        assert_eq!(stats.failed, 2, "every referenced chunk was affected");
+        let described = stats.degraded_reason.as_deref().unwrap();
+        assert!(described.contains("Network"), "{described}");
+        assert!(described.contains("embedding backend down"), "{described}");
+        // The generation itself carries the typed status: callers/health can
+        // tell a degraded build from a complete one without reading logs.
+        match index
+            .embedding_index(ws)
+            .expect("the build records its outcome")
+            .build_status()
+        {
+            EmbeddingBuildStatus::Degraded {
+                reason,
+                affected,
+                embedded,
+                carried,
+                skipped,
+            } => {
+                assert_eq!(affected, 2);
+                assert_eq!(embedded, 0);
+                assert_eq!(carried, 0);
+                assert_eq!(skipped, 0);
+                assert!(reason.contains("embedding backend down"), "{reason}");
+            }
+            other => panic!("a failed embed build must not look complete: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_rebuild_clears_the_degraded_status() {
+        let ws = WorkspaceId::new(1);
+        let text = "pub fn gamma() {}\n";
+        let mut index = index_one(ws, "src/c.rs", text);
+        let source = SpySource::new(2);
+        source.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let chunks = vec![("src/c.rs".into(), vec![text.into()])];
+        let model = EmbeddingModel::new("m", "r1");
+        let failed = apply_embeddings(&mut index, ws, None, &model, &chunks, Some(&source));
+        assert!(failed.degraded);
+        assert!(index
+            .embedding_index(ws)
+            .unwrap()
+            .build_status()
+            .is_degraded());
+        // Rebuild with a healthy provider: the same referenced corpus now
+        // embeds and the generation is Complete — the degrade is not sticky.
+        source
+            .fail
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let prior = index.embedding_index(ws).cloned().unwrap();
+        let healed = apply_embeddings(&mut index, ws, Some(&prior), &model, &chunks, Some(&source));
+        assert!(!healed.degraded);
+        assert_eq!(healed.embedded, 1);
+        assert_eq!(healed.failed, 0);
+        assert!(healed.degraded_reason.is_none());
+        assert_eq!(
+            index.embedding_index(ws).unwrap().build_status(),
+            EmbeddingBuildStatus::Complete {
+                embedded: 1,
+                carried: 0
+            },
+            "a healthy rebuild must clear the degraded status"
+        );
+        assert!(index.has_embedding_index(ws));
+    }
+
+    #[test]
+    fn panicking_source_is_degraded_not_propagated() {
+        let ws = WorkspaceId::new(1);
+        let text = "pub fn delta() {}\n";
+        let mut index = index_one(ws, "src/d.rs", text);
+        let chunks = vec![("src/d.rs".into(), vec![text.into()])];
+        let stats = apply_embeddings(
+            &mut index,
+            ws,
+            None,
+            &EmbeddingModel::new("m", "r1"),
+            &chunks,
+            Some(&PanickingSource),
+        );
+        assert!(stats.degraded);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(
+            stats.degraded_reason.as_deref(),
+            Some("embedding source panicked")
+        );
+        match index.embedding_index(ws).unwrap().build_status() {
+            EmbeddingBuildStatus::Degraded {
+                reason, affected, ..
+            } => {
+                assert_eq!(affected, 1);
+                assert_eq!(reason, "embedding source panicked");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_status_survives_serialization_and_hostile_reasons_are_bounded() {
+        let mut index = EmbeddingIndex::default();
+        index.set_identity("m", "r");
+        index.set_build(EmbeddingBuildRecord {
+            source_configured: true,
+            degraded: true,
+            reason: "x".repeat(EMBEDDING_BUILD_REASON_MAX_BYTES * 4),
+            affected: 3,
+            embedded: 1,
+            carried: 2,
+            skipped: 4,
+            calls: 1,
+        });
+        let json = serde_json::to_string(&index).unwrap();
+        let loaded: EmbeddingIndex = serde_json::from_str(&json).unwrap();
+        let loaded = loaded.sanitize();
+        match loaded.build_status() {
+            EmbeddingBuildStatus::Degraded {
+                reason,
+                affected,
+                embedded,
+                carried,
+                skipped,
+            } => {
+                assert_eq!(affected, 3);
+                assert_eq!(embedded, 1);
+                assert_eq!(carried, 2);
+                assert_eq!(skipped, 4);
+                assert!(
+                    reason.len() <= EMBEDDING_BUILD_REASON_MAX_BYTES,
+                    "a hostile reason must be bounded: {}",
+                    reason.len()
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // An old generation without the build field loads as Unconfigured,
+        // never as a load failure.
+        let old: EmbeddingIndex = serde_json::from_str(
+            r#"{"format":1,"model_id":"m","model_revision":"r","dimension":0,"records":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(old.build_status(), EmbeddingBuildStatus::Unconfigured);
+        // The bound-deferred outcome is typed as intentional, not degraded.
+        let bounded = EmbeddingBuildRecord {
+            source_configured: true,
+            skipped: 5,
+            ..EmbeddingBuildRecord::default()
+        };
+        assert_eq!(
+            bounded.status(),
+            EmbeddingBuildStatus::Bounded {
+                embedded: 0,
+                carried: 0,
+                skipped: 5
+            }
+        );
+        assert!(!bounded.status().is_degraded());
+        assert!(!EmbeddingBuildRecord::default().status().is_degraded());
     }
 
     #[test]

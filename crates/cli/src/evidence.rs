@@ -7,9 +7,12 @@
 //! the index is a memory-sidecar, never a session dependency), and asks the
 //! search service for an evidence package from concepts of the prompt.
 //!
-//! Everything here is advisory: any failure (missing session, unreadable
-//! root, hostile input, scan caps) yields an empty evidence list and never
-//! breaks the turn.
+//! Everything here is advisory for INFRASTRUCTURE failures (missing session,
+//! unreadable root, hostile input, scan caps): those yield an empty evidence
+//! list and never break the turn. A CONFIGURED semantic provider's failure is
+//! different by contract: `fused`/`evidence_package` surface the search
+//! crate's typed error unchanged, so this provider never silently replaces
+//! semantic evidence with a lexical-only package.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -17,6 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use faktor_agent::{EvidenceProvider, EvidenceQuery};
 use faktor_context::assembler::Evidence;
+use faktor_core::error::Error;
 use faktor_core::id::{SessionId, WorkspaceId};
 use faktor_index::{tokenize, WorkspaceIndex};
 use faktor_search::SearchService;
@@ -263,14 +267,23 @@ impl RepoEvidence {
     /// crate's own tests on the historical synchronous shape (the scan is
     /// CPU/fs-bound and the assertions here are about scan semantics, not
     /// async dispatch).
-    fn evidence_sync(&self, session: SessionId, query: &EvidenceQuery) -> Vec<Evidence> {
+    ///
+    /// Fallible by contract for the SEMANTIC leg: a configured provider's
+    /// typed failure propagates instead of degrading to lexical-only hits.
+    /// Infrastructure failures (unknown session, unreadable root, scan caps)
+    /// remain the documented empty advisory package.
+    fn evidence_sync(
+        &self,
+        session: SessionId,
+        query: &EvidenceQuery,
+    ) -> Result<Vec<Evidence>, Error> {
         let Some((ws, root)) = self.resolve_root(session) else {
-            return vec![];
+            return Ok(vec![]);
         };
         {
             let scan = self.scan.lock().unwrap();
             if scan.failed.contains(&ws) {
-                return vec![];
+                return Ok(vec![]);
             }
             if scan.scanned.contains(&ws) {
                 return self.evidence_package(ws, query);
@@ -294,7 +307,7 @@ impl EvidenceProvider for RepoEvidence {
         session: SessionId,
         query: EvidenceQuery,
     ) -> futures::future::BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
-        Box::pin(async move { Ok(self.evidence_sync(session, &query)) })
+        Box::pin(async move { self.evidence_sync(session, &query) })
     }
 
     fn forget(&self, workspace: WorkspaceId) {
@@ -319,25 +332,30 @@ impl EvidenceProvider for RepoEvidence {
 }
 
 impl RepoEvidence {
-    fn evidence_package(&self, ws: WorkspaceId, query: &EvidenceQuery) -> Vec<Evidence> {
+    fn evidence_package(
+        &self,
+        ws: WorkspaceId,
+        query: &EvidenceQuery,
+    ) -> Result<Vec<Evidence>, Error> {
         if query.prompt.len() > 512 * 1024 {
-            return vec![];
+            return Ok(vec![]);
         }
         let concepts = Self::concepts(query);
         if concepts.is_empty() {
-            return vec![];
+            return Ok(vec![]);
         }
         let hits = self
             .search
-            .evidence_package(ws, &concepts, EVIDENCE_MAX_HITS);
-        hits.into_iter()
+            .evidence_package(ws, &concepts, EVIDENCE_MAX_HITS)?;
+        Ok(hits
+            .into_iter()
             .enumerate()
             .map(|(i, h)| Evidence {
                 path: h.path,
                 snippet: h.snippet,
                 score: 1.0 / (1.0 + i as f64),
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -411,13 +429,15 @@ mod tests {
         let m = manager();
         let ev = RepoEvidence::new(m.clone(), None);
         let sid = registered_session(&m, root.path());
-        let evidence = ev.evidence_sync(
-            sid,
-            &EvidenceQuery {
-                prompt: "fix balance_account".into(),
-                ..Default::default()
-            },
-        );
+        let evidence = ev
+            .evidence_sync(
+                sid,
+                &EvidenceQuery {
+                    prompt: "fix balance_account".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(
             evidence.iter().any(|e| e.path.ends_with("lib.rs")),
             "evidence must surface the file defining the concept: {evidence:?}"
@@ -450,9 +470,9 @@ mod tests {
 
     /// The configured-embedder wiring of the production evidence provider:
     /// semantic fusion finds the item lexical/symbol search misses; without
-    /// an embedder the same prompt yields NO evidence (honest degradation,
-    /// no crash, no invented item); a FAILING embedder still serves the
-    /// lexical/symbol legs.
+    /// an embedder the same prompt yields NO evidence (explicit `Disabled`
+    /// semantics, no crash, no invented item); a FAILING embedder surfaces
+    /// its typed error — never a silent lexical-only package.
     #[test]
     fn configured_embedder_fuses_semantically_and_absence_degrades_honestly() {
         let root = TempDir::new().unwrap();
@@ -469,13 +489,16 @@ mod tests {
         };
 
         let with = RepoEvidence::new(m.clone(), Some(Arc::new(ConceptAxisEmbedder)))
-            .evidence_sync(sid, &query);
+            .evidence_sync(sid, &query)
+            .unwrap();
         assert!(
             with.iter().any(|e| e.path.ends_with("ledger.rs")),
             "the configured embedder must fuse the semantic-only item: {with:?}"
         );
 
-        let without = RepoEvidence::new(m.clone(), None).evidence_sync(sid, &query);
+        let without = RepoEvidence::new(m.clone(), None)
+            .evidence_sync(sid, &query)
+            .unwrap();
         assert!(
             without.is_empty(),
             "without an embedder no semantic evidence may be invented: {without:?}"
@@ -496,16 +519,23 @@ mod tests {
                 ))
             }
         }
-        let failing = RepoEvidence::new(m.clone(), Some(Arc::new(FailingEmbedder))).evidence_sync(
-            sid,
-            &EvidenceQuery {
-                prompt: "reconcile_accounts".into(),
-                ..Default::default()
-            },
+        let failing = RepoEvidence::new(m.clone(), Some(Arc::new(FailingEmbedder)))
+            .evidence_sync(
+                sid,
+                &EvidenceQuery {
+                    prompt: "reconcile_accounts".into(),
+                    ..Default::default()
+                },
+            )
+            .expect_err("a provider failure must surface, never degrade to lexical-only");
+        assert_eq!(
+            failing.kind,
+            faktor_core::error::ErrorKind::Network,
+            "{failing}"
         );
         assert!(
-            failing.iter().any(|e| e.path.ends_with("ledger.rs")),
-            "lexical evidence must survive an embedding failure: {failing:?}"
+            failing.retryable,
+            "transport errors stay retryable: {failing}"
         );
     }
 
@@ -523,13 +553,15 @@ mod tests {
         let ev = RepoEvidence::with_caps(m.clone(), 25, 10_000, 64 * 1024 * 1024, 1_000_000, None);
         // The scan cap must not panic, must terminate, and must bound work.
         let sid = registered_session(&m, root.path());
-        let evidence = ev.evidence_sync(
-            sid,
-            &EvidenceQuery {
-                prompt: "fx199".into(),
-                ..Default::default()
-            },
-        );
+        let evidence = ev
+            .evidence_sync(
+                sid,
+                &EvidenceQuery {
+                    prompt: "fx199".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(evidence.len() <= 8);
         // fx199 may or may not be indexed (25 < 200) — but the call returns.
         assert!(evidence.len() <= EVIDENCE_MAX_HITS);
@@ -549,13 +581,15 @@ mod tests {
         let m = manager();
         let ev = RepoEvidence::new(m.clone(), None);
         let sid = registered_session(&m, root.path());
-        let evidence = ev.evidence_sync(
-            sid,
-            &EvidenceQuery {
-                prompt: "payments".into(),
-                ..Default::default()
-            },
-        );
+        let evidence = ev
+            .evidence_sync(
+                sid,
+                &EvidenceQuery {
+                    prompt: "payments".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(evidence.len(), 1);
         assert!(evidence[0].path.ends_with("src/app.rs"));
     }
@@ -584,13 +618,15 @@ mod tests {
         let ev = RepoEvidence::new(m.clone(), None);
         // Plain session: the user checkout is the evidence root (a shadow
         // row exists for NO session; shadow-only files are never seen).
-        let out = ev.evidence_sync(
-            sid,
-            &EvidenceQuery {
-                prompt: "user_only_symbol".into(),
-                ..Default::default()
-            },
-        );
+        let out = ev
+            .evidence_sync(
+                sid,
+                &EvidenceQuery {
+                    prompt: "user_only_symbol".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(
             out.iter().any(|e| e.path.ends_with("useronly.rs")),
             "plain sessions scan the stored root: {out:?}"
@@ -615,13 +651,15 @@ mod tests {
         // A fresh evidence provider: per-workspace scan caches are process
         // state, so the re-pointed scan needs a clean provider instance.
         let ev = RepoEvidence::new(m.clone(), None);
-        let out = ev.evidence_sync(
-            sid,
-            &EvidenceQuery {
-                prompt: "shadow_only_symbol".into(),
-                ..Default::default()
-            },
-        );
+        let out = ev
+            .evidence_sync(
+                sid,
+                &EvidenceQuery {
+                    prompt: "shadow_only_symbol".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(
             out.iter().any(|e| e.path.ends_with("onlyshadow.rs")),
             "evidence must read the shadow root while the shadow is live: {out:?}"
@@ -635,13 +673,15 @@ mod tests {
         retired.state = ShadowRowState::Integrated;
         m.put_shadow_row(sid, &retired).unwrap();
         let ev = RepoEvidence::new(m.clone(), None);
-        let out = ev.evidence_sync(
-            sid,
-            &EvidenceQuery {
-                prompt: "user_only_symbol".into(),
-                ..Default::default()
-            },
-        );
+        let out = ev
+            .evidence_sync(
+                sid,
+                &EvidenceQuery {
+                    prompt: "user_only_symbol".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(
             out.iter().any(|e| e.path.ends_with("useronly.rs")),
             "a retired shadow never keeps re-pointing evidence"
@@ -658,13 +698,15 @@ mod tests {
         let ev = RepoEvidence::new(m.clone(), None);
         // Root that is a file, missing root, unknown session.
         let sid = registered_session(&m, root.path());
-        let _ = ev.evidence_sync(
-            sid,
-            &EvidenceQuery {
-                prompt: "payments".into(),
-                ..Default::default()
-            },
-        );
+        let _ = ev
+            .evidence_sync(
+                sid,
+                &EvidenceQuery {
+                    prompt: "payments".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let unknown = SessionId::new(99_999);
         assert!(ev
             .evidence_sync(
@@ -674,19 +716,22 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .unwrap()
             .is_empty());
         // A session whose store root vanished.
         let missing = TempDir::new().unwrap();
         write(missing.path(), "x.rs", b"fn alpha() {}\n");
         let sid2 = registered_session(&m, missing.path());
         std::fs::remove_dir_all(missing.path()).unwrap();
-        let out = ev.evidence_sync(
-            sid2,
-            &EvidenceQuery {
-                prompt: "alpha".into(),
-                ..Default::default()
-            },
-        );
+        let out = ev
+            .evidence_sync(
+                sid2,
+                &EvidenceQuery {
+                    prompt: "alpha".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(out.len() <= 8);
     }
 
@@ -699,16 +744,21 @@ mod tests {
         let sid = registered_session(&m, root.path());
         // 1 MiB prompt: bounded token extraction, bounded output.
         let huge = "a".repeat(1024 * 1024);
-        let evidence = ev.evidence_sync(
-            sid,
-            &EvidenceQuery {
-                prompt: huge,
-                ..Default::default()
-            },
-        );
+        let evidence = ev
+            .evidence_sync(
+                sid,
+                &EvidenceQuery {
+                    prompt: huge,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(evidence.len() <= EVIDENCE_MAX_HITS);
         // Empty prompt → nothing.
-        assert!(ev.evidence_sync(sid, &EvidenceQuery::default()).is_empty());
+        assert!(ev
+            .evidence_sync(sid, &EvidenceQuery::default())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -719,13 +769,15 @@ mod tests {
         let m = manager();
         let ev = RepoEvidence::with_caps(m.clone(), 100, 10_000, 64 * 1024 * 1024, 1_000, None);
         let sid = registered_session(&m, root.path());
-        let evidence = ev.evidence_sync(
-            sid,
-            &EvidenceQuery {
-                prompt: "target_fn".into(),
-                ..Default::default()
-            },
-        );
+        let evidence = ev
+            .evidence_sync(
+                sid,
+                &EvidenceQuery {
+                    prompt: "target_fn".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(evidence.len(), 1);
         assert!(evidence[0].path.ends_with("good.rs"));
     }
@@ -744,14 +796,16 @@ mod tests {
         let m = manager();
         let ev = RepoEvidence::new(m.clone(), None);
         let sid = registered_session(&m, root.path());
-        let evidence = ev.evidence_sync(
-            sid,
-            &EvidenceQuery {
-                prompt: "continue the task please".into(),
-                changed_files: vec!["src/payments_ledger.rs".into()],
-                ..Default::default()
-            },
-        );
+        let evidence = ev
+            .evidence_sync(
+                sid,
+                &EvidenceQuery {
+                    prompt: "continue the task please".into(),
+                    changed_files: vec!["src/payments_ledger.rs".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(
             evidence
                 .iter()
@@ -771,26 +825,30 @@ mod tests {
         let ev = RepoEvidence::new(m.clone(), None);
         let sid = registered_session(&m, root.path());
         // First scan: alpha_fn found.
-        let evidence = ev.evidence_sync(
-            sid,
-            &EvidenceQuery {
-                prompt: "alpha_fn".into(),
-                ..Default::default()
-            },
-        );
+        let evidence = ev
+            .evidence_sync(
+                sid,
+                &EvidenceQuery {
+                    prompt: "alpha_fn".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(evidence.len(), 1);
         let ws = ev.resolve_root(sid).unwrap().0;
         // The workspace is dropped: scan state AND postings.
         ev.forget_workspace(ws);
         // New file after the forget.
         write(root.path(), "src/two.rs", b"pub fn beta_fn() {}\n");
-        let evidence = ev.evidence_sync(
-            sid,
-            &EvidenceQuery {
-                prompt: "beta_fn".into(),
-                ..Default::default()
-            },
-        );
+        let evidence = ev
+            .evidence_sync(
+                sid,
+                &EvidenceQuery {
+                    prompt: "beta_fn".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(
             evidence.iter().any(|e| e.path.ends_with("two.rs")),
             "the rescanned index must see the new file: {evidence:?}"

@@ -117,7 +117,8 @@ pub use service::{
 pub use sso::{SsoLogin, SsoLoginOutcome, SsoStart, MAX_PENDING_SSO_LOGINS, SSO_STATE_TTL_MS};
 pub use store::{
     CloudStoreError, ControlPlaneStore, IdempotencyRecord, MemoryControlPlaneStore,
-    SqliteControlPlaneStore,
+    SqliteControlPlaneStore, IDEMPOTENCY_TTL_MS, MAX_IDEMPOTENCY_ROWS,
+    MAX_IDEMPOTENT_RESPONSE_BYTES,
 };
 pub use vendor::{
     BillingVendorAdapter, BillingVendorConfig, ReportOutcome, DEFAULT_REPORT_PATH,

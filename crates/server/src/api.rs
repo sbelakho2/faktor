@@ -27,6 +27,7 @@ use faktor_session::SessionManager;
 
 use crate::auth::{AuthToken, ServerPassword};
 use crate::permission::ChannelPermissionRequester;
+use crate::worker_plane::{WorkerPlaneHandle, WorkerPlaneStatus};
 
 pub(crate) use crate::native::*;
 
@@ -55,6 +56,139 @@ pub fn empty_evidence_store() -> EvidenceStoreHandle {
 /// The daemon's bounded request-body limit (`pub(crate)`: the dedicated
 /// worker-plane listener applies the same bound).
 pub(crate) const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// One daemon-owned slot for the dedicated worker-plane listener handle (the
+/// second listener of [`crate::worker_plane`]). The native health handler
+/// reads the typed [`WorkerPlaneStatus`] through it; the daemon shutdown
+/// sequence takes the owned handle out of it for the bounded join, so the
+/// health payload names the same socket before, during and after teardown.
+pub type WorkerPlaneListener = Arc<std::sync::Mutex<WorkerPlaneListenerSlot>>;
+
+/// The contents of a [`WorkerPlaneListener`] slot.
+#[derive(Default)]
+pub struct WorkerPlaneListenerSlot {
+    handle: Option<WorkerPlaneHandle>,
+    /// The bound address, remembered after the handle is consumed.
+    bind: Option<SocketAddr>,
+    /// The terminal snapshot recorded when the shutdown sequence consumed
+    /// the handle; `None` until then.
+    terminal: Option<WorkerPlaneStatus>,
+}
+
+impl WorkerPlaneListenerSlot {
+    /// Install the freshly bound listener handle (daemon startup; called
+    /// BEFORE the native listener starts, so a serving health route always
+    /// observes the installed handle).
+    pub fn install(&mut self, handle: WorkerPlaneHandle) {
+        self.bind = Some(handle.addr);
+        self.handle = Some(handle);
+    }
+
+    /// The typed status: live from the owned handle, or the terminal
+    /// snapshot recorded by the shutdown join. `None` = enabled but never
+    /// installed (or consumed without a recorded terminal).
+    pub fn status(&self) -> Option<WorkerPlaneStatus> {
+        if let Some(handle) = &self.handle {
+            return Some(handle.status());
+        }
+        self.terminal.clone()
+    }
+
+    /// The bound address, known even after the handle was consumed.
+    pub fn bind(&self) -> Option<SocketAddr> {
+        self.handle.as_ref().map(|handle| handle.addr).or(self.bind)
+    }
+
+    /// Take the owned handle for the bounded shutdown join. The
+    /// pre-shutdown status is captured FIRST (an unexpected death must be
+    /// named, never masked by the stop) and recorded as the provisional
+    /// terminal state; the caller may refine it with
+    /// [`WorkerPlaneListenerSlot::record_terminal`] after the join.
+    pub fn take_for_shutdown(&mut self) -> Option<(WorkerPlaneHandle, WorkerPlaneStatus)> {
+        let handle = self.handle.take()?;
+        let health = handle.status();
+        self.terminal = Some(if health.is_unavailable() {
+            health.clone()
+        } else {
+            WorkerPlaneStatus::Stopped
+        });
+        Some((handle, health))
+    }
+
+    /// Record the typed terminal status produced by the bounded join.
+    pub fn record_terminal(&mut self, status: WorkerPlaneStatus) {
+        self.terminal = Some(status);
+    }
+}
+
+/// Bound of the worker-plane health message surfaced by `/native/health`: a
+/// hostile IO/join error string must never balloon the health payload.
+pub const MAX_WORKER_PLANE_HEALTH_MESSAGE_BYTES: usize = 512;
+
+/// Truncate a typed status message on a UTF-8 char boundary. The message is
+/// derived from the typed [`crate::worker_plane::WorkerPlaneServeError`] only
+/// (bind + IO/join cause) — the configured transport bearer is never part of
+/// it, so no secret can reach the health payload through this path.
+fn bounded_worker_plane_health_message(message: &str) -> String {
+    if message.len() <= MAX_WORKER_PLANE_HEALTH_MESSAGE_BYTES {
+        return message.to_string();
+    }
+    let mut end = MAX_WORKER_PLANE_HEALTH_MESSAGE_BYTES;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &message[..end])
+}
+
+/// The additive health view of the dedicated worker-plane listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerPlaneHealth {
+    /// `[worker_plane]` is disabled (the default): no second socket exists.
+    Disabled,
+    /// The dedicated listener is wired. `status` is `None` only in the
+    /// startup window before the handle is installed and with no recorded
+    /// terminal state (the native listener starts after installation, so a
+    /// serving health route cannot observe that window in production).
+    Enabled {
+        bind: Option<SocketAddr>,
+        status: Option<WorkerPlaneStatus>,
+    },
+}
+
+impl WorkerPlaneHealth {
+    /// The stable machine spelling of the worker-plane state.
+    pub fn state(&self) -> &'static str {
+        match self {
+            WorkerPlaneHealth::Disabled => "disabled",
+            WorkerPlaneHealth::Enabled { status, .. } => match status {
+                Some(WorkerPlaneStatus::Serving) => "serving",
+                Some(WorkerPlaneStatus::Unavailable { .. }) => "unavailable",
+                Some(WorkerPlaneStatus::Stopped) | None => "stopped",
+            },
+        }
+    }
+
+    /// The additive, secret-free JSON object for `/native/health`: `state`
+    /// always; `bind` when known; `code` + `message` only for an unavailable
+    /// plane (the typed error's stable code and bounded message).
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut value = serde_json::Map::new();
+        value.insert("state".into(), self.state().into());
+        if let WorkerPlaneHealth::Enabled { bind, status } = self {
+            if let Some(bind) = bind {
+                value.insert("bind".into(), bind.to_string().into());
+            }
+            if let Some(WorkerPlaneStatus::Unavailable { code, message }) = status {
+                value.insert("code".into(), (*code).into());
+                value.insert(
+                    "message".into(),
+                    bounded_worker_plane_health_message(message).into(),
+                );
+            }
+        }
+        serde_json::Value::Object(value)
+    }
+}
 
 /// Typed construction refusal of [`ServerDeps::new`]: the embedded host's
 /// session store carries a degenerate data root, so the daemon-owned shadow
@@ -166,6 +300,11 @@ pub struct ServerDeps {
     /// default): both routes answer a typed 409 `sso_disabled` and the daemon
     /// is otherwise byte-identical.
     pub sso: Option<Arc<faktor_cloud::SsoLogin>>,
+    /// The dedicated worker-plane listener slot (see [`WorkerPlaneListener`]).
+    /// `None` = the `[worker_plane]` section is disabled (the default): the
+    /// native health payload reports an explicit `disabled` worker-plane
+    /// state and no second socket exists.
+    pub worker_plane_listener: Option<WorkerPlaneListener>,
 }
 
 impl ServerDeps {
@@ -252,6 +391,7 @@ impl ServerDeps {
             enterprise: None,
             retention: None,
             sso: None,
+            worker_plane_listener: None,
         }
     }
 
@@ -334,6 +474,32 @@ impl ServerDeps {
     pub fn with_workers(mut self, workers: Arc<faktor_worker::WorkerPlane>) -> Self {
         self.workers = Some(workers);
         self
+    }
+
+    /// Wire the dedicated worker-plane listener slot so the native health
+    /// payload reports its typed liveness (additive `worker_plane` key).
+    /// Without it the payload reports an explicit `disabled` state.
+    pub fn with_worker_plane_listener(mut self, listener: WorkerPlaneListener) -> Self {
+        self.worker_plane_listener = Some(listener);
+        self
+    }
+
+    /// The typed health of the dedicated worker-plane listener (the additive
+    /// `/native/health` entry). A poisoned slot lock degrades to the
+    /// recorded state rather than panicking a health probe.
+    pub fn worker_plane_health(&self) -> WorkerPlaneHealth {
+        match &self.worker_plane_listener {
+            None => WorkerPlaneHealth::Disabled,
+            Some(listener) => {
+                let slot = listener
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                WorkerPlaneHealth::Enabled {
+                    bind: slot.bind(),
+                    status: slot.status(),
+                }
+            }
+        }
     }
 
     /// Wire the enterprise plane (`[enterprise]`) and, optionally, the
@@ -1044,6 +1210,7 @@ pub(crate) mod tests {
             enterprise: None,
             retention: None,
             sso: None,
+            worker_plane_listener: None,
         }
     }
 
@@ -1868,6 +2035,175 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let _ = handle.shutdown.send(());
+    }
+
+    /// Serve one deps envelope's native listener and read `/native/health`
+    /// back (raw text + parsed JSON), then signal the listener to stop.
+    async fn health_json(deps: Arc<ServerDeps>, token: &AuthToken) -> (serde_json::Value, String) {
+        let native = serve_arc(deps, 0).await.unwrap();
+        let base = format!("http://{}", native.addr);
+        let raw = reqwest::Client::new()
+            .get(format!("{base}/native/health"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let _ = native.shutdown.send(());
+        (serde_json::from_str(&raw).unwrap(), raw)
+    }
+
+    /// The additive `/native/health` worker-plane entry: `disabled` by
+    /// default, `serving` + bind while the owned second listener is alive,
+    /// and `unavailable` + the typed code/message once that socket died
+    /// unexpectedly — an operator/placement decision can never mistake a
+    /// dead remote-worker socket for a live one. Existing keys stay
+    /// unchanged (additive key only) and the configured transport bearer
+    /// never enters the payload.
+    #[tokio::test]
+    async fn native_health_reports_the_worker_plane_typed_status() {
+        use crate::worker_plane::{
+            serve_worker_plane, WorkerPlaneAuth, WorkerPlaneBindConfig, WorkerPlaneHandle,
+            WorkerPlaneTransport,
+        };
+
+        fn loopback_config(bearer: Option<&str>) -> WorkerPlaneBindConfig {
+            WorkerPlaneBindConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                transport: WorkerPlaneTransport::Plaintext,
+                trusted_gateway: false,
+                auth: WorkerPlaneAuth::WorkerTokens,
+                bearer: bearer.map(str::to_string),
+            }
+        }
+
+        /// Wait (bounded) until the injected serve task recorded its death.
+        async fn wait_dead(handle: &WorkerPlaneHandle) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while handle.is_alive() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the injected serve death must land within the bound"
+                );
+                tokio::task::yield_now().await;
+            }
+        }
+
+        // (1) Disabled (the `[worker_plane]` default, no slot wired): an
+        // explicit disabled state; ok/version unchanged.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let deps = test_deps(dir.path());
+            let token = deps.auth_token.clone();
+            let (body, _raw) = health_json(Arc::new(deps), &token).await;
+            assert_eq!(body["ok"], true);
+            assert!(body["version"].is_string());
+            assert_eq!(body["worker_plane"]["state"], "disabled");
+            assert!(body["worker_plane"].get("bind").is_none());
+            assert!(body["worker_plane"].get("code").is_none());
+            assert!(body["worker_plane"].get("message").is_none());
+        }
+
+        // (2) Serving: a REAL dedicated listener over the same deps. The
+        // bound address is surfaced, the bearer is not, and the daemon
+        // shutdown handoff (take -> join -> record) keeps the entry
+        // truthful (`stopped`, never `disabled`/`serving`).
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut deps = test_deps(dir.path());
+            let token = deps.auth_token.clone();
+            let listener = WorkerPlaneListener::default();
+            deps = deps.with_worker_plane_listener(listener.clone());
+            let deps = Arc::new(deps);
+            let worker = serve_worker_plane(deps.clone(), loopback_config(Some("gateway-secret")))
+                .await
+                .unwrap();
+            let worker_addr = worker.addr;
+            listener
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .install(worker);
+            let (body, raw) = health_json(deps.clone(), &token).await;
+            assert_eq!(body["ok"], true);
+            assert!(body["version"].is_string());
+            assert_eq!(body["worker_plane"]["state"], "serving");
+            assert_eq!(body["worker_plane"]["bind"], worker_addr.to_string());
+            assert!(body["worker_plane"].get("code").is_none());
+            assert!(
+                !raw.contains("gateway-secret"),
+                "the transport bearer must never enter health: {raw}"
+            );
+            let taken = listener
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take_for_shutdown();
+            let (handle, health) = taken.expect("the slot owns the installed handle");
+            assert!(health.is_alive(), "{health:?}");
+            handle.shutdown().await.unwrap();
+            listener
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .record_terminal(WorkerPlaneStatus::Stopped);
+            let health = deps.worker_plane_health();
+            assert_eq!(health.state(), "stopped");
+            assert_eq!(health.to_json()["bind"], worker_addr.to_string());
+        }
+
+        // (3) Injected serve failure: the entry reports `unavailable` with
+        // the typed stable code and the cause; a hostile oversized error
+        // message is bounded, never ballooning the payload.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut deps = test_deps(dir.path());
+            let token = deps.auth_token.clone();
+            let listener = WorkerPlaneListener::default();
+            deps = deps.with_worker_plane_listener(listener.clone());
+            let addr: std::net::SocketAddr = "127.0.0.1:8790".parse().unwrap();
+            let exposure = loopback_config(None).validate().unwrap();
+            let dead = WorkerPlaneHandle::failing_serve_for_test(
+                addr,
+                exposure,
+                std::io::Error::other("injected accept failure"),
+            );
+            wait_dead(&dead).await;
+            listener
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .install(dead);
+            let (body, _raw) = health_json(Arc::new(deps), &token).await;
+            assert_eq!(body["worker_plane"]["state"], "unavailable");
+            assert_eq!(body["worker_plane"]["bind"], addr.to_string());
+            assert_eq!(body["worker_plane"]["code"], "worker_plane_serve_failed");
+            let message = body["worker_plane"]["message"].as_str().unwrap();
+            assert!(message.contains("injected accept failure"), "{message}");
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut deps = test_deps(dir.path());
+            let token = deps.auth_token.clone();
+            let listener = WorkerPlaneListener::default();
+            deps = deps.with_worker_plane_listener(listener.clone());
+            let exposure = loopback_config(None).validate().unwrap();
+            let dead = WorkerPlaneHandle::failing_serve_for_test(
+                addr,
+                exposure,
+                std::io::Error::other("x".repeat(4096)),
+            );
+            wait_dead(&dead).await;
+            listener
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .install(dead);
+            let (body, _raw) = health_json(Arc::new(deps), &token).await;
+            let message = body["worker_plane"]["message"].as_str().unwrap();
+            assert!(
+                message.len() <= MAX_WORKER_PLANE_HEALTH_MESSAGE_BYTES + 4,
+                "the health message must stay bounded: {} bytes",
+                message.len()
+            );
+            assert!(message.ends_with('…'), "{message}");
+        }
     }
 
     #[tokio::test]
@@ -3342,6 +3678,7 @@ pub(crate) mod tests {
             enterprise: None,
             retention: None,
             sso: None,
+            worker_plane_listener: None,
         }
     }
 
@@ -5171,6 +5508,7 @@ pub(crate) mod tests {
             enterprise: None,
             retention: None,
             sso: None,
+            worker_plane_listener: None,
         }
     }
 
@@ -6380,6 +6718,7 @@ pub(crate) mod tests {
             enterprise: None,
             retention: None,
             sso: None,
+            worker_plane_listener: None,
         };
         NativeTaskRig {
             deps,

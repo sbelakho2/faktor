@@ -110,10 +110,19 @@ struct WriterMsg {
     frame: Arc<FrameState>,
 }
 
-/// Handle to the per-client stdin writer thread (bounded FIFO queue).
+/// Handle to the per-client stdin writer thread (bounded FIFO queue). The
+/// JoinHandle is shared (clones share one thread slot) so close/Drop can join
+/// the thread bounded.
 #[derive(Clone)]
 struct WriterHandle {
     tx: std::sync::mpsc::SyncSender<WriterMsg>,
+    thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+}
+
+impl WriterHandle {
+    fn take_thread(&self) -> Option<std::thread::JoinHandle<()>> {
+        recover_lock(&self.thread).take()
+    }
 }
 
 /// Spawn the writer thread owning the child's stdin. A blocked write (server
@@ -123,7 +132,7 @@ struct WriterHandle {
 /// reorders the remaining frames.
 fn spawn_stdin_writer<W: Write + Send + 'static>(sink: W) -> WriterHandle {
     let (tx, rx) = std::sync::mpsc::sync_channel::<WriterMsg>(WRITER_QUEUE_CAP);
-    std::thread::spawn(move || {
+    let thread = std::thread::spawn(move || {
         let mut stdin = BufWriter::new(sink);
         while let Ok(msg) = rx.recv() {
             // The claim is the LAST instant cancellation is possible: after
@@ -159,7 +168,10 @@ fn spawn_stdin_writer<W: Write + Send + 'static>(sink: W) -> WriterHandle {
             }
         }
     });
-    WriterHandle { tx }
+    WriterHandle {
+        tx,
+        thread: Arc::new(Mutex::new(Some(thread))),
+    }
 }
 
 impl WriterHandle {
@@ -344,6 +356,15 @@ pub struct LspClient {
     exited: Arc<AtomicBool>,
     stderr: Arc<Mutex<StderrRing>>,
     activity: Option<Activity>,
+    /// The stdout reader and stderr drain JoinHandles: consumed by the
+    /// bounded join on shutdown/Drop (None = already joined).
+    threads: Mutex<ClientThreads>,
+}
+
+#[derive(Default)]
+struct ClientThreads {
+    reader: Option<std::thread::JoinHandle<()>>,
+    stderr: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LspClient {
@@ -379,18 +400,18 @@ impl LspClient {
         // Reader thread (stdout): incremental Content-Length framing;
         // responses are dispatched by id. EOF marks the server exited and
         // fails every pending request.
-        {
+        let reader = {
             let conn2 = conn.clone();
             let exited2 = exited.clone();
-            std::thread::spawn(move || read_loop(conn2, exited2, spawned.stdout));
-        }
+            std::thread::spawn(move || read_loop(conn2, exited2, spawned.stdout))
+        };
         // Stderr drain thread: a verbose server must never block itself on a
         // full stderr pipe; the bounded ring keeps the recent tail.
         let stderr = Arc::new(Mutex::new(StderrRing::new(STDERR_RING_CAP)));
-        {
+        let stderr_thread = {
             let ring = stderr.clone();
-            std::thread::spawn(move || stderr_drain(spawned.stderr, ring));
-        }
+            std::thread::spawn(move || stderr_drain(spawned.stderr, ring))
+        };
         Ok(Arc::new(Self {
             conn,
             writer,
@@ -398,6 +419,10 @@ impl LspClient {
             exited,
             stderr,
             activity,
+            threads: Mutex::new(ClientThreads {
+                reader: Some(reader),
+                stderr: Some(stderr_thread),
+            }),
         }))
     }
 
@@ -609,7 +634,35 @@ impl LspClient {
             }
         }
         self.exited.store(true, Ordering::SeqCst);
+        // Bounded join: the kill (or the server's own exit) closes stdout and
+        // stderr, so both drain threads reach EOF and end well inside the
+        // bound. Nothing here is left detached silently.
+        self.join_threads(Duration::from_millis(1_000));
         Ok(())
+    }
+
+    /// Consume and join the reader, stderr and writer threads with a hard
+    /// bound each; a thread still alive at its deadline is reported.
+    fn join_threads(&self, bound: Duration) {
+        let (reader, stderr) = {
+            let mut threads = recover_lock(&self.threads);
+            (threads.reader.take(), threads.stderr.take())
+        };
+        let writer = self.writer.take_thread();
+        for (name, handle) in [("reader", reader), ("stderr", stderr), ("writer", writer)] {
+            let Some(handle) = handle else { continue };
+            if !faktor_mcp::join_thread_bounded(handle, bound) {
+                tracing::warn!(thread = name, "lsp thread did not stop within the bound");
+            }
+        }
+    }
+
+    /// True once every dedicated thread was consumed by a bounded join
+    /// (test/diagnostic accessor).
+    #[cfg(test)]
+    fn threads_joined(&self) -> bool {
+        let threads = recover_lock(&self.threads);
+        threads.reader.is_none() && threads.stderr.is_none()
     }
 
     /// Recent stderr tail (bounded; lossy UTF-8) for diagnostics.
@@ -631,6 +684,10 @@ impl Drop for LspClient {
         if pid != 0 {
             let _ = self.supervisor.kill_child_pid(pid, 200);
         }
+        // Bounded joins: the kill closes the pipes, so the threads end; a
+        // thread still alive at the deadline is reported, never implicitly
+        // detached without a trace.
+        self.join_threads(Duration::from_millis(500));
     }
 }
 
@@ -646,6 +703,15 @@ fn language_of(uri: &str) -> String {
     }
 }
 
+/// One workspace's registry row: either a READY client or an in-flight start
+/// gate. Concurrent `start()` calls for the same workspace single-flight on
+/// the gate, so exactly ONE server process is ever spawned and the loser
+/// callers adopt the winner's client.
+enum ClientSlot {
+    Starting(Arc<tokio::sync::Mutex<()>>),
+    Ready(Arc<LspClient>),
+}
+
 /// Workspace-scoped registry: servers are shared per workspace and unloaded
 /// on idle. `last_used` is the single idle clock: it is touched when a
 /// server is STARTED and on EVERY request/notification after that (the
@@ -653,7 +719,7 @@ fn language_of(uri: &str) -> String {
 /// server is never unloaded while a merely-created one is.
 pub struct LspManager {
     supervisor: Arc<ProcessSupervisor>,
-    clients: Mutex<HashMap<WorkspaceId, Arc<LspClient>>>,
+    clients: Mutex<HashMap<WorkspaceId, ClientSlot>>,
     last_used: Arc<Mutex<HashMap<WorkspaceId, i64>>>,
 }
 
@@ -678,21 +744,108 @@ impl LspManager {
         })
     }
 
+    /// Start (or adopt) the workspace's server with SINGLE-FLIGHT semantics:
+    /// a placeholder gate is inserted under the registry lock, exactly one
+    /// caller connects, and every concurrent caller blocks on that gate and
+    /// adopts the same [`Arc<LspClient>`]. A failed start rolls the
+    /// placeholder back, so no unreachable server is ever left running.
     pub async fn start(
         &self,
         workspace: WorkspaceId,
         cfg: LspConfig,
     ) -> Result<Arc<LspClient>, Error> {
-        {
-            let clients = recover_lock(&self.clients);
-            if let Some(c) = clients.get(&workspace) {
-                // Reuse IS use: refresh the idle stamp.
-                self.touch(workspace);
-                return Ok(c.clone());
+        loop {
+            enum Step {
+                Ready(Arc<LspClient>),
+                Wait(Arc<tokio::sync::Mutex<()>>),
+                Lead(Arc<tokio::sync::Mutex<()>>),
+            }
+            let step = {
+                let mut clients = recover_lock(&self.clients);
+                match clients.get(&workspace) {
+                    Some(ClientSlot::Ready(client)) => Step::Ready(client.clone()),
+                    Some(ClientSlot::Starting(gate)) => Step::Wait(gate.clone()),
+                    None => {
+                        let gate = Arc::new(tokio::sync::Mutex::new(()));
+                        clients.insert(workspace, ClientSlot::Starting(gate.clone()));
+                        Step::Lead(gate)
+                    }
+                }
+            };
+            match step {
+                Step::Ready(client) => {
+                    // Reuse IS use: refresh the idle stamp.
+                    self.touch(workspace);
+                    return Ok(client);
+                }
+                Step::Wait(gate) => {
+                    // The leader either publishes a Ready client or rolls its
+                    // placeholder back; either way, re-inspect afterwards.
+                    let _guard = gate.lock().await;
+                    continue;
+                }
+                Step::Lead(gate) => {
+                    // Hold the gate across connect+initialize: waiters block
+                    // until the outcome is published, never spawn a second
+                    // server.
+                    let _guard = gate.lock().await;
+                    let outcome = self.connect_and_initialize(workspace, &cfg).await;
+                    return match outcome {
+                        Ok(client) => {
+                            // Publish ONLY if our placeholder is still there
+                            // (no await happens under this scope; a concurrent
+                            // shutdown that removed it wins and the fresh
+                            // client is shut down, never orphaned).
+                            let published = {
+                                let mut clients = recover_lock(&self.clients);
+                                let ours = matches!(
+                                    clients.get(&workspace),
+                                    Some(ClientSlot::Starting(current)) if Arc::ptr_eq(current, &gate)
+                                );
+                                if ours {
+                                    clients.insert(workspace, ClientSlot::Ready(client.clone()));
+                                }
+                                ours
+                            };
+                            if published {
+                                self.touch(workspace);
+                                Ok(client)
+                            } else {
+                                let _ = client.shutdown().await;
+                                Err(Error::new(
+                                    ErrorKind::Cancelled,
+                                    format!(
+                                        "lsp start for workspace {workspace} was superseded by shutdown"
+                                    ),
+                                ))
+                            }
+                        }
+                        Err(e) => {
+                            let mut clients = recover_lock(&self.clients);
+                            let ours = matches!(
+                                clients.get(&workspace),
+                                Some(ClientSlot::Starting(current)) if Arc::ptr_eq(current, &gate)
+                            );
+                            if ours {
+                                clients.remove(&workspace);
+                            }
+                            drop(clients);
+                            Err(e)
+                        }
+                    };
+                }
             }
         }
+    }
+
+    /// Connect one client and run its initialize handshake.
+    async fn connect_and_initialize(
+        &self,
+        workspace: WorkspaceId,
+        cfg: &LspConfig,
+    ) -> Result<Arc<LspClient>, Error> {
         let client = LspClient::connect(
-            &cfg,
+            cfg,
             workspace,
             self.supervisor.clone(),
             Some(self.activity_hook(workspace)),
@@ -702,25 +855,28 @@ impl LspManager {
         // (fire-and-forget, before any didOpen).
         client.initialize(&cfg.root).await?;
         client.notify_initialized()?;
-        recover_lock(&self.clients).insert(workspace, client.clone());
-        self.touch(workspace);
         Ok(client)
     }
 
     pub async fn client(&self, workspace: WorkspaceId) -> Result<Arc<LspClient>, Error> {
         let clients = recover_lock(&self.clients);
-        clients
-            .get(&workspace)
-            .cloned()
-            .ok_or_else(|| Error::not_found(format!("no LSP for workspace {workspace}")))
+        match clients.get(&workspace) {
+            Some(ClientSlot::Ready(client)) => Ok(client.clone()),
+            // An in-flight start is not a usable client yet: callers either
+            // wait through `start()` (single-flight) or observe not-found.
+            _ => Err(Error::not_found(format!(
+                "no LSP for workspace {workspace}"
+            ))),
+        }
     }
 
     /// Graceful teardown: shutdown request → exit notification → bounded
-    /// exit wait (kill only as the fallback).
+    /// exit wait (kill only as the fallback). A start racing this shutdown
+    /// sees its placeholder gone and shuts the fresh client down itself.
     pub async fn shutdown(&self, workspace: WorkspaceId) -> Result<(), Error> {
-        let client = recover_lock(&self.clients).remove(&workspace);
-        if let Some(c) = client {
-            c.shutdown().await?;
+        let slot = recover_lock(&self.clients).remove(&workspace);
+        if let Some(ClientSlot::Ready(client)) = slot {
+            client.shutdown().await?;
         }
         recover_lock(&self.last_used).remove(&workspace);
         Ok(())
@@ -750,11 +906,16 @@ impl LspManager {
             .map(|(w, _)| *w)
             .collect();
         for w in &stale {
-            if let Some(c) = recover_lock(&self.clients).remove(w) {
-                let pid = c.conn.lock().map(|c| c.child_pid).unwrap_or(0);
-                if pid != 0 {
-                    let _ = self.supervisor.kill_child_pid(pid, 200);
+            match recover_lock(&self.clients).remove(w) {
+                Some(ClientSlot::Ready(client)) => {
+                    let pid = client.conn.lock().map(|c| c.child_pid).unwrap_or(0);
+                    if pid != 0 {
+                        let _ = self.supervisor.kill_child_pid(pid, 200);
+                    }
                 }
+                // An in-flight start: its leader observes the placeholder is
+                // gone and shuts the fresh client down itself (no orphan).
+                Some(ClientSlot::Starting(_)) | None => {}
             }
             recover_lock(&self.last_used).remove(w);
         }
@@ -1651,6 +1812,136 @@ log("mock exiting")
             "process exits after exit: {tail}"
         );
         assert!(mgr.active().is_empty());
+        assert!(
+            client.threads_joined(),
+            "shutdown must join the reader, stderr and writer threads"
+        );
+    }
+
+    /// F4: concurrent starts for one workspace single-flight to EXACTLY one
+    /// child process; every caller adopts the winner's handle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_starts_single_flight_to_one_child() {
+        if !python_available() {
+            eprintln!("python3 missing; skipping");
+            return;
+        }
+        let root_dir = tempdir().unwrap();
+        let root = root_dir.path().to_path_buf();
+        let expected_uri = file_uri(&root);
+        let (_d, sup) = supervisor();
+        let mgr = Arc::new(LspManager::new(sup.clone()));
+        let ws = WorkspaceId::new(31);
+        let (cfg, _script) = cfg_with(root.clone(), "plain", &expected_uri);
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let mgr = mgr.clone();
+            let cfg = cfg.clone();
+            tasks.push(tokio::spawn(async move { mgr.start(ws, cfg).await }));
+        }
+        let mut clients = Vec::new();
+        for task in tasks {
+            clients.push(
+                tokio::time::timeout(Duration::from_secs(15), task)
+                    .await
+                    .expect("join timeout")
+                    .expect("task panicked")
+                    .expect("start failed"),
+            );
+        }
+        for client in clients.iter().skip(1) {
+            assert!(
+                Arc::ptr_eq(&clients[0], client),
+                "every concurrent caller must adopt the winner's handle"
+            );
+        }
+        assert_eq!(
+            sup.registered(),
+            1,
+            "exactly ONE child process may be spawned by concurrent starts"
+        );
+        clients.clear();
+        tokio::time::timeout(Duration::from_secs(10), mgr.shutdown(ws))
+            .await
+            .expect("shutdown timeout")
+            .expect("shutdown failed");
+        assert!(mgr.active().is_empty());
+    }
+
+    /// F4: a failed start rolls its placeholder back, no orphan child is
+    /// left, and the manager stays usable for a later start.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_start_failure_leaves_no_orphan_and_rolls_back() {
+        if !python_available() {
+            eprintln!("python3 missing; skipping");
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = ProcessSupervisor::new(cas);
+        let mgr = Arc::new(LspManager::new(sup.clone()));
+        let ws = WorkspaceId::new(32);
+        let cfg = LspConfig {
+            name: "dies".into(),
+            command: "python3".into(),
+            args: vec!["-c".into(), "import sys; sys.exit(0)".into()],
+            root: dir.path().to_path_buf(),
+        };
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let mgr = mgr.clone();
+            let cfg = cfg.clone();
+            tasks.push(tokio::spawn(async move { mgr.start(ws, cfg).await }));
+        }
+        for task in tasks {
+            let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .expect("join timeout")
+                .expect("task panicked");
+            assert!(outcome.is_err(), "a dead server cannot initialize");
+        }
+        assert!(
+            mgr.active().is_empty(),
+            "a failed start must roll its placeholder back"
+        );
+        // Let the exited children be reaped; none may remain registered.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sup.registered() > 0 && std::time::Instant::now() < deadline {
+            sup.reap();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        sup.reap();
+        assert_eq!(sup.registered(), 0, "no orphaned server process may remain");
+        assert!(mgr.client(ws).await.is_err());
+    }
+
+    /// F7: Drop (no graceful shutdown) kills the child and joins the
+    /// dedicated threads within the bound; the supervisor registry drains.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_joins_threads_and_leaves_no_child() {
+        if !python_available() {
+            eprintln!("python3 missing; skipping");
+            return;
+        }
+        let root_dir = tempdir().unwrap();
+        let root = root_dir.path().to_path_buf();
+        let expected_uri = file_uri(&root);
+        let (_d, sup) = supervisor();
+        let (cfg, _script) = cfg_with(root.clone(), "plain", &expected_uri);
+        let direct = LspClient::connect(&cfg, WorkspaceId::new(35), sup.clone(), None)
+            .await
+            .expect("connect");
+        let pid = direct.conn.lock().unwrap().child_pid;
+        assert!(sup.pid_alive(pid));
+        drop(direct);
+        assert!(!sup.pid_alive(pid), "Drop must terminate the child");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sup.registered() > 0 && std::time::Instant::now() < deadline {
+            sup.reap();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        sup.reap();
+        assert_eq!(sup.registered(), 0, "Drop must leave no lingering child");
     }
 
     /// (iv) a stand-in flooding stderr with megabytes keeps running (the

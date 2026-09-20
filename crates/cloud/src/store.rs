@@ -25,6 +25,23 @@ use crate::model::{
     Organization, ServiceAccount, User,
 };
 
+/// Hard bound on one recorded idempotent response body. The response is
+/// persisted and replayed verbatim, so an unbounded body would turn one
+/// mutation into an unbounded durable row (and an unbounded replay payload):
+/// a response beyond this is a typed refusal that rolls the whole operation
+/// back, exactly like a closure refusal.
+pub const MAX_IDEMPOTENT_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Idempotency-journal retention: recorded operations older than this are
+/// pruned on the open/backup tick. Documented trade-off: a retry that arrives
+/// after the TTL is no longer deduplicated (it re-executes), which is the
+/// price of a bounded journal; callers that need longer dedup windows must
+/// keep their own key ledger.
+pub const IDEMPOTENCY_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// Idempotency-journal retention: at most this many rows are kept (newest
+/// first). Bounds a control-plane database that sees unbounded logins/links.
+pub const MAX_IDEMPOTENCY_ROWS: usize = 4096;
+
 /// One recorded idempotent operation: the exact response of the first
 /// successful execution of `(key, operation, request_hash)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +132,11 @@ pub enum CloudStoreError {
     Backend(String),
     #[error("control-plane store refused a malformed row: {0}")]
     Malformed(String),
+    /// A uniqueness invariant (email, (provider, subject), token hash,
+    /// (organization, user)) refused the write. Both backends raise this same
+    /// typed conflict; the service layer maps it to a 409.
+    #[error("control-plane store refused a conflicting row: {0}")]
+    Conflict(String),
 }
 
 /// The durable control-plane seam. Object-safe: the service holds one
@@ -210,8 +232,25 @@ pub trait ControlPlaneStore: Send + Sync {
 
     /// Claim one idempotency key: `true` only for the FIRST writer. A
     /// later writer observes `false` and replays the recorded response.
+    ///
+    /// TEST-ONLY: seeding a record OUTSIDE [`Self::execute_idempotent`]
+    /// bypasses the transaction machinery that binds the claim to its domain
+    /// writes — a record written this way later makes a replay skip the
+    /// closure, and an empty response would brick the key forever.
+    /// Production callers use `execute_idempotent` exclusively.
+    #[cfg(test)]
     fn claim_idempotent(&self, record: &IdempotencyRecord) -> Result<bool, CloudStoreError>;
     fn idempotent(&self, key: &str) -> Result<Option<IdempotencyRecord>, CloudStoreError>;
+
+    /// The number of retained idempotency records (observability for the
+    /// documented bounded retention).
+    fn idempotency_count(&self) -> Result<usize, CloudStoreError>;
+
+    /// Prune the idempotency journal to its documented retention: rows older
+    /// than [`IDEMPOTENCY_TTL_MS`] are removed, then the oldest rows beyond
+    /// the newest [`MAX_IDEMPOTENCY_ROWS`]. Returns how many were removed.
+    /// Called on the open/backup tick; exposed for explicit maintenance.
+    fn prune_idempotency(&self, now_ms: i64) -> Result<usize, CloudStoreError>;
 
     /// Execute `apply` exactly once per `(key, operation, request_digest)`.
     ///
@@ -242,7 +281,7 @@ pub trait ControlPlaneStore: Send + Sync {
 struct MemInner {
     users: BTreeMap<String, User>,
     organizations: BTreeMap<String, Organization>,
-    external_identities: BTreeMap<String, ExternalIdentity>,
+    external_identities: BTreeMap<(String, String), ExternalIdentity>,
     memberships: BTreeMap<String, Membership>,
     invitations: BTreeMap<String, Invitation>,
     auth_sessions: BTreeMap<String, AuthSession>,
@@ -330,17 +369,21 @@ fn mem_external_identity(
 ) -> Option<ExternalIdentity> {
     inner
         .external_identities
-        .get(&format!("{provider}:{subject}"))
+        .get(&(provider.to_string(), subject.to_string()))
         .cloned()
 }
 
 /// Attach one external identity under the (provider, subject) uniqueness
-/// invariant: a second id may never claim an already-bound subject.
+/// invariant: a second id may never claim an already-bound subject. The key is
+/// the TUPLE, never a delimiter-joined string: subjects/providers may contain
+/// any byte (incl. `:`), and `("a:b", "c")` must not alias `("a", "b:c")` the
+/// way a `format!("{provider}:{subject}")` key would (SQLite's
+/// `UNIQUE(provider, subject)` draws the same line).
 fn mem_put_external_identity(
     inner: &mut MemInner,
     identity: &ExternalIdentity,
 ) -> Result<(), CloudStoreError> {
-    let key = format!("{}:{}", identity.provider, identity.subject);
+    let key = (identity.provider.clone(), identity.subject.clone());
     if let Some(existing) = inner.external_identities.get(&key) {
         if existing.id != identity.id {
             return Err(CloudStoreError::Malformed(format!(
@@ -396,10 +439,27 @@ fn mem_membership(
         .cloned()
 }
 
-fn mem_put_invitation(inner: &mut MemInner, invitation: &Invitation) {
+/// Invitations carry a one-shot token stored only as its hash; SQLite
+/// enforces `UNIQUE(token_hash)`, so memory must refuse a second row claiming
+/// the same hash (typed conflict) instead of silently aliasing the token.
+fn mem_put_invitation(
+    inner: &mut MemInner,
+    invitation: &Invitation,
+) -> Result<(), CloudStoreError> {
+    if let Some(existing) = inner
+        .invitations
+        .values()
+        .find(|i| i.token_hash == invitation.token_hash && i.id != invitation.id)
+    {
+        return Err(CloudStoreError::Conflict(format!(
+            "invitation token hash is already claimed by {}",
+            existing.id
+        )));
+    }
     inner
         .invitations
         .insert(invitation.id.as_str().to_string(), invitation.clone());
+    Ok(())
 }
 
 fn mem_invitation_by_token_hash(inner: &MemInner, hash: &TokenHash) -> Option<Invitation> {
@@ -410,10 +470,48 @@ fn mem_invitation_by_token_hash(inner: &MemInner, hash: &TokenHash) -> Option<In
         .cloned()
 }
 
-fn mem_put_auth_session(inner: &mut MemInner, session: &AuthSession) {
+/// Auth sessions are looked up by token hash; the hash is unique in SQLite
+/// and must be unique here too.
+fn mem_put_auth_session(
+    inner: &mut MemInner,
+    session: &AuthSession,
+) -> Result<(), CloudStoreError> {
+    if let Some(existing) = inner
+        .auth_sessions
+        .values()
+        .find(|s| s.token_hash == session.token_hash && s.id != session.id)
+    {
+        return Err(CloudStoreError::Conflict(format!(
+            "auth session token hash is already claimed by {}",
+            existing.id
+        )));
+    }
     inner
         .auth_sessions
         .insert(session.id.as_str().to_string(), session.clone());
+    Ok(())
+}
+
+/// Service-account bearer tokens are looked up by hash; the hash is unique in
+/// SQLite and must be unique here too.
+fn mem_put_service_account(
+    inner: &mut MemInner,
+    account: &ServiceAccount,
+) -> Result<(), CloudStoreError> {
+    if let Some(existing) = inner
+        .service_accounts
+        .values()
+        .find(|s| s.token_hash == account.token_hash && s.id != account.id)
+    {
+        return Err(CloudStoreError::Conflict(format!(
+            "service account token hash is already claimed by {}",
+            existing.id
+        )));
+    }
+    inner
+        .service_accounts
+        .insert(account.id.as_str().to_string(), account.clone());
+    Ok(())
 }
 
 fn mem_put_approval(inner: &mut MemInner, approval: &ApprovalRequest) {
@@ -471,7 +569,7 @@ impl ControlPlaneTx for MemoryTx<'_> {
     ) -> Result<(), CloudStoreError> {
         // The map key IS the (provider, subject) uniqueness invariant, so a
         // re-link of an already-bound subject cannot smuggle in a second row.
-        let key = format!("{}:{}", identity.provider, identity.subject);
+        let key = (identity.provider.clone(), identity.subject.clone());
         let previous = self.inner.external_identities.get(&key).cloned();
         mem_put_external_identity(self.inner, identity)?;
         let undo = Box::new(move |inner: &mut MemInner| match previous {
@@ -544,7 +642,7 @@ impl ControlPlaneTx for MemoryTx<'_> {
     fn put_invitation(&mut self, invitation: &Invitation) -> Result<(), CloudStoreError> {
         let key = invitation.id.as_str().to_string();
         let previous = self.inner.invitations.get(&key).cloned();
-        mem_put_invitation(self.inner, invitation);
+        mem_put_invitation(self.inner, invitation)?;
         let undo = Box::new(move |inner: &mut MemInner| match previous {
             Some(value) => {
                 inner.invitations.insert(key, value);
@@ -567,7 +665,7 @@ impl ControlPlaneTx for MemoryTx<'_> {
     fn put_auth_session(&mut self, session: &AuthSession) -> Result<(), CloudStoreError> {
         let key = session.id.as_str().to_string();
         let previous = self.inner.auth_sessions.get(&key).cloned();
-        mem_put_auth_session(self.inner, session);
+        mem_put_auth_session(self.inner, session)?;
         let undo = Box::new(move |inner: &mut MemInner| match previous {
             Some(value) => {
                 inner.auth_sessions.insert(key, value);
@@ -714,8 +812,7 @@ impl ControlPlaneStore for MemoryControlPlaneStore {
     }
 
     fn put_invitation(&self, invitation: &Invitation) -> Result<(), CloudStoreError> {
-        mem_put_invitation(&mut *self.lock()?, invitation);
-        Ok(())
+        mem_put_invitation(&mut *self.lock()?, invitation)
     }
 
     fn invitation(&self, id: &InvitationId) -> Result<Option<Invitation>, CloudStoreError> {
@@ -747,8 +844,7 @@ impl ControlPlaneStore for MemoryControlPlaneStore {
     }
 
     fn put_auth_session(&self, session: &AuthSession) -> Result<(), CloudStoreError> {
-        mem_put_auth_session(&mut *self.lock()?, session);
-        Ok(())
+        mem_put_auth_session(&mut *self.lock()?, session)
     }
 
     fn auth_session(&self, id: &AuthSessionId) -> Result<Option<AuthSession>, CloudStoreError> {
@@ -768,10 +864,7 @@ impl ControlPlaneStore for MemoryControlPlaneStore {
     }
 
     fn put_service_account(&self, account: &ServiceAccount) -> Result<(), CloudStoreError> {
-        self.lock()?
-            .service_accounts
-            .insert(account.id.as_str().to_string(), account.clone());
-        Ok(())
+        mem_put_service_account(&mut *self.lock()?, account)
     }
 
     fn service_account(
@@ -838,6 +931,7 @@ impl ControlPlaneStore for MemoryControlPlaneStore {
             .collect())
     }
 
+    #[cfg(test)]
     fn claim_idempotent(&self, record: &IdempotencyRecord) -> Result<bool, CloudStoreError> {
         let mut inner = self.lock()?;
         if inner.idempotency.contains_key(&record.key) {
@@ -849,6 +943,30 @@ impl ControlPlaneStore for MemoryControlPlaneStore {
 
     fn idempotent(&self, key: &str) -> Result<Option<IdempotencyRecord>, CloudStoreError> {
         Ok(self.lock()?.idempotency.get(key).cloned())
+    }
+
+    fn idempotency_count(&self) -> Result<usize, CloudStoreError> {
+        Ok(self.lock()?.idempotency.len())
+    }
+
+    fn prune_idempotency(&self, now_ms: i64) -> Result<usize, CloudStoreError> {
+        let mut inner = self.lock()?;
+        let before = inner.idempotency.len();
+        let cutoff = now_ms.saturating_sub(IDEMPOTENCY_TTL_MS);
+        inner.idempotency.retain(|_, row| row.created_ms >= cutoff);
+        if inner.idempotency.len() > MAX_IDEMPOTENCY_ROWS {
+            let mut oldest: Vec<(i64, String)> = inner
+                .idempotency
+                .values()
+                .map(|row| (row.created_ms, row.key.clone()))
+                .collect();
+            oldest.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let excess = inner.idempotency.len() - MAX_IDEMPOTENCY_ROWS;
+            for (_, key) in oldest.into_iter().take(excess) {
+                inner.idempotency.remove(&key);
+            }
+        }
+        Ok(before - inner.idempotency.len())
     }
 
     fn execute_idempotent(
@@ -869,27 +987,31 @@ impl ControlPlaneStore for MemoryControlPlaneStore {
         if let Some(existing) = inner.idempotency.get(key).cloned() {
             return replay_record(key, operation, request_digest, &existing);
         }
-        let response = {
+        let (response, response_json) = {
             let mut tx = MemoryTx {
                 inner: &mut inner,
                 undo: Vec::new(),
             };
             match apply(&mut tx) {
-                Ok(response) => response,
+                Ok(response) => match recorded_response_json(&response) {
+                    Ok(json) => (response, json),
+                    Err(e) => {
+                        // A response that cannot be persisted leaves NO domain
+                        // write behind: the journal replays exactly as for a
+                        // closure refusal (the SQLite ROLLBACK twin).
+                        replay_memory_undo(tx);
+                        return Err(e);
+                    }
+                },
                 Err(e) => {
                     // Replay the write journal in reverse: the in-memory
                     // authority is left exactly as if the operation had never
                     // started (the SQLite ROLLBACK twin).
-                    let MemoryTx { inner, undo } = tx;
-                    for undo in undo.into_iter().rev() {
-                        undo(inner);
-                    }
+                    replay_memory_undo(tx);
                     return Err(e);
                 }
             }
         };
-        let response_json = serde_json::to_string(&response)
-            .map_err(|e| ControlPlaneError::Malformed(format!("recorded response encode: {e}")))?;
         inner.idempotency.insert(
             key.to_string(),
             IdempotencyRecord {
@@ -902,6 +1024,32 @@ impl ControlPlaneStore for MemoryControlPlaneStore {
         );
         Ok(IdempotentOutcome::Executed(response))
     }
+}
+
+/// Replay a memory transaction's undo journal in reverse: the in-memory
+/// authority is left exactly as if the operation had never started (the
+/// SQLite ROLLBACK twin).
+fn replay_memory_undo(tx: MemoryTx<'_>) {
+    let MemoryTx { inner, undo } = tx;
+    for undo in undo.into_iter().rev() {
+        undo(inner);
+    }
+}
+
+/// Encode one recorded idempotent response under the hard bound. An encode or
+/// bound failure is a typed refusal that rolls the whole operation back (the
+/// response is persisted and replayed verbatim; unbounded bodies would turn
+/// one mutation into an unbounded durable row).
+fn recorded_response_json(response: &serde_json::Value) -> Result<String, ControlPlaneError> {
+    let encoded = serde_json::to_string(response)
+        .map_err(|e| ControlPlaneError::Malformed(format!("recorded response encode: {e}")))?;
+    if encoded.len() > MAX_IDEMPOTENT_RESPONSE_BYTES {
+        return Err(ControlPlaneError::Malformed(format!(
+            "recorded response is {} bytes, beyond the {MAX_IDEMPOTENT_RESPONSE_BYTES}-byte bound",
+            encoded.len()
+        )));
+    }
+    Ok(encoded)
 }
 
 /// Decode a recorded response for the same `(operation, request_digest)`;
@@ -1051,7 +1199,7 @@ impl SqliteControlPlaneStore {
         // open, in-memory included, before any migration or query.
         crate::durability::apply_policy(&conn)?;
         let mut conn = conn;
-        migrate(&mut conn, path)?;
+        let started_version = migrate(&mut conn, path)?;
         if let Some(path) = path {
             let now = crate::durability::now_ms();
             // Record the writer's policy for `doctor` (best effort: a full
@@ -1060,8 +1208,23 @@ impl SqliteControlPlaneStore {
             if let Err(e) = crate::durability::record_open_policy(&conn, now) {
                 tracing::error!("control-plane durability marker not recorded: {e}");
             }
+            // This database was opened with pending migrations, so it has (and
+            // keeps requiring) a pre-migration restore point: doctor fails
+            // loudly when one is missing.
+            if started_version < CP_MIGRATIONS.len() as i64 {
+                if let Err(e) = crate::durability::require_migration_restore_point(&conn) {
+                    tracing::warn!("control-plane restore-point policy not recorded: {e}");
+                }
+            }
+            // Bounded idempotency retention runs on the same open/backup tick
+            // as the rotating backup (documented TTL + count).
+            if let Err(e) = prune_idempotency_tick(&conn) {
+                tracing::warn!("control-plane idempotency prune skipped: {e}");
+            }
             // Interval-gated verified backup (main store convention). Best
-            // effort, like the daemon's startup backup.
+            // effort, like the daemon's startup backup. The tick's own writes
+            // count as a change (the safe direction: one extra snapshot, never
+            // a hidden commit).
             match crate::durability::rotate_backup(&conn, path) {
                 Ok(Some(dest)) => {
                     tracing::info!("commercial backup written to {}", dest.display());
@@ -1134,16 +1297,29 @@ impl SqliteControlPlaneStore {
     }
 }
 
-/// Test-only one-shot: make the NEXT migration fail AFTER the pre-migration
-/// restore point and BEFORE any migration SQL, reproducing the crash-mid-
-/// migration durable state.
+/// Test-only one-shot: make the NEXT migration of exactly `db_path` fail
+/// AFTER the pre-migration restore point and BEFORE any migration SQL,
+/// reproducing the crash-mid-migration durable state. Keyed by path so
+/// concurrent tests never consume each other's injection.
 #[cfg(test)]
-static MIGRATION_CRASH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static MIGRATION_CRASH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
-/// Arm [`MIGRATION_CRASH`] (one-shot; tests only).
+/// Arm [`MIGRATION_CRASH`] for `db_path` (one-shot; tests only).
 #[cfg(test)]
-pub(crate) fn inject_crash_before_migration() {
-    MIGRATION_CRASH.store(true, std::sync::atomic::Ordering::SeqCst);
+pub(crate) fn inject_crash_before_migration(db_path: &Path) {
+    *MIGRATION_CRASH.lock().unwrap() = Some(db_path.to_path_buf());
+}
+
+/// Consume the one-shot injection when it targets `db_path`.
+#[cfg(test)]
+fn take_injected_crash(db_path: &Path) -> bool {
+    let mut armed = MIGRATION_CRASH.lock().unwrap();
+    if armed.as_deref() == Some(db_path) {
+        *armed = None;
+        true
+    } else {
+        false
+    }
 }
 
 /// Test-only statement budget of one idempotent transaction. `tick` is
@@ -1281,31 +1457,105 @@ fn backend(e: rusqlite::Error) -> CloudStoreError {
     CloudStoreError::Backend(e.to_string())
 }
 
-fn migrate(conn: &mut Connection, db_path: Option<&Path>) -> Result<(), CloudStoreError> {
-    let mut version: i64 = conn
+/// Bounded idempotency retention (TTL + count), shared by the store method
+/// and the open/backup tick. Newest rows always survive.
+fn prune_idempotency_sql(conn: &Connection, now_ms: i64) -> Result<usize, CloudStoreError> {
+    let cutoff = now_ms.saturating_sub(IDEMPOTENCY_TTL_MS);
+    let mut removed = conn
+        .execute(
+            "DELETE FROM cp_idempotency WHERE created_ms < ?1",
+            params![cutoff],
+        )
+        .map_err(backend)?;
+    removed += prune_idempotency_excess(conn)?;
+    Ok(removed)
+}
+
+/// The count half of the retention: keep only the newest
+/// [`MAX_IDEMPOTENCY_ROWS`] rows.
+fn prune_idempotency_excess(conn: &Connection) -> Result<usize, CloudStoreError> {
+    conn.execute(
+        "DELETE FROM cp_idempotency WHERE key IN (
+             SELECT key FROM cp_idempotency
+             ORDER BY created_ms DESC, key DESC
+             LIMIT -1 OFFSET ?1
+         )",
+        params![MAX_IDEMPOTENCY_ROWS as i64],
+    )
+    .map_err(backend)
+}
+
+/// Open/backup-tick prune: the TTL is measured against the journal's OWN
+/// newest row, not the host wall clock, so a store whose event clock differs
+/// from the tick's wall clock can never mass-delete live keys on open; the
+/// count bound still applies. Returns how many rows were removed.
+fn prune_idempotency_tick(conn: &Connection) -> Result<usize, CloudStoreError> {
+    let mut removed = conn
+        .execute(
+            "DELETE FROM cp_idempotency
+             WHERE created_ms <
+                   (SELECT COALESCE(MAX(created_ms), 0) FROM cp_idempotency) - ?1",
+            params![IDEMPOTENCY_TTL_MS],
+        )
+        .map_err(backend)?;
+    removed += prune_idempotency_excess(conn)?;
+    Ok(removed)
+}
+
+/// Apply the control-plane schema ladder. Returns the version the database
+/// was at when the (serialized) migration began, so the caller can record
+/// that migration restore points are required for it.
+///
+/// Serialization: the version read, the pre-migration restore point and every
+/// migration statement run inside ONE `BEGIN IMMEDIATE` transaction. A second
+/// concurrent opener blocks on the write lock, then re-reads the (already
+/// advanced) version inside its own transaction and skips — it can never
+/// snapshot post-migration content and label it `-pre-migration-vN-`.
+fn migrate(conn: &mut Connection, db_path: Option<&Path>) -> Result<i64, CloudStoreError> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    let started: i64 = tx
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(backend)?;
-    if version >= CP_MIGRATIONS.len() as i64 {
-        return Ok(());
+    let ladder = CP_MIGRATIONS.len() as i64;
+    // A database written by a NEWER binary must never be silently opened by
+    // an older one: the newer ladder may have changed semantics this binary
+    // cannot honour. Downgrade is refused typed and diagnosed by `doctor`;
+    // the recovery path is running the newer binary or restoring the
+    // pre-upgrade restore point.
+    if started > ladder {
+        return Err(CloudStoreError::Backend(format!(
+            "control-plane database schema v{started} is newer than this binary's ladder v{ladder}: \
+             downgrade refused (run the newer binary or restore the pre-upgrade restore point)"
+        )));
     }
-    // A schema transition on an EXISTING database is irreversible structural
-    // work: before the first pending migration runs, a verified pre-migration
-    // restore point must be durable. If the restore point cannot be written
-    // and restore-verified, the migration is REFUSED (open fails) — never a
-    // schema change without a way back.
-    if version > 0 {
-        if let Some(path) = db_path {
-            crate::durability::migration_backup(conn, path, version).map_err(|e| {
-                CloudStoreError::Backend(format!(
-                    "refusing migration without a verified pre-migration restore point: {e}"
-                ))
-            })?;
-            #[cfg(test)]
-            if MIGRATION_CRASH.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                return Err(CloudStoreError::Backend(
-                    "injected crash after the pre-migration restore point".into(),
-                ));
-            }
+    if started == ladder {
+        tx.commit().map_err(backend)?;
+        return Ok(started);
+    }
+    let mut version = started;
+    // A schema transition (or FIRST creation) on a file-backed database runs
+    // only after a verified restore point of the pre-migration state exists;
+    // if it cannot be written and self-verified, the migration is REFUSED.
+    // The snapshot runs on a SEPARATE read-only connection: the backup API
+    // cannot run on a connection that holds a write transaction, and the
+    // BEGIN IMMEDIATE lock we hold makes every reader see exactly this
+    // pre-migration state.
+    if let Some(path) = db_path {
+        let reader = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(backend)?;
+        crate::durability::migration_backup(&reader, path, version).map_err(|e| {
+            CloudStoreError::Backend(format!(
+                "refusing migration without a verified pre-migration restore point: {e}"
+            ))
+        })?;
+        drop(reader);
+        #[cfg(test)]
+        if take_injected_crash(path) {
+            return Err(CloudStoreError::Backend(
+                "injected crash after the pre-migration restore point".into(),
+            ));
         }
     }
     for (i, sql) in CP_MIGRATIONS.iter().enumerate() {
@@ -1313,17 +1563,14 @@ fn migrate(conn: &mut Connection, db_path: Option<&Path>) -> Result<(), CloudSto
         if version >= target {
             continue;
         }
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(backend)?;
         tx.execute_batch(sql)
             .map_err(|e| CloudStoreError::Backend(format!("cp migration v{target}: {e}")))?;
         tx.execute_batch(&format!("PRAGMA user_version = {target}"))
             .map_err(|e| CloudStoreError::Backend(format!("cp migration v{target} cursor: {e}")))?;
-        tx.commit().map_err(backend)?;
         version = target;
     }
-    Ok(())
+    tx.commit().map_err(backend)?;
+    Ok(started)
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(payload: &str) -> Result<T, CloudStoreError> {
@@ -1539,7 +1786,40 @@ fn sql_membership(
     payload.map(|p| parse(&p)).transpose()
 }
 
+/// Refuse a second row claiming an already-used token hash with the SAME
+/// typed conflict the memory store raises. `table` is one of this module's
+/// own literals (never caller input), so the format is injection-free.
+fn sql_token_hash_conflict(
+    conn: &Connection,
+    table: &str,
+    hash: &TokenHash,
+    own_id: &str,
+) -> Result<(), CloudStoreError> {
+    let existing: Option<String> = conn
+        .query_row(
+            &format!("SELECT id FROM {table} WHERE token_hash = ?1"),
+            params![hash.as_str()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(backend)?;
+    if let Some(existing) = existing {
+        if existing != own_id {
+            return Err(CloudStoreError::Conflict(format!(
+                "{table} token hash is already claimed by {existing}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn sql_put_invitation(conn: &Connection, invitation: &Invitation) -> Result<(), CloudStoreError> {
+    sql_token_hash_conflict(
+        conn,
+        "cp_invitation",
+        &invitation.token_hash,
+        invitation.id.as_str(),
+    )?;
     conn.execute(
         "INSERT INTO cp_invitation (id, organization_id, token_hash, payload)
          VALUES (?1, ?2, ?3, ?4)
@@ -1574,6 +1854,12 @@ fn sql_invitation_by_token_hash(
 }
 
 fn sql_put_auth_session(conn: &Connection, session: &AuthSession) -> Result<(), CloudStoreError> {
+    sql_token_hash_conflict(
+        conn,
+        "cp_auth_session",
+        &session.token_hash,
+        session.id.as_str(),
+    )?;
     conn.execute(
         "INSERT INTO cp_auth_session (id, token_hash, payload) VALUES (?1, ?2, ?3)
          ON CONFLICT(id) DO UPDATE SET
@@ -1583,6 +1869,34 @@ fn sql_put_auth_session(conn: &Connection, session: &AuthSession) -> Result<(), 
             session.id.as_str(),
             session.token_hash.as_str(),
             encode(session)?,
+        ],
+    )
+    .map_err(backend)?;
+    Ok(())
+}
+
+fn sql_put_service_account(
+    conn: &Connection,
+    account: &ServiceAccount,
+) -> Result<(), CloudStoreError> {
+    sql_token_hash_conflict(
+        conn,
+        "cp_service_account",
+        &account.token_hash,
+        account.id.as_str(),
+    )?;
+    conn.execute(
+        "INSERT INTO cp_service_account (id, organization_id, token_hash, payload)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(id) DO UPDATE SET
+            organization_id = excluded.organization_id,
+            token_hash = excluded.token_hash,
+            payload = excluded.payload",
+        params![
+            account.id.as_str(),
+            account.organization.as_str(),
+            account.token_hash.as_str(),
+            encode(account)?,
         ],
     )
     .map_err(backend)?;
@@ -1807,23 +2121,7 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
     }
 
     fn put_service_account(&self, account: &ServiceAccount) -> Result<(), CloudStoreError> {
-        let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO cp_service_account (id, organization_id, token_hash, payload)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET
-                organization_id = excluded.organization_id,
-                token_hash = excluded.token_hash,
-                payload = excluded.payload",
-            params![
-                account.id.as_str(),
-                account.organization.as_str(),
-                account.token_hash.as_str(),
-                encode(account)?,
-            ],
-        )
-        .map_err(backend)?;
-        Ok(())
+        sql_put_service_account(&*self.lock()?, account)
     }
 
     fn service_account(
@@ -1906,6 +2204,7 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         )
     }
 
+    #[cfg(test)]
     fn claim_idempotent(&self, record: &IdempotencyRecord) -> Result<bool, CloudStoreError> {
         let conn = self.lock()?;
         let inserted = conn
@@ -1945,6 +2244,19 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             .optional()
             .map_err(backend)?;
         Ok(row)
+    }
+
+    fn idempotency_count(&self) -> Result<usize, CloudStoreError> {
+        let conn = self.lock()?;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cp_idempotency", [], |r| r.get(0))
+            .map_err(backend)?;
+        Ok(count.max(0) as usize)
+    }
+
+    fn prune_idempotency(&self, now_ms: i64) -> Result<usize, CloudStoreError> {
+        let conn = self.lock()?;
+        prune_idempotency_sql(&conn, now_ms)
     }
 
     fn execute_idempotent(
@@ -2000,9 +2312,7 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             // same transaction that holds the claim. Any refusal or failure
             // drops the transaction, so no domain write and no claim survive.
             let response = apply(&mut wrapper)?;
-            let encoded = serde_json::to_string(&response).map_err(|e| {
-                ControlPlaneError::Malformed(format!("recorded response encode: {e}"))
-            })?;
+            let encoded = recorded_response_json(&response)?;
             wrapper.tick()?;
             wrapper
                 .tx
@@ -2258,7 +2568,10 @@ mod tests {
             operation: "org_create".into(),
             request_hash: "h".into(),
             response_json: "{}".into(),
-            created_ms: 1,
+            // A live timestamp: the open/backup tick prunes the journal's TTL
+            // against its own newest row, and a fake ancient stamp would be
+            // pruned on the restart below.
+            created_ms: crate::durability::now_ms(),
         };
         assert!(store.claim_idempotent(&record).unwrap());
         assert!(
@@ -2360,6 +2673,252 @@ mod tests {
         idempotent_transaction_contract(&SqliteControlPlaneStore::open_in_memory().unwrap());
     }
 
+    /// F12: a recorded response beyond the hard bound cannot be persisted; the
+    /// operation must roll back ENTIRELY on both backends (memory replays its
+    /// undo journal, SQLite rolls its transaction back) — the domain write
+    /// never survives a response that cannot be replayed.
+    fn oversized_response_rolls_back_contract(store: &dyn ControlPlaneStore) {
+        let huge = "x".repeat(MAX_IDEMPOTENT_RESPONSE_BYTES + 1);
+        let err = store
+            .execute_idempotent("oversized", "op", "d", 1, &mut |tx| {
+                tx.put_organization(&organization("org_oversized"))?;
+                Ok(serde_json::json!({ "blob": huge }))
+            })
+            .unwrap_err();
+        assert!(matches!(err, ControlPlaneError::Malformed(_)), "{err:?}");
+        assert!(
+            store
+                .organization(&OrganizationId::try_new("org_oversized").unwrap())
+                .unwrap()
+                .is_none(),
+            "the domain write was rolled back with the unrecordable response"
+        );
+        assert!(store.idempotent("oversized").unwrap().is_none());
+        // The key is free: a bounded retry executes for real.
+        let retried = store
+            .execute_idempotent("oversized", "op", "d", 1, &mut |tx| {
+                tx.put_organization(&organization("org_oversized"))?;
+                Ok(serde_json::json!({ "ok": true }))
+            })
+            .unwrap();
+        assert!(matches!(retried, IdempotentOutcome::Executed(_)));
+    }
+
+    #[test]
+    fn memory_store_oversized_response_rolls_back() {
+        oversized_response_rolls_back_contract(&MemoryControlPlaneStore::new());
+    }
+
+    #[test]
+    fn sqlite_store_oversized_response_rolls_back() {
+        oversized_response_rolls_back_contract(&SqliteControlPlaneStore::open_in_memory().unwrap());
+    }
+
+    /// F13 negatives: a record seeded directly (the test-only `claim_idempotent`
+    /// seam) can never make `execute_idempotent` skip the closure silently —
+    /// a mismatched operation/digest is a typed conflict and an empty body is
+    /// a typed backend failure, and the closure never runs.
+    fn seeded_record_negative_contract(store: &dyn ControlPlaneStore) {
+        let seeded = IdempotencyRecord {
+            key: "seeded-key".into(),
+            operation: "op".into(),
+            request_hash: "digest".into(),
+            response_json: String::new(),
+            created_ms: 1,
+        };
+        assert!(store.claim_idempotent(&seeded).unwrap());
+        assert!(!store.claim_idempotent(&seeded).unwrap());
+        let mut runs = 0usize;
+        for (operation, digest) in [("op", "other-digest"), ("other-op", "digest")] {
+            let err = store
+                .execute_idempotent("seeded-key", operation, digest, 2, &mut |_tx| {
+                    runs += 1;
+                    Ok(serde_json::json!({}))
+                })
+                .unwrap_err();
+            assert!(matches!(err, ControlPlaneError::Conflict(_)), "{err:?}");
+        }
+        let err = store
+            .execute_idempotent("seeded-key", "op", "digest", 2, &mut |_tx| {
+                runs += 1;
+                Ok(serde_json::json!({}))
+            })
+            .unwrap_err();
+        assert!(matches!(err, ControlPlaneError::Backend(_)), "{err:?}");
+        assert_eq!(runs, 0, "a claimed key never runs the closure");
+    }
+
+    #[test]
+    fn memory_store_seeded_record_negatives() {
+        seeded_record_negative_contract(&MemoryControlPlaneStore::new());
+    }
+
+    #[test]
+    fn sqlite_store_seeded_record_negatives() {
+        seeded_record_negative_contract(&SqliteControlPlaneStore::open_in_memory().unwrap());
+    }
+
+    /// F7: the idempotency journal has a documented TTL + count retention;
+    /// both backends prune identically and the newest rows always survive.
+    fn idempotency_retention_contract(store: &dyn ControlPlaneStore) {
+        let record = |key: &str, created_ms: i64| IdempotencyRecord {
+            key: key.into(),
+            operation: "op".into(),
+            request_hash: "d".into(),
+            response_json: "{}".into(),
+            created_ms,
+        };
+        let now = 1_000_000_000i64;
+        store
+            .claim_idempotent(&record("stale", now - IDEMPOTENCY_TTL_MS - 1))
+            .unwrap();
+        store.claim_idempotent(&record("fresh", now)).unwrap();
+        assert_eq!(store.prune_idempotency(now).unwrap(), 1);
+        assert!(store.idempotent("stale").unwrap().is_none());
+        assert!(store.idempotent("fresh").unwrap().is_some());
+
+        for i in 0..(MAX_IDEMPOTENCY_ROWS + 64) {
+            store
+                .claim_idempotent(&record(&format!("bulk-{i:05}"), now + 1 + i as i64))
+                .unwrap();
+        }
+        assert_eq!(
+            store.idempotency_count().unwrap(),
+            MAX_IDEMPOTENCY_ROWS + 65
+        );
+        assert_eq!(store.prune_idempotency(now).unwrap(), 65);
+        assert_eq!(
+            store.idempotency_count().unwrap(),
+            MAX_IDEMPOTENCY_ROWS,
+            "the journal is bounded by count"
+        );
+        assert!(store
+            .idempotent(&format!("bulk-{:05}", MAX_IDEMPOTENCY_ROWS + 63))
+            .unwrap()
+            .is_some());
+        assert!(store.idempotent("bulk-00000").unwrap().is_none());
+        assert!(store.idempotent("fresh").unwrap().is_none());
+    }
+
+    #[test]
+    fn memory_store_idempotency_retention() {
+        idempotency_retention_contract(&MemoryControlPlaneStore::new());
+    }
+
+    #[test]
+    fn sqlite_store_idempotency_retention() {
+        idempotency_retention_contract(&SqliteControlPlaneStore::open_in_memory().unwrap());
+    }
+
+    /// F4: a database written by a NEWER schema ladder is refused typed
+    /// (documented downgrade refusal) and left untouched.
+    #[test]
+    fn opening_a_newer_schema_is_refused_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.db");
+        let newer = CP_MIGRATIONS.len() as i64 + 1;
+        {
+            let conn = Connection::open(&path).unwrap();
+            crate::durability::apply_policy(&conn).unwrap();
+            conn.execute_batch(&format!("PRAGMA user_version = {newer}"))
+                .unwrap();
+        }
+        let err = SqliteControlPlaneStore::open(&path)
+            .err()
+            .expect("a newer schema must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("newer than this binary's ladder") && message.contains("downgrade"),
+            "{message}"
+        );
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, newer, "the refused open changed nothing");
+    }
+
+    /// F5: two concurrent openers serialize on the migration write lock. The
+    /// loser re-reads the ladder version inside its own transaction and SKIPS,
+    /// so exactly ONE restore point is written and its name claim matches its
+    /// content (no post-migration snapshot mislabeled `-pre-migration-v0-`).
+    #[test]
+    fn concurrent_openers_serialize_migration_and_label_restore_points_truthfully() {
+        use std::sync::Barrier;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            crate::durability::apply_policy(&conn).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE legacy_row (id TEXT PRIMARY KEY, v INTEGER);
+                 INSERT INTO legacy_row (id, v) VALUES ('a', 1);",
+            )
+            .unwrap();
+        }
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                SqliteControlPlaneStore::open(&path).map(|_| ())
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .unwrap()
+                .expect("both concurrent openers must succeed");
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, CP_MIGRATIONS.len() as i64, "the ladder applied");
+            let legacy: i64 = conn
+                .query_row("SELECT v FROM legacy_row WHERE id = 'a'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(legacy, 1, "the pre-existing row survived");
+        }
+        let points: Vec<std::path::PathBuf> = crate::durability::list_backups(&path)
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .contains(crate::durability::MIGRATION_MARKER)
+            })
+            .collect();
+        assert_eq!(
+            points.len(),
+            1,
+            "exactly one opener snapshotted the pre-migration state: {points:?}"
+        );
+        let name = points[0].file_name().unwrap().to_str().unwrap();
+        assert!(name.contains("-pre-migration-v0-"), "{name}");
+        let snapshot =
+            Connection::open_with_flags(&points[0], rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let snapshot_version: i64 = snapshot
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            snapshot_version, 0,
+            "the restore point content matches its claimed version"
+        );
+        let snapshot_legacy: i64 = snapshot
+            .query_row("SELECT v FROM legacy_row WHERE id = 'a'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            snapshot_legacy, 1,
+            "the snapshot holds the pre-migration row"
+        );
+    }
+
     /// The in-transaction external-identity seam: an attach is visible in the
     /// same transaction, a refusal rolls the attach back, and a second row
     /// for a bound `(provider, subject)` is refused typed so a subject can
@@ -2431,6 +2990,112 @@ mod tests {
                 .as_str(),
             "usr_tx_owner"
         );
+
+        // Delimiter-bearing pairs must not alias: `format!("{provider}:{subject}")`
+        // would render both ("a:b", "c") and ("a", "b:c") as "a:b:c". The
+        // tuple key and SQLite's UNIQUE(provider, subject) resolve them apart.
+        store
+            .put_external_identity(&ExternalIdentity {
+                id: ExternalIdentityId::try_new("ext_tx_00000000000000000000000000000004").unwrap(),
+                user: UserId::try_new("usr_tx_colon_left").unwrap(),
+                provider: "a:b".into(),
+                subject: "c".into(),
+                created_ms: 7,
+            })
+            .unwrap();
+        store
+            .put_external_identity(&ExternalIdentity {
+                id: ExternalIdentityId::try_new("ext_tx_00000000000000000000000000000005").unwrap(),
+                user: UserId::try_new("usr_tx_colon_right").unwrap(),
+                provider: "a".into(),
+                subject: "b:c".into(),
+                created_ms: 7,
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .external_identity("a:b", "c")
+                .unwrap()
+                .unwrap()
+                .user
+                .as_str(),
+            "usr_tx_colon_left"
+        );
+        assert_eq!(
+            store
+                .external_identity("a", "b:c")
+                .unwrap()
+                .unwrap()
+                .user
+                .as_str(),
+            "usr_tx_colon_right"
+        );
+    }
+
+    /// Explicit cross-backend parity for delimiter-bearing identity pairs: the
+    /// memory store and SQLite must resolve the same (provider, subject)
+    /// requests to the same users.
+    #[test]
+    fn external_identity_backends_agree_on_delimiter_bearing_pairs() {
+        let memory = MemoryControlPlaneStore::new();
+        let sqlite = SqliteControlPlaneStore::open_in_memory().unwrap();
+        let mut resolved = Vec::new();
+        for store in [
+            &memory as &dyn ControlPlaneStore,
+            &sqlite as &dyn ControlPlaneStore,
+        ] {
+            for (id, provider, subject, user) in [
+                (
+                    "ext_parity_00000000000000000000000000000001",
+                    "a:b",
+                    "c",
+                    "usr_parity_left",
+                ),
+                (
+                    "ext_parity_00000000000000000000000000000002",
+                    "a",
+                    "b:c",
+                    "usr_parity_right",
+                ),
+            ] {
+                store
+                    .put_external_identity(&ExternalIdentity {
+                        id: ExternalIdentityId::try_new(id).unwrap(),
+                        user: UserId::try_new(user).unwrap(),
+                        provider: provider.into(),
+                        subject: subject.into(),
+                        created_ms: 1,
+                    })
+                    .unwrap();
+            }
+            resolved.push((
+                store
+                    .external_identity("a:b", "c")
+                    .unwrap()
+                    .unwrap()
+                    .user
+                    .as_str()
+                    .to_string(),
+                store
+                    .external_identity("a", "b:c")
+                    .unwrap()
+                    .unwrap()
+                    .user
+                    .as_str()
+                    .to_string(),
+            ));
+        }
+        assert_eq!(
+            resolved[0], resolved[1],
+            "memory and SQLite resolve delimiter-bearing pairs identically"
+        );
+        assert_eq!(
+            resolved[0],
+            (
+                "usr_parity_left".to_string(),
+                "usr_parity_right".to_string()
+            )
+        );
     }
 
     #[test]
@@ -2441,6 +3106,124 @@ mod tests {
     #[test]
     fn sqlite_store_external_identity_transaction_contract() {
         external_identity_transaction_contract(&SqliteControlPlaneStore::open_in_memory().unwrap());
+    }
+
+    /// SQLite enforces `UNIQUE(token_hash)` on invitations, auth sessions and
+    /// service accounts. The memory store must refuse the exact same
+    /// duplicates with the same typed conflict, never silently alias a token.
+    fn token_hash_uniqueness_contract(store: &dyn ControlPlaneStore) {
+        let org = OrganizationId::try_new("org_a").unwrap();
+
+        let hash = TokenHash::try_new("c".repeat(64)).unwrap();
+        let invitation = Invitation {
+            id: InvitationId::try_new("inv_tok_1").unwrap(),
+            organization: org.clone(),
+            email: "invitee@example.test".into(),
+            role: Role::Member,
+            status: crate::model::InvitationStatus::Pending,
+            invited_by: UserId::try_new("usr_1").unwrap(),
+            token_hash: hash.clone(),
+            created_ms: 1,
+            expires_ms: 100,
+            decided_ms: None,
+        };
+        store.put_invitation(&invitation).unwrap();
+        let mut second = invitation.clone();
+        second.id = InvitationId::try_new("inv_tok_2").unwrap();
+        assert!(matches!(
+            store.put_invitation(&second).unwrap_err(),
+            CloudStoreError::Conflict(_)
+        ));
+        store
+            .put_invitation(&invitation)
+            .expect("the same id may still be updated in place");
+        assert_eq!(
+            store
+                .invitation_by_token_hash(&hash)
+                .unwrap()
+                .unwrap()
+                .id
+                .as_str(),
+            "inv_tok_1",
+            "the token still resolves to the surviving row"
+        );
+
+        let session_hash = TokenHash::try_new("d".repeat(64)).unwrap();
+        let session = AuthSession {
+            id: AuthSessionId::try_new("ses_tok_1").unwrap(),
+            organization: org.clone(),
+            user: UserId::try_new("usr_1").unwrap(),
+            token_hash: session_hash.clone(),
+            created_ms: 1,
+            expires_ms: 100,
+            revoked_ms: None,
+        };
+        store.put_auth_session(&session).unwrap();
+        let mut second_session = session.clone();
+        second_session.id = AuthSessionId::try_new("ses_tok_2").unwrap();
+        assert!(matches!(
+            store.put_auth_session(&second_session).unwrap_err(),
+            CloudStoreError::Conflict(_)
+        ));
+        assert_eq!(
+            store
+                .auth_session_by_token_hash(&session_hash)
+                .unwrap()
+                .unwrap()
+                .id,
+            session.id
+        );
+
+        let account_hash = TokenHash::try_new("e".repeat(64)).unwrap();
+        let account = ServiceAccount {
+            id: ServiceAccountId::try_new("sa_tok_1").unwrap(),
+            organization: org.clone(),
+            name: "ci".into(),
+            role: Role::Member,
+            scopes: vec![Action::RepositoryRead],
+            token_hash: account_hash.clone(),
+            created_ms: 1,
+            disabled: false,
+        };
+        store.put_service_account(&account).unwrap();
+        let mut second_account = account.clone();
+        second_account.id = ServiceAccountId::try_new("sa_tok_2").unwrap();
+        assert!(matches!(
+            store.put_service_account(&second_account).unwrap_err(),
+            CloudStoreError::Conflict(_)
+        ));
+        assert_eq!(
+            store
+                .service_account_by_token_hash(&account_hash)
+                .unwrap()
+                .unwrap()
+                .id,
+            account.id
+        );
+
+        // The same invariant holds INSIDE an idempotent transaction: the
+        // duplicate is refused typed and the key is never claimed.
+        let mut third = invitation.clone();
+        third.id = InvitationId::try_new("inv_tok_3").unwrap();
+        let refused = store
+            .execute_idempotent("tok-hash-tx", "invite", "d", 1, &mut |tx| {
+                tx.put_invitation(&third)?;
+                Ok(serde_json::json!({"ok": true}))
+            })
+            .unwrap_err();
+        assert!(matches!(refused, ControlPlaneError::Conflict(_)));
+        assert!(store.idempotent("tok-hash-tx").unwrap().is_none());
+        assert!(store.invitation(&third.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn memory_store_token_hash_uniqueness_contract() {
+        token_hash_uniqueness_contract(&MemoryControlPlaneStore::new());
+    }
+
+    #[test]
+    fn sqlite_store_token_hash_uniqueness_contract() {
+        token_hash_uniqueness_contract(&SqliteControlPlaneStore::open_in_memory().unwrap());
     }
 
     #[test]
@@ -2553,7 +3336,7 @@ mod tests {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch("PRAGMA user_version = 4").unwrap();
         }
-        inject_crash_before_migration();
+        inject_crash_before_migration(&path);
         let err = SqliteControlPlaneStore::open(&path)
             .err()
             .expect("the injected crash must fail the open");

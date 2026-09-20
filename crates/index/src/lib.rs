@@ -24,7 +24,9 @@ pub use embedding::{
     apply_embeddings, chunk_text, content_hash, EmbeddingIndex, EmbeddingModel, EmbeddingRecord,
     EmbeddingSource, EmbeddingStats,
 };
-pub use service::{IndexError, IndexService, IndexView, ServiceConfig};
+pub use service::{
+    IndexError, IndexService, IndexView, ServiceConfig, WorkerShutdown, WorkerState, WorkerStatus,
+};
 pub use state::WorkspaceIndexState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

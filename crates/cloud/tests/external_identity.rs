@@ -433,6 +433,79 @@ fn concurrent_logins_bind_exactly_one_subject_across_two_connections() {
     );
 }
 
+/// Delimiter-bearing `(provider, subject)` pairs must not alias: a joined
+/// `"{provider}:{subject}"` key would collapse `("a:b", "c")` and `("a",
+/// "b:c")` onto one row. Subject-first login must resolve each pair to its
+/// own account on BOTH backends (SQLite's UNIQUE(provider, subject) is the
+/// reference semantics).
+#[test]
+fn delimiter_bearing_provider_subject_pairs_do_not_alias() {
+    for_each_store(|cp, store| {
+        let org = bootstrap(cp, "Acme", "owner@acme.test", "boot");
+        let left = cp
+            .login_external(
+                &org,
+                "a:b",
+                "c",
+                "left@example.test",
+                "Left",
+                true,
+                Role::Member,
+            )
+            .expect("left login");
+        let right = cp
+            .login_external(
+                &org,
+                "a",
+                "b:c",
+                "right@example.test",
+                "Right",
+                true,
+                Role::Member,
+            )
+            .expect("right login");
+        assert_ne!(
+            left.user.id, right.user.id,
+            "the collision pair must resolve to distinct accounts"
+        );
+
+        // Subject-first replays resolve the right account for each pair.
+        let left_again = cp
+            .login_external(
+                &org,
+                "a:b",
+                "c",
+                "left@example.test",
+                "Left",
+                true,
+                Role::Member,
+            )
+            .expect("left replay");
+        assert_eq!(left_again.user.id, left.user.id);
+        let right_again = cp
+            .login_external(
+                &org,
+                "a",
+                "b:c",
+                "right@example.test",
+                "Right",
+                true,
+                Role::Member,
+            )
+            .expect("right replay");
+        assert_eq!(right_again.user.id, right.user.id);
+
+        assert_eq!(
+            store.external_identity("a:b", "c").unwrap().unwrap().user,
+            left.user.id
+        );
+        assert_eq!(
+            store.external_identity("a", "b:c").unwrap().unwrap().user,
+            right.user.id
+        );
+    });
+}
+
 /// Organization isolation: a linked subject joining a second org keeps both
 /// memberships independent, and a missing or deleted org is a typed
 /// `NotFound` that writes nothing.

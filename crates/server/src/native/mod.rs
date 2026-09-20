@@ -191,6 +191,15 @@ pub(crate) const MAX_NATIVE_LIST: usize = 500;
 /// `GET /native/health` — liveness: 200 `{ok:true, version}` whenever the
 /// process responds (auth-gated like `/global/health`). Conceptually the
 /// same "process is up" answer as health; readiness is `/native/ready`.
+///
+/// Additive worker-plane surfacing: the payload also carries
+/// `worker_plane: {state, [bind], [code], [message]}` — the typed liveness
+/// of the dedicated worker-plane listener (see
+/// [`crate::worker_plane::WorkerPlaneStatus`]), so an operator or placement
+/// decision can SEE an unexpectedly dead remote-worker socket instead of
+/// assuming it is serving. `state` is one of `serving` / `unavailable` /
+/// `stopped` / `disabled`; `code` + `message` appear only for `unavailable`.
+/// Existing keys are unchanged.
 pub(crate) async fn native_health(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
@@ -198,6 +207,7 @@ pub(crate) async fn native_health(State(state): State<AppState>, headers: Header
     Json(serde_json::json!({
         "ok": true,
         "version": state.deps.version.clone(),
+        "worker_plane": state.deps.worker_plane_health().to_json(),
     }))
     .into_response()
 }

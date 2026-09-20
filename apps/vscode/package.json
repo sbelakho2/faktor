@@ -105,9 +105,9 @@
         },
         "faktor.startupTimeoutMs": {
           "type": "number",
-          "default": 10000,
+          "default": 45000,
           "minimum": 1000,
-          "description": "How long to wait for the daemon startup line before failing."
+          "description": "How long to wait for the daemon startup line before failing (must exceed the bootstrap launcher's ~30 s launch window)."
         },
         "faktor.autoStart": {
           "type": "boolean",

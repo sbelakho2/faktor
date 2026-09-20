@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use crate::api::tests::test_deps;
+use crate::worker_plane::{WorkerPlaneServeError, WorkerPlaneStatus, WORKER_PLANE_SHUTDOWN_BOUND};
 use crate::{
     serve_arc, serve_worker_plane, WorkerPlaneAuth, WorkerPlaneBindConfig,
     WorkerPlaneBoundaryRefusal, WorkerPlaneTransport,
@@ -355,4 +356,180 @@ async fn worker_plane_binding_does_not_change_the_native_listener_and_vice_versa
         .await
         .unwrap();
     assert_eq!(response.status(), 400);
+}
+
+// ------------------------------------------------ serve-task ownership/health
+
+/// Bounded wait for the owned serve task to end; a task that never ends fails
+/// the test instead of hanging it.
+async fn wait_until_dead(handle: &crate::WorkerPlaneHandle) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while handle.is_alive() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the serve task must terminate within the bound"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+/// (a) Unexpected serve error: the handle's daemon-queryable health
+/// transitions to UNAVAILABLE with the typed error's code/message, and a
+/// later `shutdown` surfaces the SAME typed error instead of reporting a
+/// clean stop (the production serve future is never `.ok()`-discarded).
+#[tokio::test]
+async fn unexpected_serve_error_is_recorded_typed_in_health() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_deps, _plane, _token) = deps(dir.path());
+    let config = loopback_config(None);
+    let exposure = config.validate().unwrap();
+    let addr: std::net::SocketAddr = "127.0.0.1:8790".parse().unwrap();
+    let handle = crate::worker_plane::WorkerPlaneHandle::failing_serve_for_test(
+        addr,
+        exposure,
+        std::io::Error::other("injected accept failure"),
+    );
+    wait_until_dead(&handle).await;
+    let status = handle.status();
+    assert!(
+        status.is_unavailable(),
+        "unexpected death must be typed: {status:?}"
+    );
+    assert_eq!(status.code(), Some("worker_plane_serve_failed"));
+    let line = status.health_line();
+    assert!(line.contains("UNAVAILABLE"), "{line}");
+    assert!(line.contains("worker_plane_serve_failed"), "{line}");
+    assert!(line.contains("injected accept failure"), "{line}");
+    assert!(line.contains(&addr.to_string()), "{line}");
+    assert!(!handle.is_alive());
+    // The owner's join surfaces the typed serve error (health and result
+    // agree; neither is a silent Ok).
+    let error = handle.shutdown().await.unwrap_err();
+    assert_eq!(error.code(), "worker_plane_serve_failed");
+    assert!(
+        matches!(error, WorkerPlaneServeError::Serve { .. }),
+        "expected the typed serve error, got {error}"
+    );
+}
+
+/// (a) External abort (task killed out from under the handle): health still
+/// names the death typed — never `Serving`, never a silent `Stopped`.
+#[tokio::test]
+async fn externally_aborted_task_health_names_the_death() {
+    let dir = tempfile::tempdir().unwrap();
+    let (deps, _plane, _token) = deps(dir.path());
+    let handle = serve_worker_plane(deps, loopback_config(None))
+        .await
+        .unwrap();
+    assert!(handle.is_alive());
+    handle.abort_task_for_test();
+    wait_until_dead(&handle).await;
+    let status = handle.status();
+    assert_eq!(status.code(), Some("worker_plane_task_died"), "{status:?}");
+    assert!(status.health_line().contains("UNAVAILABLE"));
+    assert!(!handle.is_alive());
+    // The owner join surfaces the task death typed as well.
+    let error = handle.shutdown().await.unwrap_err();
+    assert_eq!(error.code(), "worker_plane_task_failed");
+    assert!(
+        matches!(error, WorkerPlaneServeError::Task { .. }),
+        "expected the typed task error, got {error}"
+    );
+}
+
+/// (b) `shutdown().await` joins the owned task within the bounded window and
+/// maps the clean graceful stop to `Ok(())`; the socket is released.
+#[tokio::test]
+async fn shutdown_joins_within_the_bound_and_maps_clean_stop_to_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    let (deps, _plane, _token) = deps(dir.path());
+    let handle = serve_worker_plane(deps, loopback_config(None))
+        .await
+        .unwrap();
+    let addr = handle.addr;
+    assert!(handle.is_alive());
+    let slack = std::time::Duration::from_secs(5);
+    let started = std::time::Instant::now();
+    let joined = tokio::time::timeout(WORKER_PLANE_SHUTDOWN_BOUND + slack, handle.shutdown()).await;
+    assert!(joined.is_ok(), "shutdown must join within the bound");
+    joined.unwrap().unwrap();
+    assert!(
+        started.elapsed() < WORKER_PLANE_SHUTDOWN_BOUND + slack,
+        "the bounded join must not exceed the window"
+    );
+    // The owned task completed (not detached): the listener socket is free.
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("the listener socket must be released after the join");
+}
+
+/// (c) Shutdown is idempotent: the one-shot request is honored exactly once
+/// and every later request is a no-op; the join still returns `Ok`.
+#[tokio::test]
+async fn shutdown_request_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (deps, _plane, _token) = deps(dir.path());
+    let handle = serve_worker_plane(deps, loopback_config(None))
+        .await
+        .unwrap();
+    assert!(handle.request_shutdown(), "the first request wins");
+    assert!(!handle.request_shutdown(), "a repeated request is a no-op");
+    assert!(!handle.request_shutdown(), "still a no-op");
+    handle.shutdown().await.unwrap();
+}
+
+/// (d) Regression: refused binds stay typed — an occupied address is the
+/// typed `Bind` error with its stable code, and the boundary refusal remains
+/// the FIRST gate (unchanged).
+#[tokio::test]
+async fn refused_binds_stay_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (deps, _plane, _token) = deps(dir.path());
+    // Occupy a concrete loopback address: the worker-plane bind must refuse
+    // typed, naming the address, instead of panicking or degrading.
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = occupied.local_addr().unwrap();
+    let mut config = loopback_config(None);
+    config.bind = addr;
+    let error = serve_worker_plane(deps.clone(), config).await.unwrap_err();
+    assert_eq!(error.code(), "worker_plane_bind_failed");
+    let WorkerPlaneServeError::Bind { bind, .. } = &error else {
+        panic!("expected the typed bind error, got {error}");
+    };
+    assert_eq!(*bind, addr);
+    assert!(error.to_string().contains(&addr.to_string()), "{error}");
+    // The boundary refusal is still validated BEFORE any bind (unchanged).
+    let mut tls = loopback_config(None);
+    tls.transport = WorkerPlaneTransport::Tls;
+    let error = serve_worker_plane(deps, tls).await.unwrap_err();
+    assert_eq!(error.code(), "worker_plane_boundary_refused");
+    assert!(matches!(error, WorkerPlaneServeError::Boundary(_)));
+}
+
+/// (e) No detached task: the owner records the terminal stop and reports
+/// complete after `shutdown` — the shared status says `Stopped` (never
+/// `Serving`), and the listener socket is released.
+#[tokio::test]
+async fn owner_reports_complete_after_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let (deps, _plane, _token) = deps(dir.path());
+    let handle = serve_worker_plane(deps, loopback_config(None))
+        .await
+        .unwrap();
+    let addr = handle.addr;
+    let probe = handle.probe_for_test();
+    assert!(
+        probe.terminal().is_none(),
+        "no terminal snapshot while the task is alive"
+    );
+    assert_eq!(handle.status(), WorkerPlaneStatus::Serving);
+    handle.shutdown().await.unwrap();
+    assert_eq!(
+        probe.terminal(),
+        Some(WorkerPlaneStatus::Stopped),
+        "the owner observed the task's clean completion"
+    );
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("the owned task released the listener socket");
 }

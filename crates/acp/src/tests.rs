@@ -2298,3 +2298,326 @@ async fn poisoned_terminal_registry_locks_recover_and_keep_serving() {
     assert_eq!(created["terminalId"], "t-1");
     assert_eq!(registry.list("sess-a").unwrap().len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Wind-down: bounded task aborts, no post-shutdown writes, no leaked turns
+// ---------------------------------------------------------------------------
+
+/// A writer that blocks every write until `unblock()` and records the
+/// instant of each accepted write. Blocking parks the task (the waker is
+/// remembered), so an UN-aborted writer task would resume and write after
+/// `serve_connection` returned — the regression this test pins.
+#[derive(Clone)]
+struct BlockingWriter {
+    state: Arc<Mutex<BlockingWriterState>>,
+}
+
+struct BlockingWriterState {
+    blocked: bool,
+    writes: Vec<std::time::Instant>,
+    waker: Option<std::task::Waker>,
+}
+
+impl BlockingWriter {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(BlockingWriterState {
+                blocked: true,
+                writes: Vec::new(),
+                waker: None,
+            })),
+        }
+    }
+
+    fn unblock(&self) {
+        let waker = {
+            let mut state = self.state.lock().unwrap();
+            state.blocked = false;
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn writes_after(&self, mark: std::time::Instant) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .writes
+            .iter()
+            .filter(|t| **t > mark)
+            .count()
+    }
+}
+
+impl tokio::io::AsyncWrite for BlockingWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let mut state = self.state.lock().unwrap();
+        if state.blocked {
+            state.waker = Some(cx.waker().clone());
+            return std::task::Poll::Pending;
+        }
+        state.writes.push(std::time::Instant::now());
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let mut state = self.state.lock().unwrap();
+        if state.blocked {
+            state.waker = Some(cx.waker().clone());
+            return std::task::Poll::Pending;
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// A streaming backend whose prompt future never resolves; its Drop guard
+/// records that the task's future was dropped (i.e. the operation task was
+/// aborted/joined, not leaked).
+#[derive(Clone)]
+struct PendingStream {
+    entered: Arc<AtomicBool>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl AcpStreamBackend for PendingStream {
+    fn agent_info(&self) -> Value {
+        json!({})
+    }
+    fn create_session(&self, _p: &Value) -> Result<String, String> {
+        Ok("sess-pending".into())
+    }
+    fn list_sessions(&self) -> Vec<String> {
+        vec![]
+    }
+    fn prompt<'a>(
+        &'a self,
+        _sid: &'a str,
+        _ctx: &'a PromptCtx,
+        _text: &'a str,
+    ) -> BoxFuture<'a, Result<Value, String>> {
+        let entered = self.entered.clone();
+        let dropped = self.dropped.clone();
+        Box::pin(async move {
+            struct Guard(Arc<AtomicBool>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _guard = Guard(dropped);
+            entered.store(true, Ordering::SeqCst);
+            futures::future::pending::<()>().await;
+            Ok(Value::Null)
+        })
+    }
+}
+
+/// A timed-out writer is ABORTED: `serve_connection` returns within its bound
+/// and nothing is written after it returns, even when the blocked writer is
+/// woken afterwards. The pending turn's future is dropped (no leaked task).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_aborts_blocked_writer_and_leaves_no_post_shutdown_writes() {
+    let entered = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let writer = BlockingWriter::new();
+    let (mut client_w, server_r) = duplex(1024 * 1024);
+    let config = AcpConfig {
+        shutdown_timeout: Duration::from_millis(150),
+        cancel_grace: Duration::from_millis(50),
+        ..AcpConfig::default()
+    };
+    let server = AcpServer::new_streaming(PendingStream {
+        entered: entered.clone(),
+        dropped: dropped.clone(),
+    })
+    .with_config(config);
+    let probe = writer.clone();
+    let handle = tokio::spawn(async move { server.serve_connection(server_r, writer).await });
+
+    let mut bytes = Vec::new();
+    bytes.extend(
+        protocol::encode(
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {} }),
+        )
+        .unwrap(),
+    );
+    bytes.extend(
+        protocol::encode(
+            &json!({ "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
+        "params": { "sessionId": "sess-pending", "prompt": [{ "type": "text", "text": "x" }] } }),
+        )
+        .unwrap(),
+    );
+    client_w.write_all(&bytes).await.unwrap();
+    // Wait until the operation task is genuinely running before the shutdown,
+    // so the aborted-task assertion covers a LIVE turn.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(entered.load(Ordering::SeqCst), "the prompt turn must start");
+    let bye =
+        protocol::encode(&json!({ "jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": {} }))
+            .unwrap();
+    client_w.write_all(&bye).await.unwrap();
+    drop(client_w);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("serve_connection must return within the bounded wind-down")
+        .expect("server task panicked");
+    assert!(
+        outcome.is_err(),
+        "a blocked writer at the shutdown timeout is a typed failure, not a silent drop: {outcome:?}"
+    );
+    let mark = std::time::Instant::now();
+    // Wake the (aborted) writer: under the old drop-the-JoinHandle behavior
+    // the writer task would resume and write the queued shutdown reply AFTER
+    // serve_connection returned; the abort makes the wake a no-op.
+    probe.unblock();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        probe.writes_after(mark),
+        0,
+        "no byte may be written after serve_connection returns"
+    );
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the pending prompt future must be dropped (no leaked operation task)"
+    );
+}
+
+/// `terminals.shutdown` is bounded: a terminal authority whose kill blocks
+/// forever cannot hang the connection wind-down; the outcome is typed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_shutdown_is_bounded_and_reported_typed() {
+    struct BlockingKillHandle {
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+    impl TerminalHandle for BlockingKillHandle {
+        fn terminal_id(&self) -> &str {
+            "t-block"
+        }
+        fn pid(&self) -> u32 {
+            4242
+        }
+        fn is_alive(&self) -> bool {
+            true
+        }
+        fn ownership_id(&self) -> &str {
+            "own-block"
+        }
+        fn write(&self, _bytes: &[u8]) -> Result<(), TerminalError> {
+            Ok(())
+        }
+        fn resize(&self, _rows: u16, _cols: u16) -> Result<(), TerminalError> {
+            Ok(())
+        }
+        fn drain_output(&self) -> Vec<u8> {
+            vec![]
+        }
+        fn kill(&self) -> Result<(), TerminalError> {
+            let (lock, cond) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = cond.wait(released).unwrap();
+            }
+            Ok(())
+        }
+    }
+    struct BlockingKillAuthority {
+        handle: Arc<BlockingKillHandle>,
+    }
+    impl TerminalAuthority for BlockingKillAuthority {
+        fn create(
+            &self,
+            _session_id: &str,
+            _spec: &TerminalSpec,
+        ) -> Result<Arc<dyn TerminalHandle>, TerminalError> {
+            Ok(self.handle.clone())
+        }
+    }
+    // The kill blocks until the test releases it: only the wind-down bound
+    // can end `terminals.shutdown()`.
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let handle = Arc::new(BlockingKillHandle {
+        release: release.clone(),
+    });
+    let authority = Arc::new(BlockingKillAuthority { handle });
+    let config = AcpConfig {
+        shutdown_timeout: Duration::from_millis(100),
+        ..AcpConfig::default()
+    };
+    let server = AcpServer::new(EchoBackend::new())
+        .with_config(config)
+        .with_terminal_authority(authority as Arc<dyn TerminalAuthority>);
+    let (mut client_w, server_r) = duplex(1024 * 1024);
+    let (server_w, mut client_r) = duplex(1024 * 1024);
+    let served = tokio::spawn(async move { server.serve_connection(server_r, server_w).await });
+
+    // Negotiate the terminal extension and create one terminal, then ask for
+    // shutdown: the registry's kill is never released, so only the bound can
+    // end the wind-down.
+    let init = protocol::encode(&json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": 1, "extensions": ["faktor.terminal"] } }))
+    .unwrap();
+    let new = protocol::encode(
+        &json!({ "jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {} }),
+    )
+    .unwrap();
+    let create = protocol::encode(
+        &json!({ "jsonrpc": "2.0", "id": 3, "method": "terminal/create",
+        "params": { "sessionId": "sess-1", "command": "sh" } }),
+    )
+    .unwrap();
+    let bye =
+        protocol::encode(&json!({ "jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": {} }))
+            .unwrap();
+    client_w.write_all(&init).await.unwrap();
+    client_w.write_all(&new).await.unwrap();
+    client_w.write_all(&create).await.unwrap();
+    client_w.write_all(&bye).await.unwrap();
+    let t0 = std::time::Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(3), served)
+        .await
+        .expect("wind-down must be bounded by shutdown_timeout")
+        .expect("server task panicked");
+    assert!(
+        t0.elapsed() < Duration::from_millis(2_000),
+        "bounded: {:?}",
+        t0.elapsed()
+    );
+    assert!(
+        outcome.is_err(),
+        "an unbounded terminal kill must surface a typed failure: {outcome:?}"
+    );
+    // Drain whatever the writer produced so the duplex does not stay full.
+    let mut sink = [0u8; 4096];
+    while let Ok(Ok(n)) =
+        tokio::time::timeout(Duration::from_millis(50), client_r.read(&mut sink)).await
+    {
+        if n == 0 {
+            break;
+        }
+    }
+    let (lock, cond) = &*release;
+    let mut released = lock.lock().unwrap();
+    *released = true;
+    cond.notify_all();
+}

@@ -150,6 +150,20 @@ class FaktorFrontendService(
         clientOrThrow().revokeControlSession(organization, sessionId)
     }
 
+    /**
+     * Revoke the named session presenting an EXPLICIT captured credential
+     * (the sign-out path). The live client may already carry a ROTATED token
+     * (an external PasswordSafe write reached it through the watcher);
+     * revoking that would revoke a credential the operator just obtained, so
+     * sign-out always presents the exact credential it captured and means to
+     * delete.
+     */
+    fun revokeControlPlaneSessionWithToken(organization: String, sessionId: String, token: String) {
+        val conn = synchronized(lifecycleLock) { connection }
+            ?: throw BackendException("the daemon is not running, so the control plane is unreachable")
+        NativeClient.forConnection(conn, token).revokeControlSession(organization, sessionId)
+    }
+
     fun currentSessionId(): String? = sessionId
 
     fun daemonDescription(): String = synchronized(lifecycleLock) {
@@ -163,6 +177,16 @@ class FaktorFrontendService(
     fun start(): NativeHealth {
         synchronized(lifecycleLock) {
             if (client != null) return client!!.health()
+            // A tracked connection that still answers health is a LIVE daemon:
+            // spawning a second one would leave the first untracked. Refuse
+            // loudly instead (liveness is health-backed, never launcher-pid
+            // only).
+            val existing = connection
+            if (existing != null && existing.isAlive()) {
+                throw BackendException(
+                    "a daemon is already live at ${existing.baseUrl}; refusing to spawn a second one"
+                )
+            }
         }
         val mgr = BackendProcessManager(binaryPath, dataDir)
         listener?.onDaemonStatus("starting", binaryPath.toString())

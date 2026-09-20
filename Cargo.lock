@@ -1296,6 +1296,7 @@ dependencies = [
  "faktor-session",
  "faktor-terminal",
  "futures",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

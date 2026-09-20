@@ -63,7 +63,10 @@ impl From<crate::rbac::Denied> for ControlPlaneError {
 
 impl From<CloudStoreError> for ControlPlaneError {
     fn from(e: CloudStoreError) -> Self {
-        ControlPlaneError::Backend(e.to_string())
+        match e {
+            CloudStoreError::Conflict(message) => ControlPlaneError::Conflict(message),
+            other => ControlPlaneError::Backend(other.to_string()),
+        }
     }
 }
 

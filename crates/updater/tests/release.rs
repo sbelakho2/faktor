@@ -904,3 +904,302 @@ fn the_running_build_report_hashes_the_live_executable() {
         assert!(faktor_updater::running_install_root().is_none());
     }
 }
+
+// ------------------------------------------------- completeness / crash seams
+
+/// The pre-atomic crash residue: the binary of a release landed but its
+/// signed manifest never did. It is INCOMPLETE, never adoptable, and launch
+/// resolution refuses it typed (instead of a "missing manifest" that reads
+/// like tampering).
+#[tokio::test]
+async fn a_manifest_less_release_directory_is_refused_at_launch_typed() {
+    let host = fixture([]);
+    let (release_id, digest) = host.install_release("0.9.1", 1, b"v1 bytes").await;
+    let binary = host.updater.layout().release_binary(&release_id);
+    assert_eq!(
+        faktor_updater::install::file_digest(&binary).unwrap(),
+        digest,
+        "the binary matches the pointer's digest (what the old check trusted)"
+    );
+    std::fs::remove_file(host.updater.layout().release_manifest(&release_id)).unwrap();
+    let err = resolve_launch(&host.launch_inputs(), &host.launch_keys()).unwrap_err();
+    assert_eq!(err.code(), "launch_refused");
+    let text = err.to_string();
+    assert!(text.contains("incomplete"), "{text}");
+    assert!(text.contains("manifest"), "{text}");
+}
+
+/// A crash between binary and manifest (the old non-atomic order) is never
+/// adopted: `apply` refuses it typed, `current` stays on the previous
+/// complete release, no operation row is recorded for the refusal, and a
+/// restart still resolves the previous release through the bootstrap.
+#[tokio::test]
+async fn an_incomplete_release_dir_is_never_adopted_and_current_stays_previous() {
+    let host = fixture([]);
+    let (_v1_id, v1_digest) = host.install_release("0.9.1", 1, b"v1 bytes").await;
+
+    // Stage v2 (complete), then simulate the crash seam: the binary landed,
+    // the signed manifest never did.
+    let (signed_v2, _v2_digest) = signed_manifest(&host.key, "0.9.2", 2, b"v2 bytes");
+    host.fetcher.serve(
+        "https://mirror.test/0.9.2/faktor-cli-0.9.2-darwin-arm64",
+        b"v2 bytes",
+    );
+    let staged = host
+        .updater
+        .stage_release(&signed_v2, &components(), None, host.now())
+        .await
+        .unwrap();
+    std::fs::remove_file(host.updater.layout().release_manifest(&staged.release_id)).unwrap();
+    assert!(
+        std::path::Path::new(&staged.binary).is_file(),
+        "the binary alone is present: exactly the manifest-less residue"
+    );
+
+    let rows_before = host.store.list(100).unwrap().len();
+    let err = host.updater.apply(host.now()).unwrap_err();
+    match &err {
+        UpdateError::Install(detail) => {
+            assert!(detail.contains("incomplete"), "{detail}");
+            assert!(detail.contains("manifest"), "{detail}");
+        }
+        other => panic!("expected a typed incomplete-release refusal, got {other:?}"),
+    }
+    assert_eq!(rows_before, host.store.list(100).unwrap().len());
+    // `current` never names the incomplete directory.
+    assert_eq!(host.pointer().digest, v1_digest);
+    assert_ne!(
+        host.pointer().release_id.as_deref(),
+        Some(staged.release_id.as_str())
+    );
+    // Restart works: the bootstrap resolves the previous COMPLETE release.
+    let target = resolve_launch(&host.launch_inputs(), &host.launch_keys()).unwrap();
+    assert_eq!(target.digest, v1_digest);
+    assert!(target.binary.is_file());
+}
+
+/// Re-materializing rebuilds an incomplete directory atomically (the temp is
+/// complete before the old directory is touched), leaves exactly the two
+/// release files, and clears stale `.kp-tmp-` residue.
+#[tokio::test]
+async fn rematerializing_rebuilds_an_incomplete_release_and_clears_temp_residue() {
+    let host = fixture([]);
+    let (signed, digest) = signed_manifest(&host.key, "0.9.1", 1, b"v1 bytes");
+    host.fetcher.serve(
+        "https://mirror.test/0.9.1/faktor-cli-0.9.1-darwin-arm64",
+        b"v1 bytes",
+    );
+    let staged = host
+        .updater
+        .stage_release(&signed, &components(), None, NOW)
+        .await
+        .unwrap();
+    let layout = host.updater.layout();
+    // Crash residue: no manifest, plus a stale partial temp dir from the
+    // interrupted materialization.
+    std::fs::remove_file(layout.release_manifest(&staged.release_id)).unwrap();
+    let stale = layout
+        .versions_dir()
+        .join(format!(".{}.kp-tmp-999-1", staged.release_id));
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("faktor"), b"partial").unwrap();
+
+    let dir = layout
+        .materialize_release(
+            &staged.release_id,
+            &staged.stage.artifact.name,
+            &digest,
+            &signed,
+        )
+        .unwrap();
+    assert_eq!(
+        faktor_updater::install::file_digest(&layout.release_binary(&staged.release_id)).unwrap(),
+        digest
+    );
+    assert_eq!(
+        std::fs::read(layout.release_manifest(&staged.release_id)).unwrap(),
+        signed
+    );
+    assert!(!stale.exists(), "stale temp residue is cleared");
+    let temps: Vec<String> = std::fs::read_dir(layout.versions_dir())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.contains(".kp-tmp-"))
+        .collect();
+    assert!(temps.is_empty(), "no temp residue survives: {temps:?}");
+    let mut entries: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    entries.sort();
+    assert_eq!(entries, vec!["faktor".to_string(), "manifest".to_string()]);
+    assert_eq!(
+        layout
+            .release_id_if_materialized("0.9.1", &digest)
+            .unwrap()
+            .as_deref(),
+        Some(staged.release_id.as_str())
+    );
+
+    // An empty manifest is refused before anything is published.
+    assert!(layout
+        .materialize_release(
+            &staged.release_id,
+            &staged.stage.artifact.name,
+            &digest,
+            b""
+        )
+        .is_err());
+}
+
+/// A rollback whose previous release is absent or corrupt refuses typed and
+/// leaves `current` untouched — never a false "restored" pointer the
+/// bootstrap would refuse on the next restart.
+#[tokio::test]
+async fn rollback_refuses_typed_when_the_previous_release_is_missing_or_corrupt() {
+    let host = fixture([]);
+    let (v1_id, v1_digest) = host.install_release("0.9.1", 1, b"v1 bytes").await;
+    let (_v2_id, v2_digest) = host.install_release("0.9.2", 2, b"v2 bytes").await;
+
+    let v1_binary = host.updater.layout().release_binary(&v1_id);
+    let saved = std::fs::read(&v1_binary).unwrap();
+
+    // (a) the previous release binary vanished (dir holds only the manifest).
+    std::fs::remove_file(&v1_binary).unwrap();
+    let err = host.updater.rollback(host.now()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            UpdateError::Install(_) | UpdateError::StagedArtifactUnusable { .. }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        host.pointer().digest,
+        v2_digest,
+        "no false restored: the pointer is untouched"
+    );
+
+    // (b) the previous release binary is corrupt (digest mismatch).
+    std::fs::write(&v1_binary, b"rot").unwrap();
+    let err = host.updater.rollback(host.now()).unwrap_err();
+    assert_eq!(err.code(), "staged_artifact_unusable");
+    assert_eq!(host.pointer().digest, v2_digest);
+    assert!(
+        host.operations(UpdateOpKind::Rollback).is_empty(),
+        "a refused rollback records no rollback row"
+    );
+
+    // (c) control: a complete previous release rolls back exactly and the
+    // bootstrap can resolve it again.
+    std::fs::write(&v1_binary, &saved).unwrap();
+    let outcome = host.updater.rollback(host.now()).unwrap();
+    let ApplyOutcome::RolledBack { digest, .. } = outcome else {
+        panic!("expected a rollback, got {outcome:?}");
+    };
+    assert_eq!(digest, v1_digest);
+    assert_eq!(host.pointer().release_id.as_deref(), Some(v1_id.as_str()));
+    let target = resolve_launch(&host.launch_inputs(), &host.launch_keys()).unwrap();
+    assert_eq!(target.digest, v1_digest);
+}
+
+// ------------------------------------------- recovery re-verification
+
+/// A high-water mark that moved between the crash and recovery (a concurrent
+/// admission) makes resuming the interrupted activation a rollback: recovery
+/// forces verification and never claims Applied.
+#[tokio::test]
+async fn recovery_refuses_to_resume_when_the_high_water_moved_after_the_crash() {
+    let host = fixture([]);
+    let (release_id, digest) = host.stage_and_activate("0.9.1", 1, b"v1 bytes").await;
+
+    // The concurrent admission: the durable floor is raised past the
+    // interrupted operation's signed generation while it is still Running.
+    host.store
+        .raise_high_water("stable", 9, false, host.now())
+        .unwrap();
+    let outcomes = host
+        .updater
+        .recover_with_running_digest(host.now(), Some(&digest))
+        .unwrap();
+    assert!(
+        matches!(
+            outcomes[0],
+            faktor_updater::RecoveryOutcome::NeedsVerification { .. }
+        ),
+        "{outcomes:?}"
+    );
+    let applies = host.operations(UpdateOpKind::Apply);
+    assert_eq!(applies[0].status, UpdateOpStatus::Unverified);
+    let detail = applies[0].detail.as_deref().unwrap();
+    assert!(detail.contains("high-water"), "{detail}");
+    // The pointer was not moved and nothing claims Applied.
+    assert_eq!(host.pointer().digest, digest);
+    assert_eq!(
+        host.pointer().release_id.as_deref(),
+        Some(release_id.as_str())
+    );
+}
+
+/// A signed release manifest that no longer verifies at recovery time (here:
+/// the signature is stripped after the crash) is re-authenticated and
+/// refused: recovery forces verification instead of resuming it.
+#[tokio::test]
+async fn recovery_refuses_to_resume_when_the_signed_manifest_no_longer_verifies() {
+    let host = fixture([]);
+    let (release_id, digest) = host.stage_and_activate("0.9.1", 1, b"v1 bytes").await;
+    let manifest_path = host.updater.layout().release_manifest(&release_id);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    value.as_object_mut().unwrap().remove("signature");
+    std::fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let outcomes = host
+        .updater
+        .recover_with_running_digest(host.now(), Some(&digest))
+        .unwrap();
+    assert!(
+        matches!(
+            outcomes[0],
+            faktor_updater::RecoveryOutcome::NeedsVerification { .. }
+        ),
+        "{outcomes:?}"
+    );
+    let applies = host.operations(UpdateOpKind::Apply);
+    assert_eq!(applies[0].status, UpdateOpStatus::Unverified);
+    assert!(
+        applies[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("no longer verifies"),
+        "{:?}",
+        applies[0].detail
+    );
+}
+
+/// The honest recovery path still resumes when everything re-verifies: the
+/// signed manifest is intact and the floor still admits the operation.
+#[tokio::test]
+async fn recovery_resumes_when_the_manifest_and_high_water_still_admit_it() {
+    let host = fixture([]);
+    let (release_id, digest) = host.stage_and_activate("0.9.1", 1, b"v1 bytes").await;
+    let outcomes = host
+        .updater
+        .recover_with_running_digest(host.now(), Some(&digest))
+        .unwrap();
+    assert!(
+        matches!(outcomes[0], faktor_updater::RecoveryOutcome::Resumed { .. }),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        host.pointer().release_id.as_deref(),
+        Some(release_id.as_str())
+    );
+    assert_eq!(
+        host.operations(UpdateOpKind::Apply)[0].status,
+        UpdateOpStatus::Applied
+    );
+}

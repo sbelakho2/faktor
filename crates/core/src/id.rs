@@ -141,11 +141,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn zero_id_rejected_by_deserialize() {
-        let v: serde_json::Value = serde_json::json!(0);
-        let id: SessionId = serde_json::from_value(v).unwrap();
-        let _ = id;
+    fn zero_id_deserialization_is_a_typed_error() {
+        let err = serde_json::from_value::<SessionId>(serde_json::json!(0)).unwrap_err();
+        assert!(err.to_string().contains("SessionId cannot be 0"), "{err}");
     }
 
     #[test]

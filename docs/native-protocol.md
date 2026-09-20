@@ -51,10 +51,17 @@ this runtime, not frozen compatibility envelopes.
 
 ## Liveness and readiness
 
-- `GET /native/health` — liveness: 200 `{ok: true, version}` whenever the
-  process responds (auth-gated like every route). "The process is up",
-  nothing more; it exists so probes that must not flap on recovery do not
-  have to distinguish readiness semantics.
+- `GET /native/health` — liveness: 200 `{ok: true, version, worker_plane}`
+  whenever the process responds (auth-gated like every route). "The process
+  is up", nothing more; it exists so probes that must not flap on recovery
+  do not have to distinguish readiness semantics. `worker_plane` is an
+  **additive** object: `state` is always present — `disabled` when no
+  dedicated worker-plane listener is wired, else `serving` / `unavailable` /
+  `stopped`; `bind` appears when the bound address is known (including after
+  shutdown); `code` + `message` appear only for `unavailable` (the typed
+  error's stable code and its message, bounded to 512 bytes, never carrying
+  the transport bearer). `ok` and `version` are unchanged, so a client that
+  knows only those keys keeps working.
 - `GET /native/ready` — readiness: 200 `{ready: true}` only when the
   session store has **recovered** (the flag is set at the very end of
   `serve()` setup — the caller opens the store, applies migrations at open
