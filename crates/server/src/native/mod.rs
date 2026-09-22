@@ -174,6 +174,17 @@ pub(crate) fn wire_status(e: ApiError) -> Response {
         .into_response()
 }
 
+/// One JSON native response with every money-named key (`*_micro` /
+/// `*Micro`) rewritten to its decimal-string wire form — including money
+/// inside opaque durable JSON embedded in the response (routing decisions,
+/// tournament rows) whose source types are shared with non-protocol wire
+/// shapes. Non-money numbers (ids, sequences, counts, tokens) are never
+/// touched; see `faktor_cloud::money` for the encoding rule.
+pub(crate) fn money_json(mut value: serde_json::Value) -> Response {
+    faktor_cloud::money::stringify_money_fields(&mut value);
+    Json(value).into_response()
+}
+
 // ------------------------------------------------- question/network/config
 // This runtime has no separate question/network subsystems: questions and
 // network requests ARE pending permission requests (the daemon's one

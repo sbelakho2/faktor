@@ -10,6 +10,7 @@ use faktor_protocol::error::ApiError;
 use super::verification::native_verification_facts;
 use super::*;
 use crate::api::AppState;
+use faktor_cloud::money;
 
 /// The snake_case lifecycle tag for native projections.
 pub(crate) fn lifecycle_tag(l: SessionLifecycle) -> String {
@@ -332,9 +333,9 @@ pub(crate) async fn native_session_tasks(
             "maxTurns": task.budget.max_turns,
             "spentTokens": task.budget.spent_tokens,
             "spentTurns": task.budget.spent_turns,
-            "maxCostMicro": cost.as_ref().and_then(|c| c.max_cost_micro),
-            "spentCostMicro": cost.as_ref().map(|c| c.spent_cost_micro).unwrap_or(0),
-            "openReservedMicro": open_micro,
+            "maxCostMicro": money::json_opt(cost.as_ref().and_then(|c| c.max_cost_micro)),
+            "spentCostMicro": money::json(cost.as_ref().map(|c| c.spent_cost_micro).unwrap_or(0)),
+            "openReservedMicro": money::json(open_micro),
         }));
     }
     let progress = state

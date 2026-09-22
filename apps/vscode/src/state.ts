@@ -106,9 +106,10 @@ export interface TaskPlanStep {
 export interface BudgetSummary {
   readonly maxTokens: number | null;
   readonly spentTokens: number | null;
-  readonly maxCostMicro: number | null;
-  readonly spentCostMicro: number;
-  readonly openReservedMicro: number;
+  /** Exact micro-USD as canonical decimal strings (never a rounded float). */
+  readonly maxCostMicro: string | null;
+  readonly spentCostMicro: string;
+  readonly openReservedMicro: string;
 }
 
 /** One completion-contract step as the UI renders it. */
@@ -172,9 +173,10 @@ export interface VerificationSummary {
 
 export interface UsageSummary {
   readonly tokens: number;
-  readonly spentMicro: number;
-  readonly maxMicro: number | null;
-  readonly openMicro: number;
+  /** Exact micro-USD as canonical decimal strings (never a rounded float). */
+  readonly spentMicro: string;
+  readonly maxMicro: string | null;
+  readonly openMicro: string;
   readonly truncated: boolean;
 }
 

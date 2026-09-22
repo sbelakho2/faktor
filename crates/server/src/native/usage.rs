@@ -8,6 +8,7 @@ use faktor_core::id::SessionId;
 
 use super::*;
 use crate::api::AppState;
+use faktor_cloud::money;
 
 /// The strict query of `/native/usage`. Without `org` the route keeps its
 /// frozen pre-billing shape (the durable cross-session aggregate below);
@@ -172,19 +173,19 @@ pub(crate) async fn native_usage(
             "prefixTokens": prefix_tokens,
             "prefixStabilityObservations": prefix_stability_observations,
         },
-        "taskSpend": { "settledCostMicro": task_budget_spent_micro },
+        "taskSpend": { "settledCostMicro": money::json(task_budget_spent_micro) },
         "reservations": {
-            "open": { "count": res_open_count, "predictedMicro": res_open_predicted },
+            "open": { "count": res_open_count, "predictedMicro": money::json(res_open_predicted) },
             "settled": {
                 "count": res_settled_count,
-                "predictedMicro": res_settled_predicted,
-                "spentMicro": res_settled_spent,
-                "providerReportedMicro": res_settled_reported,
+                "predictedMicro": money::json(res_settled_predicted),
+                "spentMicro": money::json(res_settled_spent),
+                "providerReportedMicro": money::json(res_settled_reported),
             },
-            "refunded": { "count": res_refunded_count, "predictedMicro": res_refunded_predicted },
+            "refunded": { "count": res_refunded_count, "predictedMicro": money::json(res_refunded_predicted) },
             "uncertain": {
                 "count": res_uncertain_count,
-                "predictedMicro": res_uncertain_predicted,
+                "predictedMicro": money::json(res_uncertain_predicted),
             },
         },
     });
@@ -220,13 +221,12 @@ pub(crate) async fn native_usage(
             "spent": spent,
         }));
     }
-    Json(serde_json::json!({
+    money_json(serde_json::json!({
         "sessions": sessions.len(),
         "totals": { "budget": budget_total, "spent": spent_total },
         "perSession": per_session,
         "durable": durable,
     }))
-    .into_response()
 }
 
 // ------------------------------------------------------ native v1: audits 62-64
@@ -317,9 +317,9 @@ pub(crate) fn native_task_reservation_view(
                         });
                     route_decisions.push(serde_json::json!({
                         "reservationId": row.reservation_id,
-                        "predictedMicro": row.predicted_micro,
-                        "spentMicro": reservation_settled_spent_micro(row),
-                        "providerReportedMicro": reservation_provider_reported_micro(row),
+                        "predictedMicro": money::json(row.predicted_micro),
+                        "spentMicro": money::json(reservation_settled_spent_micro(row)),
+                        "providerReportedMicro": money::json(reservation_provider_reported_micro(row)),
                         "decision": route,
                     }));
                 }
@@ -338,15 +338,15 @@ pub(crate) fn native_task_reservation_view(
     }
     let truncated = rows.len() as i64 >= MAX_NATIVE_RESERVATIONS_SCAN;
     let mut v = serde_json::json!({
-        "open": { "count": open_count, "predictedMicro": open_predicted },
+        "open": { "count": open_count, "predictedMicro": money::json(open_predicted) },
         "settled": {
             "count": settled_count,
-            "predictedMicro": settled_predicted,
-            "spentMicro": settled_spent,
-            "providerReportedMicro": settled_reported,
+            "predictedMicro": money::json(settled_predicted),
+            "spentMicro": money::json(settled_spent),
+            "providerReportedMicro": money::json(settled_reported),
         },
-        "refunded": { "count": refunded_count, "predictedMicro": refunded_predicted },
-        "uncertain": { "count": uncertain_count, "predictedMicro": uncertain_predicted },
+        "refunded": { "count": refunded_count, "predictedMicro": money::json(refunded_predicted) },
+        "uncertain": { "count": uncertain_count, "predictedMicro": money::json(uncertain_predicted) },
         "routeDecisions": route_decisions,
     });
     if truncated {
@@ -398,7 +398,7 @@ pub(crate) fn native_session_usage_view(
             .cost_task_row(sid, task.task_id)
             .map_err(store_err_to_core)?;
         let reservations = native_task_reservation_view(&store, sid, task.task_id)?;
-        let open_micro = reservations["open"]["predictedMicro"].as_u64().unwrap_or(0);
+        let open_micro = money::from_json(&reservations["open"]["predictedMicro"]).unwrap_or(0);
         tasks.push(serde_json::json!({
             "taskId": task.task_id.to_string(),
             "budget": {
@@ -406,9 +406,9 @@ pub(crate) fn native_session_usage_view(
                 "maxTurns": task.budget.max_turns,
                 "spentTokens": task.budget.spent_tokens,
                 "spentTurns": task.budget.spent_turns,
-                "maxCostMicro": cost.as_ref().and_then(|c| c.max_cost_micro),
-                "spentCostMicro": cost.as_ref().map(|c| c.spent_cost_micro).unwrap_or(0),
-                "openReservedMicro": open_micro,
+                "maxCostMicro": money::json_opt(cost.as_ref().and_then(|c| c.max_cost_micro)),
+                "spentCostMicro": money::json(cost.as_ref().map(|c| c.spent_cost_micro).unwrap_or(0)),
+                "openReservedMicro": money::json(open_micro),
             },
             "reservations": reservations,
         }));
@@ -441,7 +441,7 @@ pub(crate) async fn native_session_usage(
         Err(r) => return *r,
     };
     match native_session_usage_view(&state, &handle) {
-        Ok(v) => Json(v).into_response(),
+        Ok(v) => money_json(v),
         Err(e) => api_err(&e),
     }
 }

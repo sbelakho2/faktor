@@ -109,6 +109,7 @@ import dev.faktor.shared.parseNativeVerificationView
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
+import java.math.BigInteger
 import java.net.URI
 import java.net.URLEncoder
 import java.net.http.HttpClient
@@ -262,7 +263,7 @@ class NativeClient(
         criteria: List<String>? = null,
         model: String? = null,
         maxTokens: Long? = null,
-        maxCostMicro: Long? = null,
+        maxCostMicro: BigInteger? = null,
         mutationMode: String? = null,
         files: List<String>? = null,
         completionContract: NativeCompletionContract? = null
@@ -325,7 +326,7 @@ class NativeClient(
         n: Int,
         model: String? = null,
         maxTokens: Long? = null,
-        maxCostMicro: Long? = null,
+        maxCostMicro: BigInteger? = null,
         mutationMode: String? = null,
         files: List<String>? = null
     ): NativeTournamentStarted = parseNativeTournamentStarted(
@@ -490,7 +491,7 @@ class NativeClient(
     fun setAgentBudget(
         childId: String,
         maxTokens: Long? = null,
-        maxCostMicro: Long? = null
+        maxCostMicro: BigInteger? = null
     ): NativeAgentControlAck {
         if ((maxTokens == null) == (maxCostMicro == null)) {
             throw NativeProtocolException(
@@ -574,7 +575,7 @@ class NativeClient(
      * replays the recorded result instead of appending a second grant.
      */
     fun grantCredits(
-        amountMicro: Long,
+        amountMicro: BigInteger,
         idempotencyKey: String,
         reason: String? = null,
         accountId: String? = null

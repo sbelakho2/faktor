@@ -51,6 +51,42 @@ fn billing_service() -> Arc<EntitlementService> {
     .unwrap()
 }
 
+/// Read one money field off the wire: it MUST be a quoted decimal string.
+fn money(value: &serde_json::Value) -> u64 {
+    value
+        .as_str()
+        .unwrap_or_else(|| panic!("money field is not a decimal string: {value}"))
+        .parse()
+        .expect("money field parses as u64")
+}
+
+/// The response-shape invariant: every money-named key (`*_micro` /
+/// `*Micro`), at any depth, is a decimal string or JSON null (an absent
+/// optional cap); it is NEVER a JSON number. No other numeric field is
+/// converted (ids/seqs/counts/tokens stay JSON numbers).
+fn assert_money_encoding(value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, entry) in map {
+                if faktor_cloud::money::is_money_field(key) && !entry.is_null() {
+                    let raw = entry.as_str().unwrap_or_else(|| {
+                        panic!("money field {key:?} is emitted as a JSON number: {entry}")
+                    });
+                    raw.parse::<u64>()
+                        .unwrap_or_else(|_| panic!("money field {key:?}={raw:?} is not decimal"));
+                }
+                assert_money_encoding(entry);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                assert_money_encoding(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// One served daemon with the cloud control plane AND the billing service
 /// wired (the `[cloud]` + `[billing]` configuration).
 async fn billing_deps(
@@ -371,16 +407,14 @@ async fn usage_fold_matches_the_reservation_ledger_byte_for_byte() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     let fold = &body["fold"];
+    assert_money_encoding(&body);
     assert_eq!(
-        fold["totals"]["provider_cost_micro"].as_u64(),
-        Some(expected_cost),
+        money(&fold["totals"]["provider_cost_micro"]),
+        expected_cost,
         "the fold matches the reservation ledger byte for byte: {body}"
     );
-    assert_eq!(
-        fold["totals"]["managed_cost_micro"].as_u64(),
-        Some(expected_cost)
-    );
-    assert_eq!(fold["totals"]["byok_cost_micro"].as_u64(), Some(0));
+    assert_eq!(money(&fold["totals"]["managed_cost_micro"]), expected_cost);
+    assert_eq!(money(&fold["totals"]["byok_cost_micro"]), 0);
     assert_eq!(fold["totals"]["input_tokens"].as_u64(), Some(expected_in));
     assert_eq!(fold["totals"]["output_tokens"].as_u64(), Some(expected_out));
     assert_eq!(
@@ -392,12 +426,35 @@ async fn usage_fold_matches_the_reservation_ledger_byte_for_byte() {
     assert_eq!(per_task.len(), 1);
     assert_eq!(per_task[0]["task_id"].as_u64(), Some(task.task_id.raw()));
     assert_eq!(
-        per_task[0]["totals"]["provider_cost_micro"].as_u64(),
-        Some(expected_cost)
+        money(&per_task[0]["totals"]["provider_cost_micro"]),
+        expected_cost
     );
     assert_eq!(
         per_task[0]["totals"]["input_tokens"].as_u64(),
         Some(expected_in)
+    );
+    // The per-session view follows the same encoding: camelCase money fields
+    // are decimal strings too, and the route emits no money number anywhere.
+    let resp = client
+        .get(format!("{base}/native/session/{}/usage", sess.id()))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let usage: serde_json::Value = resp.json().await.unwrap();
+    assert_money_encoding(&usage);
+    assert_eq!(
+        money(&usage["tasks"][0]["budget"]["spentCostMicro"]),
+        expected_cost
+    );
+    assert_eq!(
+        money(&usage["tasks"][0]["reservations"]["settled"]["spentMicro"]),
+        expected_cost
+    );
+    assert!(
+        usage["tasks"][0]["budget"]["spentTokens"].is_number(),
+        "token counters stay JSON numbers"
     );
     // Re-reading is idempotent (a re-projection appends nothing).
     let resp = client
@@ -485,8 +542,9 @@ async fn credits_grant_is_admin_only_idempotency_keyed_and_strict() {
         .unwrap();
     assert_eq!(first.status(), 200);
     let first_json: serde_json::Value = first.json().await.unwrap();
+    assert_money_encoding(&first_json);
     assert_eq!(first_json["duplicate"], false);
-    assert_eq!(first_json["credits"]["granted_micro"], 250_000);
+    assert_eq!(money(&first_json["credits"]["granted_micro"]), 250_000);
     let replay = client
         .post(format!("{base}/native/credits/grant"))
         .bearer_auth(&token)
@@ -500,7 +558,8 @@ async fn credits_grant_is_admin_only_idempotency_keyed_and_strict() {
     let replay_json: serde_json::Value = replay.json().await.unwrap();
     assert_eq!(replay_json["duplicate"], true);
     assert_eq!(
-        replay_json["credits"]["granted_micro"], 250_000,
+        money(&replay_json["credits"]["granted_micro"]),
+        250_000,
         "a replay never double-grants"
     );
     // The entitlements snapshot reflects the grant and the configured plan.
@@ -513,6 +572,7 @@ async fn credits_grant_is_admin_only_idempotency_keyed_and_strict() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let snapshot: serde_json::Value = resp.json().await.unwrap();
+    assert_money_encoding(&snapshot);
     assert_eq!(snapshot["entitlements"]["plan_id"], "pro");
     assert_eq!(snapshot["entitlements"]["plan_found"], true);
     assert_eq!(
@@ -520,7 +580,12 @@ async fn credits_grant_is_admin_only_idempotency_keyed_and_strict() {
         3
     );
     assert_eq!(
-        snapshot["entitlements"]["credits"]["granted_micro"],
+        money(&snapshot["entitlements"]["limits"][LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD]),
+        5_000_000,
+        "a money-named limit is a decimal string"
+    );
+    assert_eq!(
+        money(&snapshot["entitlements"]["credits"]["granted_micro"]),
         250_000
     );
     // An expired subscription mid-transaction: the continuation is admitted,
@@ -561,4 +626,226 @@ async fn credits_grant_is_admin_only_idempotency_keyed_and_strict() {
         )
         .unwrap_err();
     assert_eq!(denied.limit, CAUSE_SUBSCRIPTION_ACTIVE);
+}
+
+/// The money encoding over the real routes: every money field is a quoted
+/// decimal string at the 2^53 precision boundary and at the i64::MAX domain
+/// bound; legacy JSON numbers are still accepted on input; malformed,
+/// negative and overflowing inputs are typed 400s; and non-money numbers
+/// (counts, tokens, ids) stay JSON numbers.
+#[tokio::test]
+async fn money_fields_are_decimal_strings_and_legacy_numbers_still_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, control_plane, billing, token, _session) = billing_deps(dir.path()).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let (org, owner_token) = bootstrap(&control_plane, "A", "a@a.test");
+    let organization = OrganizationId::try_new(org.clone()).unwrap();
+    provision_account(&billing, &organization);
+
+    let grant = |body: serde_json::Value, key: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        let token = token.clone();
+        let owner_token = owner_token.clone();
+        async move {
+            client
+                .post(format!("{base}/native/credits/grant"))
+                .bearer_auth(token.as_str())
+                .header("x-faktor-control-token", &owner_token)
+                .header("idempotency-key", key)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // Every boundary value is served as a quoted decimal string: the minimum
+    // (zero is refused by the credit domain, so the smallest grant is 1), the
+    // 2^53-1/2^53 precision boundary and the i64::MAX domain bound.
+    let big = 1u64 << 53;
+    let boundary = (1u64 << 53) - 1;
+    let max = i64::MAX as u64;
+    let cases = [
+        (serde_json::json!("1"), 1u64),
+        (serde_json::json!(boundary), boundary),
+        (serde_json::json!(big.to_string()), big),
+        (serde_json::json!(max.to_string()), max),
+    ];
+    let mut total = 0u64;
+    for (index, (body, amount)) in cases.into_iter().enumerate() {
+        total = total.checked_add(amount).unwrap();
+        let resp = grant(
+            serde_json::json!({"amount_micro": body, "reason": "boundary"}),
+            match index {
+                0 => "k-min",
+                1 => "k-2p53m1",
+                2 => "k-2p53",
+                _ => "k-max",
+            },
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "case {index}");
+        let value: serde_json::Value = resp.json().await.unwrap();
+        assert_money_encoding(&value);
+        assert_eq!(
+            money(&value["credits"]["granted_micro"]),
+            total,
+            "the running grant total is exact at case {index}"
+        );
+        assert_eq!(
+            value["credits"]["granted_micro"].as_str().unwrap(),
+            total.to_string(),
+            "the wire form is the exact decimal string"
+        );
+    }
+
+    // Malformed, negative and overflowing inputs are typed 400s; nothing is
+    // written (the balance above is unchanged).
+    for (index, bad) in [
+        serde_json::json!("abc"),
+        serde_json::json!(""),
+        serde_json::json!("-1"),
+        serde_json::json!("+1"),
+        serde_json::json!("1.5"),
+        serde_json::json!(" 1"),
+        serde_json::json!("1e3"),
+        serde_json::json!("18446744073709551616"),
+        serde_json::json!(-1),
+        serde_json::json!(1.5),
+        serde_json::json!(true),
+        serde_json::json!(null),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let resp = grant(
+            serde_json::json!({"amount_micro": bad, "reason": "hostile"}),
+            match index {
+                0 => "bad-0",
+                1 => "bad-1",
+                2 => "bad-2",
+                3 => "bad-3",
+                4 => "bad-4",
+                5 => "bad-5",
+                6 => "bad-6",
+                7 => "bad-7",
+                8 => "bad-8",
+                9 => "bad-9",
+                10 => "bad-10",
+                _ => "bad-11",
+            },
+        )
+        .await;
+        assert_eq!(resp.status(), 400, "hostile amount {index} must be a 400");
+    }
+    // Above the durable domain bound (i64::MAX) is refused even though it
+    // parses as a u64.
+    let resp = grant(
+        serde_json::json!({"amount_micro": "9223372036854775808"}),
+        "over-domain",
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+
+    // The derived snapshot and the usage fold carry the same encoding, with
+    // token/count numbers untouched.
+    let resp = client
+        .get(format!("{base}/native/entitlements"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let snapshot: serde_json::Value = resp.json().await.unwrap();
+    assert_money_encoding(&snapshot);
+    assert_eq!(
+        money(&snapshot["entitlements"]["credits"]["granted_micro"]),
+        total
+    );
+    assert!(
+        snapshot["entitlements"]["total_tokens"].is_number(),
+        "token counters stay JSON numbers"
+    );
+    let resp = client
+        .get(format!("{base}/native/usage?org={org}"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let usage: serde_json::Value = resp.json().await.unwrap();
+    assert_money_encoding(&usage);
+    assert_eq!(
+        money(&usage["credits"]["granted_micro"]),
+        total,
+        "the usage route folds the same exact grants"
+    );
+    assert!(
+        usage["fold"]["totals"]["events"].is_number(),
+        "event counts stay JSON numbers"
+    );
+}
+
+/// Adversarial: an authoritative usage fold that leaves the `u64` domain is
+/// surfaced as the typed `ledger_refused` 500 on the real routes — never a
+/// saturated total served as a readable fold, and never flattened into a
+/// generic `internal`.
+#[tokio::test]
+async fn usage_overflow_is_a_typed_ledger_refusal_on_the_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, control_plane, billing, token, _session) = billing_deps(dir.path()).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let (org, owner_token) = bootstrap(&control_plane, "A", "a@a.test");
+    let organization = OrganizationId::try_new(org.clone()).unwrap();
+    let account = provision_account(&billing, &organization);
+    let max = i64::MAX as u64;
+    for index in 0..3u64 {
+        let event = faktor_cloud::UsageEvent {
+            id: faktor_cloud::UsageEventId::try_new(format!("uev_of{index}")).unwrap(),
+            organization_id: organization.clone(),
+            billing_account_id: account.clone(),
+            task_id: 7,
+            run_id: "1".into(),
+            attempt_id: "a".into(),
+            provider: "managed-provider".into(),
+            model: "m".into(),
+            unit: faktor_cloud::UsageUnit::ProviderCostMicro,
+            quantity: 1,
+            provider_cost_micro: max,
+            source_operation: "session.cost_reservation.settled".into(),
+            occurred_at_ms: NOW_MS,
+            reconciliation_state: faktor_cloud::ReconciliationState::Reconciled,
+            correction_of: None,
+            category: faktor_cloud::SpendCategory::Managed,
+            source_key: format!("manual:overflow:{index}"),
+        };
+        billing.record_usage(&event).unwrap();
+    }
+    for path in [
+        format!("{base}/native/usage?org={org}"),
+        format!("{base}/native/entitlements"),
+    ] {
+        let resp = client
+            .get(&path)
+            .bearer_auth(token.as_str())
+            .header("x-faktor-control-token", &owner_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 500, "{path}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "ledger_refused", "{path}: {body}");
+        assert_eq!(body["error"]["retryable"], false, "{path}: {body}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("provider_cost_micro"), "{path}: {message}");
+        assert!(
+            !message.contains("18446744073709551615"),
+            "no saturated total is ever reported: {message}"
+        );
+    }
 }

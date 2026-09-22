@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use faktor_cloud::billing::{
-    task_id_text, ALL_LIMITS, FEATURE_BYOK, FEATURE_CREDITS, FEATURE_MANAGED_PROVIDERS,
-    LIMIT_MAX_ACTIVE_TASKS, LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD,
+    task_id_text, CreditLedgerError, ALL_LIMITS, FEATURE_BYOK, FEATURE_CREDITS,
+    FEATURE_MANAGED_PROVIDERS, LIMIT_MAX_ACTIVE_TASKS, LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD,
     LIMIT_MAX_PROVIDER_ATTEMPTS_PER_TASK, LIMIT_MAX_TOKENS_PER_PERIOD, UNIT_PROVIDER_COST,
 };
 use faktor_cloud::{
@@ -17,7 +17,7 @@ use faktor_cloud::{
     EntitlementExceeded, EntitlementService, InFlightKind, ManualClock, MemoryBillingStore,
     ObservedUsage, OrganizationId, PlanConfig, ReconciliationState, SpendCategory,
     SqliteControlPlaneStore, Subscription, SubscriptionId, SubscriptionStatus, UsageEvent,
-    UsageEventId, UsageUnit, CAUSE_SUBSCRIPTION_ACTIVE,
+    UsageEventId, UsageUnit, CAUSE_LEDGER_OVERFLOW, CAUSE_SUBSCRIPTION_ACTIVE,
 };
 
 fn org(id: &str) -> OrganizationId {
@@ -270,7 +270,8 @@ fn byok_usage_is_recorded_but_never_debits_credits() {
         service
             .credit_balance(&organization)
             .unwrap()
-            .balance_micro(),
+            .balance_micro()
+            .unwrap(),
         800
     );
     // A BYOK spend row is recorded as usage and debits NOTHING.
@@ -299,7 +300,8 @@ fn byok_usage_is_recorded_but_never_debits_credits() {
         service
             .credit_balance(&organization)
             .unwrap()
-            .balance_micro(),
+            .balance_micro()
+            .unwrap(),
         800
     );
     let fold = service.fold(&organization).unwrap();
@@ -333,7 +335,7 @@ fn byok_usage_is_recorded_but_never_debits_credits() {
     let balance = service.credit_balance(&organization).unwrap();
     assert_eq!(balance.held_micro, 200);
     assert_eq!(balance.pending_consumes, 1);
-    assert_eq!(balance.balance_micro(), 800);
+    assert_eq!(balance.balance_micro().unwrap(), 800);
     // Settling at the actual releases the hold exactly.
     service
         .settle_consume(&organization, &acct, &consume, 150, "actual")
@@ -341,7 +343,7 @@ fn byok_usage_is_recorded_but_never_debits_credits() {
     let balance = service.credit_balance(&organization).unwrap();
     assert_eq!(balance.held_micro, 0);
     assert_eq!(balance.consumed_micro, 150);
-    assert_eq!(balance.balance_micro(), 850);
+    assert_eq!(balance.balance_micro().unwrap(), 850);
     // Refunds are exact: the unused 50 comes back, more is refused.
     service
         .refund_consume(&organization, &acct, &consume, 50, "unused")
@@ -350,7 +352,8 @@ fn byok_usage_is_recorded_but_never_debits_credits() {
         service
             .credit_balance(&organization)
             .unwrap()
-            .balance_micro(),
+            .balance_micro()
+            .unwrap(),
         900
     );
     assert!(matches!(
@@ -377,7 +380,8 @@ fn byok_usage_is_recorded_but_never_debits_credits() {
         service
             .credit_balance(&organization)
             .unwrap()
-            .balance_micro(),
+            .balance_micro()
+            .unwrap(),
         900
     );
 }
@@ -420,7 +424,7 @@ fn credit_ledger_survives_a_crash_with_the_hold_intact() {
     let balance = service.credit_balance(&organization).unwrap();
     assert_eq!(balance.held_micro, 400, "the hold survives the crash");
     assert_eq!(balance.pending_consumes, 1);
-    assert_eq!(balance.balance_micro(), 600);
+    assert_eq!(balance.balance_micro().unwrap(), 600);
     // Reconciliation settles at the actual provider spend, exactly once.
     service
         .settle_consume(&organization, &acct, &consume_id, 260, "reconciled")
@@ -429,7 +433,8 @@ fn credit_ledger_survives_a_crash_with_the_hold_intact() {
         service
             .credit_balance(&organization)
             .unwrap()
-            .balance_micro(),
+            .balance_micro()
+            .unwrap(),
         740
     );
     // Replaying the settle after another crash is the same typed refusal.
@@ -823,7 +828,11 @@ fn credit_refusals_are_typed_and_write_nothing() {
             )
         ));
         assert_eq!(
-            store.credit_balance(&organization).unwrap().balance_micro(),
+            store
+                .credit_balance(&organization)
+                .unwrap()
+                .balance_micro()
+                .unwrap(),
             100
         );
     }
@@ -928,7 +937,7 @@ fn managed_usage_reconciliation_pending_to_reconciled_is_durable_and_append_only
         .unwrap();
     let balance = service.credit_balance(&organization).unwrap();
     assert_eq!(balance.held_micro, 400);
-    assert_eq!(balance.balance_micro(), 4_600);
+    assert_eq!(balance.balance_micro().unwrap(), 4_600);
     let fold = service.fold(&organization).unwrap();
     assert_eq!(
         fold.totals.provider_cost_micro, 400,
@@ -1319,7 +1328,7 @@ fn credit_amount_i64_max_is_exact_in_payload_and_sql_on_both_backends() {
         assert_eq!(balance.refunded_micro, max);
         assert_eq!(balance.held_micro, 0);
         assert_eq!(
-            balance.balance_micro(),
+            balance.balance_micro().unwrap(),
             max,
             "grant + refund - settled consume at i64::MAX stays exact"
         );
@@ -1350,6 +1359,333 @@ fn credit_amount_i64_max_is_exact_in_payload_and_sql_on_both_backends() {
         "the payload holds the same exact value"
     );
     assert_eq!(u64::try_from(stored).unwrap(), max);
+}
+
+/// The settle guard must cover only the DELTA above the pending hold. The
+/// hold is already inside `balance_micro()` (an unsettled consume counts as
+/// consumed), so adding it back double-counts it and lets a settle spend
+/// free + hold. Both backends must refuse identically, write nothing, and
+/// leave no hidden debt (a saturated balance would hide it as 0).
+#[test]
+fn settle_delta_never_double_counts_the_pending_hold_on_both_backends() {
+    let mem = MemoryBillingStore::new();
+    let dir = tempfile::tempdir().unwrap();
+    let sqlite = SqliteControlPlaneStore::open(&dir.path().join("billing.db")).unwrap();
+    let organization = org("org_a");
+    for store in [&mem as &dyn BillingStore, &sqlite as &dyn BillingStore] {
+        // grant 1000, hold 400 -> free 600.
+        assert_eq!(
+            store
+                .append_credit_entry(&credit_entry("crd_g", CreditKind::Grant, 1_000, None))
+                .unwrap(),
+            CreditAppend::Appended
+        );
+        assert_eq!(
+            store
+                .append_credit_entry(&credit_entry("crd_hold", CreditKind::Consume, 400, None))
+                .unwrap(),
+            CreditAppend::Appended
+        );
+        let balance = store.credit_balance(&organization).unwrap();
+        assert_eq!(balance.held_micro, 400);
+        assert_eq!(balance.balance_micro().unwrap(), 600, "free = 600");
+        // The exploit: settle 1400 = hold 400 + free 600 + 400 double-counted.
+        // The delta above the hold is 1000, the free balance is 600: refused.
+        assert_eq!(
+            store
+                .append_credit_entry(&credit_entry(
+                    "crd_s1400",
+                    CreditKind::Settle,
+                    1_400,
+                    Some("crd_hold")
+                ))
+                .unwrap_err(),
+            BillingStoreError::Credit(CreditAppendRefusal::InsufficientCredits {
+                available: 600,
+                requested: 1_000,
+            }),
+            "free + hold must never be spendable"
+        );
+        // One micro above the hold is refused by exactly one micro.
+        assert_eq!(
+            store
+                .append_credit_entry(&credit_entry(
+                    "crd_s1001",
+                    CreditKind::Settle,
+                    1_001,
+                    Some("crd_hold")
+                ))
+                .unwrap_err(),
+            BillingStoreError::Credit(CreditAppendRefusal::InsufficientCredits {
+                available: 600,
+                requested: 601,
+            })
+        );
+        // Nothing was written by either refusal.
+        assert_eq!(store.credit_entries(&organization, 0, 10).unwrap().len(), 2);
+        // Exactly the hold plus the free balance (1000) is allowed.
+        assert_eq!(
+            store
+                .append_credit_entry(&credit_entry(
+                    "crd_s1000",
+                    CreditKind::Settle,
+                    1_000,
+                    Some("crd_hold")
+                ))
+                .unwrap(),
+            CreditAppend::Appended
+        );
+        let balance = store.credit_balance(&organization).unwrap();
+        assert_eq!(balance.granted_micro, 1_000);
+        assert_eq!(balance.consumed_micro, 1_000);
+        assert_eq!(balance.refunded_micro, 0);
+        assert_eq!(balance.held_micro, 0);
+        assert_eq!(
+            balance.balance_micro().unwrap(),
+            0,
+            "the accepted settle spent exactly the funded credits: no hidden debt"
+        );
+        // The corrected ledger holds no phantom credit: one more consume is
+        // refused, and the consume is settled exactly once.
+        assert!(matches!(
+            store
+                .append_credit_entry(&credit_entry("crd_c1", CreditKind::Consume, 1, None))
+                .unwrap_err(),
+            BillingStoreError::Credit(CreditAppendRefusal::InsufficientCredits {
+                available: 0,
+                requested: 1,
+            })
+        ));
+        assert_eq!(
+            store
+                .append_credit_entry(&credit_entry(
+                    "crd_s1001b",
+                    CreditKind::Settle,
+                    1_001,
+                    Some("crd_hold")
+                ))
+                .unwrap_err(),
+            BillingStoreError::Credit(CreditAppendRefusal::AlreadySettled {
+                reference: "crd_hold".into(),
+            })
+        );
+    }
+}
+
+/// Monetary aggregation is CHECKED on both backends: an aggregate that
+/// leaves the u64 domain is a typed overflow (never a saturated total that
+/// would hide debits/funding), and a ledger whose debits exceed its funding
+/// is typed corruption (never a saturated 0 balance hiding debt). The
+/// refused append writes nothing, and the read path refuses too.
+#[test]
+fn credit_aggregate_overflow_and_hidden_debt_are_typed_never_saturated() {
+    let max = i64::MAX as u64;
+    let mem = MemoryBillingStore::new();
+    let dir = tempfile::tempdir().unwrap();
+    let sqlite = SqliteControlPlaneStore::open(&dir.path().join("billing.db")).unwrap();
+    let organization = org("org_a");
+    for store in [&mem as &dyn BillingStore, &sqlite as &dyn BillingStore] {
+        assert_eq!(
+            store
+                .append_credit_entry(&credit_entry("crd_o1", CreditKind::Grant, max, None))
+                .unwrap(),
+            CreditAppend::Appended
+        );
+        assert_eq!(
+            store
+                .append_credit_entry(&credit_entry("crd_o2", CreditKind::Grant, max, None))
+                .unwrap(),
+            CreditAppend::Appended
+        );
+        // 2 * i64::MAX still fits u64 exactly (u64::MAX - 1): no saturation,
+        // no error at the boundary.
+        assert_eq!(
+            store.credit_balance(&organization).unwrap().granted_micro,
+            u64::MAX - 1
+        );
+        // The third boundary grant would overflow the aggregate: refused
+        // typed BEFORE the write, so the ledger never becomes unreadable.
+        match store
+            .append_credit_entry(&credit_entry("crd_o3", CreditKind::Grant, max, None))
+            .unwrap_err()
+        {
+            BillingStoreError::Ledger(CreditLedgerError::Overflow {
+                field: "granted_micro",
+                left,
+                right,
+            }) => {
+                assert_eq!(left, u64::MAX - 1);
+                assert_eq!(right, max);
+            }
+            other => panic!("expected a typed granted_micro overflow, got {other:?}"),
+        }
+        // The refused append wrote nothing and the ledger still reads
+        // exactly (no saturation, no unreadable state).
+        assert_eq!(
+            store.credit_entries(&organization, 0, 10).unwrap().len(),
+            2,
+            "the overflowing append wrote nothing"
+        );
+        assert_eq!(
+            store.credit_balance(&organization).unwrap().granted_micro,
+            u64::MAX - 1
+        );
+        // A refund can overflow FUNDING even when the refund itself is
+        // exact: consume max against the two grants, then refund max (the
+        // guard allows it: it is the full hold) — the funded aggregate would
+        // leave u64, so it is refused typed before the write.
+        assert_eq!(
+            store
+                .append_credit_entry(&credit_entry("crd_o_use", CreditKind::Consume, max, None))
+                .unwrap(),
+            CreditAppend::Appended
+        );
+        assert_eq!(
+            store
+                .credit_balance(&organization)
+                .unwrap()
+                .balance_micro()
+                .unwrap(),
+            max,
+            "free = funding (u64::MAX - 1) minus the hold (i64::MAX)"
+        );
+        match store
+            .append_credit_entry(&credit_entry(
+                "crd_o_refund",
+                CreditKind::Refund,
+                max,
+                Some("crd_o_use"),
+            ))
+            .unwrap_err()
+        {
+            BillingStoreError::Ledger(CreditLedgerError::Overflow {
+                field: "funded_micro",
+                ..
+            }) => {}
+            other => panic!("expected a typed funded_micro overflow, got {other:?}"),
+        }
+        // Nothing was written by the refused refund: the exact hold and the
+        // free balance stay intact.
+        let balance = store.credit_balance(&organization).unwrap();
+        assert_eq!(balance.refunded_micro, 0);
+        assert_eq!(balance.consumed_micro, max);
+        assert_eq!(balance.balance_micro().unwrap(), max);
+        assert_eq!(store.credit_entries(&organization, 0, 10).unwrap().len(), 3);
+    }
+    // Raw corrupt ledgers (planted through SQL, bypassing the guards): the
+    // typed corruption surfaces at every arithmetic boundary, never as a
+    // saturated number.
+    fn plant(path: &std::path::Path, rows: &[CreditEntry]) {
+        drop(SqliteControlPlaneStore::open(path).unwrap());
+        let conn = rusqlite::Connection::open(path).unwrap();
+        for (index, entry) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO credit_entry
+                    (id, organization_id, entry_seq, billing_account_id, kind, reference,
+                     usage_event_id, idempotency_key, amount_micro, occurred_at_ms, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    entry.id.as_str(),
+                    "org_a",
+                    index as i64 + 1,
+                    "acct_1",
+                    entry.kind.as_str(),
+                    entry.reference.as_ref().map(|r| r.as_str()),
+                    None::<String>,
+                    None::<String>,
+                    i64::try_from(entry.amount_micro).unwrap(),
+                    1i64,
+                    serde_json::to_string(entry).unwrap(),
+                ],
+            )
+            .unwrap();
+        }
+    }
+    // A pre-existing aggregate overflow (three boundary grants planted
+    // through SQL) refuses the READ typed: never a saturated u64::MAX total.
+    let overflow_path = dir.path().join("overflow.db");
+    plant(
+        &overflow_path,
+        &[
+            credit_entry("crd_x1", CreditKind::Grant, max, None),
+            credit_entry("crd_x2", CreditKind::Grant, max, None),
+            credit_entry("crd_x3", CreditKind::Grant, max, None),
+        ],
+    );
+    let store = SqliteControlPlaneStore::open(&overflow_path).unwrap();
+    match store.credit_balance(&organization).unwrap_err() {
+        BillingStoreError::Ledger(CreditLedgerError::Overflow {
+            field: "granted_micro",
+            ..
+        }) => {}
+        other => panic!("the read path must refuse the overflow typed, got {other:?}"),
+    }
+    // Debt: a consume of 500 against a grant of 100.
+    let debt_path = dir.path().join("debt.db");
+    plant(
+        &debt_path,
+        &[
+            credit_entry("crd_dg", CreditKind::Grant, 100, None),
+            credit_entry("crd_dc", CreditKind::Consume, 500, None),
+        ],
+    );
+    let store = SqliteControlPlaneStore::open(&debt_path).unwrap();
+    // The raw fold is readable (the fields are the ledger), but the DERIVED
+    // free balance refuses typed: never a saturated 0 that hides the debt.
+    match store
+        .credit_balance(&organization)
+        .unwrap()
+        .balance_micro()
+        .unwrap_err()
+    {
+        CreditLedgerError::Corrupt { detail } => {
+            assert!(detail.contains("500"), "the debits are named: {detail}");
+            assert!(detail.contains("100"), "the funding is named: {detail}");
+            assert!(detail.contains("400"), "the hidden debt is named: {detail}");
+        }
+        other => panic!("expected typed hidden-debt corruption, got {other:?}"),
+    }
+    // Refund-over-spend: 600 refunded against the 500 consume. The plain
+    // balance still folds, but the refund guard refuses typed instead of
+    // masking the excess to a zero refundable amount.
+    let refund_path = dir.path().join("refund.db");
+    plant(
+        &refund_path,
+        &[
+            credit_entry("crd_rg", CreditKind::Grant, 1_000, None),
+            credit_entry("crd_rc", CreditKind::Consume, 500, None),
+            credit_entry("crd_rr", CreditKind::Refund, 600, Some("crd_rc")),
+        ],
+    );
+    let store = SqliteControlPlaneStore::open(&refund_path).unwrap();
+    assert_eq!(
+        store
+            .credit_balance(&organization)
+            .unwrap()
+            .balance_micro()
+            .unwrap(),
+        1_100
+    );
+    match store
+        .append_credit_entry(&credit_entry(
+            "crd_rr2",
+            CreditKind::Refund,
+            1,
+            Some("crd_rc"),
+        ))
+        .unwrap_err()
+    {
+        BillingStoreError::Ledger(CreditLedgerError::Corrupt { detail }) => {
+            assert!(detail.contains("600"), "the refunds are named: {detail}");
+            assert!(detail.contains("500"), "the spend is named: {detail}");
+        }
+        other => panic!("expected typed refund-over-spend corruption, got {other:?}"),
+    }
+    assert_eq!(
+        store.credit_entries(&organization, 0, 10).unwrap().len(),
+        3,
+        "the corrupt-ledger append wrote nothing"
+    );
 }
 
 /// Every out-of-domain amount (`i64::MAX + 1`, `u64::MAX`) is refused TYPED
@@ -1453,7 +1789,7 @@ fn credit_amounts_above_i64_max_are_refused_typed_at_every_entry_point() {
     assert_eq!(balance.consumed_micro, 5);
     assert_eq!(balance.held_micro, 5);
     assert_eq!(balance.refunded_micro, 0);
-    assert_eq!(balance.balance_micro(), 5);
+    assert_eq!(balance.balance_micro().unwrap(), 5);
     let conn = rusqlite::Connection::open(&path).unwrap();
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM credit_entry", [], |r| r.get(0))
@@ -1587,4 +1923,141 @@ fn legacy_clamped_credit_amounts_are_surfaced_typed_and_never_reinterpreted() {
     let page = store.credit_entries(&organization, 0, 10).unwrap();
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].entry.amount_micro, i64::MAX as u64);
+}
+
+/// Adversarial: an authoritative usage fold that leaves the `u64` domain
+/// refuses TYPED at every call site — the service fold, the entitlement
+/// snapshot and the admission gate — and the gate's decision is EXPLICIT
+/// and fail-closed (`ledger_overflow:<field>`), never a saturated total
+/// admitted as under-quota. The exact boundary below the overflow stays
+/// readable and exact.
+#[test]
+fn usage_overflow_is_typed_at_the_fold_snapshot_and_admission_decision() {
+    let max = i64::MAX as u64;
+    let service = service_with(
+        Arc::new(MemoryBillingStore::new()),
+        Arc::new(ManualClock::new(1_000)),
+    );
+    let organization = org("org_a");
+    let acct = account("acct_1");
+    service
+        .ensure_account(&organization, &acct, "acct", true)
+        .unwrap();
+    subscribe(&service, &organization, None);
+    // Two boundary managed events reach u64::MAX - 1 exactly: no saturation
+    // and no error AT the boundary.
+    for index in 0..2u64 {
+        let mut event = usage_event(&format!("uev_o{index}"));
+        event.provider_cost_micro = max;
+        service.record_usage(&event).unwrap();
+    }
+    let snapshot = service.entitlement_snapshot(&organization).unwrap();
+    assert_eq!(
+        snapshot.managed_spend_micro,
+        u64::MAX - 1,
+        "the boundary stays exact"
+    );
+    // The third boundary event overflows the authoritative money aggregate.
+    let mut third = usage_event("uev_o2");
+    third.provider_cost_micro = max;
+    service.record_usage(&third).unwrap();
+    match service.fold(&organization) {
+        Err(ControlPlaneError::Ledger(CreditLedgerError::Overflow {
+            field: "provider_cost_micro",
+            left,
+            right,
+        })) => {
+            assert_eq!(left, u64::MAX - 1);
+            assert_eq!(right, max);
+        }
+        other => panic!("expected the typed fold overflow, got {other:?}"),
+    }
+    // The derived snapshot refuses the same typed way: never a saturated
+    // total, never a silently readable spend number.
+    match service.entitlement_snapshot(&organization) {
+        Err(ControlPlaneError::Ledger(CreditLedgerError::Overflow {
+            field: "provider_cost_micro",
+            ..
+        })) => {}
+        other => panic!("expected the typed snapshot overflow, got {other:?}"),
+    }
+    // The admission decision is EXPLICIT and documented: the overflow is
+    // treated exactly like an exhausted quota (fail closed), names the
+    // overflowed field, and admits nothing.
+    let denied = service
+        .check_admission(
+            &organization,
+            &AdmissionRequest {
+                provider: Some("openai".into()),
+                observed: ObservedUsage {
+                    estimated_provider_cost_micro: 1,
+                    ..Default::default()
+                },
+                ..AdmissionRequest::boundary(AdmissionBoundary::NewProviderAttempt)
+            },
+        )
+        .unwrap_err();
+    assert_eq!(
+        denied.limit,
+        format!("{CAUSE_LEDGER_OVERFLOW}:provider_cost_micro")
+    );
+    assert_eq!(denied.limit_value, None);
+    assert_eq!(denied.observed, u64::MAX - 1);
+    assert_eq!(denied.boundary, AdmissionBoundary::NewProviderAttempt);
+    // The in-flight invariant is untouched: a continuation is still admitted
+    // while the ledger refuses (an overflow never interrupts a transaction).
+    assert_eq!(
+        service
+            .check_admission(
+                &organization,
+                &AdmissionRequest::boundary(AdmissionBoundary::RollbackContinuation)
+            )
+            .unwrap(),
+        Admission::InFlightContinuation
+    );
+    // The token-quota numerator is checked the same way: three token buckets
+    // each at the boundary overflow the sum, and the refusal names the exact
+    // bucket that crossed it.
+    let service = service_with(
+        Arc::new(MemoryBillingStore::new()),
+        Arc::new(ManualClock::new(1_000)),
+    );
+    let organization = org("org_t");
+    service
+        .ensure_account(&organization, &acct, "acct", true)
+        .unwrap();
+    subscribe(&service, &organization, None);
+    for (index, unit) in [
+        UsageUnit::InputTokens,
+        UsageUnit::OutputTokens,
+        UsageUnit::CacheReadTokens,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut event = usage_event(&format!("uev_t{index}"));
+        event.organization_id = organization.clone();
+        event.billing_account_id = acct.clone();
+        event.unit = unit;
+        event.quantity = max;
+        event.provider_cost_micro = 0;
+        service.record_usage(&event).unwrap();
+    }
+    match service.entitlement_snapshot(&organization) {
+        Err(ControlPlaneError::Ledger(CreditLedgerError::Overflow {
+            field: "cache_read_tokens",
+            ..
+        })) => {}
+        other => panic!("expected the typed token-numerator overflow, got {other:?}"),
+    }
+    let denied = service
+        .check_admission(
+            &organization,
+            &AdmissionRequest::boundary(AdmissionBoundary::NewChildSpawn),
+        )
+        .unwrap_err();
+    assert_eq!(
+        denied.limit,
+        format!("{CAUSE_LEDGER_OVERFLOW}:cache_read_tokens")
+    );
 }

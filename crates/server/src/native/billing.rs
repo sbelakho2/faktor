@@ -28,7 +28,7 @@ use faktor_cloud::{ControlPlaneError, OrganizationId, UsageFold};
 use faktor_protocol::error::ApiError;
 
 use super::control_plane::{require_idempotency_key, require_principal};
-use super::{authed, malformed_body, wire_status};
+use super::{authed, malformed_body, money_json, wire_status};
 use crate::api::AppState;
 
 /// Bound on the usage page one response returns.
@@ -56,6 +56,10 @@ pub(crate) fn billing_err(e: ControlPlaneError) -> ApiError {
         "permission_denied" => "permission_denied",
         "conflict" => "conflict",
         "malformed" => "malformed",
+        // An authoritative ledger fold refused (typed overflow naming the
+        // field): surfaced as its own non-retryable code, never flattened
+        // into `internal` and never a saturated total.
+        "ledger_refused" => "ledger_refused",
         _ => "internal",
     };
     ApiError {
@@ -73,9 +77,85 @@ pub(crate) struct CreditGrantBody {
     /// The target billing account; omitted = the organization's default
     /// (first) account.
     pub(crate) account_id: Option<String>,
+    /// Money input: decimal string or legacy JSON integer (see
+    /// `faktor_cloud::money`).
+    #[serde(with = "faktor_cloud::money")]
     pub(crate) amount_micro: u64,
     #[serde(default)]
     pub(crate) reason: String,
+}
+
+/// The native-protocol projection of one usage-fold bucket: identical field
+/// names and values except the monetary fields, which are decimal strings
+/// (see `faktor_cloud::money`). The shared [`faktor_cloud::UsageTotals`]
+/// keeps its own numeric serde shape for the external vendor report payload.
+#[derive(serde::Serialize)]
+struct NativeUsageTotals {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+    #[serde(with = "faktor_cloud::money")]
+    provider_cost_micro: u64,
+    #[serde(with = "faktor_cloud::money")]
+    managed_cost_micro: u64,
+    #[serde(with = "faktor_cloud::money")]
+    byok_cost_micro: u64,
+    events: u64,
+    corrected_events: u64,
+}
+
+impl From<&faktor_cloud::UsageTotals> for NativeUsageTotals {
+    fn from(totals: &faktor_cloud::UsageTotals) -> Self {
+        Self {
+            input_tokens: totals.input_tokens,
+            output_tokens: totals.output_tokens,
+            cache_read_tokens: totals.cache_read_tokens,
+            cache_write_tokens: totals.cache_write_tokens,
+            reasoning_tokens: totals.reasoning_tokens,
+            provider_cost_micro: totals.provider_cost_micro,
+            managed_cost_micro: totals.managed_cost_micro,
+            byok_cost_micro: totals.byok_cost_micro,
+            events: totals.events,
+            corrected_events: totals.corrected_events,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct NativeTaskUsage {
+    task_id: u64,
+    run_id: String,
+    totals: NativeUsageTotals,
+}
+
+/// The native-protocol projection of [`faktor_cloud::UsageFold`].
+#[derive(serde::Serialize)]
+struct NativeUsageFold {
+    organization_id: faktor_cloud::OrganizationId,
+    totals: NativeUsageTotals,
+    per_task: Vec<NativeTaskUsage>,
+    next_cursor: Option<String>,
+}
+
+impl From<&faktor_cloud::UsageFold> for NativeUsageFold {
+    fn from(fold: &faktor_cloud::UsageFold) -> Self {
+        Self {
+            organization_id: fold.organization_id.clone(),
+            totals: NativeUsageTotals::from(&fold.totals),
+            per_task: fold
+                .per_task
+                .iter()
+                .map(|task| NativeTaskUsage {
+                    task_id: task.task_id,
+                    run_id: task.run_id.clone(),
+                    totals: NativeUsageTotals::from(&task.totals),
+                })
+                .collect(),
+            next_cursor: fold.next_cursor.clone(),
+        }
+    }
 }
 
 /// Resolve the caller's organization, tenant-isolated: the caller's
@@ -218,10 +298,10 @@ pub(crate) fn billing_usage(
         Ok(balance) => balance,
         Err(e) => return wire_status(billing_err(e)),
     };
-    Json(serde_json::json!({
+    money_json(serde_json::json!({
         "ok": true,
         "organization": organization,
-        "fold": fold,
+        "fold": NativeUsageFold::from(&fold),
         "credits": balance,
         "items": page.items.iter().map(|row| serde_json::json!({
             "cursor": row.event_seq.to_string(),
@@ -229,7 +309,6 @@ pub(crate) fn billing_usage(
         })).collect::<Vec<_>>(),
         "nextCursor": page.next_cursor,
     }))
-    .into_response()
 }
 
 /// `GET /native/entitlements` — the caller organization's derived
@@ -258,11 +337,10 @@ pub(crate) async fn native_entitlements(
         return wire_status(billing_err(denied.into()));
     }
     match service.entitlement_snapshot(&principal.organization) {
-        Ok(snapshot) => Json(serde_json::json!({
+        Ok(snapshot) => money_json(serde_json::json!({
             "ok": true,
             "entitlements": snapshot,
-        }))
-        .into_response(),
+        })),
         Err(e) => wire_status(billing_err(e)),
     }
 }
@@ -355,12 +433,11 @@ pub(crate) async fn native_credits_grant(
                 .credit_balance(&principal.organization)
                 .map_err(billing_err);
             match balance {
-                Ok(balance) => Json(serde_json::json!({
+                Ok(balance) => money_json(serde_json::json!({
                     "ok": true,
                     "duplicate": outcome == faktor_cloud::CreditAppend::Duplicate,
                     "credits": balance,
-                }))
-                .into_response(),
+                })),
                 Err(e) => wire_status(e),
             }
         }

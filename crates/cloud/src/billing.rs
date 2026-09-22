@@ -223,7 +223,9 @@ pub struct UsageEvent {
     pub quantity: u64,
     /// The provider cost of this event in microUSD. Enforced on write: it is
     /// non-zero only on [`UsageUnit::ProviderCostMicro`] rows, so token rows
-    /// can never smuggle money into the aggregate.
+    /// can never smuggle money into the aggregate. Wire form: decimal string
+    /// (see [`crate::money`]); legacy JSON integers still decode.
+    #[serde(with = "crate::money")]
     pub provider_cost_micro: u64,
     pub source_operation: String,
     pub occurred_at_ms: i64,
@@ -566,16 +568,83 @@ impl BillingConfig {
 
 // -------------------------------------------------------------- snapshot
 
-/// The free/held credit picture of one organization.
+/// A typed failure of ledger aggregation (credit and usage). Money never
+/// saturates: a saturated total silently hides debt (or credit) from every
+/// guard, so the folds and the derived balance refuse typed instead — an
+/// aggregate that leaves the `u64` domain is [`CreditLedgerError::Overflow`]
+/// naming the exact field, and a ledger that violates its own invariants
+/// (effective debits above funding, refunds above what their consume spent)
+/// is [`CreditLedgerError::Corrupt`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CreditLedgerError {
+    #[error(
+        "ledger aggregate {field} overflowed u64: {left} + {right} \
+         (refusing to saturate the aggregate; the ledger is out of domain)"
+    )]
+    Overflow {
+        field: &'static str,
+        left: u64,
+        right: u64,
+    },
+    #[error("corrupt credit ledger: {detail} (refusing to report a saturated value)")]
+    Corrupt { detail: String },
+}
+
+/// Checked `u64` aggregate addition for the ledger folds (money fields,
+/// token buckets and event counters alike): a saturated total is never
+/// reported — it would hide debt or spend from every subsequent guard.
+pub(crate) fn checked_ledger_sum(
+    field: &'static str,
+    left: u64,
+    right: u64,
+) -> Result<u64, CreditLedgerError> {
+    left.checked_add(right)
+        .ok_or(CreditLedgerError::Overflow { field, left, right })
+}
+
+/// The append-time domain check: the entry's own contribution to the folded
+/// aggregates must not leave the `u64` domain, so the append is refused
+/// typed BEFORE the write and no operation can leave an unreadable ledger.
+///
+/// A consume and a settle are already bounded by the balance guard (their
+/// growth stays at or below the checked funding), but grants and refunds
+/// grow funding without a balance guard, so they are checked explicitly
+/// here.
+pub(crate) fn checked_append_domain(
+    entry: &CreditEntry,
+    balance: &CreditBalance,
+) -> Result<(), CreditLedgerError> {
+    match entry.kind {
+        CreditKind::Grant => {
+            let granted =
+                checked_ledger_sum("granted_micro", balance.granted_micro, entry.amount_micro)?;
+            checked_ledger_sum("funded_micro", granted, balance.refunded_micro)?;
+        }
+        CreditKind::Refund => {
+            let refunded =
+                checked_ledger_sum("refunded_micro", balance.refunded_micro, entry.amount_micro)?;
+            checked_ledger_sum("funded_micro", balance.granted_micro, refunded)?;
+        }
+        CreditKind::Consume | CreditKind::Settle => {}
+    }
+    Ok(())
+}
+
+/// The free/held credit picture of one organization. Money fields are
+/// decimal strings on the wire (see [`crate::money`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub struct CreditBalance {
+    #[serde(with = "crate::money")]
     pub granted_micro: u64,
     /// Every consume's EFFECTIVE debit: a settled consume at its settled
     /// actual, a still-pending consume at its held estimate.
+    #[serde(with = "crate::money")]
     pub consumed_micro: u64,
+    #[serde(with = "crate::money")]
     pub refunded_micro: u64,
     /// Pending consumes (record-before-call rows not yet settled/refunded)
     /// still HOLD their amount: they are never silently released.
+    #[serde(with = "crate::money")]
     pub held_micro: u64,
     pub pending_consumes: u64,
 }
@@ -583,11 +652,29 @@ pub struct CreditBalance {
 impl CreditBalance {
     /// The free balance: grants + refunds minus the effective debits (a
     /// pending consume's hold is already part of its debit, so it is never
-    /// double counted).
-    pub fn balance_micro(&self) -> u64 {
-        self.granted_micro
-            .saturating_add(self.refunded_micro)
-            .saturating_sub(self.consumed_micro)
+    /// double counted — every settle guard must therefore use THIS number
+    /// unchanged and never add the hold back).
+    ///
+    /// Checked: an aggregate that leaves the `u64` domain or a ledger whose
+    /// debits exceed its funding is a typed error, never a saturated number.
+    pub fn balance_micro(&self) -> Result<u64, CreditLedgerError> {
+        let funded = self.granted_micro.checked_add(self.refunded_micro).ok_or(
+            CreditLedgerError::Overflow {
+                field: "funded_micro",
+                left: self.granted_micro,
+                right: self.refunded_micro,
+            },
+        )?;
+        funded
+            .checked_sub(self.consumed_micro)
+            .ok_or_else(|| CreditLedgerError::Corrupt {
+                detail: format!(
+                    "effective debits {} exceed funding {} by {} microUSD",
+                    self.consumed_micro,
+                    funded,
+                    self.consumed_micro - funded
+                ),
+            })
     }
 }
 
@@ -647,10 +734,16 @@ pub struct EntitlementSnapshot {
     pub subscription_expires_ms: Option<i64>,
     pub subscription_active: bool,
     pub features: BTreeSet<String>,
+    /// Token counts stay JSON numbers; money-named limits (for example
+    /// `max_managed_spend_micro_per_period`, `min_credit_balance_micro`) are
+    /// decimal strings (see [`crate::money`]).
+    #[serde(serialize_with = "crate::money::serialize_money_map")]
     pub limits: BTreeMap<String, u64>,
     pub credits: CreditBalance,
     /// Folded managed vs BYOK spend (projection of the reservation ledger).
+    #[serde(with = "crate::money")]
     pub managed_spend_micro: u64,
+    #[serde(with = "crate::money")]
     pub byok_spend_micro: u64,
     pub total_tokens: u64,
     pub in_flight: Vec<InFlightTxn>,
@@ -787,8 +880,9 @@ impl AdmissionRequest {
 )]
 pub struct EntitlementExceeded {
     pub boundary: AdmissionBoundary,
-    /// The exact limit name (`max_active_tasks`, ...) or the state cause
-    /// (`subscription_active`, `plan`, `credits`).
+    /// The exact limit name (`max_active_tasks`, ...), a state cause
+    /// (`subscription_active`, `plan`, `credits`), or the fail-closed ledger
+    /// cause `ledger_overflow:<field>` (see [`CAUSE_LEDGER_OVERFLOW`]).
     pub limit: String,
     pub limit_value: Option<u64>,
     pub observed: u64,
@@ -809,6 +903,22 @@ impl EntitlementExceeded {
         self.observed = observed;
         self
     }
+
+    /// The FAIL-CLOSED admission decision for an authoritative ledger
+    /// aggregate that left the `u64` domain (a checked usage/credit fold
+    /// returned [`CreditLedgerError::Overflow`]): an overflowed projection
+    /// cannot be proven below ANY configured quota, so it is refused exactly
+    /// like an exhausted limit — never saturated into an admission. The
+    /// refusal names the cause ([`CAUSE_LEDGER_OVERFLOW`]) suffixed with the
+    /// exact overflowed field, and `observed` carries the left operand.
+    pub fn ledger_overflow(boundary: AdmissionBoundary, field: &str, observed: u64) -> Self {
+        Self {
+            boundary,
+            limit: format!("{CAUSE_LEDGER_OVERFLOW}:{field}"),
+            limit_value: None,
+            observed,
+        }
+    }
 }
 
 /// The cause tags used by refusals that are not plan limits.
@@ -816,6 +926,12 @@ pub const CAUSE_SUBSCRIPTION_ACTIVE: &str = "subscription_active";
 pub const CAUSE_PLAN: &str = "plan";
 pub const CAUSE_CREDITS: &str = "credits";
 pub const CAUSE_FEATURE_MANAGED: &str = "feature_managed_providers";
+/// The fail-closed cause of an admission refused because an authoritative
+/// usage/credit ledger aggregate left the `u64` domain: an overflowed
+/// projection cannot be proven below any configured quota, so the gate
+/// refuses (naming the overflowed field) exactly like an exhausted limit —
+/// it never saturates the total into an admission.
+pub const CAUSE_LEDGER_OVERFLOW: &str = "ledger_overflow";
 
 /// The outcome of one admission decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -974,7 +1090,12 @@ impl CreditEntry {
 /// amount (never silently released). Refunds add back exactly what they
 /// carry (exactness is enforced at append time against the referenced
 /// consume/settle).
-pub fn fold_credits(entries: &[CreditEntry]) -> CreditBalance {
+///
+/// Every monetary aggregate is CHECKED: an amount sum that would leave the
+/// `u64` domain returns [`CreditLedgerError::Overflow`] instead of saturating
+/// (a saturated total would silently understate debits or overstate funding
+/// at every guard built on this balance).
+pub fn fold_credits(entries: &[CreditEntry]) -> Result<CreditBalance, CreditLedgerError> {
     let mut balance = CreditBalance::default();
     // Settle amounts by consume id.
     let mut settled: BTreeMap<&str, u64> = BTreeMap::new();
@@ -988,31 +1109,49 @@ pub fn fold_credits(entries: &[CreditEntry]) -> CreditBalance {
     for entry in entries {
         match entry.kind {
             CreditKind::Grant => {
-                balance.granted_micro = balance.granted_micro.saturating_add(entry.amount_micro);
+                balance.granted_micro =
+                    checked_ledger_sum("granted_micro", balance.granted_micro, entry.amount_micro)?;
             }
             CreditKind::Consume => {
                 let effective = settled
                     .get(entry.id.as_str())
                     .copied()
                     .unwrap_or(entry.amount_micro);
-                balance.consumed_micro = balance.consumed_micro.saturating_add(effective);
+                balance.consumed_micro =
+                    checked_ledger_sum("consumed_micro", balance.consumed_micro, effective)?;
                 if !settled.contains_key(entry.id.as_str()) {
-                    balance.held_micro = balance.held_micro.saturating_add(entry.amount_micro);
-                    balance.pending_consumes += 1;
+                    balance.held_micro =
+                        checked_ledger_sum("held_micro", balance.held_micro, entry.amount_micro)?;
+                    balance.pending_consumes = balance.pending_consumes.checked_add(1).ok_or(
+                        CreditLedgerError::Overflow {
+                            field: "pending_consumes",
+                            left: balance.pending_consumes,
+                            right: 1,
+                        },
+                    )?;
                 }
             }
             CreditKind::Settle => {}
             CreditKind::Refund => {
-                balance.refunded_micro = balance.refunded_micro.saturating_add(entry.amount_micro);
+                balance.refunded_micro = checked_ledger_sum(
+                    "refunded_micro",
+                    balance.refunded_micro,
+                    entry.amount_micro,
+                )?;
             }
         }
     }
-    balance
+    Ok(balance)
 }
 
 // ------------------------------------------------------------------- fold
 
 /// One aggregate bucket (org totals and per-task rows share this shape).
+///
+/// Every field is an authoritative aggregate of the usage ledger: the fold
+/// sums them CHECKED, so a bucket that leaves the `u64` domain is a typed
+/// [`CreditLedgerError::Overflow`] naming the field — never a saturated
+/// `u64::MAX` that would silently understate spend (or a token quota).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct UsageTotals {
     pub input_tokens: u64,
@@ -1027,6 +1166,25 @@ pub struct UsageTotals {
     /// Events whose row was superseded by a correction (they contribute
     /// nothing; the correction's values are folded instead).
     pub corrected_events: u64,
+}
+
+impl UsageTotals {
+    /// The checked sum of every token bucket (the token-quota numerator).
+    /// A projection whose token aggregate leaves `u64` refuses typed naming
+    /// the field that overflowed, never a wrapped total.
+    pub fn total_tokens(&self) -> Result<u64, CreditLedgerError> {
+        let mut total = 0u64;
+        for (field, value) in [
+            ("input_tokens", self.input_tokens),
+            ("output_tokens", self.output_tokens),
+            ("cache_read_tokens", self.cache_read_tokens),
+            ("cache_write_tokens", self.cache_write_tokens),
+            ("reasoning_tokens", self.reasoning_tokens),
+        ] {
+            total = checked_ledger_sum(field, total, value)?;
+        }
+        Ok(total)
+    }
 }
 
 /// One per-task aggregate of an organization's usage fold.
@@ -1047,42 +1205,65 @@ pub struct UsageFold {
     pub next_cursor: Option<String>,
 }
 
-fn add_event(totals: &mut UsageTotals, event: &UsageEvent) {
-    totals.events += 1;
+/// Add one event to a totals bucket, CHECKED: every counter and every money
+/// aggregate is summed with `checked_add`, so an aggregate that leaves the
+/// `u64` domain surfaces as a typed [`CreditLedgerError::Overflow`] naming
+/// the exact field instead of silently flattening at `u64::MAX` (a
+/// saturated total would understate spend at every quota guard).
+fn add_event(totals: &mut UsageTotals, event: &UsageEvent) -> Result<(), CreditLedgerError> {
+    totals.events = checked_ledger_sum("events", totals.events, 1)?;
     match event.unit {
         UsageUnit::InputTokens => {
-            totals.input_tokens = totals.input_tokens.saturating_add(event.quantity)
+            totals.input_tokens =
+                checked_ledger_sum("input_tokens", totals.input_tokens, event.quantity)?
         }
         UsageUnit::OutputTokens => {
-            totals.output_tokens = totals.output_tokens.saturating_add(event.quantity)
+            totals.output_tokens =
+                checked_ledger_sum("output_tokens", totals.output_tokens, event.quantity)?
         }
         UsageUnit::CacheReadTokens => {
-            totals.cache_read_tokens = totals.cache_read_tokens.saturating_add(event.quantity)
+            totals.cache_read_tokens = checked_ledger_sum(
+                "cache_read_tokens",
+                totals.cache_read_tokens,
+                event.quantity,
+            )?
         }
         UsageUnit::CacheWriteTokens => {
-            totals.cache_write_tokens = totals.cache_write_tokens.saturating_add(event.quantity)
+            totals.cache_write_tokens = checked_ledger_sum(
+                "cache_write_tokens",
+                totals.cache_write_tokens,
+                event.quantity,
+            )?
         }
         UsageUnit::ReasoningTokens => {
-            totals.reasoning_tokens = totals.reasoning_tokens.saturating_add(event.quantity)
+            totals.reasoning_tokens =
+                checked_ledger_sum("reasoning_tokens", totals.reasoning_tokens, event.quantity)?
         }
         UsageUnit::ProviderCostMicro => {
-            totals.provider_cost_micro = totals
-                .provider_cost_micro
-                .saturating_add(event.provider_cost_micro);
+            totals.provider_cost_micro = checked_ledger_sum(
+                "provider_cost_micro",
+                totals.provider_cost_micro,
+                event.provider_cost_micro,
+            )?;
             match event.category {
                 SpendCategory::Managed => {
-                    totals.managed_cost_micro = totals
-                        .managed_cost_micro
-                        .saturating_add(event.provider_cost_micro)
+                    totals.managed_cost_micro = checked_ledger_sum(
+                        "managed_cost_micro",
+                        totals.managed_cost_micro,
+                        event.provider_cost_micro,
+                    )?
                 }
                 SpendCategory::Byok => {
-                    totals.byok_cost_micro = totals
-                        .byok_cost_micro
-                        .saturating_add(event.provider_cost_micro)
+                    totals.byok_cost_micro = checked_ledger_sum(
+                        "byok_cost_micro",
+                        totals.byok_cost_micro,
+                        event.provider_cost_micro,
+                    )?
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// Fold one organization's usage events: superseded base events are skipped
@@ -1090,7 +1271,15 @@ fn add_event(totals: &mut UsageTotals, event: &UsageEvent) {
 /// is summed per category (managed vs BYOK) independently. Corrections of
 /// one base form an append-only chain: the LATEST correction wins, older
 /// corrections contribute nothing (they are superseded, never deleted).
-pub fn fold_usage(organization: &OrganizationId, events: &[UsageEvent]) -> UsageFold {
+///
+/// Every aggregate is CHECKED: an org total or per-task bucket that would
+/// leave the `u64` domain returns [`CreditLedgerError::Overflow`] naming the
+/// exact field instead of saturating at `u64::MAX` (a saturated spend total
+/// would silently read as under the quota).
+pub fn fold_usage(
+    organization: &OrganizationId,
+    events: &[UsageEvent],
+) -> Result<UsageFold, CreditLedgerError> {
     // The winning correction of each base event id: latest by
     // (occurred_at_ms, id) — deterministic and stable across read order.
     let mut winning: BTreeMap<&str, &str> = BTreeMap::new();
@@ -1124,29 +1313,33 @@ pub fn fold_usage(organization: &OrganizationId, events: &[UsageEvent]) -> Usage
     let mut per_task: BTreeMap<(u64, String), UsageTotals> = BTreeMap::new();
     for event in events {
         if superseded.contains(event.id.as_str()) {
-            totals.corrected_events += 1;
-            per_task
+            totals.corrected_events =
+                checked_ledger_sum("corrected_events", totals.corrected_events, 1)?;
+            let bucket = per_task
                 .entry((event.task_id, event.run_id.clone()))
-                .or_default()
-                .corrected_events += 1;
+                .or_default();
+            bucket.corrected_events =
+                checked_ledger_sum("corrected_events", bucket.corrected_events, 1)?;
             continue;
         }
         if event.correction_of.is_some() {
-            totals.corrected_events += 1;
-            per_task
+            totals.corrected_events =
+                checked_ledger_sum("corrected_events", totals.corrected_events, 1)?;
+            let bucket = per_task
                 .entry((event.task_id, event.run_id.clone()))
-                .or_default()
-                .corrected_events += 1;
+                .or_default();
+            bucket.corrected_events =
+                checked_ledger_sum("corrected_events", bucket.corrected_events, 1)?;
         }
-        add_event(&mut totals, event);
+        add_event(&mut totals, event)?;
         add_event(
             per_task
                 .entry((event.task_id, event.run_id.clone()))
                 .or_default(),
             event,
-        );
+        )?;
     }
-    UsageFold {
+    Ok(UsageFold {
         organization_id: organization.clone(),
         totals,
         per_task: per_task
@@ -1158,7 +1351,7 @@ pub fn fold_usage(organization: &OrganizationId, events: &[UsageEvent]) -> Usage
             })
             .collect(),
         next_cursor: None,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1268,7 +1461,7 @@ mod tests {
             UsageEvent::effective_state(&base, &events),
             ReconciliationState::Reconciled
         );
-        let fold = fold_usage(&org(), &events);
+        let fold = fold_usage(&org(), &events).unwrap();
         assert_eq!(fold.totals.provider_cost_micro, 60);
         assert_eq!(fold.totals.managed_cost_micro, 60);
         assert_eq!(
@@ -1286,7 +1479,7 @@ mod tests {
             token_event("e3", UsageUnit::InputTokens, 12, SpendCategory::Byok),
             token_event("e4", UsageUnit::ReasoningTokens, 4, SpendCategory::Managed),
         ];
-        let fold = fold_usage(&org(), &events);
+        let fold = fold_usage(&org(), &events).unwrap();
         assert_eq!(fold.totals.provider_cost_micro, 130);
         assert_eq!(fold.totals.managed_cost_micro, 100);
         assert_eq!(fold.totals.byok_cost_micro, 30);
@@ -1294,6 +1487,124 @@ mod tests {
         assert_eq!(fold.totals.reasoning_tokens, 4);
         assert_eq!(fold.per_task.len(), 1);
         assert_eq!(fold.per_task[0].task_id, 7);
+    }
+
+    /// Adversarial: the usage fold is CHECKED. A planted near-`u64::MAX`
+    /// ledger refuses TYPED naming the exact field — it never flattens at
+    /// `u64::MAX`. The boundary below the overflow stays bit-exact, the
+    /// token-quota numerator is checked, and managed/BYOK money never
+    /// contaminates each other.
+    #[test]
+    fn usage_fold_refuses_overflow_typed_and_stays_exact_below_the_boundary() {
+        let max = i64::MAX as u64;
+        // Two boundary token events still fit u64 exactly (u64::MAX - 1).
+        let mut boundary = vec![
+            token_event("t1", UsageUnit::InputTokens, max, SpendCategory::Byok),
+            token_event("t2", UsageUnit::InputTokens, max, SpendCategory::Byok),
+        ];
+        let fold = fold_usage(&org(), &boundary).unwrap();
+        assert_eq!(fold.totals.input_tokens, u64::MAX - 1, "boundary exact");
+        assert_eq!(fold.totals.total_tokens().unwrap(), u64::MAX - 1);
+        // The third boundary event leaves the domain: typed, not saturated.
+        boundary.push(token_event(
+            "t3",
+            UsageUnit::InputTokens,
+            max,
+            SpendCategory::Byok,
+        ));
+        match fold_usage(&org(), &boundary) {
+            Err(CreditLedgerError::Overflow {
+                field: "input_tokens",
+                left,
+                right,
+            }) => {
+                assert_eq!(left, u64::MAX - 1);
+                assert_eq!(right, max);
+            }
+            other => panic!("expected a typed input_tokens overflow, got {other:?}"),
+        }
+        // The same for money: the org money aggregate is checked and names
+        // the money field before the category bucket is touched. c1+c2 reach
+        // u64::MAX - 1 exactly, c3's +1 reaches u64::MAX exactly, and c4 is
+        // the first add that leaves the domain.
+        let money = vec![
+            cost_event("c1", max, SpendCategory::Managed),
+            cost_event("c2", max, SpendCategory::Managed),
+            cost_event("c3", 1, SpendCategory::Byok),
+            cost_event("c4", max, SpendCategory::Managed),
+        ];
+        match fold_usage(&org(), &money) {
+            Err(CreditLedgerError::Overflow {
+                field: "provider_cost_micro",
+                left,
+                right,
+            }) => {
+                assert_eq!(left, u64::MAX, "the exact boundary is preserved");
+                assert_eq!(right, max);
+            }
+            other => panic!("expected a typed provider_cost_micro overflow, got {other:?}"),
+        }
+        // The BYOK bucket is independent: a managed overflow never turns
+        // into a saturated or polluted BYOK total.
+        let byok = fold_usage(&org(), &[cost_event("b1", max, SpendCategory::Byok)]).unwrap();
+        assert_eq!(byok.totals.byok_cost_micro, max);
+        assert_eq!(byok.totals.managed_cost_micro, 0);
+        // The per-task bucket is checked too: the org total may still fit
+        // while one task's row would overflow.
+        let mut first = token_event("p1", UsageUnit::OutputTokens, max, SpendCategory::Byok);
+        first.task_id = 1;
+        let mut second = token_event("p2", UsageUnit::OutputTokens, max, SpendCategory::Byok);
+        second.task_id = 2;
+        let mut third = token_event("p3", UsageUnit::OutputTokens, 1, SpendCategory::Byok);
+        third.task_id = 1;
+        // org total = 2*max + 1 fits u64; task 1's bucket = max + 1 fits too.
+        let fold = fold_usage(&org(), &[first, second, third]).unwrap();
+        assert_eq!(fold.totals.output_tokens, u64::MAX);
+        assert_eq!(fold.per_task.len(), 2);
+        // Three boundary events on ONE task overflow that task bucket.
+        let mut events = Vec::new();
+        for index in 0..3u64 {
+            let mut event = token_event(
+                &format!("q{index}"),
+                UsageUnit::OutputTokens,
+                max,
+                SpendCategory::Byok,
+            );
+            event.task_id = 9;
+            events.push(event);
+        }
+        match fold_usage(&org(), &events) {
+            Err(CreditLedgerError::Overflow {
+                field: "output_tokens",
+                ..
+            }) => {}
+            other => panic!("expected a typed per-task output_tokens overflow, got {other:?}"),
+        }
+    }
+
+    /// The token-quota numerator is checked across buckets: fields that each
+    /// fit can still leave `u64` together — typed, naming the field that
+    /// crossed the boundary (never a wrapped total).
+    #[test]
+    fn usage_totals_token_numerator_refuses_overflow_across_buckets() {
+        let max = i64::MAX as u64;
+        let totals = UsageTotals {
+            input_tokens: max,
+            output_tokens: max,
+            cache_read_tokens: max,
+            ..UsageTotals::default()
+        };
+        match totals.total_tokens() {
+            Err(CreditLedgerError::Overflow {
+                field: "cache_read_tokens",
+                left,
+                right,
+            }) => {
+                assert_eq!(left, u64::MAX - 1);
+                assert_eq!(right, max);
+            }
+            other => panic!("expected a typed cache_read_tokens overflow, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1315,18 +1626,86 @@ mod tests {
             entry("c1", CreditKind::Grant, 1000, None),
             entry("c2", CreditKind::Consume, 400, None),
         ];
-        let balance = fold_credits(&entries);
+        let balance = fold_credits(&entries).unwrap();
         assert_eq!(balance.held_micro, 400);
-        assert_eq!(balance.balance_micro(), 600);
+        assert_eq!(balance.balance_micro().unwrap(), 600);
         let mut settled = entries.clone();
         settled.push(entry("c3", CreditKind::Settle, 250, Some("c2")));
-        let balance = fold_credits(&settled);
+        let balance = fold_credits(&settled).unwrap();
         assert_eq!(balance.held_micro, 0);
         assert_eq!(balance.consumed_micro, 250);
-        assert_eq!(balance.balance_micro(), 750);
+        assert_eq!(balance.balance_micro().unwrap(), 750);
         settled.push(entry("c4", CreditKind::Refund, 50, Some("c2")));
-        let balance = fold_credits(&settled);
-        assert_eq!(balance.balance_micro(), 800);
+        let balance = fold_credits(&settled).unwrap();
+        assert_eq!(balance.balance_micro().unwrap(), 800);
+    }
+
+    /// Adversarial: monetary aggregation is CHECKED. Three `i64::MAX` grants
+    /// overflow `u64` and the fold refuses typed instead of saturating; a
+    /// ledger whose effective debits exceed its funding refuses typed instead
+    /// of reporting a saturated `0` (hidden debt).
+    #[test]
+    fn credit_fold_refuses_overflow_and_hidden_debt_typed() {
+        let max = i64::MAX as u64;
+        let entry = |id: &str, kind: CreditKind, amount: u64| CreditEntry {
+            id: CreditEntryId::try_new(id).unwrap(),
+            organization: org(),
+            billing_account_id: account(),
+            kind,
+            amount_micro: amount,
+            reference: None,
+            usage_event_id: None,
+            reason: "test".into(),
+            occurred_at_ms: 1,
+            idempotency_key: None,
+        };
+        // Two boundary grants still fit exactly.
+        let two = vec![
+            entry("c1", CreditKind::Grant, max),
+            entry("c2", CreditKind::Grant, max),
+        ];
+        assert_eq!(fold_credits(&two).unwrap().granted_micro, u64::MAX - 1);
+        // The third overflows the aggregate: typed, not saturated.
+        let three = vec![
+            entry("c1", CreditKind::Grant, max),
+            entry("c2", CreditKind::Grant, max),
+            entry("c3", CreditKind::Grant, max),
+        ];
+        match fold_credits(&three) {
+            Err(CreditLedgerError::Overflow {
+                field: "granted_micro",
+                left,
+                right,
+            }) => {
+                assert_eq!(left, u64::MAX - 1);
+                assert_eq!(right, max);
+            }
+            other => panic!("expected a typed granted_micro overflow, got {other:?}"),
+        }
+        // A corrupt ledger (consume without funding) never reports 0.
+        let debt = CreditBalance {
+            granted_micro: 100,
+            consumed_micro: 500,
+            ..CreditBalance::default()
+        };
+        match debt.balance_micro() {
+            Err(CreditLedgerError::Corrupt { detail }) => {
+                assert!(detail.contains("500"), "{detail}");
+                assert!(detail.contains("100"), "{detail}");
+                assert!(detail.contains("400"), "the hidden debt is named: {detail}");
+            }
+            other => panic!("expected typed hidden-debt corruption, got {other:?}"),
+        }
+        // The boundary itself stays exact: grant + refund - consume at
+        // i64::MAX never overflows the u64 aggregate.
+        let boundary = CreditBalance {
+            granted_micro: max,
+            refunded_micro: max,
+            consumed_micro: max,
+            held_micro: 0,
+            pending_consumes: 0,
+        };
+        assert_eq!(boundary.balance_micro().unwrap(), max);
     }
 
     /// The credit amount domain: `i64::MAX` is the largest legal amount and

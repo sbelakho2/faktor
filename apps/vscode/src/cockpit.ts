@@ -16,6 +16,13 @@ import type {
   NativeEntitlementSnapshot,
   NativeIdentity,
 } from './nativeClient';
+import {
+  isMicroLimitName,
+  microBalance,
+  microToString,
+  microUsdText,
+  type MicroMoney,
+} from './money.ts';
 
 export interface CockpitEvidenceRef {
   readonly id: number | null;
@@ -160,9 +167,10 @@ export interface CockpitVerificationView {
 export interface CockpitSpendView {
   readonly spentTokens: number | null;
   readonly maxTokens: number | null;
-  readonly spentCostMicro: number;
-  readonly maxCostMicro: number | null;
-  readonly openReservedMicro: number;
+  /** Exact micro-USD as a canonical decimal string (never a rounded float). */
+  readonly spentCostMicro: string;
+  readonly maxCostMicro: string | null;
+  readonly openReservedMicro: string;
 }
 
 /** One tournament candidate (mirrors the durable native candidate rows). */
@@ -173,7 +181,8 @@ export interface CockpitTournamentCandidateView {
   readonly verificationPass: boolean | null;
   readonly reviewRank: string | null;
   readonly reviewer: string | null;
-  readonly costMicro: number;
+  /** Exact micro-USD as a canonical decimal string. */
+  readonly costMicro: string;
   readonly wallMs: number;
   readonly winner: boolean;
 }
@@ -279,8 +288,9 @@ export interface CockpitProofView {
   };
   readonly cost: {
     readonly status: string;
-    readonly spentMicro: number | null;
-    readonly maxMicro: number | null;
+    /** Exact micro-USD as canonical decimal strings (null = not served). */
+    readonly spentMicro: string | null;
+    readonly maxMicro: string | null;
     readonly reason: string | null;
   };
   readonly completion: {
@@ -333,8 +343,8 @@ export interface CockpitNativeProof {
   };
   readonly cost: {
     readonly status: string;
-    readonly spentCostMicro: number | null;
-    readonly maxCostMicro: number | null;
+    readonly spentCostMicro: MicroMoney | null;
+    readonly maxCostMicro: MicroMoney | null;
     readonly reason: string | null;
   };
   readonly completion: {
@@ -422,8 +432,8 @@ export function proofViewOf(
     },
     cost: {
       status: proof.cost.status,
-      spentMicro: proof.cost.spentCostMicro,
-      maxMicro: proof.cost.maxCostMicro,
+      spentMicro: proof.cost.spentCostMicro === null ? null : microToString(proof.cost.spentCostMicro),
+      maxMicro: proof.cost.maxCostMicro === null ? null : microToString(proof.cost.maxCostMicro),
       reason: proof.cost.reason === null ? null : clamp(proof.cost.reason),
     },
     completion: proof.completion
@@ -470,7 +480,7 @@ export function proofSummaryLine(proof: CockpitProofView): string {
       : `remote head ${shortRef(proof.publication.remoteHeadOid)}`,
     proof.publication.pullRequestId === null ? null : `PR ${proof.publication.pullRequestId}`,
     proof.cost.status === 'known'
-      ? `spend ${proof.cost.spentMicro ?? 0}\u00b5$${
+      ? `spend ${proof.cost.spentMicro ?? '0'}\u00b5$${
           proof.cost.maxMicro === null ? '' : ` of ${proof.cost.maxMicro}\u00b5$`
         }`
       : `spend unavailable${proof.cost.reason === null ? '' : ` (${proof.cost.reason})`}`,
@@ -533,9 +543,10 @@ export type CockpitSubscriptionState =
 export interface CockpitUsageQuota {
   /** The EXACT limit name from the entitlement snapshot. */
   readonly limit: string;
-  readonly value: number;
+  /** Exact limit value as a canonical decimal string (money or counter). */
+  readonly value: string;
   /** The observed counter, or null when this snapshot serves none. */
-  readonly observed: number | null;
+  readonly observed: string | null;
   /** True only when the observed counter is known to breach the limit. */
   readonly exceeded: boolean | null;
   /** `ceiling` limits are exceeded at/above the value; `floor` below it. */
@@ -549,9 +560,10 @@ export interface CockpitUsageBucketView {
   readonly cacheReadTokens: number;
   readonly cacheWriteTokens: number;
   readonly reasoningTokens: number;
-  readonly providerCostMicro: number;
-  readonly managedCostMicro: number;
-  readonly byokCostMicro: number;
+  /** Exact micro-USD as canonical decimal strings (never a rounded float). */
+  readonly providerCostMicro: string;
+  readonly managedCostMicro: string;
+  readonly byokCostMicro: string;
   readonly events: number;
   readonly correctedEvents: number;
 }
@@ -570,13 +582,14 @@ export interface CockpitUsagePeriodView extends CockpitUsageBucketView {
 }
 
 export interface CockpitUsageCreditsView {
-  readonly grantedMicro: number;
-  readonly consumedMicro: number;
-  readonly refundedMicro: number;
-  readonly heldMicro: number;
+  /** Exact micro-USD as canonical decimal strings (never a rounded float). */
+  readonly grantedMicro: string;
+  readonly consumedMicro: string;
+  readonly refundedMicro: string;
+  readonly heldMicro: string;
   readonly pendingConsumes: number;
   /** grants + refunds − effective debits, saturating (the server's rule). */
-  readonly balanceMicro: number;
+  readonly balanceMicro: string;
 }
 
 export interface CockpitUsagePageView {
@@ -637,9 +650,9 @@ function usageBucketView(bucket: NativeBillingUsage['fold']['totals']): CockpitU
     cacheReadTokens: bucket.cache_read_tokens,
     cacheWriteTokens: bucket.cache_write_tokens,
     reasoningTokens: bucket.reasoning_tokens,
-    providerCostMicro: bucket.provider_cost_micro,
-    managedCostMicro: bucket.managed_cost_micro,
-    byokCostMicro: bucket.byok_cost_micro,
+    providerCostMicro: microToString(bucket.provider_cost_micro),
+    managedCostMicro: microToString(bucket.managed_cost_micro),
+    byokCostMicro: microToString(bucket.byok_cost_micro),
     events: bucket.events,
     correctedEvents: bucket.corrected_events,
   };
@@ -648,17 +661,18 @@ function usageBucketView(bucket: NativeBillingUsage['fold']['totals']): CockpitU
 function creditBalanceView(
   credits: NativeBillingUsage['credits'],
 ): CockpitUsageCreditsView {
-  const balanceMicro = Math.max(
-    0,
-    credits.granted_micro + credits.refunded_micro - credits.consumed_micro,
+  const balanceMicro = microBalance(
+    credits.granted_micro,
+    credits.refunded_micro,
+    credits.consumed_micro,
   );
   return {
-    grantedMicro: credits.granted_micro,
-    consumedMicro: credits.consumed_micro,
-    refundedMicro: credits.refunded_micro,
-    heldMicro: credits.held_micro,
+    grantedMicro: microToString(credits.granted_micro),
+    consumedMicro: microToString(credits.consumed_micro),
+    refundedMicro: microToString(credits.refunded_micro),
+    heldMicro: microToString(credits.held_micro),
     pendingConsumes: credits.pending_consumes,
-    balanceMicro,
+    balanceMicro: microToString(balanceMicro),
   };
 }
 
@@ -688,8 +702,8 @@ function subscriptionViewOf(
 
 function quotaRowsOf(snapshot: NativeEntitlementSnapshot | null, panel: {
   readonly tokens: number | null;
-  readonly managedMicro: number | null;
-  readonly balanceMicro: number | null;
+  readonly managedMicro: MicroMoney | null;
+  readonly balanceMicro: MicroMoney | null;
 }): CockpitUsageQuota[] {
   if (snapshot === null) {
     return [];
@@ -698,11 +712,11 @@ function quotaRowsOf(snapshot: NativeEntitlementSnapshot | null, panel: {
   for (const [limit, value] of Object.entries(snapshot.limits).sort(([a], [b]) =>
     a.localeCompare(b),
   )) {
-    let observed: number | null = null;
+    let observed: MicroMoney | null = null;
     let reason: string | null = null;
     switch (limit) {
       case USAGE_LIMIT_MAX_TOKENS:
-        observed = panel.tokens;
+        observed = panel.tokens === null ? null : BigInt(panel.tokens);
         if (observed === null) {
           reason = 'the entitlement snapshot serves no token counter';
         }
@@ -724,13 +738,22 @@ function quotaRowsOf(snapshot: NativeEntitlementSnapshot | null, panel: {
         break;
     }
     const kind = limit === USAGE_LIMIT_MIN_CREDIT ? 'floor' : 'ceiling';
+    // Exact comparison: money limits are micro-USD, other limits are plain
+    // counters, but both are bigint so a u64 value never rounds.
     const exceeded =
       observed === null
         ? null
         : kind === 'floor'
           ? observed < value
           : observed >= value;
-    rows.push({ limit, value, observed, exceeded, kind, reason });
+    rows.push({
+      limit,
+      value: microToString(value),
+      observed: observed === null ? null : microToString(observed),
+      exceeded,
+      kind,
+      reason,
+    });
   }
   return rows;
 }
@@ -842,7 +865,11 @@ export function buildUsagePanel(input: CockpitUsageInput): CockpitUsagePanel {
     quotas: quotaRowsOf(entitlements, {
       tokens: entitlements.total_tokens,
       managedMicro: entitlements.managed_spend_micro,
-      balanceMicro: creditBalanceView(entitlements.credits).balanceMicro,
+      balanceMicro: microBalance(
+        entitlements.credits.granted_micro,
+        entitlements.credits.refunded_micro,
+        entitlements.credits.consumed_micro,
+      ),
     }),
     canGrantCredits,
     grantDisabledReason,
@@ -850,7 +877,8 @@ export function buildUsagePanel(input: CockpitUsageInput): CockpitUsagePanel {
   };
 }
 
-function microText(value: number): string {
+/** Exact micro-USD display of one canonical decimal money string. */
+function microText(value: string): string {
   return `${value}\u00b5$`;
 }
 
@@ -860,9 +888,7 @@ export function usageQuotaLine(quota: CockpitUsageQuota): string {
   if (quota.observed === null) {
     return `${head}quota ${quota.limit} — limit ${quota.value} (observed not served: ${quota.reason ?? 'unavailable'})`;
   }
-  const unit = quota.limit === USAGE_LIMIT_MANAGED_SPEND || quota.limit === USAGE_LIMIT_MIN_CREDIT
-    ? microText
-    : String;
+  const unit = isMicroLimitName(quota.limit) ? microText : String;
   return `${head}quota ${quota.limit} — observed ${unit(quota.observed)} / limit ${quota.value}`;
 }
 
@@ -1007,7 +1033,7 @@ export interface CockpitNativeTournament {
     readonly verificationPass: boolean | null;
     readonly reviewRank: string | null;
     readonly reviewer: string | null;
-    readonly costMicro: number;
+    readonly costMicro: MicroMoney;
     readonly wallMs: number;
   }[];
 }
@@ -1031,7 +1057,7 @@ export function tournamentViewOf(
     verificationPass: candidate.verificationPass,
     reviewRank: candidate.reviewRank,
     reviewer: candidate.reviewer,
-    costMicro: candidate.costMicro,
+    costMicro: microToString(candidate.costMicro),
     wallMs: candidate.wallMs,
     winner: tournament.winner !== null && candidate.childId === tournament.winner,
   }));
@@ -2139,7 +2165,7 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
                 ? `head ${digestLabel(view.verification.remotePrHead)}`
                 : null,
               view.spend !== null
-                ? `cost ${(view.spend.spentCostMicro / 1_000_000).toFixed(4)}`
+                ? `cost ${microUsdText(BigInt(view.spend.spentCostMicro))}`
                 : null,
             ]
               .filter((bit): bit is string => bit !== null)
@@ -2168,12 +2194,12 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
           `tokens ${view.spend.spentTokens ?? '—'}${
             view.spend.maxTokens !== null ? ` / ${view.spend.maxTokens}` : ''
           }`,
-          `cost ${(view.spend.spentCostMicro / 1_000_000).toFixed(4)}${
+          `cost ${microUsdText(BigInt(view.spend.spentCostMicro))}${
             view.spend.maxCostMicro !== null
-              ? ` / ${(view.spend.maxCostMicro / 1_000_000).toFixed(4)}`
+              ? ` / ${microUsdText(BigInt(view.spend.maxCostMicro))}`
               : ''
           }`,
-          `reserved ${(view.spend.openReservedMicro / 1_000_000).toFixed(4)}`,
+          `reserved ${microUsdText(BigInt(view.spend.openReservedMicro))}`,
         ]
       : ['none'],
     evidence: [],

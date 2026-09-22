@@ -18,6 +18,7 @@ import type {
   NativeTaskRunStarted,
   StartTaskRunRequest,
 } from './nativeClient.ts';
+import { microWireValue, type MicroMoney } from './money.ts';
 
 /** One durable typed attachment id a task start accepts (native DTO mirror). */
 export type TaskAttachmentId = NativeAttachmentId;
@@ -307,7 +308,8 @@ export interface StartTaskSettings {
   /** The raw `faktor.mutationMode` value; parsed strictly at admission. */
   readonly mutationMode: string;
   readonly maxTokens: number;
-  readonly maxCostMicro: number;
+  /** Exact micro-USD budget (0n = daemon default); never a rounded float. */
+  readonly maxCostMicro: MicroMoney;
   /** Workspace-relative attachment paths forwarded from the composer. */
   readonly files?: readonly string[];
   /** Durable typed binary attachments (uploaded BEFORE this start). */
@@ -388,7 +390,9 @@ export function startTaskRequest(goal: string, settings: StartTaskSettings): Sta
   const request: StartTaskRunRequest = {
     goal,
     ...(settings.maxTokens > 0 ? { max_tokens: settings.maxTokens } : {}),
-    ...(settings.maxCostMicro > 0 ? { max_cost_micro: settings.maxCostMicro } : {}),
+    ...(settings.maxCostMicro > 0n
+      ? { max_cost_micro: microWireValue(settings.maxCostMicro) }
+      : {}),
     ...(settings.files !== undefined && settings.files.length > 0
       ? { files: settings.files }
       : {}),

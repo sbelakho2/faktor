@@ -34,6 +34,9 @@ pub mod error;
 pub mod ids;
 pub mod layered_config;
 pub mod model;
+/// Native-protocol money encoding: monetary `*_micro`/`*Micro` fields are
+/// decimal strings on the wire (see [`money`]).
+pub mod money;
 pub mod oidc;
 pub mod oidc_net;
 pub mod rbac;
@@ -45,12 +48,12 @@ pub mod vendor;
 
 pub use billing::{
     fold_credits, fold_usage, Admission, AdmissionBoundary, AdmissionRequest, BillingAccount,
-    BillingConfig, CreditBalance, CreditEntry, CreditKind, EntitlementExceeded,
+    BillingConfig, CreditBalance, CreditEntry, CreditKind, CreditLedgerError, EntitlementExceeded,
     EntitlementSnapshot, InFlightKind, InFlightTxn, ObservedUsage, PlanConfig, ReconciliationState,
     SpendCategory, Subscription, SubscriptionStatus, TaskUsage, UsageEvent, UsageFold, UsageTotals,
-    UsageUnit, CAUSE_CREDITS, CAUSE_FEATURE_MANAGED, CAUSE_PLAN, CAUSE_SUBSCRIPTION_ACTIVE,
-    FEATURE_BYOK, FEATURE_CREDITS, FEATURE_MANAGED_PROVIDERS, LIMIT_MAX_ACTIVE_TASKS,
-    LIMIT_MAX_CHILDREN_PER_TASK, LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD,
+    UsageUnit, CAUSE_CREDITS, CAUSE_FEATURE_MANAGED, CAUSE_LEDGER_OVERFLOW, CAUSE_PLAN,
+    CAUSE_SUBSCRIPTION_ACTIVE, FEATURE_BYOK, FEATURE_CREDITS, FEATURE_MANAGED_PROVIDERS,
+    LIMIT_MAX_ACTIVE_TASKS, LIMIT_MAX_CHILDREN_PER_TASK, LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD,
     LIMIT_MAX_PROVIDER_ATTEMPTS_PER_TASK, LIMIT_MAX_TOKENS_PER_PERIOD,
     LIMIT_MIN_CREDIT_BALANCE_MICRO,
 };

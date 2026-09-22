@@ -21,6 +21,7 @@ import dev.faktor.shared.JsonCodec
 import dev.faktor.shared.JsonValue
 import dev.faktor.shared.NativeApiException
 import dev.faktor.shared.NativeProtocolException
+import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeRequests
 import dev.faktor.shared.parseNativeAgentControlAck
 import dev.faktor.shared.parseNativeAgents
@@ -50,6 +51,7 @@ import dev.faktor.shared.parseNativeVerificationView
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
+import java.math.BigInteger
 import java.io.InputStream
 import java.net.InetAddress
 import java.net.ServerSocket
@@ -67,6 +69,7 @@ object NativeClientTest {
         assertRequestBodies()
         assertResponseParsers()
         assertBillingParsers()
+        assertMoneyParsers()
         assertHostileParsers()
         assertClientRoutes()
         assertErrorMapping()
@@ -336,9 +339,14 @@ private fun assertRequestBodies() {
     assertEquals(
         "{\"goal\":\"g\",\"criteria\":[\"c1\"],\"model\":\"m1\",\"max_tokens\":100," +
             "\"max_cost_micro\":200,\"mutation_mode\":\"shadow\"}",
-        NativeRequests.startTaskRun("g", listOf("c1"), "m1", 100, 200, "shadow")
+        NativeRequests.startTaskRun(
+            "g", listOf("c1"), "m1", 100, BigInteger.valueOf(200), "shadow"
+        )
     )
-    assertEquals("{\"max_cost_micro\":5}", NativeRequests.changeBudget(maxCostMicro = 5))
+    assertEquals(
+        "{\"max_cost_micro\":5}",
+        NativeRequests.changeBudget(maxCostMicro = BigInteger.valueOf(5))
+    )
     assertEquals("{\"selector\":\"all\"}", NativeRequests.evidenceSelectorAll())
     assertEquals("{\"text\":\"a\\\"b\\n\"}", NativeRequests.steer("a\"b\n"))
     assertEquals(
@@ -348,11 +356,11 @@ private fun assertRequestBodies() {
     assertEquals("{\"subject\":\"s\",\"body\":\"b\"}", NativeRequests.boardPost("s", "b"))
     assertEquals(
         "{\"amount_micro\":1000000,\"reason\":\"top up\"}",
-        NativeRequests.grantCredits(1_000_000L, "top up")
+        NativeRequests.grantCredits(BigInteger.valueOf(1_000_000L), "top up")
     )
     assertEquals(
         "{\"amount_micro\":5,\"account_id\":\"acct-1\"}",
-        NativeRequests.grantCredits(5L, accountId = "acct-1")
+        NativeRequests.grantCredits(BigInteger.valueOf(5L), accountId = "acct-1")
     )
 }
 
@@ -413,7 +421,7 @@ private fun assertResponseParsers() {
     val usage = parseNativeUsage(USAGE_JSON)
     assertEquals(2L, usage.sessions)
     assertEquals(1234L, usage.durableTokens)
-    assertEquals(77L, usage.settledCostMicro)
+    assertEquals(BigInteger.valueOf(77L), usage.settledCostMicro)
     assertEquals("7", parseNativeSessionUsage(SESSION_USAGE_JSON).sessionId)
     assertEquals(10L, parseNativeSessionUsage(SESSION_USAGE_JSON).tokens)
 
@@ -441,13 +449,13 @@ private fun assertResponseParsers() {
 private fun assertBillingParsers() {
     val usage = parseNativeBillingUsage(BILLING_USAGE_JSON)
     assertEquals("org-local", usage.organization)
-    assertEquals(700_000L, usage.fold.totals.managedCostMicro)
-    assertEquals(200_000L, usage.fold.totals.byokCostMicro)
+    assertEquals(BigInteger.valueOf(700_000L), usage.fold.totals.managedCostMicro)
+    assertEquals(BigInteger.valueOf(200_000L), usage.fold.totals.byokCostMicro)
     assertEquals(1_775L, usage.fold.totals.totalTokens())
     assertEquals(3L, usage.fold.perTask[0].taskId)
     assertEquals("r1", usage.fold.perTask[0].runId)
-    assertEquals(3_100_000L, usage.credits.balanceMicro())
-    assertEquals(250_000L, usage.credits.heldMicro)
+    assertEquals(BigInteger.valueOf(3_100_000L), usage.credits.balanceMicro())
+    assertEquals(BigInteger.valueOf(250_000L), usage.credits.heldMicro)
     assertEquals(1, usage.itemCount)
     assertEquals("9", usage.nextCursor)
 
@@ -456,7 +464,7 @@ private fun assertBillingParsers() {
     assertEquals(true, entitlements.planFound)
     assertEquals(true, entitlements.subscriptionActive)
     assertEquals("active", entitlements.subscriptionStatus)
-    assertEquals(100_000L, entitlements.limits["max_tokens_per_period"])
+    assertEquals(BigInteger.valueOf(100_000L), entitlements.limits["max_tokens_per_period"])
     assertEquals(4, entitlements.limits.size)
     assertEquals(1_775L, entitlements.totalTokens)
     assertEquals(1, entitlements.inFlight.size)
@@ -470,7 +478,7 @@ private fun assertBillingParsers() {
 
     val grant = parseNativeCreditGrant(CREDIT_GRANT_JSON)
     assertEquals(false, grant.duplicate)
-    assertEquals(6_000_000L, grant.credits.grantedMicro)
+    assertEquals(BigInteger.valueOf(6_000_000L), grant.credits.grantedMicro)
 
     // Hostile billing payloads are loud protocol violations (never a
     // silently wrong panel).
@@ -515,6 +523,143 @@ private fun assertBillingParsers() {
         // expected
     }
 }
+
+/**
+ * Exact money (the `*_micro` decimal-string protocol change): strings parse
+ * exactly at the whole range, legacy numbers are tolerated only while exactly
+ * representable (<= 2^53-1) and a larger number is refused loudly rather
+ * than silently rounded; display and aggregation are exact BigInteger.
+ */
+private fun assertMoneyParsers() {
+    // 1. Decimal strings parse exactly at 0, 2^53-1, 2^53 and i64::MAX.
+    assertEquals(BigInteger.ZERO, MicroMoney.parseDecimal("0"))
+    assertEquals(
+        BigInteger.valueOf(9007199254740991L),
+        MicroMoney.parseDecimal("9007199254740991")
+    )
+    assertEquals(BigInteger("9007199254740992"), MicroMoney.parseDecimal("9007199254740992"))
+    assertEquals(MicroMoney.I64_MAX, MicroMoney.parseDecimal("9223372036854775807"))
+    // The served u64 domain is exact end to end.
+    assertEquals(
+        BigInteger("9223372036854775808"),
+        MicroMoney.parseDecimal("9223372036854775808")
+    )
+    assertEquals(MicroMoney.U64_MAX, MicroMoney.parseDecimal("18446744073709551615"))
+    assertEquals(null, MicroMoney.parseDecimal("18446744073709551616"))
+    assertEquals(null, MicroMoney.parseDecimal("-1"))
+    assertEquals(null, MicroMoney.parseDecimal("1e3"))
+    assertEquals(null, MicroMoney.parseDecimal("1.5"))
+    assertEquals(null, MicroMoney.parseDecimal(""))
+    assertEquals(null, MicroMoney.parseDecimal(" 1"))
+
+    // End to end: a string-money billing payload is exact.
+    val usage = parseNativeBillingUsage(creditsPayload("\"9223372036854775807\""))
+    assertEquals(MicroMoney.I64_MAX, usage.credits.heldMicro)
+    assertEquals(
+        BigInteger("9007199254740992"),
+        parseNativeBillingUsage(creditsPayload("\"9007199254740992\"")).credits.heldMicro
+    )
+
+    // 2. Legacy numbers <= 2^53-1 convert exactly.
+    assertEquals(BigInteger.ZERO, MicroMoney.fromNumber(0L))
+    assertEquals(
+        BigInteger.valueOf(9007199254740991L),
+        MicroMoney.fromNumber(9007199254740991L)
+    )
+    assertEquals(
+        BigInteger.valueOf(5_000_000L),
+        parseNativeBillingUsage(BILLING_USAGE_JSON).credits.grantedMicro
+    )
+    // Above 2^53-1 the number is flagged, never rounded.
+    assertEquals(null, MicroMoney.fromNumber(9007199254740992L))
+    assertEquals(null, MicroMoney.fromNumber(-1L))
+    for (text in listOf(
+        creditsPayload("9007199254740992"),
+        creditsPayload("\"12.5\""),
+        creditsPayload("\"-1\"")
+    )) {
+        try {
+            parseNativeBillingUsage(text)
+            fail("an unsafe money value must be rejected: $text")
+        } catch (e: NativeProtocolException) {
+            // expected: loud refusal, never a silent round
+        }
+    }
+    // The limit map is exact too: strings are accepted, unsafe numbers refused.
+    assertEquals(
+        MicroMoney.I64_MAX,
+        parseNativeEntitlements(
+            entitlementsPayload("\"9223372036854775807\"")
+        ).limits["max_managed_spend_micro_per_period"]
+    )
+    try {
+        parseNativeEntitlements(entitlementsPayload("9007199254740992"))
+        fail("an unsafe limit number must be rejected")
+    } catch (e: NativeProtocolException) {
+        // expected
+    }
+
+    // 3. Display is exact: no precision loss, no scientific notation.
+    assertEquals("9223372036854775807\u00b5\$", MicroMoney.microText(MicroMoney.I64_MAX))
+    assertEquals("9223372036854.7758", MicroMoney.usdText(MicroMoney.I64_MAX))
+    assertEquals("1.2346", MicroMoney.usdText(BigInteger.valueOf(1_234_567L)))
+    assertEquals("0.5000", MicroMoney.usdText(BigInteger.valueOf(500_000L)))
+    assertEquals("0.0000", MicroMoney.usdText(BigInteger.ZERO))
+    assertTrue(
+        !MicroMoney.microText(MicroMoney.I64_MAX).contains("e") &&
+            !MicroMoney.microText(MicroMoney.I64_MAX).contains("E"),
+        "money display must never use scientific notation"
+    )
+
+    // 4. Aggregation is exact (never a float, saturating balance).
+    assertEquals(
+        BigInteger("9007199254740992"),
+        BigInteger.valueOf(9007199254740991L) + BigInteger.ONE
+    )
+    assertEquals(
+        MicroMoney.I64_MAX,
+        MicroMoney.balance(MicroMoney.I64_MAX, BigInteger.ONE, BigInteger.ONE)
+    )
+    assertEquals(
+        BigInteger.ZERO,
+        MicroMoney.balance(BigInteger.ZERO, BigInteger.ZERO, BigInteger.valueOf(5L))
+    )
+
+    // 5. Request projection: a number while lossless, else the exact string.
+    assertEquals(
+        "{\"max_cost_micro\":5}",
+        NativeRequests.changeBudget(maxCostMicro = BigInteger.valueOf(5L))
+    )
+    // Above 2^53-1 the request carries the EXACT decimal string.
+    assertEquals(
+        "{\"max_cost_micro\":\"9223372036854775807\"}",
+        NativeRequests.changeBudget(maxCostMicro = MicroMoney.I64_MAX)
+    )
+    assertEquals(
+        "{\"amount_micro\":\"9007199254740992\"}",
+        NativeRequests.grantCredits(BigInteger("9007199254740992"))
+    )
+}
+
+private fun creditsPayload(heldJson: String): String =
+    "{\"ok\":true,\"organization\":\"o\"," +
+        "\"fold\":{\"organization_id\":\"o\",\"totals\":{\"input_tokens\":0," +
+        "\"output_tokens\":0,\"cache_read_tokens\":0,\"cache_write_tokens\":0," +
+        "\"reasoning_tokens\":0,\"provider_cost_micro\":0,\"managed_cost_micro\":0," +
+        "\"byok_cost_micro\":0,\"events\":0,\"corrected_events\":0}," +
+        "\"per_task\":[],\"next_cursor\":null}," +
+        "\"credits\":{\"granted_micro\":0,\"consumed_micro\":0,\"refunded_micro\":0," +
+        "\"held_micro\":$heldJson,\"pending_consumes\":0}," +
+        "\"items\":[],\"nextCursor\":null}"
+
+private fun entitlementsPayload(limitJson: String): String =
+    "{\"ok\":true,\"entitlements\":{\"organization_id\":\"o\",\"plan_found\":true," +
+        "\"subscription_active\":false,\"features\":[]," +
+        "\"limits\":{\"max_managed_spend_micro_per_period\":$limitJson}," +
+        "\"credits\":{\"granted_micro\":0,\"consumed_micro\":0,\"refunded_micro\":0," +
+        "\"held_micro\":0,\"pending_consumes\":0}," +
+        "\"managed_spend_micro\":0,\"byok_spend_micro\":0,\"total_tokens\":0," +
+        "\"in_flight\":[],\"now_ms\":0}}"
 
 private fun assertHostileParsers() {
     val hostile = listOf(
@@ -851,11 +996,16 @@ private fun assertClientRoutes() {
         assertEquals("admin", client.identity().role)
         assertEquals("pro", client.entitlements().planId)
         assertEquals(
-            700_000L,
+            BigInteger.valueOf(700_000L),
             client.billingUsage("org-local", since = "9", limit = 25L).fold.totals.managedCostMicro
         )
         assertEquals("9", client.billingUsage("org-local").nextCursor)
-        assertEquals(false, client.grantCredits(1_000_000L, "selftest-key-1", "top up").duplicate)
+        assertEquals(
+            false,
+            client.grantCredits(
+                BigInteger.valueOf(1_000_000L), "selftest-key-1", "top up"
+            ).duplicate
+        )
         assertEquals(1, client.verification("7").owed.size)
         assertEquals("3", client.taskVerification("7", "3").taskId)
         assertEquals(9L, client.evidence("7", 9).id)

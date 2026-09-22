@@ -16,6 +16,21 @@
 //   - Bounded bodies: responses are read through a streaming byte cap; an
 //     oversized body is cancelled and rejected, never buffered unbounded.
 //   - Bounded time: every request carries an abort-based timeout.
+//   - Exact money: every monetary field (snake_case `*_micro` and the legacy
+//     camelCase `*Micro` projections) is parsed as a `MicroMoney` bigint. The
+//     daemon serializes `*_micro` money as decimal strings; the legacy number
+//     form is tolerated while it is exactly representable (<= 2^53-1) and
+//     refused loudly above that — never silently rounded (see `money.ts`).
+
+import {
+  microFromDecimal,
+  microFromNumber,
+  microWireValue,
+  MICRO_I64_MAX,
+  MICRO_U64_MAX,
+  MICRO_ZERO,
+  type MicroMoney,
+} from './money.ts';
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
@@ -163,6 +178,70 @@ function fInt(object: JsonObject, key: string, path: string): number {
     fail(`${path}.${key}`, `expected an integer, got ${value}`);
   }
   return value;
+}
+
+/**
+ * Parse one exact non-negative integer money/limit value. The daemon's
+ * canonical form for money is a decimal string (exact for the full
+ * u64/i64::MAX range); a legacy JSON number is accepted only while it is
+ * exactly representable (<= 2^53-1) — a larger number has already lost
+ * precision in transit and is refused, never rounded. `noun` only names the
+ * value in the refusal text (money fields vs the limit map).
+ */
+function microValue(value: Json, path: string, noun = 'micro amount'): MicroMoney {
+  if (typeof value === 'string') {
+    const parsed = microFromDecimal(value);
+    if (parsed === null) {
+      fail(
+        path,
+        `expected a decimal ${noun} string in 0..=${MICRO_U64_MAX.toString()}, got ${JSON.stringify(value)}`,
+      );
+    }
+    return parsed;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isInteger(value) || !Number.isFinite(value)) {
+      fail(path, `expected an integer ${noun}, got ${value}`);
+    }
+    if (value < 0) {
+      fail(path, `expected a non-negative ${noun}, got ${value}`);
+    }
+    const parsed = microFromNumber(value);
+    if (parsed === null) {
+      fail(
+        path,
+        `${noun} ${value} arrives as a JSON number above 2^53-1 and is not exactly representable; the daemon must serialize it as a decimal string`,
+      );
+    }
+    return parsed;
+  }
+  fail(
+    path,
+    `expected a decimal ${noun} string or a legacy integer, got ${describe(value)}`,
+  );
+}
+
+function fMicro(object: JsonObject, key: string, path: string): MicroMoney {
+  return microValue(field(object, key, path), `${path}.${key}`);
+}
+
+function fNullableMicro(object: JsonObject, key: string, path: string): MicroMoney | null {
+  const value = field(object, key, path);
+  if (value === null) {
+    return null;
+  }
+  return microValue(value, `${path}.${key}`);
+}
+
+/** Normalize one request-side money input (exact bigint, or number/string). */
+function microInput(value: MicroMoney | number | string, path: string): MicroMoney {
+  if (typeof value === 'bigint') {
+    if (value < MICRO_ZERO || value > MICRO_I64_MAX) {
+      fail(path, `expected a micro amount in 0..=${MICRO_I64_MAX.toString()}, got ${value}`);
+    }
+    return value;
+  }
+  return microValue(value as Json, path);
 }
 
 function fBool(object: JsonObject, key: string, path: string): boolean {
@@ -462,9 +541,9 @@ export interface NativeTaskBudget {
   readonly maxTurns: number | null;
   readonly spentTokens: number | null;
   readonly spentTurns: number | null;
-  readonly maxCostMicro: number | null;
-  readonly spentCostMicro: number;
-  readonly openReservedMicro: number;
+  readonly maxCostMicro: MicroMoney | null;
+  readonly spentCostMicro: MicroMoney;
+  readonly openReservedMicro: MicroMoney;
 }
 
 export interface NativeVerificationFact {
@@ -589,7 +668,7 @@ export interface NativeTournamentCandidate {
   readonly verificationPass: boolean | null;
   readonly reviewRank: string | null;
   readonly reviewer: string | null;
-  readonly costMicro: number;
+  readonly costMicro: MicroMoney;
   readonly wallMs: number;
 }
 
@@ -685,12 +764,12 @@ export interface NativeEventPage {
 
 export interface NativeReservationGroup {
   readonly count: number;
-  readonly predictedMicro: number;
+  readonly predictedMicro: MicroMoney;
 }
 
 export interface NativeReservationSettled extends NativeReservationGroup {
-  readonly spentMicro: number;
-  readonly providerReportedMicro: number;
+  readonly spentMicro: MicroMoney;
+  readonly providerReportedMicro: MicroMoney;
 }
 
 export interface NativeReservations {
@@ -726,11 +805,11 @@ export interface NativeSessionUsage {
 
 export interface NativeUsageTotals {
   readonly sessions: number;
-  readonly totals: { readonly budget: number; readonly spent: number };
+  readonly totals: { readonly budget: MicroMoney; readonly spent: MicroMoney };
   readonly perSession: Array<{
     readonly sessionId: string;
-    readonly budget: number | null;
-    readonly spent: number | null;
+    readonly budget: MicroMoney | null;
+    readonly spent: MicroMoney | null;
   }>;
   readonly durable: {
     readonly sessionsWithCalls: number;
@@ -740,7 +819,7 @@ export interface NativeUsageTotals {
       readonly prefixTokens: number;
       readonly prefixStabilityObservations: number;
     };
-    readonly taskSpend: { readonly settledCostMicro: number };
+    readonly taskSpend: { readonly settledCostMicro: MicroMoney };
     readonly reservations: NativeReservations;
     readonly truncated: boolean;
   };
@@ -763,9 +842,9 @@ export interface NativeUsageBuckets {
   readonly cache_read_tokens: number;
   readonly cache_write_tokens: number;
   readonly reasoning_tokens: number;
-  readonly provider_cost_micro: number;
-  readonly managed_cost_micro: number;
-  readonly byok_cost_micro: number;
+  readonly provider_cost_micro: MicroMoney;
+  readonly managed_cost_micro: MicroMoney;
+  readonly byok_cost_micro: MicroMoney;
   readonly events: number;
   readonly corrected_events: number;
 }
@@ -787,10 +866,10 @@ export interface NativeBillingFold {
 
 /** The free/held credit picture of one organization. */
 export interface NativeCreditBalance {
-  readonly granted_micro: number;
-  readonly consumed_micro: number;
-  readonly refunded_micro: number;
-  readonly held_micro: number;
+  readonly granted_micro: MicroMoney;
+  readonly consumed_micro: MicroMoney;
+  readonly refunded_micro: MicroMoney;
+  readonly held_micro: MicroMoney;
   readonly pending_consumes: number;
 }
 
@@ -830,10 +909,15 @@ export interface NativeEntitlementSnapshot {
   readonly subscription_expires_ms: number | null;
   readonly subscription_active: boolean;
   readonly features: string[];
-  readonly limits: Record<string, number>;
+  /**
+   * Exact integer limit values. A limit whose NAME ends in `_micro` is a
+   * money limit (rendered as micro-USD); every other name is a plain
+   * counter. Values are exact (`bigint`) so a u64 limit never rounds.
+   */
+  readonly limits: Record<string, MicroMoney>;
   readonly credits: NativeCreditBalance;
-  readonly managed_spend_micro: number;
-  readonly byok_spend_micro: number;
+  readonly managed_spend_micro: MicroMoney;
+  readonly byok_spend_micro: MicroMoney;
   readonly total_tokens: number;
   readonly in_flight: NativeInFlightTxn[];
   readonly now_ms: number;
@@ -1084,8 +1168,8 @@ export interface NativeTaskProof {
   readonly cost: {
     readonly status: string;
     readonly reason: string | null;
-    readonly spentCostMicro: number | null;
-    readonly maxCostMicro: number | null;
+    readonly spentCostMicro: MicroMoney | null;
+    readonly maxCostMicro: MicroMoney | null;
     readonly openReservations: number | null;
     readonly settledCount: number | null;
   };
@@ -1179,7 +1263,8 @@ export interface StartTaskRunRequest {
   }>;
   readonly model?: string;
   readonly max_tokens?: number;
-  readonly max_cost_micro?: number;
+  /** Exact micro-USD budget: a number while lossless, else a decimal string. */
+  readonly max_cost_micro?: number | string;
   /** Shadow-only wire vocabulary: the sole accepted value (absent = shadow). */
   readonly mutation_mode?: 'shadow';
   /** Workspace-relative attachment paths (the same vocabulary as a prompt). */
@@ -1440,9 +1525,9 @@ function validateBudget(object: JsonObject, path: string): NativeTaskBudget {
     maxTurns: fNullableInt(object, 'maxTurns', path),
     spentTokens: fNullableInt(object, 'spentTokens', path),
     spentTurns: fNullableInt(object, 'spentTurns', path),
-    maxCostMicro: fNullableInt(object, 'maxCostMicro', path),
-    spentCostMicro: fInt(object, 'spentCostMicro', path),
-    openReservedMicro: fInt(object, 'openReservedMicro', path),
+    maxCostMicro: fNullableMicro(object, 'maxCostMicro', path),
+    spentCostMicro: fMicro(object, 'spentCostMicro', path),
+    openReservedMicro: fMicro(object, 'openReservedMicro', path),
   };
 }
 
@@ -1921,7 +2006,7 @@ function validateTournamentCandidate(
         : fBool(object, 'verification_pass', path),
     reviewRank,
     reviewer,
-    costMicro: fInt(object, 'cost_micro', path),
+    costMicro: fMicro(object, 'cost_micro', path),
     wallMs: fInt(object, 'wall_ms', path),
   };
 }
@@ -2170,7 +2255,7 @@ function validateReservationGroup(object: JsonObject, path: string): NativeReser
   checkResponseKeys(object, path, ['count', 'predictedMicro']);
   return {
     count: fInt(object, 'count', path),
-    predictedMicro: fInt(object, 'predictedMicro', path),
+    predictedMicro: fMicro(object, 'predictedMicro', path),
   };
 }
 
@@ -2187,9 +2272,9 @@ function validateReservations(object: JsonObject, path: string): NativeReservati
     ),
     settled: {
       count: fInt(settled, 'count', `${path}.settled`),
-      predictedMicro: fInt(settled, 'predictedMicro', `${path}.settled`),
-      spentMicro: fInt(settled, 'spentMicro', `${path}.settled`),
-      providerReportedMicro: fInt(settled, 'providerReportedMicro', `${path}.settled`),
+      predictedMicro: fMicro(settled, 'predictedMicro', `${path}.settled`),
+      spentMicro: fMicro(settled, 'spentMicro', `${path}.settled`),
+      providerReportedMicro: fMicro(settled, 'providerReportedMicro', `${path}.settled`),
     },
     refunded: validateReservationGroup(
       asObject(field(object, 'refunded', path), `${path}.refunded`),
@@ -2276,16 +2361,16 @@ export function validateUsage(json: Json): NativeUsageTotals {
   return {
     sessions: fInt(object, 'sessions', path),
     totals: {
-      budget: fInt(totals, 'budget', `${path}.totals`),
-      spent: fInt(totals, 'spent', `${path}.totals`),
+      budget: fMicro(totals, 'budget', `${path}.totals`),
+      spent: fMicro(totals, 'spent', `${path}.totals`),
     },
     perSession: fObjectArray(object, 'perSession', path).map((entry, index) => {
       const itemPath = `${path}.perSession[${index}]`;
       checkResponseKeys(entry, itemPath, ['sessionId', 'budget', 'spent']);
       return {
         sessionId: fString(entry, 'sessionId', itemPath),
-        budget: fNullableInt(entry, 'budget', itemPath),
-        spent: fNullableInt(entry, 'spent', itemPath),
+        budget: fNullableMicro(entry, 'budget', itemPath),
+        spent: fNullableMicro(entry, 'spent', itemPath),
       };
     }),
     durable: {
@@ -2301,7 +2386,7 @@ export function validateUsage(json: Json): NativeUsageTotals {
         ),
       },
       taskSpend: {
-        settledCostMicro: fInt(taskSpend, 'settledCostMicro', `${path}.durable.taskSpend`),
+        settledCostMicro: fMicro(taskSpend, 'settledCostMicro', `${path}.durable.taskSpend`),
       },
       reservations: validateReservations(
         asObject(field(durable, 'reservations', path), `${path}.durable.reservations`),
@@ -2331,9 +2416,9 @@ function validateUsageBuckets(object: JsonObject, path: string): NativeUsageBuck
     cache_read_tokens: fInt(object, 'cache_read_tokens', path),
     cache_write_tokens: fInt(object, 'cache_write_tokens', path),
     reasoning_tokens: fInt(object, 'reasoning_tokens', path),
-    provider_cost_micro: fInt(object, 'provider_cost_micro', path),
-    managed_cost_micro: fInt(object, 'managed_cost_micro', path),
-    byok_cost_micro: fInt(object, 'byok_cost_micro', path),
+    provider_cost_micro: fMicro(object, 'provider_cost_micro', path),
+    managed_cost_micro: fMicro(object, 'managed_cost_micro', path),
+    byok_cost_micro: fMicro(object, 'byok_cost_micro', path),
     events: fInt(object, 'events', path),
     corrected_events: fInt(object, 'corrected_events', path),
   };
@@ -2348,10 +2433,10 @@ export function validateCreditBalance(object: JsonObject, path: string): NativeC
     'pending_consumes',
   ]);
   return {
-    granted_micro: fInt(object, 'granted_micro', path),
-    consumed_micro: fInt(object, 'consumed_micro', path),
-    refunded_micro: fInt(object, 'refunded_micro', path),
-    held_micro: fInt(object, 'held_micro', path),
+    granted_micro: fMicro(object, 'granted_micro', path),
+    consumed_micro: fMicro(object, 'consumed_micro', path),
+    refunded_micro: fMicro(object, 'refunded_micro', path),
+    held_micro: fMicro(object, 'held_micro', path),
     pending_consumes: fInt(object, 'pending_consumes', path),
   };
 }
@@ -2421,15 +2506,17 @@ export function validateEntitlements(json: Json): NativeEntitlements {
     'now_ms',
   ]);
   const limitsObject = asObject(field(view, 'limits', `${path}.entitlements`), `${path}.entitlements.limits`);
-  const limits: Record<string, number> = {};
+  const limits: Record<string, MicroMoney> = {};
   for (const [name, value] of Object.entries(limitsObject)) {
-    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
-      fail(
-        `${path}.entitlements.limits.${name}`,
-        `expected a non-negative integer, got ${describe(value)}`,
-      );
-    }
-    limits[name] = value;
+    // Every limit value is an exact integer: a `*_micro` name is money and
+    // the rest are counters, but a u64 limit must never round in either case.
+    // The canonical form is a decimal string; a legacy number is accepted
+    // only while exactly representable (the shared microValue rule).
+    limits[name] = microValue(
+      value as Json,
+      `${path}.entitlements.limits.${name}`,
+      'limit',
+    );
   }
   return {
     ok: fBool(object, 'ok', path),
@@ -2447,8 +2534,8 @@ export function validateEntitlements(json: Json): NativeEntitlements {
         asObject(field(view, 'credits', `${path}.entitlements`), `${path}.entitlements.credits`),
         `${path}.entitlements.credits`,
       ),
-      managed_spend_micro: fInt(view, 'managed_spend_micro', `${path}.entitlements`),
-      byok_spend_micro: fInt(view, 'byok_spend_micro', `${path}.entitlements`),
+      managed_spend_micro: fMicro(view, 'managed_spend_micro', `${path}.entitlements`),
+      byok_spend_micro: fMicro(view, 'byok_spend_micro', `${path}.entitlements`),
       total_tokens: fInt(view, 'total_tokens', `${path}.entitlements`),
       in_flight: fObjectArray(view, 'in_flight', `${path}.entitlements`).map((entry, index) => {
         const itemPath = `${path}.entitlements.in_flight[${index}]`;
@@ -2783,8 +2870,8 @@ export function validateTaskProof(json: Json): NativeTaskProof {
     cost: {
       status: fString(cost, 'status', `${path}.cost`),
       reason: fNullableString(cost, 'reason', `${path}.cost`),
-      spentCostMicro: fNullableInt(cost, 'spentCostMicro', `${path}.cost`),
-      maxCostMicro: fNullableInt(cost, 'maxCostMicro', `${path}.cost`),
+      spentCostMicro: fNullableMicro(cost, 'spentCostMicro', `${path}.cost`),
+      maxCostMicro: fNullableMicro(cost, 'maxCostMicro', `${path}.cost`),
       openReservations: fNullableInt(cost, 'openReservations', `${path}.cost`),
       settledCount: fNullableInt(cost, 'settledCount', `${path}.cost`),
     },
@@ -3426,10 +3513,18 @@ export class NativeClient {
 
   setAgentBudget(
     childId: string,
-    budget: { max_tokens?: number; max_cost_micro?: number },
+    budget: { max_tokens?: number; max_cost_micro?: MicroMoney | number | string },
   ): Promise<NativeAgentControlAck> {
+    const body: { max_tokens?: number; max_cost_micro?: number | string } = {
+      ...(budget.max_tokens !== undefined ? { max_tokens: budget.max_tokens } : {}),
+    };
+    if (budget.max_cost_micro !== undefined) {
+      body.max_cost_micro = microWireValue(
+        microInput(budget.max_cost_micro, 'POST /native/agents/{child}/budget.max_cost_micro'),
+      );
+    }
     return this.request('POST', `/native/agents/${encodeURIComponent(childId)}/budget`, {
-      body: { ...budget },
+      body,
       validate: (json, path) => validateAgentControlAck(json, path),
     });
   }
@@ -3646,10 +3741,12 @@ export class NativeClient {
    * Grant credits to the caller organization's billing account (admin role
    * only; the server is the guard). The `Idempotency-Key` header is required
    * by the daemon: the same key + same request replays the recorded result
-   * (`duplicate: true`) instead of appending a second grant.
+   * (`duplicate: true`) instead of appending a second grant. The amount is
+   * exact: a bigint is sent as a JSON number while lossless and as the exact
+   * decimal string above 2^53-1 (never a rounded number).
    */
   grantCredits(request: {
-    amountMicro: number;
+    amountMicro: MicroMoney | number | string;
     reason?: string;
     accountId?: string;
     idempotencyKey: string;
@@ -3660,10 +3757,11 @@ export class NativeClient {
         'an idempotency key is required for a credit grant',
       );
     }
+    const amountMicro = microInput(request.amountMicro, 'POST /native/credits/grant.amount_micro');
     return this.request('POST', '/native/credits/grant', {
       headers: { 'idempotency-key': request.idempotencyKey },
       body: {
-        amount_micro: request.amountMicro,
+        amount_micro: microWireValue(amountMicro),
         ...(request.reason !== undefined && request.reason.length > 0
           ? { reason: request.reason }
           : {}),

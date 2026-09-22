@@ -9,6 +9,7 @@ package dev.faktor.frontend
 import dev.faktor.backend.BackendConnection
 import dev.faktor.backend.BackendProcessManager
 import dev.faktor.backend.NativeClient
+import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeApiException
 import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativeMessage
@@ -35,6 +36,7 @@ import dev.faktor.shared.parseNativeTournamentStarted
 import dev.faktor.shared.parseNativeTournamentSummaries
 import dev.faktor.shared.parseNativeVerificationView
 import java.awt.image.BufferedImage
+import java.math.BigInteger
 import java.nio.file.Files
 import java.nio.file.Paths
 
@@ -404,6 +406,33 @@ private const val MEMBER_IDENTITY_JSON = "{" +
     "}"
 
 // -------------------------------------------------------------------- smoke
+
+/**
+ * One exact-money billing usage payload: string `*_micro` money at the whole
+ * i64::MAX range (the daemon's canonical form after the protocol change).
+ */
+private fun moneyUsageJson(managed: String, granted: String): String =
+    "{\"ok\":true,\"organization\":\"org-local\"," +
+        "\"fold\":{\"organization_id\":\"org-local\",\"totals\":{" +
+        "\"input_tokens\":1,\"output_tokens\":0,\"cache_read_tokens\":0," +
+        "\"cache_write_tokens\":0,\"reasoning_tokens\":0," +
+        "\"provider_cost_micro\":\"$managed\",\"managed_cost_micro\":\"$managed\"," +
+        "\"byok_cost_micro\":\"0\",\"events\":1,\"corrected_events\":0}," +
+        "\"per_task\":[],\"next_cursor\":null}," +
+        "\"credits\":{\"granted_micro\":\"$granted\",\"consumed_micro\":\"1\"," +
+        "\"refunded_micro\":\"1\",\"held_micro\":\"0\",\"pending_consumes\":0}," +
+        "\"items\":[],\"nextCursor\":null}"
+
+/** One exact-money entitlement snapshot (string limits and spend). */
+private fun moneyEntitlementsJson(managed: String, limit: String, floor: String): String =
+    "{\"ok\":true,\"entitlements\":{\"organization_id\":\"org-local\"," +
+        "\"plan_found\":true,\"subscription_active\":true,\"features\":[]," +
+        "\"limits\":{\"max_managed_spend_micro_per_period\":\"$limit\"," +
+        "\"min_credit_balance_micro\":\"$floor\"}," +
+        "\"credits\":{\"granted_micro\":\"$managed\",\"consumed_micro\":\"1\"," +
+        "\"refunded_micro\":\"1\",\"held_micro\":\"0\",\"pending_consumes\":0}," +
+        "\"managed_spend_micro\":\"$managed\",\"byok_spend_micro\":\"0\"," +
+        "\"total_tokens\":1,\"in_flight\":[],\"now_ms\":0}}"
 
 object FrontendSmoke {
 
@@ -1153,7 +1182,7 @@ object FrontendSmoke {
             assertEquals("review-bot", proof.reviewer)
             assertEquals(true, proof.landedEqualsVerified)
             assertEquals("pr-42", proof.pullRequestId)
-            assertEquals(12L, proof.spentCostMicro)
+            assertEquals(BigInteger.valueOf(12L), proof.spentCostMicro)
             assertEquals(2, proof.steps.size)
 
             val model = TaskTree.build(task = task, proof = proof)
@@ -1229,18 +1258,18 @@ object FrontendSmoke {
         step("commercial metering parses: usage fold, entitlements, identity") {
             val usage = parseNativeBillingUsage(BILLING_USAGE_JSON)
             assertEquals("org-local", usage.organization)
-            assertEquals(700_000L, usage.fold.totals.managedCostMicro)
-            assertEquals(200_000L, usage.fold.totals.byokCostMicro)
+            assertEquals(BigInteger.valueOf(700_000L), usage.fold.totals.managedCostMicro)
+            assertEquals(BigInteger.valueOf(200_000L), usage.fold.totals.byokCostMicro)
             assertEquals(1_775L, usage.fold.totals.totalTokens())
             assertEquals(3L, usage.fold.perTask[0].taskId)
-            assertEquals(3_100_000L, usage.credits.balanceMicro())
+            assertEquals(BigInteger.valueOf(3_100_000L), usage.credits.balanceMicro())
             assertEquals(1, usage.itemCount)
             assertEquals("9", usage.nextCursor)
             val entitlements = parseNativeEntitlements(ENTITLEMENTS_JSON)
             assertEquals("pro", entitlements.planId)
             assertEquals(true, entitlements.planFound)
             assertEquals(true, entitlements.subscriptionActive)
-            assertEquals(100_000L, entitlements.limits[USAGE_LIMIT_MAX_TOKENS])
+            assertEquals(BigInteger.valueOf(100_000L), entitlements.limits[USAGE_LIMIT_MAX_TOKENS])
             assertEquals(4, entitlements.limits.size)
             assertEquals(1, entitlements.inFlight.size)
             assertEquals(null, entitlements.inFlight[0].endedMs)
@@ -1262,16 +1291,16 @@ object FrontendSmoke {
             assertEquals("org-local", model.organization)
             assertEquals("pro", model.planId)
             assertEquals(1_775L, model.totals?.totalTokens())
-            assertEquals(3_100_000L, model.credits?.balanceMicro())
-            assertEquals(250_000L, model.credits?.heldMicro)
+            assertEquals(BigInteger.valueOf(3_100_000L), model.credits?.balanceMicro())
+            assertEquals(BigInteger.valueOf(250_000L), model.credits?.heldMicro)
             assertEquals("active", model.subscription)
             assertEquals(1, model.tasks.size)
             assertEquals(1, model.inFlight.size)
             assertEquals(1, model.itemCount)
             assertEquals("9", model.nextCursor)
             val tokensQuota = model.quotas.first { it.limit == USAGE_LIMIT_MAX_TOKENS }
-            assertEquals(100_000L, tokensQuota.value)
-            assertEquals(1_775L, tokensQuota.observed)
+            assertEquals(BigInteger.valueOf(100_000L), tokensQuota.value)
+            assertEquals(BigInteger.valueOf(1_775L), tokensQuota.observed)
             assertEquals(false, tokensQuota.exceeded)
             // An unserved observed counter is null, never a fabricated zero.
             val unserved = model.quotas.first { it.limit == USAGE_LIMIT_ACTIVE_TASKS }
@@ -1361,7 +1390,10 @@ object FrontendSmoke {
             )
             val over = usagePanelModelOf(
                 identity,
-                entitlements.copy(totalTokens = 250_000L, managedSpendMicro = 1_000_000L),
+                entitlements.copy(
+                    totalTokens = 250_000L,
+                    managedSpendMicro = BigInteger.valueOf(1_000_000L)
+                ),
                 usage, null, null, null, false
             )
             assertTrue(over.quotas.any { it.limit == USAGE_LIMIT_MAX_TOKENS && it.exceeded == true })
@@ -1373,7 +1405,9 @@ object FrontendSmoke {
                 identity,
                 entitlements.copy(
                     credits = entitlements.credits.copy(
-                        grantedMicro = 100, consumedMicro = 50, refundedMicro = 0
+                        grantedMicro = BigInteger.valueOf(100L),
+                        consumedMicro = BigInteger.valueOf(50L),
+                        refundedMicro = BigInteger.ZERO
                     )
                 ),
                 usage, null, null, null, false
@@ -1502,6 +1536,86 @@ object FrontendSmoke {
                 malformed.lines().none { it.contains("\u00b5") },
                 "no fabricated numbers: ${malformed.lines()}"
             )
+        }
+
+        step("money is exact: string forms, unsafe-number refusal, display, aggregation") {
+            val identity = parseNativeIdentity(IDENTITY_JSON)
+            val bigUsage = parseNativeBillingUsage(
+                moneyUsageJson(
+                    managed = "9223372036854775806",
+                    granted = "9223372036854775807"
+                )
+            )
+            val bigEntitlements = parseNativeEntitlements(
+                moneyEntitlementsJson(
+                    managed = "9223372036854775806",
+                    limit = "9223372036854775807",
+                    floor = "9007199254740993"
+                )
+            )
+            val model = usagePanelModelOf(
+                identity, bigEntitlements, bigUsage, null, null, null, false
+            )
+            assertEquals("ok", model.state)
+            assertEquals(MicroMoney.I64_MAX, model.credits?.balanceMicro())
+            val lines = model.lines()
+            assertTrue(
+                lines.any { it.contains("credits balance 9223372036854775807\u00b5\$") },
+                lines.toString()
+            )
+            assertTrue(
+                lines.any { it.contains("managed 9223372036854775806\u00b5\$") },
+                lines.toString()
+            )
+            assertTrue(
+                lines.none { it.contains("E") && it.contains("\u00b5") },
+                "money display must never use scientific notation: $lines"
+            )
+            val managed = model.quotas.first { it.limit == USAGE_LIMIT_MANAGED_SPEND }
+            assertEquals(BigInteger("9223372036854775806"), managed.observed)
+            assertEquals(MicroMoney.I64_MAX, managed.value)
+            assertEquals(false, managed.exceeded)
+            val floor = model.quotas.first { it.limit == USAGE_LIMIT_MIN_CREDIT }
+            assertEquals(false, floor.exceeded)
+
+            // 2^53 vs 2^53+1: a float parse would collapse the pair and flip
+            // the verdict; the exact BigInteger compare keeps them apart.
+            val near = usagePanelModelOf(
+                identity,
+                parseNativeEntitlements(
+                    moneyEntitlementsJson(
+                        managed = "9007199254740992",
+                        limit = "9007199254740993",
+                        floor = "0"
+                    )
+                ),
+                parseNativeBillingUsage(
+                    moneyUsageJson(managed = "9007199254740992", granted = "9007199254740992")
+                ),
+                null, null, null, false
+            )
+            val nearQuota = near.quotas.first { it.limit == USAGE_LIMIT_MANAGED_SPEND }
+            assertEquals(BigInteger("9007199254740992"), nearQuota.observed)
+            assertEquals(BigInteger("9007199254740993"), nearQuota.value)
+            assertEquals(false, nearQuota.exceeded)
+
+            // Aggregation: two i64::MAX spends sum exactly (no Long overflow).
+            val sum = TaskTree.build(
+                usage = parseNativeSessionUsage(
+                    "{\"sessionId\":\"1\",\"providerCalls\":{\"tokens\":0," +
+                        "\"prefixObservations\":[]},\"prefixStability\":null,\"tasks\":[" +
+                        "{\"taskId\":\"3\",\"budget\":{\"spentCostMicro\":" +
+                        "\"9223372036854775807\",\"openReservedMicro\":\"1\"}}," +
+                        "{\"taskId\":\"4\",\"budget\":{\"spentCostMicro\":" +
+                        "\"9223372036854775807\",\"openReservedMicro\":\"1\"}}]}"
+                )
+            )
+            assertEquals(
+                BigInteger("18446744073709551614"),
+                sum.spend?.spentCostMicro,
+                "exact BigInteger aggregation past the Long range"
+            )
+            assertEquals(BigInteger.valueOf(2L), sum.spend?.openReservedMicro)
         }
 
         step("every new UI section is constructible from the mock payload") {
