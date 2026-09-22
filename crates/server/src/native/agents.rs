@@ -520,6 +520,9 @@ pub(crate) struct NativeModelBody {
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeBudgetBody {
     max_tokens: Option<u64>,
+    /// Money input: decimal string or legacy JSON integer (see
+    /// `faktor_cloud::money`).
+    #[serde(default, with = "faktor_cloud::money::option")]
     max_cost_micro: Option<u64>,
 }
 

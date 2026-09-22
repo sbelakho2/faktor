@@ -261,7 +261,7 @@ mod tests {
         let balance = service.credit_balance(&organization).unwrap();
         assert_eq!(balance.pending_consumes, 1);
         assert_eq!(balance.held_micro, 400);
-        assert_eq!(balance.balance_micro(), 600);
+        assert_eq!(balance.balance_micro().unwrap(), 600);
     }
 
     #[test]
@@ -279,7 +279,7 @@ mod tests {
             balance.consumed_micro, 260,
             "the debt is the ACTUAL, not the estimate"
         );
-        assert_eq!(balance.balance_micro(), 740);
+        assert_eq!(balance.balance_micro().unwrap(), 740);
     }
 
     #[test]
@@ -298,7 +298,7 @@ mod tests {
         // stays recorded (audit trail) while the free balance is fully
         // restored.
         assert_eq!(balance.refunded_micro, 400);
-        assert_eq!(balance.balance_micro(), 1_000);
+        assert_eq!(balance.balance_micro().unwrap(), 1_000);
     }
 
     #[test]

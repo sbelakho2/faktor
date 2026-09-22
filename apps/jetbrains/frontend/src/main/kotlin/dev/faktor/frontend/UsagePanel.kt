@@ -10,6 +10,7 @@
 // fabricated behind it. Actions are delivered to a Listener.
 package dev.faktor.frontend
 
+import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeBillingTaskUsage
 import dev.faktor.shared.NativeBillingUsage
 import dev.faktor.shared.NativeCreditBalance
@@ -18,6 +19,7 @@ import dev.faktor.shared.NativeIdentity
 import dev.faktor.shared.NativeInFlightTxn
 import dev.faktor.shared.NativeUsageBuckets
 import java.awt.BorderLayout
+import java.math.BigInteger
 import java.awt.FlowLayout
 import javax.swing.JButton
 import javax.swing.JLabel
@@ -35,8 +37,9 @@ const val USAGE_LIMIT_ATTEMPTS_PER_TASK = "max_provider_attempts_per_task"
 /** One quota/limit row; a `ceiling` breaches at/above, a `floor` below. */
 data class UsageQuotaRow(
     val limit: String,
-    val value: Long,
-    val observed: Long?,
+    /** Exact limit value (money for a `*_micro` name, else a counter). */
+    val value: BigInteger,
+    val observed: BigInteger?,
     val exceeded: Boolean?,
     val kind: String,
     val reason: String?
@@ -46,7 +49,7 @@ data class UsageQuotaRow(
         val head = if (exceeded == true) "[EXCEEDED] " else ""
         val observedText = observed ?: return head +
             "quota $limit — limit $value (observed not served: ${reason ?: "unavailable"})"
-        val unit = if (limit == USAGE_LIMIT_MANAGED_SPEND || limit == USAGE_LIMIT_MIN_CREDIT) {
+        val unit = if (MicroMoney.isMicroLimitName(limit)) {
             micro(observedText) + " / limit $value"
         } else {
             "$observedText / limit $value"
@@ -177,7 +180,8 @@ data class UsagePanelModel(
     }
 }
 
-fun micro(value: Long): String = "$value\u00b5\$"
+/** Exact micro-unit display of one money value (never scientific notation). */
+fun micro(value: BigInteger): String = MicroMoney.microText(value)
 
 private fun utcSeconds(ms: Long): String {
     val instant = java.time.Instant.ofEpochMilli(ms)
@@ -289,14 +293,15 @@ private fun subscriptionOf(snapshot: NativeEntitlementSnapshot?): SubscriptionVi
 private fun quotaRowsOf(snapshot: NativeEntitlementSnapshot): List<UsageQuotaRow> {
     val rows = ArrayList<UsageQuotaRow>()
     for ((limit, value) in snapshot.limits.entries.sortedBy { it.key }) {
-        var observed: Long? = null
+        var observed: BigInteger? = null
         var reason: String? = null
         when (limit) {
-            USAGE_LIMIT_MAX_TOKENS -> observed = snapshot.totalTokens
+            USAGE_LIMIT_MAX_TOKENS -> observed = BigInteger.valueOf(snapshot.totalTokens)
             USAGE_LIMIT_MANAGED_SPEND -> observed = snapshot.managedSpendMicro
             USAGE_LIMIT_MIN_CREDIT -> observed = snapshot.credits.balanceMicro()
             else -> reason = "no observed counter is served for this limit"
         }
+        // Exact BigInteger comparison: a u64 money limit never rounds.
         val floor = limit == USAGE_LIMIT_MIN_CREDIT
         val exceeded = if (observed == null) null else if (floor) observed < value else observed >= value
         rows.add(

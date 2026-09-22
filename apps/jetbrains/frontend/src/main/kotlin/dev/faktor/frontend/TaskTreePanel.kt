@@ -11,6 +11,7 @@ import java.awt.BorderLayout
 import java.awt.Component
 import java.awt.Font
 import java.awt.GridLayout
+import java.math.BigInteger
 import javax.swing.JLabel
 import javax.swing.JPanel
 import javax.swing.JScrollPane
@@ -314,9 +315,14 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         if (spend == null) return "spend: -"
         val tokens = "${spend.spentTokens ?: 0}/${spend.maxTokens ?: "unlimited"}" +
             (spend.remainingTokens?.let { " remaining $it" } ?: "")
-        val cost = "${spend.spentCostMicro ?: 0}/${spend.maxCostMicro ?: "unlimited"} micro" +
+        val cost = "${spend.spentCostMicro ?: BigInteger.ZERO}/" +
+            "${spend.maxCostMicro ?: "unlimited"} micro" +
             (spend.remainingCostMicro?.let { " remaining $it" } ?: "")
-        val open = if (spend.openReservedMicro > 0) " openReserved=${spend.openReservedMicro}" else ""
+        val open = if (spend.openReservedMicro.signum() > 0) {
+            " openReserved=${spend.openReservedMicro}"
+        } else {
+            ""
+        }
         return "spend (${if (spend.durable) "durable" else "estimate"}): tokens $tokens; cost $cost$open"
     }
 
@@ -364,7 +370,8 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         text.append(" worktree=").append(child.worktreeId)
         text.append(" tokens=").append(child.spentTokens ?: 0).append("/").append(child.budgetMaxTokens ?: "unlimited")
         if (child.remainingTokens != null) text.append(" remaining=").append(child.remainingTokens)
-        text.append(" cost=").append(child.spentCostMicro ?: 0).append("/").append(child.maxCostMicro ?: "unlimited")
+        text.append(" cost=").append(child.spentCostMicro ?: BigInteger.ZERO)
+            .append("/").append(child.maxCostMicro ?: "unlimited")
         child.blocker?.let { blocker ->
             text.append(" blocker=").append(blocker.kind).append(": ").append(bound(blocker.reason, 80))
         }

@@ -437,10 +437,10 @@ async fn verified_story_is_served_in_one_strict_payload() {
     assert_eq!(body["publication"]["pullRequest"]["id"], "pr-42");
     assert_eq!(body["publication"]["pullRequest"]["headOid"], oid('2'));
 
-    // Cost fold.
+    // Cost fold: money fields are decimal strings on the wire.
     assert_eq!(body["cost"]["status"], "known");
-    assert_eq!(body["cost"]["maxCostMicro"], 1_000_000);
-    assert_eq!(body["cost"]["spentCostMicro"], 12);
+    assert_eq!(body["cost"]["maxCostMicro"], "1000000");
+    assert_eq!(body["cost"]["spentCostMicro"], "12");
     assert_eq!(body["cost"]["settledCount"], 1);
     assert_eq!(body["cost"]["openReservations"], 0);
 

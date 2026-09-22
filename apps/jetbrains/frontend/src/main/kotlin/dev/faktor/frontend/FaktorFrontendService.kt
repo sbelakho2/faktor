@@ -57,6 +57,7 @@ import dev.faktor.shared.NativeTournamentStarted
 import dev.faktor.shared.NativeTournamentSummary
 import dev.faktor.shared.NativeUsageTotals
 import dev.faktor.shared.NativeVerificationView
+import java.math.BigInteger
 import java.nio.file.Path
 
 /**
@@ -378,7 +379,7 @@ class FaktorFrontendService(
         criteria: List<String>? = null,
         model: String? = null,
         maxTokens: Long? = null,
-        maxCostMicro: Long? = null,
+        maxCostMicro: BigInteger? = null,
         mutationMode: String? = null,
         files: List<String>? = null,
         completionContract: NativeCompletionContract? = null
@@ -408,7 +409,7 @@ class FaktorFrontendService(
         n: Int,
         model: String? = null,
         maxTokens: Long? = null,
-        maxCostMicro: Long? = null,
+        maxCostMicro: BigInteger? = null,
         files: List<String>? = null
     ): NativeTournamentStarted = clientOrThrow().startTournament(
         requireSession(), goal, criteria, n, model, maxTokens, maxCostMicro, null, files
@@ -486,7 +487,7 @@ class FaktorFrontendService(
     fun setAgentBudget(
         childId: String,
         maxTokens: Long? = null,
-        maxCostMicro: Long? = null
+        maxCostMicro: BigInteger? = null
     ): NativeAgentControlAck = clientOrThrow().setAgentBudget(childId, maxTokens, maxCostMicro)
 
     /** Durable foreground/background presentation transition of one child. */
@@ -519,7 +520,7 @@ class FaktorFrontendService(
 
     /** Admin-only, idempotency-keyed credit grant (the server is the guard). */
     fun grantCredits(
-        amountMicro: Long,
+        amountMicro: BigInteger,
         idempotencyKey: String,
         reason: String? = null
     ): NativeCreditGrant =

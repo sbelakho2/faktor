@@ -2,6 +2,7 @@
 //! secret, and `NotFound` for a foreign tenant is indistinguishable from
 //! `NotFound` for a nonexistent row (no existence leak).
 
+use crate::billing::CreditLedgerError;
 use crate::store::CloudStoreError;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -20,6 +21,12 @@ pub enum ControlPlaneError {
     Conflict(String),
     #[error("control-plane store unavailable: {0}")]
     Backend(String),
+    /// An authoritative ledger fold refused: an aggregate left the `u64`
+    /// domain (typed overflow naming the field) or the ledger violates its
+    /// own invariants. Money never saturates, so this is a typed refusal —
+    /// never a silently flattened total.
+    #[error(transparent)]
+    Ledger(#[from] CreditLedgerError),
 }
 
 impl ControlPlaneError {
@@ -32,6 +39,7 @@ impl ControlPlaneError {
             ControlPlaneError::Forbidden(_) => "permission_denied",
             ControlPlaneError::Conflict(_) => "conflict",
             ControlPlaneError::Backend(_) => "internal",
+            ControlPlaneError::Ledger(_) => "ledger_refused",
         }
     }
 
@@ -43,6 +51,7 @@ impl ControlPlaneError {
             ControlPlaneError::Unauthorized(_) => 401,
             ControlPlaneError::Forbidden(_) => 403,
             ControlPlaneError::Conflict(_) => 409,
+            ControlPlaneError::Ledger(_) => 500,
         }
     }
 

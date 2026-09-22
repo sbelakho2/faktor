@@ -165,6 +165,9 @@ pub(crate) struct StartTaskRunRequest {
     ownership: Option<faktor_orchestrator::OwnershipModel>,
     model: Option<String>,
     max_tokens: Option<u64>,
+    /// Money input: decimal string or legacy JSON integer (see
+    /// `faktor_cloud::money`).
+    #[serde(default, with = "faktor_cloud::money::option")]
     max_cost_micro: Option<u64>,
     mutation_mode: Option<faktor_orchestrator::runtime::task_executor::MutationMode>,
     routing_mode: Option<faktor_core::model::RoutingMode>,
@@ -495,6 +498,9 @@ pub(crate) struct StartTournamentRequest {
     n: usize,
     model: Option<String>,
     max_tokens: Option<u64>,
+    /// Money input: decimal string or legacy JSON integer (see
+    /// `faktor_cloud::money`).
+    #[serde(default, with = "faktor_cloud::money::option")]
     max_cost_micro: Option<u64>,
     mutation_mode: Option<faktor_orchestrator::runtime::task_executor::MutationMode>,
     files: Option<Vec<String>>,
@@ -581,15 +587,27 @@ pub(crate) async fn native_tournament_start(
         .tasks
         .tournament_state(sid, &receipt.tournament_id)
     {
-        Ok(tournament) => Json(serde_json::json!({
+        Ok(tournament) => money_json(serde_json::json!({
             "tournament_id": receipt.tournament_id,
             "run_id": receipt.run_id,
             "candidates": receipt.candidates,
             "state": tournament.state,
             "winner": tournament.winner,
-        }))
-        .into_response(),
+        })),
         Err(e) => exec_error_response(&e),
+    }
+}
+
+/// Serialize one durable tournament (its candidates carry `cost_micro`)
+/// through the native money encoding: money-named keys are decimal strings
+/// even though the orchestrator's own serde shape is shared with durable
+/// ledger rows.
+fn tournament_json(tournament: &faktor_orchestrator::tournament::Tournament) -> Response {
+    match serde_json::to_value(tournament) {
+        Ok(value) => money_json(value),
+        Err(e) => wire_status(internal_graph_err(format!(
+            "tournament state serialization: {e}"
+        ))),
     }
 }
 
@@ -614,7 +632,7 @@ pub(crate) async fn native_tournament_state(
         .tasks
         .tournament_state(handle.id(), &tournament_id)
     {
-        Ok(tournament) => Json(tournament).into_response(),
+        Ok(tournament) => tournament_json(&tournament),
         Err(e) => exec_error_response(&e),
     }
 }
@@ -754,7 +772,7 @@ pub(crate) async fn native_tournament_abort(
         .tasks
         .abort_tournament(handle.id(), &tournament_id, &reason)
     {
-        Ok(tournament) => Json(tournament).into_response(),
+        Ok(tournament) => tournament_json(&tournament),
         Err(e) => exec_error_response(&e),
     }
 }
@@ -1002,5 +1020,117 @@ mod completion_contract_dto_tests {
             "completion_contracts": {"include_commit": true},
         }));
         assert!(err.contains("unknown field"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod money_dto_tests {
+    //! The `max_cost_micro` inputs accept the wire decimal string AND the
+    //! legacy JSON integer at every boundary; malformed, negative and
+    //! overflowing forms are typed serde errors (the handlers map them to
+    //! plain 400s). See `faktor_cloud::money` for the encoding rule.
+    use super::{StartTaskRunRequest, StartTournamentRequest};
+    use crate::native::agents::NativeBudgetBody;
+
+    const BOUNDARIES: [u64; 4] = [0, (1 << 53) - 1, 1 << 53, i64::MAX as u64];
+
+    #[test]
+    fn max_cost_micro_accepts_decimal_strings_and_legacy_numbers() {
+        for amount in BOUNDARIES {
+            let req: StartTaskRunRequest = serde_json::from_value(serde_json::json!({
+                "goal": "g",
+                "max_cost_micro": amount.to_string(),
+            }))
+            .unwrap();
+            assert_eq!(req.max_cost_micro, Some(amount), "string form");
+            let req: StartTaskRunRequest = serde_json::from_value(serde_json::json!({
+                "goal": "g",
+                "max_cost_micro": amount,
+            }))
+            .unwrap();
+            assert_eq!(req.max_cost_micro, Some(amount), "legacy number form");
+            let req: StartTaskRunRequest =
+                serde_json::from_value(serde_json::json!({"goal": "g"})).unwrap();
+            assert_eq!(req.max_cost_micro, None, "absent = no cap");
+            let req: StartTaskRunRequest = serde_json::from_value(serde_json::json!({
+                "goal": "g",
+                "max_cost_micro": null,
+            }))
+            .unwrap();
+            assert_eq!(req.max_cost_micro, None, "null = no cap");
+
+            let tournament: StartTournamentRequest = serde_json::from_value(serde_json::json!({
+                "goal": "g",
+                "criteria": ["c"],
+                "n": 2,
+                "max_cost_micro": amount.to_string(),
+            }))
+            .unwrap();
+            assert_eq!(tournament.max_cost_micro, Some(amount));
+            let tournament: StartTournamentRequest = serde_json::from_value(serde_json::json!({
+                "goal": "g",
+                "criteria": ["c"],
+                "n": 2,
+                "max_cost_micro": amount,
+            }))
+            .unwrap();
+            assert_eq!(tournament.max_cost_micro, Some(amount));
+
+            assert!(
+                serde_json::from_value::<NativeBudgetBody>(serde_json::json!({
+                    "max_cost_micro": amount.to_string(),
+                }))
+                .is_ok()
+            );
+            assert!(serde_json::from_value::<NativeBudgetBody>(
+                serde_json::json!({"max_cost_micro": amount})
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn max_cost_micro_refuses_malformed_negative_and_overflowing_input() {
+        for bad in [
+            serde_json::json!("abc"),
+            serde_json::json!(""),
+            serde_json::json!("-1"),
+            serde_json::json!("+1"),
+            serde_json::json!("1.5"),
+            serde_json::json!(" 1"),
+            serde_json::json!("1e3"),
+            serde_json::json!("18446744073709551616"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(1e3),
+            serde_json::json!(true),
+            serde_json::json!([]),
+        ] {
+            assert!(
+                serde_json::from_value::<StartTaskRunRequest>(serde_json::json!({
+                    "goal": "g",
+                    "max_cost_micro": bad,
+                }))
+                .is_err(),
+                "task start must refuse {bad}"
+            );
+            assert!(
+                serde_json::from_value::<StartTournamentRequest>(serde_json::json!({
+                    "goal": "g",
+                    "criteria": ["c"],
+                    "n": 2,
+                    "max_cost_micro": bad,
+                }))
+                .is_err(),
+                "tournament must refuse {bad}"
+            );
+            assert!(
+                serde_json::from_value::<NativeBudgetBody>(
+                    serde_json::json!({"max_cost_micro": bad})
+                )
+                .is_err(),
+                "agent budget must refuse {bad}"
+            );
+        }
     }
 }

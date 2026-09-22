@@ -36,6 +36,7 @@ import dev.faktor.shared.NativeTournamentCriterion
 import dev.faktor.shared.NativeTournamentSummary
 import dev.faktor.shared.NativeVerificationRecord
 import dev.faktor.shared.NativeVerificationView
+import java.math.BigInteger
 
 /** Max evidence refs surfaced by one task tree (bounded like the cockpit). */
 const val MAX_TREE_EVIDENCE = 64
@@ -164,10 +165,11 @@ data class ChildNode(
     val worktreeId: Long,
     val budgetMaxTokens: Long?,
     val spentTokens: Long?,
-    val spentCostMicro: Long?,
-    val maxCostMicro: Long?,
+    /** Exact micro-USD (BigInteger; never a rounded float). */
+    val spentCostMicro: BigInteger?,
+    val maxCostMicro: BigInteger?,
     val remainingTokens: Long?,
-    val remainingCostMicro: Long?,
+    val remainingCostMicro: BigInteger?,
     val progress: NativeAgentProgress?,
     val result: NativeChildResult?,
     /** Durable presentation/attention state: foreground or background. */
@@ -285,8 +287,8 @@ data class ProofView(
     val remoteHeadOid: String?,
     val pullRequestId: String?,
     val costStatus: String,
-    val spentCostMicro: Long?,
-    val maxCostMicro: Long?,
+    val spentCostMicro: BigInteger?,
+    val maxCostMicro: BigInteger?,
     val costReason: String?,
     val gateStatus: String?,
     val gateReason: String?,
@@ -318,7 +320,7 @@ data class ProofView(
         pullRequestId?.takeIf { it.isNotEmpty() }?.let { bits.add("PR " + it) }
         if (costStatus == "known") {
             bits.add(
-                "spend " + (spentCostMicro ?: 0) + "micro" +
+                "spend " + (spentCostMicro ?: BigInteger.ZERO) + "micro" +
                     (maxCostMicro?.let { " of " + it + "micro" } ?: "")
             )
         } else {
@@ -346,11 +348,12 @@ data class ProofView(
 data class SpendSummary(
     val spentTokens: Long?,
     val maxTokens: Long?,
-    val spentCostMicro: Long?,
-    val maxCostMicro: Long?,
-    val openReservedMicro: Long,
+    /** Exact micro-USD (BigInteger; never a rounded float). */
+    val spentCostMicro: BigInteger?,
+    val maxCostMicro: BigInteger?,
+    val openReservedMicro: BigInteger,
     val remainingTokens: Long?,
-    val remainingCostMicro: Long?,
+    val remainingCostMicro: BigInteger?,
     val durable: Boolean
 )
 
@@ -365,7 +368,7 @@ data class TournamentCandidateView(
     val verificationPass: Boolean?,
     val reviewRank: String?,
     val reviewer: String?,
-    val costMicro: Long,
+    val costMicro: BigInteger,
     val wallMs: Long,
     val winner: Boolean
 )
@@ -655,15 +658,17 @@ object TaskTree {
             catalog.firstOrNull { it.provider == provider && it.model == agent.model }
         }
         var spentTokens: Long? = null
-        var spentCostMicro: Long? = null
-        var maxCostMicro: Long? = null
-        var openReserved: Long = 0
+        var spentCostMicro: BigInteger? = null
+        var maxCostMicro: BigInteger? = null
+        var openReserved: BigInteger = BigInteger.ZERO
         if (usage != null) {
             for (taskUsage in usage.tasks) {
                 val budget = taskUsage.budget
                 budget.spentTokens?.let { spentTokens = (spentTokens ?: 0L) + it }
-                spentCostMicro = (spentCostMicro ?: 0L) + budget.spentCostMicro
-                budget.maxCostMicro?.let { maxCostMicro = (maxCostMicro ?: 0L) + it }
+                // Exact BigInteger aggregation: a session total may exceed
+                // 2^53-1 micro-USD and must never pass through a float.
+                spentCostMicro = (spentCostMicro ?: BigInteger.ZERO) + budget.spentCostMicro
+                budget.maxCostMicro?.let { maxCostMicro = (maxCostMicro ?: BigInteger.ZERO) + it }
                 openReserved += budget.openReservedMicro
             }
             if (usage.tokens > 0 && spentTokens == null) spentTokens = usage.tokens
@@ -682,7 +687,7 @@ object TaskTree {
         val remainingCost = if (maxCostNow == null || spentCostNow == null) {
             null
         } else {
-            (maxCostNow - spentCostNow - openReserved).coerceAtLeast(0L)
+            (maxCostNow - spentCostNow - openReserved).max(BigInteger.ZERO)
         }
         return ChildNode(
             childId = agent.agentId,
@@ -1158,15 +1163,16 @@ object TaskTree {
         if (usage != null) {
             var spentTokens: Long? = null
             var maxTokens: Long? = null
-            var spentCost: Long? = null
-            var maxCost: Long? = null
-            var open = 0L
+            var spentCost: BigInteger? = null
+            var maxCost: BigInteger? = null
+            var open = BigInteger.ZERO
             for (taskUsage in usage.tasks) {
                 val budget = taskUsage.budget
                 budget.spentTokens?.let { spentTokens = (spentTokens ?: 0L) + it }
                 budget.maxTokens?.let { maxTokens = (maxTokens ?: 0L) + it }
-                spentCost = (spentCost ?: 0L) + budget.spentCostMicro
-                budget.maxCostMicro?.let { maxCost = (maxCost ?: 0L) + it }
+                // Exact BigInteger aggregation: never a float on money.
+                spentCost = (spentCost ?: BigInteger.ZERO) + budget.spentCostMicro
+                budget.maxCostMicro?.let { maxCost = (maxCost ?: BigInteger.ZERO) + it }
                 open += budget.openReservedMicro
             }
             if (spentTokens == null && usage.tokens > 0) spentTokens = usage.tokens
@@ -1176,8 +1182,8 @@ object TaskTree {
                 spentCostMicro = spentCost,
                 maxCostMicro = maxCost,
                 openReservedMicro = open,
-                remainingTokens = remaining(maxTokens, spentTokens, 0L),
-                remainingCostMicro = remaining(maxCost, spentCost, open),
+                remainingTokens = remainingTokens(maxTokens, spentTokens),
+                remainingCostMicro = remainingCost(maxCost, spentCost, open),
                 durable = true
             )
         }
@@ -1188,15 +1194,24 @@ object TaskTree {
             spentCostMicro = budget.spentCostMicro,
             maxCostMicro = budget.maxCostMicro,
             openReservedMicro = budget.openReservedMicro,
-            remainingTokens = remaining(budget.maxTokens, budget.spentTokens, 0L),
-            remainingCostMicro = remaining(budget.maxCostMicro, budget.spentCostMicro, budget.openReservedMicro),
+            remainingTokens = remainingTokens(budget.maxTokens, budget.spentTokens),
+            remainingCostMicro = remainingCost(
+                budget.maxCostMicro,
+                budget.spentCostMicro,
+                budget.openReservedMicro
+            ),
             durable = true
         )
     }
 
-    private fun remaining(max: Long?, spent: Long?, open: Long): Long? {
+    private fun remainingTokens(max: Long?, spent: Long?): Long? {
         if (max == null || spent == null) return null
-        return (max - spent - open).coerceAtLeast(0L)
+        return (max - spent).coerceAtLeast(0L)
+    }
+
+    private fun remainingCost(max: BigInteger?, spent: BigInteger?, open: BigInteger): BigInteger? {
+        if (max == null || spent == null) return null
+        return (max - spent - open).max(BigInteger.ZERO)
     }
 
     // ----------------------------------------------------------- tournament

@@ -4986,6 +4986,16 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    /// Read one money field off the wire: monetary fields are decimal
+    /// strings (see `faktor_cloud::money`).
+    fn money(value: &serde_json::Value) -> u64 {
+        value
+            .as_str()
+            .unwrap_or_else(|| panic!("money field is not a decimal string: {value}"))
+            .parse()
+            .expect("money field parses as u64")
+    }
+
     /// Spawn a session-owned terminal through the native endpoint. Returns
     /// `None` when the platform refuses PTY spawns (documented skip).
     async fn native_spawn_terminal(
@@ -5927,32 +5937,32 @@ pub(crate) mod tests {
             assert_eq!(t1["budget"]["maxTokens"], 5000);
             assert_eq!(t1["budget"]["maxTurns"], 3);
             assert_eq!(t1["budget"]["spentTokens"], 0);
-            assert_eq!(t1["budget"]["spentCostMicro"], 1000);
-            assert_eq!(t1["budget"]["maxCostMicro"], 1_000_000);
-            assert_eq!(t1["budget"]["openReservedMicro"], 200);
+            assert_eq!(money(&t1["budget"]["spentCostMicro"]), 1000);
+            assert_eq!(money(&t1["budget"]["maxCostMicro"]), 1_000_000);
+            assert_eq!(money(&t1["budget"]["openReservedMicro"]), 200);
             let res = &t1["reservations"];
             assert_eq!(res["open"]["count"], 1);
-            assert_eq!(res["open"]["predictedMicro"], 200);
+            assert_eq!(money(&res["open"]["predictedMicro"]), 200);
             assert_eq!(res["settled"]["count"], 1);
-            assert_eq!(res["settled"]["predictedMicro"], 5000);
-            assert_eq!(res["settled"]["spentMicro"], 1000);
-            assert_eq!(res["settled"]["providerReportedMicro"], 990);
+            assert_eq!(money(&res["settled"]["predictedMicro"]), 5000);
+            assert_eq!(money(&res["settled"]["spentMicro"]), 1000);
+            assert_eq!(money(&res["settled"]["providerReportedMicro"]), 990);
             assert_eq!(res["refunded"]["count"], 1);
-            assert_eq!(res["refunded"]["predictedMicro"], 3000);
+            assert_eq!(money(&res["refunded"]["predictedMicro"]), 3000);
             assert_eq!(res["uncertain"]["count"], 0);
             let routes = res["routeDecisions"].as_array().unwrap();
             assert_eq!(routes.len(), 1);
             assert_eq!(routes[0]["reservationId"], r1);
-            assert_eq!(routes[0]["spentMicro"], 1000);
+            assert_eq!(money(&routes[0]["spentMicro"]), 1000);
             assert_eq!(routes[0]["decision"]["provider"], "fake");
-            assert_eq!(routes[0]["decision"]["estimated_cost_micro"], 90);
+            assert_eq!(money(&routes[0]["decision"]["estimated_cost_micro"]), 90);
             // Untouched task 2: null-safe pre-first-reservation budget.
             let t2 = &tasks[1];
             assert_eq!(t2["taskId"], "2");
             assert_eq!(t2["budget"]["maxTokens"], 1000);
             assert_eq!(t2["budget"]["maxCostMicro"], serde_json::Value::Null);
-            assert_eq!(t2["budget"]["spentCostMicro"], 0);
-            assert_eq!(t2["budget"]["openReservedMicro"], 0);
+            assert_eq!(money(&t2["budget"]["spentCostMicro"]), 0);
+            assert_eq!(money(&t2["budget"]["openReservedMicro"]), 0);
             assert_eq!(t2["reservations"]["settled"]["count"], 0);
 
             // ---- isolation: B's usage never carries A's rows.
@@ -5971,9 +5981,12 @@ pub(crate) mod tests {
                 "B recorded no prefix"
             );
             assert_eq!(ub["tasks"][0]["taskId"], "1");
-            assert_eq!(ub["tasks"][0]["budget"]["spentCostMicro"], 40);
+            assert_eq!(money(&ub["tasks"][0]["budget"]["spentCostMicro"]), 40);
             assert_eq!(ub["tasks"][0]["reservations"]["settled"]["count"], 1);
-            assert_eq!(ub["tasks"][0]["reservations"]["settled"]["spentMicro"], 40);
+            assert_eq!(
+                money(&ub["tasks"][0]["reservations"]["settled"]["spentMicro"]),
+                40
+            );
             assert_eq!(ub["tasks"].as_array().unwrap().len(), 1);
 
             // ---- global aggregate: durable numbers over every session.
@@ -5988,15 +6001,15 @@ pub(crate) mod tests {
                 gu["durable"]["providerCalls"]["prefixStabilityObservations"],
                 2
             );
-            assert_eq!(gu["durable"]["taskSpend"]["settledCostMicro"], 1040);
+            assert_eq!(money(&gu["durable"]["taskSpend"]["settledCostMicro"]), 1040);
             let res = &gu["durable"]["reservations"];
             assert_eq!(res["settled"]["count"], 2);
-            assert_eq!(res["settled"]["spentMicro"], 1040);
-            assert_eq!(res["settled"]["providerReportedMicro"], 990);
+            assert_eq!(money(&res["settled"]["spentMicro"]), 1040);
+            assert_eq!(money(&res["settled"]["providerReportedMicro"]), 990);
             assert_eq!(res["refunded"]["count"], 1);
-            assert_eq!(res["refunded"]["predictedMicro"], 3000);
+            assert_eq!(money(&res["refunded"]["predictedMicro"]), 3000);
             assert_eq!(res["open"]["count"], 1);
-            assert_eq!(res["open"]["predictedMicro"], 200);
+            assert_eq!(money(&res["open"]["predictedMicro"]), 200);
             assert_eq!(res["uncertain"]["count"], 0);
 
             // ---- crash-recovery semantics (schema v17+): a crash closes
@@ -6014,8 +6027,14 @@ pub(crate) mod tests {
             )
             .await;
             let ua_after: serde_json::Value = resp.json().await.unwrap();
-            assert_eq!(ua_after["tasks"][0]["budget"]["openReservedMicro"], 0);
-            assert_eq!(ua_after["tasks"][0]["budget"]["spentCostMicro"], 1000);
+            assert_eq!(
+                money(&ua_after["tasks"][0]["budget"]["openReservedMicro"]),
+                0
+            );
+            assert_eq!(
+                money(&ua_after["tasks"][0]["budget"]["spentCostMicro"]),
+                1000
+            );
             assert_eq!(ua_after["tasks"][0]["reservations"]["open"]["count"], 0);
             assert_eq!(
                 ua_after["tasks"][0]["reservations"]["uncertain"]["count"],
@@ -6023,7 +6042,7 @@ pub(crate) mod tests {
             );
             assert_eq!(ua_after["tasks"][0]["reservations"]["refunded"]["count"], 2);
             assert_eq!(
-                ua_after["tasks"][0]["reservations"]["refunded"]["predictedMicro"],
+                money(&ua_after["tasks"][0]["reservations"]["refunded"]["predictedMicro"]),
                 3200
             );
             let resp = native_get(&client, &base, &token, "/native/usage").await;
@@ -6305,20 +6324,24 @@ pub(crate) mod tests {
         );
         let tasks = u["tasks"].as_array().unwrap();
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0]["budget"]["spentCostMicro"], cost.spent_cost_micro);
+        assert_eq!(
+            money(&tasks[0]["budget"]["spentCostMicro"]),
+            cost.spent_cost_micro
+        );
         assert_eq!(tasks[0]["budget"]["maxCostMicro"], serde_json::Value::Null);
-        assert_eq!(tasks[0]["budget"]["openReservedMicro"], 0);
+        assert_eq!(money(&tasks[0]["budget"]["openReservedMicro"]), 0);
         let res = &tasks[0]["reservations"];
         assert_eq!(res["settled"]["count"], 1);
         assert_eq!(
-            res["settled"]["spentMicro"], 123,
+            money(&res["settled"]["spentMicro"]),
+            123,
             "the folded actual (provider-reported) is what was spent"
         );
-        assert_eq!(res["settled"]["providerReportedMicro"], 123);
+        assert_eq!(money(&res["settled"]["providerReportedMicro"]), 123);
         let routes = res["routeDecisions"].as_array().unwrap();
         assert!(!routes.is_empty(), "the routed call records its decision");
-        assert_eq!(routes[0]["providerReportedMicro"], 123);
-        assert_eq!(routes[0]["spentMicro"], 123);
+        assert_eq!(money(&routes[0]["providerReportedMicro"]), 123);
+        assert_eq!(money(&routes[0]["spentMicro"]), 123);
         assert!(
             routes[0]["decision"]["provider"] == "fake" || routes[0]["decision"].is_object(),
             "{routes:?}"
@@ -6987,9 +7010,9 @@ pub(crate) mod tests {
         assert_eq!(entry["budget"]["maxTurns"], 4);
         assert_eq!(entry["budget"]["spentTokens"], 0);
         assert_eq!(entry["budget"]["spentTurns"], 0);
-        assert_eq!(entry["budget"]["maxCostMicro"], 250_000);
-        assert_eq!(entry["budget"]["spentCostMicro"], 100);
-        assert_eq!(entry["budget"]["openReservedMicro"], 60);
+        assert_eq!(money(&entry["budget"]["maxCostMicro"]), 250_000);
+        assert_eq!(money(&entry["budget"]["spentCostMicro"]), 100);
+        assert_eq!(money(&entry["budget"]["openReservedMicro"]), 60);
         let _ = handle.request_shutdown();
     }
 

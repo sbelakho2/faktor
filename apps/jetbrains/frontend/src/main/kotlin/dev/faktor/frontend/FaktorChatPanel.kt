@@ -18,6 +18,7 @@ package dev.faktor.frontend
 
 import dev.faktor.backend.NativeSseEvent
 import dev.faktor.shared.JsonValue
+import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeApiException
 import dev.faktor.shared.NativeCompletionContract
@@ -27,6 +28,7 @@ import dev.faktor.shared.NativePermissionEntry
 import dev.faktor.shared.NativeProjection
 import dev.faktor.shared.NativeTaskRun
 import dev.faktor.shared.NativeTournament
+import java.math.BigInteger
 import java.awt.BorderLayout
 import java.awt.Dimension
 import java.awt.FlowLayout
@@ -352,8 +354,18 @@ class FaktorChatPanel(
         })
         controls.add(agentButton("Cost budget") { agent ->
             val raw = JOptionPane.showInputDialog(this, "max_cost_micro for ${agent.agentId}", "1000000")
-            val micro = raw?.trim()?.toLongOrNull()
-            if (micro != null && micro > 0) service.setAgentBudget(agent.agentId, maxCostMicro = micro)
+            // Exact money: a plain decimal amount within i64::MAX; a junk or
+            // out-of-range value is refused loudly, never truncated.
+            val micro = raw?.trim()?.let { MicroMoney.parseDecimal(it) }
+            when {
+                raw == null -> Unit
+                micro == null || micro.signum() <= 0 ->
+                    appendSystem(
+                        "refused max_cost_micro \"${raw.trim()}\": enter a positive decimal " +
+                            "integer no larger than ${MicroMoney.I64_MAX}"
+                    )
+                else -> service.setAgentBudget(agent.agentId, maxCostMicro = micro)
+            }
         })
         form.add(controls)
         agentsArea.isEditable = false
@@ -729,12 +741,17 @@ class FaktorChatPanel(
                 }
                 val amountRaw = JOptionPane.showInputDialog(
                     this@FaktorChatPanel,
-                    "Credit grant amount in microUSD (integer > 0)",
+                    "Credit grant amount in microUSD (integer > 0, exact)",
                     "1000000"
                 ) ?: return
-                val amount = amountRaw.trim().toLongOrNull()
-                if (amount == null || amount <= 0) {
-                    appendSystem("grant refused: enter a positive integer amount in microUSD")
+                // Exact money: a plain positive decimal within i64::MAX; a
+                // junk or out-of-range amount is refused loudly, never rounded.
+                val amount = MicroMoney.parseDecimal(amountRaw.trim())
+                if (amount == null || amount.signum() <= 0) {
+                    appendSystem(
+                        "grant refused: enter a positive decimal integer amount in microUSD " +
+                            "no larger than ${MicroMoney.I64_MAX}"
+                    )
                     return
                 }
                 runAsync("grant credits") {

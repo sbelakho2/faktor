@@ -25,6 +25,7 @@ import * as wb from '../src/workspaceBinding.ts';
 import * as px from '../src/pixelAgents.ts';
 import * as cp from '../src/cockpit.ts';
 import * as cpa from '../src/controlPlaneAuth.ts';
+import * as mn from '../src/money.ts';
 import composerPolicy from '../media/composer-state.js';
 import {
   chmodSync,
@@ -71,17 +72,24 @@ function assert(condition, message) {
   }
 }
 
+/** JSON text that renders bigint values (money) without throwing. */
+function jsonText(value) {
+  return JSON.stringify(value, (_key, entry) =>
+    typeof entry === 'bigint' ? `${entry}n` : entry,
+  );
+}
+
 function assertEqual(actual, expected, message) {
   if (actual !== expected) {
     throw new Error(
-      `${message || 'assertEqual'}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
+      `${message || 'assertEqual'}: expected ${jsonText(expected)}, got ${jsonText(actual)}`,
     );
   }
 }
 
 function assertDeepEqual(actual, expected, message) {
-  const left = JSON.stringify(actual);
-  const right = JSON.stringify(expected);
+  const left = jsonText(actual);
+  const right = jsonText(expected);
   if (left !== right) {
     throw new Error(`${message || 'assertDeepEqual'}: expected ${right}, got ${left}`);
   }
@@ -122,7 +130,9 @@ async function assertRejects(factory, predicate, label) {
 }
 
 function clone(value) {
-  return JSON.parse(JSON.stringify(value));
+  // structuredClone keeps bigint money values exact (JSON.stringify cannot
+  // serialize a BigInt); every fixture here is plain structured data.
+  return structuredClone(value);
 }
 
 // ---------------------------------------------------------- payload builders
@@ -653,7 +663,7 @@ async function validatorAccepts() {
     assertEqual(nc.validateModelCatalog([clone(modelInfoJson)]).length, 1);
     assertEqual(nc.validateProjection(clone(projectionJson)).filesChanged[0], 'a.ts');
     assertEqual(nc.validateTurns([{ opId: '1', status: 'completed', provider: 'p', model: 'm', variant: null, toolMode: null, startedAt: 1, updatedMs: 2, queueSeq: null, promptMessageId: null }]).length, 1);
-    assertEqual(nc.validateTaskViews([clone(taskViewJson)])[0].budget.spentCostMicro, 12);
+    assertEqual(nc.validateTaskViews([clone(taskViewJson)])[0].budget.spentCostMicro, 12n);
     assertEqual(nc.validateCheckpoints([clone(checkpointJson)])[0].sequence, 1);
     assertEqual(nc.validateVerificationView(clone(verificationViewJson)).owed.length, 1);
     assertEqual(nc.validateTaskRuns([clone(taskRunJson)])[0].run_id, 'r1');
@@ -707,13 +717,13 @@ async function validatorAccepts() {
     assertEqual(nc.validateSemanticStatus(clone(semanticStatusJson)).fallback.version, 1);
     assertEqual(nc.validateAbortAck(clone(abortAckJson)).aborted[0], '1');
     const billingUsage = nc.validateBillingUsage(clone(billingUsageJson));
-    assertEqual(billingUsage.fold.totals.managed_cost_micro, 700_000);
+    assertEqual(billingUsage.fold.totals.managed_cost_micro, 700_000n);
     assertEqual(billingUsage.fold.per_task[0].task_id, 3);
-    assertEqual(billingUsage.credits.held_micro, 250_000);
+    assertEqual(billingUsage.credits.held_micro, 250_000n);
     assertEqual(billingUsage.nextCursor, '9');
     const entitlements = nc.validateEntitlements(clone(entitlementsJson));
     assertEqual(entitlements.entitlements.plan_id, 'pro');
-    assertEqual(entitlements.entitlements.limits.max_tokens_per_period, 100_000);
+    assertEqual(entitlements.entitlements.limits.max_tokens_per_period, 100_000n);
     assertEqual(entitlements.entitlements.subscription_active, true);
     assertEqual(nc.validateIdentity(clone(identityJson)).identity.effective_actions.includes('credits_grant'), true);
     assertEqual(nc.validateCreditGrant(clone(creditGrantJson)).duplicate, false);
@@ -770,9 +780,19 @@ async function validatorRejects() {
       () =>
         nc.validateTournament({
           ...clone(tournamentJson),
-          candidates: [{ ...tournamentJson.candidates[0], cost_micro: '100' }],
+          candidates: [{ ...tournamentJson.candidates[0], cost_micro: 'not-a-number' }],
         }),
-      'expected a finite number',
+      'expected a decimal micro amount string',
+    );
+    assertProtocol(
+      () =>
+        nc.validateTournament({
+          ...clone(tournamentJson),
+          candidates: [
+            { ...tournamentJson.candidates[0], cost_micro: Number.MAX_SAFE_INTEGER + 1 },
+          ],
+        }),
+      'not exactly representable',
     );
     assertProtocol(
       () => nc.validateTournamentDecision({ tournament_id: 't', winner: 'c' }),
@@ -797,7 +817,33 @@ async function validatorRejects() {
       () => nc.validateAttachmentId({ digest: 'a'.repeat(64), mime: 'application/pdf', filename: null }),
       'missing required field size',
     );
-    assertProtocol(() => nc.validateTaskViews([{ ...clone(taskViewJson), budget: { ...clone(budgetJson), spentCostMicro: '12' } }]), 'expected a finite number');
+    // Money is exact: the canonical string form is accepted (the legacy
+    // number form stays accepted below the flag threshold, see moneyTests),
+    // while a non-decimal string and an unsafe number both fail loudly.
+    assertEqual(
+      nc.validateTaskViews([
+        { ...clone(taskViewJson), budget: { ...clone(budgetJson), spentCostMicro: '12' } },
+      ])[0].budget.spentCostMicro,
+      12n,
+      'a decimal-string money value is exact',
+    );
+    assertProtocol(
+      () =>
+        nc.validateTaskViews([
+          { ...clone(taskViewJson), budget: { ...clone(budgetJson), spentCostMicro: '12.5' } },
+        ]),
+      'expected a decimal micro amount string',
+    );
+    assertProtocol(
+      () =>
+        nc.validateTaskViews([
+          {
+            ...clone(taskViewJson),
+            budget: { ...clone(budgetJson), spentCostMicro: Number.MAX_SAFE_INTEGER + 1 },
+          },
+        ]),
+      'not exactly representable',
+    );
     // Board: absent fields, hostile types and phantom entries fail loudly.
     const missingBoardField = clone(boardPageJson);
     delete missingBoardField.has_more;
@@ -832,13 +878,33 @@ async function validatorRejects() {
       () => nc.validateBillingUsage({ ...clone(billingUsageJson), nextCursor: 9 }),
       'expected a string or null',
     );
+    assertEqual(
+      nc.validateBillingUsage({
+        ...clone(billingUsageJson),
+        credits: { ...creditBalanceJson, held_micro: '1' },
+      }).credits.held_micro,
+      1n,
+      'a decimal-string credit field is exact',
+    );
     assertProtocol(
-      () => nc.validateBillingUsage({ ...clone(billingUsageJson), credits: { ...creditBalanceJson, held_micro: '1' } }),
-      'expected a finite number',
+      () =>
+        nc.validateBillingUsage({
+          ...clone(billingUsageJson),
+          credits: { ...creditBalanceJson, held_micro: '0x10' },
+        }),
+      'expected a decimal micro amount string',
+    );
+    assertProtocol(
+      () =>
+        nc.validateBillingUsage({
+          ...clone(billingUsageJson),
+          credits: { ...creditBalanceJson, held_micro: Number.MAX_SAFE_INTEGER + 1 },
+        }),
+      'not exactly representable',
     );
     assertProtocol(
       () => nc.validateEntitlements({ ...clone(entitlementsJson), entitlements: { ...entitlementsJson.entitlements, limits: { max_tokens_per_period: -1 } } }),
-      'expected a non-negative integer',
+      'expected a non-negative limit',
     );
     assertProtocol(
       () => nc.validateEntitlements({ ...clone(entitlementsJson), entitlements: { ...entitlementsJson.entitlements, subscription_status: 7 } }),
@@ -961,7 +1027,7 @@ async function clientAccepts() {
     assertEqual((await client.entitlements()).entitlements.plan_found, true);
     assertEqual(
       (await client.billingUsage('org-local', { since: '9', limit: 25 })).fold.totals.byok_cost_micro,
-      200_000,
+      200_000n,
     );
     assertEqual((await client.billingUsage('org-local')).nextCursor, '9');
     assertEqual(
@@ -1872,10 +1938,10 @@ async function daemonTests() {
 
 async function shadowDefaultTests() {
   await test('P0 shadow-only: the setting vocabulary is shadow/empty and the removed mode never forwards', () => {
-    const base = ts.startTaskRequest('goal', { mutationMode: '', maxTokens: 0, maxCostMicro: 0 });
+    const base = ts.startTaskRequest('goal', { mutationMode: '', maxTokens: 0, maxCostMicro: 0n });
     assert(!('mutation_mode' in base), `empty setting must omit mutation_mode: ${JSON.stringify(base)}`);
     assertDeepEqual(
-      ts.startTaskRequest('goal', { mutationMode: 'shadow', maxTokens: 10, maxCostMicro: 5 }),
+      ts.startTaskRequest('goal', { mutationMode: 'shadow', maxTokens: 10, maxCostMicro: 5n }),
       { goal: 'goal', max_tokens: 10, max_cost_micro: 5, mutation_mode: 'shadow' },
     );
     // The removed direct-owner mode can never reach the wire, even from a
@@ -1883,7 +1949,7 @@ async function shadowDefaultTests() {
     assert(
       !(
         'mutation_mode' in
-        ts.startTaskRequest('goal', { mutationMode: 'direct_compat', maxTokens: 0, maxCostMicro: 0 })
+        ts.startTaskRequest('goal', { mutationMode: 'direct_compat', maxTokens: 0, maxCostMicro: 0n })
       ),
       'the removed mode must never be forwarded',
     );
@@ -1908,7 +1974,7 @@ async function shadowDefaultTests() {
       },
       sessionId: '7',
       goal: 'ship it',
-      settings: { mutationMode: 'direct_compat', maxTokens: 0, maxCostMicro: 0 },
+      settings: { mutationMode: 'direct_compat', maxTokens: 0, maxCostMicro: 0n },
       onStarted: () => {
         throw new Error('must not start');
       },
@@ -1950,7 +2016,7 @@ async function shadowDefaultTests() {
       client,
       sessionId: '7',
       goal: 'ship it',
-      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0 },
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
       onStarted: () => {
         throw new Error('must not start');
       },
@@ -1984,7 +2050,7 @@ async function shadowDefaultTests() {
         client,
         sessionId: '7',
         goal: 'g',
-        settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0 },
+        settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
         onStarted: () => {},
         onFailure: (failure) => failures.push(failure),
       });
@@ -2002,7 +2068,7 @@ async function shadowDefaultTests() {
       client: { startTaskRun: async () => taskRunStartedJson },
       sessionId: '7',
       goal: 'g',
-      settings: { mutationMode: 'shadow', maxTokens: 0, maxCostMicro: 0 },
+      settings: { mutationMode: 'shadow', maxTokens: 0, maxCostMicro: 0n },
       onStarted: (run) => started.push(run),
       onFailure: () => {
         throw new Error('must not fail');
@@ -2069,7 +2135,7 @@ async function completionContractTests() {
   });
 
   await test('a non-default contract starts an explicit work item; the default stays byte-identical', () => {
-    const base = ts.startTaskRequest('goal', { mutationMode: '', maxTokens: 0, maxCostMicro: 0 });
+    const base = ts.startTaskRequest('goal', { mutationMode: '', maxTokens: 0, maxCostMicro: 0n });
     assertDeepEqual(base, { goal: 'goal' });
     assert(
       !('work_items' in base) && !('completion_contract' in base) && !('files' in base),
@@ -2079,7 +2145,7 @@ async function completionContractTests() {
       ts.startTaskRequest('goal', {
         mutationMode: '',
         maxTokens: 0,
-        maxCostMicro: 0,
+        maxCostMicro: 0n,
         files: ['src/a.ts', 'docs/b.md'],
       }),
       { goal: 'goal', files: ['src/a.ts', 'docs/b.md'] },
@@ -2088,7 +2154,7 @@ async function completionContractTests() {
     const requested = ts.startTaskRequest('goal', {
       mutationMode: 'shadow',
       maxTokens: 10,
-      maxCostMicro: 5,
+      maxCostMicro: 5n,
       files: ['src/a.ts'],
       completionContract: { include_commit: true, include_push: false, include_pr: true },
     });
@@ -2112,7 +2178,7 @@ async function completionContractTests() {
       ts.startTaskRequest('goal', {
         mutationMode: '',
         maxTokens: 0,
-        maxCostMicro: 0,
+        maxCostMicro: 0n,
         completionContract: { include_commit: false, include_push: false, include_pr: false },
       }),
       { goal: 'goal' },
@@ -2322,14 +2388,14 @@ async function pendingSubmissionTests() {
       ts.startTaskRequest('goal', {
         mutationMode: '',
         maxTokens: 0,
-        maxCostMicro: 0,
+        maxCostMicro: 0n,
         files: ['src/a.ts'],
         attachments: [id],
       }),
       { goal: 'goal', files: ['src/a.ts'], attachments: [id] },
     );
     assertDeepEqual(
-      ts.startTaskRequest('goal', { mutationMode: '', maxTokens: 0, maxCostMicro: 0 }),
+      ts.startTaskRequest('goal', { mutationMode: '', maxTokens: 0, maxCostMicro: 0n }),
       { goal: 'goal' },
       'the attachment-free path stays byte-identical',
     );
@@ -2353,7 +2419,7 @@ async function pendingSubmissionTests() {
       client,
       sessionId: '7',
       pending: pendingEnvelope({ attachments: [binaryAttachment()] }),
-      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0 },
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
       onStarted: (run) => started.push(run),
       onFailure: () => {},
       restore: (failure) => restores.push(failure),
@@ -2400,7 +2466,7 @@ async function pendingSubmissionTests() {
         client,
         sessionId: '7',
         pending: envelope,
-        settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0 },
+        settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
         onStarted: () => {
           throw new Error(`${label}: must not start`);
         },
@@ -2439,7 +2505,7 @@ async function pendingSubmissionTests() {
       client,
       sessionId: '7',
       pending: pendingEnvelope({ attachments: [binaryAttachment()] }),
-      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0 },
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
       onStarted: () => {},
       onFailure: () => {},
       restore: (failure) => restores.push(failure),
@@ -2476,7 +2542,7 @@ async function pendingSubmissionTests() {
       client,
       sessionId: '7',
       pending: envelope,
-      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0 },
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
       onStarted: () => {},
       onFailure: () => {},
       restore: (failure) => restores.push(failure),
@@ -2555,7 +2621,7 @@ async function pendingSubmissionTests() {
       },
       sessionId: '7',
       pending,
-      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0 },
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
       onStarted: () => {},
       onFailure: () => {},
       restore: () => {
@@ -2708,7 +2774,7 @@ async function boardAndForwardingTests() {
       settings: {
         mutationMode: '',
         maxTokens: 0,
-        maxCostMicro: 0,
+        maxCostMicro: 0n,
         files,
         completionContract: { include_commit: true, include_push: false, include_pr: true },
       },
@@ -3142,9 +3208,9 @@ async function cockpitTests() {
       verification,
       usage: {
         tokens: usage.providerCalls.tokens,
-        spentMicro: 12,
+        spentMicro: '12',
         maxMicro: null,
-        openMicro: 0,
+        openMicro: '0',
         truncated: false,
       },
       taskVerification: { records: [taskVerificationRecord] },
@@ -3234,7 +3300,7 @@ async function cockpitTests() {
       verificationPass: state === 'done' ? true : null,
       reviewRank: state === 'done' ? 'clean' : null,
       reviewer: null,
-      costMicro: 1,
+      costMicro: 1n,
       wallMs: 2,
     });
     const native = (state, winner, candidates) => ({
@@ -3978,7 +4044,7 @@ async function tournamentWebviewTests() {
       verificationPass: null,
       reviewRank: null,
       reviewer: null,
-      costMicro: 0,
+      costMicro: 0n,
       wallMs: 0,
     });
     const wire = {
@@ -4319,7 +4385,7 @@ async function proofSummaryTests() {
     assertEqual(proof.checks.requiredPassed, 2);
     assertEqual(proof.publication.pullRequest.id, 'pr-42');
     assertEqual(proof.publication.remoteHeadOid, '2'.repeat(40));
-    assertEqual(proof.cost.spentCostMicro, 12);
+    assertEqual(proof.cost.spentCostMicro, 12n);
     assertEqual(proof.completion.steps.length, 2);
     assertEqual(proof.trees.landedEqualsVerified, true);
     // A foreign schema or an unexplained verdict is a loud refusal (never a
@@ -4466,15 +4532,15 @@ async function usagePanelTests() {
     assertEqual(panel.period.totalTokens, 1775);
     assertEqual(panel.period.inputTokens, 1000);
     assertEqual(panel.period.reasoningTokens, 25);
-    assertEqual(panel.period.managedCostMicro, 700_000);
-    assertEqual(panel.period.byokCostMicro, 200_000);
-    assertEqual(panel.period.providerCostMicro, 900_000);
+    assertEqual(panel.period.managedCostMicro, '700000');
+    assertEqual(panel.period.byokCostMicro, '200000');
+    assertEqual(panel.period.providerCostMicro, '900000');
     assertEqual(panel.period.correctedEvents, 1);
     assertEqual(panel.period.tasks[0].taskId, 3);
     assertEqual(panel.period.tasks[0].runId, 'r1');
     assertEqual(panel.period.tasks[0].totals.inputTokens, 400);
-    assertEqual(panel.credits.balanceMicro, 5_000_000 + 100_000 - 2_000_000);
-    assertEqual(panel.credits.heldMicro, 250_000);
+    assertEqual(panel.credits.balanceMicro, '3100000');
+    assertEqual(panel.credits.heldMicro, '250000');
     assertEqual(panel.credits.pendingConsumes, 1);
     assertEqual(panel.subscription.state, 'active');
     assertEqual(panel.inFlight[0].kind, 'integration');
@@ -4486,8 +4552,8 @@ async function usagePanelTests() {
     assert(limits.includes('max_managed_spend_micro_per_period'), JSON.stringify(limits));
     assert(limits.includes('min_credit_balance_micro'), JSON.stringify(limits));
     const tokensQuota = panel.quotas.find((quota) => quota.limit === 'max_tokens_per_period');
-    assertEqual(tokensQuota.observed, 1775);
-    assertEqual(tokensQuota.value, 100_000);
+    assertEqual(tokensQuota.observed, '1775');
+    assertEqual(tokensQuota.value, '100000');
     assertEqual(tokensQuota.exceeded, false);
     const unserved = panel.quotas.find((quota) => quota.limit === 'max_active_tasks');
     assertEqual(unserved.observed, null, 'an unserved observed counter is null, never zero');
@@ -5167,6 +5233,311 @@ async function controlPlaneCredentialTests() {
   });
 }
 
+// ------------------------------------------------------- money exactness (v1)
+//
+// The daemon serializes monetary `*_micro` fields as decimal strings because
+// a JavaScript number is only integer-exact to 2^53-1. These rows pin the
+// exact parse (string AND legacy number), the loud refusal of an unsafe
+// number, exact display and exact bigint aggregation.
+
+const MONEY_I64_MAX = 9223372036854775807n;
+const MONEY_SAFE_MAX = 9007199254740991n;
+
+async function moneyTests() {
+  const creditsWith = (overrides) => ({
+    ok: true,
+    organization: 'org-local',
+    fold: {
+      organization_id: 'org-local',
+      totals: usageBucketsJson,
+      per_task: [],
+      next_cursor: null,
+    },
+    credits: { ...creditBalanceJson, ...overrides },
+    items: [],
+    nextCursor: null,
+  });
+
+  await test('money parses decimal strings exactly at 0, 2^53-1, 2^53 and i64::MAX', () => {
+    assertEqual(mn.microFromDecimal('0'), 0n);
+    assertEqual(mn.microFromDecimal('9007199254740991'), MONEY_SAFE_MAX);
+    assertEqual(mn.microFromDecimal('9007199254740992'), 9007199254740992n);
+    assertEqual(mn.microFromDecimal('9223372036854775807'), MONEY_I64_MAX);
+    // End to end through the strict validator: a string money field is exact.
+    const parsed = nc.validateBillingUsage(
+      creditsWith({
+        granted_micro: '9223372036854775807',
+        consumed_micro: '9007199254740992',
+        refunded_micro: '1',
+        held_micro: '0',
+      }),
+    );
+    assertEqual(parsed.credits.granted_micro, MONEY_I64_MAX);
+    assertEqual(parsed.credits.consumed_micro, 9007199254740992n);
+    // The served u64 domain is exact end to end; hostile strings are
+    // refused, never truncated or coerced.
+    assertEqual(mn.microFromDecimal('18446744073709551615'), 18446744073709551615n, 'u64::MAX');
+    assertEqual(mn.microFromDecimal('9223372036854775808'), 9223372036854775808n);
+    assertEqual(mn.microFromDecimal('18446744073709551616'), null, 'above u64::MAX');
+    assertEqual(mn.microFromDecimal('-1'), null);
+    assertEqual(mn.microFromDecimal('1e3'), null);
+    assertEqual(mn.microFromDecimal('1.5'), null);
+    assertEqual(mn.microFromDecimal(''), null);
+    assertEqual(mn.microFromDecimal(' 1'), null);
+    assertProtocol(
+      () => nc.validateBillingUsage(creditsWith({ held_micro: '18446744073709551616' })),
+      'expected a decimal micro amount string',
+    );
+    assertProtocol(
+      () => nc.validateBillingUsage(creditsWith({ held_micro: '12.5' })),
+      'expected a decimal micro amount string',
+    );
+  });
+
+  await test('money: legacy numbers <= 2^53-1 convert exactly; larger numbers are flagged', () => {
+    assertEqual(mn.microFromNumber(0), 0n);
+    assertEqual(mn.microFromNumber(1), 1n);
+    assertEqual(mn.microFromNumber(Number.MAX_SAFE_INTEGER), MONEY_SAFE_MAX);
+    // Above 2^53-1 the number has already lost precision: refuse, never round.
+    assertEqual(mn.microFromNumber(Number.MAX_SAFE_INTEGER + 1), null);
+    assertEqual(mn.microFromNumber(1.5), null);
+    assertEqual(mn.microFromNumber(-1), null);
+    assertEqual(mn.microFromNumber(Number.POSITIVE_INFINITY), null);
+    // The legacy number form is still accepted on the wire below the flag.
+    assertEqual(
+      nc.validateBillingUsage(clone(billingUsageJson)).credits.granted_micro,
+      5_000_000n,
+    );
+    assertEqual(
+      nc.validateEntitlements(clone(entitlementsJson)).entitlements.limits
+        .max_managed_spend_micro_per_period,
+      1_000_000n,
+    );
+    assertProtocol(
+      () =>
+        nc.validateBillingUsage(
+          creditsWith({ granted_micro: Number.MAX_SAFE_INTEGER + 1 }),
+        ),
+      'not exactly representable',
+    );
+    assertProtocol(
+      () =>
+        nc.validateEntitlements({
+          ...clone(entitlementsJson),
+          entitlements: {
+            ...clone(entitlementsJson.entitlements),
+            limits: { max_managed_spend_micro_per_period: 2 ** 53 },
+          },
+        }),
+      'not exactly representable',
+    );
+  });
+
+  await test('money display is exact: no precision loss, no scientific notation', () => {
+    assertEqual(mn.microToString(MONEY_I64_MAX), '9223372036854775807');
+    assertEqual(mn.microText(MONEY_I64_MAX), '9223372036854775807\u00b5$');
+    assertEqual(mn.microText(0n), '0\u00b5$');
+    assertEqual(mn.microUsdText(1_234_567n), '1.2346');
+    assertEqual(mn.microUsdText(0n), '0.0000');
+    assertEqual(mn.microUsdText(MONEY_I64_MAX), '9223372036854.7758');
+    assertEqual(mn.microUsdText(1n), '0.0000', 'half-up at the fifth decimal');
+    assertEqual(mn.microUsdText(500_000n), '0.5000');
+    assert(!mn.microText(MONEY_I64_MAX).includes('e'), 'never scientific notation');
+    assert(!mn.microText(MONEY_I64_MAX).includes('E'), 'never scientific notation');
+    // The panel renders the exact digits (money line + credits line).
+    const panel = cp.buildUsagePanel({
+      identity: nc.validateIdentity(clone(identityJson)).identity,
+      entitlements: nc.validateEntitlements(bigEntitlementsJson()).entitlements,
+      usage: nc.validateBillingUsage(bigBillingUsageJson()),
+      refusal: null,
+      cursor: null,
+      hasPrev: false,
+    });
+    const lines = cp.usagePanelLines(panel);
+    assert(
+      lines.some((line) => line.includes('managed 9223372036854775807\u00b5$')),
+      JSON.stringify(lines),
+    );
+    assert(
+      lines.some((line) =>
+        line.includes('credits balance 9223372036854775807\u00b5$'),
+      ),
+      JSON.stringify(lines),
+    );
+  });
+
+  await test('money aggregation is exact in bigint (sums, saturating balance, quota compare)', () => {
+    assertEqual(mn.sumMicro([MONEY_SAFE_MAX, 1n]), 9007199254740992n);
+    assertEqual(mn.sumMicro([MONEY_I64_MAX - 1n, 1n]), MONEY_I64_MAX);
+    assertEqual(mn.sumMicro([]), 0n);
+    assertEqual(mn.microBalance(MONEY_I64_MAX, 1n, 1n), MONEY_I64_MAX);
+    assertEqual(mn.microBalance(0n, 0n, 5n), 0n, 'the balance saturates at zero');
+    const panel = cp.buildUsagePanel({
+      identity: nc.validateIdentity(clone(identityJson)).identity,
+      entitlements: nc.validateEntitlements(bigEntitlementsJson()).entitlements,
+      usage: nc.validateBillingUsage(bigBillingUsageJson()),
+      refusal: null,
+      cursor: null,
+      hasPrev: false,
+    });
+    assertEqual(panel.credits.balanceMicro, '9223372036854775807');
+    assertEqual(panel.period.managedCostMicro, '9223372036854775807');
+    // 2^53 vs 2^53+1: a float would collapse the pair and flip the verdict.
+    const managed = panel.quotas.find(
+      (quota) => quota.limit === 'max_managed_spend_micro_per_period',
+    );
+    assertEqual(managed.value, '9223372036854775807');
+    assertEqual(managed.observed, '9223372036854775806');
+    assertEqual(managed.exceeded, false, 'observed below the exact ceiling');
+    const floor = panel.quotas.find((quota) => quota.limit === 'min_credit_balance_micro');
+    assertEqual(floor.value, '9007199254740993');
+    assertEqual(floor.observed, '9223372036854775807');
+    assertEqual(floor.exceeded, false, 'the exact balance is above the floor');
+    const near = cp.buildUsagePanel({
+      identity: nc.validateIdentity(clone(identityJson)).identity,
+      entitlements: nc.validateEntitlements(nearBoundaryEntitlementsJson()).entitlements,
+      usage: nc.validateBillingUsage(nearBoundaryBillingUsageJson()),
+      refusal: null,
+      cursor: null,
+      hasPrev: false,
+    });
+    const nearQuota = near.quotas.find(
+      (quota) => quota.limit === 'max_managed_spend_micro_per_period',
+    );
+    assertEqual(nearQuota.observed, '9007199254740992');
+    assertEqual(nearQuota.value, '9007199254740993');
+    assertEqual(
+      nearQuota.exceeded,
+      false,
+      '2^53 is exactly below 2^53+1 (a float parse would flip this)',
+    );
+    const over = cp.buildUsagePanel({
+      identity: nc.validateIdentity(clone(identityJson)).identity,
+      entitlements: nc.validateEntitlements(
+        nearBoundaryEntitlementsJson({ managed: '9007199254740993', limit: '9007199254740993' }),
+      ).entitlements,
+      usage: nc.validateBillingUsage(
+        nearBoundaryBillingUsageJson({ managed: '9007199254740993' }),
+      ),
+      refusal: null,
+      cursor: null,
+      hasPrev: false,
+    });
+    const overQuota = over.quotas.find(
+      (quota) => quota.limit === 'max_managed_spend_micro_per_period',
+    );
+    assertEqual(overQuota.exceeded, true, 'exactly at/above the ceiling is exceeded');
+  });
+
+  await test('money request projection: number while lossless, else the exact string', () => {
+    assertEqual(mn.microWireValue(0n), 0);
+    assertEqual(mn.microWireValue(1_000_000n), 1_000_000);
+    assertEqual(mn.microWireValue(MONEY_SAFE_MAX), Number(MONEY_SAFE_MAX));
+    assertEqual(mn.microWireValue(MONEY_SAFE_MAX + 1n), '9007199254740992');
+    assertEqual(mn.microWireValue(MONEY_I64_MAX), '9223372036854775807');
+    assertEqual(
+      mn.microWireValue(18446744073709551615n),
+      '18446744073709551615',
+      'the whole served u64 domain projects exactly',
+    );
+    // A task start with a huge budget sends the exact string, never a rounded
+    // number; a small budget stays byte-identical to the legacy number form.
+    assertDeepEqual(
+      ts.startTaskRequest('goal', { mutationMode: '', maxTokens: 0, maxCostMicro: MONEY_I64_MAX }),
+      { goal: 'goal', max_cost_micro: '9223372036854775807' },
+    );
+    assertDeepEqual(
+      ts.startTaskRequest('goal', { mutationMode: '', maxTokens: 0, maxCostMicro: 5n }),
+      { goal: 'goal', max_cost_micro: 5 },
+    );
+  });
+}
+
+// Big-money fixtures for the display/aggregation rows above (all strings).
+function bigBillingUsageJson() {
+  return {
+    ok: true,
+    organization: 'org-local',
+    fold: {
+      organization_id: 'org-local',
+      totals: {
+        ...clone(usageBucketsJson),
+        provider_cost_micro: '9223372036854775807',
+        managed_cost_micro: '9223372036854775807',
+        byok_cost_micro: '0',
+      },
+      per_task: [],
+      next_cursor: null,
+    },
+    credits: {
+      granted_micro: '9223372036854775807',
+      consumed_micro: '1',
+      refunded_micro: '1',
+      held_micro: '0',
+      pending_consumes: 0,
+    },
+    items: [],
+    nextCursor: null,
+  };
+}
+
+function bigEntitlementsJson() {
+  return {
+    ok: true,
+    entitlements: {
+      ...clone(entitlementsJson.entitlements),
+      credits: clone(bigBillingUsageJson().credits),
+      managed_spend_micro: '9223372036854775806',
+      limits: {
+        max_tokens_per_period: '100000',
+        max_managed_spend_micro_per_period: '9223372036854775807',
+        min_credit_balance_micro: '9007199254740993',
+        max_active_tasks: '4',
+      },
+    },
+  };
+}
+
+function nearBoundaryBillingUsageJson(overrides = {}) {
+  const managed = overrides.managed ?? '9007199254740992';
+  return {
+    ...clone(bigBillingUsageJson()),
+    fold: {
+      organization_id: 'org-local',
+      totals: {
+        ...clone(usageBucketsJson),
+        managed_cost_micro: managed,
+        provider_cost_micro: managed,
+      },
+      per_task: [],
+      next_cursor: null,
+    },
+    credits: {
+      granted_micro: managed,
+      consumed_micro: '0',
+      refunded_micro: '0',
+      held_micro: '0',
+      pending_consumes: 0,
+    },
+  };
+}
+
+function nearBoundaryEntitlementsJson(overrides = {}) {
+  const limit = overrides.limit ?? '9007199254740993';
+  return {
+    ok: true,
+    entitlements: {
+      ...clone(entitlementsJson.entitlements),
+      credits: clone(nearBoundaryBillingUsageJson(overrides).credits),
+      managed_spend_micro: overrides.managed ?? '9007199254740992',
+      limits: {
+        max_managed_spend_micro_per_period: limit,
+        min_credit_balance_micro: '0',
+      },
+    },
+  };
+}
+
 async function main() {
   await validatorAccepts();
   await validatorRejects();
@@ -5188,6 +5559,7 @@ async function main() {
   await acceptanceProofTests();
   await proofSummaryTests();
   await usagePanelTests();
+  await moneyTests();
   await controlPlaneCredentialTests();
   await presentationWebviewTests();
   await tournamentWebviewTests();

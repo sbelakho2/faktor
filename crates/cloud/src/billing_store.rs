@@ -36,8 +36,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::billing::{
-    fold_credits, BillingAccount, CreditBalance, CreditEntry, CreditKind, InFlightTxn,
-    Subscription, UsageEvent,
+    checked_append_domain, checked_ledger_sum, fold_credits, BillingAccount, CreditBalance,
+    CreditEntry, CreditKind, CreditLedgerError, InFlightTxn, Subscription, UsageEvent,
 };
 use crate::error::ControlPlaneError;
 use crate::ids::{BillingAccountId, InFlightTxnId, OrganizationId};
@@ -472,6 +472,11 @@ pub enum BillingStoreError {
     Malformed(String),
     #[error(transparent)]
     Credit(#[from] CreditAppendRefusal),
+    /// A monetary aggregate left the `u64` domain or the ledger violates its
+    /// own invariants: typed, never saturated (a saturated balance would hide
+    /// debt from every guard).
+    #[error(transparent)]
+    Ledger(#[from] CreditLedgerError),
 }
 
 impl From<CloudStoreError> for BillingStoreError {
@@ -496,6 +501,10 @@ impl From<BillingStoreError> for ControlPlaneError {
                 "insufficient credits: {available} microUSD available, {requested} requested"
             )),
             BillingStoreError::Credit(other) => ControlPlaneError::Conflict(other.to_string()),
+            // A typed ledger refusal (overflow / corrupt invariant) stays
+            // TYPED at the control-plane boundary: it is never retryable and
+            // never flattened into a generic backend failure.
+            BillingStoreError::Ledger(e) => ControlPlaneError::Ledger(e),
         }
     }
 }
@@ -663,7 +672,7 @@ impl MemoryBillingStore {
 fn claim_credit(
     state: &mut MemBilling,
     entry: &CreditEntry,
-) -> Result<CreditAppend, CreditAppendRefusal> {
+) -> Result<CreditAppend, BillingStoreError> {
     let org = entry.organization.as_str().to_string();
     if let Some(key) = &entry.idempotency_key {
         if let Some(existing) = state.credits.values().find(|row| {
@@ -678,7 +687,7 @@ fn claim_credit(
             {
                 return Ok(CreditAppend::Duplicate);
             }
-            return Err(CreditAppendRefusal::IdempotencyConflict(key.clone()));
+            return Err(CreditAppendRefusal::IdempotencyConflict(key.clone()).into());
         }
     }
     let entries: Vec<CreditEntry> = match state.credit_order.get(&org) {
@@ -688,15 +697,17 @@ fn claim_credit(
             .collect(),
         None => Vec::new(),
     };
-    let balance = fold_credits(&entries);
+    let balance = fold_credits(&entries)?;
     match entry.kind {
         CreditKind::Grant => {}
         CreditKind::Consume => {
-            if entry.amount_micro > balance.balance_micro() {
+            let available = balance.balance_micro()?;
+            if entry.amount_micro > available {
                 return Err(CreditAppendRefusal::InsufficientCredits {
-                    available: balance.balance_micro(),
+                    available,
                     requested: entry.amount_micro,
-                });
+                }
+                .into());
             }
         }
         CreditKind::Settle | CreditKind::Refund => {
@@ -706,15 +717,16 @@ fn claim_credit(
                 .expect("validated: settle/refund carry a reference");
             let target = entries.iter().find(|row| &row.id == reference);
             let Some(target) = target else {
-                return Err(CreditAppendRefusal::UnknownReference(
-                    reference.as_str().to_string(),
-                ));
+                return Err(
+                    CreditAppendRefusal::UnknownReference(reference.as_str().to_string()).into(),
+                );
             };
             if target.kind != CreditKind::Consume {
                 return Err(CreditAppendRefusal::NotAConsume {
                     reference: reference.as_str().to_string(),
                     kind: target.kind.as_str().to_string(),
-                });
+                }
+                .into());
             }
             let settle = entries.iter().find(|row| {
                 row.kind == CreditKind::Settle && row.reference.as_ref() == Some(reference)
@@ -723,43 +735,62 @@ fn claim_credit(
                 if settle.is_some() {
                     return Err(CreditAppendRefusal::AlreadySettled {
                         reference: reference.as_str().to_string(),
-                    });
+                    }
+                    .into());
                 }
-                // Only the DELTA above the pending hold must be covered: the
-                // hold already reserved the consume's amount at write time.
+                // Only the DELTA above the pending hold must be covered. The
+                // hold is ALREADY inside `balance_micro()` (an unsettled
+                // consume counts as consumed at its held amount), so adding
+                // `target.amount_micro` back would double-count it and let a
+                // settle spend free + hold.
                 let delta = entry.amount_micro.saturating_sub(target.amount_micro);
-                let available = balance.balance_micro().saturating_add(target.amount_micro);
+                let available = balance.balance_micro()?;
                 if delta > available {
                     return Err(CreditAppendRefusal::InsufficientCredits {
                         available,
                         requested: delta,
-                    });
+                    }
+                    .into());
                 }
             } else {
                 // Refund exactness: what the consume actually spent (its
                 // settle amount when settled, else the pending hold) minus
-                // everything already refunded for it.
+                // everything already refunded for it. Checked: a ledger whose
+                // refunds exceed the spend is refused typed, never masked to
+                // a zero refundable amount.
                 let spent = settle
                     .map(|s| s.amount_micro)
                     .unwrap_or(target.amount_micro);
-                let refunded: u64 = entries
-                    .iter()
-                    .filter(|row| {
-                        row.kind == CreditKind::Refund && row.reference.as_ref() == Some(reference)
-                    })
-                    .map(|row| row.amount_micro)
-                    .sum();
-                let refundable = spent.saturating_sub(refunded);
+                let mut refunded: u64 = 0;
+                for row in entries.iter().filter(|row| {
+                    row.kind == CreditKind::Refund && row.reference.as_ref() == Some(reference)
+                }) {
+                    refunded = checked_ledger_sum("refunded_micro", refunded, row.amount_micro)?;
+                }
+                let refundable =
+                    spent
+                        .checked_sub(refunded)
+                        .ok_or_else(|| CreditLedgerError::Corrupt {
+                            detail: format!(
+                            "consume {} has {refunded} microUSD refunded against {spent} microUSD \
+                             spent",
+                            reference.as_str()
+                        ),
+                        })?;
                 if entry.amount_micro > refundable {
                     return Err(CreditAppendRefusal::RefundExceedsConsumed {
                         reference: reference.as_str().to_string(),
                         refundable,
                         requested: entry.amount_micro,
-                    });
+                    }
+                    .into());
                 }
             }
         }
     }
+    // The entry's own contribution must not leave the u64 domain: refused
+    // typed before the write (nothing is ever written by a refusal).
+    checked_append_domain(entry, &balance)?;
     let seq = state.credit_order.get(&org).map(|v| v.len()).unwrap_or(0) as i64 + 1;
     state.credits.insert(
         entry.id.as_str().to_string(),
@@ -931,7 +962,7 @@ impl BillingStore for MemoryBillingStore {
     fn append_credit_entry(&self, entry: &CreditEntry) -> Result<CreditAppend, BillingStoreError> {
         validate_credit_amount(entry)?;
         let mut state = self.lock()?;
-        claim_credit(&mut state, entry).map_err(BillingStoreError::Credit)
+        claim_credit(&mut state, entry)
     }
 
     fn credit_entries(
@@ -986,7 +1017,7 @@ impl BillingStore for MemoryBillingStore {
                     .collect()
             })
             .unwrap_or_default();
-        Ok(fold_credits(&entries))
+        Ok(fold_credits(&entries)?)
     }
 
     fn begin_in_flight(&self, txn: &InFlightTxn) -> Result<(), BillingStoreError> {
@@ -1203,14 +1234,15 @@ impl SqliteControlPlaneStore {
             }
         }
         let entries = read_credit_entries(&tx, &entry.organization)?;
-        let balance = fold_credits(&entries);
+        let balance = fold_credits(&entries)?;
         match entry.kind {
             CreditKind::Grant => {}
             CreditKind::Consume => {
-                if entry.amount_micro > balance.balance_micro() {
+                let available = balance.balance_micro()?;
+                if entry.amount_micro > available {
                     return Err(BillingStoreError::Credit(
                         CreditAppendRefusal::InsufficientCredits {
-                            available: balance.balance_micro(),
+                            available,
                             requested: entry.amount_micro,
                         },
                     ));
@@ -1247,9 +1279,12 @@ impl SqliteControlPlaneStore {
                         ));
                     }
                     let delta = entry.amount_micro.saturating_sub(target.amount_micro);
-                    // The pending hold already reserves the target amount;
-                    // only the delta above it must be covered.
-                    let available = balance.balance_micro().saturating_add(target.amount_micro);
+                    // The pending hold is ALREADY inside `balance_micro()`
+                    // (an unsettled consume counts as consumed at its held
+                    // amount), so only the delta above it must be covered.
+                    // Adding `target.amount_micro` back would double-count
+                    // the hold and let a settle spend free + hold.
+                    let available = balance.balance_micro()?;
                     if delta > available {
                         return Err(BillingStoreError::Credit(
                             CreditAppendRefusal::InsufficientCredits {
@@ -1262,15 +1297,26 @@ impl SqliteControlPlaneStore {
                     let spent = settle
                         .map(|s| s.amount_micro)
                         .unwrap_or(target.amount_micro);
-                    let refunded: u64 = entries
-                        .iter()
-                        .filter(|row| {
-                            row.kind == CreditKind::Refund
-                                && row.reference.as_ref() == Some(reference)
-                        })
-                        .map(|row| row.amount_micro)
-                        .sum();
-                    let refundable = spent.saturating_sub(refunded);
+                    // Checked: a ledger whose refunds exceed the spend is
+                    // refused typed, never masked to a zero refundable
+                    // amount.
+                    let mut refunded: u64 = 0;
+                    for row in entries.iter().filter(|row| {
+                        row.kind == CreditKind::Refund && row.reference.as_ref() == Some(reference)
+                    }) {
+                        refunded =
+                            checked_ledger_sum("refunded_micro", refunded, row.amount_micro)?;
+                    }
+                    let refundable =
+                        spent
+                            .checked_sub(refunded)
+                            .ok_or_else(|| CreditLedgerError::Corrupt {
+                                detail: format!(
+                                    "consume {} has {refunded} microUSD refunded against {spent} \
+                                 microUSD spent",
+                                    reference.as_str()
+                                ),
+                            })?;
                     if entry.amount_micro > refundable {
                         return Err(BillingStoreError::Credit(
                             CreditAppendRefusal::RefundExceedsConsumed {
@@ -1283,6 +1329,10 @@ impl SqliteControlPlaneStore {
                 }
             }
         }
+        // The entry's own contribution must not leave the u64 domain: refused
+        // typed before the write (the transaction rolls back, nothing is
+        // written).
+        checked_append_domain(entry, &balance)?;
         let seq: i64 = tx
             .query_row(
                 "INSERT INTO billing_credit_seq (organization_id, next_seq) VALUES (?1, 1)
@@ -1686,7 +1736,7 @@ impl BillingStore for SqliteControlPlaneStore {
         organization: &OrganizationId,
     ) -> Result<CreditBalance, BillingStoreError> {
         let conn = self.lock_billing_conn()?;
-        Ok(fold_credits(&read_credit_entries(&conn, organization)?))
+        Ok(fold_credits(&read_credit_entries(&conn, organization)?)?)
     }
 
     fn begin_in_flight(&self, txn: &InFlightTxn) -> Result<(), BillingStoreError> {

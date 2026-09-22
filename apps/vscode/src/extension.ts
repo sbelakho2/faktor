@@ -67,6 +67,15 @@ import {
 import { CockpitTaskVerification, CockpitUsagePanel, buildCockpit, buildUsagePanel, cockpitSections, tournamentViewOf, usagePanelSections } from './cockpit';
 import type { PixelPresence } from './pixelAgents';
 import {
+  microBalance,
+  microFromNumber,
+  microText,
+  microToString,
+  MICRO_I64_MAX,
+  sumMicro,
+  type MicroMoney,
+} from './money.ts';
+import {
   AdmitFailure,
   PendingSubmission,
   StartFailure,
@@ -1323,9 +1332,12 @@ function taskSummary(
       ? {
           maxTokens: view.budget.maxTokens,
           spentTokens: view.budget.spentTokens,
-          maxCostMicro: view.budget.maxCostMicro,
-          spentCostMicro: view.budget.spentCostMicro,
-          openReservedMicro: view.budget.openReservedMicro,
+          maxCostMicro:
+            view.budget.maxCostMicro === null
+              ? null
+              : microToString(view.budget.maxCostMicro),
+          spentCostMicro: microToString(view.budget.spentCostMicro),
+          openReservedMicro: microToString(view.budget.openReservedMicro),
         }
       : null,
     acceptanceCriteria: view.acceptanceCriteria,
@@ -1356,25 +1368,31 @@ function verificationSummary(view: NativeVerificationView): VerificationSummary 
 }
 
 function usageSummary(usage: NativeSessionUsage): UsageSummary {
-  let spentMicro = 0;
-  let openMicro = 0;
-  let maxMicro: number | null = null;
+  const spentCosts: MicroMoney[] = [];
+  const openCosts: MicroMoney[] = [];
+  const maxCosts: MicroMoney[] = [];
+  let maxMicro: MicroMoney | null = null;
   let truncated = false;
   for (const task of usage.tasks) {
-    spentMicro += task.budget.spentCostMicro;
-    openMicro += task.budget.openReservedMicro;
+    // Exact bigint aggregation: a session total may exceed 2^53-1 micro-USD
+    // and must never pass through a float.
+    spentCosts.push(task.budget.spentCostMicro);
+    openCosts.push(task.budget.openReservedMicro);
     if (task.budget.maxCostMicro !== null) {
-      maxMicro = (maxMicro ?? 0) + task.budget.maxCostMicro;
+      maxCosts.push(task.budget.maxCostMicro);
     }
     if (task.reservations.truncated) {
       truncated = true;
     }
   }
+  if (maxCosts.length > 0) {
+    maxMicro = sumMicro(maxCosts);
+  }
   return {
     tokens: usage.providerCalls.tokens,
-    spentMicro,
-    maxMicro,
-    openMicro,
+    spentMicro: microToString(sumMicro(spentCosts)),
+    maxMicro: maxMicro === null ? null : microToString(maxMicro),
+    openMicro: microToString(sumMicro(openCosts)),
     truncated,
   };
 }
@@ -1433,13 +1451,26 @@ async function startTask(
       });
       return;
     }
+    const budgetCostRaw = config('budgetCostMicro', 0);
+    const maxCostMicro = microFromNumber(budgetCostRaw);
+    if (maxCostMicro === null) {
+      // A configured micro amount above 2^53-1 cannot be represented exactly
+      // by a VS Code number setting; refusing is the only honest option (the
+      // run must never start with a silently rounded budget).
+      reportError(
+        new Error(
+          `faktor.budgetCostMicro ${budgetCostRaw} is not an exact non-negative integer micro amount (max 2^53-1); the task was not started`,
+        ),
+      );
+      return;
+    }
     const settings: StartTaskSettings = {
       // Shadow-only: empty (the default) inherits the daemon's sole mode and
       // "shadow" names it explicitly. The removed direct_compat value is a
       // typed refusal at admission; a refused shadow run never downgrades.
       mutationMode: config('mutationMode', ''),
       maxTokens: config('budgetTokens', 0),
-      maxCostMicro: config('budgetCostMicro', 0),
+      maxCostMicro,
       files,
       completionContract: contract,
     };
@@ -1640,14 +1671,19 @@ async function grantCreditsFromCommand(): Promise<void> {
     return;
   }
   const amountRaw = await vscode.window.showInputBox({
-    prompt: 'Credit grant amount in microUSD (integer, > 0)',
+    prompt: 'Credit grant amount in microUSD (integer, > 0, exact)',
     placeHolder: '1000000',
-    validateInput: (value) =>
-      Number.isInteger(Number(value)) && Number(value) > 0
-        ? undefined
-        : 'enter a positive integer amount in microUSD',
+    validateInput: (value) => {
+      const parsed = parseGrantAmount(value);
+      return parsed.ok ? undefined : parsed.reason;
+    },
   });
   if (amountRaw === undefined) {
+    return;
+  }
+  const amount = parseGrantAmount(amountRaw);
+  if (!amount.ok) {
+    reportError(new Error(`refused credit grant: ${amount.reason}`));
     return;
   }
   const reasonRaw = await vscode.window.showInputBox({
@@ -1659,24 +1695,48 @@ async function grantCreditsFromCommand(): Promise<void> {
   }
   try {
     const ack = await client.grantCredits({
-      amountMicro: Number(amountRaw),
+      amountMicro: amount.value,
       reason: reasonRaw.trim(),
       idempotencyKey: randomUUID(),
     });
-    const balance = Math.max(
-      0,
-      ack.credits.granted_micro + ack.credits.refunded_micro - ack.credits.consumed_micro,
+    const balance = microBalance(
+      ack.credits.granted_micro,
+      ack.credits.refunded_micro,
+      ack.credits.consumed_micro,
     );
     chatProvider?.postNotice(
       'info',
       ack.duplicate
         ? 'credit grant replayed (idempotent); the recorded grant is unchanged'
-        : `credits granted; the balance is now ${balance}\u00b5$`,
+        : `credits granted; the balance is now ${microText(balance)}`,
     );
     await refresh();
   } catch (error) {
     reportError(error);
   }
+}
+
+/**
+ * Parse one operator-entered grant amount exactly. The grant is money: only
+ * a plain positive decimal integer within the protocol range is accepted, and
+ * the value is kept as a bigint end-to-end (a huge amount is sent as the
+ * exact decimal string, never as a rounded number).
+ */
+function parseGrantAmount(
+  raw: string,
+): { readonly ok: true; readonly value: MicroMoney } | { readonly ok: false; readonly reason: string } {
+  const text = raw.trim();
+  if (!/^[0-9]+$/.test(text)) {
+    return { ok: false, reason: 'enter a positive integer amount in microUSD' };
+  }
+  const value = BigInt(text);
+  if (value <= 0n) {
+    return { ok: false, reason: 'the grant amount must be greater than zero' };
+  }
+  if (value > MICRO_I64_MAX) {
+    return { ok: false, reason: `the grant amount exceeds the protocol maximum ${MICRO_I64_MAX}` };
+  }
+  return { ok: true, value };
 }
 
 async function controlAgent(message: ChatMessage): Promise<void> {

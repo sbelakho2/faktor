@@ -32,14 +32,14 @@ use std::sync::Arc;
 
 use crate::billing::{
     fold_usage, Admission, AdmissionBoundary, AdmissionRequest, BillingAccount, BillingConfig,
-    CreditBalance, CreditEntry, CreditKind, EntitlementExceeded, EntitlementSnapshot, InFlightKind,
-    InFlightTxn, ReconciliationState, SpendCategory, Subscription, UsageEvent, UsageFold,
-    UsageUnit, CAUSE_CREDITS, CAUSE_FEATURE_MANAGED, CAUSE_PLAN, CAUSE_SUBSCRIPTION_ACTIVE,
-    FEATURE_MANAGED_PROVIDERS, LIMIT_MAX_ACTIVE_TASKS, LIMIT_MAX_CHILDREN_PER_TASK,
-    LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD, LIMIT_MAX_PROVIDER_ATTEMPTS_PER_TASK,
-    LIMIT_MAX_TOKENS_PER_PERIOD, MAX_FOLD_EVENTS, MAX_SOURCE_KEY_BYTES, MAX_USAGE_TEXT,
-    UNIT_CACHE_READ_TOKENS, UNIT_CACHE_WRITE_TOKENS, UNIT_INPUT_TOKENS, UNIT_OUTPUT_TOKENS,
-    UNIT_PROVIDER_COST, UNIT_REASONING_TOKENS,
+    CreditBalance, CreditEntry, CreditKind, CreditLedgerError, EntitlementExceeded,
+    EntitlementSnapshot, InFlightKind, InFlightTxn, ReconciliationState, SpendCategory,
+    Subscription, UsageEvent, UsageFold, UsageUnit, CAUSE_CREDITS, CAUSE_FEATURE_MANAGED,
+    CAUSE_LEDGER_OVERFLOW, CAUSE_PLAN, CAUSE_SUBSCRIPTION_ACTIVE, FEATURE_MANAGED_PROVIDERS,
+    LIMIT_MAX_ACTIVE_TASKS, LIMIT_MAX_CHILDREN_PER_TASK, LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD,
+    LIMIT_MAX_PROVIDER_ATTEMPTS_PER_TASK, LIMIT_MAX_TOKENS_PER_PERIOD, MAX_FOLD_EVENTS,
+    MAX_SOURCE_KEY_BYTES, MAX_USAGE_TEXT, UNIT_CACHE_READ_TOKENS, UNIT_CACHE_WRITE_TOKENS,
+    UNIT_INPUT_TOKENS, UNIT_OUTPUT_TOKENS, UNIT_PROVIDER_COST, UNIT_REASONING_TOKENS,
 };
 use crate::billing_store::{
     BillingStore, CreditAppend, StoredCreditEntry, StoredUsageEvent, UsageAppend,
@@ -169,7 +169,11 @@ impl EntitlementService {
         let plan = plan_id.as_deref().and_then(|id| self.config.plan(id));
         let credits = self.store.credit_balance(organization)?;
         let events = self.scan_events(organization)?;
-        let fold = fold_usage(organization, &events);
+        // The fold is CHECKED: an aggregate that leaves u64 propagates as a
+        // typed ledger failure (see `ControlPlaneError::Ledger`) instead of
+        // saturating the snapshot's spend/token totals.
+        let fold = fold_usage(organization, &events)?;
+        let total_tokens = fold.totals.total_tokens()?;
         let in_flight = self
             .store
             .in_flight(organization)?
@@ -192,11 +196,7 @@ impl EntitlementService {
             credits,
             managed_spend_micro: fold.totals.managed_cost_micro,
             byok_spend_micro: fold.totals.byok_cost_micro,
-            total_tokens: fold.totals.input_tokens
-                + fold.totals.output_tokens
-                + fold.totals.cache_read_tokens
-                + fold.totals.cache_write_tokens
-                + fold.totals.reasoning_tokens,
+            total_tokens,
             in_flight,
             now_ms: now,
         })
@@ -221,9 +221,36 @@ impl EntitlementService {
             // integration/rollback/completion transaction.
             return Ok(Admission::InFlightContinuation);
         }
-        let snapshot = self
-            .entitlement_snapshot(organization)
-            .map_err(|e| EntitlementExceeded::of(request.boundary, &format!("snapshot:{e}")))?;
+        let snapshot = match self.entitlement_snapshot(organization) {
+            Ok(snapshot) => snapshot,
+            // FAIL CLOSED on an authoritative ledger aggregate that left the
+            // u64 domain: an overflowed projection cannot be proven below any
+            // configured quota, so the gate refuses naming the exact
+            // overflowed field (CAUSE_LEDGER_OVERFLOW) — it is NEVER
+            // saturated into an admission.
+            Err(ControlPlaneError::Ledger(CreditLedgerError::Overflow { field, left, .. })) => {
+                return Err(EntitlementExceeded::ledger_overflow(
+                    request.boundary,
+                    field,
+                    left,
+                ))
+            }
+            Err(ControlPlaneError::Ledger(_)) => {
+                // Any other ledger failure (a corrupt invariant, never
+                // produced by the pure fold) refuses the same way: fail
+                // closed naming the ledger cause.
+                return Err(EntitlementExceeded::of(
+                    request.boundary,
+                    CAUSE_LEDGER_OVERFLOW,
+                ));
+            }
+            Err(e) => {
+                return Err(EntitlementExceeded::of(
+                    request.boundary,
+                    &format!("snapshot:{e}"),
+                ))
+            }
+        };
         self.evaluate(&snapshot, request)
     }
 
@@ -292,7 +319,19 @@ impl EntitlementService {
                 {
                     let estimate = observed.estimated_provider_cost_micro;
                     if let Some(limit) = snapshot.limit(LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD) {
-                        let projected = snapshot.managed_spend_micro.saturating_add(estimate);
+                        // Checked: a projection that leaves u64 cannot be
+                        // below the limit, so it fails closed naming the
+                        // quota — never saturates into an admission.
+                        let projected = match snapshot.managed_spend_micro.checked_add(estimate) {
+                            Some(projected) => projected,
+                            None => {
+                                return Err(EntitlementExceeded::of(
+                                    boundary,
+                                    LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD,
+                                )
+                                .with_value(limit, snapshot.managed_spend_micro));
+                            }
+                        };
                         if projected > limit {
                             return Err(EntitlementExceeded::of(
                                 boundary,
@@ -301,9 +340,15 @@ impl EntitlementService {
                             .with_value(limit, snapshot.managed_spend_micro));
                         }
                     }
-                    if estimate > snapshot.credits.balance_micro() {
+                    // The free balance is checked (never saturated): a
+                    // corrupt ledger fails closed naming the credits cause.
+                    let free = snapshot
+                        .credits
+                        .balance_micro()
+                        .map_err(|_| EntitlementExceeded::of(boundary, CAUSE_CREDITS))?;
+                    if estimate > free {
                         return Err(EntitlementExceeded::of(boundary, CAUSE_CREDITS)
-                            .with_value(snapshot.credits.balance_micro(), estimate));
+                            .with_value(free, estimate));
                     }
                 }
                 if managed == SpendCategory::Managed
@@ -632,10 +677,12 @@ impl EntitlementService {
     /// Fold one organization's usage ledger: org totals plus per-task rows
     /// (inputs/outputs/cache/reasoning tokens, provider cost, managed vs
     /// BYOK spend). The scan is bounded; a flood past the bound refuses
-    /// loudly instead of folding a prefix.
+    /// loudly instead of folding a prefix. Every aggregate is checked: a
+    /// total that leaves the `u64` domain propagates the typed
+    /// [`ControlPlaneError::Ledger`] (never a saturated `u64::MAX`).
     pub fn fold(&self, organization: &OrganizationId) -> Result<UsageFold, ControlPlaneError> {
         let events = self.scan_events(organization)?;
-        Ok(fold_usage(organization, &events))
+        Ok(fold_usage(organization, &events)?)
     }
 
     /// The durable fold total of one organization: managed spend (used by

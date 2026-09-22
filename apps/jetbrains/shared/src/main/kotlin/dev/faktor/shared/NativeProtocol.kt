@@ -11,6 +11,7 @@
 // `apps/vscode/src/nativeClient.ts` validators.
 package dev.faktor.shared
 
+import java.math.BigInteger
 import java.util.Base64
 
 /** A native-protocol response or request-body shape violation. */
@@ -270,6 +271,100 @@ object JsonCodec {
     }
 }
 
+/**
+ * Exact micro-USD money rules shared by the protocol DTOs and the panels.
+ *
+ * The daemon serializes monetary `*_micro` fields as decimal STRINGS because
+ * a JavaScript `number` is only integer-exact up to 2^53-1 while the wire
+ * range is u64 up to i64::MAX. Money is therefore kept as a [BigInteger]
+ * end-to-end: exact arithmetic, exact canonical-decimal rendering (never
+ * scientific notation), never a floating-point operation. The legacy number
+ * form is tolerated only while it is exactly representable (<= 2^53-1); a
+ * larger number has already lost precision for a JavaScript producer and is
+ * refused loudly, never rounded.
+ */
+object MicroMoney {
+    /**
+     * The protocol's credit-amount bound (grant/input amounts): i64::MAX
+     * micro-USD. The daemon refuses a larger amount typed, so the client
+     * never constructs one.
+     */
+    val I64_MAX: BigInteger = BigInteger("9223372036854775807")
+
+    /**
+     * The full money domain the daemon serializes: u64 micro-USD. Response
+     * folds are u64 (a sum of i64::MAX-bounded grants can exceed i64::MAX),
+     * so parsing accepts the whole range exactly — display and arithmetic
+     * stay exact.
+     */
+    val U64_MAX: BigInteger = BigInteger("18446744073709551615")
+
+    /** 2^53-1: the largest integer a JSON `number` represents exactly. */
+    const val SAFE_NUMBER_MAX: Long = 9007199254740991L
+
+    private val PER_USD: BigInteger = BigInteger.valueOf(1_000_000L)
+
+    private val DISPLAY_SCALE: BigInteger = BigInteger.valueOf(10_000L)
+
+    /** Parse one canonical decimal money string; null when it is not one. */
+    fun parseDecimal(text: String): BigInteger? {
+        if (text.isEmpty() || text.any { it < '0' || it > '9' }) return null
+        val parsed = BigInteger(text)
+        return if (parsed > U64_MAX) null else parsed
+    }
+
+    /** Convert one legacy JSON number; null unless exactly representable. */
+    fun fromNumber(value: Long): BigInteger? {
+        if (value < 0 || value > SAFE_NUMBER_MAX) return null
+        return BigInteger.valueOf(value)
+    }
+
+    /** The canonical decimal wire/display form (never scientific notation). */
+    fun text(value: BigInteger): String = value.toString()
+
+    /** Exact micro-unit display: `1234567µ$`. */
+    fun microText(value: BigInteger): String = value.toString() + "\u00b5\$"
+
+    /**
+     * Exact USD display with four decimals (round-half-up, computed in
+     * [BigInteger] so no float ever touches money).
+     */
+    fun usdText(value: BigInteger): String {
+        val negative = value.signum() < 0
+        val magnitude = value.abs()
+        var whole = magnitude / PER_USD
+        val remainder = magnitude % PER_USD
+        var fraction = (remainder * DISPLAY_SCALE + PER_USD / BigInteger.valueOf(2L)) / PER_USD
+        if (fraction >= DISPLAY_SCALE) {
+            whole += BigInteger.ONE
+            fraction -= DISPLAY_SCALE
+        }
+        val frac = fraction.toString().padStart(4, '0')
+        return (if (negative) "-" else "") + whole.toString() + "." + frac
+    }
+
+    /**
+     * The request-body projection: a plain JSON number while lossless
+     * (<= 2^53-1, byte-compatible with the legacy daemon), else the exact
+     * decimal string. Never a silently rounded number.
+     */
+    fun wire(value: BigInteger): JsonValue =
+        if (value <= BigInteger.valueOf(SAFE_NUMBER_MAX)) {
+            JsonValue.Int64(value.toLong())
+        } else {
+            JsonValue.Str(value.toString())
+        }
+
+    /** The server's saturating rule: grants + refunds − consumed, floored at 0. */
+    fun balance(granted: BigInteger, refunded: BigInteger, consumed: BigInteger): BigInteger {
+        val credits = granted + refunded
+        return if (credits < consumed) BigInteger.ZERO else credits - consumed
+    }
+
+    /** TRUE when a limit NAME denotes a money limit (`*_micro`). */
+    fun isMicroLimitName(name: String): Boolean = name.endsWith("_micro")
+}
+
 /** Path-aware view over a parsed value; every accessor fails loudly on drift. */
 class JsonView internal constructor(val path: String, val value: JsonValue) {
 
@@ -300,6 +395,47 @@ class JsonView internal constructor(val path: String, val value: JsonValue) {
     fun long(): Long {
         val v = value as? JsonValue.Int64 ?: fail("expected an integer, got ${typeName(value)}")
         return v.value
+    }
+
+    /**
+     * One exact non-negative integer money value (micro-USD). The canonical
+     * `*_micro` form is a decimal STRING; a legacy JSON number is accepted
+     * only while exactly representable (<= 2^53-1) — a larger number is
+     * refused, never rounded (see [MicroMoney]).
+     */
+    fun microMoney(): BigInteger = exactNonNegative("micro amount")
+
+    /**
+     * One exact non-negative integer value that is not necessarily money
+     * (an entitlement limit value: money or a plain counter). The string
+     * form is accepted for either; the refusal text names it [noun].
+     */
+    fun exactInteger(noun: String): BigInteger = exactNonNegative(noun)
+
+    private fun exactNonNegative(noun: String): BigInteger {
+        val v = value
+        if (v is JsonValue.Str) {
+            val parsed = MicroMoney.parseDecimal(v.value)
+            if (parsed == null) {
+                fail(
+                    "expected a decimal $noun string in 0..=${MicroMoney.U64_MAX}, " +
+                        "got \"${v.value}\""
+                )
+            }
+            return parsed
+        }
+        if (v is JsonValue.Int64) {
+            if (v.value < 0) fail("expected a non-negative $noun, got ${v.value}")
+            val parsed = MicroMoney.fromNumber(v.value)
+            if (parsed == null) {
+                fail(
+                    "$noun ${v.value} arrives as a JSON number above 2^53-1 and is not " +
+                        "exactly representable; the daemon must serialize it as a decimal string"
+                )
+            }
+            return parsed
+        }
+        fail("expected a decimal $noun string or a legacy integer, got ${typeName(v)}")
     }
 
     fun int(): Int {
@@ -440,9 +576,10 @@ data class NativeProjection(
 data class NativeTaskBudget(
     val maxTokens: Long?,
     val spentTokens: Long?,
-    val maxCostMicro: Long?,
-    val spentCostMicro: Long,
-    val openReservedMicro: Long
+    /** Exact micro-USD (BigInteger; the wire form is a decimal string). */
+    val maxCostMicro: BigInteger?,
+    val spentCostMicro: BigInteger,
+    val openReservedMicro: BigInteger
 )
 
 data class NativeMilestones(val completed: List<String>, val open: List<String>)
@@ -614,11 +751,11 @@ data class NativeAgentControlAck(val queuedSeq: Long?, val applied: Boolean?)
 
 data class NativeUsageTotals(
     val sessions: Long,
-    val budget: Long,
-    val spent: Long,
+    val budget: BigInteger,
+    val spent: BigInteger,
     val sessionsWithCalls: Long,
     val durableTokens: Long,
-    val settledCostMicro: Long
+    val settledCostMicro: BigInteger
 )
 
 data class NativeSessionTaskUsage(val taskId: String, val budget: NativeTaskBudget)
@@ -639,9 +776,9 @@ data class NativeUsageBuckets(
     val cacheReadTokens: Long,
     val cacheWriteTokens: Long,
     val reasoningTokens: Long,
-    val providerCostMicro: Long,
-    val managedCostMicro: Long,
-    val byokCostMicro: Long,
+    val providerCostMicro: BigInteger,
+    val managedCostMicro: BigInteger,
+    val byokCostMicro: BigInteger,
     val events: Long,
     val correctedEvents: Long
 ) {
@@ -666,17 +803,15 @@ data class NativeBillingFold(
 
 /** The free/held credit picture of one organization. */
 data class NativeCreditBalance(
-    val grantedMicro: Long,
-    val consumedMicro: Long,
-    val refundedMicro: Long,
-    val heldMicro: Long,
+    val grantedMicro: BigInteger,
+    val consumedMicro: BigInteger,
+    val refundedMicro: BigInteger,
+    val heldMicro: BigInteger,
     val pendingConsumes: Long
 ) {
     /** grants + refunds − effective debits, saturating (the server's rule). */
-    fun balanceMicro(): Long {
-        val credits = grantedMicro + refundedMicro
-        return if (credits < consumedMicro) 0L else credits - consumedMicro
-    }
+    fun balanceMicro(): BigInteger =
+        MicroMoney.balance(grantedMicro, refundedMicro, consumedMicro)
 }
 
 /** `GET /native/usage?org=&since=&limit=` (the billing branch). */
@@ -708,10 +843,10 @@ data class NativeEntitlementSnapshot(
     val subscriptionExpiresMs: Long?,
     val subscriptionActive: Boolean,
     val features: List<String>,
-    val limits: Map<String, Long>,
+    val limits: Map<String, BigInteger>,
     val credits: NativeCreditBalance,
-    val managedSpendMicro: Long,
-    val byokSpendMicro: Long,
+    val managedSpendMicro: BigInteger,
+    val byokSpendMicro: BigInteger,
     val totalTokens: Long,
     val inFlight: List<NativeInFlightTxn>,
     val nowMs: Long
@@ -872,8 +1007,8 @@ data class NativeTaskProof(
     val pullRequestId: String?,
     val costStatus: String,
     val costReason: String?,
-    val spentCostMicro: Long?,
-    val maxCostMicro: Long?,
+    val spentCostMicro: BigInteger?,
+    val maxCostMicro: BigInteger?,
     val gateStatus: String?,
     val gateReason: String?,
     val steps: List<NativeProofStep>,
@@ -930,7 +1065,7 @@ data class NativeTournamentCandidate(
     val verificationPass: Boolean?,
     val reviewRank: String?,
     val reviewer: String?,
-    val costMicro: Long,
+    val costMicro: BigInteger,
     val wallMs: Long
 )
 
@@ -1247,9 +1382,9 @@ fun parseNativeProjection(json: String): NativeProjection {
 private fun parseBudget(v: JsonView): NativeTaskBudget = NativeTaskBudget(
     maxTokens = v.optionalField("maxTokens")?.long(),
     spentTokens = v.optionalField("spentTokens")?.long(),
-    maxCostMicro = v.optionalField("maxCostMicro")?.long(),
-    spentCostMicro = v.field("spentCostMicro").long(),
-    openReservedMicro = v.field("openReservedMicro").long()
+    maxCostMicro = v.optionalField("maxCostMicro")?.microMoney(),
+    spentCostMicro = v.field("spentCostMicro").microMoney(),
+    openReservedMicro = v.field("openReservedMicro").microMoney()
 )
 
 private fun parseBlocker(v: JsonView): NativeBlocker = NativeBlocker(
@@ -1491,11 +1626,11 @@ fun parseNativeUsage(json: String): NativeUsageTotals {
     val taskSpend = durable.field("taskSpend")
     return NativeUsageTotals(
         sessions = v.field("sessions").long(),
-        budget = totals.field("budget").long(),
-        spent = totals.field("spent").long(),
+        budget = totals.field("budget").microMoney(),
+        spent = totals.field("spent").microMoney(),
         sessionsWithCalls = durable.field("sessionsWithCalls").long(),
         durableTokens = calls.field("tokens").long(),
-        settledCostMicro = taskSpend.field("settledCostMicro").long()
+        settledCostMicro = taskSpend.field("settledCostMicro").microMoney()
     )
 }
 
@@ -1520,31 +1655,35 @@ private fun parseUsageBuckets(v: JsonView): NativeUsageBuckets = NativeUsageBuck
     cacheReadTokens = v.field("cache_read_tokens").long(),
     cacheWriteTokens = v.field("cache_write_tokens").long(),
     reasoningTokens = v.field("reasoning_tokens").long(),
-    providerCostMicro = v.field("provider_cost_micro").long(),
-    managedCostMicro = v.field("managed_cost_micro").long(),
-    byokCostMicro = v.field("byok_cost_micro").long(),
+    providerCostMicro = v.field("provider_cost_micro").microMoney(),
+    managedCostMicro = v.field("managed_cost_micro").microMoney(),
+    byokCostMicro = v.field("byok_cost_micro").microMoney(),
     events = v.field("events").long(),
     correctedEvents = v.field("corrected_events").long()
 )
 
 private fun parseCreditBalance(v: JsonView): NativeCreditBalance = NativeCreditBalance(
-    grantedMicro = v.field("granted_micro").long(),
-    consumedMicro = v.field("consumed_micro").long(),
-    refundedMicro = v.field("refunded_micro").long(),
-    heldMicro = v.field("held_micro").long(),
+    grantedMicro = v.field("granted_micro").microMoney(),
+    consumedMicro = v.field("consumed_micro").microMoney(),
+    refundedMicro = v.field("refunded_micro").microMoney(),
+    heldMicro = v.field("held_micro").microMoney(),
     pendingConsumes = v.field("pending_consumes").long()
 )
 
-/** The limit map is additive: every served name is kept, values must be ints. */
-private fun parseLimits(v: JsonView): Map<String, Long> {
+/**
+ * The limit map is additive: every served name is kept. Values are exact
+ * non-negative integers: a `*_micro` name is money and the rest are plain
+ * counters, but a u64 limit must never round in either case. The canonical
+ * form is a decimal string; a legacy number is accepted only while exactly
+ * representable (the shared [MicroMoney] rule).
+ */
+private fun parseLimits(v: JsonView): Map<String, BigInteger> {
     val objectValue = v.field("limits")
     objectValue.objectValue()
     val fields = (objectValue.value as JsonValue.Obj).fields
-    val limits = LinkedHashMap<String, Long>()
+    val limits = LinkedHashMap<String, BigInteger>()
     for ((name, value) in fields) {
-        val number = value as? JsonValue.Int64
-            ?: objectValue.fail("limits.$name must be an integer")
-        limits[name] = number.value
+        limits[name] = JsonView("${objectValue.path}.$name", value).exactInteger("limit")
     }
     return limits
 }
@@ -1585,8 +1724,8 @@ fun parseNativeEntitlements(json: String): NativeEntitlementSnapshot {
         features = v.field("features").stringArray(),
         limits = parseLimits(v),
         credits = parseCreditBalance(v.field("credits")),
-        managedSpendMicro = v.field("managed_spend_micro").long(),
-        byokSpendMicro = v.field("byok_spend_micro").long(),
+        managedSpendMicro = v.field("managed_spend_micro").microMoney(),
+        byokSpendMicro = v.field("byok_spend_micro").microMoney(),
         totalTokens = v.field("total_tokens").long(),
         inFlight = v.field("in_flight").array().map {
             NativeInFlightTxn(
@@ -1796,8 +1935,8 @@ fun parseNativeTaskProof(json: String): NativeTaskProof {
         pullRequestId = publication.optionalField("pullRequest")?.let { it.field("id").string() },
         costStatus = cost.field("status").string(),
         costReason = cost.optionalField("reason")?.let { jsonText(it) },
-        spentCostMicro = cost.optionalField("spentCostMicro")?.long(),
-        maxCostMicro = cost.optionalField("maxCostMicro")?.long(),
+        spentCostMicro = cost.optionalField("spentCostMicro")?.microMoney(),
+        maxCostMicro = cost.optionalField("maxCostMicro")?.microMoney(),
         gateStatus = gate.optionalField("status")?.string(),
         gateReason = gate.optionalField("reason")?.let { jsonText(it) },
         steps = completion.field("steps").array().map { parseProofStep(it) },
@@ -1886,7 +2025,7 @@ fun parseNativeTournament(json: String): NativeTournament {
                 verificationPass = candidate.optionalField("verification_pass")?.bool(),
                 reviewRank = review?.field("rank")?.string(),
                 reviewer = review?.field("reviewer")?.string(),
-                costMicro = candidate.field("cost_micro").long(),
+                costMicro = candidate.field("cost_micro").microMoney(),
                 wallMs = candidate.field("wall_ms").long()
             )
         },
@@ -2173,7 +2312,7 @@ object NativeRequests {
         criteria: List<String>? = null,
         model: String? = null,
         maxTokens: Long? = null,
-        maxCostMicro: Long? = null,
+        maxCostMicro: BigInteger? = null,
         mutationMode: String? = null,
         files: List<String>? = null,
         completionContract: NativeCompletionContract? = null
@@ -2183,7 +2322,7 @@ object NativeRequests {
             .putStrings("criteria", criteria)
             .put("model", model)
             .put("max_tokens", maxTokens)
-            .put("max_cost_micro", maxCostMicro)
+            .put("max_cost_micro", maxCostMicro?.let { MicroMoney.wire(it) })
             .put("mutation_mode", mutationMode)
             .putStrings("files", if (files.isNullOrEmpty()) null else files)
         // A non-default completion contract requires explicit work items (the
@@ -2217,7 +2356,7 @@ object NativeRequests {
         n: Int,
         model: String? = null,
         maxTokens: Long? = null,
-        maxCostMicro: Long? = null,
+        maxCostMicro: BigInteger? = null,
         mutationMode: String? = null,
         files: List<String>? = null
     ): String = JsonObjectBuilder()
@@ -2226,7 +2365,7 @@ object NativeRequests {
         .put("n", n.toLong())
         .put("model", model)
         .put("max_tokens", maxTokens)
-        .put("max_cost_micro", maxCostMicro)
+        .put("max_cost_micro", maxCostMicro?.let { MicroMoney.wire(it) })
         .put("mutation_mode", mutationMode)
         .putStrings("files", if (files.isNullOrEmpty()) null else files)
         .toJson()
@@ -2251,10 +2390,10 @@ object NativeRequests {
 
     fun changeModel(model: String): String = JsonObjectBuilder().put("model", model).toJson()
 
-    fun changeBudget(maxTokens: Long? = null, maxCostMicro: Long? = null): String =
+    fun changeBudget(maxTokens: Long? = null, maxCostMicro: BigInteger? = null): String =
         JsonObjectBuilder()
             .put("max_tokens", maxTokens)
-            .put("max_cost_micro", maxCostMicro)
+            .put("max_cost_micro", maxCostMicro?.let { MicroMoney.wire(it) })
             .toJson()
 
     fun evidenceSelectorAll(): String =
@@ -2262,11 +2401,11 @@ object NativeRequests {
 
     /** The strict credit-grant body (`POST /native/credits/grant`). */
     fun grantCredits(
-        amountMicro: Long,
+        amountMicro: BigInteger,
         reason: String? = null,
         accountId: String? = null
     ): String = JsonObjectBuilder()
-        .put("amount_micro", amountMicro)
+        .put("amount_micro", MicroMoney.wire(amountMicro))
         .put("reason", reason?.takeIf { it.isNotEmpty() })
         .put("account_id", accountId?.takeIf { it.isNotEmpty() })
         .toJson()

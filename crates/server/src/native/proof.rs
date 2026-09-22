@@ -218,10 +218,15 @@ pub(crate) struct TaskProofCost {
     /// `known` | `unavailable`.
     status: &'static str,
     reason: Option<String>,
+    /// Money fields are decimal strings on the wire (see `faktor_cloud::money`).
+    #[serde(with = "faktor_cloud::money::option")]
     spent_cost_micro: Option<u64>,
+    #[serde(with = "faktor_cloud::money::option")]
     max_cost_micro: Option<u64>,
+    #[serde(with = "faktor_cloud::money::option")]
     open_reserved_micro: Option<u64>,
     open_reservations: Option<u64>,
+    #[serde(with = "faktor_cloud::money::option")]
     uncertain_reserved_micro: Option<u64>,
     uncertain_reservations: Option<u64>,
     settled_count: Option<u64>,

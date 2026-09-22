@@ -49,6 +49,36 @@ this runtime, not frozen compatibility envelopes.
   convention where the store supports it, and full bounded listings
   otherwise.
 
+## Money encoding
+
+Monetary quantities are micro-unit integers (microUSD) held as `u64` in the
+runtime; the served domain is bounded by `i64::MAX` for credit amounts (the
+durable ledger column is a signed 64-bit `INTEGER`). On the wire a monetary
+field is a **quoted decimal string**, never a JSON number:
+
+- The rule is the field name: any key carrying the money token — snake_case
+  `*_micro` (`granted_micro`, `consumed_micro`, `refunded_micro`,
+  `held_micro`, `provider_cost_micro`, `managed_cost_micro`,
+  `byok_cost_micro`, `managed_spend_micro`, `byok_spend_micro`,
+  `amount_micro`, and the money-named plan limits
+  `max_managed_spend_micro_per_period` / `min_credit_balance_micro`) or
+  camelCase `*Micro` (`spentCostMicro`, `maxCostMicro`, `openReservedMicro`,
+  `uncertainReservedMicro`, `predictedMicro`, `spentMicro`,
+  `providerReportedMicro`, `settledCostMicro`) — is a decimal string in the
+  `u64` range, e.g. `"granted_micro": "9223372036854775807"`. The rule holds
+  at every depth, including money fields inside embedded durable JSON
+  (routing decisions, tournament candidates).
+- Clients MUST parse these with string-backed money or arbitrary-precision
+  integers (TypeScript `BigInt`, Kotlin `java.math.BigInteger`), never with
+  IEEE-754 `number` (integer-exact only to 2^53-1). A missing optional cap
+  is `null`, never `0`.
+- On INPUT the daemon accepts both the decimal string and a legacy JSON
+  integer for every money field (compatibility with pre-encoding clients);
+  malformed, negative, fractional and overflowing values are typed 400s.
+- Every other numeric field stays a JSON number: ids, session/task/run ids,
+  sequence numbers, cursors, counts, token counters, latencies and
+  timestamps. No `micro` token in the name, no string on the wire.
+
 ## Liveness and readiness
 
 - `GET /native/health` — liveness: 200 `{ok: true, version, worker_plane}`
