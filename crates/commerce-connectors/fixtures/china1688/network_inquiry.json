@@ -1,0 +1,14 @@
+{
+  "data": {
+    "offerId": "678901234567",
+    "subject": "定制模具加工件",
+    "priceVisibility": "inquiry",
+    "priceText": "价格：询价",
+    "moq": 100,
+    "seller": {
+      "name": "宁波某某模具厂",
+      "sellerId": "b2b-20002",
+      "country": "CN"
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "documented": "DigiKey Product Information V4 returns X-RateLimit-Limit and X-RateLimit-Remaining on every response, and Retry-After on a 429. The connector consumes these into the shared quota state instead of relying on hard-coded limits.",
+  "headers": {
+    "X-RateLimit-Limit": "1000",
+    "X-RateLimit-Remaining": "0",
+    "Retry-After": "60"
+  }
+}

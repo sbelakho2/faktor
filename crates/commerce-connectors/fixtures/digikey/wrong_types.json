@@ -1,0 +1,22 @@
+{
+  "ProductsCount": 1,
+  "Products": [
+    {
+      "ManufacturerProductNumber": "TPS5430DDAR",
+      "Description": { "ProductDescription": "Buck regulator" },
+      "Manufacturer": { "Name": "Texas Instruments" },
+      "ProductVariations": [
+        {
+          "DigiKeyProductNumber": "296-17989-1-ND",
+          "PackageType": { "Name": "Mystery Pack" },
+          "QuantityAvailable": "many",
+          "MinimumOrderQuantity": 1.5,
+          "StandardPricing": [
+            { "BreakQuantity": "many", "UnitPrice": "cheap", "Currency": "USD" },
+            { "BreakQuantity": 100, "UnitPrice": {}, "Currency": "USD" }
+          ]
+        }
+      ]
+    }
+  ]
+}

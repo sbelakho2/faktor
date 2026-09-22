@@ -1,0 +1,1 @@
+{"data": {"offerId": [1, 2, 3], "subject": {"nested": true}, "price": {"amount": "36.00"}, "skuMap": {"xxxx": {"price": ["2.00"]}}, "stock": "many"}}

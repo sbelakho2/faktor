@@ -1,0 +1,42 @@
+{
+  "Errors": [],
+  "SearchResults": {
+    "NumberOfResult": 2,
+    "Parts": [
+      {
+        "MouserPartNumber": "595-TPS5430DDAR",
+        "ManufacturerPartNumber": "TPS5430DDAR",
+        "Manufacturer": "Texas Instruments",
+        "Description": "Switching Voltage Regulators 3A 5.5-36V Step-Down DC-DC Converter",
+        "Availability": "1,234 In Stock",
+        "AvailabilityInStock": "1234",
+        "LeadTime": "8 Weeks",
+        "Min": "1",
+        "Mult": "1",
+        "StandardPackQuantity": "2500",
+        "LifecycleStatus": "Active",
+        "ProductDetailUrl": "https://www.mouser.com/ProductDetail/Texas-Instruments/TPS5430DDAR",
+        "PriceBreaks": [
+          { "Quantity": 1, "Price": "4.9200", "Currency": "USD" },
+          { "Quantity": 10, "Price": "4.4300", "Currency": "USD" },
+          { "Quantity": 100, "Price": "3.6500", "Currency": "USD" },
+          { "Quantity": 1000, "Price": "2.9800", "Currency": "USD" }
+        ]
+      },
+      {
+        "MouserPartNumber": "595-TPS5430DDA",
+        "ManufacturerPartNumber": "TPS5430DDA",
+        "Manufacturer": "Texas Instruments",
+        "Description": "Switching Voltage Regulators 3A 5.5-36V Step-Down DC-DC Converter",
+        "Availability": "0 In Stock",
+        "AvailabilityInStock": "0",
+        "LeadTime": "12 Weeks",
+        "Min": "1",
+        "Mult": "1",
+        "LifecycleStatus": "Not Recommended for New Designs",
+        "ProductDetailUrl": "https://www.mouser.com/ProductDetail/Texas-Instruments/TPS5430DDA",
+        "PriceBreaks": []
+      }
+    ]
+  }
+}

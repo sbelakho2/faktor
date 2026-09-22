@@ -36,18 +36,22 @@
 //!     over the session store: per-session repositories are views of it;
 //! 15. `tokenizers` — the ONE tokenizer registry (exact local backends with
 //!     honest conservative fallback) shared by the daemon;
-//! 16. `agent` — the reasoning runtime (drives sessions with commands);
-//! 17. `orchestrator` — the OrchestratorRuntime (audits P0-20/21/23/61),
+//! 16. `commerce` — the Faktor Acquire commerce source service, with every
+//!     enabled site adapter registered through the connector bridge
+//!     (docs/acquire.md §10/§13/§14; `None` while `[commerce]` is
+//!     disabled);
+//! 17. `agent` — the reasoning runtime (drives sessions with commands);
+//! 18. `orchestrator` — the OrchestratorRuntime (audits P0-20/21/23/61),
 //!     the AUTHORITATIVE executor of multi-agent tasks and the durable
 //!     child control surface;
-//! 18. `shadows` — the daemon's shadow-mutation roots (P0-48 + wave-24);
-//! 19. `tasks` — the TaskExecutor over the SAME orchestrator: the ONE
+//! 19. `shadows` — the daemon's shadow-mutation roots (P0-48 + wave-24);
+//! 20. `tasks` — the TaskExecutor over the SAME orchestrator: the ONE
 //!     native task-start authority of the daemon.
 //!
 //! Every authority is built EXACTLY ONCE per daemon lifetime, in the order
 //! of [`DAEMON_CONSTRUCTION_ORDER`]; the construction happens in the
 //! graph-construction region of `main.rs` (steps 1-2 in the daemon
-//! entries, steps 3-20 inline in `build_daemon_core`). Serve/ACP/commands
+//! entries, steps 3-21 inline in `build_daemon_core`). Serve/ACP/commands
 //! never construct a supervisor, ledger, index or executor of their own —
 //! they take references from this graph. The `cost_reservation`
 //! route_decision_json column and the task row's max_cost_micro column
@@ -72,14 +76,14 @@ use faktor_terminal::ProcessSupervisor;
 
 /// The ONE construction order of the daemon (audit 12/17): the canonical
 /// marker list. Steps 1-2 run in the daemon entries of `main.rs`
-/// (`build_daemon` / `build_daemon_with_mcp_inner`); steps 3-20 are inline
+/// (`build_daemon` / `build_daemon_with_mcp_inner`); steps 3-21 are inline
 /// in `main.rs::build_daemon_core` in exactly this order; step 21 consumes
 /// the graph (serve/ACP/commands) and constructs nothing of its own. The
 /// tests verify the builder text against this list — a component inserted
 /// out of order, or a second construction of any authority anywhere else,
 /// is a compile-time-red test, never a review nit.
 #[allow(dead_code)] // wave B8: consumed by the construction-order certification tests
-pub(crate) const DAEMON_CONSTRUCTION_ORDER: [&str; 21] = [
+pub(crate) const DAEMON_CONSTRUCTION_ORDER: [&str; 22] = [
     "session",      // 1. store/session
     "cas",          // 2. CAS
     "supervisor",   // 3. ProcessSupervisor
@@ -96,11 +100,12 @@ pub(crate) const DAEMON_CONSTRUCTION_ORDER: [&str; 21] = [
     "learning",     // 14. failure-learning prior
     "memory",       // 15. project-memory authority
     "tokenizers",   // 16. tokenizer registry
-    "agent",        // 17. AgentRuntime
-    "orchestrator", // 18. OrchestratorRuntime
-    "shadows",      // 19. ShadowRoots
-    "tasks",        // 20. TaskExecutor
-    "server",       // 21. ServerDeps/ACP/commands (consume only)
+    "commerce",     // 17. Faktor Acquire commerce source service
+    "agent",        // 18. AgentRuntime
+    "orchestrator", // 19. OrchestratorRuntime
+    "shadows",      // 20. ShadowRoots
+    "tasks",        // 21. TaskExecutor
+    "server",       // 22. ServerDeps/ACP/commands (consume only)
 ];
 
 /// The daemon's ONE project-memory authority (audits round: graph
@@ -189,7 +194,20 @@ pub struct DaemonGraph {
     ///     conservative fallback for unregistered identities) shared by the
     ///     daemon's context planning surface.
     pub tokenizers: Arc<faktor_context::TokenizerRegistry>,
-    /// 17. The reasoning runtime (drives sessions with commands).
+    /// 17. The Faktor Acquire commerce source service (docs/acquire.md
+    ///     §13/§14): the ONE service that owns the connector registry, the
+    ///     durable `<data-dir>/commerce/commerce.db` store, the planner and
+    ///     the credential/browser seams. The enabled site adapters are
+    ///     registered through the connector bridge at construction time
+    ///     (§10), each exactly once; an enabled-but-unconfigured source is
+    ///     registered Disabled/Unavailable so `status`/`doctor` and the
+    ///     planner see it before any request. `None` when the additive
+    ///     `[commerce]` section is absent or disabled — in that state no
+    ///     commerce directory, database, connector runtime/client, browser
+    ///     profile, broker or network request exists, and the
+    ///     `source_market` tool is not even registered.
+    pub commerce: Option<Arc<faktor_commerce::service::CommerceSourceService>>,
+    /// 18. The reasoning runtime (drives sessions with commands).
     pub agent: Arc<AgentRuntime>,
     /// THE durable evidence authority (schema v21): the ONE evidence store
     /// of record. It is the SAME allocation the runtime's ContextCompiler
@@ -198,15 +216,15 @@ pub struct DaemonGraph {
     /// ever constructed, so the runtime and the server can never disagree
     /// about ids, scope or backing.
     pub evidence: Arc<faktor_context::compiler::DurableEvidenceAuthority>,
-    /// 18. The orchestration runtime (audits P0-20/21/23/61): the
+    /// 19. The orchestration runtime (audits P0-20/21/23/61): the
     ///     AUTHORITATIVE executor of multi-agent tasks and the durable control
     ///     surface the native `/agents/{child}/...` endpoints drive.
     pub orchestrator: Arc<OrchestratorRuntime>,
-    /// 19. The shadow-mutation roots (P0-48 + P0 isolation): the executor's
+    /// 20. The shadow-mutation roots (P0-48 + P0 isolation): the executor's
     ///     shadow service; its Drop removes every shadow on graceful daemon
     ///     teardown, reconcile() at boot is the deterministic crash recovery.
     pub shadows: Arc<ShadowRoots>,
-    /// 20. The TaskExecutor over [`DaemonGraph::orchestrator`]: the ONE
+    /// 21. The TaskExecutor over [`DaemonGraph::orchestrator`]: the ONE
     ///     native task-start authority of the daemon. Non-optional; it always
     ///     carries the shadow service, so every mutating run isolates.
     pub tasks: Arc<TaskExecutor>,
@@ -2195,6 +2213,7 @@ mod tests {
         ("learning", "daemon_context_prior("),
         ("memory", "DaemonMemory::new("),
         ("tokenizers", "TokenizerRegistry::with_builtin_backends("),
+        ("commerce", "tools_market::open_commerce_service"),
         ("agent", "AgentRuntime::new"),
         ("orchestrator", "OrchestratorRuntime::new"),
         ("shadows", "ShadowRoots::new"),
@@ -2295,7 +2314,8 @@ mod tests {
                 }
                 "transport" | "providers" | "catalog" | "router" | "budgets" | "index"
                 | "evidence" | "instructions" | "verification" | "semantic" | "learning"
-                | "memory" | "tokenizers" | "agent" | "orchestrator" | "shadows" | "tasks" => {
+                | "memory" | "tokenizers" | "commerce" | "agent" | "orchestrator" | "shadows"
+                | "tasks" => {
                     assert!(
                         seen.contains(&name),
                         "step {name:?} missing from the core builder"
@@ -2413,5 +2433,168 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- Faktor Acquire disabled parity (docs/acquire.md §13/§14) --------
+
+    fn phase_bundle_table(graph: &DaemonGraph) -> Vec<(String, Vec<u8>)> {
+        let caps = faktor_core::model::ModelCapabilities::default();
+        let activation = faktor_agent::ToolActivationSet::new();
+        faktor_core::model::RouterPhase::ALL
+            .iter()
+            .copied()
+            .map(|phase| {
+                let bundle = graph.agent.deps().tools.bundle_for_phase_with_activation(
+                    phase,
+                    &caps,
+                    &activation,
+                );
+                (
+                    phase_slug_for_test(phase).to_string(),
+                    serde_json::to_vec(&bundle).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn phase_slug_for_test(phase: faktor_core::model::RouterPhase) -> &'static str {
+        use faktor_core::model::RouterPhase::*;
+        match phase {
+            Plan => "plan",
+            Explore => "explore",
+            Retrieve => "retrieve",
+            Implement => "implement",
+            Review => "review",
+            TestAnalysis => "test_analysis",
+            Debug => "debug",
+            Compact => "compact",
+            Summarize => "summarize",
+            Title => "title",
+            Embed => "embed",
+        }
+    }
+
+    /// Disabled parity (`{}` and `{enabled: false}`): no commerce service in
+    /// the graph, no `source_market` registration, no commerce directory or
+    /// database — and the wire bundle table of the whole daemon is
+    /// byte-identical between the two spellings.
+    #[test]
+    fn commerce_disabled_parity_creates_no_state_and_registers_no_tool() {
+        let dir_defaults = tempfile::tempdir().unwrap();
+        let defaults = crate::build_daemon(dir_defaults.path(), None).unwrap();
+        assert!(defaults.commerce.is_none());
+        assert!(defaults.agent.deps().tools.get("source_market").is_none());
+        assert!(!dir_defaults.path().join("commerce").exists());
+
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg_path = cfg_dir.path().join("faktor-plus.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"config_version":1,"model":"default","commerce":{"enabled":false}}"#,
+        )
+        .unwrap();
+        let cfg = crate::config::Config::load_strict(&cfg_path).unwrap();
+        let dir_disabled = tempfile::tempdir().unwrap();
+        let disabled = crate::build_daemon(dir_disabled.path(), Some(cfg)).unwrap();
+        assert!(disabled.commerce.is_none());
+        assert!(disabled.agent.deps().tools.get("source_market").is_none());
+        assert!(!dir_disabled.path().join("commerce").exists());
+
+        assert_eq!(
+            phase_bundle_table(&defaults),
+            phase_bundle_table(&disabled),
+            "an absent [commerce] section and {{enabled:false}} must render byte-identical bundles"
+        );
+    }
+
+    /// Enabled-but-unused parity (spec §2 token economics): the graph holds
+    /// the commerce service and the lazy `source_market` registration, but
+    /// with an empty activation set every phase bundle is byte-identical to
+    /// the disabled daemon's — zero schema bytes, zero schema tokens.
+    #[test]
+    fn commerce_enabled_but_inactive_adds_zero_bundle_bytes() {
+        let dir_disabled = tempfile::tempdir().unwrap();
+        let disabled = crate::build_daemon(dir_disabled.path(), None).unwrap();
+
+        let mut cfg = crate::config::Config::default();
+        cfg.commerce.enabled = true;
+        let dir_enabled = tempfile::tempdir().unwrap();
+        let enabled = crate::build_daemon(dir_enabled.path(), Some(cfg)).unwrap();
+        assert!(
+            enabled.commerce.is_some(),
+            "enabled commerce constructs once"
+        );
+        assert!(enabled.agent.deps().tools.get("source_market").is_some());
+        assert!(enabled.agent.deps().tools.is_lazy("source_market"));
+        assert!(
+            !enabled
+                .agent
+                .deps()
+                .tools
+                .bundle_for_phase(
+                    faktor_core::model::RouterPhase::Implement,
+                    &faktor_core::model::ModelCapabilities::default(),
+                )
+                .tool_names()
+                .contains(&"source_market"),
+            "an inactive lazy tool is invisible"
+        );
+        assert!(dir_enabled
+            .path()
+            .join("commerce")
+            .join("commerce.db")
+            .exists());
+        assert_eq!(
+            phase_bundle_table(&disabled),
+            phase_bundle_table(&enabled),
+            "an inactive commerce registration must not change one bundle byte"
+        );
+    }
+
+    /// Enabled-and-CONFIGURED parity (spec §13 disabled parity widened): a
+    /// daemon whose commerce section carries configured connectors (and the
+    /// browser block on) still renders byte-identical phase bundles while
+    /// the lazy `source_market` tool is inactive — the connector registry
+    /// contributes zero schema bytes. The connector registration is visible
+    /// to `status`/the planner, and no browser profile directory exists
+    /// before the first capture.
+    #[test]
+    fn commerce_enabled_and_configured_but_inactive_adds_zero_bundle_bytes() {
+        let dir_disabled = tempfile::tempdir().unwrap();
+        let disabled = crate::build_daemon(dir_disabled.path(), None).unwrap();
+
+        let mut cfg = crate::config::Config::default();
+        cfg.commerce.enabled = true;
+        cfg.commerce.browser.enabled = true;
+        cfg.commerce.connectors.mouser = Some(crate::config::CommerceApiConnectorCfg {
+            enabled: true,
+            api_key_env: Some("FAKTOR_TEST_MOUSER_UNUSED_FOR_PARITY".to_string()),
+        });
+        let dir_configured = tempfile::tempdir().unwrap();
+        let configured = crate::build_daemon(dir_configured.path(), Some(cfg)).unwrap();
+        let commerce = configured
+            .commerce
+            .as_ref()
+            .expect("enabled commerce constructs once");
+        assert!(
+            commerce
+                .sources()
+                .iter()
+                .any(|source| source.as_str() == "mouser"),
+            "the configured source is registered (Disabled/Unconfigured while its key is unset)"
+        );
+        assert!(
+            !dir_configured
+                .path()
+                .join("commerce")
+                .join("profiles")
+                .exists(),
+            "the lazy browser authority creates no profile directory before the first capture"
+        );
+        assert_eq!(
+            phase_bundle_table(&disabled),
+            phase_bundle_table(&configured),
+            "configured-but-inactive commerce must not change one bundle byte"
+        );
     }
 }

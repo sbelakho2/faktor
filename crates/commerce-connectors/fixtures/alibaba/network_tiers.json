@@ -1,0 +1,24 @@
+{
+  "data": {
+    "product": {
+      "productId": "1600123456789",
+      "title": "USB 3.0 Braided Data Cable",
+      "currency": "USD",
+      "priceTiers": [
+        {
+          "ladder": 2,
+          "price": "1.20"
+        },
+        {
+          "ladder": 100,
+          "price": "0.80"
+        }
+      ],
+      "moq": 2,
+      "supplier": {
+        "companyName": "Shenzhen Example Electronics Co., Ltd.",
+        "country": "CN"
+      }
+    }
+  }
+}

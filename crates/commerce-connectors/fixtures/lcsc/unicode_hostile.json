@@ -1,0 +1,18 @@
+{
+  "code": 200,
+  "result": {
+    "totalCount": 1,
+    "productList": [
+      {
+        "productCode": "C89642",
+        "productModel": "STM32F407\u202eVGT6",
+        "brandNameEn": "STMicroelectronics",
+        "stockNumber": 1,
+        "minBuyNumber": 1,
+        "productPriceList": [
+          { "ladder": 1, "productPrice": "12.34", "currencySymbol": "$" }
+        ]
+      }
+    ]
+  }
+}

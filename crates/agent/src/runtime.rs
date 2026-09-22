@@ -51,9 +51,9 @@ use faktor_core::time::Clock;
 use faktor_core::WorkspaceIdentity;
 use faktor_protocol::native::ToolResultBody;
 use faktor_provider::{
-    CanonicalUsage, CapabilityValidator, ContentPart, GenericAgentRequest, ProviderChunk,
-    ProviderError, ProviderErrorKind, ProviderRegistry, ReportedCost, RequestMessage, RequestMeta,
-    Role,
+    CanonicalUsage, CapabilityValidator, ContentKind, ContentPart, GenericAgentRequest,
+    ProviderChunk, ProviderError, ProviderErrorKind, ProviderRegistry, ReportedCost,
+    RequestMessage, RequestMeta, Role,
 };
 use faktor_scheduler::{OwnershipSet, ResourceRequest, ScheduledOp, Scheduler};
 use faktor_semantic::{
@@ -79,10 +79,12 @@ use faktor_verify::criteria::{
 };
 use faktor_verify::exec::{BudgetDecision, CheckRunStatus};
 
+use crate::activation::ToolActivationSet;
 use crate::loop_detect::{Fingerprint, LoopDetector};
 use crate::stall::{ProgressEvidence, StallTracker};
 use crate::tool::{
-    FilePostcondition, RecoveryHint, ReplayDescriptor, Tool, ToolOutcome, ToolRegistry, ToolRunCtx,
+    FilePostcondition, RecoveryHint, ReplayDescriptor, Tool, ToolBundle, ToolOutcome, ToolRegistry,
+    ToolRunCtx,
 };
 use crate::tool_json::ToolCallMode;
 use crate::{
@@ -5166,10 +5168,14 @@ impl AgentRuntime {
             // call's intent is `implement_main`); the Implement bundle keeps
             // the full registered set, so the wire shape is unchanged while
             // every other phase gets its strict subset.
-            let tool_bundle = self
-                .deps
-                .tools
-                .bundle_for_phase(RouterPhase::Implement, &effective_caps);
+            //
+            // Faktor Acquire (docs/acquire.md §2/§4): the bundle is built
+            // under this SESSION's durable lazy-tool activation set, folded
+            // with the newest user text by the deterministic detector. With
+            // no `/source` flag and no signal the set stays empty and this is
+            // byte-identical to `bundle_for_phase` — zero schema tokens for
+            // every ordinary prompt.
+            let tool_bundle = self.tools_bundle_for_turn(handle, &history, &effective_caps);
             // Audit 68 production hook: the failure-aware prior is applied
             // ONLY when `failure_learning` is on AND a handle was installed
             // (`None` otherwise — the baseline planner path, byte parity).
@@ -17263,6 +17269,129 @@ async fn verification_proof_from_attempt(
     }
 }
 
+// --------------------------------------------------------------------------
+// Lazy tool activation (docs/acquire.md §2/§4): the runtime half of the
+// deterministic activation policy. The session's activation set lives in
+// durable memory facts (legacy `kind`/`key` rows, which the runtime's typed
+// memory DATA block deliberately hides), so it survives restarts and adds
+// ZERO context tokens on every turn — including activated ones.
+// --------------------------------------------------------------------------
+
+/// Durable memory-fact kind of the session's lazy-tool activation set.
+const TOOL_ACTIVATION_FACT_KIND: &str = "tool_activation";
+/// Durable memory-fact key of the set (the value is a JSON name array).
+const TOOL_ACTIVATION_FACT_KEY: &str = "set";
+/// Newest-first page size of the bounded durable scan.
+const TOOL_ACTIVATION_PAGE: i64 = 200;
+/// Bounded page walk of the durable scan: a missed flag degrades to the
+/// in-turn deterministic detection, never to a wrong activation.
+const TOOL_ACTIVATION_MAX_PAGES: usize = 16;
+
+impl AgentRuntime {
+    /// Load the session's durable activation set; `found` reports whether the
+    /// durable flag exists (missing = fresh session, empty set).
+    fn load_tool_activation(
+        &self,
+        handle: &faktor_session::SessionHandle,
+    ) -> (ToolActivationSet, bool) {
+        let mut cursor: Option<(i64, String, String)> = None;
+        for _ in 0..TOOL_ACTIVATION_MAX_PAGES {
+            let page = match handle.memory_facts_page(cursor.as_ref(), TOOL_ACTIVATION_PAGE) {
+                Ok(page) => page,
+                Err(error) => {
+                    tracing::warn!(
+                        session = %handle.id(),
+                        "tool activation read failed: {error}"
+                    );
+                    return (ToolActivationSet::new(), false);
+                }
+            };
+            for (kind, key, value) in &page.facts {
+                if kind == TOOL_ACTIVATION_FACT_KIND && key == TOOL_ACTIVATION_FACT_KEY {
+                    let names: Vec<String> = serde_json::from_str(value).unwrap_or_default();
+                    let mut set = ToolActivationSet::new();
+                    for name in names {
+                        set.activate(name);
+                    }
+                    return (set, true);
+                }
+            }
+            match page.cursor {
+                Some(next) if page.has_more => cursor = Some(next),
+                _ => break,
+            }
+        }
+        (ToolActivationSet::new(), false)
+    }
+
+    /// Persist the session's activation set. A failure is logged and the
+    /// in-memory set still governs this turn (never a hard turn failure).
+    fn store_tool_activation(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        activation: &ToolActivationSet,
+    ) {
+        let value = serde_json::to_string(&activation.names()).unwrap_or_else(|_| "[]".into());
+        if let Err(error) =
+            handle.upsert_memory_fact(TOOL_ACTIVATION_FACT_KIND, TOOL_ACTIVATION_FACT_KEY, &value)
+        {
+            tracing::warn!(
+                session = %handle.id(),
+                "tool activation write failed: {error}"
+            );
+        }
+    }
+
+    /// The newest user-visible text of the loaded history window. The
+    /// deterministic detector only reads text parts of the newest user
+    /// message; older messages are covered by the durable activation flag.
+    fn newest_user_text(history: &[RequestMessage]) -> String {
+        for message in history.iter().rev() {
+            if message.role != Role::User {
+                continue;
+            }
+            let mut text = String::new();
+            for part in &message.content {
+                if let ContentKind::Text { text: part_text } = &part.kind {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(part_text);
+                }
+            }
+            return text;
+        }
+        String::new()
+    }
+
+    /// The Implement-phase tool bundle under the session's activation set.
+    /// The set is folded with the newest user text; a changed set (or a
+    /// non-empty set whose durable flag fell out of the bounded scan) is
+    /// persisted. An empty set yields EXACTLY `bundle_for_phase` bytes.
+    fn tools_bundle_for_turn(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        history: &[RequestMessage],
+        capabilities: &faktor_core::model::ModelCapabilities,
+    ) -> ToolBundle {
+        let (activation, stored) = self.load_tool_activation(handle);
+        let text = Self::newest_user_text(history);
+        let next = if text.is_empty() {
+            activation.clone()
+        } else {
+            self.deps.tools.activation_for_text(&activation, &text)
+        };
+        if next != activation || (!stored && !next.is_empty()) {
+            self.store_tool_activation(handle, &next);
+        }
+        self.deps.tools.bundle_for_phase_with_activation(
+            RouterPhase::Implement,
+            capabilities,
+            &next,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -17780,6 +17909,163 @@ mod tests {
             .create_session(ws, "test session", "fake", "m")
             .unwrap()
             .id()
+    }
+
+    // ---- lazy tool activation (docs/acquire.md §2/§4) -------------------
+
+    /// A lazy test tool with the normative Acquire trigger vocabulary.
+    fn lazy_market_tool() -> Tool {
+        Tool {
+            name: "source_market".into(),
+            description: "d".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"op": {"enum": ["search"]}},
+                "required": ["op"],
+                "additionalProperties": false
+            }),
+            resource_class: faktor_core::resource::ResourceClass::Network,
+            capability: None,
+            recovery_hint: RecoveryHint::Idempotent,
+            path_args: vec![],
+            execute: Arc::new(|_ctx, _args| Box::pin(async { Ok(ToolOutcome::default()) })),
+        }
+    }
+
+    fn lazy_registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register_lazy(
+            lazy_market_tool(),
+            crate::activation::ToolExposure::lazy(
+                crate::activation::acquire_source_phases(),
+                crate::activation::acquire_source_triggers(),
+            ),
+        );
+        registry
+    }
+
+    /// Token economics (spec §2, release-blocking): a registered but
+    /// INACTIVE lazy tool leaves the Implement bundle byte-identical to a
+    /// registry without it; an ordinary prompt never activates it.
+    #[test]
+    fn inactive_lazy_registration_is_byte_identical_and_ordinary_prompts_stay_empty() {
+        let caps = ModelCapabilities::default();
+        let baseline = ToolRegistry::new().bundle_for_phase(RouterPhase::Implement, &caps);
+        let with_lazy = lazy_registry();
+        let mut activation = ToolActivationSet::new();
+        with_lazy.observe_activation("fix the parser and run the tests", &mut activation);
+        assert!(
+            activation.is_empty(),
+            "an ordinary prompt must not activate"
+        );
+        let inactive =
+            with_lazy.bundle_for_phase_with_activation(RouterPhase::Implement, &caps, &activation);
+        assert_eq!(
+            serde_json::to_vec(&baseline).unwrap(),
+            serde_json::to_vec(&inactive).unwrap(),
+            "an inactive lazy tool must not change one wire bundle byte"
+        );
+        assert_eq!(baseline.bundle_hash(), inactive.bundle_hash());
+    }
+
+    /// The durable activation flag round-trips: a signal activates and is
+    /// persisted, an ordinary follow-up keeps it, `/source off` deactivates
+    /// durably, and the flag never leaks into the model-visible memory block.
+    #[tokio::test]
+    async fn tool_activation_persists_durably_and_is_hidden_from_the_memory_block() {
+        let script = vec![
+            ScriptedResponse::Text("ok".into()),
+            ScriptedResponse::End,
+            ScriptedResponse::Text("ok".into()),
+            ScriptedResponse::End,
+            ScriptedResponse::Text("ok".into()),
+            ScriptedResponse::End,
+        ];
+        let (mut deps, _dir) = deps(scripted_provider(script), vec![]);
+        deps.tools = Arc::new(lazy_registry());
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+
+        // Fresh session: nothing stored, nothing active.
+        let (set, found) = runtime.load_tool_activation(&handle);
+        assert!(set.is_empty() && !found);
+
+        // A signal turn activates and persists.
+        runtime
+            .run_turn(session, "source this part: TPS5430DDAR", &[])
+            .await
+            .unwrap();
+        let (set, found) = runtime.load_tool_activation(&handle);
+        assert!(found && set.is_active("source_market"), "{set:?}");
+
+        // The flag is durable across a runtime restart over the same store.
+        let facts = handle.memory_facts().unwrap();
+        assert!(
+            facts
+                .iter()
+                .any(|(kind, key, _)| kind == TOOL_ACTIVATION_FACT_KIND
+                    && key == TOOL_ACTIVATION_FACT_KEY),
+            "the activation fact must exist durably"
+        );
+
+        // The runtime's typed memory block hides legacy facts: the flag adds
+        // zero context tokens.
+        let repository =
+            faktor_memory::StoreRepository::new(runtime.deps().session.store(), session);
+        let query = faktor_memory::MemoryQuery::typed_for_session(session);
+        let rendered = faktor_memory::render_for_context(&repository, &query, 4096)
+            .unwrap()
+            .text;
+        assert!(
+            !rendered.contains("source_market") && !rendered.contains(TOOL_ACTIVATION_FACT_KIND),
+            "activation must never render into the model context: {rendered}"
+        );
+
+        // `/source off` deactivates and the deactivation persists.
+        runtime.run_turn(session, "/source off", &[]).await.unwrap();
+        let (set, found) = runtime.load_tool_activation(&handle);
+        assert!(found && set.is_empty(), "{set:?}");
+
+        // The explicit `/source on` flag re-activates and persists too.
+        runtime.run_turn(session, "/source on", &[]).await.unwrap();
+        let (set, found) = runtime.load_tool_activation(&handle);
+        assert!(found && set.is_active("source_market"), "{set:?}");
+    }
+
+    /// `tools_bundle_for_turn` over an empty history and fresh session is
+    /// byte-identical to the historical `bundle_for_phase`.
+    #[tokio::test]
+    async fn runtime_bundle_with_no_activation_matches_the_historical_bundle() {
+        let (mut deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::Text("ok".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![],
+        );
+        deps.tools = Arc::new(lazy_registry());
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+        let caps = ModelCapabilities::default();
+        let baseline = ToolRegistry::new().bundle_for_phase(RouterPhase::Implement, &caps);
+        let bundle = runtime.tools_bundle_for_turn(&handle, &[], &caps);
+        assert_eq!(
+            serde_json::to_vec(&baseline).unwrap(),
+            serde_json::to_vec(&bundle).unwrap()
+        );
+        assert_eq!(baseline.bundle_hash(), bundle.bundle_hash());
     }
 
     // ---- ChunkSink (audit 41): bounded channel + drop-oldest coalescing.

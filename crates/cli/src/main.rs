@@ -44,6 +44,7 @@ mod sso_auth;
 #[cfg(test)]
 mod test_http;
 mod tools;
+mod tools_market;
 mod worker_node;
 
 use graph::DaemonGraph;
@@ -170,6 +171,42 @@ enum Command {
     /// bootstrap launcher verified (absent when the binary was started
     /// directly). Supervisors use this to observe which artifact is live.
     Build,
+    /// Faktor Acquire local admin (never a model tool): `doctor`, `status`,
+    /// `login <source>`, `logout <source>`, `clear-cache`. Login opens the
+    /// headed dedicated profile browser; credentials never enter the model
+    /// context. The `[commerce]` section must be enabled for every action
+    /// except reading the disabled `doctor`/`status` report.
+    Commerce {
+        #[command(subcommand)]
+        action: CommerceAction,
+        /// The daemon data dir (default `~/.faktor`).
+        #[arg(long, default_value = "~/.faktor", global = true)]
+        data_dir: String,
+        #[arg(long, global = true)]
+        config: Option<String>,
+    },
+}
+
+/// The local Faktor Acquire subcommands (`faktor commerce <action>`).
+#[derive(Subcommand)]
+enum CommerceAction {
+    /// Per-source configured/auth/quota/profile/browser/extraction/
+    /// verification status (no LLM anywhere).
+    Doctor,
+    /// Local store/service status.
+    Status,
+    /// Open the headed dedicated profile browser of a source.
+    Login {
+        /// The source id (`1688`, `alibaba`, `lcsc`, `mouser`, `digikey`).
+        source: String,
+    },
+    /// Remove a source's dedicated browser profile state.
+    Logout {
+        /// The source id (`1688`, `alibaba`).
+        source: String,
+    },
+    /// Drop the whole acquisition cache.
+    ClearCache,
 }
 
 /// The worker-node local subcommands (`faktor worker <action>`).
@@ -459,6 +496,13 @@ async fn main() {
             config,
         } => {
             enterprise_command(action, expand(&data_dir), config.map(|c| expand(&c))).await;
+        }
+        Command::Commerce {
+            action,
+            data_dir,
+            config,
+        } => {
+            commerce_command(action, expand(&data_dir), config.map(|c| expand(&c))).await;
         }
         Command::Worker {
             action,
@@ -1257,6 +1301,22 @@ fn build_daemon_core(
     let learning = daemon_context_prior(config.efficiency.failure_learning, &session);
     let memory = graph::DaemonMemory::new(store.clone());
     let tokenizers = Arc::new(faktor_context::TokenizerRegistry::with_builtin_backends());
+    // Step 17 — Faktor Acquire (docs/acquire.md §13/§14): the ONE commerce
+    // source service, constructed AFTER memory/tokenizers and BEFORE the
+    // agent, because the `source_market` tool needs its Arc before the final
+    // ToolRegistry is injected. The enabled site adapters are registered
+    // through the bridge at construction time (transport from the checked
+    // egress authority, browser authority only while `[commerce.browser]` is
+    // enabled, credentials by env-var NAME) — exactly once, before the tool
+    // registry is finalized. Disabled (the default) constructs `None`:
+    // no commerce directory, database, connector runtime, browser state or
+    // network.
+    let commerce = tools_market::open_commerce_service_with(
+        data_dir,
+        &config.commerce,
+        Arc::new(tools_market::CasArtifacts::new(cas.clone())),
+        tools_market::commerce_seams(&config.commerce, data_dir, transport.clone(), &supervisor)?,
+    )?;
     // The builtin tool registry + the MCP tools (a collision never replaces
     // a builtin) and the engine layer the runtime hands its tools: edit
     // engine, CAS-backed checkpoints, the permission engine over the
@@ -1273,6 +1333,16 @@ fn build_daemon_core(
     let board_gateway = Arc::new(tools::SessionBoardGateway::new(session.clone()));
     tools.register(faktor_agent::board_post_tool(board_gateway.clone()));
     tools.register(faktor_agent::board_read_tool(board_gateway));
+    // Faktor Acquire (docs/acquire.md §4): the `source_market` tool enters
+    // the registry LAZILY with the deterministic activation policy and the
+    // §4 phase mask — until a signal/product URL/`/source on` activates it,
+    // it contributes zero schema bytes and zero schema tokens.
+    if let Some(commerce) = &commerce {
+        tools.register_lazy(
+            tools_market::source_market_tool(commerce.clone()),
+            tools_market::source_market_exposure(),
+        );
+    }
     for t in extra_tools {
         if tools.names().contains(&t.name) {
             tracing::warn!(
@@ -1390,6 +1460,7 @@ fn build_daemon_core(
         learning,
         memory,
         tokenizers,
+        commerce,
         agent,
         evidence,
         orchestrator,
@@ -4281,6 +4352,60 @@ async fn updater_command(action: UpdaterAction, data_dir: PathBuf, config_path: 
 /// organization (the daemon password is the local authority boundary, and
 /// the same role matrix is applied). GC and deletion advances scan the
 /// REAL session store and delete through the REAL guarded CAS.
+/// Daemon config for the local commerce admin commands: an EXPLICIT
+/// `--config` loads STRICTLY (a typo'd key is a startup error); without one
+/// `faktor-plus.json` next to the data dir is used when present, and a
+/// broken auto-discovered file falls back to defaults with a loud warning
+/// (the same policy as `serve`/`acp`).
+fn load_commerce_config(
+    data_dir: &std::path::Path,
+    config_path: Option<PathBuf>,
+) -> Result<config::Config, String> {
+    if let Some(path) = config_path {
+        return config::Config::load_strict(&path);
+    }
+    let path = data_dir.join("faktor-plus.json");
+    if !path.exists() {
+        return Ok(config::Config::default());
+    }
+    match config::Config::load(&path) {
+        Ok(config) => Ok(config),
+        Err(e) => {
+            tracing::error!("config error: {e}; using defaults");
+            Ok(config::Config::default())
+        }
+    }
+}
+
+/// The local Faktor Acquire admin entry (`faktor commerce <action>`). Never
+/// a model tool: no command here is registered in the agent's ToolRegistry,
+/// and `login` hands the interactive flow to the headed profile browser.
+async fn commerce_command(action: CommerceAction, data_dir: PathBuf, config_path: Option<PathBuf>) {
+    let config = match load_commerce_config(&data_dir, config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("faktor commerce: config error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let action = match action {
+        CommerceAction::Doctor => tools_market::CommerceAdminAction::Doctor,
+        CommerceAction::Status => tools_market::CommerceAdminAction::Status,
+        CommerceAction::Login { source } => tools_market::CommerceAdminAction::Login(source),
+        CommerceAction::Logout { source } => tools_market::CommerceAdminAction::Logout(source),
+        CommerceAction::ClearCache => tools_market::CommerceAdminAction::ClearCache,
+    };
+    let browser: Arc<dyn tools_market::CommerceLoginBrowser> =
+        Arc::new(tools_market::HeadedProfileBrowser);
+    match tools_market::run_commerce_admin(action, &data_dir, &config.commerce, browser).await {
+        Ok(output) => println!("{output}"),
+        Err(e) => {
+            eprintln!("faktor commerce: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 async fn enterprise_command(
     action: EnterpriseAction,
     data_dir: PathBuf,

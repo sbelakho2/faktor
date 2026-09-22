@@ -1,0 +1,19 @@
+{
+  "ProductsCount": 1,
+  "Products": [
+    {
+      "ManufacturerProductNumber": "TPS5430\u202eDDAR",
+      "Description": { "ProductDescription": "Buck regulator" },
+      "Manufacturer": { "Name": "Texas Instruments" },
+      "ProductVariations": [
+        {
+          "DigiKeyProductNumber": "296-17989-1-ND",
+          "QuantityAvailable": 1,
+          "StandardPricing": [
+            { "BreakQuantity": 1, "UnitPrice": "5.00", "Currency": "USD" }
+          ]
+        }
+      ]
+    }
+  ]
+}

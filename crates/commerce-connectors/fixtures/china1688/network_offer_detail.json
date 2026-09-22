@@ -1,0 +1,45 @@
+{
+  "data": {
+    "offerId": "678901234567",
+    "subject": "USB 3.0 数据线 编织款",
+    "price": "36.00",
+    "priceText": "¥36.00",
+    "currency": "CNY",
+    "priceRange": {
+      "low": "2.00",
+      "high": "40.00",
+      "currency": "CNY"
+    },
+    "skuMap": {
+      "颜色:白色;长度:1米": {
+        "price": "2.00",
+        "moq": 2,
+        "stock": 300
+      },
+      "颜色:黑色;长度:1米": {
+        "price": "36.00",
+        "moq": 2,
+        "stock": 500
+      },
+      "颜色:黑色;长度:2米": {
+        "price": "40.00",
+        "moq": 2,
+        "stock": 200
+      }
+    },
+    "moq": 2,
+    "stock": 1200,
+    "model": "USB3-1M-BK",
+    "spec": "1米 编织",
+    "leadTime": {
+      "minDays": 3,
+      "maxDays": 7
+    },
+    "seller": {
+      "name": "深圳市宝安区某某电子厂",
+      "sellerId": "b2b-10001",
+      "country": "CN"
+    },
+    "priceVisibility": "public"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "code": 200,
+  "result": {
+    "totalCount": 1,
+    "productList": [
+      {
+        "productCode": "C89642",
+        "productModel": "STM32F407VGT6",
+        "stockNumber": "many",
+        "minBuyNumber": 1.5,
+        "productPriceList": [
+          { "ladder": "many", "productPrice": "cheap", "currencySymbol": "$" },
+          { "ladder": 100, "productPrice": {}, "currencySymbol": "$" },
+          { "ladder": 1000, "productPrice": "9.50", "currencySymbol": "dollars" }
+        ]
+      }
+    ]
+  }
+}

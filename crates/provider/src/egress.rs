@@ -41,9 +41,36 @@
 //! only in [`execute_get`]/[`execute_post_json`] here, so the request-time
 //! destination gate applies to every adapter send identically to wave-11
 //! semantics (parsed scheme/host/port, deny before connect).
+//!
+//! # Redirects are hop-checked, never delegated to `reqwest`
+//!
+//! Every production client built here installs
+//! [`reqwest::redirect::Policy::none()`]; [`CheckedHttpClient::execute`]
+//! follows redirects itself, one request at a time, re-running the FULL
+//! request-time gate — parsed destination policy plus the outbound secret
+//! scan — on each hop's own URL/body before that hop is sent. A `Location`
+//! pointing outside the allowlist (or at a non-http(s) scheme or a URL with
+//! userinfo) is a typed [`EgressError`] refusal and the next hop is never
+//! requested. At most [`MAX_REDIRECT_HOPS`] hops are followed; the next
+//! redirect after that is [`EgressError::TooManyRedirects`]. Method/body
+//! semantics mirror the previous reqwest-internal follower exactly:
+//! 301/302 turn POST into GET (other methods keep method+body), 303 turns
+//! everything but HEAD into GET (body and payload headers dropped), and
+//! 307/308 preserve method+body (a streamed body cannot be replayed and is
+//! refused typed rather than re-sent body-less). Credentials
+//! (`authorization`, `cookie`, `cookie2`, `proxy-authorization`,
+//! `www-authenticate`) are stripped whenever scheme, host or port changes;
+//! they are kept on same-origin hops. Response bodies of intermediate hops
+//! are dropped, so the response bound is per final hop. An injected client
+//! that still follows redirects internally is detected on every response
+//! (its final URL differs from the checked hop URL) and fails closed with
+//! [`EgressError::UncheckedRedirectFollowed`].
 
 use futures::future::BoxFuture;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH,
+    CONTENT_TYPE, COOKIE, LOCATION, PROXY_AUTHORIZATION, TRANSFER_ENCODING, WWW_AUTHENTICATE,
+};
 use reqwest::{Body, Method, Request, RequestBuilder, Response, ResponseBuilderExt, Url};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -135,7 +162,12 @@ pub struct PolicyCheckedHttpTransport {
 }
 
 impl PolicyCheckedHttpTransport {
-    /// Wrap an explicit client with an optional allowlist.
+    /// Wrap an explicit client with an optional allowlist. The `inner`
+    /// client MUST be built with [`reqwest::redirect::Policy::none()`] (the
+    /// constructors here all are): [`CheckedHttpClient::execute`] follows
+    /// redirects itself so each hop is re-validated; a client that still
+    /// follows internally fails closed with
+    /// [`EgressError::UncheckedRedirectFollowed`].
     pub fn new(inner: reqwest::Client, policy: Option<DestinationPolicy>) -> Self {
         Self {
             inner: CheckedHttpClient::new(inner, policy),
@@ -201,12 +233,26 @@ impl HttpTransport for CheckedHttpClient {
 }
 
 /// The adapter-standard client: connect-timeout only (the streaming hang
-/// controls live in the adapter transport guards, never here).
+/// controls live in the adapter transport guards, never here) and
+/// redirects DISABLED — [`CheckedHttpClient::execute`] follows redirects
+/// itself so every hop passes the destination/scan gate.
 fn default_timeout_client() -> reqwest::Client {
     reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .unwrap_or_else(|_| redirect_disabled_client())
+}
+
+/// A client with automatic redirects disabled (no connect timeout). The
+/// fallback for [`default_timeout_client`] keeps `Policy::none()` even when
+/// the preferred build fails: a plain `reqwest::Client::new()` would
+/// silently reintroduce the unchecked internal follower.
+fn redirect_disabled_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("redirect-disabled HTTP client build")
 }
 
 /// Execute a GET through a transport. Request building and the raw
@@ -492,6 +538,20 @@ pub enum EgressError {
     /// adapter refuses to buffer it (bounded everything), and the partial
     /// body is discarded rather than parsed.
     ResponseTooLarge { limit_bytes: u64 },
+    /// A redirect chain exceeded [`MAX_REDIRECT_HOPS`]. Each hop is a fresh
+    /// policy-checked request, so a chain that long is refused typed; the
+    /// hop that would exceed the bound is never sent.
+    TooManyRedirects { limit: usize, url: String },
+    /// A 307/308 redirect (or a non-POST 301/302) would have to replay a
+    /// body that is not materialized (a stream); refused typed instead of
+    /// silently re-sending it body-less or converting it to GET.
+    RedirectBodyNotReplayable { url: String },
+    /// The wrapped `reqwest::Client` followed a redirect itself (its
+    /// builder installed something other than
+    /// [`reqwest::redirect::Policy::none()`]), so the final hop never
+    /// passed the per-hop destination gate. Fail closed: the caller must
+    /// not consume a response obtained through an unchecked redirect.
+    UncheckedRedirectFollowed { from: String, to: String },
 }
 
 impl std::fmt::Display for EgressError {
@@ -535,6 +595,22 @@ impl std::fmt::Display for EgressError {
             EgressError::ResponseTooLarge { limit_bytes } => write!(
                 f,
                 "response body exceeds the adapter materialization bound of {limit_bytes} bytes"
+            ),
+            EgressError::TooManyRedirects { limit, url } => write!(
+                f,
+                "egress denied: {url} exceeded the checked redirect bound of {limit} hops \
+                 (every hop is re-validated, so the chain is refused)"
+            ),
+            EgressError::RedirectBodyNotReplayable { url } => write!(
+                f,
+                "egress denied: redirect from {url} would replay a streamed (non-materialized) \
+                 request body; the body cannot be re-sent and is not silently dropped"
+            ),
+            EgressError::UncheckedRedirectFollowed { from, to } => write!(
+                f,
+                "egress denied: the wrapped HTTP client followed a redirect itself \
+                 ({from} -> {to}) without the checked hop gate; install a \
+                 Policy::none() client"
             ),
         }
     }
@@ -591,6 +667,11 @@ pub fn check_url(policy: Option<&DestinationPolicy>, url: &Url) -> Result<(), Eg
 /// secret scan of the FINAL request object (audit P0-37/P0-38). This is
 /// the enforcement point a fetch/web tool (the genuinely user-prompt-
 /// derived egress) must use for its outbound calls.
+///
+/// Redirects are followed here, not by `reqwest`: the wrapped client is
+/// built with [`reqwest::redirect::Policy::none()`] and
+/// [`CheckedHttpClient::execute`] re-runs the destination + scan gate on
+/// every hop before that hop is sent (see the module docs).
 #[derive(Debug, Clone)]
 pub struct CheckedHttpClient {
     inner: reqwest::Client,
@@ -598,9 +679,80 @@ pub struct CheckedHttpClient {
     outbound_scan: Option<OutboundScanConfig>,
 }
 
+/// The hard bound on redirect hops one checked request may follow. A
+/// redirect chain longer than this is [`EgressError::TooManyRedirects`]
+/// (the refusal arrives before the hop that would exceed the bound is
+/// sent); a redirect is only ever followed because the gate allowed the
+/// next URL.
+pub const MAX_REDIRECT_HOPS: usize = 5;
+
+/// The method (and whether the payload must be dropped) of the next hop for
+/// one redirect status, `None` when the status is not followed. Exactly the
+/// semantics of the reqwest/tower-http follower this replaced: 301/302 turn
+/// POST into GET (other methods keep method+body), 303 turns everything but
+/// HEAD into GET (body + payload headers dropped), 307/308 preserve
+/// method+body. 300/304/305/306 and non-3xx statuses are returned as-is.
+fn next_hop(status: reqwest::StatusCode, method: &Method) -> Option<(Method, bool)> {
+    use reqwest::StatusCode as S;
+    match status {
+        S::MOVED_PERMANENTLY | S::FOUND => {
+            if *method == Method::POST {
+                Some((Method::GET, true))
+            } else {
+                Some((method.clone(), false))
+            }
+        }
+        S::SEE_OTHER => {
+            if *method == Method::HEAD {
+                Some((Method::HEAD, true))
+            } else {
+                Some((Method::GET, true))
+            }
+        }
+        S::TEMPORARY_REDIRECT | S::PERMANENT_REDIRECT => Some((method.clone(), false)),
+        _ => None,
+    }
+}
+
+/// True when the two parsed URLs are not the same origin (scheme, host or
+/// effective port differs) — the exact condition the previous reqwest
+/// follower used to strip credentials.
+fn cross_origin(previous: &Url, next: &Url) -> bool {
+    next.host_str() != previous.host_str()
+        || next.port_or_known_default() != previous.port_or_known_default()
+        || next.scheme() != previous.scheme()
+}
+
+/// Drop the credential-bearing request headers on a cross-origin hop: the
+/// same set reqwest's internal follower removed.
+fn strip_credentials(headers: &mut HeaderMap) {
+    for name in [AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION, WWW_AUTHENTICATE] {
+        headers.remove(name);
+    }
+    headers.remove("cookie2");
+}
+
+/// URL equality ignoring the fragment (never sent on the wire), used to
+/// detect a wrapped client that followed a redirect itself.
+fn same_url(a: &Url, b: &Url) -> bool {
+    let (mut a, mut b) = (a.clone(), b.clone());
+    a.set_fragment(None);
+    b.set_fragment(None);
+    a == b
+}
+
 impl CheckedHttpClient {
     /// Wrap a client with an optional allowlist. `None` = no policy
     /// installed = default-allow (documented). No secret scanning.
+    ///
+    /// `inner` MUST have been built with
+    /// [`reqwest::redirect::Policy::none()`]: this client follows redirects
+    /// itself so every hop is re-validated. A client that still follows
+    /// internally is detected on the response and refused with
+    /// [`EgressError::UncheckedRedirectFollowed`] (fail closed). Prefer
+    /// [`CheckedHttpClient::with_policy`] /
+    /// [`CheckedHttpClient::with_policy_and_scan`], which build a compliant
+    /// client.
     pub fn new(inner: reqwest::Client, policy: Option<DestinationPolicy>) -> CheckedHttpClient {
         CheckedHttpClient {
             inner,
@@ -609,9 +761,9 @@ impl CheckedHttpClient {
         }
     }
 
-    /// A default client with the given allowlist.
+    /// A default redirect-disabled client with the given allowlist.
     pub fn with_policy(policy: Option<DestinationPolicy>) -> CheckedHttpClient {
-        CheckedHttpClient::new(reqwest::Client::new(), policy)
+        CheckedHttpClient::new(redirect_disabled_client(), policy)
     }
 
     /// A client with the given allowlist AND an installed outbound secret
@@ -675,18 +827,112 @@ impl CheckedHttpClient {
     /// single choke point: any `reqwest::Request` (however it was built)
     /// is checked against the policy on its parsed URL — and against the
     /// installed outbound secret scan on its FULL body — before `execute`.
+    ///
+    /// Redirects are followed here, one request at a time, up to
+    /// [`MAX_REDIRECT_HOPS`]: every hop re-runs the destination gate and
+    /// the outbound secret scan on its own URL/body BEFORE the hop is
+    /// sent, credentials never cross an origin change, and the wrapped
+    /// client must not follow redirects itself (detected and refused).
     pub async fn execute(&self, request: Request) -> Result<Response, EgressError> {
-        self.check(request.url())?;
-        if let Some(cfg) = &self.outbound_scan {
-            self.gate_outbound_body(&request, cfg)?;
+        let mut request = request;
+        let mut hops: usize = 0;
+        loop {
+            // Per-hop gate: parsed destination policy, then the full-body
+            // secret scan of THIS hop's exact request object.
+            self.check(request.url())?;
+            if let Some(cfg) = &self.outbound_scan {
+                self.gate_outbound_body(&request, cfg)?;
+            }
+            let hop_url = request.url().clone();
+            let hop_method = request.method().clone();
+            // A materialized body is cheap to replay across a preserving
+            // redirect (`try_clone` shares the refcounted bytes); `None`
+            // means the body is a stream and cannot be replayed.
+            let replay = request.try_clone();
+            let headers = request.headers().clone();
+
+            let response = self
+                .inner
+                .execute(request)
+                .await
+                .map_err(|e| EgressError::Transport(format!("{hop_url}: {e}")))?;
+
+            // Fail closed when the wrapped client followed a redirect
+            // itself: its final URL differs from the hop that was checked,
+            // so the bypass would otherwise skip every per-hop gate.
+            if !same_url(response.url(), &hop_url) {
+                return Err(EgressError::UncheckedRedirectFollowed {
+                    from: hop_url.to_string(),
+                    to: response.url().to_string(),
+                });
+            }
+
+            let Some((next_method, drop_body)) = next_hop(response.status(), &hop_method) else {
+                return Ok(response);
+            };
+            // A redirect status without a Location is not a redirect: the
+            // response is surfaced exactly as the previous follower did.
+            let Some(location) = response.headers().get(LOCATION) else {
+                return Ok(response);
+            };
+            if hops >= MAX_REDIRECT_HOPS {
+                return Err(EgressError::TooManyRedirects {
+                    limit: MAX_REDIRECT_HOPS,
+                    url: hop_url.to_string(),
+                });
+            }
+            let location = location.to_str().map_err(|_| {
+                EgressError::UnparseableUrl(format!(
+                    "redirect Location is not valid header text on {hop_url}"
+                ))
+            })?;
+            let next_url = hop_url.join(location).map_err(|e| {
+                EgressError::UnparseableUrl(format!(
+                    "redirect Location {location:?} on {hop_url}: {e}"
+                ))
+            })?;
+            // A Location carrying userinfo would smuggle embedded
+            // credentials past the credential-stripping rule.
+            if !next_url.username().is_empty() || next_url.password().is_some() {
+                return Err(EgressError::UnparseableUrl(format!(
+                    "redirect target must not carry userinfo: {next_url}"
+                )));
+            }
+
+            let mut next = match replay {
+                Some(replayed) => replayed,
+                None if !drop_body => {
+                    return Err(EgressError::RedirectBodyNotReplayable {
+                        url: hop_url.to_string(),
+                    });
+                }
+                None => {
+                    // Method conversion drops the streamed body; keep every
+                    // other header from the checked request.
+                    let mut fresh = Request::new(next_method.clone(), next_url.clone());
+                    *fresh.headers_mut() = headers;
+                    fresh
+                }
+            };
+            *next.url_mut() = next_url;
+            if drop_body {
+                *next.method_mut() = next_method;
+                *next.body_mut() = None;
+                for name in [
+                    CONTENT_TYPE,
+                    CONTENT_LENGTH,
+                    CONTENT_ENCODING,
+                    TRANSFER_ENCODING,
+                ] {
+                    next.headers_mut().remove(name);
+                }
+            }
+            if cross_origin(&hop_url, next.url()) {
+                strip_credentials(next.headers_mut());
+            }
+            hops += 1;
+            request = next;
         }
-        let url = request.url().clone();
-        let response = self
-            .inner
-            .execute(request)
-            .await
-            .map_err(|e| EgressError::Transport(format!("{url}: {e}")))?;
-        Ok(response)
     }
 
     /// Full-payload secret gate on the FINAL request body (audit P0-37 /
@@ -2034,6 +2280,123 @@ mod tests {
             transport_ctor_offenders("x/src/lib.rs", tricky)
         );
     }
+
+    // --------------------------------- redirect-policy source scan
+
+    /// Any builder call installing a redirect policy. The checked client is
+    /// the ONE place allowed to name it (and only with `Policy::none()`);
+    /// everywhere else an automatic follower would bypass the per-hop gate.
+    const REDIRECT_MARKER: &str = ".redirect(";
+
+    /// Offenders of one file: every `.redirect(` outside a test-gated item.
+    fn redirect_marker_offenders(rel: &str, source: &str) -> Vec<String> {
+        let masked = mask_noncode(source);
+        let spans = test_gated_spans(&masked);
+        let mut offenders = Vec::new();
+        for (idx, _) in masked.match_indices(REDIRECT_MARKER) {
+            if spans.iter().any(|(s, e)| idx >= *s && idx < *e) {
+                continue;
+            }
+            let line = source[..idx].matches('\n').count() + 1;
+            let text = source.lines().nth(line - 1).unwrap_or("").trim();
+            offenders.push(format!("{rel}:{line}: {text}"));
+        }
+        offenders
+    }
+
+    /// Regression certification: no production code in the workspace may
+    /// install a redirect policy except the checked egress client itself
+    /// (which installs `Policy::none()` and follows redirects through the
+    /// per-hop gate). Test-gated items and `/tests/`-layout files may use
+    /// redirects freely — the scan is about production egress.
+    #[test]
+    fn no_redirect_policy_outside_the_checked_client() {
+        let crates_root = crates_root();
+        let workspace = crates_root
+            .parent()
+            .expect("crates/ has a parent")
+            .to_path_buf();
+        let mut offenders: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
+        for root in [workspace.join("crates"), workspace.join("tests")] {
+            let mut stack = vec![root];
+            while let Some(dir) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Ok(file_type) = entry.file_type() else {
+                        continue;
+                    };
+                    if file_type.is_dir() {
+                        stack.push(path);
+                        continue;
+                    }
+                    if !(file_type.is_file()
+                        && path.extension().and_then(|e| e.to_str()) == Some("rs"))
+                    {
+                        continue;
+                    }
+                    scanned += 1;
+                    let rel = path
+                        .strip_prefix(&workspace)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string();
+                    let rel = normalize_rel(&rel);
+                    if rel == "crates/provider/src/egress.rs" || is_test_rel_at(&workspace, &rel) {
+                        continue; // the ONE checked client / test-only sources
+                    }
+                    let Ok(source) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    offenders.extend(redirect_marker_offenders(&rel, &source));
+                }
+            }
+        }
+        assert!(
+            scanned >= 10,
+            "redirect-policy scan walked nothing: {scanned}"
+        );
+        assert!(
+            offenders.is_empty(),
+            "a redirect policy is installed outside crates/provider/src/egress.rs:\n  {}\n\
+             Automatic redirect following would bypass the per-hop destination gate; \
+             production clients must use reqwest::redirect::Policy::none() and route \
+             redirects through CheckedHttpClient::execute.",
+            offenders.join("\n  ")
+        );
+
+        // Positive control: the checked client DOES install the redirect
+        // policy (the scan above would be vacuous if the marker spelling
+        // drifted); and its only spelling is `Policy::none()`.
+        let own = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/egress.rs"),
+        )
+        .expect("egress.rs is readable");
+        let own_masked = mask_noncode(&own);
+        assert!(
+            own_masked.matches(REDIRECT_MARKER).count() >= 1,
+            "the checked client must install a redirect policy explicitly"
+        );
+        assert!(
+            own_masked.contains(".redirect(reqwest::redirect::Policy::none())"),
+            "the checked client's redirect policy must be Policy::none()"
+        );
+
+        // Adversarial self-check: a production install fires; a test-gated
+        // one (and a literal) does not.
+        let production = "fn c() { let _ = reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10)); }";
+        assert_eq!(
+            redirect_marker_offenders("crates/x/src/lib.rs", production).len(),
+            1
+        );
+        let gated = "#[cfg(test)]\nfn helper() { let _ = reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10)); }\n";
+        assert!(redirect_marker_offenders("crates/x/src/lib.rs", gated).is_empty());
+        let literal = "const DOC: &str = \"builder().redirect(policy)\";";
+        assert!(redirect_marker_offenders("crates/x/src/lib.rs", literal).is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -2314,5 +2677,669 @@ mod outbound_scan_tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(server.request_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::*;
+    use faktor_security::destination::{DestinationPolicy, RuleMatch};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// One scripted route of the redirect test server.
+    #[derive(Clone)]
+    struct Route {
+        status: u16,
+        location: Option<String>,
+        body: String,
+    }
+
+    impl Route {
+        fn respond(status: u16, body: &str) -> Self {
+            Self {
+                status,
+                location: None,
+                body: body.to_string(),
+            }
+        }
+
+        fn redirect(status: u16, location: &str) -> Self {
+            Self {
+                status,
+                location: Some(location.to_string()),
+                body: String::new(),
+            }
+        }
+    }
+
+    /// One recorded request: method, path (query stripped, like MockServer),
+    /// lowercased headers and the exact body bytes.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SeenRequest {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl SeenRequest {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    /// Minimal scripted HTTP server for redirect behavior: routes
+    /// `(method, path)` to one status/Location/body and records every
+    /// request including headers and body. The stock `MockServer` cannot
+    /// emit `Location`, and redirects are exactly what must be adversarial.
+    #[derive(Default)]
+    struct RedirectServer {
+        routes: Mutex<HashMap<(String, String), Route>>,
+        seen: Mutex<Vec<SeenRequest>>,
+    }
+
+    impl RedirectServer {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn route(&self, method: &str, path: &str, route: Route) {
+            self.routes
+                .lock()
+                .unwrap()
+                .insert((method.to_string(), path.to_string()), route);
+        }
+
+        fn seen(&self) -> Vec<SeenRequest> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        fn count(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+
+        async fn serve(self: &Arc<Self>) -> std::net::SocketAddr {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("redirect server bind");
+            let addr = listener.local_addr().expect("local addr");
+            let me = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((socket, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let me = me.clone();
+                    tokio::spawn(async move { handle_conn(socket, me).await });
+                }
+            });
+            addr
+        }
+    }
+
+    async fn handle_conn(mut socket: tokio::net::TcpStream, server: Arc<RedirectServer>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let header_end;
+        loop {
+            let n = match socket.read(&mut tmp).await {
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            if n == 0 {
+                return;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = pos + 4;
+                break;
+            }
+            if buf.len() > 64 * 1024 {
+                return;
+            }
+        }
+        let header = String::from_utf8_lossy(&buf[..header_end]).to_string();
+        let mut lines = header.lines();
+        let request_line = lines.next().unwrap_or("");
+        let mut parts = request_line.split(' ');
+        let method = parts.next().unwrap_or("").to_string();
+        let path = parts
+            .next()
+            .unwrap_or("")
+            .split('?')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let mut content_length = 0usize;
+        let mut headers: Vec<(String, String)> = Vec::new();
+        for line in lines {
+            if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                headers.push((name.trim().to_lowercase(), value.trim().to_string()));
+            }
+        }
+        while buf.len() < header_end + content_length {
+            let n = socket.read(&mut tmp).await.unwrap_or_default();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        let body = buf[header_end..(header_end + content_length).min(buf.len())].to_vec();
+        server.seen.lock().unwrap().push(SeenRequest {
+            method: method.clone(),
+            path: path.clone(),
+            headers,
+            body,
+        });
+
+        let route = server.routes.lock().unwrap().get(&(method, path)).cloned();
+        let response = match route {
+            None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+            Some(route) => {
+                let mut head = format!(
+                    "HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    route.status,
+                    route.body.len()
+                );
+                if let Some(location) = &route.location {
+                    head.push_str(&format!("Location: {location}\r\n"));
+                }
+                head.push_str("\r\n");
+                head.push_str(&route.body);
+                head
+            }
+        };
+        let _ = socket.write_all(response.as_bytes()).await;
+    }
+
+    fn policy_for<I, S>(urls: I) -> DestinationPolicy
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        DestinationPolicy::parse_lines(urls).expect("test policy parses")
+    }
+
+    /// The audit defect: a cross-host `Location` target must be refused by
+    /// the SAME allowlist logic before the next hop connects. The target
+    /// differs only by HOST TEXT (`localhost` vs the allowlisted `127.0.0.1`
+    /// literal), the rebinding-style bypass class; the second server must
+    /// record ZERO requests.
+    #[tokio::test]
+    async fn cross_host_redirect_is_denied_and_the_second_hop_never_connects() {
+        let first = RedirectServer::new();
+        let second = RedirectServer::new();
+        let first_addr = first.serve().await;
+        let second_addr = second.serve().await;
+        first.route(
+            "GET",
+            "/start",
+            Route::redirect(
+                302,
+                &format!("http://localhost:{}/exfil", second_addr.port()),
+            ),
+        );
+        second.route("GET", "/exfil", Route::respond(200, "stolen"));
+        let policy = policy_for([
+            format!("http://127.0.0.1:{}", first_addr.port()),
+            format!("http://127.0.0.1:{}", second_addr.port()),
+        ]);
+        let client = CheckedHttpClient::with_policy(Some(policy));
+
+        let err = client
+            .send_checked(
+                client
+                    .get(&format!("http://127.0.0.1:{}/start", first_addr.port()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        match &err {
+            EgressError::Denied { url, reason } => {
+                assert_eq!(reason.matched, RuleMatch::None, "{err}");
+                assert!(url.contains("localhost"), "{err}");
+            }
+            other => panic!("expected a typed Denied, got {other:?}"),
+        }
+        assert_eq!(first.count(), 1, "the allowed first hop was sent");
+        assert_eq!(
+            second.count(),
+            0,
+            "the denied redirect target must never be requested"
+        );
+    }
+
+    /// Same-host path redirects are followed, in order, each hop passing the
+    /// policy; the final response streams back to the caller.
+    #[tokio::test]
+    async fn same_host_redirects_are_followed_hop_by_hop() {
+        let server = RedirectServer::new();
+        let addr = server.serve().await;
+        server.route("GET", "/a", Route::redirect(302, "/b"));
+        server.route("GET", "/b", Route::redirect(301, "/c"));
+        server.route("GET", "/c", Route::respond(200, "done"));
+        let client = CheckedHttpClient::with_policy(Some(policy_for([format!(
+            "http://127.0.0.1:{}",
+            addr.port()
+        )])));
+
+        let resp = client
+            .send_checked(
+                client
+                    .get(&format!("http://127.0.0.1:{}/a", addr.port()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "done");
+        let paths: Vec<String> = server.seen().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, ["/a", "/b", "/c"]);
+    }
+
+    /// The policy is re-enforced on EVERY hop, not just the first: an
+    /// allowed first and second hop redirecting to a denied third target is
+    /// refused before that target is contacted.
+    #[tokio::test]
+    async fn policy_is_re_enforced_after_several_hops() {
+        let first = RedirectServer::new();
+        let second = RedirectServer::new();
+        let first_addr = first.serve().await;
+        let second_addr = second.serve().await;
+        first.route("GET", "/start", Route::redirect(302, "/middle"));
+        first.route(
+            "GET",
+            "/middle",
+            Route::redirect(
+                302,
+                &format!("http://localhost:{}/exfil", second_addr.port()),
+            ),
+        );
+        second.route("GET", "/exfil", Route::respond(200, "stolen"));
+        let policy = policy_for([
+            format!("http://127.0.0.1:{}", first_addr.port()),
+            format!("http://127.0.0.1:{}", second_addr.port()),
+        ]);
+        let client = CheckedHttpClient::with_policy(Some(policy));
+
+        let err = client
+            .send_checked(
+                client
+                    .get(&format!("http://127.0.0.1:{}/start", first_addr.port()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EgressError::Denied { .. }), "{err:?}");
+        assert_eq!(first.count(), 2, "both allowed hops were sent");
+        assert_eq!(second.count(), 0, "the denied third hop never connected");
+    }
+
+    /// The hop bound is small, typed, and off-by-one adversarial: exactly
+    /// `MAX_REDIRECT_HOPS` hops are followed (`limit + 1` requests sent) and
+    /// the next redirect is refused.
+    #[tokio::test]
+    async fn redirect_hop_limit_is_typed_and_bounded() {
+        let server = RedirectServer::new();
+        let addr = server.serve().await;
+        server.route("GET", "/loop", Route::redirect(302, "/loop"));
+        let client = CheckedHttpClient::with_policy(Some(policy_for([format!(
+            "http://127.0.0.1:{}",
+            addr.port()
+        )])));
+
+        let err = client
+            .send_checked(
+                client
+                    .get(&format!("http://127.0.0.1:{}/loop", addr.port()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            EgressError::TooManyRedirects {
+                limit: MAX_REDIRECT_HOPS,
+                url: format!("http://127.0.0.1:{}/loop", addr.port()),
+            }
+        );
+        assert_eq!(
+            server.count(),
+            MAX_REDIRECT_HOPS + 1,
+            "the refusal lands before the hop that would exceed the bound"
+        );
+    }
+
+    /// Method/body semantics match the reqwest follower this replaced:
+    /// 303 => GET (HEAD stays HEAD), 301/302 POST => GET, other 301/302
+    /// methods preserved, 307/308 preserve method+body; payload headers are
+    /// dropped on GET conversion.
+    #[tokio::test]
+    async fn redirect_method_and_body_semantics_are_preserved() {
+        let server = RedirectServer::new();
+        let addr = server.serve().await;
+        for (path, status) in [
+            ("/see-other", 303),
+            ("/moved-post", 301),
+            ("/found-post", 302),
+            ("/temporary", 307),
+            ("/permanent", 308),
+        ] {
+            server.route("POST", path, Route::redirect(status, "/done"));
+        }
+        server.route("POST", "/done", Route::respond(200, "ok"));
+        // GET conversions (303 / POST 301 / POST 302) land on the same path.
+        server.route("GET", "/done", Route::respond(200, "ok"));
+        server.route("GET", "/moved-get", Route::redirect(301, "/done-get"));
+        server.route("GET", "/done-get", Route::respond(200, "ok"));
+        server.route(
+            "HEAD",
+            "/see-other-head",
+            Route::redirect(303, "/done-head"),
+        );
+        server.route("HEAD", "/done-head", Route::respond(200, ""));
+        let client = CheckedHttpClient::with_policy(Some(policy_for([format!(
+            "http://127.0.0.1:{}",
+            addr.port()
+        )])));
+        let base = format!("http://127.0.0.1:{}", addr.port());
+
+        for path in [
+            "/see-other",
+            "/moved-post",
+            "/found-post",
+            "/temporary",
+            "/permanent",
+        ] {
+            let request = client
+                .post(&format!("{base}{path}"))
+                .unwrap()
+                .header("content-type", "text/plain")
+                .body("payload")
+                .build()
+                .unwrap();
+            let resp = client.execute(request).await.unwrap();
+            assert_eq!(resp.status(), 200, "{path}");
+        }
+        // GET 301 keeps GET (no conversion, no body).
+        let resp = client
+            .send_checked(client.get(&format!("{base}/moved-get")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        // 303 from HEAD stays HEAD (tower-http semantics).
+        let request = reqwest::Request::new(
+            reqwest::Method::HEAD,
+            Url::parse(&format!("{base}/see-other-head")).unwrap(),
+        );
+        let resp = client.execute(request).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let seen = server.seen();
+        let pair = |i: usize| (&seen[i], &seen[i + 1]);
+        for (start, start_path, follow_status, want_method) in [
+            (0usize, "/see-other", 303u16, "GET"),
+            (2, "/moved-post", 301, "GET"),
+            (4, "/found-post", 302, "GET"),
+            (6, "/temporary", 307, "POST"),
+            (8, "/permanent", 308, "POST"),
+        ] {
+            let (first, second) = pair(start);
+            assert_eq!(first.path, start_path, "script order");
+            assert_eq!(
+                second.method, want_method,
+                "status {follow_status} from {}",
+                first.path
+            );
+            assert_eq!(second.path, "/done");
+            if want_method == "GET" {
+                assert!(second.body.is_empty(), "GET conversion drops the body");
+                assert_eq!(
+                    second.header("content-type"),
+                    None,
+                    "payload headers dropped"
+                );
+                assert_eq!(second.header("content-length"), None);
+            } else {
+                assert_eq!(second.body, b"payload", "307/308 replay the exact body");
+            }
+        }
+        let (moved_get, done_get) = pair(10);
+        assert_eq!(
+            (moved_get.method.as_str(), done_get.method.as_str()),
+            ("GET", "GET")
+        );
+        let (head_start, head_follow) = pair(12);
+        assert_eq!(
+            (head_start.method.as_str(), head_follow.method.as_str()),
+            ("HEAD", "HEAD"),
+            "303 from HEAD keeps HEAD"
+        );
+    }
+
+    /// Credentials never cross an origin change (scheme/host/port), and are
+    /// kept on same-origin hops — the documented stripping rule.
+    #[tokio::test]
+    async fn credentials_are_stripped_across_origins_and_kept_same_origin() {
+        let first = RedirectServer::new();
+        let second = RedirectServer::new();
+        let first_addr = first.serve().await;
+        let second_addr = second.serve().await;
+        first.route(
+            "GET",
+            "/start",
+            Route::redirect(
+                302,
+                &format!("http://127.0.0.1:{}/final", second_addr.port()),
+            ),
+        );
+        first.route("GET", "/same-start", Route::redirect(302, "/same-final"));
+        first.route("GET", "/same-final", Route::respond(200, "ok"));
+        second.route("GET", "/final", Route::respond(200, "ok"));
+        let policy = policy_for([
+            format!("http://127.0.0.1:{}", first_addr.port()),
+            format!("http://127.0.0.1:{}", second_addr.port()),
+        ]);
+        let client = CheckedHttpClient::with_policy(Some(policy));
+        let base = format!("http://127.0.0.1:{}", first_addr.port());
+
+        // Port change => cross-origin: credentials stripped.
+        let resp = client
+            .send_checked(
+                client
+                    .get(&format!("{base}/start"))
+                    .unwrap()
+                    .header("authorization", "Bearer top-secret")
+                    .header("cookie", "session=1")
+                    .header("accept", "application/json"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let cross = second.seen();
+        assert_eq!(cross.len(), 1);
+        assert_eq!(
+            cross[0].header("authorization"),
+            None,
+            "no auth across origins"
+        );
+        assert_eq!(cross[0].header("cookie"), None, "no cookie across origins");
+        assert_eq!(cross[0].header("accept"), Some("application/json"));
+
+        // Same origin (path-only change): credentials kept.
+        let resp = client
+            .send_checked(
+                client
+                    .get(&format!("{base}/same-start"))
+                    .unwrap()
+                    .header("authorization", "Bearer top-secret")
+                    .header("cookie", "session=1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let same = first.seen();
+        let final_hop = same.last().expect("same-origin hop recorded");
+        assert_eq!(final_hop.path, "/same-final");
+        assert_eq!(final_hop.header("authorization"), Some("Bearer top-secret"));
+        assert_eq!(final_hop.header("cookie"), Some("session=1"));
+    }
+
+    /// A 3xx without `Location` is not a redirect: the response is surfaced
+    /// exactly as the previous follower did (no error, no second request).
+    #[tokio::test]
+    async fn redirect_without_location_is_returned_unfollowed() {
+        let server = RedirectServer::new();
+        let addr = server.serve().await;
+        server.route("GET", "/noloc", Route::respond(302, "moved but nowhere"));
+        let client = CheckedHttpClient::with_policy(Some(policy_for([format!(
+            "http://127.0.0.1:{}",
+            addr.port()
+        )])));
+        let resp = client
+            .send_checked(
+                client
+                    .get(&format!("http://127.0.0.1:{}/noloc", addr.port()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 302);
+        assert_eq!(resp.text().await.unwrap(), "moved but nowhere");
+        assert_eq!(server.count(), 1);
+    }
+
+    /// 307/308 preserve the body; a streamed body cannot be replayed and is
+    /// refused TYPED (never silently re-sent body-less or converted to GET).
+    #[tokio::test]
+    async fn streamed_body_redirect_is_refused_typed() {
+        let server = RedirectServer::new();
+        let addr = server.serve().await;
+        server.route("POST", "/stream", Route::redirect(307, "/target"));
+        server.route("POST", "/target", Route::respond(200, "ok"));
+        let client = CheckedHttpClient::with_policy(Some(policy_for([format!(
+            "http://127.0.0.1:{}",
+            addr.port()
+        )])));
+        let stream = futures::stream::iter(vec![Ok::<_, std::io::Error>(&b"chunk"[..])]);
+        let request = client
+            .post(&format!("http://127.0.0.1:{}/stream", addr.port()))
+            .unwrap()
+            .body(reqwest::Body::wrap_stream(stream))
+            .build()
+            .unwrap();
+        let err = client.execute(request).await.unwrap_err();
+        assert!(
+            matches!(&err, EgressError::RedirectBodyNotReplayable { url } if url.ends_with("/stream")),
+            "{err:?}"
+        );
+        assert_eq!(server.count(), 1, "only the checked first hop was sent");
+    }
+
+    /// The outbound secret scan runs on every hop's body: a 307 whose
+    /// follow-up would replay a secret body is refused before ANY connect,
+    /// and a clean body follows the chain.
+    #[tokio::test]
+    async fn outbound_scan_is_enforced_before_every_hop() {
+        let server = RedirectServer::new();
+        let addr = server.serve().await;
+        server.route("POST", "/send", Route::redirect(307, "/final"));
+        server.route("POST", "/final", Route::respond(200, "ok"));
+        let client = CheckedHttpClient::with_policy_and_scan(
+            Some(policy_for([format!("http://127.0.0.1:{}", addr.port())])),
+            Some(OutboundScanConfig {
+                policy: faktor_security::payload::ScanPolicy::default(),
+                block_on_secret: true,
+                registry: None,
+            }),
+        );
+        let url = format!("http://127.0.0.1:{}/send", addr.port());
+
+        let resp = client
+            .send_checked(client.post(&url).unwrap().body("clean payload"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let followed = server.seen();
+        assert_eq!(
+            followed.len(),
+            2,
+            "clean 307 body was replayed to the final hop"
+        );
+        assert_eq!(followed[1].body, b"clean payload");
+
+        let err = client
+            .send_checked(client.post(&url).unwrap().body("AKIA0123456789ABCDEF"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EgressError::SecretBlocked { .. }), "{err:?}");
+        assert_eq!(server.count(), 2, "no hop was sent for the blocked body");
+    }
+
+    /// Constructor-level regression: the clients the checked constructors
+    /// build must NOT follow redirects on their own (the exact defect was a
+    /// default-policy client silently following past the gate).
+    #[tokio::test]
+    async fn checked_constructors_build_redirect_disabled_clients() {
+        let server = RedirectServer::new();
+        let addr = server.serve().await;
+        server.route("GET", "/go", Route::redirect(302, "/final"));
+        server.route("GET", "/final", Route::respond(200, "final"));
+        let url = format!("http://127.0.0.1:{}/go", addr.port());
+
+        let raw = default_timeout_client();
+        let resp = raw.get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 302, "default_timeout_client must not follow");
+
+        let checked = CheckedHttpClient::with_policy(None);
+        let resp = checked.inner().get(&url).send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            302,
+            "CheckedHttpClient::with_policy's inner client must not follow"
+        );
+        assert_eq!(server.count(), 2, "both probes hit the first hop only");
+    }
+
+    /// Defense in depth: an injected client that still follows redirects
+    /// internally is detected (its final URL differs from the checked hop)
+    /// and fails closed instead of handing back unchecked content.
+    #[tokio::test]
+    async fn injected_auto_following_client_fails_closed() {
+        let server = RedirectServer::new();
+        let addr = server.serve().await;
+        server.route("GET", "/go", Route::redirect(302, "/final"));
+        server.route("GET", "/final", Route::respond(200, "unchecked"));
+        // A default `reqwest::Client::new()` follows redirects (the defect).
+        let client = CheckedHttpClient::new(reqwest::Client::new(), None);
+        let err = client
+            .send_checked(
+                client
+                    .get(&format!("http://127.0.0.1:{}/go", addr.port()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        match &err {
+            EgressError::UncheckedRedirectFollowed { from, to } => {
+                assert!(from.ends_with("/go"), "{err}");
+                assert!(to.ends_with("/final"), "{err}");
+            }
+            other => panic!("expected UncheckedRedirectFollowed, got {other:?}"),
+        }
+        assert_eq!(
+            server.count(),
+            2,
+            "the inner client did follow; we refuse the result"
+        );
     }
 }

@@ -88,6 +88,13 @@ pub struct Config {
     /// `faktor worker run` entry refuses before any network or filesystem
     /// effect and the daemon is byte-identical.
     pub worker_node: WorkerNodeCfg,
+    /// The additive `[commerce]` section (spec §13, Faktor Acquire).
+    /// Disabled by default; while disabled no `source_market` tool is
+    /// registered, no commerce database is created, no connector client,
+    /// browser profile or broker exists and the rest of Faktor renders
+    /// byte-identical requests. Credentials are referenced by environment
+    /// variable NAME only — the section never carries a value.
+    pub commerce: CommerceCfg,
 }
 
 /// The additive `[completion]` section (P2 follow-up): how a contracted
@@ -2868,6 +2875,8 @@ impl<'de> serde::Deserialize<'de> for Config {
             enterprise: EnterpriseCfg,
             #[serde(default)]
             worker_node: WorkerNodeCfg,
+            #[serde(default)]
+            commerce: CommerceCfg,
         }
         let file = File::deserialize(de)?;
         if file.config_version != 1 {
@@ -2897,6 +2906,7 @@ impl<'de> serde::Deserialize<'de> for Config {
             worker_plane: file.worker_plane,
             enterprise: file.enterprise,
             worker_node: file.worker_node,
+            commerce: file.commerce,
         })
     }
 }
@@ -2939,6 +2949,7 @@ impl Default for Config {
             worker_plane: WorkerPlaneCfg::default(),
             enterprise: EnterpriseCfg::default(),
             worker_node: WorkerNodeCfg::default(),
+            commerce: CommerceCfg::default(),
         }
     }
 }
@@ -3618,6 +3629,7 @@ impl Config {
         self.worker_plane.validate()?;
         self.enterprise.validate()?;
         self.worker_node.validate()?;
+        self.commerce.validate()?;
         // The billing routes derive their tenant from the control-plane
         // principal, so an enabled billing section without the cloud section
         // could never authorize an organization-scoped read. The pair is
@@ -3751,6 +3763,499 @@ impl Config {
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         std::fs::write(path, text).map_err(|e| e.to_string())
+    }
+}
+
+// --------------------------------------------------------------------------
+// [commerce] — Faktor Acquire (docs/acquire.md §13, build step 17)
+// --------------------------------------------------------------------------
+
+/// The connector ids the section knows; any other name is a startup error.
+pub const COMMERCE_CONNECTOR_IDS: &[&str] = &["1688", "alibaba", "lcsc", "mouser", "digikey"];
+/// The default commerce database file name (spec §13).
+pub const DEFAULT_COMMERCE_DATABASE: &str = "commerce.db";
+/// Bound on one configured database file name.
+pub const MAX_COMMERCE_DATABASE_BYTES: usize = 128;
+/// Bound on one configured environment-variable NAME (never a value).
+pub const MAX_COMMERCE_ENV_NAME_BYTES: usize = 128;
+/// Bound on one configured browser profile name.
+pub const MAX_COMMERCE_PROFILE_BYTES: usize = 64;
+/// Bound on one configured browser executable path.
+pub const MAX_COMMERCE_EXECUTABLE_BYTES: usize = 4096;
+/// Upper bound on any configured cache TTL (365 days).
+pub const MAX_COMMERCE_TTL_S: u64 = 31_536_000;
+
+/// One environment-variable NAME (`[A-Za-z_][A-Za-z0-9_]*`). Values are
+/// never accepted: an operator who pastes a secret into `*_env` fails
+/// startup instead of silently shipping the value.
+fn validate_env_name(field: &str, name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > MAX_COMMERCE_ENV_NAME_BYTES {
+        return Err(format!(
+            "commerce: {field} must be 1..={MAX_COMMERCE_ENV_NAME_BYTES} bytes"
+        ));
+    }
+    let mut bytes = name.bytes();
+    let first = bytes.next().unwrap_or(0);
+    if !(first.is_ascii_alphabetic() || first == b'_')
+        || !bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Err(format!(
+            "commerce: {field} {name:?} must be an environment variable NAME \
+             ([A-Za-z_][A-Za-z0-9_]*), never a credential value"
+        ));
+    }
+    Ok(())
+}
+
+/// One browser profile name (`[a-z0-9_-]{1,64}`, the browser authority's
+/// grammar), validated here so a hostile profile never reaches a path join.
+fn validate_profile_name(field: &str, name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > MAX_COMMERCE_PROFILE_BYTES {
+        return Err(format!(
+            "commerce: {field} must be 1..={MAX_COMMERCE_PROFILE_BYTES} bytes"
+        ));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    {
+        return Err(format!("commerce: {field} {name:?} must match [a-z0-9_-]+"));
+    }
+    Ok(())
+}
+
+/// Normalize a present-but-disabled connector subsection away: the resolved
+/// config of `{enabled: false}` is byte-identically the absent key
+/// (disabled parity).
+trait ConnectorEnabled {
+    fn connector_enabled(&self) -> bool;
+}
+
+fn deserialize_enabled_connector<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + ConnectorEnabled,
+{
+    let raw = <Option<T> as serde::Deserialize>::deserialize(de)?;
+    Ok(raw.filter(ConnectorEnabled::connector_enabled))
+}
+
+/// `commerce.connectors.<source>` for the API-key connectors (LCSC,
+/// Mouser): the key is referenced by environment-variable name only.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommerceApiConnectorCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The environment variable name holding the API key.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+}
+
+impl ConnectorEnabled for CommerceApiConnectorCfg {
+    fn connector_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+impl std::fmt::Debug for CommerceApiConnectorCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommerceApiConnectorCfg")
+            .field("enabled", &self.enabled)
+            // Env-var NAMES are operator config, but Debug output is copied
+            // into logs/traces; anything credential-shaped stays redacted.
+            .field(
+                "api_key_env",
+                &self.api_key_env.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// `commerce.connectors.digikey`: the OAuth client id + secret are
+/// referenced by environment-variable names only.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommerceDigikeyConnectorCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub client_id_env: Option<String>,
+    #[serde(default)]
+    pub client_secret_env: Option<String>,
+}
+
+impl ConnectorEnabled for CommerceDigikeyConnectorCfg {
+    fn connector_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+impl std::fmt::Debug for CommerceDigikeyConnectorCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommerceDigikeyConnectorCfg")
+            .field("enabled", &self.enabled)
+            .field(
+                "client_id_env",
+                &self.client_id_env.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "client_secret_env",
+                &self.client_secret_env.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// `commerce.connectors.1688` / `commerce.connectors.alibaba`: browser
+/// profile names. The credential lives inside the browser profile, never in
+/// this config.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct CommerceProfileConnectorCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
+impl ConnectorEnabled for CommerceProfileConnectorCfg {
+    fn connector_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+/// The `commerce.connectors` map: exactly the five known source ids; any
+/// other key is a startup error. A present-but-disabled connector resolves
+/// to `None` (disabled parity).
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct CommerceConnectorsCfg {
+    #[serde(rename = "1688", deserialize_with = "deserialize_enabled_connector")]
+    pub china1688: Option<CommerceProfileConnectorCfg>,
+    #[serde(deserialize_with = "deserialize_enabled_connector")]
+    pub alibaba: Option<CommerceProfileConnectorCfg>,
+    #[serde(deserialize_with = "deserialize_enabled_connector")]
+    pub lcsc: Option<CommerceApiConnectorCfg>,
+    #[serde(deserialize_with = "deserialize_enabled_connector")]
+    pub mouser: Option<CommerceApiConnectorCfg>,
+    #[serde(deserialize_with = "deserialize_enabled_connector")]
+    pub digikey: Option<CommerceDigikeyConnectorCfg>,
+}
+
+impl CommerceConnectorsCfg {
+    /// Every enabled connector as `(source id, credential requirement)`,
+    /// sorted by source id.
+    pub fn enabled(&self) -> Vec<(&'static str, ConnectorCredential<'_>)> {
+        let mut rows: Vec<(&'static str, ConnectorCredential<'_>)> = Vec::new();
+        if let Some(cfg) = &self.china1688 {
+            rows.push(("1688", ConnectorCredential::Profile(cfg.profile.as_deref())));
+        }
+        if let Some(cfg) = &self.alibaba {
+            rows.push((
+                "alibaba",
+                ConnectorCredential::Profile(cfg.profile.as_deref()),
+            ));
+        }
+        if let Some(cfg) = &self.lcsc {
+            rows.push((
+                "lcsc",
+                ConnectorCredential::ApiKey(cfg.api_key_env.as_deref()),
+            ));
+        }
+        if let Some(cfg) = &self.mouser {
+            rows.push((
+                "mouser",
+                ConnectorCredential::ApiKey(cfg.api_key_env.as_deref()),
+            ));
+        }
+        if let Some(cfg) = &self.digikey {
+            rows.push((
+                "digikey",
+                ConnectorCredential::OAuthPair(
+                    cfg.client_id_env.as_deref(),
+                    cfg.client_secret_env.as_deref(),
+                ),
+            ));
+        }
+        rows
+    }
+}
+
+/// The credential requirement of one enabled connector: env-var NAMES (or a
+/// profile), never values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectorCredential<'a> {
+    /// A profile-based browser connector.
+    Profile(Option<&'a str>),
+    /// A single API key env var name.
+    ApiKey(Option<&'a str>),
+    /// An OAuth client id + secret env var name pair.
+    OAuthPair(Option<&'a str>, Option<&'a str>),
+}
+
+/// The `commerce.cache` field-level TTLs (seconds; spec §13).
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct CommerceCacheCfg {
+    #[serde(default = "default_commerce_discovery_ttl_s")]
+    pub discovery_ttl_s: u64,
+    #[serde(default = "default_commerce_product_ttl_s")]
+    pub product_ttl_s: u64,
+    #[serde(default = "default_commerce_price_ttl_s")]
+    pub price_ttl_s: u64,
+    #[serde(default = "default_commerce_stock_ttl_s")]
+    pub stock_ttl_s: u64,
+    #[serde(default = "default_commerce_supplier_ttl_s")]
+    pub supplier_ttl_s: u64,
+}
+
+fn default_commerce_discovery_ttl_s() -> u64 {
+    1800
+}
+fn default_commerce_product_ttl_s() -> u64 {
+    21_600
+}
+fn default_commerce_price_ttl_s() -> u64 {
+    1800
+}
+fn default_commerce_stock_ttl_s() -> u64 {
+    900
+}
+fn default_commerce_supplier_ttl_s() -> u64 {
+    86_400
+}
+
+impl Default for CommerceCacheCfg {
+    fn default() -> Self {
+        Self {
+            discovery_ttl_s: default_commerce_discovery_ttl_s(),
+            product_ttl_s: default_commerce_product_ttl_s(),
+            price_ttl_s: default_commerce_price_ttl_s(),
+            stock_ttl_s: default_commerce_stock_ttl_s(),
+            supplier_ttl_s: default_commerce_supplier_ttl_s(),
+        }
+    }
+}
+
+impl CommerceCacheCfg {
+    fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("discovery_ttl_s", self.discovery_ttl_s),
+            ("product_ttl_s", self.product_ttl_s),
+            ("price_ttl_s", self.price_ttl_s),
+            ("stock_ttl_s", self.stock_ttl_s),
+            ("supplier_ttl_s", self.supplier_ttl_s),
+        ] {
+            if value == 0 || value > MAX_COMMERCE_TTL_S {
+                return Err(format!(
+                    "commerce cache: {name} must be 1..={MAX_COMMERCE_TTL_S} seconds"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The `commerce.browser` block (spec §13): lazy Chromium startup, headed
+/// only for interactive login, idle shutdown and hard page/browser bounds.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct CommerceBrowserCfg {
+    /// Master browser switch. Default `false`: enabling it is an explicit
+    /// operator decision (browser acquisition is the last acquisition
+    /// path).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Explicit Chromium executable path; absent = resolve from PATH.
+    #[serde(default)]
+    pub executable: Option<String>,
+    /// Headless acquisition. Interactive `commerce login` always overrides
+    /// this to a headed window.
+    #[serde(default = "default_commerce_browser_headless")]
+    pub headless: bool,
+    /// Kill an unused browser after this many seconds.
+    #[serde(default = "default_commerce_browser_idle_s")]
+    pub idle_shutdown_s: u64,
+    /// Maximum simultaneously live browser children.
+    #[serde(default = "default_commerce_browser_max")]
+    pub max_browsers: usize,
+    /// Maximum simultaneously open pages per profile.
+    #[serde(default = "default_commerce_browser_pages")]
+    pub max_pages_per_profile: usize,
+}
+
+fn default_commerce_browser_headless() -> bool {
+    true
+}
+fn default_commerce_browser_idle_s() -> u64 {
+    300
+}
+fn default_commerce_browser_max() -> usize {
+    2
+}
+fn default_commerce_browser_pages() -> usize {
+    1
+}
+
+impl Default for CommerceBrowserCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            executable: None,
+            headless: default_commerce_browser_headless(),
+            idle_shutdown_s: default_commerce_browser_idle_s(),
+            max_browsers: default_commerce_browser_max(),
+            max_pages_per_profile: default_commerce_browser_pages(),
+        }
+    }
+}
+
+impl CommerceBrowserCfg {
+    fn validate(&self) -> Result<(), String> {
+        if !(1..=86_400).contains(&self.idle_shutdown_s) {
+            return Err("commerce browser: idle_shutdown_s must be 1..=86400".into());
+        }
+        if !(1..=16).contains(&self.max_browsers) {
+            return Err("commerce browser: max_browsers must be 1..=16".into());
+        }
+        if !(1..=8).contains(&self.max_pages_per_profile) {
+            return Err("commerce browser: max_pages_per_profile must be 1..=8".into());
+        }
+        if let Some(executable) = &self.executable {
+            if executable.is_empty() || executable.len() > MAX_COMMERCE_EXECUTABLE_BYTES {
+                return Err(format!(
+                    "commerce browser: executable must be 1..={MAX_COMMERCE_EXECUTABLE_BYTES} bytes"
+                ));
+            }
+            if executable.bytes().any(|b| b.is_ascii_control()) {
+                return Err("commerce browser: executable contains control characters".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The additive `[commerce]` section (docs/acquire.md §13).
+///
+/// Strict by construction: unknown keys anywhere in the section are startup
+/// errors (the derived `deny_unknown_fields` on every nested block plus the
+/// fixed connector-id map), non-matching value types are type errors, and
+/// [`CommerceCfg::validate`] enforces the semantic bounds. Credentials are
+/// referenced by environment-variable NAME only; the section never carries
+/// a value and `Debug` redacts every credential-shaped field.
+///
+/// Disabled parity (spec §13): absent, `{}` and `{enabled: false}` resolve
+/// byte-identically — no commerce tool registered, no database created, no
+/// connector client, browser profile or broker state, no network request
+/// and no schema tokens.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct CommerceCfg {
+    /// Whether Faktor Acquire is enabled at all.
+    pub enabled: bool,
+    /// The commerce database file name. Only the default `commerce.db` is
+    /// supported by the commerce store today; a different name is refused at
+    /// validation instead of being silently ignored.
+    pub database: Option<String>,
+    /// Field-level cache TTLs.
+    pub cache: CommerceCacheCfg,
+    /// Browser acquisition bounds.
+    pub browser: CommerceBrowserCfg,
+    /// The per-source connector configuration.
+    pub connectors: CommerceConnectorsCfg,
+}
+
+impl Default for CommerceCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            database: Some(DEFAULT_COMMERCE_DATABASE.to_string()),
+            cache: CommerceCacheCfg::default(),
+            browser: CommerceBrowserCfg::default(),
+            connectors: CommerceConnectorsCfg::default(),
+        }
+    }
+}
+
+impl CommerceCfg {
+    /// The resolved database file name (default when absent).
+    pub fn database_name(&self) -> &str {
+        self.database
+            .as_deref()
+            .unwrap_or(DEFAULT_COMMERCE_DATABASE)
+    }
+
+    /// Strict validation: database name, TTL bounds, browser bounds and the
+    /// enabled connectors' credential requirements. A nested enabled section
+    /// under `enabled: false` is refused (the daemon never boots a
+    /// half-configured commerce surface).
+    pub fn validate(&self) -> Result<(), String> {
+        let database = self.database_name();
+        if database.is_empty()
+            || database.len() > MAX_COMMERCE_DATABASE_BYTES
+            || database.contains('/')
+            || database.contains('\\')
+            || database.contains("..")
+            || database.contains(':')
+            || database.bytes().any(|b| b.is_ascii_control())
+        {
+            return Err(format!(
+                "commerce: database {database:?} must be a plain file name (no paths, no traversal)"
+            ));
+        }
+        if database != DEFAULT_COMMERCE_DATABASE {
+            return Err(format!(
+                "commerce: database {database:?} is not supported; the commerce store owns \
+                 {DEFAULT_COMMERCE_DATABASE:?}"
+            ));
+        }
+        self.cache.validate()?;
+        self.browser.validate()?;
+        let enabled = self.connectors.enabled();
+        if !enabled.is_empty() && !self.enabled {
+            return Err("commerce: an enabled connector requires [commerce] enabled = true".into());
+        }
+        if self.browser.enabled && !self.enabled {
+            return Err(
+                "commerce: an enabled browser block requires [commerce] enabled = true".into(),
+            );
+        }
+        for (source, credential) in enabled {
+            match credential {
+                ConnectorCredential::Profile(profile) => {
+                    let Some(profile) = profile else {
+                        return Err(format!(
+                            "commerce connectors: {source} requires a browser profile name"
+                        ));
+                    };
+                    validate_profile_name(&format!("connectors.{source}.profile"), profile)?;
+                }
+                ConnectorCredential::ApiKey(api_key_env) => {
+                    let Some(api_key_env) = api_key_env else {
+                        return Err(format!(
+                            "commerce connectors: {source} requires api_key_env to name an \
+                             environment variable"
+                        ));
+                    };
+                    validate_env_name(&format!("connectors.{source}.api_key_env"), api_key_env)?;
+                }
+                ConnectorCredential::OAuthPair(client_id, client_secret) => {
+                    let (Some(client_id), Some(client_secret)) = (client_id, client_secret) else {
+                        return Err(format!(
+                            "commerce connectors: {source} requires client_id_env and \
+                             client_secret_env to name environment variables"
+                        ));
+                    };
+                    validate_env_name(&format!("connectors.{source}.client_id_env"), client_id)?;
+                    validate_env_name(
+                        &format!("connectors.{source}.client_secret_env"),
+                        client_secret,
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -6441,5 +6946,265 @@ mod completion_cfg_tests {
         changed.policy.providers = Some(vec!["anthropic".into(), "openai".into()]);
         let changed = faktor_cloud::resolve_layers(&changed.layers().unwrap()).unwrap();
         assert_ne!(changed.digest, digest);
+    }
+}
+
+/// `[commerce]` config tests (docs/acquire.md §13): strictness, disabled
+/// parity, env-var-name-only credentials and Debug redaction.
+#[cfg(test)]
+mod commerce_config_tests {
+    use super::*;
+
+    fn parse(document: serde_json::Value) -> Result<Config, serde_json::Error> {
+        let mut object = serde_json::json!({"config_version": 1});
+        if let Some(section) = document.as_object() {
+            for (key, value) in section {
+                object[key] = value.clone();
+            }
+        } else {
+            object = document;
+        }
+        serde_json::from_value(object)
+    }
+
+    fn parse_commerce(section: serde_json::Value) -> Result<Config, serde_json::Error> {
+        parse(serde_json::json!({ "commerce": section }))
+    }
+
+    fn spec_example() -> serde_json::Value {
+        serde_json::json!({
+            "enabled": true,
+            "database": "commerce.db",
+            "cache": {
+                "discovery_ttl_s": 1800,
+                "product_ttl_s": 21600,
+                "price_ttl_s": 1800,
+                "stock_ttl_s": 900,
+                "supplier_ttl_s": 86400
+            },
+            "browser": {
+                "enabled": true,
+                "executable": null,
+                "headless": true,
+                "idle_shutdown_s": 300,
+                "max_browsers": 2,
+                "max_pages_per_profile": 1
+            },
+            "connectors": {
+                "1688": { "enabled": true, "profile": "procurement-cn" },
+                "alibaba": { "enabled": true, "profile": "procurement-global" },
+                "lcsc": { "enabled": true, "api_key_env": "FAKTOR_LCSC_KEY" },
+                "mouser": { "enabled": true, "api_key_env": "FAKTOR_MOUSER_KEY" },
+                "digikey": {
+                    "enabled": true,
+                    "client_id_env": "FAKTOR_DIGIKEY_CLIENT_ID",
+                    "client_secret_env": "FAKTOR_DIGIKEY_CLIENT_SECRET"
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn absent_and_disabled_commerce_sections_are_byte_identical_defaults() {
+        let defaults = CommerceCfg::default();
+        let absent = parse(serde_json::json!({})).unwrap().commerce;
+        let empty = parse_commerce(serde_json::json!({})).unwrap().commerce;
+        let disabled = parse_commerce(serde_json::json!({"enabled": false}))
+            .unwrap()
+            .commerce;
+        assert_eq!(absent, defaults);
+        assert_eq!(empty, defaults);
+        assert_eq!(disabled, defaults);
+        assert!(!defaults.enabled);
+        assert_eq!(defaults.database_name(), "commerce.db");
+        assert_eq!(defaults.cache.discovery_ttl_s, 1800);
+        assert_eq!(defaults.cache.product_ttl_s, 21_600);
+        assert_eq!(defaults.cache.price_ttl_s, 1800);
+        assert_eq!(defaults.cache.stock_ttl_s, 900);
+        assert_eq!(defaults.cache.supplier_ttl_s, 86_400);
+        assert!(!defaults.browser.enabled);
+        assert!(defaults.browser.headless);
+        assert_eq!(defaults.browser.idle_shutdown_s, 300);
+        assert_eq!(defaults.browser.max_browsers, 2);
+        assert_eq!(defaults.browser.max_pages_per_profile, 1);
+        assert!(defaults.connectors.enabled().is_empty());
+        defaults.validate().unwrap();
+    }
+
+    #[test]
+    fn spec_example_parses_and_validates() {
+        let cfg = parse_commerce(spec_example()).unwrap();
+        let commerce = &cfg.commerce;
+        assert!(commerce.enabled);
+        assert_eq!(commerce.connectors.enabled().len(), 5);
+        commerce.validate().unwrap();
+        cfg.validate().unwrap();
+        assert!(matches!(
+            commerce
+                .connectors
+                .mouser
+                .as_ref()
+                .unwrap()
+                .api_key_env
+                .as_deref(),
+            Some("FAKTOR_MOUSER_KEY")
+        ));
+        assert!(matches!(
+            commerce
+                .connectors
+                .digikey
+                .as_ref()
+                .unwrap()
+                .client_secret_env
+                .as_deref(),
+            Some("FAKTOR_DIGIKEY_CLIENT_SECRET")
+        ));
+    }
+
+    #[test]
+    fn disabled_connector_resolves_like_the_absent_key() {
+        let absent = parse_commerce(serde_json::json!({"enabled": true}))
+            .unwrap()
+            .commerce;
+        let explicitly_off = parse_commerce(serde_json::json!({
+            "enabled": true,
+            "connectors": {"mouser": {"enabled": false, "api_key_env": "X"}}
+        }))
+        .unwrap()
+        .commerce;
+        assert_eq!(absent, explicitly_off);
+        assert!(explicitly_off.connectors.mouser.is_none());
+    }
+
+    #[test]
+    fn unknown_keys_are_startup_errors_everywhere() {
+        for section in [
+            serde_json::json!({"enabld": true}),
+            serde_json::json!({"cache": {"discovery_ttl": 1}}),
+            serde_json::json!({"browser": {"idle_shutdown": 1}}),
+            serde_json::json!({"connectors": {"amazon": {"enabled": true}}}),
+            serde_json::json!({"connectors": {"mouser": {"enabled": true, "key": "x"}}}),
+            serde_json::json!({"connectors": {"digikey": {"enabled": true, "client_id": "x"}}}),
+            serde_json::json!({"connectors": {"1688": {"enabled": true, "cookies": []}}}),
+        ] {
+            let error = parse_commerce(section).expect_err("unknown key must fail startup");
+            assert!(
+                error.to_string().contains("unknown field"),
+                "expected an unknown-field error, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn credentials_are_env_var_names_only() {
+        // A literal secret pasted into `*_env` fails validation.
+        let cfg = parse_commerce(serde_json::json!({
+            "enabled": true,
+            "connectors": {"mouser": {"enabled": true, "api_key_env": "sk-live-abc123"}}
+        }))
+        .unwrap();
+        let error = cfg
+            .commerce
+            .validate()
+            .expect_err("a value must not be accepted");
+        assert!(error.contains("environment variable NAME"), "{error}");
+
+        let cfg = parse_commerce(serde_json::json!({
+            "enabled": true,
+            "connectors": {"digikey": {
+                "enabled": true,
+                "client_id_env": "FAKTOR_DIGIKEY_CLIENT_ID",
+                "client_secret_env": "FAKTOR DIGIKEY SECRET"
+            }}
+        }))
+        .unwrap();
+        assert!(cfg.commerce.validate().is_err());
+
+        // Missing env names and missing profiles are startup errors.
+        let cfg = parse_commerce(serde_json::json!({
+            "enabled": true,
+            "connectors": {"lcsc": {"enabled": true}}
+        }))
+        .unwrap();
+        assert!(cfg.commerce.validate().is_err());
+        let cfg = parse_commerce(serde_json::json!({
+            "enabled": true,
+            "connectors": {"1688": {"enabled": true}}
+        }))
+        .unwrap();
+        assert!(cfg.commerce.validate().is_err());
+
+        // A valid name-shaped config validates.
+        let cfg = parse_commerce(serde_json::json!({
+            "enabled": true,
+            "connectors": {"lcsc": {"enabled": true, "api_key_env": "FAKTOR_LCSC_KEY"}}
+        }))
+        .unwrap();
+        cfg.commerce.validate().unwrap();
+    }
+
+    #[test]
+    fn debug_redacts_credential_shaped_fields() {
+        let cfg = parse_commerce(spec_example()).unwrap();
+        let debug = format!("{:?}", cfg.commerce);
+        assert!(debug.contains("<redacted>"), "{debug}");
+        for secret_shaped in [
+            "FAKTOR_LCSC_KEY",
+            "FAKTOR_MOUSER_KEY",
+            "FAKTOR_DIGIKEY_CLIENT_ID",
+            "FAKTOR_DIGIKEY_CLIENT_SECRET",
+        ] {
+            assert!(
+                !debug.contains(secret_shaped),
+                "Debug output must not carry {secret_shaped}: {debug}"
+            );
+        }
+        // Profiles are operator config (not credential-shaped) and remain
+        // visible for diagnosis.
+        assert!(debug.contains("procurement-cn"));
+        // The wire/serialized config keeps the NAMES (a name is not a value;
+        // `Config::save` round-trips).
+        let json = serde_json::to_value(&cfg.commerce).unwrap();
+        assert_eq!(
+            json["connectors"]["mouser"]["api_key_env"],
+            "FAKTOR_MOUSER_KEY"
+        );
+    }
+
+    #[test]
+    fn nested_enabled_sections_require_commerce_enabled() {
+        let cfg = parse_commerce(serde_json::json!({
+            "enabled": false,
+            "connectors": {"mouser": {"enabled": true, "api_key_env": "FAKTOR_MOUSER_KEY"}}
+        }))
+        .unwrap();
+        assert!(cfg.commerce.validate().is_err());
+
+        let cfg = parse_commerce(serde_json::json!({
+            "enabled": false,
+            "browser": {"enabled": true}
+        }))
+        .unwrap();
+        assert!(cfg.commerce.validate().is_err());
+    }
+
+    #[test]
+    fn hostile_bounds_are_refused() {
+        for section in [
+            serde_json::json!({"enabled": true, "cache": {"stock_ttl_s": 0}}),
+            serde_json::json!({"enabled": true, "cache": {"stock_ttl_s": 99_999_999_999_u64}}),
+            serde_json::json!({"enabled": true, "browser": {"max_browsers": 0}}),
+            serde_json::json!({"enabled": true, "browser": {"max_pages_per_profile": 9}}),
+            serde_json::json!({"enabled": true, "browser": {"idle_shutdown_s": 0}}),
+            serde_json::json!({"enabled": true, "database": "../escape.db"}),
+            serde_json::json!({"enabled": true, "database": "other.db"}),
+            serde_json::json!({"enabled": true, "connectors": {"1688": {"enabled": true, "profile": "../x"}}}),
+        ] {
+            let cfg = parse_commerce(section.clone()).unwrap();
+            assert!(
+                cfg.commerce.validate().is_err(),
+                "{section} must be refused at validation"
+            );
+        }
     }
 }

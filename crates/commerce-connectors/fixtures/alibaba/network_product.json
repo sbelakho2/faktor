@@ -1,0 +1,79 @@
+{
+  "data": {
+    "product": {
+      "productId": "1600123456789",
+      "title": "USB 3.0 Braided Data Cable",
+      "price": "1.20",
+      "currency": "USD",
+      "priceRange": {
+        "min": "0.30",
+        "max": "5.00",
+        "currency": "USD"
+      },
+      "moq": 2,
+      "orderMultiple": 2,
+      "stock": 5000,
+      "model": "USB3-BK-1M",
+      "spec": "1m braided",
+      "supplier": {
+        "companyName": "Shenzhen Example Electronics Co., Ltd.",
+        "country": "CN",
+        "yearEstablished": 2012,
+        "responseRate": "98%",
+        "verified": true
+      },
+      "skuOptions": [
+        {
+          "attributes": [
+            {
+              "name": "Color",
+              "value": "Black"
+            },
+            {
+              "name": "Length",
+              "value": "1m"
+            }
+          ],
+          "price": "1.20",
+          "moq": 2,
+          "stock": 900
+        },
+        {
+          "attributes": [
+            {
+              "name": "Color",
+              "value": "White"
+            },
+            {
+              "name": "Length",
+              "value": "1m"
+            }
+          ],
+          "price": "0.30",
+          "moq": 2,
+          "stock": 100
+        },
+        {
+          "attributes": [
+            {
+              "name": "Color",
+              "value": "Black"
+            },
+            {
+              "name": "Length",
+              "value": "2m"
+            }
+          ],
+          "price": "5.00",
+          "moq": 2,
+          "stock": 50
+        }
+      ],
+      "contactSupplier": false,
+      "leadTime": {
+        "minDays": 7,
+        "maxDays": 15
+      }
+    }
+  }
+}

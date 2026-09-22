@@ -1,0 +1,14 @@
+{
+  "data": {
+    "product": {
+      "productId": "1600987654321",
+      "title": "Custom CNC Machining Part",
+      "contactSupplier": true,
+      "moq": 100,
+      "supplier": {
+        "companyName": "Ningbo Example Machining Co., Ltd.",
+        "country": "CN"
+      }
+    }
+  }
+}

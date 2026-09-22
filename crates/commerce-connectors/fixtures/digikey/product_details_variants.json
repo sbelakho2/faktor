@@ -1,0 +1,32 @@
+{
+  "Product": {
+    "ManufacturerProductNumber": "TPS5430DDAR",
+    "Description": {
+      "ProductDescription": "IC REG BUCK ADJ 3A 8SOIC"
+    },
+    "Manufacturer": { "Id": 296, "Name": "Texas Instruments" },
+    "ProductUrl": "https://www.digikey.com/en/products/detail/texas-instruments/TPS5430DDAR/1234567",
+    "ProductStatus": { "Status": "Active" },
+    "ProductVariations": [
+      {
+        "DigiKeyProductNumber": "296-17989-1-ND",
+        "PackageType": { "Id": 1, "Name": "Cut Tape (CT)" },
+        "QuantityAvailable": 100,
+        "MinimumOrderQuantity": 1,
+        "StandardPricing": [
+          { "BreakQuantity": 1, "UnitPrice": "5.00", "Currency": "USD" },
+          { "BreakQuantity": 100, "UnitPrice": "4.50", "Currency": "USD" }
+        ]
+      },
+      {
+        "DigiKeyProductNumber": "296-17989-2-ND",
+        "PackageType": { "Id": 3, "Name": "Tape & Reel (TR)" },
+        "QuantityAvailable": 5000,
+        "MinimumOrderQuantity": 2500,
+        "StandardPricing": [
+          { "BreakQuantity": 2500, "UnitPrice": "3.90", "Currency": "USD" }
+        ]
+      }
+    ]
+  }
+}

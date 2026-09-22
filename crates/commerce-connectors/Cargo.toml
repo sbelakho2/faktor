@@ -1,0 +1,18 @@
+[package]
+name = "faktor-commerce-connectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Faktor Commerce Source site connectors: official-API-first adapters (Mouser, DigiKey, LCSC) and typed follow-up stubs (Alibaba, 1688). No HTTP client, no browser, no model."
+
+[dependencies]
+faktor-commerce.workspace = true
+faktor-security.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+thiserror.workspace = true
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
