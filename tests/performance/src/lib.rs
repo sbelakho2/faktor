@@ -141,7 +141,11 @@ async fn cold_start_under_150ms() {
     let t0 = Instant::now();
     let handle = faktor_server::serve(deps, 0).await.unwrap();
     let elapsed = t0.elapsed();
-    let _ = handle;
+    // Consume the handle via the owned shutdown path: teardown happens after
+    // the measured window, and dropping a live handle would abort the serve
+    // task and emit the loud contract-violation diagnostic, which this
+    // harness has no seam to assert or suppress.
+    handle.shutdown().await.unwrap();
     // Debug builds are slower; assert the relaxed budget (150ms typical in
     // release).
     assert!(

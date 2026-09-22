@@ -20,9 +20,27 @@ pub const MAX_REPOSITORY_BYTES: usize = 100;
 pub const MAX_REF_NAME_BYTES: usize = 255;
 /// Bound on one external-operation identity string.
 pub const MAX_OPERATION_ID_BYTES: usize = 200;
+/// The largest installation id the type admits: `i64::MAX`.
+///
+/// The durable rows persist installation ids in SIGNED SQLite `INTEGER`
+/// columns; bounding the type here keeps the signed column an exact,
+/// injective, order-preserving image of this type's domain (GitHub App
+/// installation ids do not need the full `u64` space).
+pub const MAX_INSTALLATION_ID: u64 = i64::MAX as u64;
 
-/// The provider-side installation identity (GitHub App installation id).
-/// Never zero.
+/// The provider-side installation identity (GitHub App installation id):
+/// `1..=i64::MAX`, never zero.
+///
+/// # Signed SQLite mapping
+///
+/// `scm_installation.installation_id` and `scm_repository.installation_id`
+/// are SIGNED SQLite `INTEGER` columns, so the type deliberately does NOT
+/// admit the full `u64` space. [`ScmInstallationId::to_sqlite_i64`] is the
+/// mapping: total, injective and order-preserving, so SQL
+/// `ORDER BY`/range/`MAX` and external tooling observe exactly the declared
+/// semantics. A raw value above [`MAX_INSTALLATION_ID`] is refused typed by
+/// every constructor naming the limit; a `u64` above `i64::MAX` would wrap
+/// negative in the column and invert ordering/positivity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScmInstallationId(u64);
 
@@ -31,23 +49,41 @@ impl ScmInstallationId {
         self.0
     }
 
-    /// The only raw-`u64` constructor: zero is not a real installation, so
-    /// it is a typed error. Untrusted/decoded values (webhook payloads,
-    /// storage, wire) must enter through here; there is no infallible
-    /// `u64` constructor that could smuggle a zero into the domain.
+    /// The signed SQLite `INTEGER` image of this id: the exact value the
+    /// `installation_id` columns hold.
+    ///
+    /// Total and lossless by the constructor bound `1..=i64::MAX`: the
+    /// cast can never wrap, and `a < b` implies
+    /// `to_sqlite_i64(a) < to_sqlite_i64(b)`.
+    pub const fn to_sqlite_i64(self) -> i64 {
+        self.0 as i64
+    }
+
+    /// The only raw-`u64` constructor: zero is not a real installation, and
+    /// a value above [`MAX_INSTALLATION_ID`] cannot be represented in the
+    /// signed SQLite column, so both are typed errors. Untrusted/decoded
+    /// values (webhook payloads, storage, wire) must enter through here;
+    /// there is no infallible `u64` constructor that could smuggle an
+    /// out-of-domain value into the domain.
     pub fn try_from_raw(raw: u64) -> Result<Self, ScmError> {
         if raw == 0 {
             return Err(ScmError::InvalidInput("installation id cannot be 0".into()));
         }
+        if raw > MAX_INSTALLATION_ID {
+            return Err(ScmError::InvalidInput(format!(
+                "installation id {raw} exceeds the maximum {MAX_INSTALLATION_ID} \
+                 (i64::MAX, the signed SQLite INTEGER bound)"
+            )));
+        }
         Ok(Self(raw))
     }
-}
 
-impl From<NonZeroU64> for ScmInstallationId {
-    /// Infallible constructor from an already-validated non-zero value (the
-    /// type system proves the invariant).
-    fn from(raw: NonZeroU64) -> Self {
-        Self(raw.get())
+    /// Guarded constructor from an already-non-zero value. Non-zero alone is
+    /// NOT sufficient (the signed-SQLite bound still applies), so this
+    /// re-validates through [`Self::try_from_raw`]; there is no infallible
+    /// constructor that could admit a value above [`MAX_INSTALLATION_ID`].
+    pub fn try_from_non_zero(raw: NonZeroU64) -> Result<Self, ScmError> {
+        Self::try_from_raw(raw.get())
     }
 }
 
@@ -407,18 +443,85 @@ mod tests {
             serde_json::from_str::<ScmInstallationId>("12").unwrap(),
             ScmInstallationId::try_from_raw(12).unwrap()
         );
-        // The NonZeroU64 path makes zero unrepresentable in the type system.
+        // The guarded NonZeroU64 path re-validates the signed-SQLite bound.
         assert_eq!(
-            ScmInstallationId::from(NonZeroU64::new(5).unwrap()).raw(),
+            ScmInstallationId::try_from_non_zero(NonZeroU64::new(5).unwrap())
+                .unwrap()
+                .raw(),
             5
         );
+    }
+
+    /// P1 persistence-domain bound: the type admits exactly `1..=i64::MAX`
+    /// so the signed SQLite `installation_id` column is an exact,
+    /// order-preserving image. One above the bound and `u64::MAX` are typed
+    /// refusals naming the limit — never a wrapped (negative) value.
+    #[test]
+    fn installation_id_is_bounded_by_the_signed_sqlite_integer() {
+        let max = ScmInstallationId::try_from_raw(MAX_INSTALLATION_ID).unwrap();
+        assert_eq!(max.raw(), i64::MAX as u64);
+        assert_eq!(max.to_sqlite_i64(), i64::MAX);
+        assert!(max.to_sqlite_i64() > 0, "the mapping stays positive");
+
+        for out_of_domain in [MAX_INSTALLATION_ID + 1, u64::MAX] {
+            match ScmInstallationId::try_from_raw(out_of_domain) {
+                Err(ScmError::InvalidInput(message)) => {
+                    assert!(
+                        message.contains("9223372036854775807"),
+                        "the refusal names the limit: {message}"
+                    );
+                    assert!(
+                        message.contains("i64::MAX"),
+                        "the refusal names the limit: {message}"
+                    );
+                    assert!(
+                        message.contains(&out_of_domain.to_string()),
+                        "the refusal names the offending value: {message}"
+                    );
+                }
+                other => panic!("{out_of_domain} must be a typed refusal, got {other:?}"),
+            }
+        }
+
+        // Deserialization re-validates the same bound: a hostile DTO cannot
+        // smuggle an out-of-domain id into the domain.
+        for hostile in ["9223372036854775808", "18446744073709551615"] {
+            assert!(
+                serde_json::from_str::<ScmInstallationId>(hostile).is_err(),
+                "{hostile} must be refused by Deserialize"
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<ScmInstallationId>("9223372036854775807").unwrap(),
+            max
+        );
+
+        // The guarded non-zero constructor re-validates the bound too.
+        assert!(ScmInstallationId::try_from_non_zero(NonZeroU64::new(u64::MAX).unwrap()).is_err());
+        assert!(ScmInstallationId::try_from_non_zero(
+            NonZeroU64::new(MAX_INSTALLATION_ID + 1).unwrap()
+        )
+        .is_err());
+        assert_eq!(
+            ScmInstallationId::try_from_non_zero(NonZeroU64::new(1).unwrap())
+                .unwrap()
+                .to_sqlite_i64(),
+            1
+        );
+
+        // Ordering is the domain order all the way to the bound: no wrap.
+        let near = ScmInstallationId::try_from_raw(MAX_INSTALLATION_ID - 1).unwrap();
+        let low = ScmInstallationId::try_from_raw(1).unwrap();
+        assert!(low < near && near < max);
+        assert!(low.to_sqlite_i64() < near.to_sqlite_i64());
+        assert!(near.to_sqlite_i64() < max.to_sqlite_i64());
     }
 
     #[test]
     fn repository_ref_cannot_observe_a_zero_installation() {
         // There is no infallible raw-u64 constructor. Every path a zero
         // could take is either a typed error (try_from_raw / Deserialize)
-        // or non-zero by proof (From<NonZeroU64>).
+        // or re-validated (try_from_non_zero).
         assert!(ScmInstallationId::try_from_raw(0).is_err());
         let err = serde_json::from_str::<RepositoryRef>(
             r#"{"installation":0,"owner":"acme","name":"widgets"}"#,
@@ -428,7 +531,7 @@ mod tests {
             err.to_string().contains("installation id cannot be 0"),
             "hostile zero must be refused before RepositoryRef sees an id: {err}"
         );
-        let id = ScmInstallationId::from(NonZeroU64::new(1).unwrap());
+        let id = ScmInstallationId::try_from_non_zero(NonZeroU64::new(1).unwrap()).unwrap();
         assert_ne!(id.raw(), 0);
         assert!(RepositoryRef::try_new(id, "acme", "widgets").is_ok());
     }
@@ -509,6 +612,8 @@ mod tests {
         assert_eq!(parsed.full_name(), "acme/widgets");
         for bad in [
             r#"{"installation":0,"owner":"acme","name":"widgets"}"#,
+            r#"{"installation":9223372036854775808,"owner":"acme","name":"widgets"}"#,
+            r#"{"installation":18446744073709551615,"owner":"acme","name":"widgets"}"#,
             r#"{"installation":3,"owner":"acme","name":"../escape"}"#,
             r#"{"installation":3,"owner":"acme","name":"widgets","extra":1}"#,
         ] {

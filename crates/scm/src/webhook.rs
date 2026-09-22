@@ -643,9 +643,9 @@ mod tests {
             Some(ScmInstallationId::try_from_raw(7).unwrap())
         );
         assert_eq!(
-            installation_of(br#"{"installation":{"id":18446744073709551615}}"#).unwrap(),
-            Some(ScmInstallationId::try_from_raw(u64::MAX).unwrap()),
-            "the u64 boundary is a valid installation id"
+            installation_of(br#"{"installation":{"id":9223372036854775807}}"#).unwrap(),
+            Some(ScmInstallationId::try_from_raw(i64::MAX as u64).unwrap()),
+            "the signed-SQLite maximum (i64::MAX) is a valid installation id"
         );
         assert_eq!(installation_of(br#"{"action":"created"}"#).unwrap(), None);
         assert_eq!(installation_of(b"not-json").unwrap(), None);
@@ -653,6 +653,8 @@ mod tests {
             br#"{"installation":{"id":0}}"#.as_slice(),
             br#"{"installation":{"id":-1}}"#,
             br#"{"installation":{"id":1.5}}"#,
+            br#"{"installation":{"id":9223372036854775808}}"#,
+            br#"{"installation":{"id":18446744073709551615}}"#,
             br#"{"installation":{"id":18446744073709551616}}"#,
             br#"{"installation":{"id":"7"}}"#,
         ] {
@@ -663,6 +665,18 @@ mod tests {
             );
             assert!(!err.retryable(), "malformed {body:?} must never be retried");
             assert!(err.to_string().contains("installation.id"), "{err}");
+        }
+        // Out-of-domain ids are refused typed naming the signed-SQLite
+        // limit: no panic, no wrapped (negative) id, nothing durable.
+        for body in [
+            br#"{"installation":{"id":9223372036854775808}}"#.as_slice(),
+            br#"{"installation":{"id":18446744073709551615}}"#,
+        ] {
+            let err = installation_of(body).unwrap_err().to_string();
+            assert!(
+                err.contains("9223372036854775807") && err.contains("i64::MAX"),
+                "the refusal names the limit: {err}"
+            );
         }
     }
 

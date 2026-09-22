@@ -648,6 +648,12 @@ struct ServerShared {
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
     shutdown_requested: AtomicBool,
     terminal: Mutex<Option<ServerStatus>>,
+    /// Test-visible signal: set by `ServerHandle::drop` when the handle was
+    /// dropped while its serve task was still live (i.e. `shutdown().await`
+    /// was skipped). The production drop path is the only writer; tests read
+    /// it through [`ServerStatusProbe::dropped_live`] to prove a path
+    /// consumed the handle.
+    dropped_live: AtomicBool,
 }
 
 impl ServerShared {
@@ -656,6 +662,7 @@ impl ServerShared {
             shutdown: Mutex::new(Some(shutdown)),
             shutdown_requested: AtomicBool::new(false),
             terminal: Mutex::new(None),
+            dropped_live: AtomicBool::new(false),
         }
     }
 
@@ -699,6 +706,19 @@ impl ServerShared {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
+
+    /// Record the live-drop signal. Called from the SAME branch that emits
+    /// the loud error-level diagnostic, so a test observing this flag proves
+    /// the diagnostic fired.
+    fn record_dropped_live(&self) {
+        self.dropped_live.store(true, Ordering::SeqCst);
+    }
+
+    /// Read the live-drop signal (test seam; see [`ServerStatusProbe`]).
+    #[cfg(test)]
+    fn dropped_live(&self) -> bool {
+        self.dropped_live.load(Ordering::SeqCst)
+    }
 }
 
 /// The live handle of the native listener: it OWNS the serve task's
@@ -707,6 +727,25 @@ impl ServerShared {
 /// disposition in the shared status BEFORE its `JoinHandle` completes, so
 /// [`ServerHandle::status`] always names an unexpected death typed — the
 /// owning daemon can never mistake a dead native socket for a live one.
+///
+/// # Ownership contract
+///
+/// There is exactly ONE lifecycle for a daemon-critical listener: consume
+/// the handle with [`ServerHandle::shutdown`] and await it. That call
+/// requests the bounded graceful stop AND joins the owned serve task, so the
+/// listener has terminated before the handle's ownership ends and its typed
+/// result is surfaced — never `.ok()`-discarded.
+///
+/// `Drop` cannot await the join. A handle that falls out of scope while its
+/// serve task is still live loses that guarantee: the task is aborted (the
+/// synchronous last-resort fallback, so a listener can never outlive its
+/// owner) and an error-level structured diagnostic is emitted — the drop is
+/// a contract violation, not an equivalent stop. `#[must_use]` turns a
+/// forgotten `shutdown()` into a compile-time warning, and the live-drop
+/// signal on the shared owner state is test-visible so tests can prove no
+/// path drops a live handle.
+#[must_use = "the native serve task is owned by this handle: await \
+              ServerHandle::shutdown() to join it (dropping a live handle only aborts it)"]
 pub struct ServerHandle {
     pub addr: SocketAddr,
     /// The startup line the CLI prints on stdout after binding.
@@ -771,6 +810,10 @@ impl ServerHandle {
 
     /// Signal graceful shutdown and JOIN the owned serve task.
     ///
+    /// This is the only lifecycle that joins the task (see the ownership
+    /// contract on [`ServerHandle`]); dropping the handle while the task is
+    /// live aborts it and emits an error-level diagnostic instead.
+    ///
     /// - Bounded: the join waits at most [`SERVER_SHUTDOWN_BOUND`]; a
     ///   straggler is aborted and reaped within [`SERVER_ABORT_REAP_BOUND`].
     /// - Idempotent: requesting shutdown twice is a no-op (the signal is
@@ -814,13 +857,30 @@ impl Drop for ServerHandle {
             return;
         };
         if status.is_unavailable() {
-            tracing::error!("{}", status.health_line());
+            tracing::error!(addr = %self.addr, "{}", status.health_line());
+        }
+        let live = !task.is_finished();
+        if live {
+            // The caller let a LIVE handle fall out of scope: `Drop` cannot
+            // await the join, so the bounded graceful stop and the typed
+            // serve result are lost. This is the lifecycle violation the
+            // type's ownership contract forbids (`#[must_use]`): signal it
+            // loudly (structured, error-level) and abort the task so the
+            // listener still cannot outlive its owner.
+            self.shared.record_dropped_live();
+            tracing::error!(
+                addr = %self.addr,
+                status = %status.health_line(),
+                "ServerHandle dropped while the native serve task was still live: \
+                 the bounded graceful join was skipped (call ServerHandle::shutdown().await); \
+                 aborting the serve task"
+            );
         }
         // Synchronous fallback so the listener task can never outlive its
         // owner: request graceful shutdown, then abort. Callers that need the
         // graceful drain call `shutdown().await`.
         self.request_shutdown();
-        if !task.is_finished() {
+        if live {
             task.abort();
         }
     }
@@ -919,6 +979,13 @@ pub(crate) struct ServerStatusProbe(Arc<ServerShared>);
 impl ServerStatusProbe {
     pub(crate) fn terminal(&self) -> Option<ServerStatus> {
         self.0.terminal()
+    }
+
+    /// The test-visible live-drop signal: `true` once the handle was dropped
+    /// while its serve task was still live (the loud diagnostic fired). An
+    /// explicitly awaited [`ServerHandle::shutdown`] never sets it.
+    pub(crate) fn dropped_live(&self) -> bool {
+        self.0.dropped_live()
     }
 }
 
@@ -2760,21 +2827,31 @@ pub(crate) mod tests {
     }
 
     /// (e) Drop aborts (never detaches): dropping the handle WITHOUT joining
-    /// releases the listener socket. The one-shot signal lives in the shared
-    /// owner state, so a detached task would keep the socket bound and this
-    /// test would time out.
+    /// releases the listener socket, fires the live-drop signal (the same
+    /// branch emits the error-level diagnostic), and leaves the task
+    /// aborted rather than gracefully joined. The one-shot signal lives in
+    /// the shared owner state, so a detached task would keep the socket
+    /// bound and this test would time out.
     #[tokio::test]
     async fn native_handle_drop_aborts_and_releases_the_socket() {
         let dir = tempfile::tempdir().unwrap();
         let handle = serve(test_deps(dir.path()), 0).await.unwrap();
         let addr = handle.addr;
+        let probe = handle.probe_for_test();
+        assert!(!probe.dropped_live(), "no signal while the handle is owned");
         drop(handle);
+        assert!(
+            probe.dropped_live(),
+            "dropping a live handle must fire the loud live-drop signal"
+        );
         wait_until_rebindable(addr).await;
     }
 
     /// (f) No detached task: the owner records the terminal stop and reports
     /// complete after `shutdown` — the shared status says `Stopped` (never
-    /// `Serving`), and the listener socket is released.
+    /// `Serving`), the live-drop signal stays silent (the explicit
+    /// `shutdown().await` path never emits the diagnostic), and the listener
+    /// socket is released.
     #[tokio::test]
     async fn native_owner_reports_complete_after_shutdown() {
         let dir = tempfile::tempdir().unwrap();
@@ -2792,6 +2869,10 @@ pub(crate) mod tests {
             probe.terminal(),
             Some(ServerStatus::Stopped),
             "the owner observed the task's clean completion"
+        );
+        assert!(
+            !probe.dropped_live(),
+            "the explicit shutdown path must never fire the live-drop diagnostic"
         );
         assert_eq!(
             ServerStatus::Stopped.health_line(),

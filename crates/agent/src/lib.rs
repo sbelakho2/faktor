@@ -1443,23 +1443,14 @@ pub(crate) enum OffTurnThreadFailure {
     Panicked { message: String },
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Per-thread count of failures surfaced by the legacy
-    /// [`run_off_turn_thread`] adapter (deterministic to assert without a
-    /// global subscriber).
-    static OFF_TURN_THREAD_FAILURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn off_turn_thread_failures() -> usize {
-    OFF_TURN_THREAD_FAILURES.with(|count| count.get())
-}
-
 /// Run `f` on a blocking-pool thread and return its TYPED result: a normal
 /// value, a panic (the `JoinError` panic message is surfaced) or a
 /// scheduling refusal. Used to isolate the synchronous cold-evidence ladder
-/// (file reads + supervised git/rg children) from the turn thread.
+/// (file reads + supervised git/rg children) from the turn thread. This is
+/// the ONLY off-turn bridge: the legacy `Option`-shaped wrapper that
+/// collapsed panics/refusals into `None` was deleted (P2), and every
+/// production caller maps its typed failure into an explicit
+/// [`EvidencePollStatus`] degradation.
 pub(crate) async fn run_off_turn_thread_outcome<T, F>(f: F) -> Result<T, OffTurnThreadFailure>
 where
     T: Send + 'static,
@@ -1479,34 +1470,20 @@ where
     }
 }
 
-/// Legacy `Option`-shaped adapter kept for the frozen `runtime.rs` call
-/// site: a failure of [`run_off_turn_thread_outcome`] is logged LOUDLY
-/// (never swallowed) and degrades to `None` exactly like the old `.ok()`
-/// did, so the cold-evidence ladder's behavior is unchanged while the
-/// failure is no longer silent. Callers that must branch on the failure
-/// kind use the typed entry point.
-pub(crate) async fn run_off_turn_thread<T, F>(f: F) -> Option<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    match run_off_turn_thread_outcome(f).await {
-        Ok(value) => Some(value),
-        Err(failure) => {
-            #[cfg(test)]
-            OFF_TURN_THREAD_FAILURES.with(|count| count.set(count.get() + 1));
-            match &failure {
-                OffTurnThreadFailure::Panicked { message } => tracing::error!(
-                    target: "faktor_agent::off_turn",
-                    "off-turn blocking task panicked: {message} (the caller degrades; the panic is never silent)"
-                ),
-                OffTurnThreadFailure::Unscheduled { message } => tracing::error!(
-                    target: "faktor_agent::off_turn",
-                    "off-turn blocking task could not be scheduled: {message} (the caller degrades; the refusal is never silent)"
-                ),
-            }
-            None
+/// Map one TYPED off-turn failure into an explicit evidence degradation
+/// (never `None`, never "no evidence"): a panic becomes
+/// [`EvidencePollStatus::ProviderPanicked`], a scheduling refusal becomes
+/// the typed [`EvidencePollStatus::NotSpawned`] refusal. Both are
+/// degradations (`is_degraded`), so a caller can never mistake a broken
+/// cold ladder for an honest empty answer.
+pub(crate) fn evidence_status_from_off_turn_failure(
+    failure: OffTurnThreadFailure,
+) -> EvidencePollStatus {
+    match failure {
+        OffTurnThreadFailure::Panicked { message } => {
+            EvidencePollStatus::ProviderPanicked { message }
         }
+        OffTurnThreadFailure::Unscheduled { message } => EvidencePollStatus::NotSpawned { message },
     }
 }
 
@@ -1546,6 +1523,22 @@ pub(crate) enum EvidencePollStatus {
     /// shut down), or no worker thread could be spawned. Explicit, never a
     /// silently spawned thread.
     NotSpawned { message: String },
+    /// The executor's CIRCUIT is OPEN: the absolute abandoned-thread cap
+    /// ([`EVIDENCE_EXECUTOR_MAX_ABANDONED_THREADS`]) was reached because
+    /// providers ignored cancellation and their physical worker threads had
+    /// to be quarantined, then abandoned. No replacement slot exists, so the
+    /// poll is refused — typed and distinct from a plain saturation
+    /// [`Self::NotSpawned`]. The circuit closes again when abandoned
+    /// provider threads actually exit.
+    CircuitOpen {
+        /// Physical worker threads currently abandoned (blocked inside
+        /// non-yielding providers).
+        abandoned: usize,
+        /// Absolute documented cap on abandoned physical threads.
+        cap: usize,
+        /// Bounded human diagnostic.
+        message: String,
+    },
 }
 
 impl EvidencePollStatus {
@@ -1623,6 +1616,9 @@ pub(crate) fn evidence_poll_degraded_diagnostics() -> usize {
 
 /// Emit the structured diagnostic of one degraded poll. Loud by contract:
 /// the advisory path may degrade, but "retrieval failed" is NEVER silent.
+/// Owned by the TEST-ONLY legacy wrapper: production callers
+/// ([`poll_evidence_with_wall_budget_outcome`]) own their diagnostic.
+#[cfg(test)]
 fn log_evidence_poll_degrade(status: &EvidencePollStatus, budget: std::time::Duration) {
     #[cfg(test)]
     EVIDENCE_POLL_DEGRADED_DIAGNOSTICS.with(|count| count.set(count.get() + 1));
@@ -1668,6 +1664,20 @@ fn log_evidence_poll_degrade(status: &EvidencePollStatus, budget: std::time::Dur
                 "advisory evidence poll could not start on its bounded worker: {message} (advisory contract: the turn continues with an empty package)"
             );
         }
+        EvidencePollStatus::CircuitOpen {
+            abandoned,
+            cap,
+            message,
+        } => {
+            tracing::error!(
+                target: "faktor_agent::evidence",
+                status = "circuit_open",
+                abandoned,
+                cap,
+                budget_ms,
+                "advisory evidence poll refused: the evidence executor circuit is OPEN ({abandoned}/{cap} physical worker threads abandoned inside non-yielding providers): {message} (advisory contract: the turn continues with an empty package; the circuit closes when an abandoned provider returns)"
+            );
+        }
     }
 }
 
@@ -1683,6 +1693,101 @@ pub(crate) const EVIDENCE_EXECUTOR_WORKERS: usize = 4;
 /// `workers + queue` polls; the next poll of a saturated executor is refused
 /// (typed `NotSpawned`), never buffered without bound.
 pub(crate) const EVIDENCE_EXECUTOR_QUEUE_CAPACITY: usize = 8;
+
+/// Hard per-job RETIREMENT DEADLINE of the bounded evidence executor (P1
+/// worker retirement): a worker whose CURRENT poll has been executing for
+/// longer than this is QUARANTINED — it may be blocked inside a provider
+/// that ignores cancellation. The production value is deliberately generous
+/// (a healthy provider answers in milliseconds), so ordinary slow polls are
+/// never retired; tests drive short deadlines through
+/// [`EvidenceRetirementPolicy`].
+pub(crate) const EVIDENCE_EXECUTOR_RETIREMENT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// QUARANTINE GRACE of the bounded evidence executor: how long a
+/// quarantined worker is given to return on its own (a yielding future
+/// cancelled by the caller's budget usually returns immediately) before its
+/// physical thread is ABANDONED and its logical slot is replaced. The
+/// process is never killed and the request is never lost silently: the
+/// caller already holds a typed `TimedOut`/`CircuitOpen` outcome.
+pub(crate) const EVIDENCE_EXECUTOR_QUARANTINE_GRACE: Duration = Duration::from_secs(10);
+
+/// ABSOLUTE cap on abandoned physical evidence-worker threads per executor:
+/// one replacement logical slot per abandoned worker, and at most this many
+/// physical threads may be abandoned, so an executor can hold at most
+/// `EVIDENCE_EXECUTOR_WORKERS + cap` evidence threads ever (documented
+/// growth bound; never one thread per poll). At the cap the executor's
+/// circuit OPENS: further polls are refused with the typed
+/// [`EvidencePollStatus::CircuitOpen`] until an abandoned provider actually
+/// returns and its thread exits.
+pub(crate) const EVIDENCE_EXECUTOR_MAX_ABANDONED_THREADS: usize = EVIDENCE_EXECUTOR_WORKERS;
+
+/// Retirement/quarantine policy of one executor. Production uses
+/// [`EvidenceRetirementPolicy::DEFAULT`]; tests construct short deadlines so
+/// a blocked provider is retired deterministically without waiting the
+/// production bound out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EvidenceRetirementPolicy {
+    /// Per-job wall bound before its worker is quarantined.
+    pub retirement_deadline: Duration,
+    /// Grace a quarantined worker gets to return before abandonment.
+    pub quarantine_grace: Duration,
+    /// Absolute cap on abandoned physical threads (see
+    /// [`EVIDENCE_EXECUTOR_MAX_ABANDONED_THREADS`]).
+    pub max_abandoned: usize,
+}
+
+impl EvidenceRetirementPolicy {
+    pub(crate) const DEFAULT: Self = Self {
+        retirement_deadline: EVIDENCE_EXECUTOR_RETIREMENT_DEADLINE,
+        quarantine_grace: EVIDENCE_EXECUTOR_QUARANTINE_GRACE,
+        max_abandoned: EVIDENCE_EXECUTOR_MAX_ABANDONED_THREADS,
+    };
+}
+
+impl Default for EvidenceRetirementPolicy {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Typed circuit state of the bounded evidence executor (observable in
+/// [`EvidenceExecutorStats`] and through the typed
+/// [`EvidencePollStatus::CircuitOpen`] refusal): `Closed` while replacement
+/// slots are available, `Open` once the absolute abandoned cap is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum EvidenceCircuitState {
+    /// Replacement capacity exists: polls are admitted normally.
+    #[default]
+    Closed,
+    /// The absolute abandoned-thread cap is reached: every poll is refused
+    /// with the typed circuit-open status until abandoned threads exit.
+    Open {
+        /// Physical threads currently abandoned.
+        abandoned: usize,
+        /// Absolute cap ([`EVIDENCE_EXECUTOR_MAX_ABANDONED_THREADS`]).
+        cap: usize,
+    },
+}
+
+/// Terminal disposition of the bounded evidence executor (P2): PERSISTED so
+/// repeated [`EvidenceExecutor::shutdown`] calls return the SAME terminal
+/// disposition — the old shape reported `false` on the first call and then
+/// `true` on the next one merely because the abandoned join handles had been
+/// forgotten, which lied about the abandoned workers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum EvidenceExecutorShutdownState {
+    /// No shutdown has run yet.
+    #[default]
+    Running,
+    /// Every owned worker exited and was joined within the bound.
+    Clean,
+    /// `workers` physical worker threads could not be joined (they block
+    /// inside a non-yielding provider) and were abandoned.
+    Abandoned {
+        /// Number of abandoned physical worker threads at shutdown time.
+        workers: usize,
+    },
+}
 
 /// Bounded wait for the worker pool to drain and exit on shutdown/Drop
 /// before the remaining (synchronously blocked) workers are abandoned. A
@@ -1740,9 +1845,21 @@ enum SubmitRefusal {
     /// The executor is closed (shutdown/Drop): no new poll is accepted.
     Closed,
     /// Every worker is busy and the bounded queue is full.
-    Saturated { workers: usize, capacity: usize },
+    Saturated {
+        workers: usize,
+        capacity: usize,
+        /// How many of the busy workers are QUARANTINED (blocked inside a
+        /// non-yielding provider past the hard retirement deadline): named in
+        /// the refusal so a saturation caused by stuck providers is
+        /// distinguishable from plain load.
+        quarantined: usize,
+    },
     /// No worker thread exists (spawn failed at startup).
     NoWorkers,
+    /// The executor's circuit is open: the absolute abandoned-thread cap was
+    /// reached, so no replacement slot exists and the poll is refused with
+    /// the typed circuit state (never a plain saturation refusal).
+    CircuitOpen { abandoned: usize, cap: usize },
 }
 
 impl SubmitRefusal {
@@ -1751,13 +1868,20 @@ impl SubmitRefusal {
             SubmitRefusal::Closed => {
                 "evidence executor is closed (shutdown); poll refused".to_string()
             }
-            SubmitRefusal::Saturated { workers, capacity } => format!(
-                "evidence executor saturated: all {workers} poll workers are busy and the bounded queue ({capacity}) is full; the poll was refused instead of spawning another thread"
+            SubmitRefusal::Saturated {
+                workers,
+                capacity,
+                quarantined,
+            } => format!(
+                "evidence executor saturated: all {workers} poll workers are busy ({quarantined} quarantined inside non-yielding providers) and the bounded queue ({capacity}) is full; the poll was refused instead of spawning another thread"
             ),
             SubmitRefusal::NoWorkers => {
                 "evidence executor has no live workers (thread spawn failed); poll refused"
                     .to_string()
             }
+            SubmitRefusal::CircuitOpen { abandoned, cap } => format!(
+                "evidence executor circuit is OPEN: {abandoned}/{cap} physical worker threads were abandoned inside non-yielding providers and no replacement slot is available; the poll was refused instead of spawning another thread"
+            ),
         }
     }
 }
@@ -1780,7 +1904,23 @@ struct ExecutorStatsCore {
 /// the "no unbounded leak" gate).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct EvidenceExecutorStats {
+    /// Logical worker slots (healthy + quarantined); never exceeds the
+    /// configured worker count.
     pub workers: usize,
+    /// Logical slots whose current poll is inside its retirement deadline.
+    pub workers_healthy: usize,
+    /// Logical slots QUARANTINED because their current poll exceeded the
+    /// hard retirement deadline (possibly blocked inside a provider).
+    pub workers_quarantined: usize,
+    /// Physical worker threads currently ABANDONED (detached while blocked
+    /// inside a non-yielding provider). Never exceeds `max_abandoned`.
+    pub abandoned: usize,
+    /// Total physical threads ever abandoned by this executor.
+    pub abandoned_total: u64,
+    /// Absolute cap on abandoned physical threads.
+    pub max_abandoned: usize,
+    /// Typed circuit state.
+    pub circuit: EvidenceCircuitState,
     pub capacity: usize,
     pub enqueued: u64,
     pub completed: u64,
@@ -1804,26 +1944,60 @@ impl ExitFlag {
         *self.state.lock().unwrap_or_else(|p| p.into_inner()) = true;
         self.cv.notify_all();
     }
+
+    /// Clear the all-exited flag when a replacement worker is spawned (the
+    /// pool may have transiently reached zero live threads when every
+    /// abandoned worker drained before its replacement existed).
+    fn reset(&self) {
+        *self.state.lock().unwrap_or_else(|p| p.into_inner()) = false;
+    }
+}
+
+/// One admitted poll currently executing on a worker: its cooperative
+/// cancellation token, the identity of the worker that owns it and the
+/// instant it started — the inputs of the retirement deadline.
+struct ExecutingJob {
+    cancel: CancellationToken,
+    worker_id: u64,
+    started: Instant,
 }
 
 /// State shared between the executor handle and its worker threads.
 struct ExecutorShared {
     capacity: usize,
+    /// Logical worker slots the executor restores after an abandonment.
+    target_workers: usize,
+    policy: EvidenceRetirementPolicy,
     queue: Mutex<VecDeque<EvidenceJob>>,
     wake: Condvar,
     closed: AtomicBool,
-    executing: Mutex<HashMap<u64, CancellationToken>>,
+    executing: Mutex<HashMap<u64, ExecutingJob>>,
     next_id: AtomicU64,
+    next_worker_id: AtomicU64,
+    /// Live worker threads (logical slots + abandoned threads still alive).
     running: AtomicUsize,
+    /// Worker id -> the instant it was QUARANTINED (its current poll
+    /// exceeded the hard retirement deadline).
+    quarantined: Mutex<HashMap<u64, Instant>>,
+    /// Physical threads currently abandoned (detached; still possibly
+    /// alive). The absolute growth bound: never above
+    /// `policy.max_abandoned`.
+    abandoned_live: AtomicUsize,
+    /// Total physical threads ever abandoned.
+    abandoned_total: AtomicU64,
     exit: ExitFlag,
     stats: ExecutorStatsCore,
 }
 
-/// One owned worker thread: its join handle (bounded join on shutdown/Drop)
-/// and the flag set just before it exits.
+/// One owned worker thread: its join handle (bounded join on shutdown/Drop),
+/// the flag set just before it exits and the RETIRED flag set when the
+/// executor abandons it — a retired worker never takes another poll and
+/// exits the moment its blocked provider returns.
 struct EvidenceWorker {
+    id: u64,
     join: Option<std::thread::JoinHandle<()>>,
     exited: Arc<AtomicBool>,
+    retired: Arc<AtomicBool>,
 }
 
 /// The bounded, owned evidence executor: a fixed set of long-lived worker
@@ -1834,52 +2008,63 @@ struct EvidenceWorker {
 pub(crate) struct EvidenceExecutor {
     shared: Arc<ExecutorShared>,
     workers: Mutex<Vec<EvidenceWorker>>,
+    /// Serializes retirement passes (quarantine/abandon/replace) so the
+    /// absolute cap is never exceeded by concurrent admissions.
+    maintain_lock: Mutex<()>,
+    /// PERSISTED terminal disposition (see [`EvidenceExecutorShutdownState`]).
+    shutdown_state: Mutex<EvidenceExecutorShutdownState>,
 }
 
 impl EvidenceExecutor {
     /// Start an executor with `workers` owned threads and a queue of
-    /// `capacity` polls. Thread-spawn failures are logged loudly; the
-    /// executor simply runs with fewer workers (zero workers refuses every
-    /// poll with a typed refusal).
+    /// `capacity` polls, under the production retirement policy. Thread-spawn
+    /// failures are logged loudly; the executor simply runs with fewer
+    /// workers (zero workers refuses every poll with a typed refusal).
     pub(crate) fn start(workers: usize, capacity: usize) -> Arc<Self> {
+        Self::start_with_policy(workers, capacity, EvidenceRetirementPolicy::DEFAULT)
+    }
+
+    /// [`Self::start`] with an explicit retirement policy (the test seam for
+    /// short retirement deadlines and small abandonment caps).
+    pub(crate) fn start_with_policy(
+        workers: usize,
+        capacity: usize,
+        policy: EvidenceRetirementPolicy,
+    ) -> Arc<Self> {
+        // A zero cap would make the circuit permanently open (nothing could
+        // ever be replaced); clamp to the smallest meaningful cap. The
+        // production policy uses the documented absolute cap.
+        let policy = EvidenceRetirementPolicy {
+            max_abandoned: policy.max_abandoned.max(1),
+            ..policy
+        };
         let shared = Arc::new(ExecutorShared {
             capacity: capacity.max(1),
+            target_workers: workers,
+            policy,
             queue: Mutex::new(VecDeque::new()),
             wake: Condvar::new(),
             closed: AtomicBool::new(false),
             executing: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+            next_worker_id: AtomicU64::new(0),
             running: AtomicUsize::new(0),
+            quarantined: Mutex::new(HashMap::new()),
+            abandoned_live: AtomicUsize::new(0),
+            abandoned_total: AtomicU64::new(0),
             exit: ExitFlag::default(),
             stats: ExecutorStatsCore::default(),
         });
         let mut spawned: Vec<EvidenceWorker> = Vec::with_capacity(workers);
-        for index in 0..workers {
-            let exited = Arc::new(AtomicBool::new(false));
-            let worker_shared = shared.clone();
-            let worker_exited = exited.clone();
-            match std::thread::Builder::new()
-                .name(format!("{EVIDENCE_WORKER_NAME}-{index}"))
-                .spawn(move || worker_main(worker_shared, worker_exited))
-            {
-                Ok(join) => {
-                    #[cfg(test)]
-                    {
-                        EVIDENCE_WORKERS_SPAWNED.fetch_add(1, Ordering::SeqCst);
-                        EVIDENCE_WORKERS_LIVE.fetch_add(1, Ordering::SeqCst);
-                    }
-                    spawned.push(EvidenceWorker {
-                        join: Some(join),
-                        exited,
-                    });
+        for _ in 0..workers {
+            match spawn_worker(&shared) {
+                Some(worker) => spawned.push(worker),
+                None => {
+                    // `spawn_worker` logged the typed spawn failure; the
+                    // bounded pool runs with fewer workers.
                 }
-                Err(error) => tracing::error!(
-                    target: "faktor_agent::evidence",
-                    "evidence executor worker {index} could not be spawned: {error} (the bounded pool runs with fewer workers; saturation is a typed refusal)"
-                ),
             }
         }
-        shared.running.store(spawned.len(), Ordering::SeqCst);
         // Production observability of the fixed size: the pool's worker count
         // and queue bound are visible in the daemon log (never per-poll).
         tracing::info!(
@@ -1887,24 +2072,58 @@ impl EvidenceExecutor {
             workers = spawned.len(),
             requested_workers = workers,
             capacity = shared.capacity,
+            retirement_deadline_ms = policy.retirement_deadline.as_millis() as u64,
+            quarantine_grace_ms = policy.quarantine_grace.as_millis() as u64,
+            max_abandoned = policy.max_abandoned,
             "evidence executor started: fixed bounded pool of owned workers fed by a bounded queue (saturation is a typed refusal, never another thread)"
         );
         Arc::new(Self {
             shared,
             workers: Mutex::new(spawned),
+            maintain_lock: Mutex::new(()),
+            shutdown_state: Mutex::new(EvidenceExecutorShutdownState::Running),
         })
     }
 
-    /// Live owned worker threads (never grows after `start`).
+    /// Logical worker slots (healthy + quarantined); a replacement slot is
+    /// spawned for every abandoned worker, so this stays at the configured
+    /// count until the abandoned cap opens the circuit.
     pub(crate) fn worker_count(&self) -> usize {
         self.workers.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
-    /// Instrumentation snapshot.
+    /// Instrumentation snapshot, including the retirement counters and the
+    /// typed circuit state (tests/health surface).
     pub(crate) fn stats(&self) -> EvidenceExecutorStats {
         let stats = &self.shared.stats;
+        let workers = self.worker_count();
+        let quarantined_live = {
+            let quarantined = self
+                .shared
+                .quarantined
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let slots = self.workers.lock().unwrap_or_else(|p| p.into_inner());
+            slots
+                .iter()
+                .filter(|worker| quarantined.contains_key(&worker.id))
+                .count()
+        };
+        let abandoned = self.shared.abandoned_live.load(Ordering::SeqCst);
+        let cap = self.shared.policy.max_abandoned;
+        let circuit = if abandoned >= cap {
+            EvidenceCircuitState::Open { abandoned, cap }
+        } else {
+            EvidenceCircuitState::Closed
+        };
         EvidenceExecutorStats {
-            workers: self.worker_count(),
+            workers,
+            workers_healthy: workers.saturating_sub(quarantined_live),
+            workers_quarantined: quarantined_live,
+            abandoned,
+            abandoned_total: self.shared.abandoned_total.load(Ordering::SeqCst),
+            max_abandoned: cap,
+            circuit,
             capacity: self.shared.capacity,
             enqueued: stats.enqueued.load(Ordering::Relaxed),
             completed: stats.completed.load(Ordering::Relaxed),
@@ -1913,6 +2132,16 @@ impl EvidenceExecutor {
             max_active: stats.max_active.load(Ordering::Relaxed),
             max_queue_depth: stats.max_queue_depth.load(Ordering::Relaxed),
         }
+    }
+
+    /// The PERSISTED terminal shutdown disposition: `Running` before the
+    /// first [`Self::shutdown`], then the same terminal value on every later
+    /// call.
+    pub(crate) fn shutdown_state(&self) -> EvidenceExecutorShutdownState {
+        *self
+            .shutdown_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// Admit one poll or refuse it. NEVER spawns a thread.
@@ -1925,6 +2154,11 @@ impl EvidenceExecutor {
         handle: tokio::runtime::Handle,
         reply: tokio::sync::oneshot::Sender<WorkerReply>,
     ) -> Result<(), SubmitRefusal> {
+        // One retirement pass per admission: quarantined workers are
+        // detected, expired grace abandons a bounded number of physical
+        // threads and restores their replacement slots, and a recovered
+        // abandoned thread closes the circuit again.
+        self.maintain();
         let job = EvidenceJob {
             id: self.shared.next_id.fetch_add(1, Ordering::Relaxed),
             provider,
@@ -1938,6 +2172,14 @@ impl EvidenceExecutor {
         if self.shared.closed.load(Ordering::SeqCst) {
             self.shared.stats.refused.fetch_add(1, Ordering::Relaxed);
             return Err(SubmitRefusal::Closed);
+        }
+        let abandoned = self.shared.abandoned_live.load(Ordering::SeqCst);
+        let cap = self.shared.policy.max_abandoned;
+        if abandoned >= cap {
+            // The absolute abandoned-thread cap is reached: the circuit is
+            // OPEN. Typed refusal, never another thread.
+            self.shared.stats.refused.fetch_add(1, Ordering::Relaxed);
+            return Err(SubmitRefusal::CircuitOpen { abandoned, cap });
         }
         if self.shared.running.load(Ordering::SeqCst) == 0 {
             self.shared.stats.refused.fetch_add(1, Ordering::Relaxed);
@@ -1970,6 +2212,12 @@ impl EvidenceExecutor {
             return Err(SubmitRefusal::Saturated {
                 workers: self.shared.running.load(Ordering::SeqCst),
                 capacity: self.shared.capacity,
+                quarantined: self
+                    .shared
+                    .quarantined
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .len(),
             });
         }
         queue.push_back(job);
@@ -1981,6 +2229,165 @@ impl EvidenceExecutor {
         drop(queue);
         self.shared.wake.notify_one();
         Ok(())
+    }
+
+    /// One retirement pass (P1 worker retirement; called on every admission,
+    /// so a wedged pool is maintained while requests keep arriving — also
+    /// the test/health seam):
+    ///
+    /// 1. QUARANTINE every worker whose current poll exceeded the hard
+    ///    retirement deadline;
+    /// 2. clear the quarantine of workers that returned in time (they are
+    ///    healthy again — a cooperative provider freed its thread);
+    /// 3. ABANDON the physical threads whose grace expired (up to the
+    ///    absolute cap) and spawn their replacement logical slots;
+    /// 4. restore capacity after abandoned threads actually exited.
+    ///
+    /// Never kills the process, never spawns unboundedly: the cap is
+    /// absolute and reaching it opens the circuit (typed refusals).
+    pub(crate) fn maintain(&self) {
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        let _pass = self.maintain_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        let policy = self.shared.policy;
+        let expired: Vec<u64> = {
+            let mut quarantined = self
+                .shared
+                .quarantined
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            {
+                let executing = self
+                    .shared
+                    .executing
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                // A worker that answered while quarantined is healthy again.
+                quarantined.retain(|worker_id, _| {
+                    executing.values().any(|job| job.worker_id == *worker_id)
+                });
+                for (job_id, job) in executing.iter() {
+                    if now.saturating_duration_since(job.started) >= policy.retirement_deadline {
+                        if let std::collections::hash_map::Entry::Vacant(entry) =
+                            quarantined.entry(job.worker_id)
+                        {
+                            entry.insert(now);
+                            tracing::warn!(
+                                target: "faktor_agent::evidence",
+                                worker_id = job.worker_id,
+                                job_id = *job_id,
+                                deadline_ms = policy.retirement_deadline.as_millis() as u64,
+                                grace_ms = policy.quarantine_grace.as_millis() as u64,
+                                "evidence executor quarantined a worker whose poll exceeded the hard retirement deadline (the provider may ignore cancellation); the logical slot is replaced after the grace expires and the physical thread is abandoned only up to the absolute cap"
+                            );
+                        }
+                    }
+                }
+            }
+            quarantined
+                .iter()
+                .filter(|(_, since)| {
+                    now.saturating_duration_since(**since) >= policy.quarantine_grace
+                })
+                .map(|(worker_id, _)| *worker_id)
+                .collect()
+        };
+        for worker_id in expired {
+            if !self.abandon_worker(worker_id) {
+                // The absolute cap is reached: the circuit is open and no
+                // further physical thread may be abandoned. The quarantined
+                // worker keeps its slot; requests are refused typed.
+                break;
+            }
+        }
+        self.restore_capacity();
+    }
+
+    /// Abandon ONE physical worker thread (its provider ignores
+    /// cancellation): mark it retired so it exits the moment it returns,
+    /// detach its join handle and reserve one abandoned slot. Returns false
+    /// (leaving the worker quarantined) when the absolute cap is reached —
+    /// the caller's circuit-open condition.
+    fn abandon_worker(&self, worker_id: u64) -> bool {
+        let cap = self.shared.policy.max_abandoned;
+        if self.shared.abandoned_live.load(Ordering::SeqCst) >= cap {
+            return false;
+        }
+        let mut workers = self.workers.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(index) = workers.iter().position(|worker| worker.id == worker_id) else {
+            // Already abandoned or exited: the quarantine entry is stale.
+            drop(workers);
+            self.shared
+                .quarantined
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&worker_id);
+            return true;
+        };
+        if self.shared.abandoned_live.load(Ordering::SeqCst) >= cap {
+            // Re-checked under the worker lock: a concurrent shutdown may
+            // have abandoned another worker since the first check.
+            return false;
+        }
+        let mut worker = workers.remove(index);
+        // Reserve the abandoned slot BEFORE publishing `retired`, so the
+        // worker's exit (which observes `retired`) can never decrement the
+        // counter before the increment. Both happen under the worker lock,
+        // so an observer either sees the worker still owned or already
+        // counted as abandoned — never neither.
+        self.shared.abandoned_live.fetch_add(1, Ordering::SeqCst);
+        self.shared.abandoned_total.fetch_add(1, Ordering::SeqCst);
+        worker.retired.store(true, Ordering::SeqCst);
+        // Drop the join handle: the thread is DETACHED (it cannot be killed
+        // from safe Rust), bounded by the absolute cap. The process lives on
+        // and the caller already holds a typed outcome.
+        worker.join.take();
+        drop(workers);
+        self.shared
+            .quarantined
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&worker_id);
+        tracing::error!(
+            target: "faktor_agent::evidence",
+            worker_id,
+            abandoned = self.shared.abandoned_live.load(Ordering::SeqCst),
+            cap,
+            "evidence executor abandoned a worker thread blocked inside a non-yielding provider (grace expired); its logical slot is replaced and the physical thread exits if the provider ever returns"
+        );
+        // Wake an idle retired worker so it observes the flag and exits.
+        self.shared.wake.notify_all();
+        true
+    }
+
+    /// Spawn replacement logical slots after an abandonment or after
+    /// abandoned threads exited, up to the configured worker count — never
+    /// while the abandoned cap is reached (that is the open circuit).
+    fn restore_capacity(&self) {
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.shared.abandoned_live.load(Ordering::SeqCst) >= self.shared.policy.max_abandoned {
+            return;
+        }
+        loop {
+            let missing = {
+                let workers = self.workers.lock().unwrap_or_else(|p| p.into_inner());
+                self.shared.target_workers.saturating_sub(workers.len())
+            };
+            if missing == 0 {
+                return;
+            }
+            let Some(worker) = spawn_worker(&self.shared) else {
+                return;
+            };
+            self.workers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(worker);
+        }
     }
 
     /// Close the queue, cancel every executing poll and release every queued
@@ -2001,8 +2408,8 @@ impl EvidenceExecutor {
                 .executing
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            for token in executing.values() {
-                token.cancel();
+            for job in executing.values() {
+                job.cancel.cancel();
             }
         }
         self.shared.wake.notify_all();
@@ -2011,21 +2418,34 @@ impl EvidenceExecutor {
     /// Bounded shutdown: cancel, wait up to `timeout` for the workers to
     /// exit, then join every exited worker. Workers still blocked inside a
     /// non-yielding provider are ABANDONED after the bound (at most the
-    /// fixed worker count, never one per poll); returns whether every owned
-    /// worker exited within the bound. Idempotent: once every owned worker
-    /// has been joined or abandoned there is nothing left to wait for, so a
-    /// repeated call (e.g. the `Drop` after an explicit `shutdown`) returns
-    /// immediately instead of waiting out the bound on an abandoned pool.
-    pub(crate) fn shutdown(&self, timeout: Duration) -> bool {
-        self.close_and_cancel();
-        if self
-            .workers
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .is_empty()
-        {
-            return true;
+    /// fixed worker count, never one per poll) and their physical threads
+    /// stay alive until their provider returns; the process is never killed.
+    ///
+    /// The terminal disposition is PERSISTED: the first call returns
+    /// [`EvidenceExecutorShutdownState::Clean`] or
+    /// [`EvidenceExecutorShutdownState::Abandoned`] and every later call
+    /// (including the `Drop` after an explicit `shutdown`) returns the SAME
+    /// value with the SAME abandoned count — never the old "false, then
+    /// true" lie after blocked workers had been abandoned.
+    pub(crate) fn shutdown(&self, timeout: Duration) -> EvidenceExecutorShutdownState {
+        // Fast path through the diagnostic accessor; the guard below
+        // re-checks under the lock so two concurrent shutdowns cannot both
+        // run the bounded join.
+        let terminal = self.shutdown_state();
+        if terminal != EvidenceExecutorShutdownState::Running {
+            return terminal;
         }
+        let mut state = self
+            .shutdown_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if *state != EvidenceExecutorShutdownState::Running {
+            // Terminal: report the SAME disposition again (with the same
+            // abandoned count) instead of waiting out the bound on a pool
+            // whose join handles were already forgotten.
+            return *state;
+        }
+        self.close_and_cancel();
         let deadline = Instant::now() + timeout;
         {
             let mut exited = self
@@ -2045,10 +2465,10 @@ impl EvidenceExecutor {
                 }
             }
         }
-        let (all_exited, abandoned) = {
+        let (all_exited, newly_abandoned) = {
             let mut workers = self.workers.lock().unwrap_or_else(|p| p.into_inner());
             let mut all_exited = true;
-            let mut abandoned = 0usize;
+            let mut newly_abandoned = 0usize;
             for worker in workers.iter_mut() {
                 if worker.exited.load(Ordering::SeqCst) {
                     if let Some(join) = worker.join.take() {
@@ -2056,17 +2476,33 @@ impl EvidenceExecutor {
                     }
                 } else {
                     all_exited = false;
-                    abandoned += 1;
+                    newly_abandoned += 1;
                     // Bounded abandonment: at most one thread per FIXED
                     // worker slot, only when the provider blocks its OS
                     // thread past the join bound (uncancellable from safe
                     // Rust). Never one thread per poll.
+                    self.shared.abandoned_live.fetch_add(1, Ordering::SeqCst);
+                    self.shared.abandoned_total.fetch_add(1, Ordering::SeqCst);
+                    worker.retired.store(true, Ordering::SeqCst);
                     worker.join.take();
                 }
             }
             workers.clear();
-            (all_exited, abandoned)
+            (all_exited, newly_abandoned)
         };
+        // Every abandoned physical thread still alive (quarantine
+        // abandonments plus this shutdown's) — the honest count. A pool whose
+        // logical slots are gone but whose abandoned threads are still alive
+        // is NOT clean: the persisted disposition must never claim it is.
+        let abandoned_live = self.shared.abandoned_live.load(Ordering::SeqCst);
+        let disposition = if all_exited && abandoned_live == 0 {
+            EvidenceExecutorShutdownState::Clean
+        } else {
+            EvidenceExecutorShutdownState::Abandoned {
+                workers: abandoned_live,
+            }
+        };
+        *state = disposition;
         if !all_exited {
             // Loud, structured: a bounded abandonment is still a defect
             // signal (the provider ignores cancellation), and the counters
@@ -2074,10 +2510,10 @@ impl EvidenceExecutor {
             let stats = self.stats();
             tracing::error!(
                 target: "faktor_agent::evidence",
-                abandoned,
+                abandoned = newly_abandoned,
+                abandoned_live = stats.abandoned,
                 workers = stats.workers,
-                "evidence executor shutdown bound elapsed: {abandoned} of {} worker(s) blocked inside a non-yielding provider were abandoned (bounded by the fixed pool, never one per poll); counters enqueued={} completed={} refused={} cancelled={} max_active={} max_queue_depth={} capacity={}",
-                stats.workers,
+                "evidence executor shutdown bound elapsed: {newly_abandoned} worker(s) blocked inside a non-yielding provider were abandoned and their logical slots dropped (bounded by the fixed pool + the absolute abandoned cap, never one per poll); terminal disposition is persisted and repeated shutdown calls report the same Abandoned count; counters enqueued={} completed={} refused={} cancelled={} max_active={} max_queue_depth={} capacity={}",
                 stats.enqueued,
                 stats.completed,
                 stats.refused,
@@ -2087,7 +2523,7 @@ impl EvidenceExecutor {
                 stats.capacity,
             );
         }
-        all_exited
+        disposition
     }
 }
 
@@ -2097,11 +2533,16 @@ impl Drop for EvidenceExecutor {
     }
 }
 
-/// FIFO dequeue with a condvar wait; `None` only once the executor is closed
-/// and the queue is drained (workers exit by themselves).
-fn next_job(shared: &Arc<ExecutorShared>) -> Option<EvidenceJob> {
+/// FIFO dequeue with a condvar wait; `None` once the executor is closed and
+/// the queue is drained, or once this worker was RETIRED (abandoned): a
+/// retired worker must never take another poll, so it exits the moment its
+/// blocked provider returns (or immediately, when it was idle).
+fn next_job(shared: &Arc<ExecutorShared>, retired: &AtomicBool) -> Option<EvidenceJob> {
     let mut queue = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
     loop {
+        if retired.load(Ordering::SeqCst) {
+            return None;
+        }
         if let Some(job) = queue.pop_front() {
             return Some(job);
         }
@@ -2112,13 +2553,68 @@ fn next_job(shared: &Arc<ExecutorShared>) -> Option<EvidenceJob> {
     }
 }
 
+/// Spawn one owned worker thread. `None` (with a loud typed log) when the OS
+/// refuses the thread: the bounded pool runs with fewer logical slots.
+fn spawn_worker(shared: &Arc<ExecutorShared>) -> Option<EvidenceWorker> {
+    let id = shared.next_worker_id.fetch_add(1, Ordering::Relaxed);
+    let exited = Arc::new(AtomicBool::new(false));
+    let retired = Arc::new(AtomicBool::new(false));
+    let worker_shared = shared.clone();
+    let worker_exited = exited.clone();
+    let worker_retired = retired.clone();
+    // The live-thread accounting is reserved BEFORE the thread starts: the
+    // new worker may exit immediately (a closed executor) and must never
+    // decrement a counter its spawn has not incremented yet.
+    shared.running.fetch_add(1, Ordering::SeqCst);
+    // A replacement may follow a transient zero-live-thread window.
+    shared.exit.reset();
+    #[cfg(test)]
+    EVIDENCE_WORKERS_LIVE.fetch_add(1, Ordering::SeqCst);
+    match std::thread::Builder::new()
+        .name(format!("{EVIDENCE_WORKER_NAME}-{id}"))
+        .spawn(move || worker_main(worker_shared, id, worker_exited, worker_retired))
+    {
+        Ok(join) => {
+            #[cfg(test)]
+            EVIDENCE_WORKERS_SPAWNED.fetch_add(1, Ordering::SeqCst);
+            Some(EvidenceWorker {
+                id,
+                join: Some(join),
+                exited,
+                retired,
+            })
+        }
+        Err(error) => {
+            #[cfg(test)]
+            EVIDENCE_WORKERS_LIVE.fetch_sub(1, Ordering::SeqCst);
+            if shared.running.fetch_sub(1, Ordering::SeqCst) == 1 {
+                shared.exit.notify_exited();
+            }
+            tracing::error!(
+                target: "faktor_agent::evidence",
+                worker_id = id,
+                "evidence executor worker could not be spawned: {error} (the bounded pool runs with fewer workers; saturation is a typed refusal)"
+            );
+            None
+        }
+    }
+}
+
 /// The worker loop: dequeue, skip cancelled polls WITHOUT invoking the
 /// provider (cooperative admission check), drive the provider future under a
 /// cancellation select (a yielding future is dropped at its next await point
-/// when the caller's budget fires), and reply under panic isolation.
-fn worker_main(shared: Arc<ExecutorShared>, exited: Arc<AtomicBool>) {
+/// when the caller's budget fires), and reply under panic isolation. A
+/// worker RETIRED by the executor (abandoned after quarantine) never takes
+/// another poll and exits as soon as it returns, releasing the abandoned
+/// physical slot so the circuit can close.
+fn worker_main(
+    shared: Arc<ExecutorShared>,
+    worker_id: u64,
+    exited: Arc<AtomicBool>,
+    retired: Arc<AtomicBool>,
+) {
     loop {
-        let Some(job) = next_job(&shared) else {
+        let Some(job) = next_job(&shared, &retired) else {
             break;
         };
         if job.cancel.is_cancelled() || shared.closed.load(Ordering::SeqCst) {
@@ -2130,7 +2626,14 @@ fn worker_main(shared: Arc<ExecutorShared>, exited: Arc<AtomicBool>) {
         let job_id = job.id;
         {
             let mut executing = shared.executing.lock().unwrap_or_else(|p| p.into_inner());
-            executing.insert(job_id, job.cancel.clone());
+            executing.insert(
+                job_id,
+                ExecutingJob {
+                    cancel: job.cancel.clone(),
+                    worker_id,
+                    started: Instant::now(),
+                },
+            );
         }
         // Register BEFORE the shutdown re-check so `close_and_cancel` can
         // never miss this poll: either shutdown sees the registration and
@@ -2171,10 +2674,22 @@ fn worker_main(shared: Arc<ExecutorShared>, exited: Arc<AtomicBool>) {
             Err(payload) => WorkerReply::Completed(Err(payload)),
         };
         let _ = reply.send(reply_value);
+        if retired.load(Ordering::SeqCst) {
+            // Abandoned while blocked inside the provider: the reply is
+            // already sent (the caller may still be listening) and this
+            // physical thread must exit instead of taking another poll.
+            break;
+        }
     }
     #[cfg(test)]
     EVIDENCE_WORKERS_LIVE.fetch_sub(1, Ordering::SeqCst);
     exited.store(true, Ordering::SeqCst);
+    if retired.load(Ordering::SeqCst) {
+        // The abandoned physical thread drained: release its slot so the
+        // circuit can close and capacity can be restored.
+        shared.abandoned_live.fetch_sub(1, Ordering::SeqCst);
+        shared.wake.notify_all();
+    }
     if shared.running.fetch_sub(1, Ordering::SeqCst) == 1 {
         shared.exit.notify_exited();
     }
@@ -2217,11 +2732,23 @@ async fn poll_on_executor(
     );
     drop(executor);
     if let Err(refusal) = submitted {
+        // Every refusal is typed. A closed/saturated/no-worker executor is
+        // `NotSpawned`; an OPEN CIRCUIT is its own status carrying the
+        // abandoned/cap counts, never a plain saturation refusal.
+        let message = bounded_poll_message(&refusal.message());
+        let status = match refusal {
+            SubmitRefusal::CircuitOpen { abandoned, cap } => EvidencePollStatus::CircuitOpen {
+                abandoned,
+                cap,
+                message,
+            },
+            SubmitRefusal::Closed | SubmitRefusal::Saturated { .. } | SubmitRefusal::NoWorkers => {
+                EvidencePollStatus::NotSpawned { message }
+            }
+        };
         return EvidencePollOutcome {
             evidence: Vec::new(),
-            status: EvidencePollStatus::NotSpawned {
-                message: bounded_poll_message(&refusal.message()),
-            },
+            status,
         };
     }
     let mut evidence = Vec::new();
@@ -2249,7 +2776,12 @@ async fn poll_on_executor(
         Err(_) => {
             // Cooperative cancellation: the executing future observes the
             // token and is dropped at its next await point; a queued poll is
-            // skipped before the provider is ever invoked.
+            // skipped before the provider is ever invoked. A provider that
+            // blocks its OS thread is NOT cancellable: the caller gets this
+            // typed timeout while the executor quarantines and (bounded by
+            // the absolute cap) abandons the blocked physical worker —
+            // observable in [`EvidenceExecutorStats`]; the request is never
+            // lost silently and the process is never killed.
             cancel.cancel();
             EvidencePollStatus::TimedOut { budget_ms }
         }
@@ -2285,10 +2817,12 @@ pub(crate) async fn poll_evidence_with_wall_budget_outcome(
     poll_on_executor(global_evidence_executor(), provider, session, query, budget).await
 }
 
-/// Advisory legacy poll (used when the IndexService cannot be hosted):
-/// returns the evidence package, empty when the provider fails/panics/times
-/// out. This wrapper keeps the frozen `runtime.rs` call shape status-free,
-/// but its advisory contract is explicit and loud:
+/// Advisory legacy poll (TEST-ONLY): returns the evidence package, empty
+/// when the provider fails/panics/times out. No production caller remains —
+/// the runtime drive owns the typed outcome
+/// ([`poll_evidence_with_wall_budget_outcome`]) and archives the status — so
+/// the status-free shape survives only to pin the documented legacy
+/// contract in tests:
 ///
 /// - an empty package is the SAME input as "no evidence" for the turn (the
 ///   advisorship never blocks a turn), and the degradation is NEVER silent:
@@ -2297,6 +2831,7 @@ pub(crate) async fn poll_evidence_with_wall_budget_outcome(
 /// - callers that need to distinguish "no evidence" from "retrieval failed"
 ///   at the decision boundary must use
 ///   [`poll_evidence_with_wall_budget_outcome`] instead.
+#[cfg(test)]
 pub(crate) async fn poll_evidence_with_wall_budget(
     provider: Arc<dyn EvidenceProvider>,
     session: SessionId,
@@ -2966,9 +3501,16 @@ mod bounded_evidence_executor_tests {
         // most the fixed worker count (never one thread per poll). The
         // executor handle is released, so Drop is immediate afterwards.
         let started = Instant::now();
-        assert!(
-            !executor.shutdown(Duration::from_millis(100)),
-            "a synchronously blocked worker must be reported as not exited"
+        let disposition = executor.shutdown(Duration::from_millis(100));
+        assert_eq!(
+            disposition,
+            EvidenceExecutorShutdownState::Abandoned { workers: 2 },
+            "a synchronously blocked worker must be reported as abandoned, with the count"
+        );
+        assert_eq!(
+            executor.shutdown(Duration::from_millis(100)),
+            disposition,
+            "the terminal disposition is persisted, not re-derived"
         );
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -3000,9 +3542,15 @@ mod bounded_evidence_executor_tests {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         let started = Instant::now();
-        assert!(
+        assert_eq!(
             executor.shutdown(Duration::from_secs(2)),
+            EvidenceExecutorShutdownState::Clean,
             "cooperative workers must be cancelled and joined"
+        );
+        assert_eq!(
+            executor.shutdown(Duration::from_secs(2)),
+            EvidenceExecutorShutdownState::Clean,
+            "a repeated shutdown reports the same clean disposition"
         );
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -3081,7 +3629,7 @@ mod bounded_evidence_executor_tests {
     }
 
     #[tokio::test]
-    async fn off_turn_thread_panic_is_differentiated_and_normal_path_unchanged() {
+    async fn off_turn_failure_is_a_typed_degradation_never_none() {
         assert_eq!(run_off_turn_thread_outcome(|| 21 + 21).await, Ok(42));
         match run_off_turn_thread_outcome(|| -> u32 { panic!("off-turn boom") }).await {
             Err(OffTurnThreadFailure::Panicked { message }) => {
@@ -3089,18 +3637,484 @@ mod bounded_evidence_executor_tests {
             }
             other => panic!("a panic must be a typed outcome, got {other:?}"),
         }
-        // The legacy adapter keeps its Option shape and surfaces the failure
-        // loudly instead of the old silent `.ok()`.
-        assert_eq!(run_off_turn_thread(|| 41 + 1).await, Some(42));
-        let before = off_turn_thread_failures();
-        assert_eq!(
-            run_off_turn_thread(|| -> u32 { panic!("legacy boom") }).await,
-            None
+        // P2: the typed failure maps to an explicit evidence degradation —
+        // never `None`, never conflated with an honest empty answer.
+        let failure = run_off_turn_thread_outcome(|| -> u32 { panic!("cold ladder boom") })
+            .await
+            .expect_err("the panic must be a typed outcome");
+        let status = evidence_status_from_off_turn_failure(failure);
+        match &status {
+            EvidencePollStatus::ProviderPanicked { message } => {
+                assert!(message.contains("cold ladder boom"), "{message}");
+            }
+            other => panic!("a panicking off-turn task must be ProviderPanicked, got {other:?}"),
+        }
+        assert!(
+            status.is_degraded(),
+            "a broken off-turn task is never no-evidence"
+        );
+        let unscheduled =
+            evidence_status_from_off_turn_failure(OffTurnThreadFailure::Unscheduled {
+                message: "pool closed".into(),
+            });
+        assert!(
+            matches!(
+                unscheduled,
+                EvidencePollStatus::NotSpawned { ref message } if message.contains("pool closed")
+            ),
+            "{unscheduled:?}"
+        );
+        assert!(unscheduled.is_degraded());
+    }
+
+    /// Test seam: a gate that parks the provider's OS thread until the test
+    /// releases it, so an ABANDONED worker can actually drain and prove that
+    /// capacity recovers (the forever-blocked [`SyncBlockingProvider`]
+    /// proves the terminal cap/circuit behavior instead).
+    #[derive(Default)]
+    struct BlockGate {
+        released: std::sync::Mutex<bool>,
+        cv: std::sync::Condvar,
+        entered: AtomicUsize,
+    }
+
+    impl BlockGate {
+        fn block(&self) {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let mut released = self.released.lock().unwrap_or_else(|p| p.into_inner());
+            while !*released {
+                released = self.cv.wait(released).unwrap_or_else(|p| p.into_inner());
+            }
+        }
+
+        fn release_all(&self) {
+            *self.released.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            self.cv.notify_all();
+        }
+
+        fn entered(&self) -> usize {
+            self.entered.load(Ordering::SeqCst)
+        }
+    }
+
+    struct GatedBlockingProvider {
+        gate: Arc<BlockGate>,
+    }
+
+    impl EvidenceProvider for GatedBlockingProvider {
+        fn evidence_for(
+            &self,
+            _session: SessionId,
+            _query: EvidenceQuery,
+        ) -> BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
+            let gate = self.gate.clone();
+            Box::pin(async move {
+                // Blocks the worker's OS thread inside the first poll: the
+                // P1 scenario (not cancellable from safe Rust).
+                gate.block();
+                Ok(vec![Evidence {
+                    path: "src/gated.rs".into(),
+                    snippet: "served after release".into(),
+                    score: 1.0,
+                }])
+            })
+        }
+    }
+
+    /// P1: a stuck provider is quarantined after the hard retirement
+    /// deadline, its physical thread is abandoned after the grace and its
+    /// logical slot is REPLACED — evidence stays available until the
+    /// absolute abandoned cap, where the typed circuit opens; the physical
+    /// thread count never exceeds `workers + cap`; and a released provider
+    /// drains the abandoned threads so capacity recovers.
+    #[tokio::test]
+    async fn stuck_workers_are_quarantined_replaced_and_capped_by_the_circuit() {
+        let _guard = HEAVY_TESTS.lock().await;
+        warm_global_executor().await;
+        let live_before = EVIDENCE_WORKERS_LIVE.load(Ordering::SeqCst);
+        let spawned_before = EVIDENCE_WORKERS_SPAWNED.load(Ordering::SeqCst);
+        let threads_before = live_thread_count();
+        let gate = Arc::new(BlockGate::default());
+        let executor = EvidenceExecutor::start_with_policy(
+            2,
+            4,
+            EvidenceRetirementPolicy {
+                retirement_deadline: Duration::from_millis(40),
+                quarantine_grace: Duration::from_millis(40),
+                max_abandoned: 4,
+            },
         );
         assert_eq!(
-            off_turn_thread_failures(),
-            before + 1,
-            "the legacy adapter must surface the failure, never swallow it"
+            executor.shutdown_state(),
+            EvidenceExecutorShutdownState::Running,
+            "no shutdown has run yet"
+        );
+        assert_eq!(executor.stats().circuit, EvidenceCircuitState::Closed);
+
+        // Wedge both workers with providers that block their OS thread.
+        for _ in 0..2 {
+            let outcome = poll_on_executor(
+                executor.clone(),
+                Arc::new(GatedBlockingProvider { gate: gate.clone() }),
+                session(),
+                query(),
+                Duration::from_millis(20),
+            )
+            .await;
+            assert!(
+                matches!(outcome.status, EvidencePollStatus::TimedOut { .. }),
+                "a synchronously blocked poll times out typed: {:?}",
+                outcome.status
+            );
+        }
+        assert_eq!(gate.entered(), 2, "both workers reached the provider");
+
+        // Hard retirement deadline exceeded -> QUARANTINED (no early
+        // abandonment: the grace has not expired).
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        executor.maintain();
+        let stats = executor.stats();
+        assert_eq!(stats.workers_quarantined, 2, "{stats:?}");
+        assert_eq!(stats.workers_healthy, 0, "{stats:?}");
+        assert_eq!(
+            stats.abandoned, 0,
+            "quarantine never abandons early: {stats:?}"
+        );
+        assert_eq!(stats.circuit, EvidenceCircuitState::Closed, "{stats:?}");
+
+        // Grace expiry -> the blocked physical threads are ABANDONED and
+        // their logical slots replaced: evidence stays available.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        executor.maintain();
+        let stats = executor.stats();
+        assert_eq!(
+            stats.abandoned, 2,
+            "one abandoned physical thread per wedged worker: {stats:?}"
+        );
+        assert_eq!(stats.abandoned_total, 2, "{stats:?}");
+        assert_eq!(stats.workers, 2, "replacement logical slots: {stats:?}");
+        assert_eq!(stats.workers_healthy, 2, "{stats:?}");
+        assert_eq!(stats.workers_quarantined, 0, "{stats:?}");
+        assert_eq!(
+            stats.circuit,
+            EvidenceCircuitState::Closed,
+            "under the cap the circuit stays closed: {stats:?}"
+        );
+        assert_eq!(
+            EVIDENCE_WORKERS_SPAWNED.load(Ordering::SeqCst) - spawned_before,
+            4,
+            "2 original + 2 replacement worker threads"
+        );
+        let served = poll_on_executor(
+            executor.clone(),
+            Arc::new(ServingProvider),
+            session(),
+            query(),
+            Duration::from_millis(500),
+        )
+        .await;
+        assert_eq!(
+            served.status,
+            EvidencePollStatus::Served,
+            "replacement slots keep evidence available while stuck threads never drain"
+        );
+
+        // Wedge the replacements too: the abandoned count reaches the
+        // absolute cap and the circuit OPENS.
+        for _ in 0..2 {
+            let outcome = poll_on_executor(
+                executor.clone(),
+                Arc::new(GatedBlockingProvider { gate: gate.clone() }),
+                session(),
+                query(),
+                Duration::from_millis(20),
+            )
+            .await;
+            assert!(matches!(
+                outcome.status,
+                EvidencePollStatus::TimedOut { .. }
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        executor.maintain();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        executor.maintain();
+        let stats = executor.stats();
+        assert_eq!(stats.abandoned, 4, "the absolute cap is reached: {stats:?}");
+        assert_eq!(
+            stats.circuit,
+            EvidenceCircuitState::Open {
+                abandoned: 4,
+                cap: 4
+            },
+            "{stats:?}"
+        );
+
+        // At the cap: typed CIRCUIT-OPEN refusal, never a plain NotSpawned.
+        let refused = poll_on_executor(
+            executor.clone(),
+            Arc::new(ServingProvider),
+            session(),
+            query(),
+            Duration::from_millis(500),
+        )
+        .await;
+        match &refused.status {
+            EvidencePollStatus::CircuitOpen {
+                abandoned,
+                cap,
+                message,
+            } => {
+                assert_eq!((*abandoned, *cap), (4, 4));
+                assert!(message.contains("circuit"), "{message}");
+            }
+            other => panic!("the cap must refuse with the typed circuit state, got {other:?}"),
+        }
+        assert!(refused.status.is_degraded());
+
+        // Physical growth is bounded by workers + the absolute cap.
+        let live_now = EVIDENCE_WORKERS_LIVE.load(Ordering::SeqCst);
+        assert!(
+            live_now <= live_before + 2 + 4,
+            "live evidence threads must stay within workers + cap: before={live_before} now={live_now}"
+        );
+        if let (Some(before), Some(after)) = (threads_before, live_thread_count()) {
+            assert!(
+                after <= before + 2 + 4 + 16,
+                "OS thread growth must stay bounded (workers + cap + slack): before={before} after={after}"
+            );
+        }
+
+        // RECOVERY: the stuck provider returns (test seam) -> the abandoned
+        // threads drain -> the circuit closes -> capacity is restored.
+        gate.release_all();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while executor.stats().abandoned > 0 {
+            assert!(Instant::now() < deadline, "abandoned threads never drained");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        executor.maintain();
+        let stats = executor.stats();
+        assert_eq!(stats.circuit, EvidenceCircuitState::Closed, "{stats:?}");
+        assert_eq!(stats.workers, 2, "capacity restored: {stats:?}");
+        assert_eq!(stats.workers_healthy, 2, "{stats:?}");
+        assert_eq!(
+            stats.abandoned_total, 4,
+            "the abandonment history stays observable: {stats:?}"
+        );
+        let recovered = poll_on_executor(
+            executor.clone(),
+            Arc::new(ServingProvider),
+            session(),
+            query(),
+            Duration::from_millis(500),
+        )
+        .await;
+        assert_eq!(
+            recovered.status,
+            EvidencePollStatus::Served,
+            "recovered capacity serves evidence again"
+        );
+        // A drained pool shuts down cleanly, and the disposition persists.
+        assert_eq!(
+            executor.shutdown(Duration::from_secs(2)),
+            EvidenceExecutorShutdownState::Clean
+        );
+        assert_eq!(
+            executor.shutdown(Duration::from_secs(2)),
+            EvidenceExecutorShutdownState::Clean
+        );
+        drop(executor);
+        assert_eq!(
+            EVIDENCE_WORKERS_LIVE.load(Ordering::SeqCst),
+            live_before,
+            "no evidence worker may outlive a clean shutdown"
+        );
+    }
+
+    /// P1 terminal behavior: a provider that NEVER returns leaves the
+    /// executor permanently at the abandoned cap — the documented terminal
+    /// state. Requests keep being refused with the typed circuit status,
+    /// the process is never killed, and the persisted shutdown disposition
+    /// reports the abandoned count on every call (never the old
+    /// `false`-then-`true` lie).
+    #[tokio::test]
+    async fn forever_blocked_provider_opens_the_circuit_and_shutdown_stays_abandoned() {
+        let _guard = HEAVY_TESTS.lock().await;
+        warm_global_executor().await;
+        let executor = EvidenceExecutor::start_with_policy(
+            1,
+            2,
+            EvidenceRetirementPolicy {
+                retirement_deadline: Duration::from_millis(20),
+                quarantine_grace: Duration::from_millis(20),
+                max_abandoned: 2,
+            },
+        );
+        assert_eq!(
+            executor.shutdown_state(),
+            EvidenceExecutorShutdownState::Running
+        );
+
+        // Wedge the single worker.
+        let outcome = poll_on_executor(
+            executor.clone(),
+            Arc::new(SyncBlockingProvider),
+            session(),
+            query(),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(matches!(
+            outcome.status,
+            EvidencePollStatus::TimedOut { .. }
+        ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        executor.maintain();
+        assert_eq!(executor.stats().workers_quarantined, 1);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        executor.maintain();
+        let stats = executor.stats();
+        assert_eq!(stats.abandoned, 1, "{stats:?}");
+        assert_eq!(stats.workers, 1, "the logical slot is replaced: {stats:?}");
+        assert_eq!(stats.circuit, EvidenceCircuitState::Closed, "{stats:?}");
+
+        // Wedge the replacement: the abandoned count reaches the cap.
+        let outcome = poll_on_executor(
+            executor.clone(),
+            Arc::new(SyncBlockingProvider),
+            session(),
+            query(),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(matches!(
+            outcome.status,
+            EvidencePollStatus::TimedOut { .. }
+        ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        executor.maintain();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        executor.maintain();
+        let stats = executor.stats();
+        assert_eq!(stats.abandoned, 2, "the absolute cap: {stats:?}");
+        assert_eq!(
+            stats.circuit,
+            EvidenceCircuitState::Open {
+                abandoned: 2,
+                cap: 2
+            },
+            "{stats:?}"
+        );
+
+        // The provider never returns: the documented terminal behavior is a
+        // permanently open circuit with typed refusals (never NotSpawned,
+        // never a killed process, never a lost request).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        executor.maintain();
+        assert_eq!(
+            executor.stats().circuit,
+            EvidenceCircuitState::Open {
+                abandoned: 2,
+                cap: 2
+            }
+        );
+        let refused = poll_on_executor(
+            executor.clone(),
+            Arc::new(ServingProvider),
+            session(),
+            query(),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            matches!(
+                refused.status,
+                EvidencePollStatus::CircuitOpen {
+                    abandoned: 2,
+                    cap: 2,
+                    ..
+                }
+            ),
+            "{:?}",
+            refused.status
+        );
+
+        // Shutdown: the terminal disposition names the abandoned count and
+        // REPEATS identically.
+        let first = executor.shutdown(Duration::from_millis(50));
+        assert_eq!(
+            first,
+            EvidenceExecutorShutdownState::Abandoned { workers: 2 }
+        );
+        assert_eq!(executor.shutdown_state(), first);
+        let second = executor.shutdown(Duration::from_millis(50));
+        assert_eq!(
+            second, first,
+            "repeated shutdown must report the SAME terminal disposition"
+        );
+        assert_eq!(executor.worker_count(), 0);
+        drop(executor);
+        // The two forever-blocked threads cannot be killed from safe Rust:
+        // they stay alive in this test process, bounded by workers + cap —
+        // exactly the documented terminal behavior.
+    }
+
+    /// P2: the shutdown disposition is `Running` before the first call, then
+    /// `Clean` on every call — never a value that flips to `true` merely
+    /// because the join handles were forgotten.
+    #[tokio::test]
+    async fn shutdown_disposition_is_running_then_persistently_clean() {
+        let _guard = HEAVY_TESTS.lock().await;
+        let executor = EvidenceExecutor::start(2, 4);
+        assert_eq!(
+            executor.shutdown_state(),
+            EvidenceExecutorShutdownState::Running
+        );
+        assert_eq!(
+            executor.shutdown(Duration::from_secs(2)),
+            EvidenceExecutorShutdownState::Clean
+        );
+        assert_eq!(
+            executor.shutdown(Duration::from_millis(1)),
+            EvidenceExecutorShutdownState::Clean,
+            "the persisted disposition is returned without waiting again"
+        );
+        assert_eq!(
+            executor.shutdown_state(),
+            EvidenceExecutorShutdownState::Clean
+        );
+        assert_eq!(executor.worker_count(), 0);
+        drop(executor);
+    }
+}
+
+/// P2 structural proof: the legacy `Option`-shaped off-turn wrapper is
+/// DELETED, not merely unused. The typed `run_off_turn_thread_outcome` is the
+/// only bridge, so a panic or an unschedulable bridge can never collapse
+/// into `None` again.
+#[cfg(test)]
+mod off_turn_wrapper_is_deleted {
+    #[test]
+    fn production_sources_never_reference_the_option_wrapper() {
+        // Assembled at runtime so this test's own source can never satisfy
+        // (or accidentally trip) the needle it searches for.
+        let needle = ["run_off_turn", "thread("].concat();
+        let mut sources = String::new();
+        for file in [
+            "lib.rs",
+            "runtime.rs",
+            "tool.rs",
+            "tool_json.rs",
+            "loop_detect.rs",
+            "stall.rs",
+        ] {
+            let path = format!("{}/src/{file}", env!("CARGO_MANIFEST_DIR"));
+            sources.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+        }
+        assert!(
+            !sources.contains(&needle),
+            "the Option-shaped off-turn wrapper must stay deleted: every production caller maps the typed outcome to an explicit evidence degradation"
         );
     }
 }

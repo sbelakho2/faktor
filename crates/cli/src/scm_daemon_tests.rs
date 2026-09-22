@@ -352,8 +352,11 @@ async fn webhook_installation_id_hostile_values_are_refused_before_any_claim() {
         .unwrap()
         .expect("enabled github app builds");
 
-    // Zero / negative / fractional / overflow / non-numeric ids are typed
-    // refusals: no panic, no durable claim, no enqueued sync.
+    // Zero / negative / fractional / non-numeric ids and ids above the
+    // signed-SQLite bound (`i64::MAX`) are typed payload refusals: no panic,
+    // no durable claim, no enqueued sync. The full u64 space is deliberately
+    // NOT admitted — a value above `i64::MAX` would wrap negative in the
+    // signed `installation_id` columns and invert ordering/positivity.
     for (delivery, body) in [
         (
             "d-zero",
@@ -368,8 +371,16 @@ async fn webhook_installation_id_hostile_values_are_refused_before_any_claim() {
             br#"{"installation":{"id":1.5},"action":"created"}"#.as_slice(),
         ),
         (
-            "d-overflow",
+            "d-u64-overflow",
             br#"{"installation":{"id":18446744073709551616},"action":"created"}"#.as_slice(),
+        ),
+        (
+            "d-i64-overflow",
+            br#"{"installation":{"id":9223372036854775808},"action":"created"}"#.as_slice(),
+        ),
+        (
+            "d-u64-max",
+            br#"{"installation":{"id":18446744073709551615},"action":"created"}"#.as_slice(),
         ),
         (
             "d-string",
@@ -380,6 +391,10 @@ async fn webhook_installation_id_hostile_values_are_refused_before_any_claim() {
             .deliver(&signed_webhook(body, delivery), body)
             .unwrap_err();
         assert!(
+            matches!(err, faktor_scm::WebhookError::MalformedPayload(_)),
+            "{delivery}: typed payload refusal expected, got {err:?}"
+        );
+        assert!(
             err.to_string().contains("installation.id"),
             "{delivery}: {err}"
         );
@@ -389,17 +404,28 @@ async fn webhook_installation_id_hostile_values_are_refused_before_any_claim() {
         "malformed payloads must be refused before any durable claim"
     );
 
-    // A valid id is accepted (including the u64 boundary) and claimed once.
+    // The signed-SQLite bound itself (`i64::MAX`) IS a valid installation id:
+    // it is accepted, claimed once, and round-trips through the domain type
+    // to the signed column image without wrapping.
     let body = br#"{"installation":{"id":7},"action":"created"}"#;
     let outcome = daemon
         .deliver(&signed_webhook(body, "d-valid"), body)
         .unwrap();
     assert!(matches!(outcome, faktor_scm::IngestOutcome::Accepted(_)));
-    let boundary = br#"{"installation":{"id":18446744073709551615}}"#;
+    let boundary = br#"{"installation":{"id":9223372036854775807}}"#;
     let outcome = daemon
         .deliver(&signed_webhook(boundary, "d-max"), boundary)
         .unwrap();
     assert!(matches!(outcome, faktor_scm::IngestOutcome::Accepted(_)));
+    let max = faktor_scm::installation_of(boundary)
+        .unwrap()
+        .expect("a valid id names an installation scope");
+    assert_eq!(max.raw(), i64::MAX as u64, "i64::MAX must round-trip raw");
+    assert_eq!(
+        max.to_sqlite_i64(),
+        i64::MAX,
+        "i64::MAX must round-trip to the signed SQLite image"
+    );
     assert_eq!(store.webhook_deliveries(10).unwrap().len(), 2);
 }
 
