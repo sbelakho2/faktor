@@ -269,7 +269,7 @@ async fn hostile_http_is_clean_4xx() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
-    let _ = handle.shutdown.send(());
+    let _ = handle.shutdown().await;
 }
 
 /// Permission flow end-to-end: the agent blocks on the durable permission,

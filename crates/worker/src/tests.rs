@@ -506,7 +506,7 @@ fn stale_generation_accept_is_superseded_and_journaled() {
             )
             .unwrap_err();
         assert!(
-            matches!(err, WorkerError::SupersededLease { generation, current, .. } if generation == JobGeneration::FIRST && current == JobGeneration(2)),
+            matches!(err, WorkerError::SupersededLease { generation, current, .. } if generation == JobGeneration::FIRST && current == JobGeneration::try_new(2).unwrap()),
             "{label}: {err}"
         );
         assert!(

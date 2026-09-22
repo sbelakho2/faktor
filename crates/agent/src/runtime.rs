@@ -1985,21 +1985,40 @@ impl AgentRuntime {
     /// here AFTER construction, so every existing constructor site stays
     /// byte-identical. With `None` the runtime never consults any debit
     /// authority — the pre-billing behavior exactly.
+    ///
+    /// Fallible (P0 monetary fail-closed): a POISONED authority slot is
+    /// surfaced as [`crate::credits::DebitError::Unavailable`] — installing
+    /// (or clearing) the billing authority can never silently no-op.
     pub fn set_provider_debits(
         &self,
         debits: Option<Arc<dyn crate::credits::ProviderAttemptDebits>>,
-    ) {
-        if let Ok(mut slot) = self.provider_debits.lock() {
-            *slot = debits;
-        }
+    ) -> Result<(), crate::credits::DebitError> {
+        let mut slot =
+            self.provider_debits
+                .lock()
+                .map_err(|_| crate::credits::DebitError::Unavailable {
+                    reason: "provider debit authority lock poisoned".into(),
+                })?;
+        *slot = debits;
+        Ok(())
     }
 
-    /// The installed debit authority, when billing is enabled.
-    fn provider_debits(&self) -> Option<Arc<dyn crate::credits::ProviderAttemptDebits>> {
+    /// The installed debit authority, when billing is enabled. Fallible
+    /// (P0 monetary fail-closed): a POISONED lock is an UNAVAILABLE
+    /// authority, never a silent `None` — `None` means "billing deliberately
+    /// disabled" (BYOK/no-authority), and conflating the two would let a
+    /// managed-provider dispatch proceed without its commercial debit
+    /// authority after a poisoning.
+    fn provider_debits(
+        &self,
+    ) -> Result<Option<Arc<dyn crate::credits::ProviderAttemptDebits>>, crate::credits::DebitError>
+    {
         self.provider_debits
             .lock()
-            .ok()
-            .and_then(|slot| slot.clone())
+            .map(|slot| slot.clone())
+            .map_err(|_| crate::credits::DebitError::Unavailable {
+                reason: "provider debit authority lock poisoned".into(),
+            })
     }
 
     /// Build the per-attempt commercial debit machine for one physical
@@ -2027,7 +2046,7 @@ impl AgentRuntime {
             estimate_micro,
             reason: "agent_provider_attempt".to_string(),
         };
-        crate::credits::AttemptDebits::new(self.provider_debits(), debit)
+        crate::credits::AttemptDebits::new(self.provider_debits()?, debit)
     }
 
     /// THE durable evidence authority of this runtime (schema v21).
@@ -3755,6 +3774,129 @@ impl AgentRuntime {
         self.dw_note_finish_turn_record(handle, turn_op, status, DW_SITE_EXECUTOR_REFUSAL_RECORD);
     }
 
+    /// Crash-resume transcript integrity: every assistant tool_call part the
+    /// wire carries needs an answering tool_result part, or the next request
+    /// is protocol-invalid (real providers reject a call with no result, and
+    /// a model may hallucinate an outcome). The live batch paths answer
+    /// every call they resolve — including refusals — so with NO open run
+    /// rows an unanswered call can only be crash residue: a refusal whose
+    /// typed result write was lost, or a call the crashed driver never
+    /// resolved. This repair walks the durable transcript NEWEST-FIRST and
+    /// stops at the first message that carries no tool part at all (the
+    /// turn's tool cluster is contiguous at the tail; the walk is additionally
+    /// capped), appending ONE typed `interrupted` result per unanswered call.
+    /// Calls already answered are skipped, so re-running after a repair is a
+    /// no-op (idempotent). Run rows MUST be empty: a deferred replay answers
+    /// its own call, and a second result for the same call would itself be
+    /// protocol-invalid.
+    fn answer_dangling_tool_calls(
+        &self,
+        handle: &faktor_session::SessionHandle,
+    ) -> faktor_core::Result<usize> {
+        const MAX_SCAN: usize = 128;
+        const MAX_REPAIRS: usize = 32;
+        let mut calls: Vec<(String, String)> = Vec::new();
+        let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cursor: Option<i64> = None;
+        let mut scanned = 0usize;
+        'scan: loop {
+            let page = handle.messages_before(cursor, 100)?;
+            if page.is_empty() {
+                break;
+            }
+            // The page is newest-first: the walk stays newest-first so the
+            // tool-cluster stop is exact (nothing older than the first
+            // non-tool message can belong to this turn's tail).
+            for row in page.iter() {
+                if scanned >= MAX_SCAN {
+                    break 'scan;
+                }
+                scanned += 1;
+                let mut saw_tool_part = false;
+                for part in handle.parts_of(row.id)? {
+                    let Some(call_id) = part
+                        .data
+                        .get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .filter(|id| !id.is_empty())
+                    else {
+                        continue;
+                    };
+                    match part.kind.as_str() {
+                        // Only the call states the wire carries (the history
+                        // reconstruction skips pending/partial calls) can be
+                        // dangling on the wire.
+                        "tool_call"
+                            if matches!(
+                                part.data.get("state").and_then(|v| v.as_str()),
+                                Some("completed") | Some("error")
+                            ) =>
+                        {
+                            let name = part
+                                .data
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            calls.push((call_id.to_string(), name));
+                            saw_tool_part = true;
+                        }
+                        "tool_call" => saw_tool_part = true,
+                        "tool_result" => {
+                            answered.insert(call_id.to_string());
+                            saw_tool_part = true;
+                        }
+                        _ => {}
+                    }
+                }
+                // The turn's tool cluster ends here: nothing older can be
+                // dangling for THIS turn (the walk is bounded regardless).
+                if !saw_tool_part {
+                    break 'scan;
+                }
+            }
+            let Some(oldest) = page.last() else { break };
+            if scanned >= MAX_SCAN || oldest.seq <= 1 {
+                break;
+            }
+            cursor = Some(oldest.seq);
+        }
+        // Collected newest-first (the walk order); repair in durable order.
+        calls.reverse();
+        let mut repaired = 0usize;
+        for (call_id, name) in calls {
+            if answered.contains(&call_id) {
+                continue;
+            }
+            if repaired >= MAX_REPAIRS {
+                tracing::error!(
+                    session = %handle.id(),
+                    bound = MAX_REPAIRS,
+                    "dangling tool-call repair hit its bound; the remaining calls are answered at a later open"
+                );
+                break;
+            }
+            let seq = handle.proposed_message_seq()?;
+            let mid = handle.put_message(seq, "assistant", serde_json::json!({ "parts": [] }))?;
+            let body = ToolResultBody {
+                excerpt: interrupted_tool_excerpt(&name),
+                exit_code: Some(1),
+                artifact: None,
+                slice_hint: None,
+            };
+            handle.put_tool_result_part(mid, &call_id, &body)?;
+            repaired += 1;
+        }
+        if repaired > 0 {
+            tracing::warn!(
+                session = %handle.id(),
+                repaired,
+                "answered dangling tool calls left by an interrupted turn (protocol-valid transcript)"
+            );
+        }
+        Ok(repaired)
+    }
+
     /// Resolve interrupted tool runs of one session. Returns the rows that
     /// need ASYNC replay (idempotent tools with a stored descriptor), left
     /// running on the SAME row — the replay is a new physical attempt of the
@@ -3784,6 +3926,29 @@ impl AgentRuntime {
             contradiction: false,
             applied: false,
         };
+        // A LIVE in-process driver owns the session's active logical turn
+        // (registered cancellation token): nothing crashed — recovery must
+        // not journal CrashDetected, touch the driver's running rows, or
+        // answer the calls the driver is still resolving. Checked BEFORE the
+        // transcript repair and the fast path (the driver's own batch
+        // legitimately has calls that are not answered yet). Post-restart
+        // there is no tracking, so crash residue is swept.
+        if let Some(rec) = handle.active_turn_record()? {
+            if handle.turn_cancellation(rec.turn_op_id).is_some() {
+                return Ok(report);
+            }
+        }
+        // Crash-resume transcript integrity (see
+        // [`AgentRuntime::answer_dangling_tool_calls`]): with NO open run
+        // rows nothing will replay (a replay answers its own call), so any
+        // unanswered call in the durable transcript is residue of the
+        // interrupted turn and is answered BEFORE the machine is driven
+        // again — the next wire request never carries a dangling call. A
+        // TERMINAL session accepts no further prompts, so its transcript is
+        // never sent again and is left byte-identical.
+        if pending.is_empty() && !current.is_terminal() {
+            report.applied |= self.answer_dangling_tool_calls(handle)? > 0;
+        }
         if pending.is_empty() && !state_is_op_active(current) {
             return Ok(report);
         }
@@ -3795,15 +3960,6 @@ impl AgentRuntime {
             return handle
                 .recover_all()
                 .map_err(|e| Error::new(ErrorKind::Store, format!("session recovery: {e}")));
-        }
-        // A LIVE in-process driver owns the session's active logical turn
-        // (registered cancellation token): nothing crashed — recovery must
-        // not journal CrashDetected nor touch the driver's running rows.
-        // Post-restart there is no tracking, so crash residue is swept.
-        if let Some(rec) = handle.active_turn_record()? {
-            if handle.turn_cancellation(rec.turn_op_id).is_some() {
-                return Ok(report);
-            }
         }
         report.applied = true;
         // CrashDetected at the CURRENT state (self-transition): the machine
@@ -6172,24 +6328,28 @@ impl AgentRuntime {
                     // Tools ran: the SAME logical turn continues. Interior
                     // hops (no TurnCompleted — that is reserved for the one
                     // genuine end) return the machine to WaitingForModel so
-                    // the model can see the tool results.
-                    handle
-                        .append_journal_event(
-                            faktor_core::event::EventKind::PhaseChanged,
-                            AgentState::UpdatingMemory,
-                            Some(op_id),
-                            None,
-                        )
-                        .await?;
-                    handle
-                        .append_journal_event(
-                            faktor_core::event::EventKind::PhaseChanged,
-                            AgentState::WaitingForModel,
-                            Some(op_id),
-                            None,
-                        )
-                        .await?;
+                    // the model can see the tool results. The hop depends on
+                    // what the batch left behind: all-completed leaves the
+                    // machine at `Validating`; a MIXED batch (>=1 completed,
+                    // >=1 failed recoverably) leaves it at `FailedRecoverable`
+                    // because every failed finish takes that edge. The
+                    // recovery hop below is the explicit retry/re-plan path
+                    // — see [`AgentRuntime::walk_tool_batch_to_waiting`] for
+                    // the state diagram.
+                    self.walk_tool_batch_to_waiting(handle, op_id).await?;
                     continue; // stream again with tool results (machine at WaitingForModel)
+                }
+                if handle.state()? == AgentState::FailedRecoverable {
+                    // executed == 0 with at least one submitted tool that
+                    // failed recoverably: the turn's classified end. The
+                    // machine is already at `FailedRecoverable` (the failed
+                    // finishes), so this is an honest report, not a
+                    // transition; the durable per-tool rows carry the
+                    // outcomes. `FailedRecoverable -> Validating` is ILLEGAL
+                    // by design — the old fall-through into the genuine-end
+                    // tail died there with `InvalidState`.
+                    outcome.final_state = AgentState::FailedRecoverable;
+                    return Ok(outcome);
                 }
                 // executed == 0: every call was denied or unknown. If the
                 // loop detector tripped we returned above; otherwise the
@@ -6211,6 +6371,63 @@ impl AgentRuntime {
             .await?;
             return Ok(outcome);
         }
+    }
+
+    /// Interior hop from the state ONE tool batch left behind back to
+    /// `WaitingForModel`, using ONLY the session machine's legal edges.
+    ///
+    /// The legal tool-batch interior (and its one missing edge):
+    ///
+    /// ```text
+    /// batch outcome                      legal interior hops
+    /// ---------------------------------  ----------------------------------------
+    /// every tool completed               Validating -> UpdatingMemory
+    ///                                    UpdatingMemory -> WaitingForModel
+    ///
+    /// mixed: >=1 completed AND           Validating -> FailedRecoverable
+    /// >=1 failed recoverably             (the failed finishes; completed
+    ///                                    finishes resolve FIRST — the
+    ///                                    reverse order is illegal)
+    ///                                    FailedRecoverable -> Preparing
+    ///                                    (the explicit retry/re-plan hop:
+    ///                                    the ONLY forward edge out of a
+    ///                                    recoverable failure)
+    ///                                    Preparing -> BuildingContext
+    ///                                    BuildingContext -> WaitingForModel
+    ///
+    /// every submitted tool failed        no hop: the turn's classified end
+    ///                                    is FailedRecoverable itself
+    /// ```
+    ///
+    /// `FailedRecoverable -> Validating`/`UpdatingMemory` are deliberately
+    /// absent from [`AgentState::allowed_transitions`]: a recoverable
+    /// failure may only re-enter the turn through its preparation entry,
+    /// never by pretending the failure did not happen. The failure stays a
+    /// per-tool record and the turn continues with it visible to the model.
+    async fn walk_tool_batch_to_waiting(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        op_id: OpId,
+    ) -> faktor_core::Result<()> {
+        let targets: &[AgentState] = match handle.state()? {
+            AgentState::FailedRecoverable => &[
+                AgentState::Preparing,
+                AgentState::BuildingContext,
+                AgentState::WaitingForModel,
+            ],
+            _ => &[AgentState::UpdatingMemory, AgentState::WaitingForModel],
+        };
+        for target in targets {
+            handle
+                .append_journal_event(
+                    faktor_core::event::EventKind::PhaseChanged,
+                    *target,
+                    Some(op_id),
+                    None,
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     /// The shared genuine-end entry (audits 4/6/7 + audit 26 slice end):
@@ -7127,7 +7344,10 @@ impl AgentRuntime {
         let outcomes: Arc<std::sync::Mutex<HashMap<OpId, ToolOutcome>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
         let mut submitted: Vec<(OpId, String, String, serde_json::Value)> = Vec::new();
-        let mut denied: Vec<String> = Vec::new();
+        // Refused calls, with their durable call identity and typed kind:
+        // each one is answered by a tool_result part below so the transcript
+        // the next wire request is built from never carries a dangling call.
+        let mut denied: Vec<DeniedToolCall> = Vec::new();
 
         for (call_id, name, input) in calls {
             // Loop detection on the call itself (normalized).
@@ -7138,8 +7358,26 @@ impl AgentRuntime {
             let tool = match self.deps.tools.get(&name) {
                 Some(t) => t,
                 None => {
+                    let reason = format!("unknown tool: {name}");
                     detector.record_error(&format!("unknown tool {name}"));
-                    denied.push(format!("unknown tool: {name}"));
+                    // Uniform journal outcome: every other refusal path
+                    // journals PermissionDenied, so the unknown-tool refusal
+                    // is durable audit too — never a silent skip (the
+                    // self-transition is legal from the batch-entry state).
+                    handle
+                        .append_journal_event(
+                            faktor_core::event::EventKind::PermissionDenied,
+                            handle.state()?,
+                            Some(turn_op),
+                            Some(serde_json::json!({ "tool": name, "reason": reason })),
+                        )
+                        .await?;
+                    denied.push(DeniedToolCall {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        kind: ToolDenialKind::UnknownTool,
+                        reason,
+                    });
                     continue;
                 }
             };
@@ -7157,7 +7395,12 @@ impl AgentRuntime {
             match &decision {
                 PermissionDecision::Deny => {
                     handle.resolve_permission(permission.id, PermissionDecision::Deny)?;
-                    denied.push(format!("permission denied: {name}"));
+                    denied.push(DeniedToolCall {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        kind: ToolDenialKind::PermissionDenied,
+                        reason: format!("permission denied: {name}"),
+                    });
                     continue;
                 }
                 PermissionDecision::Ask => {
@@ -7210,7 +7453,12 @@ impl AgentRuntime {
                                 Some(serde_json::json!({ "tool": name, "reason": reason })),
                             )
                             .await?;
-                        denied.push(format!("tool {name} denied: {reason}"));
+                        denied.push(DeniedToolCall {
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                            kind: ToolDenialKind::CapabilityRefused,
+                            reason: format!("tool {name} denied: {reason}"),
+                        });
                         continue;
                     }
                 }
@@ -7238,7 +7486,12 @@ impl AgentRuntime {
                             Some(serde_json::json!({ "tool": name, "reason": reason })),
                         )
                         .await?;
-                    denied.push(format!("tool {name} denied by hook: {reason}"));
+                    denied.push(DeniedToolCall {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        kind: ToolDenialKind::HookDenied,
+                        reason: format!("tool {name} denied by hook: {reason}"),
+                    });
                     continue;
                 }
             }
@@ -7266,7 +7519,12 @@ impl AgentRuntime {
                         Some(serde_json::json!({ "tool": name, "reason": reason })),
                     )
                     .await?;
-                denied.push(format!("tool {name} denied: {reason}"));
+                denied.push(DeniedToolCall {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    kind: ToolDenialKind::SecretDetected,
+                    reason: format!("tool {name} denied: {reason}"),
+                });
                 continue;
             }
 
@@ -7299,7 +7557,12 @@ impl AgentRuntime {
                                 Some(serde_json::json!({ "tool": name, "reason": reason })),
                             )
                             .await?;
-                        denied.push(format!("tool {name} denied: {reason}"));
+                        denied.push(DeniedToolCall {
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                            kind: ToolDenialKind::ChangeBudgetRefused,
+                            reason: format!("tool {name} denied: {reason}"),
+                        });
                         continue;
                     }
                 }
@@ -7423,12 +7686,25 @@ impl AgentRuntime {
                 .map_err(|e| Error::internal(format!("tool schedule {op_id}: {e}")))?;
         }
 
-        let done: std::collections::HashSet<OpId> = scheduler
-            .run_to_completion()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        // The scheduler's terminal result is FALLIBLE (P1 error-collapse):
+        // a spawned task panic (`ErrorKind::Internal`), a deadlock/starvation
+        // classification, a validation refusal or a resource-graph failure
+        // must NEVER collapse into an empty done set and ordinary per-tool
+        // failures. The live scheduler statuses are inspected so genuinely
+        // completed operations stay recorded as completed, every still-open
+        // row is resolved honestly with the scheduler failure, and the
+        // ORIGINAL typed error is returned after that resolution.
+        let scheduler_result = self.run_scheduled_batch(&scheduler).await;
+        let scheduler_failure = scheduler_result.as_ref().err().cloned();
+        let done: std::collections::HashSet<OpId> = match &scheduler_result {
+            Ok(ids) => ids.iter().copied().collect(),
+            Err(_) => scheduler
+                .statuses()
+                .into_iter()
+                .filter(|(_, status)| *status == faktor_scheduler::TaskStatus::Done)
+                .map(|(id, _)| id)
+                .collect(),
+        };
 
         // Two passes over the done set: ALL FileChanged notifications while
         // the machine is still ExecutingTool, THEN all finishes (each finish
@@ -7447,6 +7723,17 @@ impl AgentRuntime {
                     .await?;
             }
         }
+        // Resolution ORDER is load-bearing for the session state machine:
+        // every `completed` finish moves the machine toward `Validating`,
+        // every failed/abandoned finish moves it to `FailedRecoverable`, and
+        // `FailedRecoverable -> Validating` is ILLEGAL. Resolving strictly in
+        // submit order could therefore let a genuinely completed op (one
+        // submitted after a failing one) fail its transition and MASK the
+        // batch outcome — including the original typed scheduler error. So
+        // every COMPLETED op is resolved first (each is a legal
+        // self-transition on `Validating`), then every failed/abandoned op
+        // (a legal self-transition on `FailedRecoverable` after the first).
+        let mut abandoned: Vec<(OpId, String, String)> = Vec::new();
         for (op_id, name, call_id, input) in submitted {
             if done.contains(&op_id) {
                 let mut outcome =
@@ -7550,29 +7837,186 @@ impl AgentRuntime {
                     let _ = detector.record_tool_evidence(key_hash, evidence_hash);
                 }
             } else {
-                handle.finish_tool_run(op_id, "failed", EffectStatus::Unknown)?;
-                detector.record_error(&format!("tool {name} failed"));
-                // ToolError hook (audit): the run failed (execution error,
-                // cancellation or scheduler loss) and the row is durably
-                // finished. Best-effort: a Deny after the failure is
-                // audit-only — the turn is never retroactively failed. The
-                // error snippet is bounded (the scheduler keeps no full
-                // error text).
-                self.run_hook_best_effort(
-                    faktor_hooks::HookEvent::ToolError,
-                    handle.id(),
-                    Some(op_id),
-                    serde_json::json!({ "tool": name, "error": format!("tool {name} failed") }),
-                );
-                self.progress_heartbeat(handle.id());
+                abandoned.push((op_id, name, call_id));
             }
         }
-        for d in denied {
-            detector.record_error(&d);
+        for (op_id, name, call_id) in abandoned {
+            // A scheduler failure must be resolved honestly, never
+            // misrepresented as a per-tool failure: an op the scheduler
+            // itself marked Failed stays a tool failure (with the
+            // batch-level failure as context); every still-open op
+            // (Pending/Running/Blocked/Cancelled) records the scheduler
+            // failure that abandoned it.
+            let tool_error = match (&scheduler_failure, scheduler.status(op_id)) {
+                (Some(err), Some(faktor_scheduler::TaskStatus::Failed)) => {
+                    format!("tool {name} failed (scheduler aborted the batch: {err})")
+                }
+                (Some(err), _) => {
+                    format!("scheduler aborted the batch before tool {name} completed: {err}")
+                }
+                (None, _) => format!("tool {name} failed"),
+            };
+            // The scheduler's typed failure is the batch outcome and must
+            // survive a failed resolution: a lost finish is loud (the row
+            // stays durably open for recovery) instead of replacing the
+            // scheduler error. On the ordinary path the store error still
+            // propagates exactly as before.
+            if let Err(err) = handle.finish_tool_run(op_id, "failed", EffectStatus::Unknown) {
+                if scheduler_failure.is_some() {
+                    tracing::error!(
+                        session = %handle.id(),
+                        op = %op_id,
+                        "durably resolving a still-open tool run after a scheduler failure failed: {err}"
+                    );
+                } else {
+                    return Err(err);
+                }
+            }
+            detector.record_error(&tool_error);
+            // A per-tool execution failure is durable turn history, never a
+            // dropped outcome: it feeds the turn summary (ledger + memory)
+            // exactly like a non-zero-exit outcome does. The summary failure
+            // also feeds the durable loop signals — an execute-Err call
+            // repeated across turns is the same "stop and re-plan" signal as
+            // a failing command.
+            if !turn_summary.failures.iter().any(|f| f == &tool_error) {
+                turn_summary.failures.push(truncate(&tool_error, 400));
+            }
+            // When the turn continues (or ends at FailedRecoverable) the
+            // model must SEE the failure: every tool call of the assistant
+            // message needs an answering result part, or the next wire
+            // request carries a dangling call (real providers reject it).
+            // The scheduler-failure path aborts the turn and writes no
+            // further transcript — its rows are resolved above and the
+            // typed scheduler error is the outcome.
+            if scheduler_failure.is_none() {
+                let seq = handle.proposed_message_seq()?;
+                let mid = handle
+                    .append_message(seq, "assistant", serde_json::json!({ "parts": [] }))
+                    .await?;
+                let body = ToolResultBody {
+                    excerpt: truncate(&tool_error, 2000),
+                    exit_code: Some(1),
+                    artifact: None,
+                    slice_hint: None,
+                };
+                handle.append_tool_result_part(mid, &call_id, &body).await?;
+            }
+            // ToolError hook (audit): the run failed (execution error,
+            // cancellation or scheduler loss) and the row is durably
+            // finished. Best-effort: a Deny after the failure is
+            // audit-only — the turn is never retroactively failed. The
+            // error snippet is bounded (the scheduler keeps no full
+            // error text).
+            self.run_hook_best_effort(
+                faktor_hooks::HookEvent::ToolError,
+                handle.id(),
+                Some(op_id),
+                serde_json::json!({ "tool": name, "error": tool_error }),
+            );
+            self.progress_heartbeat(handle.id());
+        }
+        // Refused calls are durable turn history exactly like failed tools:
+        // each denial answers its tool call with a typed tool_result part
+        // (kind + bounded, credential-redacted reason) so the transcript the
+        // next wire request is built from never carries a dangling call —
+        // the model sees WHY the call did not run instead of hallucinating
+        // an outcome. Nothing executed and no run row exists: the refusal's
+        // own semantics are unchanged; this only records the decision that
+        // already landed (journaled by the refusal path) plus its ledger
+        // line, mirroring the failed-tool path above.
+        for denial in &denied {
+            if let Err(err) = self.append_denial_result(handle, denial).await {
+                if scheduler_failure.is_some() {
+                    // The typed scheduler error is the batch outcome and must
+                    // survive: a lost denial result is loud (the crash-resume
+                    // repair answers the call on the next open), never a mask.
+                    tracing::error!(
+                        session = %handle.id(),
+                        tool = %denial.name,
+                        "denied-call result write failed after a scheduler failure: {err}"
+                    );
+                } else {
+                    return Err(err);
+                }
+            }
+            let line = denial.ledger_line();
+            if !turn_summary.failures.iter().any(|f| f == &line) {
+                turn_summary.failures.push(line);
+            }
+        }
+        for d in &denied {
+            detector.record_error(&d.reason);
         }
         self.progress_heartbeat(handle.id());
+        if let Some(err) = scheduler_failure {
+            // Every submitted run is durably resolved above; the scheduler's
+            // own typed classification is the turn's outcome.
+            return Err(err);
+        }
         handle.put_task_ledger(serde_json::to_value(ledger)?)?;
         Ok(executed)
+    }
+
+    /// Append ONE refused call's durable typed result part (see
+    /// [`DeniedToolCall`]). The result is an ERROR result (`exit_code` 1) so
+    /// the wire marks it `is_error`; the typed tag + reason ride the
+    /// excerpt. The test-only durable-write fault seam can fail the write so
+    /// the crash-resume repair is exercised against a genuinely lost result.
+    async fn append_denial_result(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        denial: &DeniedToolCall,
+    ) -> faktor_core::Result<()> {
+        if let Some(err) = self.take_durable_write_fault(DW_SITE_DENIAL_RESULT) {
+            tracing::error!(
+                session = %handle.id(),
+                site = DW_SITE_DENIAL_RESULT,
+                tool = %denial.name,
+                "denied-call result write failed: {err}"
+            );
+            return Err(err);
+        }
+        let seq = handle.proposed_message_seq()?;
+        let mid = handle
+            .append_message(seq, "assistant", serde_json::json!({ "parts": [] }))
+            .await?;
+        let body = ToolResultBody {
+            excerpt: denial.excerpt(),
+            exit_code: Some(1),
+            artifact: None,
+            slice_hint: None,
+        };
+        handle
+            .append_tool_result_part(mid, &denial.call_id, &body)
+            .await?;
+        Ok(())
+    }
+
+    /// Run one tool batch to completion through the scheduler. The scheduler
+    /// result is NEVER defaulted: see the caller for the typed-error
+    /// contract. Test-only fault seam (see [`scheduler_faults`]): an armed
+    /// injected failure replaces the scheduler's terminal result so the
+    /// resolution path is exercised with the REAL classifications (task
+    /// panic → `Internal`, deadlock, validation refusal) without depending on
+    /// a scheduler that can be made to panic from the outside.
+    async fn run_scheduled_batch(&self, scheduler: &Scheduler) -> Result<Vec<OpId>, Error> {
+        #[cfg(test)]
+        if let Some(err) = scheduler_faults::take(
+            self.deps.session.store().root(),
+            scheduler_faults::Point::BeforeRun,
+        ) {
+            return Err(err);
+        }
+        let result = scheduler.run_to_completion().await;
+        #[cfg(test)]
+        if let Some(err) = scheduler_faults::take(
+            self.deps.session.store().root(),
+            scheduler_faults::Point::AfterRun,
+        ) {
+            return Err(err);
+        }
+        result
     }
 
     /// Tool-outcome sanitization (audit round 16): a tool's output may echo
@@ -12230,6 +12674,11 @@ const DW_SITE_END_LOOP_SIGNALS: &str = "finish_logical_turn.reset_loop_signals";
 const DW_SITE_TURN_ENVELOPE: &str = "drive_turn_inner.set_turn_envelope";
 const DW_SITE_DRIVE_ABORT_CANCEL: &str = "drive_turn_inner.abort_cancelled";
 const DW_SITE_DRIVE_ABORT_DISPATCH: &str = "drive_turn_inner.abort_after_dispatch";
+/// The typed tool_result part answering one REFUSED tool call (the denial
+/// decision itself is journaled by its own refusal path; this is only the
+/// transcript answer the model must see). Test seam: a failed write here
+/// exercises the crash-resume dangling-call repair.
+const DW_SITE_DENIAL_RESULT: &str = "run_tool_calls.denial_result";
 /// Queue runner: the durable queue-head RE-CHECK failed (a store read error).
 /// Never treated as an empty queue; recorded as a durable retry marker when
 /// the bounded retries are exhausted.
@@ -13388,6 +13837,48 @@ pub(crate) mod durable_faults {
     }
 }
 
+/// Test-only scheduler fault injection (see
+/// [`AgentRuntime::run_scheduled_batch`]): arms ONE typed scheduler failure
+/// for one store root, either before the batch runs (every submitted op is
+/// still open) or after it ran (the scheduler's terminal statuses are the
+/// truth the resolution must honor). Store-scoped so a concurrent test's
+/// batch can never steal another test's fault.
+#[cfg(test)]
+mod scheduler_faults {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum Point {
+        /// The scheduler never ran: every submitted op is still open.
+        BeforeRun,
+        /// The scheduler ran to completion first; its terminal statuses are
+        /// visible when the injected failure is resolved.
+        AfterRun,
+    }
+
+    fn armed() -> &'static Mutex<HashMap<(PathBuf, Point), faktor_core::Error>> {
+        static ARMED: OnceLock<Mutex<HashMap<(PathBuf, Point), faktor_core::Error>>> =
+            OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Arm one injected scheduler failure of `kind` at `point` for the store
+    /// at `root`. Takes precedence over any previously armed fault for the
+    /// same slot.
+    pub fn arm(root: &Path, point: Point, kind: faktor_core::ErrorKind, message: &str) {
+        armed().lock().unwrap().insert(
+            (root.to_path_buf(), point),
+            faktor_core::Error::new(kind, message),
+        );
+    }
+
+    pub fn take(root: &Path, point: Point) -> Option<faktor_core::Error> {
+        armed().lock().unwrap().remove(&(root.to_path_buf(), point))
+    }
+}
+
 /// Outcome of attaching a workspace for first-turn index evidence. The
 /// distinction matters: a BROKEN ATTACH (hostile root, unknown workspace,
 /// poisoned service) is a diagnosable failure, while NO READY GENERATION is
@@ -13740,6 +14231,103 @@ fn effect_tag(e: EffectStatus) -> &'static str {
         EffectStatus::Applied => "applied",
         EffectStatus::Failed => "failed",
     }
+}
+
+/// The typed kind of one refused tool call. A refusal is durable turn
+/// history, never a dangling call: the tag rides the durable tool_result
+/// excerpt so a denial is machine-distinguishable from an execution failure
+/// without parsing prose. Tags are stable, lowercase and never renumbered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolDenialKind {
+    /// The model called a tool that is not registered.
+    UnknownTool,
+    /// The interactive permission hop denied the call.
+    PermissionDenied,
+    /// The semantic capability gate removed the tool's class.
+    CapabilityRefused,
+    /// A PreTool lifecycle hook denied the call.
+    HookDenied,
+    /// The secret gate detected a credential in the tool input.
+    SecretDetected,
+    /// The task's ChangeBudget refused the declared write.
+    ChangeBudgetRefused,
+}
+
+impl ToolDenialKind {
+    fn tag(self) -> &'static str {
+        match self {
+            ToolDenialKind::UnknownTool => "unknown_tool",
+            ToolDenialKind::PermissionDenied => "permission_denied",
+            ToolDenialKind::CapabilityRefused => "capability_refused",
+            ToolDenialKind::HookDenied => "hook_denied",
+            ToolDenialKind::SecretDetected => "secret_detected",
+            ToolDenialKind::ChangeBudgetRefused => "change_budget_refused",
+        }
+    }
+}
+
+/// One refused tool call of a batch: the durable call identity plus the
+/// typed refusal and the refusal path's own reason text (bounded/redacted
+/// only when it reaches the durable surfaces below).
+#[derive(Debug, Clone)]
+struct DeniedToolCall {
+    call_id: String,
+    name: String,
+    kind: ToolDenialKind,
+    reason: String,
+}
+
+impl DeniedToolCall {
+    /// The durable tool_result excerpt: a stable typed tag + the bounded,
+    /// credential-redacted reason. The model sees WHY the call was refused;
+    /// the shape is machine-checkable without parsing prose.
+    fn excerpt(&self) -> String {
+        let reason = redact_secrets_bounded(&self.reason, 400);
+        truncate(
+            &format!("tool call denied ({}): {reason}", self.kind.tag()),
+            2000,
+        )
+    }
+
+    /// The bounded ledger line (TurnSummary failures -> TaskLedger
+    /// known_failures + typed ledger failures), mirroring the failed-tool
+    /// path.
+    fn ledger_line(&self) -> String {
+        truncate(
+            &format!(
+                "{} refused ({}): {}",
+                self.name,
+                self.kind.tag(),
+                redact_secrets_bounded(&self.reason, 400)
+            ),
+            400,
+        )
+    }
+}
+
+/// Redact any credential the text echoes (default SecretPolicy) and bound
+/// the result; benign text stays byte-identical.
+fn redact_secrets_bounded(text: &str, max: usize) -> String {
+    let policy = faktor_security::SecretPolicy::default();
+    let bounded = truncate(text, max);
+    if faktor_security::scan_secrets(&bounded, &policy).is_empty() {
+        bounded
+    } else {
+        truncate(&faktor_security::redact(&bounded, &policy), max)
+    }
+}
+
+/// The durable excerpt of a call the crash left unresolved (see
+/// [`AgentRuntime::answer_dangling_tool_calls`]): typed and honest, never a
+/// fabricated tool outcome.
+fn interrupted_tool_excerpt(name: &str) -> String {
+    truncate(
+        &format!(
+            "tool call unresolved (interrupted): the turn was interrupted before {name} was \
+             resolved; no outcome was recorded"
+        ),
+        2000,
+    )
 }
 
 fn tool_mode_tag(mode: ToolCallMode) -> &'static str {
@@ -17755,6 +18343,1116 @@ mod tests {
         assert!(handle.pending_tool_runs().unwrap().is_empty());
     }
 
+    // ------------------------------------------------------------------
+    // Refused tool calls (gap fix): a denial is durable turn history, never
+    // a dangling call. Every refusal kind answers its tool call with a typed
+    // tool_result part (kind + bounded, secret-free reason) and the turn
+    // continues through the SAME legal state walk; the approved path stays
+    // byte-identical. A crash between the denial decision and the result
+    // write is repaired on the next session open (crash-resume integrity).
+
+    /// A `PermissionRequester` that denies every hop.
+    struct DenyEveryTool;
+    impl PermissionRequester for DenyEveryTool {
+        fn request(
+            &self,
+            _s: SessionId,
+            _p: &SessionPermission,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = faktor_core::Result<PermissionDecision>> + Send>,
+        > {
+            Box::pin(async { Ok(PermissionDecision::Deny) })
+        }
+    }
+
+    /// An echo tool that counts executions (a refused call must never reach
+    /// the tool body).
+    fn counting_echo_tool(executions: Arc<std::sync::atomic::AtomicUsize>) -> Tool {
+        Tool {
+            name: "echo".into(),
+            description: "echo back".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: faktor_core::resource::ResourceClass::Cpu,
+            capability: None,
+            recovery_hint: RecoveryHint::Idempotent,
+            path_args: vec![],
+            execute: Arc::new(move |_ctx, args| {
+                let executions = executions.clone();
+                Box::pin(async move {
+                    executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(ToolOutcome {
+                        text: format!("echo: {args}"),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    })
+                })
+            }),
+        }
+    }
+
+    /// A DiskWrite tool that counts executions.
+    fn counting_write_tool(executions: Arc<std::sync::atomic::AtomicUsize>) -> Tool {
+        Tool {
+            name: "write_file".into(),
+            description: "writes a file".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+            capability: None,
+            recovery_hint: RecoveryHint::WorkspaceWrite,
+            path_args: vec!["path".into()],
+            execute: Arc::new(move |_ctx, _args| {
+                let executions = executions.clone();
+                Box::pin(async move {
+                    executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(ToolOutcome {
+                        text: "wrote".into(),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    })
+                })
+            }),
+        }
+    }
+
+    /// The durable tool_result answering `call_id`, if any: (excerpt,
+    /// exit_code).
+    fn tool_result_for(
+        handle: &faktor_session::SessionHandle,
+        call_id: &str,
+    ) -> Option<(String, Option<i64>)> {
+        for m in handle.messages_before(None, 100).unwrap() {
+            for p in handle.parts_of(m.id).unwrap() {
+                if p.kind == "tool_result"
+                    && p.data.get("tool_call_id").and_then(|v| v.as_str()) == Some(call_id)
+                {
+                    return Some((
+                        p.data
+                            .get("excerpt")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        p.data.get("exit_code").and_then(|v| v.as_i64()),
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// Every wire-visible tool call (the states `history_messages` carries)
+    /// with NO answering result part.
+    fn dangling_tool_calls(handle: &faktor_session::SessionHandle) -> Vec<String> {
+        let mut calls = Vec::new();
+        let mut answered = std::collections::HashSet::new();
+        for m in handle.messages_before(None, 200).unwrap() {
+            for p in handle.parts_of(m.id).unwrap() {
+                let Some(id) = p.data.get("tool_call_id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                match p.kind.as_str() {
+                    "tool_call"
+                        if matches!(
+                            p.data.get("state").and_then(|v| v.as_str()),
+                            Some("completed") | Some("error")
+                        ) =>
+                    {
+                        calls.push(id.to_string())
+                    }
+                    "tool_result" => {
+                        answered.insert(id.to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        calls
+            .into_iter()
+            .filter(|c| !answered.contains(c))
+            .collect()
+    }
+
+    fn ledger_known_failures(handle: &faktor_session::SessionHandle) -> Vec<String> {
+        let raw = handle.get_task_ledger().unwrap().expect("ledger row");
+        let ledger: faktor_context::ledger::TaskLedger = serde_json::from_value(raw).unwrap();
+        ledger.known_failures
+    }
+
+    /// Shared assertions for ONE refused call: the typed denial result is
+    /// present (error-flagged, bounded, tagged), nothing executed, no run
+    /// row exists, the call is not dangling, and the refusal is durable
+    /// ledger + journal history.
+    fn assert_refusal_answered(
+        runtime: &AgentRuntime,
+        session: SessionId,
+        call_id: &str,
+        kind_tag: &str,
+        reason_fragment: &str,
+        executions: &Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused call must never execute"
+        );
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        assert!(handle.pending_tool_runs().unwrap().is_empty());
+        let events = handle.events_range(1, None).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.kind == faktor_core::event::EventKind::ToolStarted),
+            "no run may start for a refused call"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == faktor_core::event::EventKind::PermissionDenied),
+            "the refusal must be journaled"
+        );
+        let (excerpt, exit) =
+            tool_result_for(&handle, call_id).unwrap_or_else(|| panic!("{call_id} unanswered"));
+        assert_eq!(exit, Some(1), "a denial is an error result: {excerpt}");
+        assert!(
+            excerpt.contains(&format!("tool call denied ({kind_tag})")),
+            "typed denial tag missing: {excerpt}"
+        );
+        assert!(
+            excerpt.contains(reason_fragment),
+            "the refusal reason must reach the model: {excerpt}"
+        );
+        assert!(excerpt.len() <= 2000, "bounded excerpt: {}", excerpt.len());
+        let dangling = dangling_tool_calls(&handle);
+        assert!(dangling.is_empty(), "dangling calls: {dangling:?}");
+        let failures = ledger_known_failures(&handle);
+        assert!(
+            failures.iter().any(|f| f.contains(kind_tag)),
+            "the refusal is durable ledger history: {failures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_tool_call_is_answered_with_typed_result_and_turn_continues() {
+        // Permission refusal: the interactive hop denied the call. The
+        // transcript must answer the call with the typed denial and the turn
+        // must continue through the legal walk (ReadyForNextTurn) — never
+        // InvalidState, never a dangling call, never an execution.
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+                ScriptedResponse::End,
+            ]),
+            vec![counting_echo_tool(executions.clone())],
+        );
+        deps.permission_requester = Arc::new(DenyEveryTool);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime.run_turn(session, "use echo", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_refusal_answered(
+            &runtime,
+            session,
+            "c1",
+            "permission_denied",
+            "permission denied: echo",
+            &executions,
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Mixed PERMISSION batch (the last state-machine hole): a permission
+    // DENIED call plus an APPROVED sibling in the SAME batch. The denied
+    // call's result is written only after the whole batch resolves, so at
+    // deny time the sibling is durably pending (its tool_call part has no
+    // result). Landing `ReadyForNextTurn` there claimed the batch was
+    // finished and the approved sibling's next hop (`ToolRequested`,
+    // `ToolStarted`, `FileChanged`) died with
+    // `InvalidState{ReadyForNextTurn -> ExecutingTool}`. The denial now
+    // lands on the batch-execution edge (`ExecutingTool`) while a sibling
+    // is pending; the deny-only batch keeps its `ReadyForNextTurn` landing.
+
+    /// A `PermissionRequester` that denies exactly the listed tool names (a
+    /// tool without an explicit capability requests `ExecuteShell { command:
+    /// <tool name> }`) and allows every sibling.
+    struct DenyToolNames(&'static [&'static str]);
+    impl PermissionRequester for DenyToolNames {
+        fn request(
+            &self,
+            _s: SessionId,
+            p: &SessionPermission,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = faktor_core::Result<PermissionDecision>> + Send>,
+        > {
+            let denied = matches!(
+                &p.capability,
+                faktor_core::capability::Capability::ExecuteShell { command }
+                    if self.0.contains(&command.as_str())
+            );
+            Box::pin(async move {
+                Ok(if denied {
+                    PermissionDecision::Deny
+                } else {
+                    PermissionDecision::Allow
+                })
+            })
+        }
+    }
+
+    /// One refused call's durable result: error-flagged, typed
+    /// `permission_denied`, naming the tool, answered (never dangling).
+    fn assert_permission_denial(handle: &faktor_session::SessionHandle, call_id: &str, tool: &str) {
+        let (excerpt, exit) =
+            tool_result_for(handle, call_id).unwrap_or_else(|| panic!("{call_id} unanswered"));
+        assert_eq!(exit, Some(1), "a denial is an error result: {excerpt}");
+        assert!(
+            excerpt.contains("tool call denied (permission_denied)"),
+            "{excerpt}"
+        );
+        assert!(
+            excerpt.contains(&format!("permission denied: {tool}")),
+            "{excerpt}"
+        );
+    }
+
+    /// The wire-visible tool results of the recorded second request:
+    /// (call_id, is_error), sorted.
+    fn wire_tool_results(recorder: &RecordingProvider) -> Vec<(String, bool)> {
+        let requests = recorder.requests();
+        let mut seen: Vec<(String, bool)> = Vec::new();
+        for m in &requests[1].messages {
+            for p in &m.content {
+                if let ContentKind::ToolResult { is_error, .. } = &p.kind {
+                    seen.push((p.tool_call_id.clone().unwrap_or_default(), *is_error));
+                }
+            }
+        }
+        seen.sort();
+        seen
+    }
+
+    /// Build the mixed-batch runtime: `calls` is the model's batch, the
+    /// permission requester denies the listed tool names, the trailing text
+    /// continues the turn.
+    fn mixed_permission_batch(
+        calls: Vec<(String, String, serde_json::Value)>,
+        denied: &'static [&'static str],
+        tools: Vec<Tool>,
+    ) -> (
+        Arc<AgentRuntime>,
+        Arc<RecordingProvider>,
+        SessionId,
+        tempfile::TempDir,
+    ) {
+        let mut script: Vec<ScriptedResponse> = calls
+            .into_iter()
+            .map(|(id, name, input)| ScriptedResponse::ToolCall { id, name, input })
+            .collect();
+        script.push(ScriptedResponse::Text("done".into()));
+        script.push(ScriptedResponse::End);
+        let recorder = RecordingProvider::new(Arc::new(scripted_provider(script)));
+        let (mut deps, dir) = deps_with(recorder.clone(), tools);
+        deps.permission_requester = Arc::new(DenyToolNames(denied));
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        (runtime, recorder, session, dir)
+    }
+
+    #[tokio::test]
+    async fn mixed_permission_denied_and_approved_batch_continues_lawfully() {
+        // The approved call is submitted FIRST and its run is in flight when
+        // the sibling permission is denied: the denial must keep the batch
+        // executing, or the approved sibling's FileChanged/finish die.
+        let approved_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let denied_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (runtime, recorder, session, _dir) = mixed_permission_batch(
+            vec![
+                ("ok".into(), "echo".into(), serde_json::json!({"x": 1})),
+                (
+                    "refused".into(),
+                    "write_file".into(),
+                    serde_json::json!({"path": "notes.txt", "content": "hi"}),
+                ),
+            ],
+            &["write_file"],
+            vec![
+                counting_echo_tool(approved_execs.clone()),
+                counting_write_tool(denied_execs.clone()),
+            ],
+        );
+        let outcome = runtime.run_turn(session, "use both", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(
+            approved_execs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the approved sibling must execute"
+        );
+        assert_eq!(
+            denied_execs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the denied sibling must never execute"
+        );
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        assert!(dangling_tool_calls(&handle).is_empty());
+        let (approved, approved_exit) = tool_result_for(&handle, "ok").expect("approved result");
+        assert_eq!(approved_exit, Some(0));
+        assert_eq!(approved, "echo: {\"x\":1}");
+        assert_permission_denial(&handle, "refused", "write_file");
+        assert!(handle.pending_tool_runs().unwrap().is_empty());
+        let events = handle.events_range(1, None).unwrap();
+        let denial = events
+            .iter()
+            .find(|e| e.kind == faktor_core::event::EventKind::PermissionDenied)
+            .expect("the denial is journaled");
+        assert_eq!(
+            denial.state,
+            AgentState::ExecutingTool,
+            "the denial lands on the batch-execution edge, never ReadyForNextTurn"
+        );
+        assert!(
+            events.iter().any(|e| {
+                e.kind == faktor_core::event::EventKind::FileChanged
+                    && e.state == AgentState::ExecutingTool
+            }),
+            "the approved sibling's FileChanged stays legal"
+        );
+        assert_eq!(recorder.requests().len(), 2, "the mixed batch continues");
+        assert_eq!(
+            wire_tool_results(&recorder),
+            vec![("ok".to_string(), false), ("refused".to_string(), true)],
+            "both calls answered on the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_permission_denied_first_batch_continues_lawfully() {
+        // The DENIED call is submitted FIRST: at deny time no run is in
+        // flight yet, but the sibling call is durably unanswered. The old
+        // code landed ReadyForNextTurn and the sibling's own permission hop
+        // (`ReadyForNextTurn -> ToolRequested`) died with InvalidState.
+        let approved_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let denied_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (runtime, recorder, session, _dir) = mixed_permission_batch(
+            vec![
+                (
+                    "refused".into(),
+                    "write_file".into(),
+                    serde_json::json!({"path": "notes.txt", "content": "hi"}),
+                ),
+                ("ok".into(), "echo".into(), serde_json::json!({"x": 1})),
+            ],
+            &["write_file"],
+            vec![
+                counting_echo_tool(approved_execs.clone()),
+                counting_write_tool(denied_execs.clone()),
+            ],
+        );
+        let outcome = runtime.run_turn(session, "use both", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(approved_execs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(denied_execs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        assert!(dangling_tool_calls(&handle).is_empty());
+        let (approved, approved_exit) = tool_result_for(&handle, "ok").expect("approved result");
+        assert_eq!(approved_exit, Some(0));
+        assert_eq!(approved, "echo: {\"x\":1}");
+        assert_permission_denial(&handle, "refused", "write_file");
+        let events = handle.events_range(1, None).unwrap();
+        let denial = events
+            .iter()
+            .find(|e| e.kind == faktor_core::event::EventKind::PermissionDenied)
+            .expect("the denial is journaled");
+        assert_eq!(denial.state, AgentState::ExecutingTool);
+        // The sibling's permission hop happened AFTER the denial and the
+        // batch still executed it.
+        let denial_seq = denial.seq.raw();
+        assert!(
+            events.iter().any(|e| {
+                e.kind == faktor_core::event::EventKind::ToolStarted && e.seq.raw() > denial_seq
+            }),
+            "the approved sibling starts after the denial"
+        );
+        assert_eq!(recorder.requests().len(), 2, "the mixed batch continues");
+        assert_eq!(
+            wire_tool_results(&recorder),
+            vec![("ok".to_string(), false), ("refused".to_string(), true)],
+        );
+    }
+
+    #[tokio::test]
+    async fn two_denied_one_approved_batch_continues_lawfully() {
+        // Two denied calls + one approved sibling: every denial keeps the
+        // batch executing, the approved call runs once, and all three calls
+        // are answered (the two denials typed, the approval with its output).
+        let approved_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let denied_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (runtime, recorder, session, _dir) = mixed_permission_batch(
+            vec![
+                (
+                    "refused_1".into(),
+                    "write_file".into(),
+                    serde_json::json!({"path": "a.txt", "content": "a"}),
+                ),
+                (
+                    "refused_2".into(),
+                    "write_file".into(),
+                    serde_json::json!({"path": "b.txt", "content": "b"}),
+                ),
+                ("ok".into(), "echo".into(), serde_json::json!({"x": 3})),
+            ],
+            &["write_file"],
+            vec![
+                counting_echo_tool(approved_execs.clone()),
+                counting_write_tool(denied_execs.clone()),
+            ],
+        );
+        let outcome = runtime
+            .run_turn(session, "use all three", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(approved_execs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(denied_execs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        assert!(dangling_tool_calls(&handle).is_empty());
+        let (approved, exit) = tool_result_for(&handle, "ok").expect("approved result");
+        assert_eq!(exit, Some(0));
+        assert_eq!(approved, "echo: {\"x\":3}");
+        assert_permission_denial(&handle, "refused_1", "write_file");
+        assert_permission_denial(&handle, "refused_2", "write_file");
+        assert_eq!(
+            handle
+                .events_range(1, None)
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == faktor_core::event::EventKind::PermissionDenied)
+                .count(),
+            2
+        );
+        assert_eq!(recorder.requests().len(), 2);
+        assert_eq!(
+            wire_tool_results(&recorder),
+            vec![
+                ("ok".to_string(), false),
+                ("refused_1".to_string(), true),
+                ("refused_2".to_string(), true)
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn all_denied_multi_call_batch_ends_lawfully() {
+        // Adversarial: EVERY call of the batch is denied. While the batch is
+        // still open the denials land on the batch-execution edge; the
+        // genuine end then walks the legal interior (ExecutingTool ->
+        // Validating -> UpdatingMemory -> ReadyForNextTurn) and both calls
+        // are answered. Nothing executes and no second request is made.
+        let denied_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (runtime, recorder, session, _dir) = mixed_permission_batch(
+            vec![
+                (
+                    "refused_1".into(),
+                    "write_file".into(),
+                    serde_json::json!({"path": "a.txt", "content": "a"}),
+                ),
+                (
+                    "refused_2".into(),
+                    "write_file".into(),
+                    serde_json::json!({"path": "b.txt", "content": "b"}),
+                ),
+            ],
+            &["write_file"],
+            vec![counting_write_tool(denied_execs.clone())],
+        );
+        let outcome = runtime
+            .run_turn(session, "refused twice", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(denied_execs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        assert!(dangling_tool_calls(&handle).is_empty());
+        assert_permission_denial(&handle, "refused_1", "write_file");
+        assert_permission_denial(&handle, "refused_2", "write_file");
+        assert!(handle.pending_tool_runs().unwrap().is_empty());
+        let events = handle.events_range(1, None).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == faktor_core::event::EventKind::PermissionDenied)
+                .count(),
+            2
+        );
+        assert_eq!(
+            recorder.requests().len(),
+            1,
+            "nothing executed, so the turn ends without another model request"
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_only_batch_keeps_the_documented_ready_landing() {
+        // CONTROL (unchanged): a batch whose ONLY call is denied has no
+        // pending sibling — the denial lands `ReadyForNextTurn` directly and
+        // the genuine end needs no interior hop.
+        let denied_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (runtime, _recorder, session, _dir) = mixed_permission_batch(
+            vec![(
+                "refused".into(),
+                "write_file".into(),
+                serde_json::json!({"path": "a.txt", "content": "a"}),
+            )],
+            &["write_file"],
+            vec![counting_write_tool(denied_execs.clone())],
+        );
+        let outcome = runtime.run_turn(session, "refused", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(denied_execs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        assert_permission_denial(&handle, "refused", "write_file");
+        let events = handle.events_range(1, None).unwrap();
+        let denial = events
+            .iter()
+            .find(|e| e.kind == faktor_core::event::EventKind::PermissionDenied)
+            .expect("the denial is journaled");
+        assert_eq!(denial.state, AgentState::ReadyForNextTurn);
+        assert!(!events
+            .iter()
+            .any(|e| e.kind == faktor_core::event::EventKind::ToolStarted));
+        assert!(!events
+            .iter()
+            .any(|e| e.kind == faktor_core::event::EventKind::FileChanged));
+    }
+
+    #[tokio::test]
+    async fn approve_only_multi_call_batch_is_unchanged() {
+        // CONTROL (unchanged): an all-approved batch takes the documented
+        // interior hop and every call is answered with its real output.
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (runtime, recorder, session, _dir) = mixed_permission_batch(
+            vec![
+                ("ok_1".into(), "echo".into(), serde_json::json!({"x": 1})),
+                ("ok_2".into(), "echo".into(), serde_json::json!({"x": 2})),
+            ],
+            &[],
+            vec![counting_echo_tool(executions.clone())],
+        );
+        let outcome = runtime.run_turn(session, "echo twice", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        assert!(dangling_tool_calls(&handle).is_empty());
+        for (call, x) in [("ok_1", 1), ("ok_2", 2)] {
+            let (excerpt, exit) = tool_result_for(&handle, call).expect("approved result");
+            assert_eq!(exit, Some(0));
+            assert_eq!(excerpt, format!("echo: {{\"x\":{x}}}"));
+        }
+        let events = handle.events_range(1, None).unwrap();
+        assert!(!events
+            .iter()
+            .any(|e| e.kind == faktor_core::event::EventKind::PermissionDenied));
+        let last_completed = events
+            .iter()
+            .rposition(|e| {
+                e.kind == faktor_core::event::EventKind::ToolCompleted
+                    && e.state == AgentState::Validating
+            })
+            .expect("the completed finishes are journaled");
+        let after: Vec<AgentState> = events[last_completed + 1..]
+            .iter()
+            .take(2)
+            .map(|e| e.state)
+            .collect();
+        assert_eq!(
+            after,
+            vec![AgentState::UpdatingMemory, AgentState::WaitingForModel],
+            "the approved interior hop is unchanged"
+        );
+        assert_eq!(recorder.requests().len(), 2);
+        assert_eq!(
+            wire_tool_results(&recorder),
+            vec![("ok_1".to_string(), false), ("ok_2".to_string(), false)],
+        );
+    }
+
+    #[tokio::test]
+    async fn crash_mid_mixed_batch_resumes_without_dangling_or_blind_rerun() {
+        // Crash window of the mixed batch: the approved sibling executed and
+        // its result is durable, the denial decision is journaled, but the
+        // denied call's typed result write was lost. The next open repairs
+        // the dangling call BEFORE the next wire request, the turn completes,
+        // and the approved sibling is never blindly re-run.
+        let approved_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let denied_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (runtime, recorder, session, _dir) = mixed_permission_batch(
+            vec![
+                ("ok".into(), "echo".into(), serde_json::json!({"x": 1})),
+                (
+                    "refused".into(),
+                    "write_file".into(),
+                    serde_json::json!({"path": "notes.txt", "content": "hi"}),
+                ),
+            ],
+            &["write_file"],
+            vec![
+                counting_echo_tool(approved_execs.clone()),
+                counting_write_tool(denied_execs.clone()),
+            ],
+        );
+        durable_faults::arm(runtime.deps().session.store().root(), DW_SITE_DENIAL_RESULT);
+        let err = runtime
+            .run_turn(session, "use both", &[])
+            .await
+            .expect_err("the lost denial result must surface");
+        assert_eq!(err.kind, ErrorKind::Store, "{err:?}");
+        assert_eq!(
+            approved_execs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the approved sibling executed before the crash"
+        );
+        assert_eq!(denied_execs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let (approved, exit) = tool_result_for(&handle, "ok").expect("approved result survived");
+        assert_eq!(exit, Some(0));
+        assert_eq!(approved, "echo: {\"x\":1}");
+        assert!(handle.pending_tool_runs().unwrap().is_empty());
+        assert!(
+            handle
+                .events_range(1, None)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == faktor_core::event::EventKind::PermissionDenied),
+            "the denial decision is durable even though its result was lost"
+        );
+        assert!(tool_result_for(&handle, "refused").is_none());
+        assert_eq!(dangling_tool_calls(&handle), vec!["refused".to_string()]);
+        assert_eq!(
+            handle.state().unwrap(),
+            AgentState::FailedRecoverable,
+            "the interrupted batch is honest history, never silently ready"
+        );
+        // Next open: the repair answers the lost call before the next wire
+        // request; the session (failed recoverably, never silently ready)
+        // accepts the next turn and completes it.
+        let outcome = runtime.run_turn(session, "continue", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        assert!(dangling_tool_calls(&handle).is_empty());
+        assert_eq!(
+            approved_execs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the approved sibling is never blindly re-run"
+        );
+        assert_eq!(denied_execs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let (repaired, exit) = tool_result_for(&handle, "refused").expect("repaired result");
+        assert_eq!(exit, Some(1));
+        assert!(repaired.contains("(interrupted)"), "{repaired}");
+        // The repaired call reached the wire: the next request carries BOTH
+        // the surviving approved result and the repaired refusal.
+        assert_eq!(
+            wire_tool_results(&recorder),
+            vec![("ok".to_string(), false), ("refused".to_string(), true)],
+            "no dangling call ever reaches the wire"
+        );
+        handle
+            .replay_journal()
+            .expect("the journal replays lawfully");
+    }
+
+    #[tokio::test]
+    async fn mixed_approved_and_secret_denied_batch_continues_with_both_results_on_the_wire() {
+        // Adversarial mixed batch on the CONTINUING path: one call is
+        // approved and executes, its sibling is refused by the secret gate.
+        // The turn continues (executed > 0) and the next wire request must
+        // carry BOTH results — the real output for the approved call and the
+        // typed denial for the refused one — so the model never sees a
+        // dangling call.
+        let approved_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let denied_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fake = scripted_provider(vec![
+            ScriptedResponse::ToolCall {
+                id: "ok".into(),
+                name: "echo".into(),
+                input: serde_json::json!({"x": 1}),
+            },
+            ScriptedResponse::ToolCall {
+                id: "refused".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "creds.txt", "content": SK_SAMPLE}),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ]);
+        let recorder = RecordingProvider::new(Arc::new(fake));
+        let (deps, _dir) = deps_with(
+            recorder.clone(),
+            vec![
+                counting_echo_tool(approved_execs.clone()),
+                counting_write_tool(denied_execs.clone()),
+            ],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime.run_turn(session, "use both", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(approved_execs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            denied_execs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the refused sibling must never execute"
+        );
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        assert!(dangling_tool_calls(&handle).is_empty());
+        let (approved, approved_exit) = tool_result_for(&handle, "ok").expect("approved result");
+        assert_eq!(approved_exit, Some(0));
+        assert_eq!(approved, "echo: {\"x\":1}");
+        let (denied, denied_exit) = tool_result_for(&handle, "refused").expect("denial result");
+        assert_eq!(denied_exit, Some(1));
+        assert!(
+            denied.contains("tool call denied (secret_detected)"),
+            "{denied}"
+        );
+        assert!(!denied.contains(SK_SAMPLE), "no secret echo: {denied}");
+        // The continuing turn's SECOND request carries both answers.
+        let requests = recorder.requests();
+        assert_eq!(requests.len(), 2, "the mixed batch continues the same turn");
+        let mut seen: Vec<(String, bool)> = Vec::new();
+        for m in &requests[1].messages {
+            for p in &m.content {
+                if let ContentKind::ToolResult { is_error, .. } = &p.kind {
+                    seen.push((p.tool_call_id.clone().unwrap_or_default(), *is_error));
+                }
+            }
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![("ok".to_string(), false), ("refused".to_string(), true)],
+            "both calls answered on the wire, the denial marked as an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_refusal_is_answered_with_typed_result() {
+        // The model hallucinated a tool name: the refusal is journaled,
+        // typed, and answered — no run row, no execution.
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "ghost_1".into(),
+                    name: "ghost_tool".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+                ScriptedResponse::End,
+            ]),
+            vec![counting_echo_tool(executions.clone())],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime
+            .run_turn(session, "call the ghost", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_refusal_answered(
+            &runtime,
+            session,
+            "ghost_1",
+            "unknown_tool",
+            "unknown tool: ghost_tool",
+            &executions,
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_refusal_is_answered_with_typed_result() {
+        // Semantic capability gate: the provider's restrictions remove the
+        // tool's class. The refusal is journaled, the tool never executes,
+        // and the call is answered with the typed capability denial.
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (deps, _dir, root) = review_env(vec![
+            ScriptedResponse::ToolCall {
+                id: "c_cap".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "src/cap_denied.rs",
+                    "content": "pub fn denied() -> u32 { 0 }\n"
+                }),
+            },
+            ScriptedResponse::End,
+        ]);
+        let mut deps = deps;
+        deps.semantic = semantic_registry_with(FakeSemanticProvider::affected(vec![
+            "src/sandbox_policy.rs".into(),
+        ]));
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(counting_write_tool(executions.clone()));
+        deps.tools = Arc::new(tool_registry);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = session_in_workspace(runtime.deps(), &root);
+        let outcome = runtime
+            .run_turn(session, "write the file", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert!(
+            !root.join("src/cap_denied.rs").exists(),
+            "the restricted tool must never execute"
+        );
+        assert_refusal_answered(
+            &runtime,
+            session,
+            "c_cap",
+            "capability_refused",
+            "semantic restriction removed capability",
+            &executions,
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hook_refusal_is_answered_with_typed_result() {
+        // A PreTool lifecycle hook fails closed (Deny): the refusal is
+        // journaled and answered with the typed hook denial.
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c_hook".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+                ScriptedResponse::End,
+            ]),
+            vec![counting_echo_tool(executions.clone())],
+        );
+        let hooks = Arc::new(faktor_hooks::HookRegistry::new());
+        hooks
+            .register(failing_closed_hook(
+                "pre_deny",
+                faktor_hooks::HookEvent::PreTool,
+            ))
+            .unwrap();
+        deps.hooks = Some(hooks);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime.run_turn(session, "use echo", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_refusal_answered(
+            &runtime,
+            session,
+            "c_hook",
+            "hook_denied",
+            "denied by hook",
+            &executions,
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_refusal_is_answered_with_typed_result_and_never_echoes_the_secret() {
+        // The denial result carries the detected KIND, never the credential
+        // bytes it detected.
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "leak_1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({ "path": "creds.txt", "content": SK_SAMPLE }),
+                },
+                ScriptedResponse::End,
+            ]),
+            vec![counting_write_tool(executions.clone())],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime
+            .run_turn(session, "store the key", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_refusal_answered(
+            &runtime,
+            session,
+            "leak_1",
+            "secret_detected",
+            "secret detected in tool input (openai_key)",
+            &executions,
+        );
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let (excerpt, _) = tool_result_for(&handle, "leak_1").unwrap();
+        assert!(
+            !excerpt.contains(SK_SAMPLE),
+            "the denial result must never echo the secret: {excerpt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_budget_refusal_is_answered_with_typed_result() {
+        // ChangeBudget edit gate: a mutating tool whose declared write paths
+        // leave the budget is refused BEFORE execution and answered typed.
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c_budget".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/out_of_scope.rs",
+                        "content": "pub fn out() -> u32 { 0 }\n"
+                    }),
+                },
+                ScriptedResponse::End,
+            ]),
+            vec![counting_write_tool(executions.clone())],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        handle
+            .set_change_budget(Some(&faktor_core::state::ChangeBudget {
+                allowed_paths: vec!["docs".into()],
+                ..Default::default()
+            }))
+            .unwrap();
+        let outcome = runtime
+            .run_turn(session, "edit outside", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_refusal_answered(
+            &runtime,
+            session,
+            "c_budget",
+            "change_budget_refused",
+            "change budget refused the edit",
+            &executions,
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_tool_call_result_is_unchanged_by_the_denial_fix() {
+        // CONTROL: the approved path is byte-identical — the tool executes,
+        // its result carries the real output (exit 0, no denial tag), and
+        // the documented interior hop (Validating -> UpdatingMemory ->
+        // WaitingForModel) still runs for the continuing turn.
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "ok".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![counting_echo_tool(executions.clone())],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime.run_turn(session, "use echo", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let (excerpt, exit) = tool_result_for(&handle, "ok").expect("approved call answered");
+        assert_eq!(exit, Some(0), "{excerpt}");
+        assert_eq!(excerpt, "echo: {\"x\":1}", "approved result byte-identical");
+        assert!(!excerpt.contains("denied") && !excerpt.contains("unresolved"));
+        assert!(dangling_tool_calls(&handle).is_empty());
+        let events = handle.events_range(1, None).unwrap();
+        let last_completed = events
+            .iter()
+            .rposition(|e| {
+                e.kind == faktor_core::event::EventKind::ToolCompleted
+                    && e.state == AgentState::Validating
+            })
+            .expect("the completed finish is journaled");
+        let after: Vec<AgentState> = events[last_completed + 1..]
+            .iter()
+            .take(2)
+            .map(|e| e.state)
+            .collect();
+        assert_eq!(
+            after,
+            vec![AgentState::UpdatingMemory, AgentState::WaitingForModel],
+            "the approved interior hop is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn crash_between_denial_and_result_write_resumes_without_a_dangling_call() {
+        // The refusal decision (journaled) landed but the typed result write
+        // was lost to a crash. The transcript is momentarily dangling; the
+        // next session open (recovery) answers the call with the typed
+        // `interrupted` result BEFORE the next model request is built — the
+        // wire never carries a call with no result.
+        let fake = scripted_provider(vec![
+            ScriptedResponse::ToolCall {
+                id: "leak_1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({ "path": "creds.txt", "content": SK_SAMPLE }),
+            },
+            ScriptedResponse::Text("recovered".into()),
+            ScriptedResponse::End,
+        ]);
+        let recorder = RecordingProvider::new(Arc::new(fake));
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (deps, _dir) = deps_with(
+            recorder.clone(),
+            vec![counting_write_tool(executions.clone())],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        durable_faults::arm(runtime.deps().session.store().root(), DW_SITE_DENIAL_RESULT);
+        let err = runtime
+            .run_turn(session, "store the key", &[])
+            .await
+            .expect_err("the lost denial result must surface");
+        assert_eq!(err.kind, ErrorKind::Store, "{err:?}");
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the refusal never executed the tool"
+        );
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        assert!(
+            tool_result_for(&handle, "leak_1").is_none(),
+            "the crash window left the call unanswered"
+        );
+        assert_eq!(dangling_tool_calls(&handle), vec!["leak_1".to_string()]);
+        // Next open: recovery answers the dangling call before the model is
+        // called again, and the repaired result reaches the second request.
+        let outcome = runtime.run_turn(session, "continue", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let dangling = dangling_tool_calls(&handle);
+        assert!(dangling.is_empty(), "dangling after recovery: {dangling:?}");
+        let (excerpt, exit) = tool_result_for(&handle, "leak_1").expect("repaired result");
+        assert_eq!(exit, Some(1));
+        assert!(excerpt.contains("(interrupted)"), "{excerpt}");
+        assert!(
+            !excerpt.contains(SK_SAMPLE),
+            "no secret in the repaired result: {excerpt}"
+        );
+        let requests = recorder.requests();
+        assert_eq!(requests.len(), 2, "one provider request per turn");
+        let answered = requests[1].messages.iter().any(|m| {
+            m.content.iter().any(|p| {
+                matches!(&p.kind, ContentKind::ToolResult { content, is_error }
+                    if content.contains("(interrupted)") && *is_error)
+            })
+        });
+        assert!(
+            answered,
+            "the repaired tool_result must ride the next wire request"
+        );
+    }
+
     #[tokio::test]
     async fn stream_death_is_state_aware_no_replay() {
         // Provider dies mid-stream after a tool call ran: effect marked
@@ -19078,6 +20776,467 @@ mod tests {
             .filter(|e| e.kind == faktor_core::event::EventKind::PhaseChanged)
             .count();
         assert!(interior >= 2, "interior hops must use PhaseChanged");
+    }
+
+    /// A tool whose runnable returns a typed error: the scheduler marks the
+    /// op `Failed` — an ORDINARY per-tool failure, distinct from a scheduler
+    /// infrastructure failure.
+    fn failing_tool() -> Tool {
+        Tool {
+            name: "explode".into(),
+            execute: Arc::new(|_ctx, _args| {
+                Box::pin(async move { Err(Error::new(ErrorKind::Internal, "tool blew up")) })
+            }),
+            ..echo_tool()
+        }
+    }
+
+    /// The ToolCompleted journal rows of one session, `(op_id, status)`.
+    fn tool_completed_statuses(
+        handle: &faktor_session::SessionHandle,
+    ) -> Vec<(Option<OpId>, String)> {
+        handle
+            .events_range(1, None)
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == faktor_core::event::EventKind::ToolCompleted)
+            .map(|e| {
+                let status = e
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.get("status"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                (e.op_id, status)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn scheduler_panic_returns_the_original_typed_error_and_resolves_open_rows() {
+        // P1 error-collapse: a spawned scheduler task panic
+        // (`ErrorKind::Internal`) used to be swallowed by
+        // `unwrap_or_default()` into an empty done set — every submitted op
+        // was then finished as an ordinary failed tool and `run_tool_calls`
+        // continued its normal path. The typed scheduler failure must
+        // surface, and every still-open durable row must be resolved before
+        // it does (never left `running`).
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+                ScriptedResponse::ToolCall {
+                    id: "c2".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"x": 2}),
+                },
+                ScriptedResponse::Text("unreachable".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![echo_tool()],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        scheduler_faults::arm(
+            runtime.deps().session.store().root(),
+            scheduler_faults::Point::BeforeRun,
+            ErrorKind::Internal,
+            "scheduler task failed unexpectedly",
+        );
+        let err = runtime
+            .run_turn(session, "do work", &[])
+            .await
+            .expect_err("a scheduler task panic must not collapse into Ok");
+        assert_eq!(err.kind, ErrorKind::Internal, "{err:?}");
+        assert!(err.message.contains("scheduler task failed"), "{err:?}");
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        assert!(
+            handle.pending_tool_runs().unwrap().is_empty(),
+            "every submitted op must be durably resolved before the error returns"
+        );
+        let statuses = tool_completed_statuses(&handle);
+        assert_eq!(statuses.len(), 2, "both open runs resolved: {statuses:?}");
+        for (_, status) in statuses {
+            assert_eq!(status, "failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_deadlock_is_typed_and_never_masks_a_completed_op() {
+        // A deadlock classification after a PARTIALLY completed batch: the
+        // op that genuinely finished stays recorded `completed` (the live
+        // scheduler status is the truth), the op that failed on its own is
+        // resolved as a failed tool, and the returned error is the ORIGINAL
+        // `ErrorKind::Deadlock` — never an empty done set and never Ok.
+        // The FAILING call is submitted FIRST on purpose: resolving strictly
+        // in submit order would finish it first (`FailedRecoverable`) and
+        // then reject the completed op's finish (`FailedRecoverable ->
+        // Validating` is illegal), masking the scheduler error with a bogus
+        // `InvalidState`.
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "bad".into(),
+                    name: "explode".into(),
+                    input: serde_json::json!({"x": 2}),
+                },
+                ScriptedResponse::ToolCall {
+                    id: "ok".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+                ScriptedResponse::Text("unreachable".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![echo_tool(), failing_tool()],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        scheduler_faults::arm(
+            runtime.deps().session.store().root(),
+            scheduler_faults::Point::AfterRun,
+            ErrorKind::Deadlock,
+            "no ready tasks and work remains; cycle or unscheduled dependency",
+        );
+        let err = runtime
+            .run_turn(session, "do work", &[])
+            .await
+            .expect_err("a deadlock must surface typed");
+        assert_eq!(err.kind, ErrorKind::Deadlock, "{err:?}");
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        assert!(handle.pending_tool_runs().unwrap().is_empty());
+        let statuses = tool_completed_statuses(&handle);
+        assert_eq!(statuses.len(), 2, "{statuses:?}");
+        assert!(
+            statuses.iter().any(|(_, s)| s == "completed"),
+            "the completed op must stay completed: {statuses:?}"
+        );
+        assert!(
+            statuses.iter().any(|(_, s)| s == "failed"),
+            "the failed op must be resolved: {statuses:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_validation_refusal_is_typed_and_rows_still_resolve() {
+        // A scheduler validation refusal (e.g. the DAG bound) is
+        // infrastructure, not a per-tool failure: it must surface with its
+        // own kind and still leave no open durable row behind.
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+                ScriptedResponse::End,
+            ]),
+            vec![echo_tool()],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        scheduler_faults::arm(
+            runtime.deps().session.store().root(),
+            scheduler_faults::Point::BeforeRun,
+            ErrorKind::Oversized,
+            "task 1 declares 9 dependencies; cap is 8",
+        );
+        let err = runtime
+            .run_turn(session, "do work", &[])
+            .await
+            .expect_err("a validation refusal must surface typed");
+        assert_eq!(err.kind, ErrorKind::Oversized, "{err:?}");
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        assert!(handle.pending_tool_runs().unwrap().is_empty());
+        let statuses = tool_completed_statuses(&handle);
+        assert_eq!(statuses.len(), 1, "{statuses:?}");
+        assert_eq!(statuses[0].1, "failed");
+    }
+
+    #[tokio::test]
+    async fn scheduler_success_path_still_returns_the_done_set() {
+        // Control: with no injected failure the operational path is
+        // unchanged — every submitted op is in the scheduler's done set and
+        // is recorded `completed` (the old resolution behavior byte-for-byte).
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+                ScriptedResponse::ToolCall {
+                    id: "c2".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"x": 2}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![echo_tool()],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime.run_turn(session, "do work", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let statuses = tool_completed_statuses(&handle);
+        assert_eq!(statuses.len(), 2, "{statuses:?}");
+        for (_, status) in statuses {
+            assert_eq!(status, "completed");
+        }
+        assert!(handle.pending_tool_runs().unwrap().is_empty());
+        // The all-success interior hop is UNCHANGED by the mixed-batch fix:
+        // the completed finishes leave `Validating`, then the documented
+        // Validating -> UpdatingMemory -> WaitingForModel hops run.
+        let events = handle.events_range(1, None).unwrap();
+        let last_completed = events
+            .iter()
+            .rposition(|e| {
+                e.kind == faktor_core::event::EventKind::ToolCompleted
+                    && e.state == AgentState::Validating
+            })
+            .expect("the completed finishes are journaled");
+        let after: Vec<AgentState> = events[last_completed + 1..]
+            .iter()
+            .take(2)
+            .map(|e| e.state)
+            .collect();
+        assert_eq!(
+            after,
+            vec![AgentState::UpdatingMemory, AgentState::WaitingForModel],
+            "the all-success interior hop must stay byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_tool_batch_completes_lawfully_with_per_tool_records() {
+        // DEFECT REPRODUCER (mixed success+failure batch): one scheduled
+        // tool succeeds and one fails recoverably in the SAME batch. The
+        // failed finish moves the machine to `FailedRecoverable`; the batch
+        // still has a completed tool, so the turn continues and the old
+        // code tried `FailedRecoverable -> UpdatingMemory` — an illegal edge
+        // — and the whole turn died with `InvalidState` instead of recording
+        // the per-tool outcomes. The FAILING call is submitted FIRST on
+        // purpose: the completed finishes must resolve before the failed
+        // ones (the reverse order is itself illegal), so this locks the
+        // order-independent resolution.
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "bad".into(),
+                    name: "explode".into(),
+                    input: serde_json::json!({"x": 2}),
+                },
+                ScriptedResponse::ToolCall {
+                    id: "ok".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+                ScriptedResponse::Text("recovered".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![echo_tool(), failing_tool()],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime.run_turn(session, "do work", &[]).await.unwrap();
+        assert_eq!(
+            outcome.final_state,
+            AgentState::ReadyForNextTurn,
+            "a mixed batch is a per-tool outcome, not a turn failure"
+        );
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let statuses = tool_completed_statuses(&handle);
+        assert_eq!(statuses.len(), 2, "{statuses:?}");
+        assert!(
+            statuses.iter().any(|(_, s)| s == "completed"),
+            "the successful tool stays completed: {statuses:?}"
+        );
+        assert!(
+            statuses.iter().any(|(_, s)| s == "failed"),
+            "the failed tool must never be dropped: {statuses:?}"
+        );
+        assert!(handle.pending_tool_runs().unwrap().is_empty());
+        // No dropped failure: the failure is durable turn history — the
+        // ledger (and therefore the memory facts) carries it.
+        let ledger: faktor_context::ledger::TaskLedger =
+            serde_json::from_value(handle.get_task_ledger().unwrap().unwrap()).unwrap();
+        assert!(
+            ledger.known_failures.iter().any(|f| f.contains("explode")),
+            "the failed tool must land in the ledger: {:?}",
+            ledger.known_failures
+        );
+        // Every tool call is answered in the durable transcript: the
+        // successful result AND the failed call's error result. The turn
+        // continues to the model, so a dangling call would reach the next
+        // wire request.
+        let page = handle.messages_before(None, 20).unwrap();
+        let result_for = |call: &str| {
+            page.iter().any(|m| {
+                handle.parts_of(m.id).unwrap().iter().any(|p| {
+                    p.kind == "tool_result"
+                        && p.data.get("tool_call_id").and_then(|v| v.as_str()) == Some(call)
+                })
+            })
+        };
+        assert!(result_for("ok"), "the completed call must have its result");
+        assert!(
+            result_for("bad"),
+            "the failed call must have its error result"
+        );
+        // The mixed batch recovers through the documented legal hop chain
+        // (FailedRecoverable -> Preparing -> BuildingContext ->
+        // WaitingForModel); the old code attempted the illegal
+        // FailedRecoverable -> UpdatingMemory edge.
+        let events = handle.events_range(1, None).unwrap();
+        let failed_idx = events
+            .iter()
+            .rposition(|e| {
+                e.kind == faktor_core::event::EventKind::ToolCompleted
+                    && e.state == AgentState::FailedRecoverable
+            })
+            .expect("the failed finish is journaled");
+        let after: Vec<AgentState> = events[failed_idx + 1..]
+            .iter()
+            .take(3)
+            .map(|e| e.state)
+            .collect();
+        assert_eq!(
+            after,
+            vec![
+                AgentState::Preparing,
+                AgentState::BuildingContext,
+                AgentState::WaitingForModel
+            ],
+            "the mixed batch must recover through the legal retry hop"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_failed_tool_batch_ends_recoverable_without_illegal_hop() {
+        // The all-recoverable-failure end: EVERY submitted tool fails
+        // (execute -> Err), so `executed == 0` and the machine is already at
+        // `FailedRecoverable` when the batch returns. The turn must report
+        // that classified end — the old fall-through into the genuine-end
+        // tail attempted `FailedRecoverable -> Validating` and died with
+        // `InvalidState`. The session stays promptable afterwards.
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "bad_1".into(),
+                    name: "explode".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+                ScriptedResponse::ToolCall {
+                    id: "bad_2".into(),
+                    name: "explode".into(),
+                    input: serde_json::json!({"x": 2}),
+                },
+                ScriptedResponse::Text("unreachable".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![echo_tool(), failing_tool()],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime.run_turn(session, "do work", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::FailedRecoverable);
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let statuses = tool_completed_statuses(&handle);
+        assert_eq!(statuses.len(), 2, "{statuses:?}");
+        assert!(
+            statuses.iter().all(|(_, s)| s == "failed"),
+            "every failed tool is recorded failed: {statuses:?}"
+        );
+        assert!(handle.pending_tool_runs().unwrap().is_empty());
+        // Both failed calls are answered in the durable transcript: the
+        // next turn's request must never carry a dangling tool call.
+        let page = handle.messages_before(None, 20).unwrap();
+        for call in ["bad_1", "bad_2"] {
+            assert!(
+                page.iter().any(|m| {
+                    handle.parts_of(m.id).unwrap().iter().any(|p| {
+                        p.kind == "tool_result"
+                            && p.data.get("tool_call_id").and_then(|v| v.as_str()) == Some(call)
+                    })
+                }),
+                "the failed call {call} must have its error result"
+            );
+        }
+        // The session stays usable: a fresh prompt completes normally.
+        let outcome = runtime.run_turn(session, "try again", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    }
+
+    #[tokio::test]
+    async fn recoverable_failure_to_updating_memory_stays_illegal() {
+        // CONTROL: the machine guard the old mixed-batch path tripped over is
+        // still armed. From `FailedRecoverable`, the illegal edges
+        // (`UpdatingMemory`, `Validating`) are refused with the exact
+        // `InvalidState`, while the legal retry hop (`Preparing` ->
+        // `BuildingContext` -> `WaitingForModel`) is the only way back into
+        // the turn.
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "bad".into(),
+                    name: "explode".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+                ScriptedResponse::Text("after the failure".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![echo_tool(), failing_tool()],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let _ = runtime.run_turn(session, "do work", &[]).await;
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        assert_eq!(handle.state().unwrap(), AgentState::FailedRecoverable);
+        for illegal in [AgentState::UpdatingMemory, AgentState::Validating] {
+            let err = handle
+                .append_event(
+                    faktor_core::event::EventKind::PhaseChanged,
+                    illegal,
+                    None,
+                    None,
+                )
+                .expect_err("an illegal recovery edge must stay refused");
+            assert_eq!(
+                err.kind,
+                ErrorKind::InvalidState {
+                    from: AgentState::FailedRecoverable,
+                    to: illegal,
+                },
+                "{err:?}"
+            );
+        }
+        assert_eq!(
+            handle.state().unwrap(),
+            AgentState::FailedRecoverable,
+            "a refused transition never moves the machine"
+        );
+        // The legal hop chain succeeds and lands at WaitingForModel.
+        for target in [
+            AgentState::Preparing,
+            AgentState::BuildingContext,
+            AgentState::WaitingForModel,
+        ] {
+            handle
+                .append_event(
+                    faktor_core::event::EventKind::PhaseChanged,
+                    target,
+                    None,
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("{target:?} is a legal hop: {e:?}"));
+        }
+        assert_eq!(handle.state().unwrap(), AgentState::WaitingForModel);
     }
 
     #[tokio::test]
@@ -36738,7 +38897,9 @@ mod tests {
         let (mut deps, _dir) = deps_with(debit_aware_provider(recorder), vec![]);
         deps.budgets = budget;
         let runtime = AgentRuntime::new(deps).unwrap();
-        runtime.set_provider_debits(Some(recorder.clone() as Arc<dyn ProviderAttemptDebits>));
+        runtime
+            .set_provider_debits(Some(recorder.clone() as Arc<dyn ProviderAttemptDebits>))
+            .expect("install debit authority");
         let (manager, session) = shared_session(runtime.deps());
         let _ = manager;
         let outcome = runtime
@@ -36791,7 +38952,9 @@ mod tests {
         let (mut deps, _dir) = deps_with(debit_aware_provider(&recorder), vec![]);
         deps.budgets = budget.clone();
         let runtime = AgentRuntime::new(deps).unwrap();
-        runtime.set_provider_debits(Some(recorder.clone() as Arc<dyn ProviderAttemptDebits>));
+        runtime
+            .set_provider_debits(Some(recorder.clone() as Arc<dyn ProviderAttemptDebits>))
+            .expect("install debit authority");
         let (manager, session) = shared_session(runtime.deps());
         let _ = manager;
         let err = runtime.run_turn(session, "do the thing", &[]).await;
@@ -36816,7 +38979,9 @@ mod tests {
         let (mut deps, _dir) = deps_with(debit_aware_provider(&recorder), vec![]);
         deps.budgets = budget.clone();
         let runtime = AgentRuntime::new(deps).unwrap();
-        runtime.set_provider_debits(Some(recorder.clone() as Arc<dyn ProviderAttemptDebits>));
+        runtime
+            .set_provider_debits(Some(recorder.clone() as Arc<dyn ProviderAttemptDebits>))
+            .expect("install debit authority");
         let (manager, session) = shared_session(runtime.deps());
         let _ = manager;
         let outcome = runtime
@@ -36872,6 +39037,124 @@ mod tests {
         let (manager, session) = shared_session(runtime.deps());
         let _ = manager;
         let outcome = runtime
+            .run_turn(session, "do the thing", &[])
+            .await
+            .expect("turn");
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    }
+
+    #[tokio::test]
+    async fn poisoned_debit_authority_refuses_typed_before_dispatch_and_never_reads_as_disabled() {
+        // P0 monetary fail-open: `provider_debits()` used to map a poisoned
+        // authority lock to `None`, which means "billing deliberately
+        // disabled" — a Faktor-managed provider request would then dispatch
+        // with no commercial debit authority (a free managed call after a
+        // poisoning). Retrieval and the setter must surface the poison typed,
+        // and the attempt must be refused BEFORE any provider dispatch.
+        let recorder = DebitRecorder::new(true);
+        let budget = DebitBudget::new(Some(260));
+        let (mut deps, _dir) = deps_with(debit_aware_provider(&recorder), vec![]);
+        deps.budgets = budget.clone();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        runtime
+            .set_provider_debits(Some(recorder.clone() as Arc<dyn ProviderAttemptDebits>))
+            .expect("install debit authority");
+
+        // The only way to poison a std::sync::Mutex: panic while it is held.
+        let poisoner = runtime.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.provider_debits.lock().unwrap();
+            panic!("poison the provider debit authority slot");
+        })
+        .join();
+
+        // Retrieval is fallible: a poisoned lock is `Unavailable`, NEVER a
+        // silent `None`.
+        match runtime.provider_debits() {
+            Err(DebitError::Unavailable { reason }) => {
+                assert!(reason.contains("poisoned"), "{reason}");
+            }
+            Err(other) => panic!("poisoned authority must be Unavailable, got {other:?}"),
+            Ok(_) => panic!("a poisoned authority must never read as an authority slot"),
+        }
+
+        // The per-attempt debit machine is refused typed before any dispatch.
+        let attempt = ModelCallAttempt::new(OpId::new(7), OpId::new(8), 0).unwrap();
+        let attempt_err = runtime
+            .attempt_debits(SessionId::new(1), TaskId::new(1), "fake", "m", attempt, 10)
+            .expect_err("a poisoned authority must refuse the debit machine");
+        assert!(
+            matches!(attempt_err, DebitError::Unavailable { .. }),
+            "{attempt_err:?}"
+        );
+
+        // The SETTER is typed too: a poisoned slot is never a silent ignore.
+        let setter_err = runtime
+            .set_provider_debits(None)
+            .expect_err("a poisoned authority slot must refuse the setter");
+        assert!(
+            matches!(setter_err, DebitError::Unavailable { .. }),
+            "{setter_err:?}"
+        );
+
+        // End to end: a managed turn with a poisoned authority is refused
+        // pre-dispatch. The provider is invoked ZERO times and the budget
+        // reservation is released.
+        let (manager, session) = shared_session(runtime.deps());
+        let _ = manager;
+        let outcome = runtime
+            .run_turn(session, "do the thing", &[])
+            .await
+            .expect("the refusal is a classified turn end, not a hard error");
+        assert_eq!(outcome.final_state, AgentState::FailedRecoverable);
+        let detail = outcome
+            .stop_reason
+            .as_ref()
+            .expect("a typed refusal reason")
+            .detail
+            .clone();
+        assert!(
+            detail.contains("provider debit authority lock poisoned"),
+            "{detail}"
+        );
+        let events = recorder.events();
+        assert!(
+            !events.iter().any(|event| event == "stream"),
+            "a poisoned authority must never dispatch: {events:?}"
+        );
+        assert_eq!(
+            recorder.begins.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no debit hold exists without the authority"
+        );
+        assert_eq!(
+            budget.refunds.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the pre-dispatch refusal releases the reservation"
+        );
+
+        // Billing deliberately disabled (`None` on a CLEAN slot) still takes
+        // the documented pre-billing path byte-for-byte.
+        let (mut clean_deps, _dir2) = deps_with(
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    context: 200_000,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
+            )),
+            vec![],
+        );
+        clean_deps.budgets = DebitBudget::new(Some(260));
+        let clean_runtime = AgentRuntime::new(clean_deps).unwrap();
+        clean_runtime
+            .set_provider_debits(None)
+            .expect("a clean slot accepts None");
+        let (manager, session) = shared_session(clean_runtime.deps());
+        let _ = manager;
+        let outcome = clean_runtime
             .run_turn(session, "do the thing", &[])
             .await
             .expect("turn");

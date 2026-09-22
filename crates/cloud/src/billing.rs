@@ -162,6 +162,43 @@ impl ReconciliationState {
     }
 }
 
+// ------------------------------------------------------- task-id identity
+
+/// The canonical durable/storage encoding of a [`UsageEvent::task_id`]:
+/// fixed-width, zero-padded, lowercase 16-hex-digit text
+/// (`format!("{task_id:016x}")`).
+///
+/// Why the encoding exists (P1 identity-integrity): SQLite `INTEGER` is
+/// signed 64-bit, and the original storage path wrote
+/// `task_id.min(i64::MAX as u64) as i64`. Every id in
+/// `[i64::MAX, u64::MAX]` therefore collapsed onto the single indexed value
+/// `i64::MAX`: `0x7fff_ffff_ffff_ffff`, `0x8000_0000_0000_0000` and
+/// `0xffff_ffff_ffff_ffff` all became the same row key, while the JSON
+/// payload still reported the original id. A task-filtered query for one
+/// high id could then return another high id's rows — two distinct tasks
+/// aliased onto one ledger slice. `{:016x}` is a bijection over the WHOLE
+/// u64 domain (no clamping, no sign, no float), compares as ordinary text
+/// (no unsigned ordering is required since the column is used only for
+/// equality filters), and keeps the `(organization_id, task_id, event_seq)`
+/// index applicable.
+///
+/// Invariant: every write to and filter over the stored `task_id` column
+/// goes through this pair ([`task_id_text`] / [`task_id_from_text`]); no SQL
+/// path may compare a raw numeric task id against the column.
+pub fn task_id_text(task_id: u64) -> String {
+    format!("{task_id:016x}")
+}
+
+/// The exact inverse of [`task_id_text`]: `Some` only for 16 lowercase hex
+/// digits (the SQL CHECK constraint enforces the same shape); anything else
+/// is `None`, never a silently truncated id.
+pub fn task_id_from_text(raw: &str) -> Option<u64> {
+    if raw.len() != 16 || !raw.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    u64::from_str_radix(raw, 16).ok()
+}
+
 // ------------------------------------------------------------ usage event
 
 /// One append-only usage ledger row: the exact projection of one durable
@@ -1322,5 +1359,65 @@ mod tests {
         assert!(!AdmissionBoundary::IntegrationContinuation.is_gated());
         assert!(!AdmissionBoundary::RollbackContinuation.is_gated());
         assert!(!AdmissionBoundary::CompletionContinuation.is_gated());
+    }
+
+    /// The task-id storage encoding is a bijection over the FULL u64 domain:
+    /// every boundary value (including the three the old
+    /// `min(i64::MAX as u64) as i64` projection aliased together) maps to a
+    /// distinct canonical 16-hex text and back exactly.
+    #[test]
+    fn task_id_text_is_a_reversible_full_u64_bijection() {
+        let ids = [
+            0u64,
+            1,
+            0x00ff_ffff_ffff_ffff,
+            i64::MAX as u64,
+            i64::MAX as u64 + 1,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let mut seen = BTreeSet::new();
+        for id in ids {
+            let text = task_id_text(id);
+            assert_eq!(text.len(), 16, "{id:#x} must encode to 16 digits");
+            assert!(
+                text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "{text:?} must be lowercase hex"
+            );
+            assert_eq!(task_id_from_text(&text), Some(id), "{text:?} round-trips");
+            assert!(seen.insert(text), "distinct ids must not alias");
+        }
+        assert_eq!(task_id_text(i64::MAX as u64), "7fffffffffffffff");
+        assert_eq!(task_id_text(i64::MAX as u64 + 1), "8000000000000000");
+        assert_eq!(task_id_text(u64::MAX), "ffffffffffffffff");
+        for bad in [
+            "",
+            "0",
+            "7FFFFFFFFFFFFFFF",
+            "7fffffffffffffff0",
+            "7ffffffffffffffg",
+            " 7fffffffffffffff",
+        ] {
+            assert_eq!(task_id_from_text(bad), None, "{bad:?} is not canonical");
+        }
+    }
+
+    /// Zero stays rejected (a usage event never carries task id 0); every
+    /// non-zero value of the full u64 domain — the aliased boundaries
+    /// included — passes validation unchanged.
+    #[test]
+    fn validator_rejects_zero_task_id_and_accepts_every_boundary() {
+        let mut event = token_event("e1", UsageUnit::InputTokens, 1, SpendCategory::Byok);
+        event.task_id = 0;
+        match event.validate() {
+            Err(ControlPlaneError::Malformed(msg)) => {
+                assert!(msg.contains("non-zero task id"), "{msg}")
+            }
+            other => panic!("expected Malformed non-zero task id, got {other:?}"),
+        }
+        for id in [1, 7, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+            event.task_id = id;
+            assert_eq!(event.validate(), Ok(()), "task id {id} is legal");
+        }
     }
 }

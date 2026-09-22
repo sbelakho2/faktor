@@ -1,7 +1,10 @@
 //! The durable billing seam: the [`BillingStore`] trait plus its in-memory
 //! implementation and the additive SQLite implementation over the SAME
 //! [`crate::store::SqliteControlPlaneStore`] database and migration ladder
-//! (its migration v2 — the crate-owned next `user_version`).
+//! (its migration v2 — the crate-owned next `user_version` — and its
+//! migration v6, which rebuilds `usage_event.task_id` from the old lossy
+//! signed INTEGER projection to the reversible fixed-width text encoding
+//! [`crate::billing::task_id_text`]).
 //!
 //! Append-only enforcement lives here: usage events and credit entries are
 //! INSERT-only (no UPDATE/DELETE surface exists), ingestion is idempotent
@@ -9,6 +12,13 @@
 //! immediate transaction that re-derives the balance before the insert, so
 //! two racing consumes can never jointly overdraw the account and a refund
 //! can never exceed what its referenced consume/settle actually spent.
+//!
+//! Task identity: the `task_id` column is TEXT holding exactly
+//! [`crate::billing::task_id_text`]`(id)` (16 lowercase hex digits, a
+//! bijection over the full u64 domain). Writes encode through that helper
+//! and task-filtered queries compare against the same encoding, so
+//! `usage_events_of_task` can never alias two ids that the old
+//! `task_id.min(i64::MAX as u64) as i64` projection collapsed together.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -27,6 +37,11 @@ use crate::store::{CloudStoreError, SqliteControlPlaneStore};
 /// The SQL schema of the billing domain (migration v2 of the control-plane
 /// ladder). Append-only by construction: no UPDATE/DELETE statement names
 /// `usage_event` or `credit_entry` outside the store's own read paths.
+///
+/// `usage_event.task_id` is created as `INTEGER` here for historical shape
+/// only: migration [`BILLING_TASK_ID_TEXT_SCHEMA_V6`] rebuilds it as the
+/// reversible fixed-width TEXT encoding before any query runs, fresh
+/// databases included (see [`crate::billing::task_id_text`]).
 pub const BILLING_SCHEMA_V2: &str = "
      CREATE TABLE IF NOT EXISTS billing_account (
         id TEXT PRIMARY KEY,
@@ -102,6 +117,196 @@ pub const BILLING_SCHEMA_V2: &str = "
      CREATE INDEX IF NOT EXISTS idx_billing_in_flight_org
         ON billing_in_flight(organization_id, ended_ms);
 ";
+
+/// The SQL half of migration v6 of the control-plane ladder: rebuild
+/// `usage_event.task_id` from the lossy signed INTEGER projection to the
+/// reversible fixed-width TEXT encoding ([`crate::billing::task_id_text`]).
+///
+/// The old projection was `task_id.min(i64::MAX as u64) as i64`: every id
+/// `>= i64::MAX` aliased onto the same indexed value, so a task-filtered
+/// query could return another task's ledger rows. The rebuild cannot be
+/// completed in SQL alone: SQLite JSON functions expose an integer above
+/// `i64::MAX` only as an inexact REAL, and the legacy payload is the sole
+/// authority for such an id. This SQL therefore only STAGES the rebuild —
+/// every row gets a syntactically valid placeholder and its legacy INTEGER
+/// value is carried in `usage_event_v6_task_id_carry` — and
+/// [`finalize_task_id_text_migration`] resolves each row's exact id in Rust
+/// inside the SAME migration transaction, then drops the carry table. The
+/// placeholder is never visible to a committed database; if any row cannot
+/// be recovered exactly the whole migration transaction rolls back and the
+/// pre-v6 database (and its rows) stay untouched.
+pub const BILLING_TASK_ID_TEXT_SCHEMA_V6: &str = "
+     CREATE TABLE usage_event_v6 (
+        id TEXT PRIMARY KEY,
+        organization_id TEXT NOT NULL,
+        event_seq INTEGER NOT NULL,
+        source_key TEXT NOT NULL,
+        billing_account_id TEXT NOT NULL,
+        task_id TEXT NOT NULL
+            CONSTRAINT usage_event_task_id_text CHECK (
+                length(task_id) = 16
+                AND task_id NOT GLOB '*[^0-9a-f]*'
+            ),
+        run_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        category TEXT NOT NULL,
+        correction_of TEXT,
+        occurred_at_ms INTEGER NOT NULL,
+        reconciliation_state TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        UNIQUE (organization_id, source_key)
+     );
+     CREATE TABLE usage_event_v6_task_id_carry (
+        event_id TEXT PRIMARY KEY,
+        legacy_task_id INTEGER NOT NULL
+     );
+     INSERT INTO usage_event_v6
+        (id, organization_id, event_seq, source_key, billing_account_id, task_id,
+         run_id, attempt_id, category, correction_of, occurred_at_ms,
+         reconciliation_state, payload)
+     SELECT id, organization_id, event_seq, source_key, billing_account_id,
+            '0000000000000000',
+            run_id, attempt_id, category, correction_of, occurred_at_ms,
+            reconciliation_state, payload
+     FROM usage_event;
+     INSERT INTO usage_event_v6_task_id_carry (event_id, legacy_task_id)
+     SELECT id, task_id FROM usage_event;
+     DROP TABLE usage_event;
+     ALTER TABLE usage_event_v6 RENAME TO usage_event;
+     CREATE INDEX IF NOT EXISTS idx_usage_event_org_seq
+        ON usage_event(organization_id, event_seq);
+     CREATE INDEX IF NOT EXISTS idx_usage_event_org_task
+        ON usage_event(organization_id, task_id, event_seq);
+     CREATE INDEX IF NOT EXISTS idx_usage_event_correction
+        ON usage_event(organization_id, correction_of);
+";
+
+/// The staging table [`BILLING_TASK_ID_TEXT_SCHEMA_V6`] carries legacy
+/// INTEGER task ids in until [`finalize_task_id_text_migration`] resolves
+/// them; its presence marks the rebuild as not yet finalized.
+const TASK_ID_TEXT_CARRY_TABLE: &str = "usage_event_v6_task_id_carry";
+/// Page size of the v6 finalizer (bounded everything: the migration never
+/// holds an unbounded row set in memory).
+const TASK_ID_TEXT_FINALIZE_PAGE: i64 = 256;
+
+/// Resolve the staged v6 rebuild exactly. For every carried row: read the
+/// original id from the JSON payload (the authority the read paths already
+/// return), verify it against the carried legacy projection, write the
+/// reversible [`crate::billing::task_id_text`] encoding, and finally drop
+/// the carry table. Runs inside the migration transaction, so a refusal
+/// leaves the database exactly at v5.
+///
+/// Refuses typed (never guesses) when a row cannot be recovered exactly:
+///
+/// - the legacy stored value is not a non-zero id;
+/// - the payload is unreadable or carries no exact u64 `task_id` (ids above
+///   `i64::MAX` cannot be parsed out of JSON by SQL, which is why this runs
+///   in Rust);
+/// - the payload id is 0 (never a legal event) or the two sources
+///   disagree. A carried value below `i64::MAX` was stored exactly, so a
+///   disagreement is corruption. A carried `i64::MAX` is the one
+///   intentionally lossy case (every original id `>= i64::MAX` clamped onto
+///   it), so it is accepted when the payload id is `>= i64::MAX` and
+///   refused when the payload id is lower.
+///
+/// Idempotent: a no-op when the carry table is absent (already finalized or
+/// never staged), so it is safe to call on every open.
+pub(crate) fn finalize_task_id_text_migration(conn: &Connection) -> Result<(), BillingStoreError> {
+    let staged: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![TASK_ID_TEXT_CARRY_TABLE],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(backend)?;
+    if staged.is_none() {
+        return Ok(());
+    }
+    let mut after = String::new();
+    loop {
+        let mut stmt = conn
+            .prepare(
+                "SELECT carry.event_id, carry.legacy_task_id, event.payload
+                 FROM usage_event_v6_task_id_carry carry
+                 JOIN usage_event event ON event.id = carry.event_id
+                 WHERE carry.event_id > ?1
+                 ORDER BY carry.event_id LIMIT ?2",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map(params![after, TASK_ID_TEXT_FINALIZE_PAGE], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?;
+        if rows.is_empty() {
+            break;
+        }
+        after = rows.last().map(|row| row.0.clone()).unwrap_or_default();
+        for (event_id, legacy_task_id, payload) in rows {
+            let task_id = resolve_legacy_task_id(&event_id, legacy_task_id, &payload)?;
+            conn.execute(
+                "UPDATE usage_event SET task_id = ?1 WHERE id = ?2",
+                params![crate::billing::task_id_text(task_id), event_id],
+            )
+            .map_err(backend)?;
+        }
+    }
+    conn.execute("DROP TABLE usage_event_v6_task_id_carry", [])
+        .map_err(backend)?;
+    Ok(())
+}
+
+/// One legacy row's exact recovery (see [`finalize_task_id_text_migration`]
+/// for the refusal rules). Extracted so every refusal names the event id.
+fn resolve_legacy_task_id(
+    event_id: &str,
+    legacy_task_id: i64,
+    payload: &str,
+) -> Result<u64, BillingStoreError> {
+    let refuse = |reason: String| {
+        BillingStoreError::Malformed(format!(
+            "usage_event {event_id}: {reason}; refusing to guess the task identity \
+             (operator verification required)"
+        ))
+    };
+    if legacy_task_id < 1 {
+        return Err(refuse(format!(
+            "legacy stored task id {legacy_task_id} is not a valid non-zero id"
+        )));
+    }
+    let payload: serde_json::Value = serde_json::from_str(payload).map_err(|e| {
+        refuse(format!(
+            "payload is unreadable ({e}), so the exact task id cannot be recovered"
+        ))
+    })?;
+    let task_id = payload
+        .get("task_id")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| refuse("payload carries no exact u64 task_id".to_string()))?;
+    if task_id == 0 {
+        return Err(refuse("payload task id is 0".to_string()));
+    }
+    if legacy_task_id < i64::MAX {
+        if task_id != legacy_task_id as u64 {
+            return Err(refuse(format!(
+                "payload task id {task_id} disagrees with the exact stored id {legacy_task_id}"
+            )));
+        }
+    } else if task_id < i64::MAX as u64 {
+        return Err(refuse(format!(
+            "the stored id is the clamped sentinel i64::MAX but payload task id {task_id} is lower, \
+             so the original id cannot be recovered unambiguously"
+        )));
+    }
+    Ok(task_id)
+}
 
 /// One stored usage event with its immutable durable order (`event_seq`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,7 +527,11 @@ pub trait BillingStore: Send + Sync {
         after_seq: i64,
         limit: usize,
     ) -> Result<Vec<StoredUsageEvent>, BillingStoreError>;
-    /// Every event of one organization, ascending (bounded by `limit`).
+    /// Every event of one organization with `task_id`, ascending (bounded
+    /// by `limit`). Both implementations match the EXACT id: SQLite compares
+    /// the canonical [`crate::billing::task_id_text`] encoding of the
+    /// column, the memory store the raw `u64` — no projection may alias two
+    /// ids.
     fn usage_events_of_task(
         &self,
         organization: &OrganizationId,
@@ -1231,7 +1440,7 @@ impl BillingStore for SqliteControlPlaneStore {
                 seq,
                 event.source_key,
                 event.billing_account_id.as_str(),
-                event.task_id.min(i64::MAX as u64) as i64,
+                crate::billing::task_id_text(event.task_id),
                 event.run_id,
                 event.attempt_id,
                 event.category.as_str(),
@@ -1528,35 +1737,69 @@ impl SqliteControlPlaneStore {
         limit: usize,
     ) -> Result<Vec<StoredUsageEvent>, BillingStoreError> {
         let conn = self.lock_billing_conn()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT event_seq, payload FROM usage_event
-                 WHERE organization_id = ?1
-                   AND event_seq > ?2
-                   AND (?3 IS NULL OR task_id = ?3)
-                 ORDER BY event_seq LIMIT ?4",
-            )
-            .map_err(backend)?;
-        let rows = stmt
-            .query_map(
-                params![
-                    organization.as_str(),
-                    after_seq,
-                    task_id.map(|t| t.min(i64::MAX as u64) as i64),
-                    limit as i64
-                ],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-            )
-            .map_err(backend)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(backend)?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (event_seq, payload) in rows {
-            out.push(StoredUsageEvent {
-                event_seq,
-                event: parse(&payload)?,
-            });
-        }
-        Ok(out)
+        // The task filter compares the reversible text encoding
+        // (`crate::billing::task_id_text`), NEVER a numeric projection: the
+        // old `task_id.min(i64::MAX as u64) as i64` comparison aliased every
+        // id >= i64::MAX onto one value, so a filtered page could return
+        // another task's rows. Two statements (rather than an
+        // `? IS NULL OR task_id = ?` predicate) keep the
+        // `(organization_id, task_id, event_seq)` index applicable to the
+        // filtered page.
+        let rows: Vec<(i64, String)> = match task_id {
+            Some(task_id) => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT event_seq, payload FROM usage_event
+                         WHERE organization_id = ?1 AND task_id = ?2 AND event_seq > ?3
+                         ORDER BY event_seq LIMIT ?4",
+                    )
+                    .map_err(backend)?;
+                let mapped = stmt
+                    .query_map(
+                        params![
+                            organization.as_str(),
+                            crate::billing::task_id_text(task_id),
+                            after_seq,
+                            limit as i64
+                        ],
+                        usage_row,
+                    )
+                    .map_err(backend)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(backend)?;
+                mapped
+            }
+            None => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT event_seq, payload FROM usage_event
+                         WHERE organization_id = ?1 AND event_seq > ?2
+                         ORDER BY event_seq LIMIT ?3",
+                    )
+                    .map_err(backend)?;
+                let mapped = stmt
+                    .query_map(
+                        params![organization.as_str(), after_seq, limit as i64],
+                        usage_row,
+                    )
+                    .map_err(backend)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(backend)?;
+                mapped
+            }
+        };
+        rows.into_iter()
+            .map(|(event_seq, payload)| {
+                Ok(StoredUsageEvent {
+                    event_seq,
+                    event: parse(&payload)?,
+                })
+            })
+            .collect()
     }
+}
+
+/// Decode one `(event_seq, payload)` usage row.
+fn usage_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, String)> {
+    Ok((r.get(0)?, r.get(1)?))
 }

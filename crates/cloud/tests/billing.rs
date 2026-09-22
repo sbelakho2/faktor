@@ -6,9 +6,9 @@
 use std::sync::Arc;
 
 use faktor_cloud::billing::{
-    ALL_LIMITS, FEATURE_BYOK, FEATURE_CREDITS, FEATURE_MANAGED_PROVIDERS, LIMIT_MAX_ACTIVE_TASKS,
-    LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD, LIMIT_MAX_PROVIDER_ATTEMPTS_PER_TASK,
-    LIMIT_MAX_TOKENS_PER_PERIOD, UNIT_PROVIDER_COST,
+    task_id_text, ALL_LIMITS, FEATURE_BYOK, FEATURE_CREDITS, FEATURE_MANAGED_PROVIDERS,
+    LIMIT_MAX_ACTIVE_TASKS, LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD,
+    LIMIT_MAX_PROVIDER_ATTEMPTS_PER_TASK, LIMIT_MAX_TOKENS_PER_PERIOD, UNIT_PROVIDER_COST,
 };
 use faktor_cloud::{
     Admission, AdmissionBoundary, AdmissionRequest, BillingAccount, BillingAccountId,
@@ -958,4 +958,306 @@ fn managed_usage_reconciliation_pending_to_reconciled_is_durable_and_append_only
     bad.correction_of = Some(base.event.id.clone());
     bad.reconciliation_state = ReconciliationState::Pending;
     assert!(service.correct_usage(&bad).is_err());
+}
+
+// ------------------------------------------------- P1 task-id identity
+
+/// Create a pre-v6 database: a full current-schema database is opened first
+/// so every other table exists at its final shape, then `usage_event` is
+/// rolled back to the OLD schema (`task_id INTEGER NOT NULL`, the lossy
+/// projection) and the ladder cursor is set to v5. `rows` are
+/// `(legacy INTEGER column value, event id, payload JSON)`; entity columns
+/// other than id/payload are constants (the v6 finalizer and the read paths
+/// only need id + payload).
+fn legacy_task_id_db(path: &std::path::Path, rows: &[(i64, String, String)]) {
+    drop(SqliteControlPlaneStore::open(path).unwrap());
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE usage_event;
+         CREATE TABLE usage_event (
+            id TEXT PRIMARY KEY,
+            organization_id TEXT NOT NULL,
+            event_seq INTEGER NOT NULL,
+            source_key TEXT NOT NULL,
+            billing_account_id TEXT NOT NULL,
+            task_id INTEGER NOT NULL,
+            run_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            category TEXT NOT NULL,
+            correction_of TEXT,
+            occurred_at_ms INTEGER NOT NULL,
+            reconciliation_state TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            UNIQUE (organization_id, source_key)
+         );
+         CREATE INDEX idx_usage_event_org_task
+            ON usage_event(organization_id, task_id, event_seq);
+         PRAGMA user_version = 5;",
+    )
+    .unwrap();
+    for (seq, (legacy, id, payload)) in rows.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO usage_event
+                (id, organization_id, event_seq, source_key, billing_account_id, task_id,
+                 run_id, attempt_id, category, correction_of, occurred_at_ms,
+                 reconciliation_state, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                id,
+                "org_a",
+                seq as i64 + 1,
+                format!("manual:legacy:{id}"),
+                "acct_1",
+                legacy,
+                "1",
+                "attempt-x",
+                "managed",
+                None::<String>,
+                1i64,
+                "reconciled",
+                payload,
+            ],
+        )
+        .unwrap();
+    }
+}
+
+fn legacy_payload(task_id: u64) -> String {
+    let mut event = usage_event(&format!("uev_{task_id:016x}"));
+    event.task_id = task_id;
+    event.source_key = format!("manual:legacy:{task_id:016x}");
+    serde_json::to_string(&event).unwrap()
+}
+
+/// The four boundary ids that must never alias:
+/// `i64::MAX`, `i64::MAX + 1` (`0x8000_0000_0000_0000`), `u64::MAX - 1` and
+/// `u64::MAX` — three of which the old `min(i64::MAX as u64) as i64`
+/// projection collapsed onto one indexed value. Every id must round-trip
+/// exactly and a task-filtered page must return exactly its own event,
+/// identically on both backends.
+#[test]
+fn task_id_boundaries_roundtrip_and_never_cross_match_on_both_backends() {
+    let mem = MemoryBillingStore::new();
+    let dir = tempfile::tempdir().unwrap();
+    let sqlite = SqliteControlPlaneStore::open(&dir.path().join("b.sqlite")).unwrap();
+    let organization = org("org_a");
+    let boundaries = [
+        1u64,
+        i64::MAX as u64,
+        i64::MAX as u64 + 1,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+    for store in [&mem as &dyn BillingStore, &sqlite as &dyn BillingStore] {
+        for id in boundaries {
+            let mut event = usage_event(&format!("uev_{id:016x}"));
+            event.task_id = id;
+            event.source_key = format!("manual:boundary:{id:016x}");
+            assert_eq!(
+                store.append_usage_event(&event).unwrap(),
+                faktor_cloud::UsageAppend::Appended,
+                "task {id:#x} appends"
+            );
+        }
+        for id in boundaries {
+            let page = store
+                .usage_events_of_task(&organization, id, 0, 100)
+                .unwrap();
+            let found: Vec<String> = page
+                .iter()
+                .map(|row| row.event.id.as_str().to_string())
+                .collect();
+            assert_eq!(
+                found,
+                vec![format!("uev_{id:016x}")],
+                "task {id:#x} must see exactly its own row"
+            );
+            assert_eq!(page[0].event.task_id, id);
+        }
+        // The defect's exact aliasing pair: the query for i64::MAX + 1 must
+        // never return the i64::MAX row.
+        let high = store
+            .usage_events_of_task(&organization, i64::MAX as u64 + 1, 0, 100)
+            .unwrap();
+        assert_eq!(high.len(), 1);
+        assert_ne!(high[0].event.id.as_str(), format!("uev_{:016x}", i64::MAX));
+        assert_eq!(high[0].event.task_id, i64::MAX as u64 + 1);
+        // Ids that were never written never match (no clamping aliases them
+        // onto a written high/high boundary).
+        for unwritten in [i64::MAX as u64 - 1, u64::MAX - 2] {
+            assert!(
+                store
+                    .usage_events_of_task(&organization, unwritten, 0, 100)
+                    .unwrap()
+                    .is_empty(),
+                "unwritten task {unwritten:#x} matches nothing"
+            );
+        }
+        // The unfiltered page returns every payload identity exactly:
+        // storage does not mutate the identity the read paths report.
+        let all = store.usage_events(&organization, 0, 100).unwrap();
+        let seen: Vec<u64> = all.iter().map(|row| row.event.task_id).collect();
+        assert_eq!(seen, boundaries.to_vec());
+    }
+}
+
+/// Legacy v5 rows migrate to the exact reversible encoding — including the
+/// previously CLAMPED high ids, recovered from the payload (the only
+/// authority for ids above `i64::MAX`, which SQLite JSON cannot parse
+/// exactly) — and the index travels with the rebuilt column.
+#[test]
+fn legacy_integer_task_ids_migrate_to_exact_reversible_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("billing.db");
+    let ids = [
+        1u64,
+        7,
+        i64::MAX as u64,
+        i64::MAX as u64 + 1,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+    let payloads: Vec<String> = ids.iter().map(|id| legacy_payload(*id)).collect();
+    let rows: Vec<(i64, String, String)> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            // The old write path: everything above i64::MAX clamped.
+            let legacy = if *id > i64::MAX as u64 {
+                i64::MAX
+            } else {
+                *id as i64
+            };
+            (legacy, format!("uev_{id:016x}"), payloads[i].clone())
+        })
+        .collect();
+    legacy_task_id_db(&path, &rows);
+
+    let store = SqliteControlPlaneStore::open(&path).unwrap();
+    for id in ids {
+        let page = store
+            .usage_events_of_task(&org("org_a"), id, 0, 100)
+            .unwrap();
+        assert_eq!(page.len(), 1, "task {id:#x} must have exactly its own row");
+        assert_eq!(page[0].event.id.as_str(), format!("uev_{id:016x}"));
+        assert_eq!(page[0].event.task_id, id, "clamped ids recover exactly");
+    }
+    let all = store.usage_events(&org("org_a"), 0, 100).unwrap();
+    let seen: Vec<u64> = all.iter().map(|row| row.event.task_id).collect();
+    assert_eq!(seen, ids.to_vec());
+    drop(store);
+
+    // The committed schema is the canonical text encoding; the staging
+    // table is gone and the (org, task_id, event_seq) index still serves
+    // the task filter.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 6, "the ladder advanced to v6");
+    for id in ids {
+        let hex: String = conn
+            .query_row(
+                "SELECT task_id FROM usage_event WHERE id = ?1",
+                rusqlite::params![format!("uev_{id:016x}")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hex, task_id_text(id), "canonical 16-hex text for {id:#x}");
+    }
+    let staging: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'usage_event_v6_task_id_carry'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        staging, 0,
+        "the staging table is dropped after finalization"
+    );
+    let plan: Vec<String> = conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT event_seq, payload FROM usage_event
+             WHERE organization_id = ?1 AND task_id = ?2 AND event_seq > ?3
+             ORDER BY event_seq LIMIT ?4",
+        )
+        .unwrap()
+        .query_map(
+            rusqlite::params!["org_a", task_id_text(u64::MAX), 0i64, 10i64],
+            |r| r.get::<_, String>(3),
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("idx_usage_event_org_task")),
+        "the rebuilt task index still serves the filter: {plan:?}"
+    );
+    drop(conn);
+    // A second open (carry table gone) is a no-op: the identities stay
+    // exactly recoverable across restarts.
+    let store = SqliteControlPlaneStore::open(&path).unwrap();
+    for id in ids {
+        let page = store
+            .usage_events_of_task(&org("org_a"), id, 0, 100)
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].event.task_id, id);
+    }
+}
+
+/// A legacy row that cannot be recovered EXACTLY refuses the migration
+/// typed (no guessing, no partial conversion): the v6 transaction rolls
+/// back, the ladder stays at v5, and the legacy row is untouched.
+#[test]
+fn unrecoverable_legacy_task_ids_refuse_the_migration_without_guessing() {
+    let cases: Vec<(&str, i64, String, &str)> = vec![
+        (
+            "payload disagrees with an exact stored id",
+            9,
+            legacy_payload(5),
+            "disagrees with the exact stored id",
+        ),
+        (
+            "clamped sentinel with a lower payload id",
+            i64::MAX,
+            legacy_payload(5),
+            "clamped sentinel",
+        ),
+        (
+            "unreadable payload",
+            7,
+            "{ this is not json".to_string(),
+            "payload is unreadable",
+        ),
+        ("zero id", 0, legacy_payload(0), "not a valid non-zero id"),
+    ];
+    for (name, legacy, payload, needle) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("billing.db");
+        legacy_task_id_db(&path, &[(legacy, "uev_legacy".to_string(), payload)]);
+        let err = SqliteControlPlaneStore::open(&path)
+            .err()
+            .unwrap_or_else(|| panic!("{name}: the migration must refuse"));
+        let message = err.to_string();
+        assert!(message.contains(needle), "{name}: {message}");
+        assert!(
+            message.contains("refusing to guess") || message.contains("unreadable"),
+            "{name}: the refusal is explicit: {message}"
+        );
+        // Nothing migrated, nothing lost.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 5, "{name}: the ladder did not advance");
+        let stored: i64 = conn
+            .query_row("SELECT task_id FROM usage_event LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, legacy, "{name}: the legacy row is untouched");
+    }
 }

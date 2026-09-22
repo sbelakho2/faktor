@@ -202,9 +202,16 @@ pub struct PersistedIndexState {
 impl PersistedIndexState {
     pub fn parse(state_json: String, row_generation: i64) -> Result<Self, StateError> {
         let state = WorkspaceIndexState::from_row_json(&state_json)?;
+        // The column is a SIGNED integer but only ever carries a legal
+        // `u64`-domain generation; a negative value cannot describe any
+        // machine state and is typed corruption (the caller decides whether
+        // to reject or to record an explicit repair), never a silent 0.
+        let row_generation = u64::try_from(row_generation).map_err(|_| {
+            StateError::Corrupt(format!("negative persisted generation {row_generation}"))
+        })?;
         Ok(Self {
             state,
-            row_generation: row_generation.max(0) as u64,
+            row_generation,
             state_json,
         })
     }
@@ -369,5 +376,22 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn persisted_row_generation_rejects_negative_values() {
+        let json = WorkspaceIndexState::NotStarted.to_row_json();
+        let parsed = PersistedIndexState::parse(json.clone(), 3).unwrap();
+        assert_eq!(parsed.row_generation, 3);
+        assert_eq!(parsed.state_json, json);
+        assert!(PersistedIndexState::parse(json.clone(), 0).is_ok());
+        // A negative persisted generation is typed corruption naming the
+        // value, never a silent clamp to 0.
+        match PersistedIndexState::parse(json, -37).unwrap_err() {
+            StateError::Corrupt(message) => {
+                assert!(message.contains("-37"), "names the value: {message}");
+            }
+            other => panic!("negative generation must be typed corruption: {other:?}"),
+        }
     }
 }

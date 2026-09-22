@@ -99,6 +99,7 @@ pub(crate) fn worker_err(e: WorkerError) -> ApiError {
             ("not_found", 404, false)
         }
         WorkerError::WorkerVanished(_) => ("internal", 500, false),
+        WorkerError::UnsupportedSchema { .. } => ("unsupported_schema", 409, false),
         WorkerError::JobTerminal { .. } => ("job_terminal", 409, false),
     };
     ApiError {
@@ -297,13 +298,17 @@ pub(crate) async fn native_worker_heartbeat(
         Ok(org) => org,
         Err(e) => return wire_status(worker_err(e)),
     };
+    let generation = match JobGeneration::try_new(body.generation) {
+        Ok(generation) => generation,
+        Err(e) => return wire_status(worker_err(e)),
+    };
     match plane.heartbeat(
         &organization,
         &worker_id,
         &token,
         body.protocol_version,
         &lease_id,
-        JobGeneration(body.generation),
+        generation,
     ) {
         Ok(outcome) => Json(serde_json::json!({
             "ok": true,
@@ -576,13 +581,17 @@ pub(crate) async fn native_job_result(
         Ok(org) => org,
         Err(e) => return wire_status(worker_err(e)),
     };
+    let generation = match JobGeneration::try_new(body.generation) {
+        Ok(generation) => generation,
+        Err(e) => return wire_status(worker_err(e)),
+    };
     match plane.submit_result_with_claim(
         &organization,
         &worker_id,
         &token,
         body.protocol_version,
         &job_id,
-        JobGeneration(body.generation),
+        generation,
         &lease_id,
         &body.digest,
         body.outcome,

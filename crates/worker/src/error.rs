@@ -18,6 +18,16 @@ pub enum WorkerError {
     Backend(String),
     #[error("worker-plane store refused a malformed row: {0}")]
     Malformed(String),
+    /// A database written by a NEWER binary's schema ladder must never be
+    /// silently opened by an older one: the newer ladder may have changed
+    /// semantics this binary cannot honour. Downgrade is refused typed; the
+    /// recovery path is running the newer binary or restoring the
+    /// pre-upgrade restore point.
+    #[error(
+        "worker-plane store schema v{found} is newer than this binary's ladder v{maximum_supported}: \
+         downgrade refused (run the newer binary or restore the pre-upgrade restore point)"
+    )]
+    UnsupportedSchema { found: i64, maximum_supported: i64 },
     #[error("worker token is unknown")]
     UnknownToken,
     #[error("worker token was revoked")]
@@ -165,8 +175,8 @@ mod tests {
     fn superseded_lease_names_both_generations() {
         let e = WorkerError::SupersededLease {
             job: "job_1".into(),
-            generation: JobGeneration(1),
-            current: JobGeneration(2),
+            generation: JobGeneration::try_new(1).unwrap(),
+            current: JobGeneration::try_new(2).unwrap(),
         };
         let text = e.to_string();
         assert!(text.contains("generation 1"), "{text}");

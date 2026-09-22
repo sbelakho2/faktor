@@ -19,7 +19,7 @@ pub mod worker_plane;
 
 pub use api::{
     drain_chunk_stream, empty_evidence_store, serve, serve_arc, EvidenceStoreHandle, ServerDeps,
-    ServerDepsError, ServerHandle,
+    ServerDepsError, ServerHandle, ServerServeError, ServerShutdownError, ServerStatus,
 };
 pub use auth::{check_bearer, check_password, AuthToken, ServerPassword};
 pub use permission::{ChannelPermissionRequester, PendingPermission};
