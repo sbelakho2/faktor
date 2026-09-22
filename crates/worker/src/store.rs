@@ -831,6 +831,12 @@ impl WorkerStore for MemoryWorkerStore {
 /// The durable [`WorkerStore`] over its own SQLite database file: WAL +
 /// busy-timeout + an explicit migration cursor (`PRAGMA user_version`), and
 /// one writer mutex so every compound transition is serialized.
+///
+/// Generations are persisted in SIGNED SQLite `INTEGER` columns and compared
+/// in SQL, so they are mapped through [`JobGeneration::as_i64`] (exact for
+/// the type's `1..=i64::MAX` domain) and decoded back through
+/// [`JobGeneration::try_from_i64`] (a zero/negative column is typed
+/// corruption, never a silent wrap).
 pub struct SqliteWorkerStore {
     conn: Mutex<Connection>,
 }
@@ -899,30 +905,70 @@ fn durability(e: faktor_cloud::CloudStoreError) -> WorkerError {
     WorkerError::Backend(e.to_string())
 }
 
+/// Apply the worker-plane schema ladder. The version read, the pre-migration
+/// restore point and every migration statement run inside ONE `BEGIN
+/// IMMEDIATE` transaction: a second concurrent opener blocks on the write
+/// lock, then re-reads the (already advanced) version inside its own
+/// transaction and skips — it can never snapshot post-migration content and
+/// label it `-pre-migration-vN-`.
+///
+/// A database written by a NEWER binary (`user_version` above this binary's
+/// ladder) is refused typed, before any snapshot or write; a NEGATIVE
+/// `user_version` (impossible for a database this ladder created) is refused
+/// typed as corruption, before any snapshot or write.
 fn migrate(conn: &mut Connection, db_path: Option<&Path>) -> Result<(), WorkerError> {
-    let mut version: i64 = conn
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    let started: i64 = tx
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(backend)?;
-    if version >= WORKER_MIGRATIONS.len() as i64 {
+    let ladder = WORKER_MIGRATIONS.len() as i64;
+    // A NEGATIVE `user_version` cannot have been produced by any legitimate
+    // open of this ladder (SQLite stores the pragma as a SIGNED integer and
+    // every writer here only ever moves it forward from 0). It is durable
+    // corruption, and it is refused typed BEFORE the restore point and the
+    // ladder: a snapshot labeled `-pre-migration-v-1-` would be a
+    // trusted-looking way back to a state this binary never created, and
+    // treating it as v0 would silently migrate corrupt state.
+    if started < 0 {
+        return Err(WorkerError::Malformed(format!(
+            "worker-plane store schema user_version {started} is corrupt (negative): \
+             refusing to snapshot or migrate it"
+        )));
+    }
+    if started > ladder {
+        return Err(WorkerError::UnsupportedSchema {
+            found: started,
+            maximum_supported: ladder,
+        });
+    }
+    if started == ladder {
+        tx.commit().map_err(backend)?;
         return Ok(());
     }
-    // A schema transition on an EXISTING database is irreversible structural
-    // work: before the first pending migration runs, a verified pre-migration
-    // restore point must be durable. If it cannot be written and
-    // restore-verified, the migration is REFUSED (open fails).
-    if version > 0 {
-        if let Some(path) = db_path {
-            faktor_cloud::durability::migration_backup(conn, path, version).map_err(|e| {
-                WorkerError::Backend(format!(
-                    "refusing migration without a verified pre-migration restore point: {e}"
-                ))
-            })?;
-            #[cfg(test)]
-            if take_injected_crash(path) {
-                return Err(WorkerError::Backend(
-                    "injected crash after the pre-migration restore point".into(),
-                ));
-            }
+    let mut version = started;
+    // A schema transition (or FIRST creation) on a file-backed database runs
+    // only after a verified restore point of the ACTUAL predecessor state
+    // exists; if it cannot be written and self-verified, the migration is
+    // REFUSED. The snapshot runs on a SEPARATE read-only connection: the
+    // backup API cannot run on a connection that holds a write transaction,
+    // and the BEGIN IMMEDIATE lock we hold makes every reader see exactly
+    // this pre-migration state.
+    if let Some(path) = db_path {
+        let reader = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(backend)?;
+        faktor_cloud::durability::migration_backup(&reader, path, version).map_err(|e| {
+            WorkerError::Backend(format!(
+                "refusing migration without a verified pre-migration restore point: {e}"
+            ))
+        })?;
+        drop(reader);
+        #[cfg(test)]
+        if take_injected_crash(path) {
+            return Err(WorkerError::Backend(
+                "injected crash after the pre-migration restore point".into(),
+            ));
         }
     }
     for (i, sql) in WORKER_MIGRATIONS.iter().enumerate() {
@@ -930,16 +976,13 @@ fn migrate(conn: &mut Connection, db_path: Option<&Path>) -> Result<(), WorkerEr
         if version >= target {
             continue;
         }
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(backend)?;
         tx.execute_batch(sql)
             .map_err(|e| WorkerError::Backend(format!("worker migration v{target}: {e}")))?;
         tx.execute_batch(&format!("PRAGMA user_version = {target}"))
             .map_err(|e| WorkerError::Backend(format!("worker migration v{target} cursor: {e}")))?;
-        tx.commit().map_err(backend)?;
         version = target;
     }
+    tx.commit().map_err(backend)?;
     Ok(())
 }
 
@@ -1084,7 +1127,7 @@ impl WorkerStore for SqliteWorkerStore {
                 job.job_id.as_str(),
                 job.organization_id,
                 job.job_key.as_str(),
-                job.current_generation.as_u64() as i64,
+                job.current_generation.as_i64(),
                 job.state.as_str(),
                 encode(job)?
             ],
@@ -1131,7 +1174,7 @@ impl WorkerStore for SqliteWorkerStore {
                 payload = excluded.payload",
             params![
                 row.job_id.as_str(),
-                row.generation.as_u64() as i64,
+                row.generation.as_i64(),
                 row.organization_id,
                 row.state.as_str(),
                 encode(row)?
@@ -1150,7 +1193,7 @@ impl WorkerStore for SqliteWorkerStore {
         let payload: Option<String> = conn
             .query_row(
                 "SELECT payload FROM wp_generation WHERE job_id = ?1 AND generation = ?2",
-                params![job.as_str(), generation.as_u64() as i64],
+                params![job.as_str(), generation.as_i64()],
                 |r| r.get(0),
             )
             .optional()
@@ -1187,10 +1230,7 @@ impl WorkerStore for SqliteWorkerStore {
         let existing: Option<String> = tx
             .query_row(
                 "SELECT payload FROM wp_generation WHERE job_id = ?1 AND generation = ?2",
-                params![
-                    generation.job_id.as_str(),
-                    generation.generation.as_u64() as i64
-                ],
+                params![generation.job_id.as_str(), generation.generation.as_i64()],
                 |r| r.get(0),
             )
             .optional()
@@ -1202,7 +1242,7 @@ impl WorkerStore for SqliteWorkerStore {
                     "SELECT payload FROM wp_attempt WHERE job_id = ?1 AND generation = ?2 AND attempt = ?3",
                     params![
                         attempt.job_id.as_str(),
-                        attempt.generation.as_u64() as i64,
+                        attempt.generation.as_i64(),
                         attempt.attempt as i64
                     ],
                     |r| r.get(0),
@@ -1227,7 +1267,7 @@ impl WorkerStore for SqliteWorkerStore {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 generation.job_id.as_str(),
-                generation.generation.as_u64() as i64,
+                generation.generation.as_i64(),
                 generation.organization_id,
                 generation.state.as_str(),
                 encode(generation)?
@@ -1239,7 +1279,7 @@ impl WorkerStore for SqliteWorkerStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 attempt.job_id.as_str(),
-                attempt.generation.as_u64() as i64,
+                attempt.generation.as_i64(),
                 attempt.attempt as i64,
                 attempt.state.as_str(),
                 attempt.worker_id.as_ref().map(|w| w.as_str()),
@@ -1259,7 +1299,7 @@ impl WorkerStore for SqliteWorkerStore {
                 job.job_id.as_str(),
                 job.organization_id,
                 job.job_key.as_str(),
-                job.current_generation.as_u64() as i64,
+                job.current_generation.as_i64(),
                 job.state.as_str(),
                 encode(job)?
             ],
@@ -1285,7 +1325,7 @@ impl WorkerStore for SqliteWorkerStore {
         let payload: Option<String> = tx
             .query_row(
                 "SELECT payload FROM wp_generation WHERE job_id = ?1 AND generation = ?2",
-                params![job.as_str(), generation.as_u64() as i64],
+                params![job.as_str(), generation.as_i64()],
                 |r| r.get(0),
             )
             .optional()
@@ -1310,7 +1350,7 @@ impl WorkerStore for SqliteWorkerStore {
             "UPDATE wp_generation SET state = ?3, payload = ?4 WHERE job_id = ?1 AND generation = ?2",
             params![
                 job.as_str(),
-                generation.as_u64() as i64,
+                generation.as_i64(),
                 row.state.as_str(),
                 encode(&row)?
             ],
@@ -1365,7 +1405,7 @@ impl WorkerStore for SqliteWorkerStore {
         let existing: Option<String> = tx
             .query_row(
                 "SELECT payload FROM wp_lease WHERE job_id = ?1 AND generation = ?2",
-                params![lease.job_id.as_str(), lease.generation.as_u64() as i64],
+                params![lease.job_id.as_str(), lease.generation.as_i64()],
                 |r| r.get(0),
             )
             .optional()
@@ -1383,7 +1423,7 @@ impl WorkerStore for SqliteWorkerStore {
                 lease.lease_id.as_str(),
                 lease.organization_id,
                 lease.job_id.as_str(),
-                lease.generation.as_u64() as i64,
+                lease.generation.as_i64(),
                 lease.worker_id.as_str(),
                 lease.state.as_str(),
                 lease.expires_at_ms,
@@ -1396,7 +1436,7 @@ impl WorkerStore for SqliteWorkerStore {
         let generation_payload: Option<String> = tx
             .query_row(
                 "SELECT payload FROM wp_generation WHERE job_id = ?1 AND generation = ?2",
-                params![lease.job_id.as_str(), lease.generation.as_u64() as i64],
+                params![lease.job_id.as_str(), lease.generation.as_i64()],
                 |r| r.get(0),
             )
             .optional()
@@ -1409,7 +1449,7 @@ impl WorkerStore for SqliteWorkerStore {
                     "UPDATE wp_generation SET state = ?3, payload = ?4 WHERE job_id = ?1 AND generation = ?2",
                     params![
                         lease.job_id.as_str(),
-                        lease.generation.as_u64() as i64,
+                        lease.generation.as_i64(),
                         row.state.as_str(),
                         encode(&row)?
                     ],
@@ -1442,7 +1482,7 @@ impl WorkerStore for SqliteWorkerStore {
             .query_row(
                 "SELECT payload FROM wp_attempt
                  WHERE job_id = ?1 AND generation = ?2 ORDER BY attempt LIMIT 1",
-                params![lease.job_id.as_str(), lease.generation.as_u64() as i64],
+                params![lease.job_id.as_str(), lease.generation.as_i64()],
                 |r| r.get(0),
             )
             .optional()
@@ -1458,7 +1498,7 @@ impl WorkerStore for SqliteWorkerStore {
                      WHERE job_id = ?1 AND generation = ?2 AND attempt = ?3",
                     params![
                         attempt.job_id.as_str(),
-                        attempt.generation.as_u64() as i64,
+                        attempt.generation.as_i64(),
                         attempt.attempt as i64,
                         attempt.state.as_str(),
                         attempt.worker_id.as_ref().map(|w| w.as_str()),
@@ -1490,7 +1530,7 @@ impl WorkerStore for SqliteWorkerStore {
         let payload: Option<String> = conn
             .query_row(
                 "SELECT payload FROM wp_lease WHERE job_id = ?1 AND generation = ?2",
-                params![job.as_str(), generation.as_u64() as i64],
+                params![job.as_str(), generation.as_i64()],
                 |r| r.get(0),
             )
             .optional()
@@ -1627,7 +1667,7 @@ impl WorkerStore for SqliteWorkerStore {
                 payload = excluded.payload",
             params![
                 attempt.job_id.as_str(),
-                attempt.generation.as_u64() as i64,
+                attempt.generation.as_i64(),
                 attempt.attempt as i64,
                 attempt.state.as_str(),
                 attempt.worker_id.as_ref().map(|w| w.as_str()),
@@ -1649,7 +1689,7 @@ impl WorkerStore for SqliteWorkerStore {
         let payload: Option<String> = conn
             .query_row(
                 "SELECT payload FROM wp_attempt WHERE job_id = ?1 AND generation = ?2 AND attempt = ?3",
-                params![job.as_str(), generation.as_u64() as i64, attempt as i64],
+                params![job.as_str(), generation.as_i64(), attempt as i64],
                 |r| r.get(0),
             )
             .optional()
@@ -1717,7 +1757,7 @@ impl WorkerStore for SqliteWorkerStore {
         let payload: Option<String> = tx
             .query_row(
                 "SELECT payload FROM wp_attempt WHERE job_id = ?1 AND generation = ?2 AND attempt = ?3",
-                params![job.as_str(), generation.as_u64() as i64, attempt as i64],
+                params![job.as_str(), generation.as_i64(), attempt as i64],
                 |r| r.get(0),
             )
             .optional()
@@ -1749,7 +1789,7 @@ impl WorkerStore for SqliteWorkerStore {
              WHERE job_id = ?1 AND generation = ?2 AND attempt = ?3",
             params![
                 job.as_str(),
-                generation.as_u64() as i64,
+                generation.as_i64(),
                 attempt as i64,
                 row.state.as_str(),
                 row.worker_id.as_ref().map(|w| w.as_str()),
@@ -1770,7 +1810,7 @@ impl WorkerStore for SqliteWorkerStore {
         let existing: Option<String> = tx
             .query_row(
                 "SELECT payload FROM wp_result WHERE job_id = ?1 AND generation = ?2",
-                params![result.job_id.as_str(), result.generation.as_u64() as i64],
+                params![result.job_id.as_str(), result.generation.as_i64()],
                 |r| r.get(0),
             )
             .optional()
@@ -1846,7 +1886,7 @@ impl WorkerStore for SqliteWorkerStore {
              VALUES (?1, ?2, ?3, ?4)",
             params![
                 result.job_id.as_str(),
-                result.generation.as_u64() as i64,
+                result.generation.as_i64(),
                 job.organization_id,
                 encode(result)?
             ],
@@ -1862,7 +1902,7 @@ impl WorkerStore for SqliteWorkerStore {
         let generation_payload: Option<String> = tx
             .query_row(
                 "SELECT payload FROM wp_generation WHERE job_id = ?1 AND generation = ?2",
-                params![result.job_id.as_str(), result.generation.as_u64() as i64],
+                params![result.job_id.as_str(), result.generation.as_i64()],
                 |r| r.get(0),
             )
             .optional()
@@ -1877,7 +1917,7 @@ impl WorkerStore for SqliteWorkerStore {
                 "UPDATE wp_generation SET state = ?3, payload = ?4 WHERE job_id = ?1 AND generation = ?2",
                 params![
                     result.job_id.as_str(),
-                    result.generation.as_u64() as i64,
+                    result.generation.as_i64(),
                     row.state.as_str(),
                     encode(&row)?
                 ],
@@ -1893,7 +1933,7 @@ impl WorkerStore for SqliteWorkerStore {
         let attempt_payload: Option<String> = tx
             .query_row(
                 "SELECT payload FROM wp_attempt WHERE job_id = ?1 AND generation = ?2 ORDER BY attempt LIMIT 1",
-                params![result.job_id.as_str(), result.generation.as_u64() as i64],
+                params![result.job_id.as_str(), result.generation.as_i64()],
                 |r| r.get(0),
             )
             .optional()
@@ -1908,7 +1948,7 @@ impl WorkerStore for SqliteWorkerStore {
                      WHERE job_id = ?1 AND generation = ?2 AND attempt = ?3",
                     params![
                         attempt.job_id.as_str(),
-                        attempt.generation.as_u64() as i64,
+                        attempt.generation.as_i64(),
                         attempt.attempt as i64,
                         encode(&attempt)?
                     ],
@@ -1929,7 +1969,7 @@ impl WorkerStore for SqliteWorkerStore {
         let payload: Option<String> = conn
             .query_row(
                 "SELECT payload FROM wp_result WHERE job_id = ?1 AND generation = ?2",
-                params![job.as_str(), generation.as_u64() as i64],
+                params![job.as_str(), generation.as_i64()],
                 |r| r.get(0),
             )
             .optional()
@@ -1951,7 +1991,7 @@ impl WorkerStore for SqliteWorkerStore {
                 entry.kind,
                 entry.job_id,
                 entry.worker_id,
-                entry.generation.map(|g| g.as_u64() as i64),
+                entry.generation.map(|g| g.as_i64()),
                 entry.at_ms,
                 entry.detail
             ],
@@ -1977,21 +2017,36 @@ impl WorkerStore for SqliteWorkerStore {
             .map_err(backend)?;
         let rows = stmt
             .query_map(params![organization, after_seq, limit as i64], |r| {
-                Ok(JournalEntry {
-                    seq: r.get(0)?,
-                    organization_id: r.get(1)?,
-                    kind: r.get(2)?,
-                    job_id: r.get(3)?,
-                    worker_id: r.get(4)?,
-                    generation: r.get::<_, Option<i64>>(5)?.map(|g| JobGeneration(g as u64)),
-                    at_ms: r.get(6)?,
-                    detail: r.get(7)?,
-                })
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, String>(7)?,
+                ))
             })
             .map_err(backend)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(backend)?;
-        Ok(rows)
+        rows.into_iter()
+            .map(
+                |(seq, organization_id, kind, job_id, worker_id, generation, at_ms, detail)| {
+                    Ok(JournalEntry {
+                        seq,
+                        organization_id,
+                        kind,
+                        job_id,
+                        worker_id,
+                        generation: generation.map(JobGeneration::try_from_i64).transpose()?,
+                        at_ms,
+                        detail,
+                    })
+                },
+            )
+            .collect()
     }
 }
 
@@ -2405,5 +2460,325 @@ mod tests {
         let loser = store.try_accept_lease(&other).unwrap().unwrap();
         assert_eq!(loser.lease_id, lease.lease_id);
         assert_eq!(loser.worker_id, lease.worker_id);
+    }
+
+    /// P1/P2: generations live in SIGNED SQLite `INTEGER` columns and are
+    /// compared in SQL, so the exact `1..=i64::MAX` domain round-trips
+    /// byte-exactly, the ordering survives a reopen, and the max-generation
+    /// query sees the exact persisted value.
+    #[test]
+    fn generation_persistence_is_exact_ordered_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workers.db");
+        let store = SqliteWorkerStore::open(&path).unwrap();
+        let j = job("job_1", "org_1");
+        store.put_job(&j).unwrap();
+        let max = JobGeneration::try_new(i64::MAX as u64).unwrap();
+        let second = JobGeneration::try_new(2).unwrap();
+        for generation in [JobGeneration::FIRST, second, max] {
+            store
+                .put_generation(&JobGenerationRow {
+                    job_id: j.job_id.clone(),
+                    organization_id: "org_1".into(),
+                    generation,
+                    state: GenerationState::Assigned,
+                    created_ms: 1,
+                    ended_ms: None,
+                    reason: None,
+                })
+                .unwrap();
+        }
+        drop(store);
+        let store = SqliteWorkerStore::open(&path).unwrap();
+        assert_eq!(
+            store
+                .generation(&j.job_id, max)
+                .unwrap()
+                .unwrap()
+                .generation,
+            max,
+            "i64::MAX round-trips exactly across a reopen"
+        );
+        let ordered: Vec<u64> = store
+            .generations(&j.job_id)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.generation.as_u64())
+            .collect();
+        assert_eq!(ordered, vec![1, 2, i64::MAX as u64]);
+        let persisted: Option<i64> = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT MAX(generation) FROM wp_generation WHERE job_id = ?1",
+                params![j.job_id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            persisted,
+            Some(i64::MAX),
+            "the persisted maximum is the exact signed value"
+        );
+    }
+
+    /// A persisted generation outside the domain is typed corruption on
+    /// read, never a wrap into a valid-looking generation.
+    #[test]
+    fn out_of_domain_persisted_generation_is_a_typed_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workers.db");
+        let store = SqliteWorkerStore::open(&path).unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "INSERT INTO wp_journal (organization_id, kind, job_id, worker_id, generation, at_ms, detail)
+                 VALUES ('org_1', 'accepted', 'job_1', NULL, -37, 1, 'hostile')",
+                [],
+            )
+            .unwrap();
+        }
+        match store.journal("org_1", None, 10).unwrap_err() {
+            WorkerError::Malformed(message) => {
+                assert!(message.contains("-37"), "names the value: {message}");
+            }
+            other => panic!("a negative persisted generation must be typed corruption: {other}"),
+        }
+    }
+
+    /// Every migration restore point this database owns, with the version
+    /// its NAME claims and the version its CONTENT holds (they must agree).
+    fn migration_points(db_path: &Path) -> Vec<(String, i64, i64)> {
+        faktor_cloud::durability::list_backups(db_path)
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .contains(faktor_cloud::durability::MIGRATION_MARKER)
+            })
+            .map(|p| {
+                let name = p.file_name().unwrap().to_str().unwrap().to_string();
+                let claimed: i64 = name
+                    .rsplit_once(faktor_cloud::durability::MIGRATION_MARKER)
+                    .and_then(|(_, rest)| {
+                        rest.chars()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect::<String>()
+                            .parse()
+                            .ok()
+                    })
+                    .expect("a migration point carries a parseable version");
+                let conn =
+                    Connection::open_with_flags(&p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                        .unwrap();
+                let content: i64 = conn
+                    .query_row("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap();
+                (name, claimed, content)
+            })
+            .collect()
+    }
+
+    /// P1 downgrade protection: a database written by a NEWER schema ladder
+    /// is refused typed (naming both versions) and left untouched — no writes
+    /// and no restore-point snapshot of a state this binary cannot honour.
+    #[test]
+    fn opening_a_newer_schema_is_refused_typed_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workers.db");
+        let newer = WORKER_MIGRATIONS.len() as i64 + 1;
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!("PRAGMA user_version = {newer}"))
+                .unwrap();
+        }
+        let err = SqliteWorkerStore::open(&path)
+            .err()
+            .expect("a newer schema must be refused");
+        match &err {
+            WorkerError::UnsupportedSchema {
+                found,
+                maximum_supported,
+            } => {
+                assert_eq!(*found, newer);
+                assert_eq!(*maximum_supported, WORKER_MIGRATIONS.len() as i64);
+            }
+            other => panic!("downgrade must be refused typed, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(
+            message.contains("newer than this binary's ladder"),
+            "{message}"
+        );
+        assert!(message.contains("downgrade refused"), "{message}");
+        assert!(message.contains(&format!("v{newer}")), "{message}");
+        assert!(
+            message.contains(&format!("v{}", WORKER_MIGRATIONS.len())),
+            "{message}"
+        );
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, newer, "the refused open changed nothing");
+        drop(conn);
+        assert!(
+            migration_points(&path).is_empty(),
+            "a newer schema is never snapshotted as a trusted way back"
+        );
+    }
+
+    /// P1 corruption protection: a NEGATIVE `user_version` cannot be produced
+    /// by any legitimate open (SQLite stores the cursor as a signed integer).
+    /// It is refused typed BEFORE the restore point and the ladder, so no
+    /// snapshot labeled `-pre-migration-v-1-` is ever written and the database
+    /// is left unchanged; 0 and the ladder version still open as before.
+    #[test]
+    fn negative_schema_version_is_refused_typed_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workers.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA user_version = -1").unwrap();
+        }
+        let before = {
+            let conn = Connection::open(&path).unwrap();
+            faktor_cloud::durability::canonical_fingerprint(&conn).unwrap()
+        };
+        let err = SqliteWorkerStore::open(&path)
+            .err()
+            .expect("a negative schema version must be refused");
+        match &err {
+            WorkerError::Malformed(message) => {
+                assert!(
+                    message.contains("-1"),
+                    "the refusal names the found value: {message}"
+                );
+                assert!(message.contains("corrupt"), "{message}");
+            }
+            other => panic!("a negative schema version must be refused typed, got {other:?}"),
+        }
+        assert!(
+            migration_points(&path).is_empty(),
+            "the refused open writes no restore point"
+        );
+        assert!(
+            faktor_cloud::durability::list_backups(&path).is_empty(),
+            "the refused open writes no backup at all"
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, -1, "the refused open changed nothing");
+            assert_eq!(
+                faktor_cloud::durability::canonical_fingerprint(&conn).unwrap(),
+                before,
+                "the refused open left the database unchanged"
+            );
+        }
+        // A clean cursor still opens: 0 migrates the whole ladder and the
+        // ladder version reopens as a no-op (no new restore point).
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA user_version = 0").unwrap();
+        }
+        drop(SqliteWorkerStore::open(&path).expect("0 still migrates"));
+        assert_eq!(
+            schema_version(&SqliteWorkerStore::open(&path).unwrap()).unwrap(),
+            WORKER_MIGRATIONS.len() as i64
+        );
+        let points = migration_points(&path);
+        assert_eq!(points.len(), 1, "0 -> ladder writes its v0 restore point");
+        drop(SqliteWorkerStore::open(&path).expect("the ladder still reopens"));
+        assert_eq!(
+            migration_points(&path),
+            points,
+            "an at-ladder reopen writes no new restore point"
+        );
+    }
+
+    /// A database already AT this binary's ladder opens; re-opening neither
+    /// migrates nor writes another restore point (the ladder is a no-op).
+    #[test]
+    fn a_database_at_the_ladder_reopens_without_a_new_restore_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workers.db");
+        drop(SqliteWorkerStore::open(&path).unwrap());
+        let before = migration_points(&path);
+        let store = SqliteWorkerStore::open(&path).unwrap();
+        assert_eq!(
+            schema_version(&store).unwrap(),
+            WORKER_MIGRATIONS.len() as i64
+        );
+        assert_eq!(
+            migration_points(&path),
+            before,
+            "an at-ladder reopen writes no new restore point"
+        );
+    }
+
+    /// Adversarial concurrency: two openers race the migration. One applies
+    /// the ladder and snapshots the TRUE predecessor (v1); the loser blocks
+    /// on the write lock, re-reads the advanced version inside its own
+    /// transaction and skips — so exactly one point is labeled v1 and every
+    /// point's name claim matches its content.
+    #[test]
+    fn concurrent_openers_serialize_the_migration_and_label_one_restore_point() {
+        use std::sync::Barrier;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workers.db");
+        drop(SqliteWorkerStore::open(&path).unwrap());
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA user_version = 1").unwrap();
+        }
+        let barrier = std::sync::Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                SqliteWorkerStore::open(&path).map(|_| ())
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .unwrap()
+                .expect("both concurrent openers must succeed");
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                version,
+                WORKER_MIGRATIONS.len() as i64,
+                "the ladder applied"
+            );
+        }
+        let points = migration_points(&path);
+        for (name, claimed, content) in &points {
+            assert_eq!(
+                claimed, content,
+                "{name} claims v{claimed} but holds v{content}"
+            );
+        }
+        let v1: Vec<&(String, i64, i64)> = points
+            .iter()
+            .filter(|(n, _, _)| n.contains("-pre-migration-v1-"))
+            .collect();
+        assert_eq!(
+            v1.len(),
+            1,
+            "exactly one opener snapshotted the v1 predecessor: {points:?}"
+        );
+        assert_eq!(v1[0].2, 1, "the v1 point holds the true predecessor state");
     }
 }

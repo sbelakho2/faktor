@@ -1588,6 +1588,11 @@ const SERVE_DRIVE_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::fro
 
 /// The ONE post-signal daemon shutdown sequence (serve):
 ///
+/// 0. stop the native listener (when its handle is passed): the handle OWNS
+///    the serve task, so this is the bounded graceful join
+///    ([`faktor_server::api::ServerHandle::shutdown`]) — never a detached
+///    future; an unexpected death is logged with its typed status BEFORE the
+///    stop, so it is never masked as a requested one;
 /// 1. stop the worker plane (when enabled): the slot hands back the owned
 ///    `WorkerPlaneHandle`, which requests graceful shutdown and JOINS its
 ///    serve task within
@@ -1631,6 +1636,7 @@ const SERVE_DRIVE_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::fro
 #[allow(clippy::too_many_arguments)]
 async fn shutdown_serving_daemon(
     tasks: &Arc<faktor_orchestrator::runtime::task_executor::TaskExecutor>,
+    server: Option<faktor_server::api::ServerHandle>,
     worker_plane: Option<faktor_server::api::WorkerPlaneListener>,
     index: Option<Arc<faktor_index::IndexService>>,
     agent: Option<&Arc<AgentRuntime>>,
@@ -1639,6 +1645,24 @@ async fn shutdown_serving_daemon(
     billing_report_task: Option<tokio::task::JoinHandle<()>>,
     backup_task: tokio::task::JoinHandle<()>,
 ) -> faktor_orchestrator::runtime::task_executor::DriveDrainReport {
+    // Stop the native listener first (the primary intake): the handle OWNS
+    // the serve task, so this is a bounded join, never a detached future.
+    // Health is queried BEFORE the request so an unexpected death is named,
+    // not masked by the stop (the same contract the worker plane follows
+    // below).
+    if let Some(server) = server {
+        let health = server.status();
+        if health.is_unavailable() {
+            tracing::error!("{}", health.health_line());
+        }
+        match server.shutdown().await {
+            Ok(()) => tracing::info!("native server: stopped (bounded graceful join)"),
+            Err(error) => tracing::error!(
+                code = error.code(),
+                "native server: shutdown failed: {error}"
+            ),
+        }
+    }
     // Stop the remote intake first: the slot owns the serve task, so this
     // is a bounded join, never a detached listener. Health is queried BEFORE
     // the request so an unexpected death is named, not masked by the stop;
@@ -3021,13 +3045,17 @@ async fn serve_impl(
         // reservation ledger; BYOK providers are classified and never
         // debited. Without this install the agent dispatch path is exactly
         // the pre-billing path (no debit call exists).
+        // A poisoned authority slot must refuse daemon startup (fail-closed):
+        // silently continuing would run managed traffic without the debit
+        // authority it is configured to have.
         graph
             .agent
             .set_provider_debits(Some(Arc::new(billing_debits::CloudAttemptDebits::new(
                 service.clone(),
                 organization.clone(),
                 account.clone(),
-            ))));
+            ))))
+            .map_err(|e| format!("installing the agent debit authority: {e}"))?;
         billing_gate = Some(Arc::new(BillingAdmissionGate::new(
             service.clone(),
             organization,
@@ -3308,6 +3336,7 @@ async fn serve_impl(
             let _ = rx.await;
             shutdown_serving_daemon(
                 &graph.tasks,
+                Some(handle),
                 worker_plane_listener,
                 graph.index.clone(),
                 Some(&graph.agent),
@@ -3329,6 +3358,7 @@ async fn serve_impl(
             spawn_force_exit_watchdog();
             shutdown_serving_daemon(
                 &graph.tasks,
+                Some(handle),
                 worker_plane_listener,
                 graph.index.clone(),
                 Some(&graph.agent),
@@ -7216,6 +7246,38 @@ mod tests {
             .unwrap();
         // ACP session/prompt.
         rig.backend.prompt(&sid, "ping").unwrap();
+        // Durable-point synchronization (load flake): the ACP prompt returns
+        // when the turn MACHINE settles, but the drive's durable turn record
+        // can still be ACTIVE for a moment (the detached drive resolves it on
+        // its way out). A prompt issued in that window is correctly refused by
+        // the executor's interrupted-run guard ("a live shadow ... and an
+        // active drive"), so wait on the SAME durable point the guard reads
+        // (the session's active turn record) before issuing the SDK call. The
+        // retained shadow row is expected — a later prompt settles it. Bounded:
+        // a run that never settles fails loudly here.
+        {
+            let sid = SessionId::new(sid.parse().unwrap());
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let mid_turn = rig
+                    .session
+                    .get_session(sid)
+                    .unwrap()
+                    .expect("the session exists")
+                    .active_turn_record()
+                    .unwrap()
+                    .is_some();
+                if !mid_turn {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the first ACP run's drive never settled (active turn record \
+                     still durable)"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
         // The SDK compat surface's exact service call (the server builds
         // its facade over the same deps and calls `prompt`).
         let request = faktor_server::native::PromptRequest {
@@ -8133,6 +8195,7 @@ mod tests {
             drain_bound,
             shutdown_serving_daemon(
                 &tasks,
+                None,
                 None,
                 None,
                 None,
@@ -11541,6 +11604,7 @@ mod tests {
                 shutdown_serving_daemon(
                     tasks,
                     None,
+                    None,
                     Some(index.clone()),
                     None,
                     tokio::spawn(std::future::pending::<()>()),
@@ -11635,6 +11699,7 @@ mod tests {
                 std::time::Duration::from_secs(60),
                 shutdown_serving_daemon(
                     tasks,
+                    None,
                     None,
                     None,
                     Some(agent),

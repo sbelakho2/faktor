@@ -1178,6 +1178,14 @@ const CP_MIGRATIONS: &[&str] = &[
     // observe it (SQLite pragmas are connection-scoped and invisible to a
     // separate probe connection). Owned by the durability stack.
     crate::durability::POLICY_SCHEMA_V5,
+    // v6 — the usage ledger's task identity (P1 identity-integrity): rebuild
+    // `usage_event.task_id` from the lossy signed INTEGER projection to the
+    // reversible fixed-width 16-hex-digit TEXT encoding. The rebuild is
+    // staged by SQL (the billing domain owns this ladder slot) and finalized
+    // in Rust BEFORE the migration transaction commits, because SQLite JSON
+    // cannot carry ids above i64::MAX exactly; a row that cannot be
+    // recovered exactly refuses the whole migration rather than guessing.
+    crate::billing_store::BILLING_TASK_ID_TEXT_SCHEMA_V6,
 ];
 
 impl SqliteControlPlaneStore {
@@ -1511,6 +1519,9 @@ fn prune_idempotency_tick(conn: &Connection) -> Result<usize, CloudStoreError> {
 /// concurrent opener blocks on the write lock, then re-reads the (already
 /// advanced) version inside its own transaction and skips — it can never
 /// snapshot post-migration content and label it `-pre-migration-vN-`.
+///
+/// A NEGATIVE `user_version` (impossible for a database this ladder created)
+/// is refused typed as corruption, before any snapshot or migration.
 fn migrate(conn: &mut Connection, db_path: Option<&Path>) -> Result<i64, CloudStoreError> {
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -1519,6 +1530,19 @@ fn migrate(conn: &mut Connection, db_path: Option<&Path>) -> Result<i64, CloudSt
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(backend)?;
     let ladder = CP_MIGRATIONS.len() as i64;
+    // A NEGATIVE `user_version` cannot have been produced by any legitimate
+    // open of this ladder (SQLite stores the pragma as a SIGNED integer and
+    // every writer here only ever moves it forward from 0). It is durable
+    // corruption, and it is refused typed BEFORE the restore point and the
+    // ladder: a snapshot labeled `-pre-migration-v-1-` would be a
+    // trusted-looking way back to a state this binary never created, and
+    // treating it as v0 would silently migrate corrupt state.
+    if started < 0 {
+        return Err(CloudStoreError::Malformed(format!(
+            "control-plane database schema user_version {started} is corrupt (negative): \
+             refusing to snapshot or migrate it"
+        )));
+    }
     // A database written by a NEWER binary must never be silently opened by
     // an older one: the newer ladder may have changed semantics this binary
     // cannot honour. Downgrade is refused typed and diagnosed by `doctor`;
@@ -1569,6 +1593,15 @@ fn migrate(conn: &mut Connection, db_path: Option<&Path>) -> Result<i64, CloudSt
             .map_err(|e| CloudStoreError::Backend(format!("cp migration v{target} cursor: {e}")))?;
         version = target;
     }
+    // The billing domain's v6 rebuild stages every legacy task id and
+    // resolves its exact reversible text encoding from the row payload in
+    // Rust (SQLite JSON cannot carry ids above i64::MAX exactly). This runs
+    // inside the SAME migration transaction and is a no-op once finalized; a
+    // row that cannot be recovered exactly fails the open with the database
+    // left at its pre-migration version. See
+    // `billing_store::finalize_task_id_text_migration`.
+    crate::billing_store::finalize_task_id_text_migration(&tx)
+        .map_err(|e| CloudStoreError::Backend(format!("cp migration v6 task-id finalize: {e}")))?;
     tx.commit().map_err(backend)?;
     Ok(started)
 }
@@ -2836,6 +2869,86 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, newer, "the refused open changed nothing");
+    }
+
+    /// P1 corruption protection: a NEGATIVE `user_version` cannot be produced
+    /// by any legitimate open (SQLite stores the cursor as a signed integer).
+    /// It is refused typed BEFORE the restore point and the ladder, so no
+    /// snapshot labeled `-pre-migration-v-1-` is ever written and the database
+    /// is left unchanged; 0 and the ladder version still open as before.
+    #[test]
+    fn negative_schema_version_is_refused_typed_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            crate::durability::apply_policy(&conn).unwrap();
+            conn.execute_batch("PRAGMA user_version = -1").unwrap();
+        }
+        let before = {
+            let conn = Connection::open(&path).unwrap();
+            crate::durability::canonical_fingerprint(&conn).unwrap()
+        };
+        let err = SqliteControlPlaneStore::open(&path)
+            .err()
+            .expect("a negative schema version must be refused");
+        match &err {
+            CloudStoreError::Malformed(message) => {
+                assert!(
+                    message.contains("-1"),
+                    "the refusal names the found value: {message}"
+                );
+                assert!(message.contains("corrupt"), "{message}");
+            }
+            other => panic!("a negative schema version must be refused typed, got {other:?}"),
+        }
+        // No migration, no restore point, not even the open/backup tick ran:
+        // the refused open wrote nothing at all.
+        assert!(
+            crate::durability::list_backups(&path).is_empty(),
+            "the refused open writes no snapshot"
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, -1, "the refused open changed nothing");
+            assert_eq!(
+                crate::durability::canonical_fingerprint(&conn).unwrap(),
+                before,
+                "the refused open left the database unchanged"
+            );
+        }
+        // A clean 0 still migrates the ladder, and the ladder version still
+        // reopens as a no-op.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA user_version = 0").unwrap();
+        }
+        drop(SqliteControlPlaneStore::open(&path).expect("0 still migrates"));
+        let migration_points = || -> usize {
+            crate::durability::list_backups(&path)
+                .into_iter()
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .contains(crate::durability::MIGRATION_MARKER)
+                })
+                .count()
+        };
+        assert_eq!(
+            migration_points(),
+            1,
+            "0 -> ladder writes its v0 restore point"
+        );
+        drop(SqliteControlPlaneStore::open(&path).expect("the ladder still reopens"));
+        assert_eq!(
+            migration_points(),
+            1,
+            "an at-ladder reopen writes no new restore point"
+        );
     }
 
     /// F5: two concurrent openers serialize on the migration write lock. The

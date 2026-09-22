@@ -15,11 +15,14 @@
 //! tests and the daemon entry points consume.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::routing::{get, post};
 use axum::Router;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use faktor_agent::AgentRuntime;
@@ -522,11 +525,401 @@ impl ServerDeps {
     }
 }
 
+/// A native-server serve failure: the accept/serve loop returned an error, or
+/// the owned serve task ended without a typed result (panic/abort).
+#[derive(Debug, thiserror::Error)]
+pub enum ServerServeError {
+    /// The serve loop returned an error. The production future is never
+    /// `.ok()`-discarded: the typed error is recorded in the handle's health
+    /// status and returned by [`ServerHandle::shutdown`].
+    #[error("native server serve {addr}: {source}")]
+    Serve {
+        addr: SocketAddr,
+        source: std::io::Error,
+    },
+    /// The serve task ended without a typed serve result: it panicked, or it
+    /// was aborted/cancelled out from under its owner.
+    #[error("native server task {addr} ended without a typed result: {detail}")]
+    Task { addr: SocketAddr, detail: String },
+}
+
+impl ServerServeError {
+    /// The stable machine code of the failure (the same code recorded in
+    /// [`ServerStatus::Unavailable`]).
+    pub const fn code(&self) -> &'static str {
+        match self {
+            ServerServeError::Serve { .. } => "server_serve_failed",
+            ServerServeError::Task { .. } => "server_task_failed",
+        }
+    }
+}
+
+/// Bound on the native server's graceful-shutdown join: the owned serve task
+/// is joined within this window (a straggler is aborted), so shutdown is
+/// never unbounded.
+pub const SERVER_SHUTDOWN_BOUND: Duration = Duration::from_secs(5);
+/// Bound on reaping the serve task after the graceful window elapsed.
+pub const SERVER_ABORT_REAP_BOUND: Duration = Duration::from_secs(1);
+
+/// A native-server shutdown failure: the owned serve task's typed result, or
+/// the bounded join elapsing.
+#[derive(Debug, thiserror::Error)]
+pub enum ServerShutdownError {
+    /// The serve task ended with a typed error (including an unexpected death
+    /// that happened BEFORE the shutdown request); a clean graceful stop is
+    /// the only `Ok`.
+    #[error(transparent)]
+    Serve(#[from] ServerServeError),
+    /// The bounded graceful-shutdown join elapsed; the straggler was aborted
+    /// and reaped, so shutdown was still bounded.
+    #[error(
+        "native server shutdown for {addr} exceeded the bounded {bound:?} join; \
+         the serve task was aborted"
+    )]
+    ShutdownTimeout { addr: SocketAddr, bound: Duration },
+}
+
+impl ServerShutdownError {
+    /// The stable machine code of the failure (the same code recorded in
+    /// [`ServerStatus::Unavailable`]).
+    pub const fn code(&self) -> &'static str {
+        match self {
+            ServerShutdownError::Serve(error) => error.code(),
+            ServerShutdownError::ShutdownTimeout { .. } => "server_shutdown_timeout",
+        }
+    }
+}
+
+/// The daemon-queryable liveness snapshot of the native listener.
+///
+/// The owned serve task records ONE terminal snapshot when it ends; until
+/// then the listener is [`ServerStatus::Serving`]. An unexpected end is
+/// ALWAYS [`ServerStatus::Unavailable`] carrying the typed error code — a
+/// dead native socket can never masquerade as a live one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerStatus {
+    /// The listener task is alive: requests are accepted.
+    Serving,
+    /// The task ended before any graceful-shutdown request. The listener is
+    /// UNAVAILABLE; `code` is the typed [`ServerServeError::code`] (or
+    /// `server_task_died` for a panic/abort) and `message` names the cause.
+    Unavailable { code: &'static str, message: String },
+    /// The task ended after (and because of) a graceful-shutdown request.
+    Stopped,
+}
+
+impl ServerStatus {
+    /// `true` only while the listener task is alive and accepting requests.
+    pub fn is_alive(&self) -> bool {
+        matches!(self, ServerStatus::Serving)
+    }
+
+    /// `true` when the listener died unexpectedly (never for a clean stop).
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, ServerStatus::Unavailable { .. })
+    }
+
+    /// The stable machine code of an unavailable listener (the typed error's
+    /// code); `None` while serving or after a clean stop.
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            ServerStatus::Unavailable { code, .. } => Some(code),
+            ServerStatus::Serving | ServerStatus::Stopped => None,
+        }
+    }
+
+    /// One bounded health/audit line for the daemon log.
+    pub fn health_line(&self) -> String {
+        match self {
+            ServerStatus::Serving => "native server: serving".to_string(),
+            ServerStatus::Stopped => "native server: stopped".to_string(),
+            ServerStatus::Unavailable { code, message } => {
+                format!("native server: UNAVAILABLE [{code}] {message}")
+            }
+        }
+    }
+}
+
+/// The shared owner state of one native-server serve task: the one-shot
+/// graceful shutdown signal plus the terminal status recorded exactly once by
+/// the task itself.
+#[derive(Debug)]
+struct ServerShared {
+    shutdown: Mutex<Option<oneshot::Sender<()>>>,
+    shutdown_requested: AtomicBool,
+    terminal: Mutex<Option<ServerStatus>>,
+}
+
+impl ServerShared {
+    fn new(shutdown: oneshot::Sender<()>) -> Self {
+        Self {
+            shutdown: Mutex::new(Some(shutdown)),
+            shutdown_requested: AtomicBool::new(false),
+            terminal: Mutex::new(None),
+        }
+    }
+
+    /// Request graceful shutdown. Idempotent: the first call wins and sends
+    /// the one-shot signal; every later call is a no-op. (A send failure only
+    /// means the task already ended — its result is surfaced by the join.)
+    fn request_shutdown(&self) -> bool {
+        if self.shutdown_requested.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        let sender = self
+            .shutdown
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
+        true
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::SeqCst)
+    }
+
+    /// Record the single terminal status (first writer wins; the serve task
+    /// records exactly once, before its `JoinHandle` completes).
+    fn record(&self, status: ServerStatus) {
+        let mut slot = self
+            .terminal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_none() {
+            *slot = Some(status);
+        }
+    }
+
+    fn terminal(&self) -> Option<ServerStatus> {
+        self.terminal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+/// The live handle of the native listener: it OWNS the serve task's
+/// `JoinHandle<Result<(), ServerServeError>>` (never dropped or detached)
+/// plus the one-shot graceful-shutdown signal. The task records its terminal
+/// disposition in the shared status BEFORE its `JoinHandle` completes, so
+/// [`ServerHandle::status`] always names an unexpected death typed — the
+/// owning daemon can never mistake a dead native socket for a live one.
 pub struct ServerHandle {
     pub addr: SocketAddr,
-    pub shutdown: oneshot::Sender<()>,
     /// The startup line the CLI prints on stdout after binding.
     pub startup_line: String,
+    task: Option<JoinHandle<Result<(), ServerServeError>>>,
+    shared: Arc<ServerShared>,
+}
+
+impl std::fmt::Debug for ServerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerHandle")
+            .field("addr", &self.addr)
+            .field("status", &self.status())
+            .field("owns_task", &self.task.is_some())
+            .finish()
+    }
+}
+
+impl ServerHandle {
+    /// Request graceful shutdown of the listener. Idempotent: returns `true`
+    /// exactly once (the call that initiated the shutdown) and `false` when
+    /// shutdown was already requested. The owned task is joined (bounded) by
+    /// [`ServerHandle::shutdown`].
+    pub fn request_shutdown(&self) -> bool {
+        self.shared.request_shutdown()
+    }
+
+    /// `true` only while the owned serve task is alive and accepting
+    /// requests.
+    pub fn is_alive(&self) -> bool {
+        self.status().is_alive()
+    }
+
+    /// The typed liveness snapshot the daemon queries for health decisions
+    /// (see [`ServerStatus`]). A recorded terminal result wins; a task that
+    /// ended without recording (panic/abort) is reported
+    /// [`ServerStatus::Unavailable`] with `server_task_died`, never silently
+    /// as stopped.
+    pub fn status(&self) -> ServerStatus {
+        if let Some(status) = self.shared.terminal() {
+            return status;
+        }
+        let finished = match &self.task {
+            Some(task) => task.is_finished(),
+            None => true,
+        };
+        if !finished {
+            return ServerStatus::Serving;
+        }
+        if self.shared.shutdown_requested() {
+            ServerStatus::Stopped
+        } else {
+            ServerStatus::Unavailable {
+                code: "server_task_died",
+                message: format!(
+                    "native server serve task for {} ended without a typed result (panic or abort)",
+                    self.addr
+                ),
+            }
+        }
+    }
+
+    /// Signal graceful shutdown and JOIN the owned serve task.
+    ///
+    /// - Bounded: the join waits at most [`SERVER_SHUTDOWN_BOUND`]; a
+    ///   straggler is aborted and reaped within [`SERVER_ABORT_REAP_BOUND`].
+    /// - Idempotent: requesting shutdown twice is a no-op (the signal is
+    ///   one-shot); a handle whose task already ended joins immediately.
+    /// - A clean graceful stop maps to `Ok(())`; a serve error (including an
+    ///   unexpected death that happened BEFORE the request), a panicked/
+    ///   aborted task, or an elapsed join bound is surfaced as the typed
+    ///   [`ServerShutdownError`] — never `.ok()`-discarded.
+    pub async fn shutdown(mut self) -> Result<(), ServerShutdownError> {
+        let addr = self.addr;
+        self.request_shutdown();
+        let mut task = self
+            .task
+            .take()
+            .expect("the native server task is owned until shutdown consumes the handle");
+        match tokio::time::timeout(SERVER_SHUTDOWN_BOUND, &mut task).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(ServerShutdownError::Serve(error)),
+            Ok(Err(join_error)) => Err(ServerShutdownError::Serve(ServerServeError::Task {
+                addr,
+                detail: join_error.to_string(),
+            })),
+            Err(_elapsed) => {
+                task.abort();
+                let _ = tokio::time::timeout(SERVER_ABORT_REAP_BOUND, &mut task).await;
+                Err(ServerShutdownError::ShutdownTimeout {
+                    addr,
+                    bound: SERVER_SHUTDOWN_BOUND,
+                })
+            }
+        }
+    }
+}
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        // Terminal health is read BEFORE the shutdown request so an
+        // unexpected death is never masked as a requested stop.
+        let status = self.status();
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        if status.is_unavailable() {
+            tracing::error!("{}", status.health_line());
+        }
+        // Synchronous fallback so the listener task can never outlive its
+        // owner: request graceful shutdown, then abort. Callers that need the
+        // graceful drain call `shutdown().await`.
+        self.request_shutdown();
+        if !task.is_finished() {
+            task.abort();
+        }
+    }
+}
+
+/// Spawn the OWNED serve task: it maps the serve future's `io::Error` into
+/// the typed [`ServerServeError::Serve`], records the terminal disposition in
+/// the handle's shared status, and returns the typed result to its owner
+/// ([`ServerHandle::shutdown`]). The production serve future is never
+/// `.ok()`-discarded.
+fn spawn_server_task<F>(
+    addr: SocketAddr,
+    shared: Arc<ServerShared>,
+    serve: F,
+) -> JoinHandle<Result<(), ServerServeError>>
+where
+    F: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let result = serve
+            .await
+            .map_err(|source| ServerServeError::Serve { addr, source });
+        let status = match &result {
+            Ok(()) if shared.shutdown_requested() => ServerStatus::Stopped,
+            Ok(()) => ServerStatus::Unavailable {
+                code: "server_serve_ended",
+                message: format!(
+                    "native server serve for {addr} completed without a shutdown request"
+                ),
+            },
+            Err(error) => ServerStatus::Unavailable {
+                code: error.code(),
+                message: error.to_string(),
+            },
+        };
+        shared.record(status);
+        result
+    })
+}
+
+/// Test seams for the ownership/health contract. These exercise the SAME
+/// recording wrapper the production task uses (`spawn_server_task`), never a
+/// parallel code path.
+#[cfg(test)]
+impl ServerHandle {
+    /// A handle whose serve task fails immediately with `source`: unexpected
+    /// termination must be recorded typed and surfaced by `shutdown`.
+    pub(crate) fn failing_serve_for_test(addr: SocketAddr, source: std::io::Error) -> ServerHandle {
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
+        let shared = Arc::new(ServerShared::new(shutdown_tx));
+        let task = spawn_server_task(addr, Arc::clone(&shared), async move { Err(source) });
+        ServerHandle {
+            addr,
+            startup_line: startup_line(addr.port()),
+            task: Some(task),
+            shared,
+        }
+    }
+
+    /// A handle whose serve task completes cleanly WITHOUT a shutdown
+    /// request: that is an unexpected end (the socket stopped accepting), not
+    /// a requested stop, and must be recorded typed.
+    pub(crate) fn ended_serve_for_test(addr: SocketAddr) -> ServerHandle {
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
+        let shared = Arc::new(ServerShared::new(shutdown_tx));
+        let task = spawn_server_task(addr, Arc::clone(&shared), async move { Ok(()) });
+        ServerHandle {
+            addr,
+            startup_line: startup_line(addr.port()),
+            task: Some(task),
+            shared,
+        }
+    }
+
+    /// Abort the owned serve task out from under the handle (an external
+    /// kill), so the health snapshot must name the death.
+    pub(crate) fn abort_task_for_test(&self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+
+    /// A detached probe of the shared owner state, so a test can observe the
+    /// recorded terminal snapshot AFTER `shutdown` consumed the handle.
+    pub(crate) fn probe_for_test(&self) -> ServerStatusProbe {
+        ServerStatusProbe(Arc::clone(&self.shared))
+    }
+}
+
+/// Test-only detached view of a handle's shared owner state.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct ServerStatusProbe(Arc<ServerShared>);
+
+#[cfg(test)]
+impl ServerStatusProbe {
+    pub(crate) fn terminal(&self) -> Option<ServerStatus> {
+        self.0.terminal()
+    }
 }
 
 /// Bind (port 0 = ephemeral) and serve. Returns once listening.
@@ -908,18 +1301,21 @@ pub async fn serve_arc(deps: Arc<ServerDeps>, port: u16) -> std::io::Result<Serv
         ready.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    tokio::spawn(async move {
+    let shared = Arc::new(ServerShared::new(shutdown_tx));
+    // The handle OWNS this task: its result is recorded in `shared` and
+    // returned to `shutdown()`; nothing is discarded here.
+    let task = spawn_server_task(addr, Arc::clone(&shared), async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async {
+            .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
             })
             .await
-            .ok();
     });
     Ok(ServerHandle {
         addr,
-        shutdown: shutdown_tx,
         startup_line,
+        task: Some(task),
+        shared,
     })
 }
 
@@ -1475,7 +1871,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 400);
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -1558,7 +1954,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 400);
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -1719,7 +2115,7 @@ pub(crate) mod tests {
             body["prefixStability"].is_object(),
             "prefix stability must surface after a driven turn: {body}"
         );
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -1836,7 +2232,7 @@ pub(crate) mod tests {
             ps["mean"].as_f64().unwrap(),
             "projection must reflect the store aggregate"
         );
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -1949,7 +2345,7 @@ pub(crate) mod tests {
         assert_eq!(openai_entry["runtimeContextLimitSupported"], false);
         let fake_entry = body.get("fake").expect("fake provider key present");
         assert_eq!(fake_entry["runtimeContextLimitSupported"], false);
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     // --------------------------------------------------- native v1: audits 55-56
@@ -2005,7 +2401,7 @@ pub(crate) mod tests {
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["ready"], true);
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
 
         // The not-ready window (deterministic test knob): with
         // simulate_not_ready the flag never flips, so ready is 503
@@ -2034,7 +2430,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     /// Serve one deps envelope's native listener and read `/native/health`
@@ -2051,7 +2447,7 @@ pub(crate) mod tests {
             .text()
             .await
             .unwrap();
-        let _ = native.shutdown.send(());
+        let _ = native.request_shutdown();
         (serde_json::from_str(&raw).unwrap(), raw)
     }
 
@@ -2206,6 +2602,204 @@ pub(crate) mod tests {
         }
     }
 
+    // ------------------------------------------ native server lifecycle/health
+
+    /// Bounded wait for the owned native-server task to end; a task that
+    /// never ends fails the test instead of hanging it.
+    async fn wait_until_server_dead(handle: &ServerHandle) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while handle.is_alive() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the native serve task must terminate within the bound"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Bounded wait for `addr` to be rebindable. The shared one-shot signal
+    /// is owned by the task's shared state, so a DETACHED task would keep the
+    /// socket bound forever and fail this test.
+    async fn wait_until_rebindable(addr: std::net::SocketAddr) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(listener) = tokio::net::TcpListener::bind(addr).await {
+                drop(listener);
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the listener socket {addr} was never released (detached task?)"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// (a) Injected serve failure: the owner records UNAVAILABLE with the
+    /// typed stable code and cause, `is_alive` turns false, and a later
+    /// `shutdown` surfaces the SAME typed error instead of a clean stop (the
+    /// production serve future is never `.ok()`-discarded).
+    #[tokio::test]
+    async fn unexpected_native_serve_error_is_recorded_typed_in_health() {
+        let addr: std::net::SocketAddr = "127.0.0.1:8790".parse().unwrap();
+        let handle = ServerHandle::failing_serve_for_test(
+            addr,
+            std::io::Error::other("injected accept failure"),
+        );
+        wait_until_server_dead(&handle).await;
+        let status = handle.status();
+        assert!(
+            status.is_unavailable(),
+            "unexpected death must be typed: {status:?}"
+        );
+        assert_eq!(status.code(), Some("server_serve_failed"));
+        let line = status.health_line();
+        assert!(line.contains("UNAVAILABLE"), "{line}");
+        assert!(line.contains("server_serve_failed"), "{line}");
+        assert!(line.contains("injected accept failure"), "{line}");
+        assert!(line.contains(&addr.to_string()), "{line}");
+        assert!(!handle.is_alive());
+        let error = handle.shutdown().await.unwrap_err();
+        assert_eq!(error.code(), "server_serve_failed");
+        assert!(
+            matches!(
+                error,
+                ServerShutdownError::Serve(ServerServeError::Serve { .. })
+            ),
+            "expected the typed serve error, got {error}"
+        );
+    }
+
+    /// (a2) A serve future that completes CLEANLY without a shutdown request
+    /// is still an unexpected end: the socket stopped accepting while the
+    /// owner never asked it to, so the status must say UNAVAILABLE
+    /// (`server_serve_ended`), never `Stopped`.
+    #[tokio::test]
+    async fn unexpected_native_serve_end_is_not_a_clean_stop() {
+        let addr: std::net::SocketAddr = "127.0.0.1:8791".parse().unwrap();
+        let handle = ServerHandle::ended_serve_for_test(addr);
+        let probe = handle.probe_for_test();
+        wait_until_server_dead(&handle).await;
+        let status = handle.status();
+        assert_eq!(status.code(), Some("server_serve_ended"), "{status:?}");
+        assert!(!handle.is_alive());
+        assert!(
+            matches!(
+                probe.terminal(),
+                Some(ServerStatus::Unavailable {
+                    code: "server_serve_ended",
+                    ..
+                })
+            ),
+            "the recorded terminal must name the unexpected end: {:?}",
+            probe.terminal()
+        );
+        // The typed join result is Ok (the future itself succeeded), but the
+        // recorded health never lies: it stays Unavailable.
+        handle.shutdown().await.unwrap();
+    }
+
+    /// (b) External abort (task killed out from under the handle): health
+    /// still names the death typed — never `Serving`, never a silent
+    /// `Stopped`.
+    #[tokio::test]
+    async fn externally_aborted_native_task_health_names_the_death() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = serve(test_deps(dir.path()), 0).await.unwrap();
+        assert!(handle.is_alive());
+        handle.abort_task_for_test();
+        wait_until_server_dead(&handle).await;
+        let status = handle.status();
+        assert_eq!(status.code(), Some("server_task_died"), "{status:?}");
+        assert!(status.health_line().contains("UNAVAILABLE"));
+        assert!(!handle.is_alive());
+        // The owner join surfaces the task death typed as well.
+        let error = handle.shutdown().await.unwrap_err();
+        assert_eq!(error.code(), "server_task_failed");
+        assert!(
+            matches!(
+                error,
+                ServerShutdownError::Serve(ServerServeError::Task { .. })
+            ),
+            "expected the typed task error, got {error}"
+        );
+    }
+
+    /// (c) `shutdown().await` joins the owned task within the bounded window
+    /// and maps the clean graceful stop to `Ok(())`; the socket is released.
+    #[tokio::test]
+    async fn native_shutdown_joins_within_the_bound_and_maps_clean_stop_to_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = serve(test_deps(dir.path()), 0).await.unwrap();
+        let addr = handle.addr;
+        assert!(handle.is_alive());
+        let slack = Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        let joined = tokio::time::timeout(SERVER_SHUTDOWN_BOUND + slack, handle.shutdown()).await;
+        assert!(joined.is_ok(), "shutdown must join within the bound");
+        joined.unwrap().unwrap();
+        assert!(
+            started.elapsed() < SERVER_SHUTDOWN_BOUND + slack,
+            "the bounded join must not exceed the window"
+        );
+        // The owned task completed (not detached): the listener socket is
+        // free.
+        wait_until_rebindable(addr).await;
+    }
+
+    /// (d) Shutdown is idempotent: the one-shot request is honored exactly
+    /// once and every later request is a no-op; the join still returns `Ok`.
+    #[tokio::test]
+    async fn native_shutdown_request_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = serve(test_deps(dir.path()), 0).await.unwrap();
+        assert!(handle.request_shutdown(), "the first request wins");
+        assert!(!handle.request_shutdown(), "a repeated request is a no-op");
+        assert!(!handle.request_shutdown(), "still a no-op");
+        handle.shutdown().await.unwrap();
+    }
+
+    /// (e) Drop aborts (never detaches): dropping the handle WITHOUT joining
+    /// releases the listener socket. The one-shot signal lives in the shared
+    /// owner state, so a detached task would keep the socket bound and this
+    /// test would time out.
+    #[tokio::test]
+    async fn native_handle_drop_aborts_and_releases_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = serve(test_deps(dir.path()), 0).await.unwrap();
+        let addr = handle.addr;
+        drop(handle);
+        wait_until_rebindable(addr).await;
+    }
+
+    /// (f) No detached task: the owner records the terminal stop and reports
+    /// complete after `shutdown` — the shared status says `Stopped` (never
+    /// `Serving`), and the listener socket is released.
+    #[tokio::test]
+    async fn native_owner_reports_complete_after_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = serve(test_deps(dir.path()), 0).await.unwrap();
+        let addr = handle.addr;
+        let probe = handle.probe_for_test();
+        assert!(
+            probe.terminal().is_none(),
+            "no terminal snapshot while the task is alive"
+        );
+        assert_eq!(handle.status(), ServerStatus::Serving);
+        assert_eq!(handle.status().health_line(), "native server: serving");
+        handle.shutdown().await.unwrap();
+        assert_eq!(
+            probe.terminal(),
+            Some(ServerStatus::Stopped),
+            "the owner observed the task's clean completion"
+        );
+        assert_eq!(
+            ServerStatus::Stopped.health_line(),
+            "native server: stopped"
+        );
+        wait_until_rebindable(addr).await;
+    }
+
     #[tokio::test]
     async fn native_turns_lists_a_driven_turn_and_hostile_ids_are_loud() {
         // Drive a REAL turn through the HTTP surface (FakeProvider pong),
@@ -2282,7 +2876,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -2439,7 +3033,7 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(resp.status(), 404, "{path}");
         }
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -2509,7 +3103,7 @@ pub(crate) mod tests {
         assert_eq!(rows[1]["afterHash"], after.to_hex());
         assert!(rows[0]["createdMs"].as_i64().unwrap_or(0) > 0);
         assert!(rows[0]["restoredMs"].is_null());
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -2627,7 +3221,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -2663,7 +3257,7 @@ pub(crate) mod tests {
                 resp.json::<serde_json::Value>().await.unwrap(),
                 serde_json::json!([])
             );
-            let _ = handle.shutdown.send(());
+            let _ = handle.request_shutdown();
             return;
         };
         let pty_id = created["terminalId"].as_str().unwrap().to_string();
@@ -2733,7 +3327,7 @@ pub(crate) mod tests {
             .expect("the killed terminal row stays durable");
         assert_eq!(mine["alive"], false);
         assert_eq!(mine["state"], "killed");
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -2795,7 +3389,7 @@ pub(crate) mod tests {
         assert!(per.iter().any(|e| {
             e["sessionId"] == s2.id().to_string() && e["budget"].is_null() && e["spent"] == 42
         }));
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     // ------------------------------------ orchestration graph (audit 93)
@@ -3172,7 +3766,7 @@ pub(crate) mod tests {
             faktor_session::child::PresentationState::Background,
             "the refused revival wrote nothing"
         );
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -3254,7 +3848,7 @@ pub(crate) mod tests {
         assert_eq!(events[1]["kind"]["note"], "focus the api");
         assert!(events[1]["applied_ms"].is_null());
         assert!(events[0]["seq"].as_u64().unwrap() < events[1]["seq"].as_u64().unwrap());
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     /// The canonical projection is ONE function: the JSON graph surface and
@@ -3381,7 +3975,7 @@ pub(crate) mod tests {
             run["state"], g["state"],
             "task-run state must use the same projection"
         );
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -3460,7 +4054,7 @@ pub(crate) mod tests {
             .as_str()
             .unwrap_or("")
             .contains("run-2"));
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -3497,7 +4091,7 @@ pub(crate) mod tests {
                 .contains("run-1/child-1"),
             "{body}"
         );
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     // ------------------------------------------------- native agents + control
@@ -4076,7 +4670,7 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(resp.status(), 404, "hostile {hostile:?}");
         }
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4292,7 +4886,7 @@ pub(crate) mod tests {
             .expect("self entry");
         assert_eq!(root["run_id"], "run-seam");
         assert_eq!(root["state"], "Running");
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     // ------------------------------------------------- audits P0-62/63/64
@@ -4446,7 +5040,7 @@ pub(crate) mod tests {
             let body: serde_json::Value = resp.json().await.unwrap();
             assert_eq!(body["terminals"], serde_json::json!([]));
             assert_eq!(body["unowned"], 0);
-            let _ = handle.shutdown.send(());
+            let _ = handle.request_shutdown();
             return;
         };
         let pty_a_id = pty_a["terminalId"].as_str().unwrap().to_string();
@@ -4478,7 +5072,7 @@ pub(crate) mod tests {
             native_spawn_terminal(&client, &base, &token, &b_sid, "/bin/sleep", &["60"]).await
         else {
             let _ = native_kill_terminal(&client, &base, &token, &a_sid, &pty_a_id).await;
-            let _ = handle.shutdown.send(());
+            let _ = handle.request_shutdown();
             return;
         };
         let pty_b_id = pty_b["terminalId"].as_str().unwrap().to_string();
@@ -4732,7 +5326,7 @@ pub(crate) mod tests {
             native_kill_terminal(&client, &base, &token, &b_sid, &pty_b_id).await,
             200
         );
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -4866,7 +5460,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 401);
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -4985,7 +5579,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 401);
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -5060,7 +5654,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 401);
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -5359,7 +5953,7 @@ pub(crate) mod tests {
             // Capture the authoritative snapshots for the reopen check.
             let expected_a = ua_after;
             let expected_global = gu_after;
-            let _ = handle.shutdown.send(());
+            let _ = handle.request_shutdown();
             (expected_a, expected_global, a.id())
         };
         // ---- reopen durability: a brand-new manager (and server) over the
@@ -5382,7 +5976,7 @@ pub(crate) mod tests {
         let resp = native_get(&client, &base2, &token2, "/native/usage").await;
         let reopened_global: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(reopened_global, expected_global);
-        let _ = handle2.shutdown.send(());
+        let _ = handle2.request_shutdown();
     }
 
     /// Provider for the real-turn usage test (P0-63): a canonical usage
@@ -5664,7 +6258,7 @@ pub(crate) mod tests {
         let ub: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(ub["providerCalls"]["tokens"], 0);
         assert_eq!(ub["tasks"], serde_json::json!([]));
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -5942,7 +6536,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 401);
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -6230,7 +6824,7 @@ pub(crate) mod tests {
         assert_eq!(legacy["origin"], serde_json::Value::Null);
         assert_eq!(legacy["requirement"], serde_json::Value::Null);
 
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -6315,7 +6909,7 @@ pub(crate) mod tests {
         assert_eq!(entry["budget"]["maxCostMicro"], 250_000);
         assert_eq!(entry["budget"]["spentCostMicro"], 100);
         assert_eq!(entry["budget"]["openReservedMicro"], 60);
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     // ---------------------------------------- max_cost_micro task control E2E
@@ -6403,7 +6997,7 @@ pub(crate) mod tests {
         let e = &entries.as_array().unwrap()[0];
         assert_eq!(e["kind"], "self");
         assert_eq!(e["state"], "Failed");
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     // =========================================== native task runs (wave-24)
@@ -6982,7 +7576,7 @@ pub(crate) mod tests {
         .await;
         let done: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(done["state"], "Done", "{done}");
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7128,7 +7722,7 @@ pub(crate) mod tests {
             faktor_core::id::WorktreeId::new(owner_wt as u64),
             "the self-heal re-adopted the workspace owner row"
         );
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7384,7 +7978,7 @@ pub(crate) mod tests {
             NATIVE_IMPL_LIB_RS.as_bytes(),
             "review sees the integrated candidate"
         );
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
         drop(client);
         drop(orchestrator);
         drop(tasks);
@@ -7481,7 +8075,7 @@ pub(crate) mod tests {
             NATIVE_OWNER_LIB_RS.as_bytes(),
             "the owner checkout is byte-untouched"
         );
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7550,7 +8144,7 @@ pub(crate) mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7680,7 +8274,7 @@ pub(crate) mod tests {
             NATIVE_OWNER_LIB_RS.as_bytes(),
             "the owner checkout stayed byte-untouched"
         );
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7759,7 +8353,7 @@ pub(crate) mod tests {
         // No provider call ever happened on the hostile attempts.
         let h = manager.get_session(sid).unwrap().unwrap();
         assert_eq!(h.message_count().unwrap(), 0, "hostile starts never drive");
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7846,7 +8440,7 @@ pub(crate) mod tests {
         // No provider call ever happened on the hostile attempts.
         let h = manager.get_session(sid).unwrap().unwrap();
         assert_eq!(h.message_count().unwrap(), 0, "hostile starts never drive");
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -7949,7 +8543,7 @@ pub(crate) mod tests {
         .await;
         let list: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(list.as_array().unwrap().len(), 2);
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -8229,7 +8823,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 400);
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8360,7 +8954,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 404, "unknown runs are typed 404s");
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8478,7 +9072,7 @@ pub(crate) mod tests {
             409,
             "a cancelled run is never cancelled twice"
         );
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[test]
@@ -8714,7 +9308,7 @@ pub(crate) mod tests {
         assert_eq!(resp.status(), 403);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["error"]["code"], "evidence_access_denied");
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -8792,7 +9386,7 @@ pub(crate) mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["bytesBase64"], "aGVsbG8=");
         assert_eq!(body["byteLen"], 5);
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     // ---------------------------------------------- native semantic (audit 83)
@@ -8834,7 +9428,7 @@ pub(crate) mod tests {
             .as_object()
             .unwrap()
             .is_empty());
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test]
@@ -9077,7 +9671,7 @@ pub(crate) mod tests {
             after.posts.len(),
             "a refused terminal post writes nothing"
         );
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9172,7 +9766,7 @@ pub(crate) mod tests {
         assert_eq!(resp.status(), 200);
         let ack: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(ack["applied"], true);
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9258,7 +9852,7 @@ pub(crate) mod tests {
             .find(|c| c["child_id"] == "child-0")
             .expect("graph child listed");
         assert_eq!(graph_child["execution_phase"], "coding");
-        let _ = handle.shutdown.send(());
+        let _ = handle.request_shutdown();
     }
 
     // ------------------------------------------------ split invariants

@@ -1412,24 +1412,102 @@ impl AttemptAccounting {
 }
 
 // --------------------------------------------------------------------------
-// Off-turn-thread evidence polling (audit 14/26): the drive awaits evidence
-// under hard wall budgets, but a provider that blocks inside its poll (the
-// legacy bounded scan) must never occupy a turn thread, and the runtime.rs
-// verification-path source probes forbid the blocking-pool API name there.
-// Both helpers live here so runtime.rs keeps the async call shape without
-// the banned literal.
+// Off-turn blocking bridge + the bounded evidence executor (audit 14/26; P1
+// unbounded-thread-leak fix): the drive awaits evidence under hard wall
+// budgets, but a provider that blocks inside its poll must never occupy a
+// turn thread, and the runtime.rs verification-path source probes forbid the
+// blocking-pool API name there. Both helpers live here.
+//
+// The advisory poll runs on a FIXED pool of long-lived, owned worker threads
+// fed by a bounded queue — never one OS thread per poll, which leaked one
+// live thread per timed-out poll. Saturation is a typed `NotSpawned`
+// refusal, and every worker is cancelled and joined on shutdown/Drop.
 // --------------------------------------------------------------------------
 
-/// Run `f` on a blocking-pool thread and return its result; `None` when the
-/// runtime could not schedule the task. Used to isolate the synchronous
-/// cold-evidence ladder (file reads + supervised git/rg children) from the
-/// turn thread.
+use faktor_core::cancellation::CancellationToken;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// Why an off-turn blocking task produced no value: the TYPED outcome of
+/// [`run_off_turn_thread_outcome`]. A panic (`JoinError::is_panic`) and a
+/// scheduling refusal are distinct — the old `.ok()` collapsed both, plus a
+/// normal `None`, into one indistinguishable fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OffTurnThreadFailure {
+    /// The blocking pool could not schedule the task (runtime shutting
+    /// down / refusing work).
+    Unscheduled { message: String },
+    /// The task panicked; the bounded panic payload message is carried.
+    Panicked { message: String },
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread count of failures surfaced by the legacy
+    /// [`run_off_turn_thread`] adapter (deterministic to assert without a
+    /// global subscriber).
+    static OFF_TURN_THREAD_FAILURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn off_turn_thread_failures() -> usize {
+    OFF_TURN_THREAD_FAILURES.with(|count| count.get())
+}
+
+/// Run `f` on a blocking-pool thread and return its TYPED result: a normal
+/// value, a panic (the `JoinError` panic message is surfaced) or a
+/// scheduling refusal. Used to isolate the synchronous cold-evidence ladder
+/// (file reads + supervised git/rg children) from the turn thread.
+pub(crate) async fn run_off_turn_thread_outcome<T, F>(f: F) -> Result<T, OffTurnThreadFailure>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(value) => Ok(value),
+        Err(join) if join.is_panic() => {
+            let payload = join.into_panic();
+            Err(OffTurnThreadFailure::Panicked {
+                message: poll_panic_message(payload.as_ref()),
+            })
+        }
+        Err(join) => Err(OffTurnThreadFailure::Unscheduled {
+            message: bounded_poll_message(&join.to_string()),
+        }),
+    }
+}
+
+/// Legacy `Option`-shaped adapter kept for the frozen `runtime.rs` call
+/// site: a failure of [`run_off_turn_thread_outcome`] is logged LOUDLY
+/// (never swallowed) and degrades to `None` exactly like the old `.ok()`
+/// did, so the cold-evidence ladder's behavior is unchanged while the
+/// failure is no longer silent. Callers that must branch on the failure
+/// kind use the typed entry point.
 pub(crate) async fn run_off_turn_thread<T, F>(f: F) -> Option<T>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    tokio::task::spawn_blocking(f).await.ok()
+    match run_off_turn_thread_outcome(f).await {
+        Ok(value) => Some(value),
+        Err(failure) => {
+            #[cfg(test)]
+            OFF_TURN_THREAD_FAILURES.with(|count| count.set(count.get() + 1));
+            match &failure {
+                OffTurnThreadFailure::Panicked { message } => tracing::error!(
+                    target: "faktor_agent::off_turn",
+                    "off-turn blocking task panicked: {message} (the caller degrades; the panic is never silent)"
+                ),
+                OffTurnThreadFailure::Unscheduled { message } => tracing::error!(
+                    target: "faktor_agent::off_turn",
+                    "off-turn blocking task could not be scheduled: {message} (the caller degrades; the refusal is never silent)"
+                ),
+            }
+            None
+        }
+    }
 }
 
 /// Hard byte bound of one poll diagnostic message (a hostile provider can
@@ -1463,7 +1541,10 @@ pub(crate) enum EvidencePollStatus {
     ProviderPanicked { message: String },
     /// The wall budget fired before the provider answered.
     TimedOut { budget_ms: u64 },
-    /// The detached poll thread could not be spawned.
+    /// The poll could not be STARTED: the bounded executor refused admission
+    /// (every worker busy and its bounded queue full, or the executor is
+    /// shut down), or no worker thread could be spawned. Explicit, never a
+    /// silently spawned thread.
     NotSpawned { message: String },
 }
 
@@ -1526,7 +1607,7 @@ fn poll_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 // Test-observable per-THREAD count of emitted degraded-poll diagnostics.
 // The tracing sink is process-global and cannot be captured
 // deterministically under parallel tests, while diagnostics are emitted on
-// the polling caller's thread (the detached evidence thread never logs):
+// the polling caller's thread (the executor's worker never logs itself):
 // a thread-local counter makes the "loud, never silent" contract
 // assertable without a lock or a global subscriber.
 #[cfg(test)]
@@ -1584,59 +1665,568 @@ fn log_evidence_poll_degrade(status: &EvidencePollStatus, budget: std::time::Dur
                 target: "faktor_agent::evidence",
                 status = "not_spawned",
                 budget_ms,
-                "advisory evidence poll could not spawn its detached thread: {message} (advisory contract: the turn continues with an empty package)"
+                "advisory evidence poll could not start on its bounded worker: {message} (advisory contract: the turn continues with an empty package)"
             );
         }
     }
 }
 
-/// Poll one async `EvidenceProvider` on a DETACHED thread and await it
-/// under `budget`, returning the typed outcome: a provider that panics,
-/// errors, or simply never yields degrades to an empty package once the
-/// budget fires. The provider's future is driven on a plain (non-tokio)
-/// thread via the captured runtime handle — never on a runtime worker and
-/// never on a tokio blocking-pool task — so a stuck provider can neither
-/// occupy a turn thread nor delay the drop of the drive's runtime (tokio
-/// joins blocking-pool tasks at shutdown; the detached thread is abandoned
-/// instead, and its eventual completion just fails the dropped oneshot).
-///
-/// Degradation is observable by contract: the status distinguishes an
-/// honest [`EvidencePollStatus::NoEvidence`] answer from
-/// [`EvidencePollStatus::RetrievalFailed`] (provider code + retryability),
-/// a panic, a missed budget and a failed spawn. The caller OWNS the
-/// diagnostic: [`poll_evidence_with_wall_budget`] emits the structured
-/// log for the frozen `runtime.rs` call shape; any other caller must
-/// surface a degraded status itself (never swallow it).
-pub(crate) async fn poll_evidence_with_wall_budget_outcome(
+/// Fixed worker count of the process-wide advisory evidence executor: the
+/// whole concurrency budget of the feature (the audit's 2..=4 bound). A
+/// provider that never yields can occupy at most these workers; every
+/// further poll is refused with a typed status instead of spawning a thread.
+pub(crate) const EVIDENCE_EXECUTOR_WORKERS: usize = 4;
+
+/// Bounded admission queue of the evidence executor: at most this many polls
+/// wait for a worker at any instant. Combined with
+/// [`EVIDENCE_EXECUTOR_WORKERS`], the executor holds at most
+/// `workers + queue` polls; the next poll of a saturated executor is refused
+/// (typed `NotSpawned`), never buffered without bound.
+pub(crate) const EVIDENCE_EXECUTOR_QUEUE_CAPACITY: usize = 8;
+
+/// Bounded wait for the worker pool to drain and exit on shutdown/Drop
+/// before the remaining (synchronously blocked) workers are abandoned. A
+/// provider that blocks its OS thread inside one `poll` cannot be cancelled
+/// from safe Rust, so the executor abandons at most the fixed worker count —
+/// never one thread per poll. Cooperative providers (any future that
+/// yields) are cancelled by token and exit immediately.
+pub(crate) const EVIDENCE_EXECUTOR_JOIN_BOUND: Duration = Duration::from_secs(5);
+
+/// Worker thread-name prefix (observable in crash forensics).
+const EVIDENCE_WORKER_NAME: &str = "faktor-evidence";
+
+/// Test-observable count of evidence worker threads ever spawned: a bounded
+/// executor spawns its fixed workers once and never again, so the counter is
+/// flat across any number of polls.
+#[cfg(test)]
+pub(crate) static EVIDENCE_WORKERS_SPAWNED: AtomicUsize = AtomicUsize::new(0);
+
+/// Test-observable count of LIVE evidence worker threads (decremented when a
+/// worker exits): the thread-leak gate.
+#[cfg(test)]
+pub(crate) static EVIDENCE_WORKERS_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// One poll admitted to the executor: the provider seam inputs, the reply
+/// channel and the cooperative cancellation token the caller fires when its
+/// wall budget expires (or the executor fires on shutdown).
+struct EvidenceJob {
+    id: u64,
+    provider: Arc<dyn EvidenceProvider>,
+    session: SessionId,
+    query: EvidenceQuery,
+    reply: tokio::sync::oneshot::Sender<WorkerReply>,
+    cancel: CancellationToken,
+    handle: tokio::runtime::Handle,
+}
+
+/// The provider outcome of one executed poll: the caught panic payload when
+/// the provider panicked, else the typed provider result.
+type ProviderPollResult =
+    std::thread::Result<faktor_core::Result<Vec<faktor_context::assembler::Evidence>>>;
+
+/// The bounded executor's reply: the provider outcome (with the caught panic
+/// payload when it panicked) or an explicit cancellation (the caller's
+/// budget fired before the provider was invoked, or shutdown intervened).
+enum WorkerReply {
+    Completed(ProviderPollResult),
+    Cancelled,
+}
+
+/// Why one poll was refused admission to the bounded executor. Every refusal
+/// maps to [`EvidencePollStatus::NotSpawned`] at the caller: an EXPLICIT
+/// typed degradation, never a silently spawned thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SubmitRefusal {
+    /// The executor is closed (shutdown/Drop): no new poll is accepted.
+    Closed,
+    /// Every worker is busy and the bounded queue is full.
+    Saturated { workers: usize, capacity: usize },
+    /// No worker thread exists (spawn failed at startup).
+    NoWorkers,
+}
+
+impl SubmitRefusal {
+    fn message(&self) -> String {
+        match self {
+            SubmitRefusal::Closed => {
+                "evidence executor is closed (shutdown); poll refused".to_string()
+            }
+            SubmitRefusal::Saturated { workers, capacity } => format!(
+                "evidence executor saturated: all {workers} poll workers are busy and the bounded queue ({capacity}) is full; the poll was refused instead of spawning another thread"
+            ),
+            SubmitRefusal::NoWorkers => {
+                "evidence executor has no live workers (thread spawn failed); poll refused"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// Atomic instrumentation of the executor (the bounded-growth gate: the
+/// queue high-water can never exceed its capacity and the active high-water
+/// can never exceed the worker count).
+#[derive(Default)]
+struct ExecutorStatsCore {
+    enqueued: AtomicU64,
+    completed: AtomicU64,
+    refused: AtomicU64,
+    cancelled: AtomicU64,
+    active: AtomicU64,
+    max_active: AtomicU64,
+    max_queue_depth: AtomicU64,
+}
+
+/// Snapshot of the executor's instrumentation (observable by tests and by
+/// the "no unbounded leak" gate).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct EvidenceExecutorStats {
+    pub workers: usize,
+    pub capacity: usize,
+    pub enqueued: u64,
+    pub completed: u64,
+    pub refused: u64,
+    pub cancelled: u64,
+    /// High-water of concurrently executing polls; never exceeds `workers`.
+    pub max_active: u64,
+    /// High-water of queued polls; never exceeds `capacity`.
+    pub max_queue_depth: u64,
+}
+
+/// Condvar-backed all-workers-exited signal, waitable with a timeout.
+#[derive(Default)]
+struct ExitFlag {
+    state: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl ExitFlag {
+    fn notify_exited(&self) {
+        *self.state.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.cv.notify_all();
+    }
+}
+
+/// State shared between the executor handle and its worker threads.
+struct ExecutorShared {
+    capacity: usize,
+    queue: Mutex<VecDeque<EvidenceJob>>,
+    wake: Condvar,
+    closed: AtomicBool,
+    executing: Mutex<HashMap<u64, CancellationToken>>,
+    next_id: AtomicU64,
+    running: AtomicUsize,
+    exit: ExitFlag,
+    stats: ExecutorStatsCore,
+}
+
+/// One owned worker thread: its join handle (bounded join on shutdown/Drop)
+/// and the flag set just before it exits.
+struct EvidenceWorker {
+    join: Option<std::thread::JoinHandle<()>>,
+    exited: Arc<AtomicBool>,
+}
+
+/// The bounded, owned evidence executor: a fixed set of long-lived worker
+/// threads fed by a bounded queue. There is NO per-poll thread spawn and NO
+/// detached thread: an admission that cannot be served is refused with a
+/// typed [`SubmitRefusal`], and shutdown/Drop cancels the workers and joins
+/// them (bounded).
+pub(crate) struct EvidenceExecutor {
+    shared: Arc<ExecutorShared>,
+    workers: Mutex<Vec<EvidenceWorker>>,
+}
+
+impl EvidenceExecutor {
+    /// Start an executor with `workers` owned threads and a queue of
+    /// `capacity` polls. Thread-spawn failures are logged loudly; the
+    /// executor simply runs with fewer workers (zero workers refuses every
+    /// poll with a typed refusal).
+    pub(crate) fn start(workers: usize, capacity: usize) -> Arc<Self> {
+        let shared = Arc::new(ExecutorShared {
+            capacity: capacity.max(1),
+            queue: Mutex::new(VecDeque::new()),
+            wake: Condvar::new(),
+            closed: AtomicBool::new(false),
+            executing: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            running: AtomicUsize::new(0),
+            exit: ExitFlag::default(),
+            stats: ExecutorStatsCore::default(),
+        });
+        let mut spawned: Vec<EvidenceWorker> = Vec::with_capacity(workers);
+        for index in 0..workers {
+            let exited = Arc::new(AtomicBool::new(false));
+            let worker_shared = shared.clone();
+            let worker_exited = exited.clone();
+            match std::thread::Builder::new()
+                .name(format!("{EVIDENCE_WORKER_NAME}-{index}"))
+                .spawn(move || worker_main(worker_shared, worker_exited))
+            {
+                Ok(join) => {
+                    #[cfg(test)]
+                    {
+                        EVIDENCE_WORKERS_SPAWNED.fetch_add(1, Ordering::SeqCst);
+                        EVIDENCE_WORKERS_LIVE.fetch_add(1, Ordering::SeqCst);
+                    }
+                    spawned.push(EvidenceWorker {
+                        join: Some(join),
+                        exited,
+                    });
+                }
+                Err(error) => tracing::error!(
+                    target: "faktor_agent::evidence",
+                    "evidence executor worker {index} could not be spawned: {error} (the bounded pool runs with fewer workers; saturation is a typed refusal)"
+                ),
+            }
+        }
+        shared.running.store(spawned.len(), Ordering::SeqCst);
+        // Production observability of the fixed size: the pool's worker count
+        // and queue bound are visible in the daemon log (never per-poll).
+        tracing::info!(
+            target: "faktor_agent::evidence",
+            workers = spawned.len(),
+            requested_workers = workers,
+            capacity = shared.capacity,
+            "evidence executor started: fixed bounded pool of owned workers fed by a bounded queue (saturation is a typed refusal, never another thread)"
+        );
+        Arc::new(Self {
+            shared,
+            workers: Mutex::new(spawned),
+        })
+    }
+
+    /// Live owned worker threads (never grows after `start`).
+    pub(crate) fn worker_count(&self) -> usize {
+        self.workers.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    /// Instrumentation snapshot.
+    pub(crate) fn stats(&self) -> EvidenceExecutorStats {
+        let stats = &self.shared.stats;
+        EvidenceExecutorStats {
+            workers: self.worker_count(),
+            capacity: self.shared.capacity,
+            enqueued: stats.enqueued.load(Ordering::Relaxed),
+            completed: stats.completed.load(Ordering::Relaxed),
+            refused: stats.refused.load(Ordering::Relaxed),
+            cancelled: stats.cancelled.load(Ordering::Relaxed),
+            max_active: stats.max_active.load(Ordering::Relaxed),
+            max_queue_depth: stats.max_queue_depth.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Admit one poll or refuse it. NEVER spawns a thread.
+    fn submit(
+        &self,
+        provider: Arc<dyn EvidenceProvider>,
+        session: SessionId,
+        query: EvidenceQuery,
+        cancel: CancellationToken,
+        handle: tokio::runtime::Handle,
+        reply: tokio::sync::oneshot::Sender<WorkerReply>,
+    ) -> Result<(), SubmitRefusal> {
+        let job = EvidenceJob {
+            id: self.shared.next_id.fetch_add(1, Ordering::Relaxed),
+            provider,
+            session,
+            query,
+            reply,
+            cancel,
+            handle,
+        };
+        let mut queue = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+        if self.shared.closed.load(Ordering::SeqCst) {
+            self.shared.stats.refused.fetch_add(1, Ordering::Relaxed);
+            return Err(SubmitRefusal::Closed);
+        }
+        if self.shared.running.load(Ordering::SeqCst) == 0 {
+            self.shared.stats.refused.fetch_add(1, Ordering::Relaxed);
+            return Err(SubmitRefusal::NoWorkers);
+        }
+        if queue.len() >= self.shared.capacity {
+            // Reclaim capacity held by polls whose callers already gave up:
+            // a cancelled queued poll can never produce an answer, so it
+            // must not block a live one.
+            let mut kept = VecDeque::with_capacity(queue.len());
+            let mut reclaimed = 0u64;
+            while let Some(stale) = queue.pop_front() {
+                if stale.cancel.is_cancelled() {
+                    let _ = stale.reply.send(WorkerReply::Cancelled);
+                    reclaimed += 1;
+                } else {
+                    kept.push_back(stale);
+                }
+            }
+            *queue = kept;
+            if reclaimed > 0 {
+                self.shared
+                    .stats
+                    .cancelled
+                    .fetch_add(reclaimed, Ordering::Relaxed);
+            }
+        }
+        if queue.len() >= self.shared.capacity {
+            self.shared.stats.refused.fetch_add(1, Ordering::Relaxed);
+            return Err(SubmitRefusal::Saturated {
+                workers: self.shared.running.load(Ordering::SeqCst),
+                capacity: self.shared.capacity,
+            });
+        }
+        queue.push_back(job);
+        self.shared.stats.enqueued.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .stats
+            .max_queue_depth
+            .fetch_max(queue.len() as u64, Ordering::Relaxed);
+        drop(queue);
+        self.shared.wake.notify_one();
+        Ok(())
+    }
+
+    /// Close the queue, cancel every executing poll and release every queued
+    /// one with an explicit cancellation, then wake the workers.
+    fn close_and_cancel(&self) {
+        self.shared.closed.store(true, Ordering::SeqCst);
+        {
+            let mut queue = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+            while let Some(job) = queue.pop_front() {
+                self.shared.stats.cancelled.fetch_add(1, Ordering::Relaxed);
+                self.shared.stats.completed.fetch_add(1, Ordering::Relaxed);
+                let _ = job.reply.send(WorkerReply::Cancelled);
+            }
+        }
+        {
+            let executing = self
+                .shared
+                .executing
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            for token in executing.values() {
+                token.cancel();
+            }
+        }
+        self.shared.wake.notify_all();
+    }
+
+    /// Bounded shutdown: cancel, wait up to `timeout` for the workers to
+    /// exit, then join every exited worker. Workers still blocked inside a
+    /// non-yielding provider are ABANDONED after the bound (at most the
+    /// fixed worker count, never one per poll); returns whether every owned
+    /// worker exited within the bound. Idempotent: once every owned worker
+    /// has been joined or abandoned there is nothing left to wait for, so a
+    /// repeated call (e.g. the `Drop` after an explicit `shutdown`) returns
+    /// immediately instead of waiting out the bound on an abandoned pool.
+    pub(crate) fn shutdown(&self, timeout: Duration) -> bool {
+        self.close_and_cancel();
+        if self
+            .workers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+        {
+            return true;
+        }
+        let deadline = Instant::now() + timeout;
+        {
+            let mut exited = self
+                .shared
+                .exit
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            while !*exited && self.shared.running.load(Ordering::SeqCst) > 0 {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                match self.shared.exit.cv.wait_timeout(exited, deadline - now) {
+                    Ok((guard, _)) => exited = guard,
+                    Err(poisoned) => exited = poisoned.into_inner().0,
+                }
+            }
+        }
+        let (all_exited, abandoned) = {
+            let mut workers = self.workers.lock().unwrap_or_else(|p| p.into_inner());
+            let mut all_exited = true;
+            let mut abandoned = 0usize;
+            for worker in workers.iter_mut() {
+                if worker.exited.load(Ordering::SeqCst) {
+                    if let Some(join) = worker.join.take() {
+                        let _ = join.join();
+                    }
+                } else {
+                    all_exited = false;
+                    abandoned += 1;
+                    // Bounded abandonment: at most one thread per FIXED
+                    // worker slot, only when the provider blocks its OS
+                    // thread past the join bound (uncancellable from safe
+                    // Rust). Never one thread per poll.
+                    worker.join.take();
+                }
+            }
+            workers.clear();
+            (all_exited, abandoned)
+        };
+        if !all_exited {
+            // Loud, structured: a bounded abandonment is still a defect
+            // signal (the provider ignores cancellation), and the counters
+            // are the operator's proof that no poll leaked a thread.
+            let stats = self.stats();
+            tracing::error!(
+                target: "faktor_agent::evidence",
+                abandoned,
+                workers = stats.workers,
+                "evidence executor shutdown bound elapsed: {abandoned} of {} worker(s) blocked inside a non-yielding provider were abandoned (bounded by the fixed pool, never one per poll); counters enqueued={} completed={} refused={} cancelled={} max_active={} max_queue_depth={} capacity={}",
+                stats.workers,
+                stats.enqueued,
+                stats.completed,
+                stats.refused,
+                stats.cancelled,
+                stats.max_active,
+                stats.max_queue_depth,
+                stats.capacity,
+            );
+        }
+        all_exited
+    }
+}
+
+impl Drop for EvidenceExecutor {
+    fn drop(&mut self) {
+        let _ = self.shutdown(EVIDENCE_EXECUTOR_JOIN_BOUND);
+    }
+}
+
+/// FIFO dequeue with a condvar wait; `None` only once the executor is closed
+/// and the queue is drained (workers exit by themselves).
+fn next_job(shared: &Arc<ExecutorShared>) -> Option<EvidenceJob> {
+    let mut queue = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+    loop {
+        if let Some(job) = queue.pop_front() {
+            return Some(job);
+        }
+        if shared.closed.load(Ordering::SeqCst) {
+            return None;
+        }
+        queue = shared.wake.wait(queue).unwrap_or_else(|p| p.into_inner());
+    }
+}
+
+/// The worker loop: dequeue, skip cancelled polls WITHOUT invoking the
+/// provider (cooperative admission check), drive the provider future under a
+/// cancellation select (a yielding future is dropped at its next await point
+/// when the caller's budget fires), and reply under panic isolation.
+fn worker_main(shared: Arc<ExecutorShared>, exited: Arc<AtomicBool>) {
+    loop {
+        let Some(job) = next_job(&shared) else {
+            break;
+        };
+        if job.cancel.is_cancelled() || shared.closed.load(Ordering::SeqCst) {
+            shared.stats.cancelled.fetch_add(1, Ordering::Relaxed);
+            shared.stats.completed.fetch_add(1, Ordering::Relaxed);
+            let _ = job.reply.send(WorkerReply::Cancelled);
+            continue;
+        }
+        let job_id = job.id;
+        {
+            let mut executing = shared.executing.lock().unwrap_or_else(|p| p.into_inner());
+            executing.insert(job_id, job.cancel.clone());
+        }
+        // Register BEFORE the shutdown re-check so `close_and_cancel` can
+        // never miss this poll: either shutdown sees the registration and
+        // cancels it, or this check sees `closed` and self-cancels. The
+        // select below then returns immediately either way.
+        if shared.closed.load(Ordering::SeqCst) {
+            job.cancel.cancel();
+        }
+        let active = shared.stats.active.fetch_add(1, Ordering::Relaxed) + 1;
+        shared.stats.max_active.fetch_max(active, Ordering::Relaxed);
+        let EvidenceJob {
+            provider,
+            session,
+            query,
+            cancel,
+            handle,
+            reply,
+            ..
+        } = job;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            handle.block_on(async move {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => None,
+                    result = provider.evidence_for(session, query) => Some(result),
+                }
+            })
+        }));
+        shared.stats.active.fetch_sub(1, Ordering::Relaxed);
+        shared.stats.completed.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut executing = shared.executing.lock().unwrap_or_else(|p| p.into_inner());
+            executing.remove(&job_id);
+        }
+        let reply_value = match outcome {
+            Ok(Some(result)) => WorkerReply::Completed(Ok(result)),
+            Ok(None) => WorkerReply::Cancelled,
+            Err(payload) => WorkerReply::Completed(Err(payload)),
+        };
+        let _ = reply.send(reply_value);
+    }
+    #[cfg(test)]
+    EVIDENCE_WORKERS_LIVE.fetch_sub(1, Ordering::SeqCst);
+    exited.store(true, Ordering::SeqCst);
+    if shared.running.fetch_sub(1, Ordering::SeqCst) == 1 {
+        shared.exit.notify_exited();
+    }
+}
+
+/// The process-wide executor: started lazily on the first advisory poll and
+/// kept for the process lifetime (a fixed, bounded pool — long-lived workers
+/// by design; there is nothing per-poll to leak).
+fn global_evidence_executor() -> Arc<EvidenceExecutor> {
+    static EXECUTOR: OnceLock<Arc<EvidenceExecutor>> = OnceLock::new();
+    EXECUTOR
+        .get_or_init(|| {
+            EvidenceExecutor::start(EVIDENCE_EXECUTOR_WORKERS, EVIDENCE_EXECUTOR_QUEUE_CAPACITY)
+        })
+        .clone()
+}
+
+/// [`poll_evidence_with_wall_budget_outcome`] on an explicit executor (test
+/// seam; the production entry point always uses the process-wide bounded
+/// pool). The executor handle is dropped before the poll is awaited: the
+/// poll does not keep the pool alive, so an executor can be shut down while
+/// polls are in flight (they settle with a typed cancellation).
+async fn poll_on_executor(
+    executor: Arc<EvidenceExecutor>,
     provider: Arc<dyn EvidenceProvider>,
     session: SessionId,
     query: EvidenceQuery,
     budget: std::time::Duration,
 ) -> EvidencePollOutcome {
+    let budget_ms = budget.as_millis().min(u64::MAX as u128) as u64;
+    let cancel = CancellationToken::new();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let handle = tokio::runtime::Handle::current();
-    let spawned = std::thread::Builder::new()
-        .name("evidence-poll".to_string())
-        .spawn(move || {
-            // The provider is untrusted input: a panic inside its future is
-            // caught here so the detached thread always answers (dropping
-            // the oneshot silently would hide the failure).
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handle.block_on(provider.evidence_for(session, query))
-            }));
-            let _ = tx.send(result);
-        });
-    if let Err(error) = spawned {
+    let submitted = executor.submit(
+        provider,
+        session,
+        query,
+        cancel.clone(),
+        tokio::runtime::Handle::current(),
+        tx,
+    );
+    drop(executor);
+    if let Err(refusal) = submitted {
         return EvidencePollOutcome {
             evidence: Vec::new(),
             status: EvidencePollStatus::NotSpawned {
-                message: bounded_poll_message(&error.to_string()),
+                message: bounded_poll_message(&refusal.message()),
             },
         };
     }
     let mut evidence = Vec::new();
     let status = match tokio::time::timeout(budget, rx).await {
-        Ok(Ok(Ok(Ok(package)))) => {
+        Ok(Ok(WorkerReply::Completed(Ok(Ok(package))))) => {
             if package.is_empty() {
                 EvidencePollStatus::NoEvidence
             } else {
@@ -1644,18 +2234,55 @@ pub(crate) async fn poll_evidence_with_wall_budget_outcome(
                 EvidencePollStatus::Served
             }
         }
-        Ok(Ok(Ok(Err(error)))) => status_from_provider_error(error),
-        Ok(Ok(Err(payload))) => EvidencePollStatus::ProviderPanicked {
+        Ok(Ok(WorkerReply::Completed(Ok(Err(error))))) => status_from_provider_error(error),
+        Ok(Ok(WorkerReply::Completed(Err(payload)))) => EvidencePollStatus::ProviderPanicked {
             message: poll_panic_message(payload.as_ref()),
         },
+        Ok(Ok(WorkerReply::Cancelled)) => EvidencePollStatus::NotSpawned {
+            message:
+                "evidence poll cancelled before it answered (executor shutdown or caller budget)"
+                    .to_string(),
+        },
         Ok(Err(_)) => EvidencePollStatus::ProviderPanicked {
-            message: "evidence poll thread died without answering".to_string(),
+            message: "evidence poll worker died without answering".to_string(),
         },
-        Err(_) => EvidencePollStatus::TimedOut {
-            budget_ms: budget.as_millis().min(u64::MAX as u128) as u64,
-        },
+        Err(_) => {
+            // Cooperative cancellation: the executing future observes the
+            // token and is dropped at its next await point; a queued poll is
+            // skipped before the provider is ever invoked.
+            cancel.cancel();
+            EvidencePollStatus::TimedOut { budget_ms }
+        }
     };
     EvidencePollOutcome { evidence, status }
+}
+
+/// Poll one async `EvidenceProvider` on the process-wide BOUNDED executor
+/// and await it under `budget`, returning the typed outcome: a provider that
+/// panics, errors, or simply never yields degrades to an empty package once
+/// the budget fires. The provider's future is driven on an OWNED worker
+/// thread via the captured runtime handle — never on a runtime worker, never
+/// on a tokio blocking-pool task, and never a freshly spawned detached
+/// thread per poll (the P1 leak this replaced). When the budget fires the
+/// caller cancels the admission: a queued poll is skipped before the
+/// provider is invoked, and a yielding in-flight future is dropped at its
+/// next await point, freeing the worker.
+///
+/// Degradation is observable by contract: the status distinguishes an
+/// honest [`EvidencePollStatus::NoEvidence`] answer from
+/// [`EvidencePollStatus::RetrievalFailed`] (provider code + retryability),
+/// a panic, a missed budget and a refusal (saturation/shutdown/spawn
+/// failure). The caller OWNS the diagnostic:
+/// [`poll_evidence_with_wall_budget`] emits the structured log for the
+/// frozen `runtime.rs` call shape; any other caller must surface a degraded
+/// status itself (never swallow it).
+pub(crate) async fn poll_evidence_with_wall_budget_outcome(
+    provider: Arc<dyn EvidenceProvider>,
+    session: SessionId,
+    query: EvidenceQuery,
+    budget: std::time::Duration,
+) -> EvidencePollOutcome {
+    poll_on_executor(global_evidence_executor(), provider, session, query, budget).await
 }
 
 /// Advisory legacy poll (used when the IndexService cannot be hosted):
@@ -2039,6 +2666,441 @@ mod advisory_evidence_poll_tests {
                 retryable: true,
                 message: "index busy".into(),
             }
+        );
+    }
+}
+
+/// Adversarial coverage of the bounded evidence executor (P1): a provider
+/// that never yields must never grow the thread/worker population, excess
+/// polls must be explicitly typed, shutdown/Drop must join owned workers
+/// within a bound, and the off-turn blocking bridge must differentiate a
+/// panic from a normal value.
+#[cfg(test)]
+mod bounded_evidence_executor_tests {
+    use super::*;
+    use faktor_context::assembler::Evidence;
+    use futures::future::BoxFuture;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    fn query() -> EvidenceQuery {
+        EvidenceQuery {
+            prompt: "where is the parser".into(),
+            changed_files: vec!["src/a.rs".into()],
+            failures: vec![],
+        }
+    }
+
+    fn session() -> SessionId {
+        SessionId::new(11)
+    }
+
+    struct ServingProvider;
+
+    impl EvidenceProvider for ServingProvider {
+        fn evidence_for(
+            &self,
+            _session: SessionId,
+            _query: EvidenceQuery,
+        ) -> BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
+            Box::pin(async {
+                Ok(vec![Evidence {
+                    path: "src/a.rs".into(),
+                    snippet: "fn parser()".into(),
+                    score: 0.9,
+                }])
+            })
+        }
+    }
+
+    /// A future that yields forever: cooperative — the worker's cancellation
+    /// select drops it the moment the caller's budget fires.
+    struct CooperativeHangingProvider;
+
+    impl EvidenceProvider for CooperativeHangingProvider {
+        fn evidence_for(
+            &self,
+            _session: SessionId,
+            _query: EvidenceQuery,
+        ) -> BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
+            Box::pin(futures::future::pending())
+        }
+    }
+
+    /// A provider that blocks its OS thread INSIDE the first poll forever:
+    /// not cancellable from safe Rust, so it can strand at most the fixed
+    /// worker count.
+    struct SyncBlockingProvider;
+
+    impl EvidenceProvider for SyncBlockingProvider {
+        fn evidence_for(
+            &self,
+            _session: SessionId,
+            _query: EvidenceQuery,
+        ) -> BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
+            Box::pin(async move {
+                let (_tx, rx) = std::sync::mpsc::channel::<()>();
+                let _ = rx.recv();
+                Ok(vec![])
+            })
+        }
+    }
+
+    /// Serializes the heavy measurement tests: the process-wide evidence
+    /// worker counters are shared and the leak math needs a quiet window.
+    static HEAVY_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Live OS threads of this process when the platform exposes them
+    /// (Linux `/proc/self/task`, macOS `ps -M`); `None` elsewhere.
+    fn live_thread_count() -> Option<usize> {
+        #[cfg(target_os = "linux")]
+        let count = std::fs::read_dir("/proc/self/task").ok().map(|d| d.count());
+        #[cfg(target_os = "macos")]
+        let count = std::process::Command::new("ps")
+            .arg("-M")
+            .arg(std::process::id().to_string())
+            .output()
+            .ok()
+            .and_then(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .count()
+                    .checked_sub(1)
+            });
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let count = None;
+        count
+    }
+
+    /// Initialize the process-wide pool once, so later spawn-counter deltas
+    /// measure only this test's executors. Also pins the DOCUMENTED fixed
+    /// size of the production pool: the whole concurrency budget of the
+    /// feature is `EVIDENCE_EXECUTOR_WORKERS` owned workers with a
+    /// `EVIDENCE_EXECUTOR_QUEUE_CAPACITY`-bounded admission queue.
+    async fn warm_global_executor() {
+        let outcome = poll_evidence_with_wall_budget_outcome(
+            Arc::new(ServingProvider),
+            session(),
+            query(),
+            Duration::from_millis(500),
+        )
+        .await;
+        assert_eq!(outcome.status, EvidencePollStatus::Served);
+        let global = global_evidence_executor();
+        assert_eq!(
+            global.worker_count(),
+            EVIDENCE_EXECUTOR_WORKERS,
+            "the production pool is fixed at its documented worker count"
+        );
+        assert_eq!(
+            global.stats().capacity,
+            EVIDENCE_EXECUTOR_QUEUE_CAPACITY,
+            "the production pool keeps its documented bounded queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn hundreds_of_polls_never_grow_the_worker_population() {
+        let _guard = HEAVY_TESTS.lock().await;
+        warm_global_executor().await;
+        let live_before = EVIDENCE_WORKERS_LIVE.load(Ordering::SeqCst);
+        let executor = EvidenceExecutor::start(2, 4);
+        assert_eq!(executor.worker_count(), 2, "the pool is fixed at start");
+        assert_eq!(
+            EVIDENCE_WORKERS_LIVE.load(Ordering::SeqCst),
+            live_before + 2,
+            "start owns exactly its fixed worker count"
+        );
+        let spawned_after_start = EVIDENCE_WORKERS_SPAWNED.load(Ordering::SeqCst);
+        let threads_before = live_thread_count();
+        let (mut served, mut timed_out) = (0usize, 0usize);
+        for i in 0..200usize {
+            let (provider, budget): (Arc<dyn EvidenceProvider>, Duration) = if i % 4 == 0 {
+                (Arc::new(ServingProvider), Duration::from_secs(5))
+            } else {
+                (
+                    Arc::new(CooperativeHangingProvider),
+                    Duration::from_millis(2),
+                )
+            };
+            let outcome =
+                poll_on_executor(executor.clone(), provider, session(), query(), budget).await;
+            match outcome.status {
+                EvidencePollStatus::Served => served += 1,
+                EvidencePollStatus::TimedOut { .. } => timed_out += 1,
+                other => panic!("unexpected status under bounded polling: {other:?}"),
+            }
+        }
+        assert_eq!(served, 50, "served polls keep their normal answer");
+        assert_eq!(timed_out, 150, "every missed budget is typed, none hangs");
+        assert_eq!(executor.worker_count(), 2, "the pool must stay fixed");
+        assert_eq!(
+            EVIDENCE_WORKERS_SPAWNED.load(Ordering::SeqCst),
+            spawned_after_start,
+            "200 polls must never spawn a worker thread (the old leak spawned one detached thread per poll)"
+        );
+        let stats = executor.stats();
+        assert_eq!(stats.enqueued, 200);
+        // The worker's completion counter settles just after each reply; the
+        // last timed-out poll races its caller, so wait (bounded) for the
+        // settle instead of asserting on a snapshot.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut stats = stats;
+        while stats.completed < 200 {
+            assert!(
+                Instant::now() < deadline,
+                "every admitted poll must settle: {stats:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            stats = executor.stats();
+        }
+        assert_eq!(stats.workers, 2, "the pool must stay fixed");
+        assert_eq!(stats.capacity, 4, "the queue bound is fixed");
+        assert!(stats.max_active <= 2, "active high-water: {stats:?}");
+        assert!(stats.max_queue_depth <= 4, "queue high-water: {stats:?}");
+        assert_eq!(
+            EVIDENCE_WORKERS_LIVE.load(Ordering::SeqCst),
+            live_before + 2,
+            "200 polls must neither spawn nor leak an evidence worker"
+        );
+        if let (Some(before), Some(after)) = (threads_before, live_thread_count()) {
+            assert!(
+                after <= before + 64,
+                "200 polls must not leak threads (generous ceiling): before={before} after={after}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn saturating_stuck_provider_is_typed_and_never_spawns_more_workers() {
+        let _guard = HEAVY_TESTS.lock().await;
+        warm_global_executor().await;
+        let live_before = EVIDENCE_WORKERS_LIVE.load(Ordering::SeqCst);
+        let executor = EvidenceExecutor::start(2, 4);
+        let spawned_after_start = EVIDENCE_WORKERS_SPAWNED.load(Ordering::SeqCst);
+        let threads_before = live_thread_count();
+        let polls: Vec<_> = (0..60)
+            .map(|_| {
+                poll_on_executor(
+                    executor.clone(),
+                    Arc::new(SyncBlockingProvider),
+                    session(),
+                    query(),
+                    Duration::from_millis(60),
+                )
+            })
+            .collect();
+        let outcomes = futures::future::join_all(polls).await;
+        let (mut timed_out, mut refused) = (0usize, 0usize);
+        for outcome in outcomes {
+            match outcome.status {
+                EvidencePollStatus::TimedOut { .. } => timed_out += 1,
+                EvidencePollStatus::NotSpawned { message } => {
+                    assert!(message.contains("saturated"), "{message}");
+                    refused += 1;
+                }
+                other => panic!("stuck-provider polls must be typed, got {other:?}"),
+            }
+        }
+        assert!(timed_out >= 2, "the two workers admit at least two polls");
+        assert!(refused >= 1, "the burst must overflow the bounded pool");
+        assert_eq!(timed_out + refused, 60, "every poll is accounted for");
+        assert_eq!(
+            executor.worker_count(),
+            2,
+            "saturation never grows the pool"
+        );
+        assert_eq!(
+            EVIDENCE_WORKERS_SPAWNED.load(Ordering::SeqCst),
+            spawned_after_start,
+            "a saturating burst must not spawn a worker"
+        );
+        let stats = executor.stats();
+        assert_eq!(
+            stats.enqueued as usize + stats.refused as usize,
+            60,
+            "admission is a bounded partition: {stats:?}"
+        );
+        assert!(stats.max_active <= 2, "active high-water: {stats:?}");
+        assert!(stats.max_queue_depth <= 4, "queue high-water: {stats:?}");
+        if let (Some(before), Some(after)) = (threads_before, live_thread_count()) {
+            assert!(
+                after <= before + 64,
+                "the stuck provider must not leak threads: before={before} after={after}"
+            );
+        }
+        // Sequential hundreds of polls against the same wedged pool: every
+        // poll is admitted into reclaimed capacity (cancelled queued entries
+        // are purged) or refused, and ALWAYS typed — never a new thread.
+        for _ in 0..200 {
+            let outcome = poll_on_executor(
+                executor.clone(),
+                Arc::new(SyncBlockingProvider),
+                session(),
+                query(),
+                Duration::from_millis(5),
+            )
+            .await;
+            assert!(
+                matches!(
+                    outcome.status,
+                    EvidencePollStatus::TimedOut { .. } | EvidencePollStatus::NotSpawned { .. }
+                ),
+                "sequential polls against a wedged pool must stay typed: {:?}",
+                outcome.status
+            );
+        }
+        assert_eq!(executor.worker_count(), 2, "sequential polls grow nothing");
+        assert_eq!(
+            EVIDENCE_WORKERS_LIVE.load(Ordering::SeqCst),
+            live_before + 2,
+            "the stuck pool strands exactly the fixed worker count, never one thread per poll"
+        );
+        assert_eq!(
+            EVIDENCE_WORKERS_SPAWNED.load(Ordering::SeqCst),
+            spawned_after_start,
+            "200 sequential polls must not spawn a worker"
+        );
+        // The synchronously blocked workers cannot be cancelled from safe
+        // Rust: a SHORT bounded shutdown reports the truth and abandons at
+        // most the fixed worker count (never one thread per poll). The
+        // executor handle is released, so Drop is immediate afterwards.
+        let started = Instant::now();
+        assert!(
+            !executor.shutdown(Duration::from_millis(100)),
+            "a synchronously blocked worker must be reported as not exited"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the bounded join attempt must not wait out the provider"
+        );
+        assert_eq!(executor.worker_count(), 0);
+        drop(executor);
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_cooperative_workers_within_bound() {
+        let _guard = HEAVY_TESTS.lock().await;
+        warm_global_executor().await;
+        let live_before = EVIDENCE_WORKERS_LIVE.load(Ordering::SeqCst);
+        let executor = EvidenceExecutor::start(2, 4);
+        let mut polls = Vec::new();
+        for _ in 0..2 {
+            polls.push(tokio::spawn(poll_on_executor(
+                executor.clone(),
+                Arc::new(CooperativeHangingProvider),
+                session(),
+                query(),
+                Duration::from_secs(30),
+            )));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while executor.stats().max_active < 2 {
+            assert!(Instant::now() < deadline, "workers never started the polls");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let started = Instant::now();
+        assert!(
+            executor.shutdown(Duration::from_secs(2)),
+            "cooperative workers must be cancelled and joined"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown must join within its bound"
+        );
+        assert_eq!(executor.worker_count(), 0, "workers are owned, then joined");
+        assert_eq!(
+            EVIDENCE_WORKERS_LIVE.load(Ordering::SeqCst),
+            live_before,
+            "shutdown must leave no evidence worker alive"
+        );
+        for poll in polls {
+            match poll.await.unwrap().status {
+                EvidencePollStatus::NotSpawned { .. } => {}
+                other => panic!("a shutdown-cancelled poll must be typed, got {other:?}"),
+            }
+        }
+        let late = poll_on_executor(
+            executor.clone(),
+            Arc::new(ServingProvider),
+            session(),
+            query(),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            matches!(late.status, EvidencePollStatus::NotSpawned { .. }),
+            "a closed executor refuses with a typed status: {:?}",
+            late.status
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_joins_cooperative_workers_within_bound() {
+        let _guard = HEAVY_TESTS.lock().await;
+        warm_global_executor().await;
+        let live_before = EVIDENCE_WORKERS_LIVE.load(Ordering::SeqCst);
+        let executor = EvidenceExecutor::start(2, 4);
+        let mut polls = Vec::new();
+        for _ in 0..2 {
+            polls.push(tokio::spawn(poll_on_executor(
+                executor.clone(),
+                Arc::new(CooperativeHangingProvider),
+                session(),
+                query(),
+                Duration::from_secs(30),
+            )));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while executor.stats().max_active < 2 {
+            assert!(Instant::now() < deadline, "workers never started the polls");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            Arc::strong_count(&executor),
+            1,
+            "the in-flight polls must not keep the executor alive"
+        );
+        let started = Instant::now();
+        drop(executor);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "Drop must cancel and join owned workers within the bound"
+        );
+        assert_eq!(
+            EVIDENCE_WORKERS_LIVE.load(Ordering::SeqCst),
+            live_before,
+            "Drop must join every owned worker"
+        );
+        for poll in polls {
+            match poll.await.unwrap().status {
+                EvidencePollStatus::NotSpawned { .. } => {}
+                other => panic!("a Drop-cancelled poll must be typed, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn off_turn_thread_panic_is_differentiated_and_normal_path_unchanged() {
+        assert_eq!(run_off_turn_thread_outcome(|| 21 + 21).await, Ok(42));
+        match run_off_turn_thread_outcome(|| -> u32 { panic!("off-turn boom") }).await {
+            Err(OffTurnThreadFailure::Panicked { message }) => {
+                assert!(message.contains("off-turn boom"), "{message}");
+            }
+            other => panic!("a panic must be a typed outcome, got {other:?}"),
+        }
+        // The legacy adapter keeps its Option shape and surfaces the failure
+        // loudly instead of the old silent `.ok()`.
+        assert_eq!(run_off_turn_thread(|| 41 + 1).await, Some(42));
+        let before = off_turn_thread_failures();
+        assert_eq!(
+            run_off_turn_thread(|| -> u32 { panic!("legacy boom") }).await,
+            None
+        );
+        assert_eq!(
+            off_turn_thread_failures(),
+            before + 1,
+            "the legacy adapter must surface the failure, never swallow it"
         );
     }
 }

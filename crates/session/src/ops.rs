@@ -650,10 +650,12 @@ impl SessionHandle {
     }
 
     /// Resolve a pending permission. `Allow` journals `PermissionGranted`
-    /// (state `ExecutingTool`); `Deny` journals `PermissionDenied` and returns
-    /// the session to `ReadyForNextTurn` when nothing else is running (stays
-    /// `ExecutingTool` under parallel tools). A double resolve loses the race
-    /// with `Conflict`; the journal never records two resolutions.
+    /// (state `ExecutingTool`); `Deny` journals `PermissionDenied` and lands
+    /// on `ReadyForNextTurn` only when no sibling call of the batch is still
+    /// pending — a mixed batch keeps the machine on `ExecutingTool` until
+    /// every call resolved, so the approved siblings stay reachable. A double
+    /// resolve loses the race with `Conflict`; the journal never records two
+    /// resolutions.
     pub fn resolve_permission(
         &self,
         id: i64,
@@ -693,6 +695,42 @@ impl SessionHandle {
                 .into());
             }
         };
+        // Deny sibling-awareness (mixed permission batch): the denied call's
+        // own result is written only after the whole batch resolves, so at
+        // this point the batch may still have unresolved sibling calls (or a
+        // sibling already executing). Landing on `ReadyForNextTurn` would
+        // claim the batch is finished and make the sibling's next hop
+        // (`ToolRequested`, `ToolStarted`, `FileChanged`) illegal. The
+        // honest landing while the batch continues is `ExecutingTool`
+        // (`WaitingForPermission -> ExecutingTool` is the legal edge); the
+        // deny-only batch keeps the documented `ReadyForNextTurn` landing.
+        // Resolved BEFORE the durable row: a read failure must never leave a
+        // half-resolved permission behind.
+        let target = if kind == faktor_core::event::EventKind::PermissionDenied {
+            let current = self.state()?;
+            let preferred = if self.open_batch_has_pending_siblings()? {
+                AgentState::ExecutingTool
+            } else {
+                AgentState::ReadyForNextTurn
+            };
+            // Never bypass the machine: pick the first LEGAL landing (a
+            // self-transition is legal and idempotent), never a forced one.
+            if faktor_core::state::StateMachine::new(current)
+                .transition(preferred)
+                .is_ok()
+            {
+                preferred
+            } else if faktor_core::state::StateMachine::new(current)
+                .transition(AgentState::ReadyForNextTurn)
+                .is_ok()
+            {
+                AgentState::ReadyForNextTurn
+            } else {
+                current
+            }
+        } else {
+            target
+        };
         self.manager
             .store()
             .resolve_permission(id, decision_str)
@@ -710,25 +748,90 @@ impl SessionHandle {
             ))
             .into());
         }
-        // Deny under a parallel tool: staying ExecutingTool is the honest
-        // machine outcome (ExecutingTool cannot go to ReadyForNextTurn).
-        let target = if kind == faktor_core::event::EventKind::PermissionDenied {
-            let current = self.state()?;
-            let mut m = faktor_core::state::StateMachine::new(current);
-            if m.transition(AgentState::ReadyForNextTurn).is_err() {
-                current
-            } else {
-                AgentState::ReadyForNextTurn
-            }
-        } else {
-            target
-        };
         self.transition_locked(
             kind,
             target,
             Some(op),
             Some(serde_json::json!({ "permission_id": id, "decision": decision_str })),
         )
+    }
+
+    /// Durable sibling evidence for a permission DENIAL: is another tool
+    /// call of the session's open batch still unresolved?
+    ///
+    /// A model tool batch is durable BEFORE any permission hop: every call of
+    /// the batch is an assistant `tool_call` part, and the batch's results are
+    /// written only after every call resolved. So a wire-visible `tool_call`
+    /// part with no answering `tool_result` (other than the denied call
+    /// itself) is exactly "the batch is still open"; a still-running
+    /// `tool_run` row is the second, direct signal (a sibling already
+    /// executing). The scan is bounded and mirrors the runtime's
+    /// dangling-call repair: newest-first, stopping at the first message with
+    /// no tool part (the batch cluster is contiguous at the tail) and capped.
+    fn open_batch_has_pending_siblings(&self) -> faktor_core::Result<bool> {
+        if !self.pending_tool_runs()?.is_empty() {
+            return Ok(true);
+        }
+        const MAX_SCAN: usize = 128;
+        let mut calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cursor: Option<i64> = None;
+        let mut scanned = 0usize;
+        'scan: loop {
+            let page = self.messages_before(cursor, 100)?;
+            if page.is_empty() {
+                break;
+            }
+            for row in &page {
+                if scanned >= MAX_SCAN {
+                    break 'scan;
+                }
+                scanned += 1;
+                let mut saw_tool_part = false;
+                for part in self.parts_of(row.id)? {
+                    let Some(call_id) = part
+                        .data
+                        .get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .filter(|id| !id.is_empty())
+                    else {
+                        continue;
+                    };
+                    match part.kind.as_str() {
+                        // Only the call states the wire carries can be
+                        // pending on the wire (same filter as the runtime's
+                        // dangling-call repair).
+                        "tool_call"
+                            if matches!(
+                                part.data.get("state").and_then(|v| v.as_str()),
+                                Some("completed") | Some("error")
+                            ) =>
+                        {
+                            calls.insert(call_id.to_string());
+                            saw_tool_part = true;
+                        }
+                        "tool_call" => saw_tool_part = true,
+                        "tool_result" => {
+                            answered.insert(call_id.to_string());
+                            saw_tool_part = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if !saw_tool_part {
+                    break 'scan;
+                }
+            }
+            let Some(oldest) = page.last() else { break };
+            if scanned >= MAX_SCAN || oldest.seq <= 1 {
+                break;
+            }
+            cursor = Some(oldest.seq);
+        }
+        // The denied call is itself unanswered (its result lands after the
+        // batch resolves), so a pending sibling exists iff at least two
+        // batch calls still await a result.
+        Ok(calls.iter().filter(|c| !answered.contains(*c)).count() > 1)
     }
 
     pub fn pending_permission(
@@ -1146,7 +1249,10 @@ mod tests {
             .find(|e| e.kind == EventKind::PermissionDenied)
             .expect("denial journaled");
         assert_eq!(ev.state, AgentState::ExecutingTool);
-        // A clean deny from WaitingForPermission returns to ready.
+        // A second denial while the batch still has a LIVE sibling run stays
+        // on the batch-execution edge too: the run is still pending, so the
+        // batch is not finished (the old state-only check landed
+        // ReadyForNextTurn and stranded the running row's later hops).
         let req2 = s
             .request_permission(
                 turn_op,
@@ -1157,7 +1263,222 @@ mod tests {
             .unwrap();
         s.resolve_permission(req2.id, faktor_core::capability::PermissionDecision::Deny)
             .unwrap();
+        assert_eq!(s.state().unwrap(), AgentState::ExecutingTool);
+        // Finishing the sibling walks the batch lawfully to its end.
+        let rows = s.pending_tool_runs().unwrap();
+        assert_eq!(rows.len(), 1);
+        s.finish_tool_run(
+            rows[0].op_id,
+            "completed",
+            faktor_core::op::EffectStatus::Verified,
+        )
+        .unwrap();
+        assert_eq!(s.state().unwrap(), AgentState::Validating);
+        assert!(s.pending_tool_runs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn denied_call_with_an_unanswered_sibling_keeps_the_batch_executing() {
+        // DEFECT REPRODUCER (mixed permission batch): the model's batch is
+        // durable as tool_call parts BEFORE the permission hops, so at deny
+        // time the sibling call is durably pending even though its run has
+        // not started. The denial must not advance to ReadyForNextTurn — the
+        // batch is still open — or the sibling's own permission hop and the
+        // later FileChanged/start hop become illegal.
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        to_streaming(&s);
+        let turn_op = s.ops().all()[0];
+        let mid = s
+            .put_message(
+                s.proposed_message_seq().unwrap(),
+                "assistant",
+                serde_json::json!({ "parts": [] }),
+            )
+            .unwrap();
+        s.put_tool_call_part(mid, "c1", "read_file", serde_json::json!({}), "completed")
+            .unwrap();
+        s.put_tool_call_part(mid, "c2", "write_file", serde_json::json!({}), "completed")
+            .unwrap();
+        let req = s
+            .request_permission(
+                turn_op,
+                &Capability::ReadWorkspace {
+                    path: "/w/b".into(),
+                },
+            )
+            .unwrap();
+        s.resolve_permission(req.id, faktor_core::capability::PermissionDecision::Deny)
+            .unwrap();
+        assert_eq!(
+            s.state().unwrap(),
+            AgentState::ExecutingTool,
+            "an unanswered sibling keeps the batch executing"
+        );
+        // The sibling's own permission hop stays legal and the batch can
+        // continue to execute it.
+        let req2 = s
+            .request_permission(
+                turn_op,
+                &Capability::ReadWorkspace {
+                    path: "/w/c".into(),
+                },
+            )
+            .unwrap();
+        s.resolve_permission(req2.id, faktor_core::capability::PermissionDecision::Allow)
+            .unwrap();
+        assert_eq!(s.state().unwrap(), AgentState::ExecutingTool);
+    }
+
+    #[test]
+    fn genuinely_illegal_transitions_are_still_refused() {
+        // CONTROL: the sibling-aware denial path only ever PICKS legal
+        // landings — the machine's guards are never weakened. A FileChanged
+        // that tries to enter ExecutingTool from ReadyForNextTurn is still
+        // refused, and the refusal leaves no trace in the journal or the
+        // session row.
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        to_streaming(&s);
+        let turn_op = s.ops().all()[0];
+        let req = s
+            .request_permission(
+                turn_op,
+                &Capability::ReadWorkspace {
+                    path: "/w/a".into(),
+                },
+            )
+            .unwrap();
+        s.resolve_permission(req.id, faktor_core::capability::PermissionDecision::Deny)
+            .unwrap();
         assert_eq!(s.state().unwrap(), AgentState::ReadyForNextTurn);
+        let before = s.last_event_seq().unwrap().expect("journaled events").raw();
+        let err = s
+            .append_event(
+                EventKind::FileChanged,
+                AgentState::ExecutingTool,
+                Some(turn_op),
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err.kind, faktor_core::ErrorKind::InvalidState { .. }),
+            "a genuinely illegal transition must stay refused: {err:?}"
+        );
+        assert_eq!(
+            s.last_event_seq().unwrap().expect("journaled events").raw(),
+            before,
+            "no event was appended"
+        );
+        assert_eq!(s.state().unwrap(), AgentState::ReadyForNextTurn);
+        // The tool-request hop is illegal from ReadyForNextTurn too: a
+        // permission can never re-open a batch that already ended.
+        let err = s
+            .request_permission(
+                turn_op,
+                &Capability::ReadWorkspace {
+                    path: "/w/c".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err.kind, faktor_core::ErrorKind::InvalidState { .. }),
+            "the ToolRequested hop stays guarded: {err:?}"
+        );
+        assert!(!s
+            .events_range(1, None)
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == EventKind::ToolRequested && e.seq.raw() > before));
+    }
+
+    #[test]
+    fn crash_mid_mixed_batch_recovery_resolves_the_row_lawfully() {
+        // Crash residue of a MIXED batch: both calls are durable, the
+        // approved sibling's run is still running, the denial is journaled
+        // and its result was never written. Recovery must resolve the row on
+        // a legal path, land the honest recoverable end (never claim the
+        // batch finished) and leave a journal that replays cleanly.
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        to_streaming(&s);
+        let turn_op = s.ops().all()[0];
+        let mid = s
+            .put_message(
+                s.proposed_message_seq().unwrap(),
+                "assistant",
+                serde_json::json!({ "parts": [] }),
+            )
+            .unwrap();
+        s.put_tool_call_part(mid, "c_ok", "read_file", serde_json::json!({}), "completed")
+            .unwrap();
+        s.put_tool_call_part(
+            mid,
+            "c_deny",
+            "write_file",
+            serde_json::json!({}),
+            "completed",
+        )
+        .unwrap();
+        // The approved sibling is mid-flight at the crash.
+        let ok = s
+            .request_permission(
+                turn_op,
+                &Capability::ReadWorkspace {
+                    path: "/w/a".into(),
+                },
+            )
+            .unwrap();
+        s.resolve_permission(ok.id, faktor_core::capability::PermissionDecision::Allow)
+            .unwrap();
+        let meta = op_meta(&m, s.id(), faktor_core::op::RecoveryStrategy::Idempotent);
+        s.start_tool_run(meta, "read_file", serde_json::json!({}))
+            .unwrap();
+        // The denial is decided; its durable result part never landed.
+        let deny = s
+            .request_permission(
+                turn_op,
+                &Capability::WriteWorkspace {
+                    path: "/w/b".into(),
+                },
+            )
+            .unwrap();
+        s.resolve_permission(deny.id, faktor_core::capability::PermissionDecision::Deny)
+            .unwrap();
+        assert_eq!(s.state().unwrap(), AgentState::ExecutingTool);
+        // CRASH. Recovery resolves the running row honestly.
+        let report = s.recover_all().unwrap();
+        assert_eq!(report.crashed_ops.len(), 1);
+        assert_eq!(report.crashed_ops[0].status, "failed");
+        assert_eq!(
+            report.crashed_ops[0].effect,
+            faktor_core::op::EffectStatus::Unknown
+        );
+        assert_eq!(report.state, AgentState::FailedRecoverable);
+        assert_eq!(s.state().unwrap(), AgentState::FailedRecoverable);
+        assert!(s.pending_tool_runs().unwrap().is_empty());
+        // The denial and the recovery are durable; the journal replays with
+        // no corruption (every landing was legal).
+        let events = s.events_range(1, None).unwrap();
+        assert!(events.iter().any(|e| e.kind == EventKind::PermissionDenied));
+        assert!(events.iter().any(|e| e.kind == EventKind::CrashDetected));
+        assert!(events.iter().any(|e| e.kind == EventKind::RecoveryApplied));
+        assert_eq!(
+            s.replay_journal().unwrap().state,
+            AgentState::FailedRecoverable
+        );
+        // The interrupted turn is over: the session stays promptable and
+        // nothing is blindly re-run.
+        s.submit_prompt("try again", &[]).unwrap();
+        assert_eq!(s.state().unwrap(), AgentState::Preparing);
+        assert!(
+            s.events_range(1, None)
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == EventKind::ToolStarted)
+                .count()
+                == 1
+        );
     }
 
     #[test]

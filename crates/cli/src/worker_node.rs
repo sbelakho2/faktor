@@ -367,9 +367,11 @@ impl WorkerTransport for HttpWorkerTransport {
             .ok_or_else(|| {
                 WorkerRuntimeError::Transport("heartbeat carries no expiresAtMs".into())
             })?;
+        let generation = faktor_worker::JobGeneration::try_new(generation)
+            .map_err(|e| WorkerRuntimeError::Transport(e.to_string()))?;
         Ok(HeartbeatOutcome {
             lease_id,
-            generation: faktor_worker::JobGeneration(generation),
+            generation,
             heartbeat_interval_ms,
             expires_at_ms,
         })

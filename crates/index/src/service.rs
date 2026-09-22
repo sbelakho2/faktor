@@ -185,6 +185,11 @@ pub enum IndexError {
     BuildFailed { workspace: u64, message: String },
     #[error("corrupt generation data for workspace {workspace}: {message}")]
     CorruptGeneration { workspace: u64, message: String },
+    /// A durable row that cannot describe any legal machine state with the
+    /// value it carries (today: a negative persisted generation). Refused
+    /// typed and diagnosable; never normalized into a clean-looking value.
+    #[error("corrupt persisted index state: {0}")]
+    CorruptState(String),
 }
 
 /// One immutable published-generation snapshot. Holding an [`IndexView`]
@@ -685,8 +690,13 @@ impl IndexService {
         let (mut state, mut row_generation, mut state_json) =
             match self.inner.store.index_state_get(workspace)? {
                 Some(row) => {
+                    // A negative persisted generation is typed corruption: it
+                    // can never be "cleaned" by normalizing to 0 (that would
+                    // destroy the forensic value and make corruption look like
+                    // a clean initial generation).
+                    let row_generation = persisted_generation(workspace, row.generation)?;
                     match PersistedIndexState::parse(row.state_json.clone(), row.generation) {
-                        Ok(p) => (p.state, p.row_generation, p.state_json),
+                        Ok(p) => (p.state, row_generation, p.state_json),
                         Err(e) => {
                             let msg = format!("corrupt persisted index state: {e}");
                             tracing::error!(workspace = workspace.raw(), "{msg}");
@@ -697,10 +707,10 @@ impl IndexService {
                             self.inner.store.index_state_put(
                                 workspace,
                                 &failed_json,
-                                row.generation.max(0),
+                                row.generation,
                                 JOURNAL_CORRUPT,
                             )?;
-                            (failed, row.generation.max(0) as u64, failed_json)
+                            (failed, row_generation, failed_json)
                         }
                     }
                 }
@@ -1096,45 +1106,53 @@ impl IndexService {
     /// external writer advanced the row).
     fn refresh_mirror(&self, workspace: WorkspaceId) -> Result<(), IndexError> {
         let row = self.inner.store.index_state_get(workspace)?;
+        // Same typed corruption gate as `attach`: a negative persisted
+        // generation is refused with its value, never normalized to 0.
+        let row = match row {
+            Some(row) => Some((persisted_generation(workspace, row.generation)?, row)),
+            None => None,
+        };
         let mut live = self.inner.live.lock().expect("live poisoned");
         let Some(l) = live.get_mut(&workspace) else {
             return Ok(());
         };
         match row {
-            Some(row) => match PersistedIndexState::parse(row.state_json.clone(), row.generation) {
-                Ok(p) => refresh_mirror_into(l, p),
-                Err(e) => {
-                    // Corrupt row from an external writer: fail open loudly —
-                    // and never discard the rewrite of the durable Failed
-                    // marker: the caller retries the reconcile pass with the
-                    // propagated store error (the corrupt row stays the
-                    // durable retry trigger until the rewrite lands).
-                    let message = format!("corrupt persisted index state: {e}");
-                    tracing::error!(
-                        workspace = workspace.raw(),
-                        generation = row.generation,
-                        "refresh_mirror: {message}; rewriting the durable row as Failed"
-                    );
-                    let failed = WorkspaceIndexState::Failed {
-                        message: truncate(&message, 256),
-                    };
-                    let failed_json = failed.to_row_json();
-                    self.inner.store.index_state_put(
-                        workspace,
-                        &failed_json,
-                        row.generation.max(0),
-                        JOURNAL_CORRUPT,
-                    )?;
-                    refresh_mirror_into(
-                        l,
-                        PersistedIndexState {
-                            state: failed,
-                            row_generation: row.generation.max(0) as u64,
-                            state_json: failed_json,
-                        },
-                    );
+            Some((row_generation, row)) => {
+                match PersistedIndexState::parse(row.state_json.clone(), row.generation) {
+                    Ok(p) => refresh_mirror_into(l, p),
+                    Err(e) => {
+                        // Corrupt row from an external writer: fail open loudly —
+                        // and never discard the rewrite of the durable Failed
+                        // marker: the caller retries the reconcile pass with the
+                        // propagated store error (the corrupt row stays the
+                        // durable retry trigger until the rewrite lands).
+                        let message = format!("corrupt persisted index state: {e}");
+                        tracing::error!(
+                            workspace = workspace.raw(),
+                            generation = row.generation,
+                            "refresh_mirror: {message}; rewriting the durable row as Failed"
+                        );
+                        let failed = WorkspaceIndexState::Failed {
+                            message: truncate(&message, 256),
+                        };
+                        let failed_json = failed.to_row_json();
+                        self.inner.store.index_state_put(
+                            workspace,
+                            &failed_json,
+                            row.generation,
+                            JOURNAL_CORRUPT,
+                        )?;
+                        refresh_mirror_into(
+                            l,
+                            PersistedIndexState {
+                                state: failed,
+                                row_generation,
+                                state_json: failed_json,
+                            },
+                        );
+                    }
                 }
-            },
+            }
             None => {
                 l.state = WorkspaceIndexState::NotStarted;
                 l.row_generation = 0;
@@ -1937,6 +1955,20 @@ fn scratch_dir(data_root: &Path, ws: WorkspaceId) -> PathBuf {
 
 fn generation_file_path(data_root: &Path, ws: WorkspaceId, generation: u64) -> PathBuf {
     generation_dir(data_root, ws).join(format!("gen-{generation}.json"))
+}
+
+/// Decode the persisted SIGNED `generation` column of an `index_state` row.
+/// The column is written only by this service and only ever holds a `u64`
+/// domain value, so a negative value cannot describe any legal machine
+/// state: it is typed corruption evidence naming the value, never silently
+/// normalized to a clean-looking generation 0.
+fn persisted_generation(workspace: WorkspaceId, generation: i64) -> Result<u64, IndexError> {
+    u64::try_from(generation).map_err(|_| {
+        IndexError::CorruptState(format!(
+            "workspace {} has negative persisted generation {generation}",
+            workspace.raw()
+        ))
+    })
 }
 
 /// Read + decode a generation file (bounded read: oversized hostile files
@@ -2978,6 +3010,71 @@ mod tests {
             2,
             "the external corruption and the landed repair are both journaled: {log:?}"
         );
+    }
+
+    /// P2: a negative persisted generation is impossible under this writer
+    /// and is typed corruption naming the value — refused on the reconcile
+    /// and fresh-attach recovery paths — never a silent `max(0)` rewrite
+    /// that destroys the forensic evidence and looks like a clean initial
+    /// generation.
+    #[test]
+    fn negative_persisted_generation_is_typed_corruption_not_silent_zero() {
+        let _serial = serial();
+        let (env, store, svc, ws) = first_fixture();
+        pub_view_asserts(&svc, ws, 1);
+        store
+            .index_state_put(ws, &St::NotStarted.to_row_json(), -37, "hostile_write")
+            .unwrap();
+        // The live mirror sees the corruption on the reconcile path...
+        let err = svc
+            .refresh_mirror(ws)
+            .expect_err("a negative persisted generation must be typed corruption");
+        match err {
+            IndexError::CorruptState(message) => {
+                assert!(message.contains("-37"), "names the value: {message}");
+            }
+            other => panic!("typed corruption expected, got {other:?}"),
+        }
+        // ...and on a fresh attach (daemon restart).
+        let fs = faktor_fs::WorkspaceFileService::new();
+        let store2 = Arc::new(Store::open(&env.store_root, true).unwrap());
+        let svc2 = IndexService::open(store2.clone(), env.data_root.clone(), fs).unwrap();
+        svc2.set_config(fast_cfg());
+        let err = svc2
+            .attach(ws)
+            .expect_err("a negative persisted generation must be typed corruption");
+        match &err {
+            IndexError::CorruptState(message) => {
+                assert!(message.contains("-37"), "names the value: {message}");
+            }
+            other => panic!("typed corruption expected, got {other:?}"),
+        }
+        // The row is untouched: the forensic value survives, the corruption
+        // stays diagnosable, and no repair transition was silently applied.
+        let row = store2.index_state_get(ws).unwrap().expect("row persists");
+        assert_eq!(row.generation, -37, "the original value is preserved");
+        assert_eq!(row.state_json, St::NotStarted.to_row_json());
+        assert!(matches!(
+            svc2.attach(ws).unwrap_err(),
+            IndexError::CorruptState(_)
+        ));
+        // A valid positive generation is unaffected by the gate.
+        let ws_valid = store2.create_workspace(env.repo.to_str().unwrap()).unwrap();
+        store2
+            .index_state_put(
+                ws_valid,
+                &St::Failed {
+                    message: "prior failure".into(),
+                }
+                .to_row_json(),
+                3,
+                "seed",
+            )
+            .unwrap();
+        svc2.attach(ws_valid).unwrap();
+        let (state, generation) = svc2.state(ws_valid).unwrap();
+        assert!(matches!(state, St::Failed { .. }), "{state:?}");
+        assert_eq!(generation, 3, "a valid generation is untouched");
     }
 
     // ------------------------------------------------------ (c) event storm

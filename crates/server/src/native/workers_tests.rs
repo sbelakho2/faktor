@@ -9,7 +9,8 @@ use crate::api::tests::test_deps;
 use crate::{serve, ServerHandle};
 use faktor_cloud::{ControlPlane, ManualClock, MemoryControlPlaneStore};
 use faktor_worker::{
-    JobGeneration, JobKey, JobRequirements, RequeuePolicy, WorkerPlane, WORKER_PROTOCOL_VERSION,
+    JobGeneration, JobKey, JobRequirements, RequeuePolicy, WorkerError, WorkerPlane,
+    WORKER_PROTOCOL_VERSION,
 };
 
 const NOW_MS: i64 = 1_700_000_000_000;
@@ -792,4 +793,37 @@ async fn claim_route_cas_accepts_open_generations_and_adopts_scheduler_leases() 
         .await
         .unwrap();
     assert_eq!(resp.status(), 401);
+}
+
+/// P1 downgrade protection on the worker wire: the worker store refuses a
+/// database written by a NEWER schema ladder with the typed
+/// [`WorkerError::UnsupportedSchema`] (the refusal happens at store open, so
+/// the daemon fails closed at startup; see `SqliteWorkerStore::open`). This
+/// pins the route mapping so the total `worker_err` table can never silently
+/// regress that refusal to a generic 500: it is the stable
+/// `unsupported_schema` 409 — the same conflict class as the other state
+/// refusals, NON-retryable (an older binary cannot become able to honour a
+/// newer ladder by retrying), and the message names both versions so an
+/// operator sees a downgrade refusal, not an opaque error.
+#[test]
+fn newer_worker_store_schema_is_a_typed_409_on_the_worker_wire() {
+    let err = super::worker_err(WorkerError::UnsupportedSchema {
+        found: 9,
+        maximum_supported: 7,
+    });
+    assert_eq!(err.code, "unsupported_schema");
+    assert_eq!(err.http_status, 409);
+    assert!(!err.retryable, "a retry cannot make an older ladder newer");
+    let body = err.to_json();
+    assert_eq!(body["error"]["code"], "unsupported_schema");
+    assert_eq!(body["error"]["retryable"], false);
+    assert_eq!(
+        body["error"].as_object().unwrap().len(),
+        3,
+        "frozen: only code, message, retryable"
+    );
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("downgrade refused"), "{message}");
+    assert!(message.contains("v9"), "{message}");
+    assert!(message.contains("v7"), "{message}");
 }

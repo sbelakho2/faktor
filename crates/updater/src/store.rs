@@ -38,6 +38,16 @@ pub enum UpdateStoreError {
     Malformed(String),
     #[error("update store unavailable: {0}")]
     Backend(String),
+    /// A database written by a NEWER binary's schema ladder must never be
+    /// silently opened by an older one: the newer ladder may have changed
+    /// semantics this binary cannot honour. Downgrade is refused typed; the
+    /// recovery path is running the newer binary or restoring the
+    /// pre-upgrade restore point.
+    #[error(
+        "update store schema v{found} is newer than this binary's ladder v{maximum_supported}: \
+         downgrade refused (run the newer binary or restore the pre-upgrade restore point)"
+    )]
+    UnsupportedSchema { found: i64, maximum_supported: i64 },
 }
 
 /// One update operation id.
@@ -584,33 +594,74 @@ fn durability(e: faktor_cloud::CloudStoreError) -> UpdateStoreError {
     UpdateStoreError::Backend(e.to_string())
 }
 
+/// Apply the updater schema ladder. The version read, the pre-migration
+/// restore point and every migration statement run inside ONE `BEGIN
+/// IMMEDIATE` transaction: a second concurrent opener blocks on the write
+/// lock, then re-reads the (already advanced) version inside its own
+/// transaction and skips — it can never snapshot post-migration content and
+/// label it `-pre-migration-vN-`.
+///
+/// A database written by a NEWER binary (`user_version` above this binary's
+/// ladder) is refused typed, before any snapshot or write; a NEGATIVE
+/// `user_version` (impossible for a database this ladder created) is refused
+/// typed as corruption, before any snapshot or write.
 fn migrate(
     conn: &mut rusqlite::Connection,
     db_path: Option<&Path>,
 ) -> Result<(), UpdateStoreError> {
-    let mut version: i64 = conn
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    let started: i64 = tx
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(backend)?;
-    if version >= UPDATER_MIGRATIONS.len() as i64 {
+    let ladder = UPDATER_MIGRATIONS.len() as i64;
+    // A NEGATIVE `user_version` cannot have been produced by any legitimate
+    // open of this ladder (SQLite stores the pragma as a SIGNED integer and
+    // every writer here only ever moves it forward from 0). It is durable
+    // corruption, and it is refused typed BEFORE the restore point and the
+    // ladder: a snapshot labeled `-pre-migration-v-1-` would be a
+    // trusted-looking way back to a state this binary never created, and
+    // treating it as v0 would silently migrate corrupt state.
+    if started < 0 {
+        return Err(UpdateStoreError::Malformed(format!(
+            "update store schema user_version {started} is corrupt (negative): \
+             refusing to snapshot or migrate it"
+        )));
+    }
+    if started > ladder {
+        return Err(UpdateStoreError::UnsupportedSchema {
+            found: started,
+            maximum_supported: ladder,
+        });
+    }
+    if started == ladder {
+        tx.commit().map_err(backend)?;
         return Ok(());
     }
-    // A schema transition on an EXISTING database is irreversible structural
-    // work: before the first pending migration runs, a verified pre-migration
-    // restore point must be durable. If it cannot be written and
-    // restore-verified, the migration is REFUSED (open fails).
-    if version > 0 {
-        if let Some(path) = db_path {
-            faktor_cloud::durability::migration_backup(conn, path, version).map_err(|e| {
-                UpdateStoreError::Backend(format!(
-                    "refusing migration without a verified pre-migration restore point: {e}"
-                ))
-            })?;
-            #[cfg(test)]
-            if take_injected_crash(path) {
-                return Err(UpdateStoreError::Backend(
-                    "injected crash after the pre-migration restore point".into(),
-                ));
-            }
+    let mut version = started;
+    // A schema transition (or FIRST creation) on a file-backed database runs
+    // only after a verified restore point of the ACTUAL predecessor state
+    // exists; if it cannot be written and self-verified, the migration is
+    // REFUSED. The snapshot runs on a SEPARATE read-only connection: the
+    // backup API cannot run on a connection that holds a write transaction,
+    // and the BEGIN IMMEDIATE lock we hold makes every reader see exactly
+    // this pre-migration state.
+    if let Some(path) = db_path {
+        let reader =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(backend)?;
+        faktor_cloud::durability::migration_backup(&reader, path, version).map_err(|e| {
+            UpdateStoreError::Backend(format!(
+                "refusing migration without a verified pre-migration restore point: {e}"
+            ))
+        })?;
+        drop(reader);
+        #[cfg(test)]
+        if take_injected_crash(path) {
+            return Err(UpdateStoreError::Backend(
+                "injected crash after the pre-migration restore point".into(),
+            ));
         }
     }
     for (i, sql) in UPDATER_MIGRATIONS.iter().enumerate() {
@@ -618,16 +669,13 @@ fn migrate(
         if version >= target {
             continue;
         }
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(backend)?;
         tx.execute_batch(sql)
             .map_err(|e| UpdateStoreError::Backend(format!("updater migration v{target}: {e}")))?;
         tx.execute_batch(&format!("PRAGMA user_version = {target}"))
             .map_err(|e| UpdateStoreError::Backend(format!("updater migration v{target}: {e}")))?;
-        tx.commit().map_err(backend)?;
         version = target;
     }
+    tx.commit().map_err(backend)?;
     Ok(())
 }
 
@@ -1280,5 +1328,248 @@ mod tests {
         assert!(UpdateOpId::try_new("").is_err());
         assert!(UpdateOpId::try_new("x".repeat(200)).is_err());
         assert!(UpdateOpId::try_new("upd_ok").is_ok());
+    }
+
+    /// Every migration restore point this database owns, with the version
+    /// its NAME claims and the version its CONTENT holds (they must agree).
+    fn migration_points(db_path: &Path) -> Vec<(String, i64, i64)> {
+        faktor_cloud::durability::list_backups(db_path)
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .contains(faktor_cloud::durability::MIGRATION_MARKER)
+            })
+            .map(|p| {
+                let name = p.file_name().unwrap().to_str().unwrap().to_string();
+                let claimed: i64 = name
+                    .rsplit_once(faktor_cloud::durability::MIGRATION_MARKER)
+                    .and_then(|(_, rest)| {
+                        rest.chars()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect::<String>()
+                            .parse()
+                            .ok()
+                    })
+                    .expect("a migration point carries a parseable version");
+                let conn = rusqlite::Connection::open_with_flags(
+                    &p,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let content: i64 = conn
+                    .query_row("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap();
+                (name, claimed, content)
+            })
+            .collect()
+    }
+
+    /// P1 downgrade protection: a database written by a NEWER schema ladder
+    /// is refused typed (naming both versions) and left untouched — no writes
+    /// and no restore-point snapshot of a state this binary cannot honour.
+    #[test]
+    fn opening_a_newer_schema_is_refused_typed_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update.db");
+        let newer = UPDATER_MIGRATIONS.len() as i64 + 1;
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(&format!("PRAGMA user_version = {newer}"))
+                .unwrap();
+        }
+        let err = SqliteUpdaterStore::open(&path)
+            .err()
+            .expect("a newer schema must be refused");
+        match &err {
+            UpdateStoreError::UnsupportedSchema {
+                found,
+                maximum_supported,
+            } => {
+                assert_eq!(*found, newer);
+                assert_eq!(*maximum_supported, UPDATER_MIGRATIONS.len() as i64);
+            }
+            other => panic!("downgrade must be refused typed, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(
+            message.contains("newer than this binary's ladder"),
+            "{message}"
+        );
+        assert!(message.contains("downgrade refused"), "{message}");
+        assert!(message.contains(&format!("v{newer}")), "{message}");
+        assert!(
+            message.contains(&format!("v{}", UPDATER_MIGRATIONS.len())),
+            "{message}"
+        );
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, newer, "the refused open changed nothing");
+        drop(conn);
+        assert!(
+            migration_points(&path).is_empty(),
+            "a newer schema is never snapshotted as a trusted way back"
+        );
+    }
+
+    /// P1 corruption protection: a NEGATIVE `user_version` cannot be produced
+    /// by any legitimate open (SQLite stores the cursor as a signed integer).
+    /// It is refused typed BEFORE the restore point and the ladder, so no
+    /// snapshot labeled `-pre-migration-v-1-` is ever written and the database
+    /// is left unchanged; 0 and the ladder version still open as before.
+    #[test]
+    fn negative_schema_version_is_refused_typed_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA user_version = -1").unwrap();
+        }
+        let before = {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            faktor_cloud::durability::canonical_fingerprint(&conn).unwrap()
+        };
+        let err = SqliteUpdaterStore::open(&path)
+            .err()
+            .expect("a negative schema version must be refused");
+        match &err {
+            UpdateStoreError::Malformed(message) => {
+                assert!(
+                    message.contains("-1"),
+                    "the refusal names the found value: {message}"
+                );
+                assert!(message.contains("corrupt"), "{message}");
+            }
+            other => panic!("a negative schema version must be refused typed, got {other:?}"),
+        }
+        assert!(
+            migration_points(&path).is_empty(),
+            "the refused open writes no restore point"
+        );
+        assert!(
+            faktor_cloud::durability::list_backups(&path).is_empty(),
+            "the refused open writes no backup at all"
+        );
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, -1, "the refused open changed nothing");
+            assert_eq!(
+                faktor_cloud::durability::canonical_fingerprint(&conn).unwrap(),
+                before,
+                "the refused open left the database unchanged"
+            );
+        }
+        // A clean cursor still opens: 0 migrates the whole ladder and the
+        // ladder version reopens as a no-op (no new restore point).
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA user_version = 0").unwrap();
+        }
+        drop(SqliteUpdaterStore::open(&path).expect("0 still migrates"));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, UPDATER_MIGRATIONS.len() as i64);
+        }
+        let points = migration_points(&path);
+        assert_eq!(points.len(), 1, "0 -> ladder writes its v0 restore point");
+        drop(SqliteUpdaterStore::open(&path).expect("the ladder still reopens"));
+        assert_eq!(
+            migration_points(&path),
+            points,
+            "an at-ladder reopen writes no new restore point"
+        );
+    }
+
+    /// A database already AT this binary's ladder opens; re-opening neither
+    /// migrates nor writes another restore point (the ladder is a no-op).
+    #[test]
+    fn a_database_at_the_ladder_reopens_without_a_new_restore_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update.db");
+        drop(SqliteUpdaterStore::open(&path).unwrap());
+        let before = migration_points(&path);
+        let store = SqliteUpdaterStore::open(&path).unwrap();
+        let version: i64 = store
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, UPDATER_MIGRATIONS.len() as i64);
+        assert_eq!(
+            migration_points(&path),
+            before,
+            "an at-ladder reopen writes no new restore point"
+        );
+    }
+
+    /// Adversarial concurrency: two openers race the migration. One applies
+    /// the ladder and snapshots the TRUE predecessor (v2); the loser blocks
+    /// on the write lock, re-reads the advanced version inside its own
+    /// transaction and skips — so exactly one point is labeled v2 and every
+    /// point's name claim matches its content.
+    #[test]
+    fn concurrent_openers_serialize_the_migration_and_label_one_restore_point() {
+        use std::sync::Barrier;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update.db");
+        drop(SqliteUpdaterStore::open(&path).unwrap());
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA user_version = 2").unwrap();
+        }
+        let barrier = std::sync::Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                SqliteUpdaterStore::open(&path).map(|_| ())
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .unwrap()
+                .expect("both concurrent openers must succeed");
+        }
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                version,
+                UPDATER_MIGRATIONS.len() as i64,
+                "the ladder applied"
+            );
+        }
+        let points = migration_points(&path);
+        for (name, claimed, content) in &points {
+            assert_eq!(
+                claimed, content,
+                "{name} claims v{claimed} but holds v{content}"
+            );
+        }
+        let v2: Vec<&(String, i64, i64)> = points
+            .iter()
+            .filter(|(n, _, _)| n.contains("-pre-migration-v2-"))
+            .collect();
+        assert_eq!(
+            v2.len(),
+            1,
+            "exactly one opener snapshotted the v2 predecessor: {points:?}"
+        );
+        assert_eq!(v2[0].2, 2, "the v2 point holds the true predecessor state");
     }
 }

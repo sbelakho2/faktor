@@ -582,8 +582,9 @@ async fn sqlite_backed_control_plane_survives_a_route_restart() {
     let (org, token) = bootstrap_org(&client, &base, &daemon, "Acme", "owner@acme.test", "k").await;
 
     // Restart the daemon surface over the SAME database: the token still
-    // authenticates and the organization is intact.
-    handle.shutdown.send(()).ok();
+    // authenticates and the organization is intact. The first listener is
+    // JOINED (bounded graceful shutdown) before the store is reopened.
+    handle.shutdown().await.unwrap();
     let reopened = Arc::new(ControlPlane::new(
         Arc::new(SqliteControlPlaneStore::open(&path).unwrap()),
         Arc::new(ManualClock::new(NOW_MS)),
