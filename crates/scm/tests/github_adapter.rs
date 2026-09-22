@@ -868,6 +868,91 @@ async fn installation_and_repository_sync_converges_across_restarts() {
     assert_eq!(store.repositories_for_installation(7).unwrap().len(), 2);
 }
 
+/// P1 persistence-domain bound on the provider parse path: an installation
+/// id above `i64::MAX` (the signed SQLite bound) is a typed `InvalidInput`
+/// naming the limit — never a panic, never a negative row — while the
+/// maximum itself is accepted and persisted positive.
+#[tokio::test]
+async fn installation_ids_above_the_signed_sqlite_bound_are_refused_typed() {
+    let server = MockServer::start().await;
+    let clock = Arc::new(ManualClock::new(NOW_MS));
+    let provider = Arc::new(
+        GitHubApp::new(
+            GitHubAppConfig {
+                api_base: server.base(),
+                ..Default::default()
+            },
+            Arc::new(PolicyCheckedHttpTransport::permissive()),
+            Arc::new(
+                StaticTokenSource::minimal(NOW_MS.saturating_add(3_600_000)).expect("token source"),
+            ),
+            Arc::new(MemoryScmStore::new()),
+            clock.clone(),
+        )
+        .expect("adapter"),
+    );
+
+    for out_of_domain in [i64::MAX as u64 + 1, u64::MAX] {
+        server.push(
+            "GET",
+            "/app/installations",
+            Reply::json(
+                200,
+                serde_json::json!([{
+                    "id": out_of_domain,
+                    "account": {"login": "acme", "type": "Organization"},
+                    "permissions": {"contents": "write"},
+                }]),
+            ),
+        );
+        let err = provider.list_installations().await.unwrap_err();
+        assert!(
+            matches!(err, faktor_scm::ScmError::InvalidInput(_)),
+            "{out_of_domain} must be a typed InvalidInput, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("9223372036854775807") && message.contains("i64::MAX"),
+            "the refusal names the limit: {message}"
+        );
+    }
+
+    // The maximum itself is accepted and persisted POSITIVE.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scm.db");
+    server.push(
+        "GET",
+        "/app/installations",
+        Reply::json(
+            200,
+            serde_json::json!([{
+                "id": i64::MAX as u64,
+                "account": {"login": "acme", "type": "Organization"},
+                "permissions": {"contents": "write"},
+            }]),
+        ),
+    );
+    server.push(
+        "GET",
+        "/installation/repositories",
+        Reply::json(
+            200,
+            serde_json::json!({"total_count": 0, "repositories": []}),
+        ),
+    );
+    let store: Arc<dyn ScmStore> = Arc::new(SqliteScmStore::open(&path).unwrap());
+    let sync = ScmSync::new(provider, store.clone(), clock);
+    let report = sync.sync_all("org:alpha").await.unwrap();
+    assert_eq!(report.installations, 1);
+    let rows = store.installations().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].installation_id,
+        i64::MAX,
+        "the accepted maximum is stored positive and exact"
+    );
+}
+
 #[tokio::test]
 async fn webhook_dedupe_survives_a_restart_and_refuses_bad_signatures() {
     let dir = tempfile::tempdir().unwrap();

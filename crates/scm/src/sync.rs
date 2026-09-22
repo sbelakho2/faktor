@@ -100,7 +100,7 @@ impl ScmSync {
 
     fn upsert_installation(&self, installation: &ScmInstallation) -> Result<(), ScmError> {
         self.store.upsert_installation(&InstallationRow {
-            installation_id: installation.installation_id.raw() as i64,
+            installation_id: installation.installation_id.to_sqlite_i64(),
             account_login: installation.account_login.clone(),
             account_type: installation.account_type.clone(),
             permissions_json: Self::permissions_json(installation),
@@ -117,7 +117,7 @@ impl ScmSync {
     ) -> Result<(), ScmError> {
         self.store.upsert_repository(&RepositoryRow {
             id: 0,
-            installation_id: repository.reference.installation().raw() as i64,
+            installation_id: repository.reference.installation().to_sqlite_i64(),
             organization_id: organization.to_string(),
             owner: repository.reference.owner().to_string(),
             name: repository.reference.name().to_string(),
@@ -141,7 +141,7 @@ mod tests {
         BranchSpec, CommentTarget, PullRequestSpec, ScmBranch, ScmComment, ScmIssue,
         ScmPullRequest, ScmRemoteRef, ScmReviewEvent,
     };
-    use crate::store::{MemoryScmStore, RepositoryRow};
+    use crate::store::{MemoryScmStore, RepositoryRow, SqliteScmStore};
     use async_trait::async_trait;
 
     #[derive(Default)]
@@ -152,8 +152,12 @@ mod tests {
     }
 
     fn installation(id: u64) -> ScmInstallation {
+        installation_of(ScmInstallationId::try_from_raw(id).unwrap())
+    }
+
+    fn installation_of(installation_id: ScmInstallationId) -> ScmInstallation {
         ScmInstallation {
-            installation_id: ScmInstallationId::try_from_raw(id).unwrap(),
+            installation_id,
             account_login: "acme".into(),
             account_type: "Organization".into(),
             permissions: vec![("contents".into(), "write".into())],
@@ -162,13 +166,12 @@ mod tests {
     }
 
     fn repository(installation: u64, name: &str) -> ScmRepository {
+        repository_of(ScmInstallationId::try_from_raw(installation).unwrap(), name)
+    }
+
+    fn repository_of(installation: ScmInstallationId, name: &str) -> ScmRepository {
         ScmRepository {
-            reference: RepositoryRef::try_new(
-                ScmInstallationId::try_from_raw(installation).unwrap(),
-                "acme",
-                name,
-            )
-            .unwrap(),
+            reference: RepositoryRef::try_new(installation, "acme", name).unwrap(),
             full_name: format!("acme/{name}"),
             default_branch: "main".into(),
             private: true,
@@ -315,6 +318,86 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    /// P1 persistence-domain bound: the maximum admitted installation id
+    /// (`i64::MAX`) is persisted POSITIVE, round-trips exactly through
+    /// SQLite, and the signed column still orders and range-scans correctly
+    /// at the high end of the domain.
+    #[tokio::test]
+    async fn high_but_valid_installation_ids_round_trip_and_order_in_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scm.db");
+        let store: Arc<dyn ScmStore> = Arc::new(SqliteScmStore::open(&path).unwrap());
+        let low = ScmInstallationId::try_from_raw(1).unwrap();
+        let near = ScmInstallationId::try_from_raw(i64::MAX as u64 - 1).unwrap();
+        let max = ScmInstallationId::try_from_raw(i64::MAX as u64).unwrap();
+        let provider = Arc::new(FakeProvider {
+            installations: vec![
+                installation_of(near),
+                installation_of(max),
+                installation_of(low),
+            ],
+            repositories: vec![
+                repository_of(near, "gadgets"),
+                repository_of(max, "sprockets"),
+                repository_of(low, "widgets"),
+            ],
+            calls: Default::default(),
+        });
+        let sync = ScmSync::new(provider, store.clone(), Arc::new(ManualClock::new(1_000)));
+        let report = sync.sync_all("org:alpha").await.unwrap();
+        assert_eq!(report.installations, 3);
+        assert_eq!(report.repositories, 3);
+
+        let ids: Vec<i64> = store
+            .installations()
+            .unwrap()
+            .iter()
+            .map(|row| row.installation_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1, i64::MAX - 1, i64::MAX],
+            "ORDER BY installation_id is exact and positive at the high end"
+        );
+        assert!(ids.iter().all(|id| *id > 0), "no wrapped row");
+
+        // Point queries at the high end resolve exactly their rows.
+        let max_rows = store.repositories_for_installation(i64::MAX).unwrap();
+        assert_eq!(max_rows.len(), 1);
+        assert_eq!(max_rows[0].name, "sprockets");
+        assert_eq!(max_rows[0].installation_id, i64::MAX);
+        assert_eq!(
+            store.repositories_for_installation(i64::MAX - 1).unwrap()[0].name,
+            "gadgets"
+        );
+
+        // Raw SQL from an independent connection: the durable column is
+        // positive, `MIN`/`MAX` see the true domain bounds, and a range scan
+        // over the top of the domain sees exactly the high rows.
+        let probe = rusqlite::Connection::open(&path).unwrap();
+        let (minimum, maximum, negatives): (i64, i64, i64) = probe
+            .query_row(
+                "SELECT MIN(installation_id), MAX(installation_id),
+                        COUNT(*) FILTER (WHERE installation_id < 0)
+                 FROM scm_installation",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((minimum, maximum, negatives), (1, i64::MAX, 0));
+        let high: Vec<i64> = probe
+            .prepare(
+                "SELECT installation_id FROM scm_repository
+                 WHERE installation_id >= ?1 ORDER BY installation_id",
+            )
+            .unwrap()
+            .query_map([i64::MAX - 1], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(high, vec![i64::MAX - 1, i64::MAX]);
     }
 
     #[test]

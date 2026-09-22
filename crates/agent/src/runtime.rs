@@ -454,6 +454,23 @@ pub struct EvidenceQuery {
 /// it (its future is dropped and the package degrades to empty).
 const LEGACY_EVIDENCE_MAX_WAIT: Duration = Duration::from_millis(2000);
 
+/// Typed outcome of the cold-evidence ladder (P2). `NotHosted` is the
+/// documented legacy bounded-scan degrade (no IndexService / no attach / no
+/// cold provider); `Degraded` carries the TYPED failure of the off-turn
+/// bridge as an explicit [`crate::EvidencePollStatus`], so a
+/// panicking/unschedulable cold ladder can never collapse into an
+/// indistinguishable `None` (the old `Option` wrapper's defect) and can
+/// never be mistaken for an honest "no evidence" answer.
+enum ColdEvidenceOutcome {
+    /// The cold provider served a (possibly empty) package.
+    Served(Vec<Evidence>),
+    /// The IndexService is not hosted (or not attached): the caller's
+    /// documented legacy bounded-scan degrade.
+    NotHosted,
+    /// The ladder ran but its off-turn bridge failed: explicit degradation.
+    Degraded(crate::EvidencePollStatus),
+}
+
 // ------------------------------------------------- durable evidence-poll status
 //
 // The advisory evidence poll used to hand the turn only its (possibly
@@ -504,6 +521,10 @@ struct DurableEvidencePollStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     budget_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    abandoned: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cap: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     truncated: Option<bool>,
 }
 
@@ -529,6 +550,7 @@ fn evidence_poll_status_code(status: &crate::EvidencePollStatus) -> &'static str
         crate::EvidencePollStatus::ProviderPanicked { .. } => "provider_panicked",
         crate::EvidencePollStatus::TimedOut { .. } => "timed_out",
         crate::EvidencePollStatus::NotSpawned { .. } => "not_spawned",
+        crate::EvidencePollStatus::CircuitOpen { .. } => "circuit_open",
     }
 }
 
@@ -545,6 +567,8 @@ fn encode_evidence_poll_status(status: &crate::EvidencePollStatus) -> String {
         retryable: None,
         message: None,
         budget_ms: None,
+        abandoned: None,
+        cap: None,
         truncated: None,
     };
     match status {
@@ -574,6 +598,21 @@ fn encode_evidence_poll_status(status: &crate::EvidencePollStatus) -> String {
             durable.budget_ms = Some(*budget_ms);
         }
         crate::EvidencePollStatus::NotSpawned { message } => {
+            durable.message = Some(bounded_durable_field(
+                message,
+                EVIDENCE_POLL_DURABLE_MESSAGE_MAX_BYTES,
+            ));
+        }
+        crate::EvidencePollStatus::CircuitOpen {
+            abandoned,
+            cap,
+            message,
+        } => {
+            // The circuit state is machine-readable and survives the round
+            // trip: abandoned/cap are the typed counters, the message is the
+            // bounded human diagnostic.
+            durable.abandoned = Some(*abandoned);
+            durable.cap = Some(*cap);
             durable.message = Some(bounded_durable_field(
                 message,
                 EVIDENCE_POLL_DURABLE_MESSAGE_MAX_BYTES,
@@ -620,6 +659,11 @@ fn decode_evidence_poll_status(encoded: &str) -> Option<crate::EvidencePollStatu
         "not_spawned" => crate::EvidencePollStatus::NotSpawned {
             message: durable.message.unwrap_or_default(),
         },
+        "circuit_open" => crate::EvidencePollStatus::CircuitOpen {
+            abandoned: durable.abandoned?,
+            cap: durable.cap?,
+            message: durable.message.unwrap_or_default(),
+        },
         _ => return None,
     })
 }
@@ -664,6 +708,18 @@ fn log_evidence_poll_outcome(status: &crate::EvidencePollStatus, budget: Duratio
             status = "not_spawned",
             budget_ms,
             "advisory evidence poll could not spawn its detached thread: {message} (advisory contract: the turn continues with an empty package)"
+        ),
+        crate::EvidencePollStatus::CircuitOpen {
+            abandoned,
+            cap,
+            message,
+        } => tracing::error!(
+            target: "faktor_agent::evidence",
+            status = "circuit_open",
+            abandoned,
+            cap,
+            budget_ms,
+            "advisory evidence poll refused: the evidence executor circuit is OPEN ({abandoned}/{cap} abandoned worker threads): {message} (advisory contract: the turn continues with an empty package; the typed circuit state is archived durably)"
         ),
     }
 }
@@ -4951,8 +5007,19 @@ impl AgentRuntime {
             let mut evidence = match self.index_evidence_if_ready(handle, &evidence_query)? {
                 Some(evidence) => evidence,
                 None => match self.cold_evidence_if_unready(handle, &evidence_query).await {
-                    Some(evidence) => evidence,
-                    None => {
+                    ColdEvidenceOutcome::Served(evidence) => evidence,
+                    ColdEvidenceOutcome::Degraded(status) => {
+                        // The cold ladder ran but its off-turn bridge failed
+                        // (provider panic / unschedulable bridge): the SAME
+                        // durable archive + diagnostic path as the legacy
+                        // poll, so a broken cold ladder is an EXPLICIT
+                        // degradation — never "no evidence", never silent.
+                        log_evidence_poll_outcome(&status, LEGACY_EVIDENCE_MAX_WAIT);
+                        outcome.evidence_poll = Some(encode_evidence_poll_status(&status));
+                        evidence_poll_status = Some(status);
+                        Vec::new()
+                    }
+                    ColdEvidenceOutcome::NotHosted => {
                         // Index hosting failed entirely: the legacy bounded
                         // scan is the documented degrade for that case,
                         // polled off the turn thread under a hard wall
@@ -4973,16 +5040,6 @@ impl AgentRuntime {
                         log_evidence_poll_outcome(&status, LEGACY_EVIDENCE_MAX_WAIT);
                         outcome.evidence_poll = Some(encode_evidence_poll_status(&status));
                         evidence_poll_status = Some(status);
-                        // Compile-time use only (never called): the frozen
-                        // status-free wrapper — and the private diagnostic
-                        // helper it owns in lib.rs — stays the documented
-                        // legacy shape the lib.rs tests pin. The drive now
-                        // owns the typed call, so without this reference
-                        // the wrapper would be dead code in non-test lib
-                        // builds (lib.rs is outside this change's file
-                        // ownership). One poll, one owner: this line never
-                        // polls.
-                        let _ = &crate::poll_evidence_with_wall_budget;
                         polled
                     }
                 },
@@ -11380,6 +11437,23 @@ impl AgentRuntime {
         ))
     }
 
+    /// Run the synchronous cold ladder off the turn thread and map its TYPED
+    /// failure into an explicit [`crate::EvidencePollStatus`] degradation
+    /// (P2): never `None`, never conflated with "no evidence". A panic is
+    /// `ProviderPanicked`; an unschedulable bridge is the typed `NotSpawned`
+    /// refusal. This is the ONLY bridge the production cold path uses.
+    async fn cold_ladder_off_turn<F>(
+        f: F,
+    ) -> Result<faktor_index::cold::ColdEvidence, crate::EvidencePollStatus>
+    where
+        F: FnOnce() -> faktor_index::cold::ColdEvidence + Send + 'static,
+    {
+        match crate::run_off_turn_thread_outcome(f).await {
+            Ok(package) => Ok(package),
+            Err(failure) => Err(crate::evidence_status_from_off_turn_failure(failure)),
+        }
+    }
+
     /// Cheap cold evidence while no Ready generation exists (P0-30): the
     /// IndexService's `ColdEvidenceProvider` serves a persisted OLD
     /// generation when one exists, else targeted reads of the turn's own
@@ -11387,26 +11461,40 @@ impl AgentRuntime {
     /// The provider itself is synchronous and internally bounded: every
     /// git/rg child belongs to the ONE process supervisor with a 900 ms
     /// kill deadline (audit 14/26), and this wrapper runs the whole ladder
-    /// on a blocking-pool thread so evidence assembly never occupies a turn
-    /// thread (async turn latency). `Some(..)` (possibly empty) when the
-    /// IndexService is hosted; `None` only when hosting failed — the
-    /// caller's legacy scan degrade.
+    /// off the turn thread (the TYPED bridge above) so evidence assembly
+    /// never occupies a turn thread (async turn latency).
+    /// `Served(..)` (possibly empty) when the IndexService is hosted;
+    /// `NotHosted` only when hosting failed — the caller's legacy scan
+    /// degrade; `Degraded(status)` when the ladder ran but its off-turn
+    /// bridge failed — an explicit, typed degradation, never "no evidence".
     async fn cold_evidence_if_unready(
         &self,
         handle: &faktor_session::SessionHandle,
         query: &EvidenceQuery,
-    ) -> Option<Vec<Evidence>> {
-        let ws = handle.row().ok().map(|r| r.workspace_id)?;
-        let service = self.index_service()?;
-        service.attach(ws).ok()?;
-        let provider = service.cold_provider(ws)?;
+    ) -> ColdEvidenceOutcome {
+        let Some(ws) = handle.row().ok().map(|r| r.workspace_id) else {
+            return ColdEvidenceOutcome::NotHosted;
+        };
+        let Some(service) = self.index_service() else {
+            return ColdEvidenceOutcome::NotHosted;
+        };
+        if service.attach(ws).is_err() {
+            return ColdEvidenceOutcome::NotHosted;
+        }
+        let Some(provider) = service.cold_provider(ws) else {
+            return ColdEvidenceOutcome::NotHosted;
+        };
         let cold_query = faktor_index::cold::ColdQuery {
             prompt: query.prompt.clone(),
             changed_files: query.changed_files.clone(),
             referenced_paths: Vec::new(),
             failures: query.failures.clone(),
         };
-        let package = crate::run_off_turn_thread(move || provider.evidence(&cold_query)).await?;
+        let package = match Self::cold_ladder_off_turn(move || provider.evidence(&cold_query)).await
+        {
+            Ok(package) => package,
+            Err(status) => return ColdEvidenceOutcome::Degraded(status),
+        };
         // The provider's origin/stats carry the degrade ladder for
         // observability; evidence mapping keeps the renderer's shape
         // (scores finite in [0,1]: the wire planner clamps again).
@@ -11431,7 +11519,7 @@ impl AgentRuntime {
                 .then_with(|| a.path.cmp(&b.path))
         });
         out.truncate(INDEX_EVIDENCE_MAX_HITS);
-        Some(out)
+        ColdEvidenceOutcome::Served(out)
     }
 
     /// Bounded repository knowledge for the context (spec §8 class 3 +
@@ -34186,6 +34274,51 @@ mod tests {
         assert_eq!(durable, vec![expected]);
     }
 
+    /// P2: the cold-evidence ladder's off-turn bridge is TYPED. A panicking
+    /// provider surfaces `ProviderPanicked` — an explicit degradation whose
+    /// durable encoding can never collapse into "no evidence" (the old
+    /// `Option` wrapper returned `None`, indistinguishable from an honest
+    /// empty answer).
+    #[tokio::test]
+    async fn cold_ladder_panic_is_a_typed_degradation_never_no_evidence() {
+        let outcome = AgentRuntime::cold_ladder_off_turn(|| -> faktor_index::cold::ColdEvidence {
+            panic!("cold provider exploded");
+        })
+        .await;
+        let status = match outcome {
+            Err(status) => status,
+            Ok(_) => panic!("a panicking cold provider must not answer successfully"),
+        };
+        match &status {
+            crate::EvidencePollStatus::ProviderPanicked { message } => {
+                assert!(message.contains("cold provider exploded"), "{message}");
+            }
+            other => {
+                panic!("a panicking cold provider must surface a typed degradation, got {other:?}")
+            }
+        }
+        assert!(
+            status.is_degraded(),
+            "a broken cold ladder is an explicit degradation"
+        );
+        assert_ne!(
+            encode_evidence_poll_status(&status),
+            encode_evidence_poll_status(&crate::EvidencePollStatus::NoEvidence),
+            "a panicked cold ladder must never encode identically to no evidence"
+        );
+        // The normal cold path is unchanged.
+        let served = AgentRuntime::cold_ladder_off_turn(|| faktor_index::cold::ColdEvidence {
+            hits: Vec::new(),
+            origin: faktor_index::cold::ColdOrigin::None,
+            stats: faktor_index::cold::ColdStats::default(),
+        })
+        .await;
+        assert!(
+            served.is_ok(),
+            "the normal cold path must stay unchanged: {served:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn legacy_poll_served_keeps_ranking_and_is_durable_served() {
         let captured: Arc<std::sync::Mutex<Vec<String>>> =
@@ -34302,6 +34435,32 @@ mod tests {
             }
             other => panic!("expected a bounded RetrievalFailed, got {other:?}"),
         }
+    }
+
+    /// The P1 circuit-open refusal is a typed, durable fact: its
+    /// abandoned/cap counters survive the canonical encoding (and are
+    /// required to decode), so a reopened store can never turn an open
+    /// circuit into "no evidence".
+    #[test]
+    fn durable_circuit_open_encoding_round_trips_with_counters() {
+        let status = crate::EvidencePollStatus::CircuitOpen {
+            abandoned: 4,
+            cap: 4,
+            message: "circuit open".into(),
+        };
+        let encoded = encode_evidence_poll_status(&status);
+        assert_eq!(decode_evidence_poll_status(&encoded), Some(status.clone()));
+        assert!(status.is_degraded());
+        assert_ne!(
+            encoded,
+            encode_evidence_poll_status(&crate::EvidencePollStatus::NoEvidence)
+        );
+        // A hostile payload missing the typed counters is not decodable
+        // (never a guessed circuit state).
+        assert!(decode_evidence_poll_status(
+            "{\"schema\":1,\"status\":\"circuit_open\",\"degraded\":true,\"message\":\"x\"}"
+        )
+        .is_none());
     }
 
     #[test]

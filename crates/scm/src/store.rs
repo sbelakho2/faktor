@@ -17,6 +17,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// One installation row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallationRow {
+    /// The signed SQLite image of the provider installation id: always
+    /// `1..=i64::MAX` ([`crate::ids::ScmInstallationId::to_sqlite_i64`]),
+    /// so `ORDER BY`/`MIN`/`MAX` and external tooling see the declared
+    /// semantics (never a wrapped negative).
     pub installation_id: i64,
     pub account_login: String,
     pub account_type: String,
@@ -33,6 +37,8 @@ pub struct InstallationRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryRow {
     pub id: i64,
+    /// The signed SQLite image of the provider installation id (see
+    /// [`InstallationRow::installation_id`]).
     pub installation_id: i64,
     pub organization_id: String,
     pub owner: String,

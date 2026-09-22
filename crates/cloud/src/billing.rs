@@ -21,7 +21,12 @@
 //!   ledger;
 //! - plans/features/limits come EXCLUSIVELY from [`BillingConfig`]. There is
 //!   no price constant anywhere in this crate: a plan's numbers (token and
-//!   spend limits) and the managed-provider set are operator configuration.
+//!   spend limits) and the managed-provider set are operator configuration;
+//! - a credit entry's `amount_micro` is bounded by
+//!   [`MAX_CREDIT_AMOUNT_MICRO`] (`i64::MAX` micro-units) so its durable
+//!   signed-INTEGER projection is EXACT: the JSON payload and the SQL column
+//!   can never disagree, and no monetary read/aggregation/audit/ordering
+//!   path ever has to clamp an amount.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -823,6 +828,43 @@ pub enum Admission {
 
 // ----------------------------------------------------------------- credit
 
+/// The maximum legal `amount_micro` of one credit ledger entry: `i64::MAX`
+/// micro-units (~9.22e18 micro-units, ~9.22e12 USD in the ledger's microUSD
+/// unit).
+///
+/// This is a DOMAIN invariant, not a formatting choice. The durable SQLite
+/// projection of [`CreditEntry::amount_micro`] is a signed 64-bit `INTEGER`
+/// column, and a monetary ledger must never persist a value it cannot read
+/// back exactly. The old writer persisted
+/// `amount_micro.min(i64::MAX as u64) as i64`: `i64::MAX`, `i64::MAX + 1`
+/// and `u64::MAX` all stored the SAME row value while the JSON payload kept
+/// the true amount, so the column and the payload could disagree and any SQL
+/// aggregation/audit/balance/reconciliation/ordering over the column would
+/// silently use the clamped number. Bounding the domain at `i64::MAX` makes
+/// the projection exact for every legal value (no clamp, no lossy cast), so
+/// payload and column are bit-identical by construction.
+pub const MAX_CREDIT_AMOUNT_MICRO: u64 = i64::MAX as u64;
+
+/// The one write-time amount rule of the credit ledger (the domain bound is
+/// documented on [`MAX_CREDIT_AMOUNT_MICRO`]): zero is refused (every entry
+/// moves a non-zero amount) and anything above the bound is refused TYPED,
+/// naming the field and the limit — never clamped, never truncated.
+pub fn validate_credit_amount_micro(amount: u64) -> Result<(), ControlPlaneError> {
+    if amount == 0 {
+        return Err(ControlPlaneError::Malformed(
+            "a credit entry must carry a non-zero amount".into(),
+        ));
+    }
+    if amount > MAX_CREDIT_AMOUNT_MICRO {
+        return Err(ControlPlaneError::Malformed(format!(
+            "credit entry amount_micro {amount} exceeds the maximum {MAX_CREDIT_AMOUNT_MICRO} \
+             micro-units (i64::MAX): the durable ledger column is a signed 64-bit INTEGER and a \
+             larger amount cannot be stored without loss"
+        )));
+    }
+    Ok(())
+}
+
 /// The credit ledger entry kind. Every entry is a NEW append-only row; a
 /// settle/refund never mutates the consume it refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -882,11 +924,10 @@ pub struct CreditEntry {
 impl CreditEntry {
     pub fn validate(&self) -> Result<(), ControlPlaneError> {
         bounded("credit reason", &self.reason, MAX_USAGE_REASON)?;
-        if self.amount_micro == 0 {
-            return Err(ControlPlaneError::Malformed(
-                "a credit entry must carry a non-zero amount".into(),
-            ));
-        }
+        // The amount domain bound (zero rules included) is enforced HERE and
+        // at every store append boundary; a larger amount is refused typed,
+        // never clamped into the durable column.
+        validate_credit_amount_micro(self.amount_micro)?;
         match self.kind {
             CreditKind::Grant => {
                 if self.reference.is_some() {
@@ -1286,6 +1327,54 @@ mod tests {
         settled.push(entry("c4", CreditKind::Refund, 50, Some("c2")));
         let balance = fold_credits(&settled);
         assert_eq!(balance.balance_micro(), 800);
+    }
+
+    /// The credit amount domain: `i64::MAX` is the largest legal amount and
+    /// is accepted unchanged; `i64::MAX + 1` and `u64::MAX` are refused typed
+    /// naming the field and the limit (never clamped); zero stays refused
+    /// with its exact message.
+    #[test]
+    fn credit_amount_domain_is_bounded_at_i64_max_and_refuses_larger_values() {
+        let entry = |amount: u64| CreditEntry {
+            id: CreditEntryId::try_new("crd_1").unwrap(),
+            organization: org(),
+            billing_account_id: account(),
+            kind: CreditKind::Grant,
+            amount_micro: amount,
+            reference: None,
+            usage_event_id: None,
+            reason: "test".into(),
+            occurred_at_ms: 1,
+            idempotency_key: None,
+        };
+        assert_eq!(MAX_CREDIT_AMOUNT_MICRO, i64::MAX as u64);
+        assert_eq!(entry(1).validate(), Ok(()));
+        assert_eq!(entry(i64::MAX as u64).validate(), Ok(()));
+        for over in [i64::MAX as u64 + 1, u64::MAX] {
+            match entry(over).validate() {
+                Err(ControlPlaneError::Malformed(msg)) => {
+                    assert!(msg.contains("amount_micro"), "{msg}");
+                    assert!(
+                        msg.contains(&MAX_CREDIT_AMOUNT_MICRO.to_string()),
+                        "the refusal names the limit: {msg}"
+                    );
+                    assert!(
+                        msg.contains(&over.to_string()),
+                        "the refusal names the value: {msg}"
+                    );
+                }
+                other => panic!("amount {over} must be refused typed, got {other:?}"),
+            }
+        }
+        match entry(0).validate() {
+            Err(ControlPlaneError::Malformed(msg)) => {
+                assert!(
+                    msg.contains("non-zero amount"),
+                    "zero rules unchanged: {msg}"
+                )
+            }
+            other => panic!("zero must stay refused, got {other:?}"),
+        }
     }
 
     #[test]

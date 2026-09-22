@@ -12,11 +12,12 @@ use faktor_cloud::billing::{
 };
 use faktor_cloud::{
     Admission, AdmissionBoundary, AdmissionRequest, BillingAccount, BillingAccountId,
-    BillingConfig, BillingStore, BillingStoreError, CreditAppend, CreditAppendRefusal, CreditEntry,
-    CreditEntryId, CreditKind, DurableSpendRow, EntitlementExceeded, EntitlementService,
-    InFlightKind, ManualClock, MemoryBillingStore, ObservedUsage, OrganizationId, PlanConfig,
-    ReconciliationState, SpendCategory, SqliteControlPlaneStore, Subscription, SubscriptionId,
-    SubscriptionStatus, UsageEvent, UsageEventId, UsageUnit, CAUSE_SUBSCRIPTION_ACTIVE,
+    BillingConfig, BillingStore, BillingStoreError, ControlPlaneError, CreditAppend,
+    CreditAppendRefusal, CreditEntry, CreditEntryId, CreditKind, DurableSpendRow,
+    EntitlementExceeded, EntitlementService, InFlightKind, ManualClock, MemoryBillingStore,
+    ObservedUsage, OrganizationId, PlanConfig, ReconciliationState, SpendCategory,
+    SqliteControlPlaneStore, Subscription, SubscriptionId, SubscriptionStatus, UsageEvent,
+    UsageEventId, UsageUnit, CAUSE_SUBSCRIPTION_ACTIVE,
 };
 
 fn org(id: &str) -> OrganizationId {
@@ -120,6 +121,26 @@ fn usage_event(id: &str) -> UsageEvent {
         correction_of: None,
         category: SpendCategory::Managed,
         source_key: format!("manual:{id}"),
+    }
+}
+
+fn credit_entry(
+    id: &str,
+    kind: CreditKind,
+    amount_micro: u64,
+    reference: Option<&str>,
+) -> CreditEntry {
+    CreditEntry {
+        id: CreditEntryId::try_new(id).unwrap(),
+        organization: org("org_a"),
+        billing_account_id: account("acct_1"),
+        kind,
+        amount_micro,
+        reference: reference.map(|r| CreditEntryId::try_new(r).unwrap()),
+        usage_event_id: None,
+        reason: "boundary".into(),
+        occurred_at_ms: 1,
+        idempotency_key: None,
     }
 }
 
@@ -1260,4 +1281,310 @@ fn unrecoverable_legacy_task_ids_refuse_the_migration_without_guessing() {
             .unwrap();
         assert_eq!(stored, legacy, "{name}: the legacy row is untouched");
     }
+}
+
+// --------------------------------------------- P1 credit amount domain
+
+/// `i64::MAX` micro-units is the largest legal credit amount and it stays
+/// EXACT end to end: the JSON payload, the signed SQL column and every
+/// balance/read projection report the same value, and the fold's boundary
+/// arithmetic (grant + refund - settled consume) neither saturates nor
+/// clamps.
+#[test]
+fn credit_amount_i64_max_is_exact_in_payload_and_sql_on_both_backends() {
+    let max = i64::MAX as u64;
+    let mem = MemoryBillingStore::new();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("billing.db");
+    let sqlite = SqliteControlPlaneStore::open(&path).unwrap();
+    let organization = org("org_a");
+    for store in [&mem as &dyn BillingStore, &sqlite as &dyn BillingStore] {
+        for (id, kind, reference) in [
+            ("crd_max", CreditKind::Grant, None),
+            ("crd_use", CreditKind::Consume, None),
+            ("crd_settle", CreditKind::Settle, Some("crd_use")),
+            ("crd_refund", CreditKind::Refund, Some("crd_use")),
+        ] {
+            assert_eq!(
+                store
+                    .append_credit_entry(&credit_entry(id, kind, max, reference))
+                    .unwrap(),
+                CreditAppend::Appended,
+                "{id} at i64::MAX appends"
+            );
+        }
+        let balance = store.credit_balance(&organization).unwrap();
+        assert_eq!(balance.granted_micro, max);
+        assert_eq!(balance.consumed_micro, max);
+        assert_eq!(balance.refunded_micro, max);
+        assert_eq!(balance.held_micro, 0);
+        assert_eq!(
+            balance.balance_micro(),
+            max,
+            "grant + refund - settled consume at i64::MAX stays exact"
+        );
+        let page = store.credit_entries(&organization, 0, 10).unwrap();
+        assert_eq!(page.len(), 4);
+        for row in &page {
+            assert_eq!(row.entry.amount_micro, max, "the read path is exact");
+        }
+    }
+    // SQL column == payload, bit for bit: no clamp exists anywhere.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let (stored, payload): (i64, String) = conn
+        .query_row(
+            "SELECT amount_micro, payload FROM credit_entry WHERE id = 'crd_max'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        stored,
+        i64::MAX,
+        "the column holds the exact boundary value"
+    );
+    let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        value.get("amount_micro").and_then(|v| v.as_u64()),
+        Some(max),
+        "the payload holds the same exact value"
+    );
+    assert_eq!(u64::try_from(stored).unwrap(), max);
+}
+
+/// Every out-of-domain amount (`i64::MAX + 1`, `u64::MAX`) is refused TYPED
+/// at every entry point — entry validation, credit grant/consume/settle/
+/// refund, and the store append on both backends — naming the field
+/// `amount_micro` and the `i64::MAX` limit, and writes nothing. The zero
+/// rules are unchanged.
+#[test]
+fn credit_amounts_above_i64_max_are_refused_typed_at_every_entry_point() {
+    let max = i64::MAX as u64;
+    fn refused(err: ControlPlaneError, over: u64) {
+        match err {
+            ControlPlaneError::Malformed(msg) => {
+                assert!(msg.contains("amount_micro"), "names the field: {msg}");
+                assert!(
+                    msg.contains(&(i64::MAX as u64).to_string()),
+                    "names the limit: {msg}"
+                );
+                assert!(msg.contains(&over.to_string()), "names the value: {msg}");
+            }
+            other => panic!("expected Malformed naming amount_micro, got {other:?}"),
+        }
+    }
+    let mem = MemoryBillingStore::new();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("billing.db");
+    let sqlite = SqliteControlPlaneStore::open(&path).unwrap();
+    let organization = org("org_a");
+    let acct = account("acct_1");
+    let service = service_with(
+        Arc::new(MemoryBillingStore::new()),
+        Arc::new(ManualClock::new(1_000)),
+    );
+    service
+        .ensure_account(&organization, &acct, "acct", true)
+        .unwrap();
+    // A real consume to aim settle/refund at.
+    service
+        .grant_credits(&organization, &acct, 10, "seed", Some("seed"))
+        .unwrap();
+    service
+        .consume_before_call(&organization, &acct, 5, None, "hold", Some("hold"))
+        .unwrap();
+    let consume = service
+        .credit_entry_id_by_idempotency_key(&organization, "hold")
+        .unwrap()
+        .unwrap();
+    for over in [max + 1, u64::MAX] {
+        // 1. The constructor/validation boundary.
+        match credit_entry("crd_bad", CreditKind::Grant, over, None).validate() {
+            Err(e) => refused(e, over),
+            Ok(()) => panic!("validate must refuse {over}"),
+        }
+        // 2. Every service entry point.
+        refused(
+            service
+                .grant_credits(&organization, &acct, over, "grant", None)
+                .unwrap_err(),
+            over,
+        );
+        refused(
+            service
+                .consume_before_call(&organization, &acct, over, None, "consume", None)
+                .unwrap_err(),
+            over,
+        );
+        refused(
+            service
+                .settle_consume(&organization, &acct, &consume, over, "settle")
+                .unwrap_err(),
+            over,
+        );
+        refused(
+            service
+                .refund_consume(&organization, &acct, &consume, over, "refund")
+                .unwrap_err(),
+            over,
+        );
+        // 3. The store append boundary on both backends.
+        for store in [&mem as &dyn BillingStore, &sqlite as &dyn BillingStore] {
+            match store
+                .append_credit_entry(&credit_entry(
+                    "crd_store_bad",
+                    CreditKind::Grant,
+                    over,
+                    None,
+                ))
+                .unwrap_err()
+            {
+                BillingStoreError::Malformed(msg) => {
+                    assert!(msg.contains("amount_micro"), "{msg}");
+                    assert!(msg.contains(&max.to_string()), "{msg}");
+                }
+                other => panic!("the store must refuse {over} typed, got {other:?}"),
+            }
+        }
+    }
+    // Nothing was written by any refused call.
+    let balance = service.credit_balance(&organization).unwrap();
+    assert_eq!(balance.granted_micro, 10);
+    assert_eq!(balance.consumed_micro, 5);
+    assert_eq!(balance.held_micro, 5);
+    assert_eq!(balance.refunded_micro, 0);
+    assert_eq!(balance.balance_micro(), 5);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM credit_entry", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "refused store writes wrote nothing");
+    drop(conn);
+    // The zero rules are unchanged at both boundaries.
+    match credit_entry("crd_zero", CreditKind::Grant, 0, None).validate() {
+        Err(ControlPlaneError::Malformed(msg)) => {
+            assert!(msg.contains("non-zero amount"), "{msg}")
+        }
+        other => panic!("zero must stay refused, got {other:?}"),
+    }
+    for store in [&mem as &dyn BillingStore, &sqlite as &dyn BillingStore] {
+        match store
+            .append_credit_entry(&credit_entry("crd_zero", CreditKind::Grant, 0, None))
+            .unwrap_err()
+        {
+            BillingStoreError::Malformed(msg) => assert!(msg.contains("non-zero amount"), "{msg}"),
+            other => panic!("the store must refuse zero typed, got {other:?}"),
+        }
+    }
+}
+
+/// A legacy `credit_entry` row written by the old clamping writer (stored
+/// `i64::MAX` sentinel with a payload above the domain bound) is surfaced
+/// TYPED at every read/mutation boundary: never silently reinterpreted as
+/// `i64::MAX`, never folded into a balance, and never mistaken for a replayed
+/// request. A legacy row whose payload is exactly `i64::MAX` (the legal
+/// boundary) keeps reading exactly. No in-place migration rewrites these
+/// rows: the true amount has no exact in-domain value, so the documented
+/// decision is refusal with the row named (the v6 task-id precedent).
+#[test]
+fn legacy_clamped_credit_amounts_are_surfaced_typed_and_never_reinterpreted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("billing.db");
+    let organization = org("org_a");
+    // Create the full current schema, then plant the legacy rows through raw
+    // SQL exactly as the old writer stored them.
+    drop(SqliteControlPlaneStore::open(&path).unwrap());
+    let exact = serde_json::to_string(&credit_entry(
+        "crd_exact",
+        CreditKind::Grant,
+        i64::MAX as u64,
+        None,
+    ))
+    .unwrap();
+    let clamped = serde_json::to_string(&credit_entry(
+        "crd_clamped",
+        CreditKind::Grant,
+        u64::MAX,
+        None,
+    ))
+    .unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    for (seq, id, amount, key, payload) in [
+        (1i64, "crd_exact", i64::MAX, None, exact),
+        (2i64, "crd_clamped", i64::MAX, Some("legacy-key"), clamped),
+    ] {
+        conn.execute(
+            "INSERT INTO credit_entry
+                (id, organization_id, entry_seq, billing_account_id, kind, reference,
+                 usage_event_id, idempotency_key, amount_micro, occurred_at_ms, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                id,
+                "org_a",
+                seq,
+                "acct_1",
+                "grant",
+                None::<String>,
+                None::<String>,
+                key,
+                amount,
+                1i64,
+                payload,
+            ],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let store = SqliteControlPlaneStore::open(&path).unwrap();
+    let refuse = |err: BillingStoreError| {
+        assert!(
+            matches!(err, BillingStoreError::Malformed(_)),
+            "the legacy row is refused typed: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("crd_clamped"), "{message}");
+        assert!(message.contains(&i64::MAX.to_string()), "{message}");
+        assert!(message.contains(&u64::MAX.to_string()), "{message}");
+        assert!(message.contains("clamped"), "{message}");
+    };
+    refuse(store.credit_balance(&organization).unwrap_err());
+    refuse(store.credit_entries(&organization, 0, 10).unwrap_err());
+    refuse(
+        store
+            .credit_entry_by_idempotency_key(&organization, "legacy-key")
+            .unwrap_err(),
+    );
+    // A replay of the legacy idempotency key with the boundary amount is NOT
+    // accepted as a Duplicate of the clamped row.
+    let mut replay = credit_entry("crd_replay", CreditKind::Grant, i64::MAX as u64, None);
+    replay.idempotency_key = Some("legacy-key".into());
+    refuse(store.append_credit_entry(&replay).unwrap_err());
+    // A fresh legal append is refused too: the balance cannot be trusted
+    // while the clamped row exists.
+    refuse(
+        store
+            .append_credit_entry(&credit_entry("crd_new", CreditKind::Grant, 1, None))
+            .unwrap_err(),
+    );
+    // The legacy row is untouched (append-only: nothing rewrote it).
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let stored: i64 = conn
+        .query_row(
+            "SELECT amount_micro FROM credit_entry WHERE id = 'crd_clamped'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, i64::MAX, "the legacy row is never rewritten");
+    // Removing the out-of-domain row makes the ledger readable again: the
+    // legal `i64::MAX` boundary row reads exactly.
+    conn.execute("DELETE FROM credit_entry WHERE id = 'crd_clamped'", [])
+        .unwrap();
+    drop(conn);
+    let balance = store.credit_balance(&organization).unwrap();
+    assert_eq!(balance.granted_micro, i64::MAX as u64);
+    let page = store.credit_entries(&organization, 0, 10).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].entry.amount_micro, i64::MAX as u64);
 }

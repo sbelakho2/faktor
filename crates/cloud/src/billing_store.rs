@@ -19,6 +19,15 @@
 //! and task-filtered queries compare against the same encoding, so
 //! `usage_events_of_task` can never alias two ids that the old
 //! `task_id.min(i64::MAX as u64) as i64` projection collapsed together.
+//!
+//! Amount projection: `credit_entry.amount_micro` is a signed `INTEGER`
+//! column whose domain is bounded by
+//! [`crate::billing::MAX_CREDIT_AMOUNT_MICRO`] (`i64::MAX` micro-units).
+//! Writes therefore store the amount EXACTLY (no `.min(...)` clamp, checked
+//! conversion only) and every read decodes the column and the payload
+//! together, refusing typed when they disagree — a legacy row written by the
+//! old clamping writer is surfaced, never silently reinterpreted as its
+//! clamped sentinel.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -609,6 +618,15 @@ pub enum CreditAppend {
     Duplicate,
 }
 
+/// Enforce the credit-amount domain bound at the persistence boundary
+/// (defense in depth: the service validates too, but no store write may ever
+/// project an out-of-domain amount into the ledger). The refusal is typed and
+/// names the field and the limit; both backends refuse identically.
+fn validate_credit_amount(entry: &CreditEntry) -> Result<(), BillingStoreError> {
+    crate::billing::validate_credit_amount_micro(entry.amount_micro)
+        .map_err(|e| BillingStoreError::Malformed(e.to_string()))
+}
+
 // ------------------------------------------------------------- in-memory
 
 #[derive(Default)]
@@ -911,6 +929,7 @@ impl BillingStore for MemoryBillingStore {
     }
 
     fn append_credit_entry(&self, entry: &CreditEntry) -> Result<CreditAppend, BillingStoreError> {
+        validate_credit_amount(entry)?;
         let mut state = self.lock()?;
         claim_credit(&mut state, entry).map_err(BillingStoreError::Credit)
     }
@@ -1115,9 +1134,19 @@ fn encode<T: Serialize>(value: &T) -> Result<String, BillingStoreError> {
         .map_err(|e| BillingStoreError::Malformed(format!("billing row encode: {e}")))
 }
 
-/// One matched `credit_entry` idempotency row: (id, kind, amount_micro,
-/// reference, billing_account_id, usage_event_id).
-type CreditEntryKeyRow = (String, String, i64, Option<String>, String, Option<String>);
+/// One matched `credit_entry` idempotency row: (id, kind, stored
+/// `amount_micro` column, reference, billing_account_id, usage_event_id,
+/// payload). The payload is carried so the identity comparison uses the
+/// EXACT amount authority, never the signed column projection.
+type CreditEntryKeyRow = (
+    String,
+    String,
+    i64,
+    Option<String>,
+    String,
+    Option<String>,
+    String,
+);
 
 impl SqliteControlPlaneStore {
     /// Run one credit append inside an IMMEDIATE transaction: the balance is
@@ -1127,13 +1156,17 @@ impl SqliteControlPlaneStore {
         conn: &mut Connection,
         entry: &CreditEntry,
     ) -> Result<CreditAppend, BillingStoreError> {
+        // The amount domain bound is enforced BEFORE the transaction opens:
+        // an out-of-domain amount is refused typed and writes nothing.
+        validate_credit_amount(entry)?;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(backend)?;
         if let Some(key) = &entry.idempotency_key {
             let existing: Option<CreditEntryKeyRow> = tx
                 .query_row(
-                    "SELECT id, kind, amount_micro, reference, billing_account_id, usage_event_id
+                    "SELECT id, kind, amount_micro, reference, billing_account_id, usage_event_id,
+                            payload
                      FROM credit_entry
                      WHERE organization_id = ?1 AND idempotency_key = ?2",
                     params![entry.organization.as_str(), key],
@@ -1145,14 +1178,18 @@ impl SqliteControlPlaneStore {
                             r.get(3)?,
                             r.get(4)?,
                             r.get(5)?,
+                            r.get(6)?,
                         ))
                     },
                 )
                 .optional()
                 .map_err(backend)?;
-            if let Some((_id, kind, amount, reference, account, usage_event)) = existing {
+            if let Some((id, kind, amount, reference, account, usage_event, payload)) = existing {
+                // The payload amount is the authority (and a legacy clamped
+                // row is refused typed here too, before any comparison).
+                let stored = decode_credit_row(&id, amount, &payload)?;
                 let same = kind == entry.kind.as_str()
-                    && amount as u64 == entry.amount_micro
+                    && stored.amount_micro == entry.amount_micro
                     && reference.as_deref() == entry.reference.as_ref().map(|r| r.as_str())
                     && account == entry.billing_account_id.as_str()
                     && usage_event.as_deref() == entry.usage_event_id.as_ref().map(|u| u.as_str());
@@ -1255,6 +1292,17 @@ impl SqliteControlPlaneStore {
                 |r| r.get(0),
             )
             .map_err(backend)?;
+        // The domain bound (validated above) makes the signed projection
+        // EXACT. The conversion is still checked, never `as`: no future path
+        // can silently reintroduce a clamp into the monetary column.
+        let amount_i64 = i64::try_from(entry.amount_micro).map_err(|_| {
+            BillingStoreError::Malformed(format!(
+                "credit entry {} amount_micro {} exceeds the durable i64::MAX limit {}",
+                entry.id.as_str(),
+                entry.amount_micro,
+                crate::billing::MAX_CREDIT_AMOUNT_MICRO
+            ))
+        })?;
         tx.execute(
             "INSERT INTO credit_entry
                 (id, organization_id, entry_seq, billing_account_id, kind, reference,
@@ -1269,7 +1317,7 @@ impl SqliteControlPlaneStore {
                 entry.reference.as_ref().map(|r| r.as_str()),
                 entry.usage_event_id.as_ref().map(|u| u.as_str()),
                 entry.idempotency_key.as_deref(),
-                entry.amount_micro.min(i64::MAX as u64) as i64,
+                amount_i64,
                 entry.occurred_at_ms,
                 encode(entry)?,
             ],
@@ -1280,21 +1328,64 @@ impl SqliteControlPlaneStore {
     }
 }
 
+/// Decode one `credit_entry` row and verify its durable amount projection.
+///
+/// Invariant (P1 ledger-consistency): the stored `amount_micro` column is
+/// the EXACT signed projection of the payload's `amount_micro`, whose domain
+/// is bounded by [`crate::billing::MAX_CREDIT_AMOUNT_MICRO`] (`i64::MAX`), so
+/// column and payload are bit-identical for every row the current writer
+/// produces. A row written by the old clamping writer can still hold the
+/// sentinel `i64::MAX` while the payload carries the true (out-of-domain)
+/// amount. Such a row is REFUSED typed here, naming the row id and both
+/// values — never silently reinterpreted as the clamped `i64::MAX`, and
+/// never folded into a balance/audit/aggregation number.
+///
+/// No in-place migration rewrites these rows: the true amount is outside the
+/// bounded domain, so there is no exact in-domain value to migrate to and
+/// any rewrite would be a guess. The refusal names the row so an operator
+/// can verify the ledger; this is the documented decision (the v6 task-id
+/// precedent: refuse rather than guess).
+fn decode_credit_row(
+    id: &str,
+    stored_amount: i64,
+    payload: &str,
+) -> Result<CreditEntry, BillingStoreError> {
+    let entry: CreditEntry = parse(payload)?;
+    if u64::try_from(stored_amount).ok() != Some(entry.amount_micro) {
+        return Err(BillingStoreError::Malformed(format!(
+            "credit_entry {id}: stored amount_micro {stored_amount} disagrees with the payload \
+             amount_micro {} (legacy clamped row written before the i64::MAX domain bound); \
+             refusing to reinterpret the ledger amount (operator verification required)",
+            entry.amount_micro
+        )));
+    }
+    Ok(entry)
+}
+
 fn read_credit_entries(
     conn: &Connection,
     organization: &OrganizationId,
 ) -> Result<Vec<CreditEntry>, BillingStoreError> {
     let mut stmt = conn
-        .prepare("SELECT payload FROM credit_entry WHERE organization_id = ?1 ORDER BY entry_seq")
+        .prepare(
+            "SELECT id, amount_micro, payload FROM credit_entry
+             WHERE organization_id = ?1 ORDER BY entry_seq",
+        )
         .map_err(backend)?;
     let rows = stmt
-        .query_map(params![organization.as_str()], |r| r.get::<_, String>(0))
+        .query_map(params![organization.as_str()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
         .map_err(backend)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(backend)?;
     let mut out = Vec::with_capacity(rows.len());
-    for payload in rows {
-        out.push(parse(&payload)?);
+    for (id, amount, payload) in rows {
+        out.push(decode_credit_row(&id, amount, &payload)?);
     }
     Ok(out)
 }
@@ -1529,7 +1620,7 @@ impl BillingStore for SqliteControlPlaneStore {
         let conn = self.lock_billing_conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT entry_seq, payload FROM credit_entry
+                "SELECT entry_seq, id, amount_micro, payload FROM credit_entry
                  WHERE organization_id = ?1 AND entry_seq > ?2
                  ORDER BY entry_seq LIMIT ?3",
             )
@@ -1537,16 +1628,23 @@ impl BillingStore for SqliteControlPlaneStore {
         let rows = stmt
             .query_map(
                 params![organization.as_str(), after_seq, limit as i64],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                },
             )
             .map_err(backend)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(backend)?;
         let mut out = Vec::with_capacity(rows.len());
-        for (entry_seq, payload) in rows {
+        for (entry_seq, id, amount, payload) in rows {
             out.push(StoredCreditEntry {
                 entry_seq,
-                entry: parse(&payload)?,
+                entry: decode_credit_row(&id, amount, &payload)?,
             });
         }
         Ok(out)
@@ -1560,17 +1658,24 @@ impl BillingStore for SqliteControlPlaneStore {
         let conn = self.lock_billing_conn()?;
         let row = conn
             .query_row(
-                "SELECT entry_seq, payload FROM credit_entry
+                "SELECT entry_seq, id, amount_micro, payload FROM credit_entry
                  WHERE organization_id = ?1 AND idempotency_key = ?2",
                 params![organization.as_str(), key],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                },
             )
             .optional()
             .map_err(backend)?;
         match row {
-            Some((entry_seq, payload)) => Ok(Some(StoredCreditEntry {
+            Some((entry_seq, id, amount, payload)) => Ok(Some(StoredCreditEntry {
                 entry_seq,
-                entry: parse(&payload)?,
+                entry: decode_credit_row(&id, amount, &payload)?,
             })),
             None => Ok(None),
         }
