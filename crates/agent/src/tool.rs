@@ -16,6 +16,7 @@ use faktor_core::resource::ResourceClass;
 use faktor_core::WorkspaceIdentity;
 use faktor_provider::ToolSpec;
 
+use crate::activation::{ToolActivationSet, ToolExposure};
 use crate::tool_json::{parse_tool_calls, ToolCallMode};
 
 /// How the runtime should recover this tool after a crash (spec §7).
@@ -259,7 +260,9 @@ pub struct ToolBundle {
 pub const SEMANTIC_QUERY_TOOL: &str = "semantic_query";
 
 impl ToolBundle {
-    /// Select the phase bundle over `registry` for `capabilities`.
+    /// Select the phase bundle over `registry` for `capabilities` with an
+    /// EMPTY lazy activation set: exactly the historical behavior (a lazy
+    /// tool contributes nothing until it is activated).
     ///
     /// Selection is by registry metadata (`ResourceClass`) and declared
     /// capabilities only — never provider names. A semantic-provider
@@ -271,9 +274,22 @@ impl ToolBundle {
         registry: &ToolRegistry,
         capabilities: &ModelCapabilities,
     ) -> Self {
+        Self::for_phase_with_activation(phase, registry, capabilities, &ToolActivationSet::new())
+    }
+
+    /// [`ToolBundle::for_phase`] under an explicit activation set: a tool
+    /// registered [`ToolExposure::Lazy`] is included only when its name is
+    /// active AND its phase mask contains `phase`. `Normal` tools are
+    /// unaffected — the historical class policy still decides them.
+    pub fn for_phase_with_activation(
+        phase: RouterPhase,
+        registry: &ToolRegistry,
+        capabilities: &ModelCapabilities,
+        activation: &ToolActivationSet,
+    ) -> Self {
         let mut tools: Vec<ToolSpec> = registry
             .iter()
-            .filter(|tool| phase_allows(phase, tool))
+            .filter(|tool| registry.exposure_allows(phase, tool, activation))
             .map(Tool::spec)
             .collect();
         if phase_exposes_semantic(phase) {
@@ -415,6 +431,15 @@ fn phase_exposes_semantic(phase: RouterPhase) -> bool {
     )
 }
 
+/// Whether a phase may carry tools at all. `Compact`/`Title`/`Embed` are
+/// model-only: no tool (lazy or not) is ever exposed there.
+fn phase_is_tool_bearing(phase: RouterPhase) -> bool {
+    !matches!(
+        phase,
+        RouterPhase::Compact | RouterPhase::Title | RouterPhase::Embed
+    )
+}
+
 fn phase_slug(phase: RouterPhase) -> &'static str {
     match phase {
         RouterPhase::Plan => "plan",
@@ -432,9 +457,16 @@ fn phase_slug(phase: RouterPhase) -> &'static str {
 }
 
 /// Tool registry: the agent asks the registry, tools are wired by the CLI.
+///
+/// `tools` carries every registered tool (lazy or not) so execution and
+/// ownership lookups are unchanged; `exposure` carries the per-name
+/// [`ToolExposure`] that decides MODEL VISIBILITY. A name registered before
+/// exposure tracking (or absent from the map) is `Normal` by construction —
+/// [`ToolRegistry::register`] always inserts [`ToolExposure::Normal`].
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: std::collections::HashMap<String, Arc<Tool>>,
+    exposure: std::collections::HashMap<String, ToolExposure>,
 }
 
 impl ToolRegistry {
@@ -442,13 +474,38 @@ impl ToolRegistry {
         Self::default()
     }
 
+    /// Register a `Normal` tool: exposed exactly as before (the per-phase
+    /// class policy decides). Unchanged meaning.
     pub fn register(&mut self, tool: Tool) {
+        self.register_with_exposure(tool, ToolExposure::Normal);
+    }
+
+    /// Register a tool with an explicit exposure. A [`ToolExposure::Lazy`]
+    /// tool is invisible to the model (zero schema bytes/tokens) until its
+    /// activation set contains its name; [`ToolExposure::Normal`] here is an
+    /// alias of [`ToolRegistry::register`].
+    pub fn register_lazy(&mut self, tool: Tool, exposure: ToolExposure) {
+        self.register_with_exposure(tool, exposure);
+    }
+
+    fn register_with_exposure(&mut self, tool: Tool, exposure: ToolExposure) {
         let name = tool.name.clone();
-        self.tools.insert(name, Arc::new(tool));
+        self.tools.insert(name.clone(), Arc::new(tool));
+        self.exposure.insert(name, exposure);
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<Tool>> {
         self.tools.get(name).cloned()
+    }
+
+    /// The declared exposure of `name` (`None` for an unregistered name).
+    pub fn exposure(&self, name: &str) -> Option<&ToolExposure> {
+        self.exposure.get(name)
+    }
+
+    /// Whether `name` is a registered lazy tool (invisible until activated).
+    pub fn is_lazy(&self, name: &str) -> bool {
+        self.exposure.get(name).is_some_and(ToolExposure::is_lazy)
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -463,15 +520,77 @@ impl ToolRegistry {
         self.tools.values().map(|t| t.as_ref())
     }
 
-    /// The tool bundle `phase` exposes over this registry (audit 47).
+    /// The tool bundle `phase` exposes over this registry with an EMPTY lazy
+    /// activation set: byte-identical to the historical behavior (audit 47).
     pub fn bundle_for_phase(
         &self,
         phase: RouterPhase,
         capabilities: &ModelCapabilities,
     ) -> ToolBundle {
-        ToolBundle::for_phase(phase, self, capabilities)
+        self.bundle_for_phase_with_activation(phase, capabilities, &ToolActivationSet::new())
     }
 
+    /// The tool bundle `phase` exposes under `activation`. Only `Lazy`
+    /// exposure consults the activation set; `Normal` tools follow the
+    /// historical class policy byte-for-byte.
+    pub fn bundle_for_phase_with_activation(
+        &self,
+        phase: RouterPhase,
+        capabilities: &ModelCapabilities,
+        activation: &ToolActivationSet,
+    ) -> ToolBundle {
+        ToolBundle::for_phase_with_activation(phase, self, capabilities, activation)
+    }
+
+    /// Registry-metadata visibility of one tool. `Normal` tools use the
+    /// historical class policy; a `Lazy` tool is visible only while active
+    /// AND inside its phase mask. The mask IS the lazy tool's phase policy
+    /// for tool-bearing phases — a `Network`-class acquisition tool must be
+    /// able to ride `Plan`/`Explore`/`Retrieve`, which the class policy
+    /// alone refuses — while the model-only phases (`Compact`, `Title`,
+    /// `Embed`) stay a hard floor no lazy mask can breach.
+    fn exposure_allows(
+        &self,
+        phase: RouterPhase,
+        tool: &Tool,
+        activation: &ToolActivationSet,
+    ) -> bool {
+        match self.exposure.get(&tool.name) {
+            Some(ToolExposure::Lazy { phases, .. }) => {
+                phase_is_tool_bearing(phase)
+                    && activation.is_active(&tool.name)
+                    && phases.contains(phase)
+            }
+            _ => phase_allows(phase, tool),
+        }
+    }
+
+    /// Fold one user text into `activation`: every registered lazy tool's
+    /// deterministic triggers (whole-token signals, first-party product
+    /// URLs, the explicit `/source on|off` flag) are evaluated over the text.
+    /// No classifier, embedding or model call. Activation is sticky; only an
+    /// explicit `off` flag deactivates. Names are visited in sorted order so
+    /// the result is independent of registration order.
+    pub fn observe_activation(&self, text: &str, activation: &mut ToolActivationSet) {
+        let mut names: Vec<&String> = self.exposure.keys().collect();
+        names.sort();
+        for name in names {
+            let Some(ToolExposure::Lazy { triggers, .. }) = self.exposure.get(name) else {
+                continue;
+            };
+            activation.observe(name, triggers, text);
+        }
+    }
+
+    /// [`ToolRegistry::observe_activation`] on a copy of `prior`.
+    pub fn activation_for_text(&self, prior: &ToolActivationSet, text: &str) -> ToolActivationSet {
+        let mut next = prior.clone();
+        self.observe_activation(text, &mut next);
+        next
+    }
+
+    /// Every registered spec, lazy or not (the historical meaning: this is
+    /// NOT a model-visible bundle; use `bundle_for_phase*` for that).
     pub fn specs(&self) -> Vec<ToolSpec> {
         let mut v: Vec<ToolSpec> = self.tools.values().map(|t| t.spec()).collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1299,5 +1418,404 @@ mod tests {
             assert!(!names.contains(&"board_post"), "{phase:?}");
             assert!(!names.contains(&"board_read"), "{phase:?}");
         }
+    }
+
+    // ---- lazy tool exposure (docs/acquire.md §2/§4) ----------------------
+
+    use crate::activation::{
+        acquire_source_phases, acquire_source_triggers, evaluate_triggers, PhaseMask,
+        TriggerVerdict,
+    };
+
+    /// The future `source_market` shape: a `Network`-class tool with the
+    /// normative §4 mask and trigger vocabulary (the acquisition runtime
+    /// itself is a later build step; the class and schema are real).
+    fn source_market_tool() -> Tool {
+        bundle_tool(
+            "source_market",
+            ResourceClass::Network,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"op": {"enum": ["search", "product", "quote", "bom", "job"]}},
+                "required": ["op"],
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    fn lazy_registry() -> ToolRegistry {
+        let mut registry = phase_registry(&[
+            "read_file",
+            "search",
+            "write_file",
+            "edit_file",
+            "run_command",
+            "mcp_database",
+        ]);
+        registry.register_lazy(
+            source_market_tool(),
+            ToolExposure::lazy(acquire_source_phases(), acquire_source_triggers()),
+        );
+        registry
+    }
+
+    /// Every phase whose bundle exposes `source_market` under `activation`.
+    fn exposing_phases(
+        registry: &ToolRegistry,
+        activation: &ToolActivationSet,
+    ) -> Vec<RouterPhase> {
+        RouterPhase::ALL
+            .into_iter()
+            .filter(|phase| {
+                registry
+                    .bundle_for_phase_with_activation(
+                        *phase,
+                        &ModelCapabilities::default(),
+                        activation,
+                    )
+                    .tool_names()
+                    .contains(&"source_market")
+            })
+            .collect()
+    }
+
+    fn active_source_market() -> ToolActivationSet {
+        let mut activation = ToolActivationSet::new();
+        activation.activate("source_market");
+        activation
+    }
+
+    #[test]
+    fn register_still_means_normal_and_unregistered_names_have_no_exposure() {
+        let mut registry = ToolRegistry::new();
+        registry.register(bundle_tool(
+            "read_file",
+            ResourceClass::DiskRead,
+            serde_json::json!({"type": "object"}),
+        ));
+        assert_eq!(registry.exposure("read_file"), Some(&ToolExposure::Normal));
+        assert!(!registry.is_lazy("read_file"));
+        assert_eq!(registry.exposure("never_registered"), None);
+        assert!(!registry.is_lazy("never_registered"));
+        assert!(registry
+            .bundle_for_phase(RouterPhase::Implement, &ModelCapabilities::default())
+            .tool_names()
+            .contains(&"read_file"));
+    }
+
+    #[test]
+    fn legacy_bundle_is_byte_identical_to_the_empty_activation_bundle() {
+        let registry = lazy_registry();
+        let empty = ToolActivationSet::new();
+        for caps in [ModelCapabilities::default(), caps_semantic()] {
+            for phase in RouterPhase::ALL {
+                let legacy = registry.bundle_for_phase(phase, &caps);
+                let explicit = registry.bundle_for_phase_with_activation(phase, &caps, &empty);
+                assert_eq!(
+                    serde_json::to_vec(&legacy).unwrap(),
+                    serde_json::to_vec(&explicit).unwrap(),
+                    "{phase:?}: bundle_for_phase must be byte-identical to an empty activation"
+                );
+                assert_eq!(legacy.bundle_hash(), explicit.bundle_hash());
+                assert!(
+                    !legacy.tool_names().contains(&"source_market"),
+                    "{phase:?}: an inactive lazy tool must be invisible"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_tool_is_invisible_until_activated_and_mask_gated() {
+        let registry = lazy_registry();
+        let empty = ToolActivationSet::new();
+        assert!(exposing_phases(&registry, &empty).is_empty());
+
+        let active = active_source_market();
+        assert_eq!(
+            exposing_phases(&registry, &active),
+            vec![
+                RouterPhase::Plan,
+                RouterPhase::Explore,
+                RouterPhase::Retrieve,
+                RouterPhase::Implement,
+                RouterPhase::Debug,
+            ],
+            "spec §4: Plan/Explore/Retrieve/Implement yes, Debug optional (chosen yes), \
+             Review/TestAnalysis/Summarize/Compact/Title/Embed no"
+        );
+        for phase in [
+            RouterPhase::Review,
+            RouterPhase::TestAnalysis,
+            RouterPhase::Summarize,
+        ] {
+            assert!(
+                !exposing_phases(&registry, &active).contains(&phase),
+                "{phase:?} must not expose an acquisition tool"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lazy_mask_can_never_breach_the_model_only_phases() {
+        let mut registry = ToolRegistry::new();
+        registry.register_lazy(
+            source_market_tool(),
+            ToolExposure::lazy(PhaseMask::ALL, acquire_source_triggers()),
+        );
+        let active = active_source_market();
+        let phases = exposing_phases(&registry, &active);
+        assert!(phases.contains(&RouterPhase::Implement));
+        for phase in [RouterPhase::Compact, RouterPhase::Title, RouterPhase::Embed] {
+            assert!(
+                !phases.contains(&phase),
+                "the model-only phase {phase:?} is a hard floor"
+            );
+        }
+    }
+
+    #[test]
+    fn lazy_mask_is_authoritative_over_the_class_policy_for_tool_phases() {
+        // A Network tool is refused by the class policy in Plan/Explore/
+        // Retrieve; the lazy mask is what lets the activated tool ride them.
+        let registry = lazy_registry();
+        let caps = ModelCapabilities::default();
+        let active = active_source_market();
+        for phase in [
+            RouterPhase::Plan,
+            RouterPhase::Explore,
+            RouterPhase::Retrieve,
+        ] {
+            assert!(
+                registry
+                    .bundle_for_phase_with_activation(phase, &caps, &active)
+                    .tool_names()
+                    .contains(&"source_market"),
+                "{phase:?} must expose the activated Network tool"
+            );
+        }
+        // And a lazy DiskWrite tool with an Explore-only mask is exposed in
+        // Explore (mask authoritative) while a NORMAL DiskWrite tool is not.
+        let mut write_registry = ToolRegistry::new();
+        let write = bundle_tool(
+            "lazy_writer",
+            ResourceClass::DiskWrite,
+            serde_json::json!({"type": "object"}),
+        );
+        write_registry.register_lazy(
+            write.clone(),
+            ToolExposure::lazy(PhaseMask::of([RouterPhase::Explore]), vec![]),
+        );
+        write_registry.register(bundle_tool(
+            "normal_writer",
+            ResourceClass::DiskWrite,
+            serde_json::json!({"type": "object"}),
+        ));
+        let mut activation = ToolActivationSet::new();
+        activation.activate("lazy_writer");
+        let explore = write_registry.bundle_for_phase_with_activation(
+            RouterPhase::Explore,
+            &caps,
+            &activation,
+        );
+        let names = explore.tool_names();
+        assert!(names.contains(&"lazy_writer"));
+        assert!(!names.contains(&"normal_writer"));
+        let implement = write_registry.bundle_for_phase_with_activation(
+            RouterPhase::Implement,
+            &caps,
+            &activation,
+        );
+        assert!(!implement.tool_names().contains(&"lazy_writer"));
+    }
+
+    #[test]
+    fn activation_folds_ordinary_supplier_and_strong_prompts_deterministically() {
+        let registry = lazy_registry();
+        let empty = ToolActivationSet::new();
+
+        // An unrelated coding turn: no activation, no lazy schema anywhere.
+        let ordinary =
+            registry.activation_for_text(&empty, "fix the failing parser test in src/parser.rs");
+        assert!(ordinary.is_empty());
+        assert!(exposing_phases(&registry, &ordinary).is_empty());
+
+        // A Rust `supplier` trait discussion: still nothing (weak signal).
+        let supplier_trait =
+            registry.activation_for_text(&empty, "the supplier trait needs a lifetime parameter");
+        assert!(
+            supplier_trait.is_empty(),
+            "a supplier trait discussion must never expose an acquisition tool"
+        );
+
+        // Strong signals activate; `/source off` deactivates.
+        for text in [
+            "check 1688 for this connector",
+            "please source this part",
+            "quote this BOM",
+            "see https://detail.1688.com/offer/1.html",
+            "/source on",
+        ] {
+            let folded = registry.activation_for_text(&empty, text);
+            assert!(
+                folded.is_active("source_market"),
+                "{text:?} must activate source_market"
+            );
+        }
+        let active = registry.activation_for_text(&empty, "Mouser quote");
+        let off = registry.activation_for_text(&active, "/source off");
+        assert!(!off.is_active("source_market"));
+
+        // Deterministic: identical text + prior, identical set, regardless
+        // of registration order.
+        let a = registry.activation_for_text(&empty, "buy 5,000 LCSC reels");
+        let b = registry.activation_for_text(&empty, "buy 5,000 LCSC reels");
+        assert_eq!(a, b);
+        let mut reversed = ToolRegistry::new();
+        for name in [
+            "mcp_database",
+            "run_command",
+            "edit_file",
+            "write_file",
+            "search",
+            "read_file",
+        ] {
+            let (class, schema) = (
+                if name == "run_command" {
+                    ResourceClass::Terminal
+                } else if name == "write_file" || name == "edit_file" {
+                    ResourceClass::DiskWrite
+                } else if name == "read_file" || name == "search" {
+                    ResourceClass::DiskRead
+                } else {
+                    ResourceClass::Mcp
+                },
+                serde_json::json!({"type": "object"}),
+            );
+            reversed.register(bundle_tool(name, class, schema));
+        }
+        reversed.register_lazy(
+            source_market_tool(),
+            ToolExposure::lazy(acquire_source_phases(), acquire_source_triggers()),
+        );
+        assert_eq!(
+            reversed.activation_for_text(&empty, "buy 5,000 LCSC reels"),
+            a,
+            "activation is independent of registration order"
+        );
+    }
+
+    #[test]
+    fn re_registration_replaces_the_exposure() {
+        let caps = ModelCapabilities::default();
+        let mut registry = ToolRegistry::new();
+        registry.register_lazy(
+            source_market_tool(),
+            ToolExposure::lazy(acquire_source_phases(), acquire_source_triggers()),
+        );
+        assert!(registry.is_lazy("source_market"));
+        // A later normal registration of the same name wins.
+        registry.register(source_market_tool());
+        assert_eq!(
+            registry.exposure("source_market"),
+            Some(&ToolExposure::Normal)
+        );
+        assert!(registry
+            .bundle_for_phase(RouterPhase::Implement, &caps)
+            .tool_names()
+            .contains(&"source_market"));
+
+        // ... and the reverse: a lazy re-registration hides it again.
+        let mut registry = ToolRegistry::new();
+        registry.register(source_market_tool());
+        assert!(registry
+            .bundle_for_phase(RouterPhase::Implement, &caps)
+            .tool_names()
+            .contains(&"source_market"));
+        registry.register_lazy(
+            source_market_tool(),
+            ToolExposure::lazy(acquire_source_phases(), acquire_source_triggers()),
+        );
+        assert!(registry.is_lazy("source_market"));
+        assert!(!registry
+            .bundle_for_phase(RouterPhase::Implement, &caps)
+            .tool_names()
+            .contains(&"source_market"));
+
+        // `register_lazy(.., Normal)` is an alias of `register`.
+        let mut registry = ToolRegistry::new();
+        registry.register_lazy(source_market_tool(), ToolExposure::Normal);
+        assert_eq!(
+            registry.exposure("source_market"),
+            Some(&ToolExposure::Normal)
+        );
+    }
+
+    #[test]
+    fn activation_does_not_touch_the_semantic_surface_or_normal_tools() {
+        let registry = lazy_registry();
+        let active = active_source_market();
+        for phase in [
+            RouterPhase::Plan,
+            RouterPhase::Explore,
+            RouterPhase::Retrieve,
+        ] {
+            let bundle =
+                registry.bundle_for_phase_with_activation(phase, &caps_semantic(), &active);
+            let names = bundle.tool_names();
+            assert!(names.contains(&"semantic_query"));
+            assert!(names.contains(&"source_market"));
+            // The class policy still governs the normal tools.
+            assert!(!names.contains(&"write_file"));
+        }
+        let summarize = registry.bundle_for_phase_with_activation(
+            RouterPhase::Summarize,
+            &caps_semantic(),
+            &active,
+        );
+        assert!(!summarize.tool_names().contains(&"source_market"));
+    }
+
+    #[tokio::test]
+    async fn lazy_tool_execution_and_ownership_are_unaffected_by_activation() {
+        let mut registry = ToolRegistry::new();
+        let mut lazy = bundle_tool(
+            "lazy_probe",
+            ResourceClass::Network,
+            serde_json::json!({"type": "object"}),
+        );
+        lazy.path_args = vec!["path".into()];
+        registry.register_lazy(
+            lazy,
+            ToolExposure::lazy(acquire_source_phases(), acquire_source_triggers()),
+        );
+        // Lookup and ownership are registry metadata, not model visibility.
+        let tool = registry.get("lazy_probe").expect("registered");
+        assert_eq!(
+            tool.ownership(&serde_json::json!({"path": "src/a.rs"}))
+                .reads,
+            vec!["src/a.rs"]
+        );
+        let out = (tool.execute)(board_ctx(), serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out.text, "");
+    }
+
+    #[test]
+    fn evaluate_triggers_is_exposed_with_the_normative_vocabulary() {
+        let triggers = acquire_source_triggers();
+        assert_eq!(
+            evaluate_triggers(&triggers, "the supplier trait"),
+            TriggerVerdict::None
+        );
+        assert_eq!(
+            evaluate_triggers(&triggers, "find manufacturers"),
+            TriggerVerdict::Activate
+        );
+        assert_eq!(
+            evaluate_triggers(&triggers, "/source off"),
+            TriggerVerdict::Deactivate
+        );
     }
 }

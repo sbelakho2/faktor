@@ -1,0 +1,7 @@
+{
+  "Currency": "USD",
+  "ProductPricing": [
+    { "BreakQuantity": 1, "UnitPrice": "5.00", "TotalPrice": "5.00" },
+    { "BreakQuantity": 100, "UnitPrice": "4.50", "TotalPrice": "450.00" }
+  ]
+}

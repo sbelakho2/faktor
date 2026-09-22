@@ -1,0 +1,1 @@
+{"data": {"product": {"productId": [1, 2, 3], "title": {"nested": true}, "price": {"amount": "1.20"}, "skuOptions": [{"attributes": "not-a-list", "price": ["1.20"]}], "supplier": "not-an-object"}}}

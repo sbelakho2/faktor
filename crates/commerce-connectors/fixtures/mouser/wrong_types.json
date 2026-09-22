@@ -1,0 +1,25 @@
+{
+  "Errors": [],
+  "SearchResults": {
+    "NumberOfResult": 1,
+    "Parts": [
+      {
+        "MouserPartNumber": "595-TPS5430DDAR",
+        "ManufacturerPartNumber": "TPS5430DDAR",
+        "Manufacturer": "Texas Instruments",
+        "Description": "Buck regulator",
+        "Availability": "many in stock",
+        "AvailabilityInStock": "lots",
+        "Min": "1.5",
+        "Mult": "1e3",
+        "StandardPackQuantity": {},
+        "ProductDetailUrl": "https://www.mouser.com/ProductDetail/Texas-Instruments/TPS5430DDAR",
+        "PriceBreaks": [
+          { "Quantity": "many", "Price": "cheap", "Currency": "USD" },
+          { "Quantity": 10, "Price": {}, "Currency": "USD" },
+          { "Quantity": 100, "Price": "3.65", "Currency": "dollars" }
+        ]
+      }
+    ]
+  }
+}

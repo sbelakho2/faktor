@@ -1778,4 +1778,156 @@ mod tests {
         assert!(plain.system.contains("### src/b.rs"));
         assert!(service.len() == 1);
     }
+
+    // ---- lazy tool exposure (docs/acquire.md §2/§4) ---------------------
+
+    /// A registry of normal tools plus, when `lazy` is set, a registered
+    /// `source_market`-shaped lazy `Network` tool (spec §4: the future tool
+    /// is never faked — the class and schema are the real shape, only the
+    /// acquisition runtime is a later step).
+    fn lazy_wire_registry(lazy: bool) -> crate::tool::ToolRegistry {
+        use crate::tool::{RecoveryHint, Tool, ToolOutcome, ToolRegistry};
+        use faktor_core::resource::ResourceClass;
+        let make = |name: &str, class: ResourceClass, schema: serde_json::Value| Tool {
+            name: name.into(),
+            description: format!("{name} description"),
+            input_schema: schema,
+            resource_class: class,
+            capability: None,
+            recovery_hint: RecoveryHint::Idempotent,
+            path_args: vec![],
+            execute: std::sync::Arc::new(|_ctx, _args| {
+                Box::pin(async move { Ok(ToolOutcome::default()) })
+            }),
+        };
+        let mut registry = ToolRegistry::new();
+        registry.register(make(
+            "read_file",
+            ResourceClass::DiskRead,
+            serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        ));
+        registry.register(make(
+            "run_command",
+            ResourceClass::Terminal,
+            serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+        ));
+        if lazy {
+            registry.register_lazy(
+                make(
+                    "source_market",
+                    ResourceClass::Network,
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {"op": {"enum": ["search", "product", "quote", "bom", "job"]}},
+                        "required": ["op"],
+                        "additionalProperties": false
+                    }),
+                ),
+                crate::activation::ToolExposure::lazy(
+                    crate::activation::acquire_source_phases(),
+                    crate::activation::acquire_source_triggers(),
+                ),
+            );
+        }
+        registry
+    }
+
+    /// Token economics (spec §2, release-blocking): a registered but
+    /// INACTIVE lazy tool contributes exactly zero schema bytes and zero
+    /// schema tokens — the whole wire plan of an ordinary prompt is
+    /// byte-identical to the plan built without the registration. Once the
+    /// prompt activates it, the schema rides the bundle and the tool-bundle
+    /// segment grows.
+    #[test]
+    fn inactive_lazy_tool_is_wire_byte_identical_and_activation_adds_schema_tokens() {
+        use crate::activation::ToolActivationSet;
+        use faktor_core::model::{ModelCapabilities, RouterPhase};
+        let caps = ModelCapabilities::default();
+        let budget = ContextBudget::default();
+        let cache = cache();
+        let history = small_history(6);
+        let ev = evidence(2);
+        let ledger = ledger();
+        let baseline = lazy_wire_registry(false);
+        let with_lazy = lazy_wire_registry(true);
+
+        // Bundle bytes: the inactive lazy registration is invisible.
+        let baseline_bundle = baseline.bundle_for_phase(RouterPhase::Implement, &caps);
+        let inactive_bundle = with_lazy.bundle_for_phase(RouterPhase::Implement, &caps);
+        assert_eq!(
+            serde_json::to_vec(&baseline_bundle).unwrap(),
+            serde_json::to_vec(&inactive_bundle).unwrap(),
+            "an inactive lazy tool must not change one bundle byte"
+        );
+        assert_eq!(baseline_bundle.bundle_hash(), inactive_bundle.bundle_hash());
+        assert_eq!(
+            serde_json::to_vec(&baseline_bundle.tools).unwrap(),
+            serde_json::to_vec(&inactive_bundle.tools).unwrap(),
+            "schema bytes are identical"
+        );
+        assert!(!inactive_bundle.tool_names().contains(&"source_market"));
+
+        // The request, constructed twice: identical bytes AND identical
+        // token accounting (total + every segment, tools included).
+        let plan = |schemas: &[faktor_provider::ToolSpec]| {
+            plan_wire_turn(
+                "You are Faktor.\n",
+                "",
+                schemas,
+                "rules",
+                &ledger,
+                "map",
+                &history,
+                &ev,
+                &budget,
+                TEST_MODEL,
+                &cache,
+            )
+            .unwrap()
+        };
+        let before = plan(&baseline_bundle.tools);
+        let ordinary = plan(&inactive_bundle.tools);
+        assert_eq!(before.system, ordinary.system);
+        assert_eq!(before.messages, ordinary.messages);
+        assert_eq!(
+            serde_json::to_vec(&before.tools).unwrap(),
+            serde_json::to_vec(&ordinary.tools).unwrap(),
+            "the wire tool list is byte-identical"
+        );
+        assert_eq!(before.cacheable_prefix_len, ordinary.cacheable_prefix_len);
+        assert_eq!(before.total_tokens, ordinary.total_tokens);
+        assert_eq!(before.prompt_segments, ordinary.prompt_segments);
+        assert_eq!(
+            before.prompt_segments.tool_bundle.tokens,
+            ordinary.prompt_segments.tool_bundle.tokens
+        );
+        assert_eq!(
+            before.prompt_segments.tool_bundle.bytes, ordinary.prompt_segments.tool_bundle.bytes,
+            "the tool-bundle segment digest/bytes are unchanged"
+        );
+
+        // An ACTIVATED prompt (deterministic signal, no model call) exposes
+        // the tool in the masked phase and the schema tokens appear.
+        let mut activation = ToolActivationSet::new();
+        with_lazy.observe_activation("quote this BOM for the 1688 listing", &mut activation);
+        assert!(activation.is_active("source_market"));
+        let active_bundle =
+            with_lazy.bundle_for_phase_with_activation(RouterPhase::Implement, &caps, &activation);
+        assert!(active_bundle.tool_names().contains(&"source_market"));
+        assert_ne!(baseline_bundle.bundle_hash(), active_bundle.bundle_hash());
+        let activated = plan(&active_bundle.tools);
+        assert!(
+            activated.prompt_segments.tool_bundle.tokens
+                > before.prompt_segments.tool_bundle.tokens,
+            "an activated lazy tool must contribute schema tokens"
+        );
+        assert!(activated.total_tokens > before.total_tokens);
+        assert!(activated
+            .tools
+            .iter()
+            .any(|spec| spec.name == "source_market"));
+        // The cacheable head boundary is untouched by activation: only the
+        // tool bundle moves.
+        assert_eq!(before.cacheable_prefix_len, activated.cacheable_prefix_len);
+    }
 }

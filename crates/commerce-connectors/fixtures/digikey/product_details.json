@@ -1,0 +1,25 @@
+{
+  "Product": {
+    "ManufacturerProductNumber": "TPS5430DDAR",
+    "Description": {
+      "ProductDescription": "IC REG BUCK ADJ 3A 8SOIC",
+      "DetailedDescription": "Buck Switching Regulator IC Positive Adjustable 1.221V 1 Output 3A 8-SOIC"
+    },
+    "Manufacturer": { "Id": 296, "Name": "Texas Instruments" },
+    "ProductUrl": "https://www.digikey.com/en/products/detail/texas-instruments/TPS5430DDAR/1234567",
+    "ProductStatus": { "Status": "Active" },
+    "ProductVariations": [
+      {
+        "DigiKeyProductNumber": "296-17989-5-ND",
+        "PackageType": { "Id": 2, "Name": "Tube" },
+        "QuantityAvailable": 4321,
+        "MinimumOrderQuantity": 1,
+        "StandardPackage": 1,
+        "StandardPricing": [
+          { "BreakQuantity": 1, "UnitPrice": "5.00", "TotalPrice": "5.00", "Currency": "USD" },
+          { "BreakQuantity": 10, "UnitPrice": "4.75", "TotalPrice": "47.50", "Currency": "USD" }
+        ]
+      }
+    ]
+  }
+}

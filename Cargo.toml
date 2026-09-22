@@ -1,7 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/acquire",
     "crates/core",
+    "crates/commerce",
+    "crates/commerce-connectors",
+    "crates/browser",
     "crates/evidence",
     "crates/semantic",
     "crates/protocol",
@@ -72,6 +76,8 @@ rust-version = "1.98"
 
 [workspace.dependencies]
 faktor-core = { path = "crates/core" }
+faktor-commerce = { path = "crates/commerce" }
+faktor-commerce-connectors = { path = "crates/commerce-connectors" }
 faktor-semantic = { path = "crates/semantic" }
 faktor-protocol = { path = "crates/protocol" }
 faktor-cas = { path = "crates/cas" }
@@ -104,6 +110,7 @@ faktor-hooks = { path = "crates/hooks" }
 faktor-pty = { path = "crates/pty" }
 faktor-winjob = { path = "crates/winjob" }
 faktor-terminal = { path = "crates/terminal" }
+faktor-browser = { path = "crates/browser" }
 faktor-mcp = { path = "crates/mcp" }
 faktor-lsp = { path = "crates/lsp" }
 faktor-index = { path = "crates/index" }
@@ -118,6 +125,7 @@ faktor-cli = { path = "crates/cli" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+async-trait = "0.1"
 tokio = { version = "1.53", features = ["full"] }
 thiserror = "2"
 tracing = "0.1"
@@ -127,6 +135,7 @@ blake3 = "1.8"
 zstd = "0.13"
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.9"
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 tempfile = "3"
 futures-util = "0.3"
 tower = "0.5"

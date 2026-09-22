@@ -20,6 +20,7 @@ use faktor_core::id::SessionId;
 use faktor_router::stability::TurnPrefix;
 use faktor_verify::exec::{BudgetDecision, CheckOutcome, CheckRunStatus};
 
+pub mod activation;
 pub mod credits;
 pub mod loop_detect;
 pub mod runtime;
@@ -28,6 +29,11 @@ pub mod tool;
 pub mod tool_json;
 pub mod wire_plan;
 
+pub use activation::{
+    acquire_source_phases, acquire_source_triggers, evaluate_triggers, PhaseMask,
+    ToolActivationSet, ToolExposure, ToolTrigger, TriggerVerdict, ACQUIRE_FLAG_OFF,
+    ACQUIRE_FLAG_ON, ACQUIRE_PRODUCT_URL_HOSTS, ACQUIRE_STRONG_SIGNALS, ACQUIRE_WEAK_SIGNALS,
+};
 pub use credits::{
     AttemptDebits, DebitDecision, DebitError, DebitHold, ProviderAttemptDebit,
     ProviderAttemptDebits, MAX_DEBIT_TEXT_BYTES,

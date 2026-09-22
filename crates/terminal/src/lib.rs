@@ -57,6 +57,47 @@ pub use faktor_core::command::{CommandSpec, ShellKind};
 /// a `DenyAll` spawn either isolates the child or fails closed typed.
 pub use faktor_core::command::NetworkIsolationRequirement;
 
+/// The daemon names a supervised Chromium child may inherit (values copied
+/// when set): executable resolution plus locale/timezone. Provider keys,
+/// tokens, API secrets, `FAKTOR_SERVER_PASSWORD` and proxy passwords are
+/// absent by construction (spec §9).
+pub const BROWSER_ENV_ALLOWLIST: &[&str] = &["PATH", "LANG", "LC_ALL", "TZ"];
+
+/// THE browser child environment authority (spec §9): an
+/// [`EnvSpec::Explicit`] built from [`BROWSER_ENV_ALLOWLIST`] (daemon values
+/// copied) plus the caller's exact entries (scratch HOME/TMPDIR/XDG dirs,
+/// proxy address). Every name — allowlisted or caller-supplied — is checked
+/// against the universal secret deny-set BEFORE spawn: a secret-shaped name
+/// is a typed refusal, never a silent drop, so a caller can never believe a
+/// value was applied while the deny-set stripped it. `EnvSpec::resolve`
+/// applies the deny-set again on the resolved view (defense in depth).
+pub fn browser_env_spec(
+    exact: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) -> Result<EnvSpec, Error> {
+    use std::ffi::{OsStr, OsString};
+    for name in BROWSER_ENV_ALLOWLIST {
+        if faktor_core::command::env_name_is_denied(OsStr::new(name)) {
+            return Err(Error::permission(format!(
+                "browser env allowlist names a denied variable: {name}"
+            )));
+        }
+    }
+    let mut entries: Vec<(OsString, OsString)> = BROWSER_ENV_ALLOWLIST
+        .iter()
+        .map(|name| (OsString::from(*name), OsString::new()))
+        .collect();
+    for (name, value) in exact {
+        if faktor_core::command::env_name_is_denied(&name) {
+            return Err(Error::permission(format!(
+                "browser env entry names a denied variable: {}",
+                name.to_string_lossy()
+            )));
+        }
+        entries.push((name, value));
+    }
+    Ok(EnvSpec::Explicit(entries))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessOwner {
     Session(SessionId),
@@ -65,6 +106,15 @@ pub enum ProcessOwner {
     /// touching the session's other children, so a session whose turn died
     /// mid-check can reap exactly its verification tree.
     Verification(SessionId),
+    /// One supervised Chromium child (faktor-browser, spec §9): scoped by
+    /// the connector `source` and the browser `profile` so one profile's
+    /// browser tree is separately killable (`kill_all_for`) without
+    /// touching any session/workspace child. `profile` is the validated
+    /// profile NAME (never a path); `source` is the connector's source id.
+    Browser {
+        source: String,
+        profile: String,
+    },
     /// One cold-evidence git/ripgrep child of the index crate's pre-Ready
     /// fallback provider (audit 14/26): separately killable so a session or
     /// workspace teardown never needs to reap (or spare) the whole
@@ -2155,6 +2205,50 @@ mod tests {
         #[cfg(not(unix))]
         {
             !ps_alive(pid)
+        }
+    }
+
+    /// The browser env allowlist path (spec §9): only the allowlisted daemon
+    /// names resolve (plus the universal `GIT_TERMINAL_PROMPT=0`), a
+    /// secret-shaped caller entry is a typed refusal (never a silent drop),
+    /// and the allowlist itself can never name a denied variable.
+    #[test]
+    fn browser_env_spec_is_allowlisted_and_refuses_denied_names() {
+        for name in BROWSER_ENV_ALLOWLIST {
+            assert!(
+                !faktor_core::command::env_name_is_denied(std::ffi::OsStr::new(name)),
+                "the browser allowlist must never name a denied variable: {name}"
+            );
+        }
+        std::env::set_var("KP_BROWSER_TEST_PATH", "/tmp/kp-browser-test-bin");
+        let spec = browser_env_spec(vec![(
+            "HOME".into(),
+            OsString::from("/tmp/kp-browser-test-home"),
+        )])
+        .unwrap();
+        let resolved = spec.resolve();
+        let names: Vec<String> = resolved
+            .iter()
+            .map(|(k, _)| k.to_string_lossy().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "PATH"), "{names:?}");
+        assert!(names.iter().any(|n| n == "HOME"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n == "KP_BROWSER_TEST_PATH"),
+            "a non-allowlisted daemon name must never resolve: {names:?}"
+        );
+        assert!(
+            resolved
+                .iter()
+                .any(|(k, v)| k == "HOME" && v == std::ffi::OsStr::new("/tmp/kp-browser-test-home")),
+            "the exact scratch HOME must win"
+        );
+        std::env::remove_var("KP_BROWSER_TEST_PATH");
+
+        for denied in ["OPENAI_API_KEY", "FAKTOR_SERVER_PASSWORD", "PROXY_PASSWORD"] {
+            let err = browser_env_spec(vec![(denied.into(), OsString::from("x"))])
+                .expect_err("a secret-shaped exact entry must be refused typed");
+            assert_eq!(err.kind, ErrorKind::Permission, "{err}");
         }
     }
 

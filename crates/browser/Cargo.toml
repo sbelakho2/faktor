@@ -1,0 +1,25 @@
+[package]
+name = "faktor-browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Faktor Browser authority: supervised Chromium/CDP, profiles, interception, egress broker. No site knowledge, no model dependencies."
+
+[dependencies]
+faktor-core.workspace = true
+faktor-terminal.workspace = true
+tokio.workspace = true
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+base64 = "0.22"
+uuid.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+faktor-cas.workspace = true

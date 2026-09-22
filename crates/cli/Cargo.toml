@@ -46,6 +46,9 @@ faktor-cloud.workspace = true
 faktor-worker.workspace = true
 faktor-updater.workspace = true
 faktor-scm.workspace = true
+faktor-commerce.workspace = true
+faktor-commerce-connectors.workspace = true
+faktor-browser.workspace = true
 async-trait = "0.1"
 futures.workspace = true
 clap = { version = "4", features = ["derive"] }

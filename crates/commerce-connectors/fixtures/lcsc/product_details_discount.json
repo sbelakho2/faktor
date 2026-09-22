@@ -1,0 +1,30 @@
+{
+  "code": 200,
+  "result": {
+    "totalCount": 1,
+    "productList": [
+      {
+        "productCode": "C89642",
+        "productModel": "STM32F407VGT6",
+        "brandNameEn": "STMicroelectronics",
+        "productDescEn": "ARM Microcontrollers - MCU 32BIT 1MB FLASH 100LQFP",
+        "stockNumber": 4321,
+        "minBuyNumber": 1,
+        "standardPack": 540,
+        "packingType": "Tray",
+        "leadTime": "5 Days",
+        "productStatus": "Active",
+        "productUrl": "https://www.lcsc.com/product-detail/C89642.html",
+        "currencyCode": "USD",
+        "productPriceList": [
+          { "ladder": 1, "productPrice": "12.3400", "currencyCode": "USD" },
+          { "ladder": 10, "productPrice": "10.9900", "currencyCode": "USD" },
+          { "ladder": 100, "productPrice": "9.8700", "currencyCode": "USD" }
+        ],
+        "productDiscountPriceList": [
+          { "ladder": 100, "productPrice": "9.5000", "currencyCode": "USD" }
+        ]
+      }
+    ]
+  }
+}

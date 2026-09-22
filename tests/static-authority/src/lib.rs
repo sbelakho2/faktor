@@ -1380,6 +1380,11 @@ mod scans {
                 // fallback (env-var hook registry / crate-level tests): an
                 // ephemeral per-process supervisor, documented in place.
                 ("crates/terminal/src/lib.rs", 1),
+                // Faktor Acquire `commerce login` (docs/acquire.md §14): the
+                // LOCAL admin command opens the headed dedicated profile
+                // browser through a short-lived supervisor over its own CAS.
+                // Never a model tool, never the daemon's model environment.
+                ("crates/cli/src/tools_market.rs", 1),
             ],
         ),
     ];
@@ -3047,5 +3052,535 @@ fn prod_only() {}
             "//! stable_list_digest is retired here\nconst X: &str = \"fnv1a\";\n",
         );
         assert!(authority_digest_offenders("crates/memory/src/lib.rs", &doc).is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // scan 9: Faktor Acquire commerce-path static authority
+    // (`docs/acquire.md` §2/§3/§16)
+    //
+    //  * the commerce-path crates, and every workspace crate their NORMAL
+    //    dependency closure reaches, must contain no model reasoning
+    //    runtime, no model router and no model adapter;
+    //  * no commerce-path production source may build an HTTP client or
+    //    spawn any child process (HTTP is an injected checked transport,
+    //    Chromium is a supervised child in `faktor-browser`);
+    //  * no literal Chromium/Chrome binary may be spawned from a
+    //    `Command::new` anywhere in production;
+    //  * no floating-point type may appear on a price-bearing commerce
+    //    source (the `visit_f64`/`visit_f32` rejection guards are the one
+    //    allowed mention).
+    // ------------------------------------------------------------------
+
+    /// The commerce-path crates whose transitive NORMAL dependency closure
+    /// is certified model-free (spec §2/§3).
+    const COMMERCE_PATH_CRATES: &[&str] = &[
+        "faktor-acquire",
+        "faktor-commerce",
+        "faktor-commerce-connectors",
+        "faktor-browser",
+    ];
+
+    /// Model execution, routing and adapter crates that must never be
+    /// reachable (directly or transitively) from a commerce path (spec §2).
+    const COMMERCE_FORBIDDEN_DEPS: &[&str] = &[
+        "faktor-agent",
+        "faktor-router",
+        "faktor-gateway",
+        "faktor-ollama",
+        "faktor-deepseek",
+        "faktor-openai",
+        "faktor-anthropic",
+        "faktor-google",
+    ];
+
+    /// The cli file that carries the `source_market` gateway and the money
+    /// decimal serialization: it is a commerce path too.
+    const COMMERCE_TOOL_GATEWAY: &str = "crates/cli/src/tools_market.rs";
+
+    /// Quoted strings inside a manifest fragment.
+    fn manifest_quoted_strings(src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = src;
+        while let Some(start) = rest.find('"') {
+            let after = &rest[start + 1..];
+            let Some(end) = after.find('"') else {
+                break;
+            };
+            out.push(after[..end].to_string());
+            rest = &after[end + 1..];
+        }
+        out
+    }
+
+    /// Comment-stripped manifest line body (Cargo.toml `#` comments).
+    fn manifest_body(raw: &str) -> &str {
+        raw.split('#').next().unwrap_or(raw)
+    }
+
+    /// The `members = [ ... ]` array of the workspace root manifest.
+    fn workspace_members(src: &str) -> Vec<String> {
+        let Some(at) = src.find("members") else {
+            return Vec::new();
+        };
+        let rest = &src[at..];
+        let Some(open) = rest.find('[') else {
+            return Vec::new();
+        };
+        let body = &rest[open + 1..];
+        let Some(close) = body.find(']') else {
+            return Vec::new();
+        };
+        manifest_quoted_strings(&body[..close])
+    }
+
+    /// The `[package] name = "..."` of one crate manifest.
+    fn manifest_package_name(src: &str) -> Option<String> {
+        let mut in_package = false;
+        for raw in src.lines() {
+            let line = manifest_body(raw).trim();
+            if line.starts_with('[') {
+                in_package = line == "[package]";
+                continue;
+            }
+            if !in_package {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("name") {
+                let rest = rest.trim_start();
+                if let Some(rest) = rest.strip_prefix('=') {
+                    return manifest_quoted_strings(rest).into_iter().next();
+                }
+            }
+        }
+        None
+    }
+
+    /// One dependency edge parsed from a crate manifest.
+    struct ManifestDep {
+        /// The dependency target: the `package = "..."` rename when
+        /// present, else the dependency key.
+        target: String,
+        /// The `path = "..."` value when the dependency is path-based.
+        path: Option<String>,
+        /// True when the rename was explicit (`package = "..."`), so a
+        /// path lookup must not override it.
+        renamed: bool,
+        /// True when the entry came from a `dev-dependencies` table.
+        dev: bool,
+    }
+
+    /// Parse every dependency-table entry of one crate manifest. Sections
+    /// `[dependencies]`, `[build-dependencies]`, `[target.<cfg>.dependencies]`
+    /// (and their `dev-dependencies` variants, marked) are recognized; a
+    /// comment mention or a `[package]`/other table entry never counts.
+    fn manifest_deps(src: &str) -> Vec<ManifestDep> {
+        let mut out = Vec::new();
+        let mut section = String::new();
+        for raw in src.lines() {
+            let line = manifest_body(raw).trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('[') {
+                section = line
+                    .trim_matches(|c| c == '[' || c == ']')
+                    .trim()
+                    .to_string();
+                continue;
+            }
+            let parts: Vec<&str> = section.split('.').collect();
+            let last = parts.last().copied().unwrap_or("");
+            if last != "dependencies" && last != "build-dependencies" && last != "dev-dependencies"
+            {
+                continue;
+            }
+            let dev = last == "dev-dependencies" || parts.contains(&"dev-dependencies");
+            let Some(eq) = line.find('=') else {
+                continue;
+            };
+            let key = line[..eq].trim().trim_matches('"');
+            // `faktor-core.workspace = true` names the dependency before the
+            // first dot.
+            let key = key.split('.').next().unwrap_or(key);
+            let value = &line[eq + 1..];
+            let mut renamed = false;
+            let mut target = key.to_string();
+            for entry in value.split(',') {
+                let entry = entry.trim().trim_matches(|c| c == '{' || c == '}').trim();
+                if let Some(rest) = entry.strip_prefix("package") {
+                    let rest = rest.trim_start();
+                    if let Some(rest) = rest.strip_prefix('=') {
+                        if let Some(name) = manifest_quoted_strings(rest).into_iter().next() {
+                            target = name;
+                            renamed = true;
+                        }
+                    }
+                }
+            }
+            let mut path = None;
+            for entry in value.split(',') {
+                let entry = entry.trim().trim_matches(|c| c == '{' || c == '}').trim();
+                if let Some(rest) = entry.strip_prefix("path") {
+                    let rest = rest.trim_start();
+                    if let Some(rest) = rest.strip_prefix('=') {
+                        path = manifest_quoted_strings(rest).into_iter().next();
+                    }
+                }
+            }
+            out.push(ManifestDep {
+                target,
+                path,
+                renamed,
+                dev,
+            });
+        }
+        out
+    }
+
+    /// `(offender chains, visited crates)` for the commerce-path dependency
+    /// closure. A forbidden crate anywhere in the closure is reported with
+    /// the full path that reached it.
+    fn commerce_dependency_offenders() -> (Vec<String>, usize) {
+        let root = repo_root();
+        let root_src =
+            std::fs::read_to_string(root.join("Cargo.toml")).expect("root Cargo.toml readable");
+        let members = workspace_members(&root_src);
+        assert!(!members.is_empty(), "workspace members list parsed");
+        let mut packages: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for member in &members {
+            let dir = root.join(member);
+            let manifest = dir.join("Cargo.toml");
+            let src = std::fs::read_to_string(&manifest)
+                .unwrap_or_else(|e| panic!("{} unreadable: {e}", manifest.display()));
+            let name = manifest_package_name(&src)
+                .unwrap_or_else(|| panic!("{} has no [package] name", manifest.display()));
+            let deps = manifest_deps(&src)
+                .into_iter()
+                .filter(|dep| !dep.dev)
+                .map(|dep| {
+                    if dep.renamed {
+                        return dep.target;
+                    }
+                    if let Some(path) = &dep.path {
+                        let path_manifest = dir.join(path).join("Cargo.toml");
+                        if let Ok(path_src) = std::fs::read_to_string(&path_manifest) {
+                            if let Some(path_name) = manifest_package_name(&path_src) {
+                                return path_name;
+                            }
+                        }
+                    }
+                    dep.target
+                })
+                .collect();
+            packages.insert(name, deps);
+        }
+        for crate_name in COMMERCE_PATH_CRATES {
+            assert!(
+                packages.contains_key(*crate_name),
+                "commerce-path crate {crate_name} is not a workspace member; the closure \
+                 would silently certify nothing"
+            );
+        }
+        let mut offenders = Vec::new();
+        let mut visited: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut queue: std::collections::VecDeque<(String, Vec<String>)> = COMMERCE_PATH_CRATES
+            .iter()
+            .map(|c| (c.to_string(), vec![c.to_string()]))
+            .collect();
+        while let Some((crate_name, chain)) = queue.pop_front() {
+            if !visited.insert(crate_name.clone()) {
+                continue;
+            }
+            let Some(deps) = packages.get(&crate_name) else {
+                continue; // external dependency: not a workspace member
+            };
+            for dep in deps {
+                let mut next = chain.clone();
+                next.push(dep.clone());
+                if COMMERCE_FORBIDDEN_DEPS.contains(&dep.as_str()) {
+                    offenders.push(next.join(" -> "));
+                    continue;
+                }
+                queue.push_back((dep.clone(), next));
+            }
+        }
+        // The parse must have walked a real graph: every commerce path
+        // reaches `faktor-core`, and the acquire engine reaches
+        // `faktor-provider`.
+        assert!(
+            visited.contains("faktor-core") && visited.contains("faktor-provider"),
+            "commerce dependency closure walked nothing (parser failure): {visited:?}"
+        );
+        (offenders, visited.len())
+    }
+
+    #[test]
+    fn commerce_dependency_closure_never_reaches_model_execution_or_adapters() {
+        let (offenders, visited) = commerce_dependency_offenders();
+        assert!(
+            visited >= 10,
+            "commerce dependency closure suspiciously small: {visited} crates"
+        );
+        assert!(
+            offenders.is_empty(),
+            "commerce dependency authority violations (a model execution/adapter crate is \
+             reachable through normal dependencies):\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn manifest_dependency_parser_is_rename_section_and_path_aware() {
+        let src = r#"
+[package]
+name = "faktor-commerce"
+
+[dependencies]
+faktor-core.workspace = true
+serde = { version = "1", features = ["derive"] }
+sneaky = { package = "faktor-agent", path = "../agent" }
+client = { path = "../provider" }
+
+[dev-dependencies]
+faktor-openai.workspace = true
+tokio = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+faktor-router = { path = "../router" }
+
+[target.'cfg(unix)'.dev-dependencies]
+faktor-ollama = { path = "../ollama" }
+
+# faktor-google = { path = "../google" }
+"#;
+        let deps = manifest_deps(src);
+        let normal: Vec<&str> = deps
+            .iter()
+            .filter(|d| !d.dev)
+            .map(|d| d.target.as_str())
+            .collect();
+        assert_eq!(
+            normal,
+            vec![
+                "faktor-core",
+                "serde",
+                "faktor-agent",
+                "client",
+                "faktor-router"
+            ]
+        );
+        let dev: Vec<&str> = deps
+            .iter()
+            .filter(|d| d.dev)
+            .map(|d| d.target.as_str())
+            .collect();
+        assert_eq!(dev, vec!["faktor-openai", "tokio", "faktor-ollama"]);
+        let renamed = deps
+            .iter()
+            .find(|d| d.target == "faktor-agent")
+            .expect("rename parsed");
+        assert!(renamed.renamed && renamed.path.as_deref() == Some("../agent"));
+        assert_eq!(
+            manifest_package_name(src).as_deref(),
+            Some("faktor-commerce")
+        );
+        assert_eq!(
+            workspace_members("members = [\n  \"crates/a\",\n  \"crates/b\",\n]"),
+            vec!["crates/a", "crates/b"]
+        );
+        assert!(manifest_deps("# faktor-agent = { path = \"../agent\" }\n").is_empty());
+        assert!(manifest_deps("names = \"faktor-agent\"\n").is_empty());
+    }
+
+    /// Commerce-path production sources that must never construct an HTTP
+    /// client or spawn a child process of their own.
+    const COMMERCE_PATH_PROCESS_MARKERS: &[&str] = &[
+        "reqwest::Client::new",
+        "reqwest::Client::builder",
+        "Command::new(",
+    ];
+
+    fn is_commerce_path_source(rel: &str) -> bool {
+        let rel = normalize_rel(rel);
+        rel == COMMERCE_TOOL_GATEWAY
+            || rel.starts_with("crates/acquire/src/")
+            || rel.starts_with("crates/commerce/src/")
+            || rel.starts_with("crates/commerce-connectors/src/")
+            || rel.starts_with("crates/browser/src/")
+    }
+
+    #[test]
+    fn commerce_paths_never_build_clients_or_spawn_children() {
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for rel in walk_crate_sources() {
+            if !is_commerce_path_source(&rel) || is_test_file(&rel) {
+                continue;
+            }
+            let Some(f) = load(&rel) else {
+                continue;
+            };
+            scanned += 1;
+            for (line, text) in find_markers(&f, COMMERCE_PATH_PROCESS_MARKERS) {
+                offenders.push(format!(
+                    "{rel}:{line}: {text}  [commerce production source; HTTP goes through \
+                     the injected checked transport, children through the ProcessSupervisor]"
+                ));
+            }
+        }
+        assert_no_offenders("commerce-path client/child scan", &offenders, scanned, 40);
+    }
+
+    /// A chrome-like literal argument of any `Command::new` in production.
+    fn chromium_literal_offenders(rel: &str, f: &File<'_>) -> Vec<String> {
+        let mut offenders = Vec::new();
+        for at in find_marker_offsets(f, "Command::new(") {
+            let rest = &f.src[at + "Command::new(".len()..];
+            let rest = rest.trim_start();
+            if !rest.starts_with('"') {
+                continue;
+            }
+            let after = &rest[1..];
+            let Some(end) = after.find('"') else {
+                continue;
+            };
+            let literal = after[..end].to_ascii_lowercase();
+            if literal.contains("chrom") || literal.contains("chrome") || literal.contains("webkit")
+            {
+                offenders.push(format!(
+                    "{}:{}: literal browser binary {literal:?} spawned by Command::new; \
+                     Chromium launches only through the supervised browser authority",
+                    rel,
+                    line_of(f.src, at)
+                ));
+            }
+        }
+        offenders
+    }
+
+    #[test]
+    fn no_literal_browser_binary_is_ever_spawned() {
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        let mut browser_launch_seen = false;
+        for rel in walk_crate_sources() {
+            if is_test_file(&rel) {
+                continue;
+            }
+            let Some(f) = load(&rel) else {
+                continue;
+            };
+            scanned += 1;
+            if rel == "crates/browser/src/launch.rs" {
+                browser_launch_seen = !find_markers(&f, &["spawn_detached_with_pipes"]).is_empty();
+            }
+            offenders.extend(chromium_literal_offenders(&rel, &f));
+        }
+        assert!(
+            browser_launch_seen,
+            "crates/browser/src/launch.rs no longer launches through the supervisor; the \
+             chromium-literal scan needs re-audit"
+        );
+        assert_no_offenders(
+            "literal browser-binary spawn scan",
+            &offenders,
+            scanned,
+            100,
+        );
+    }
+
+    /// Floating-point markers that must not appear on a price-bearing
+    /// commerce source. The serde `visit_f64`/`visit_f32` rejection
+    /// signatures are guards that REFUSE floating input, not price paths,
+    /// and are the only allowed mention.
+    const COMMERCE_FLOAT_MARKERS: &[&str] = &[
+        "f64",
+        "f32",
+        "powf(",
+        "is_nan(",
+        "is_finite(",
+        "to_bits(",
+        "from_bits(",
+        "EPSILON",
+        "NAN",
+        "INFINITY",
+    ];
+
+    fn commerce_float_offenders(rel: &str, f: &File<'_>) -> Vec<String> {
+        find_markers(f, COMMERCE_FLOAT_MARKERS)
+            .into_iter()
+            .filter(|(_, text)| {
+                let trimmed = text.trim_start();
+                !(trimmed.starts_with("fn visit_f64") || trimmed.starts_with("fn visit_f32"))
+            })
+            .map(|(line, text)| {
+                format!("{rel}:{line}: {text}  [floating-point type on a commerce path]")
+            })
+            .collect()
+    }
+
+    fn is_commerce_price_source(rel: &str) -> bool {
+        let rel = normalize_rel(rel);
+        rel == COMMERCE_TOOL_GATEWAY
+            || rel.starts_with("crates/acquire/src/")
+            || rel.starts_with("crates/commerce/src/")
+            || rel.starts_with("crates/commerce-connectors/src/")
+    }
+
+    #[test]
+    fn commerce_price_paths_never_mention_a_floating_type() {
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        let mut guards = 0usize;
+        for rel in walk_crate_sources() {
+            if !is_commerce_price_source(&rel) || is_test_file(&rel) {
+                continue;
+            }
+            let Some(f) = load(&rel) else {
+                continue;
+            };
+            scanned += 1;
+            for (_, text) in find_markers(&f, COMMERCE_FLOAT_MARKERS) {
+                let trimmed = text.trim_start();
+                if trimmed.starts_with("fn visit_f64") || trimmed.starts_with("fn visit_f32") {
+                    guards += 1;
+                }
+            }
+            offenders.extend(commerce_float_offenders(&rel, &f));
+        }
+        assert!(
+            guards >= 1,
+            "the serde floating-rejection guards vanished; the allowlist is stale"
+        );
+        assert_no_offenders("commerce exact-money scan", &offenders, scanned, 40);
+    }
+
+    #[test]
+    fn commerce_float_scan_detects_planted_floating_money() {
+        let planted = synthetic_file(
+            "crates/commerce/src/money.rs",
+            "fn total(price: f64) -> f64 { price * 1.0 }\n",
+        );
+        // Both floating types sit on the same line and the scan reports the
+        // offending LINE (deduplicated), so one violation is expected.
+        assert_eq!(
+            commerce_float_offenders("crates/commerce/src/money.rs", &planted).len(),
+            1,
+            "the planted floating money line must be reported"
+        );
+        let guard = synthetic_file(
+            "crates/commerce/src/money.rs",
+            "fn visit_f64<E: de::Error>(self, _value: f64) -> Result<Self::Value, E> {\n    Err(E::custom(\"no floats\"))\n}\n",
+        );
+        assert!(
+            commerce_float_offenders("crates/commerce/src/money.rs", &guard).is_empty(),
+            "the floating-input rejection guard is the one allowed mention"
+        );
+        let comment = synthetic_file(
+            "crates/commerce/src/money.rs",
+            "// exact money only: no f64 anywhere\n",
+        );
+        assert!(commerce_float_offenders("crates/commerce/src/money.rs", &comment).is_empty());
     }
 }
