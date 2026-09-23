@@ -44,6 +44,9 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+
 use faktor_core::error::Error;
 
 use crate::guardian::{GuardianHandle, ProcessIdentity, TerminalLedger};
@@ -67,6 +70,24 @@ pub struct Pty {
     /// Durable reconciliation row opened by [`Pty::spawn_recorded`]:
     /// `(ledger, row id)`, marked reaped once the group is gone.
     ledger: Option<(Arc<TerminalLedger>, String)>,
+    /// Set by the reader/reaper thread the instant `waitpid` consumed the
+    /// child (or proved it is no longer ours). From then on the recorded pid
+    /// may be recycled by the kernel at any moment, so NO teardown path may
+    /// ever signal it again — a stale signal could hit an unrelated process
+    /// group that inherited the recycled pid.
+    reaped: Arc<AtomicBool>,
+    /// Serializes the teardown's `[check reaped → signal]` pair against the
+    /// reader's `[waitpid → set reaped]` pair. The kernel cannot recycle a
+    /// pid before its parent reaps it, and this Pty's reader is the single
+    /// reaper, so a signal sent while holding this lock with `reaped ==
+    /// false` can only reach this Pty's own live (or zombie) group.
+    reap_serial: Arc<Mutex<()>>,
+    /// Test-only fault-injection counter: how many group signals this Pty
+    /// actually attempted. The adversarial teardown tests prove the counter
+    /// stays frozen once the child was reaped; it never exists in production
+    /// builds.
+    #[cfg(test)]
+    signal_attempts: Arc<AtomicU64>,
 }
 
 /// The optional durable-ledger plan of one spawn (see
@@ -211,10 +232,14 @@ impl Pty {
         //    the few syscalls between them.
         let shared = Arc::new((Mutex::new(Ring::new()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let reaped = Arc::new(AtomicBool::new(false));
+        let reap_serial = Arc::new(Mutex::new(()));
         let (tx, rx) = std::sync::mpsc::channel::<Result<ChildSpawn, Error>>();
         let reader = {
             let shared = shared.clone();
             let stop = stop.clone();
+            let reaped = reaped.clone();
+            let reap_serial = reap_serial.clone();
             let cfg = cfg.clone();
             std::thread::spawn(move || {
                 let spawned = match spawn_child(&cfg, slave_fd, ledger_plan) {
@@ -226,7 +251,7 @@ impl Pty {
                 };
                 let pid = spawned.pid;
                 let _ = tx.send(Ok(spawned));
-                reader_loop(reader_master, pid, shared, stop);
+                reader_loop(reader_master, pid, shared, stop, reaped, reap_serial);
             })
         };
         let spawned = match rx.recv() {
@@ -249,6 +274,10 @@ impl Pty {
             reader: Some(reader),
             guardian: Some(spawned.guardian),
             ledger: spawned.ledger,
+            reaped,
+            reap_serial,
+            #[cfg(test)]
+            signal_attempts: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -389,14 +418,55 @@ impl Pty {
         r == 0
     }
 
+    /// Test-only fault-injection counter: how many group signals this Pty
+    /// attempted so far (see [`Self::signal_group`]).
+    #[cfg(test)]
+    fn signal_attempts(&self) -> u64 {
+        self.signal_attempts.load(Ordering::SeqCst)
+    }
+
+    /// Signal the recorded process group, but ONLY while this Pty's child is
+    /// provably unreaped. Once the single reader/reaper consumed the child
+    /// the kernel may recycle the pid at any moment, so a stale signal would
+    /// be able to hit an unrelated process group — the exact load-dependent
+    /// pid-reuse hazard under a spawning storm. Holding [`Self::reap_serial`]
+    /// across the `reaped` check and the `kill` makes the pair atomic
+    /// against the reader's `waitpid`, and the kernel cannot recycle a pid
+    /// before its parent reaps it — so a signal sent here can only ever
+    /// reach this Pty's own live (or zombie) group. Returns whether a signal
+    /// was actually attempted.
+    fn signal_group(&self, signal: libc::c_int) -> bool {
+        if self.pid <= 0 {
+            return false;
+        }
+        let _serial = self
+            .reap_serial
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.reaped.load(Ordering::SeqCst) {
+            return false;
+        }
+        #[cfg(test)]
+        self.signal_attempts.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: `self.pid` is the group leader of this Pty's `setsid`
+        // child (pids fit `pid_t`), so the negative id addresses exactly that
+        // process group, and the reap serial + `reaped` check guarantee the
+        // pid was not recycled before the signal.
+        unsafe {
+            libc::kill(-self.pid, signal);
+        }
+        true
+    }
+
     /// Graceful shutdown: SIGTERM the process group, a short grace period,
     /// SIGKILL, then join the reader/reaper thread (bounded). This is the
-    /// normal lifecycle for live objects; [`Drop`] is the emergency path.
+    /// normal lifecycle for live objects; [`Drop`] is the emergency path. A
+    /// child that was already reaped is never signalled again (only the
+    /// guardian's identity-verified release may still adjudicate surviving
+    /// descendants).
     pub fn shutdown(&mut self) {
         if self.pid > 0 {
-            unsafe {
-                libc::kill(-self.pid, libc::SIGTERM);
-            }
+            self.signal_group(libc::SIGTERM);
             // Give the group a short grace, watching for exit.
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
             loop {
@@ -408,11 +478,7 @@ impl Pty {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            if self.is_alive() {
-                unsafe {
-                    libc::kill(-self.pid, libc::SIGKILL);
-                }
-            }
+            self.signal_group(libc::SIGKILL);
         }
         self.settle();
     }
@@ -456,13 +522,12 @@ impl Drop for Pty {
     /// Emergency failsafe ONLY: immediate SIGKILL of the group (no grace
     /// sleep on the caller's thread) then reap + deliberate guardian
     /// release. Live objects should use [`Pty::shutdown`] for the graceful
-    /// SIGTERM path.
+    /// SIGTERM path. A child that was already reaped is never signalled
+    /// again: its pid may have been recycled, and the guardian release
+    /// (identity-verified) remains the authority for any surviving
+    /// descendants.
     fn drop(&mut self) {
-        if self.pid > 0 {
-            unsafe {
-                libc::kill(-self.pid, libc::SIGKILL);
-            }
-        }
+        self.signal_group(libc::SIGKILL);
         self.settle();
     }
 }
@@ -583,14 +648,65 @@ fn reap_blocking(pid: libc::pid_t) {
     let _ = unsafe { libc::waitpid(pid, &mut status, 0) };
 }
 
+/// Test-only fault-injection seam for the reap/reap-publication window. The
+/// reader invokes the hook registered for its child pid while holding the
+/// reap serial, AFTER `waitpid` consumed the child and BEFORE the `reaped`
+/// flag is published. A test can therefore pin the exact dangerous
+/// interleaving open — "the child is reaped (its pid is now recyclable) but a
+/// teardown has not yet observed it" — and prove a concurrent teardown can
+/// neither signal through the stale pid nor hang. Never compiled into
+/// production builds.
+#[cfg(test)]
+pub(crate) mod reap_injection {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    static HOOKS: OnceLock<Mutex<HashMap<i32, Hook>>> = OnceLock::new();
+
+    fn hooks() -> &'static Mutex<HashMap<i32, Hook>> {
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(crate) fn register(pid: i32, hook: Hook) {
+        hooks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(pid, hook);
+    }
+
+    pub(crate) fn clear(pid: i32) {
+        hooks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&pid);
+    }
+
+    pub(crate) fn fire(pid: i32) {
+        let hook = hooks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&pid);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 /// The reader + single reaper loop: blocking reads into the bounded ring,
 /// then exactly one waitpid for the child. Owns its private blocking master
-/// duplicate (closed when this returns, on every path).
+/// duplicate (closed when this returns, on every path). The `[waitpid → set
+/// reaped]` pair runs under the shared reap serial so a teardown's `[check
+/// reaped → signal]` can never interleave between the reap and the state
+/// observation: once `reaped` is set, no signal is ever sent again.
 fn reader_loop(
     mfd: OwnedFd,
     pid: libc::pid_t,
     shared: Arc<(Mutex<Ring>, Condvar)>,
     stop: Arc<AtomicBool>,
+    reaped: Arc<AtomicBool>,
+    reap_serial: Arc<Mutex<()>>,
 ) {
     let mfd_raw = mfd.as_raw_fd();
     let mut buf = [0u8; 8192];
@@ -617,7 +733,25 @@ fn reader_loop(
     // final blocking wait (the group is being SIGKILLed).
     loop {
         let mut status = 0;
-        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        let r = {
+            let _serial = reap_serial
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if r == pid
+                || (r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+            {
+                #[cfg(test)]
+                reap_injection::fire(pid);
+                // The child is consumed (or provably not ours): its pid may
+                // now be recycled, so every subsequent teardown signal must
+                // be suppressed. Published inside the serial so a teardown
+                // can never observe a stale `reaped == false` after this
+                // point.
+                reaped.store(true, Ordering::SeqCst);
+            }
+            r
+        };
         if r == pid {
             break;
         }
@@ -625,7 +759,13 @@ fn reader_loop(
             break;
         }
         if stop.load(Ordering::SeqCst) {
+            let _serial = reap_serial
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             reap_blocking(pid);
+            #[cfg(test)]
+            reap_injection::fire(pid);
+            reaped.store(true, Ordering::SeqCst);
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -653,6 +793,12 @@ mod tests {
 
     fn group_alive(pid: libc::pid_t) -> bool {
         (unsafe { libc::kill(pid, 0) }) == 0
+    }
+
+    /// Does the recorded process GROUP still have a member (the leader's own
+    /// pid may already be reaped)? Negative-pid probe.
+    fn group_exists(pgid: libc::pid_t) -> bool {
+        (unsafe { libc::kill(-pgid, 0) }) == 0
     }
 
     #[test]
@@ -765,6 +911,183 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         pty.kill();
+    }
+
+    /// Wait until `pid` is provably reaped (ESRCH): only then can the kernel
+    /// recycle it, so only then is a remaining signal a pid-reuse hazard.
+    fn wait_reaped(pid: libc::pid_t, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let r = unsafe { libc::kill(pid, 0) };
+            if r != 0 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                assert_eq!(
+                    errno,
+                    libc::ESRCH,
+                    "{what}: pid {pid} must be reaped (ESRCH), not {errno}"
+                );
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: the single reader/reaper must consume the exited child"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Wait until the recorded process group is fully gone.
+    fn wait_group_gone(pid: libc::pid_t, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while group_alive(pid) || group_exists(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: group {pid} must be gone"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// ADVERSARIAL PID-REUSE BOUNDARY (deterministic fault injection): the
+    /// dangerous order is "the reader reaped the child first, then a teardown
+    /// ran" — at that instant the kernel may have recycled the pid, so ANY
+    /// signal would be able to hit an unrelated group. Both the graceful
+    /// shutdown path and the emergency Drop decision (the same
+    /// `signal_group(SIGKILL)` Drop calls) must be no-ops after the reap.
+    #[test]
+    fn teardown_after_reap_never_signals_the_stale_pid() {
+        let mut pty = Pty::spawn(&sh_cfg("exit 0")).unwrap();
+        let pid = pty.pid() as libc::pid_t;
+        wait_reaped(pid, "teardown-after-reap fixture");
+        let before = pty.signal_attempts();
+        pty.shutdown();
+        assert_eq!(
+            pty.signal_attempts(),
+            before,
+            "shutdown must never signal a reaped child (pid {pid} is recyclable)"
+        );
+        // The exact decision Drop makes: still nothing after a second
+        // teardown and after the explicit emergency signal.
+        pty.signal_group(libc::SIGKILL);
+        assert_eq!(
+            pty.signal_attempts(),
+            before,
+            "the emergency Drop signal must be suppressed after the reap too"
+        );
+        pty.shutdown();
+        assert_eq!(pty.signal_attempts(), before, "idempotent teardown");
+    }
+
+    /// The normal order still works: an unreaped live child is signalled and
+    /// its whole group is taken by the teardown.
+    #[test]
+    fn teardown_before_reap_still_signals_and_kills_the_group() {
+        let mut pty = Pty::spawn(&sh_cfg("sleep 300")).unwrap();
+        let pid = pty.pid() as libc::pid_t;
+        assert!(pty.is_alive(), "fixture child must be live");
+        let before = pty.signal_attempts();
+        pty.shutdown();
+        assert!(
+            pty.signal_attempts() > before,
+            "an unreaped live child must be signalled"
+        );
+        wait_reaped(pid, "live teardown fixture");
+        wait_group_gone(pid, "live teardown fixture");
+    }
+
+    /// ADVERSARIAL: the reader reaps the leader (pid now recyclable) while a
+    /// detached descendant keeps the process group alive. The teardown must
+    /// NOT signal through the stale leader pid, yet the descendant must not
+    /// leak either: the identity-verified guardian release adjudicates the
+    /// surviving group after the reap.
+    #[test]
+    fn reaped_leader_with_surviving_descendants_is_cleaned_without_a_stale_signal() {
+        // `nohup` (with a grace delay so its SIG_IGN lands before the leader
+        // exits) keeps the detached descendant alive across the session
+        // leader's exit, which otherwise HUPs the foreground group.
+        let cfg = sh_cfg("nohup sleep 300 </dev/null >/dev/null 2>&1 & sleep 1; exit 0");
+        let mut pty = Pty::spawn(&cfg).unwrap();
+        let pid = pty.pid() as libc::pid_t;
+        wait_reaped(pid, "descendant fixture leader");
+        assert!(
+            group_exists(pid),
+            "the detached descendant must keep the group alive"
+        );
+        let before = pty.signal_attempts();
+        pty.shutdown();
+        assert_eq!(
+            pty.signal_attempts(),
+            before,
+            "no signal may be sent through a reaped leader's pid"
+        );
+        wait_group_gone(pid, "guardian release after a reaped leader");
+    }
+
+    /// ADVERSARIAL INTERLEAVING (deterministic fault injection): pin the
+    /// reader inside its `[waitpid consumed the child → publish reaped]`
+    /// window — the exact instant the pid becomes recyclable — and start a
+    /// teardown. The teardown must block on the reap serial, must not signal
+    /// through the stale pid, and must complete promptly once the reap is
+    /// published.
+    #[test]
+    fn teardown_cannot_signal_inside_the_reap_publication_window() {
+        // The child lives until we let it exit; the hook fires in the reader
+        // after waitpid consumed it.
+        let pty = Arc::new(Mutex::new(
+            Pty::spawn(&sh_cfg("sleep 0.3; exit 0")).unwrap(),
+        ));
+        let (pid, attempts) = {
+            let guard = pty.lock().unwrap();
+            (
+                guard.pid() as libc::pid_t,
+                Arc::clone(&guard.signal_attempts),
+            )
+        };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        reap_injection::register(
+            pid,
+            Arc::new(move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv();
+            }),
+        );
+        // The child exits on its own; wait until the reader is pinned INSIDE
+        // the `[waitpid → publish]` window (holding the reap serial) before
+        // the teardown starts, so the teardown can only ever observe the
+        // window, never a pre-reap state.
+        assert!(
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
+            "the reader must reach the reap-publication window"
+        );
+        let teardown = {
+            let pty = Arc::clone(&pty);
+            std::thread::spawn(move || pty.lock().unwrap().shutdown())
+        };
+        // The teardown is inside `signal_group` waiting on the reap serial:
+        // it must not have attempted any signal for the reaped pid.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "a teardown blocked on the reap window must not signal the stale pid"
+        );
+        // Publish the reap: the teardown must observe it and skip the signal.
+        release_tx.send(()).unwrap();
+        teardown.join().unwrap();
+        reap_injection::clear(pid);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "no signal may be attempted once the reap is published"
+        );
+        wait_reaped(pid, "reap-window fixture");
     }
 
     #[test]

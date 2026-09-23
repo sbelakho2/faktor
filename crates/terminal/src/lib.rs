@@ -30,6 +30,17 @@
 //! child. [`ProcessSupervisor::run_sync`] gives synchronous callers (the
 //! hook lifecycle) the same deadline/group-kill/bounded-head semantics as
 //! [`ProcessSupervisor::run`] without a tokio context.
+//!
+//! Pid-reuse discipline (the terminal twin of faktor-pty's guarded
+//! `signal_group`): every child has exactly one reaper, and that reaper
+//! publishes the reap under a per-child serial the instant `wait` consumed
+//! the child. From then on the kernel may recycle the pid, so every kill
+//! path holds the same serial across its `[observe reaped → signal]` pair
+//! and only ever signals while the child is provably unreaped — or, for the
+//! one deliberate descendant-cleanup case, while the owned group provably
+//! still has a live member (see [`AfterReap`]). Reap, Drop and kill are
+//! mutually exclusive through that serial, so no signal can be issued after
+//! a `wait` consumed the child and no signal can race a concurrent kill.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
@@ -38,6 +49,9 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+#[cfg(all(test, unix))]
+use std::sync::atomic::AtomicU64;
 
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::error::Error;
@@ -478,6 +492,11 @@ struct ChildState {
     owner: ProcessOwner,
     started_ms: i64,
     exited: Option<Option<i32>>,
+    /// The per-child reap/signal serial ([`ReapState`]): the single reaper
+    /// publishes `reaped` under it and every kill path observes `reaped`
+    /// under it, so no signal can reference a consumed pid or race a
+    /// concurrent kill.
+    reap: Arc<ReapState>,
     /// The per-child containment of this row (Windows: its own
     /// `KILL_ON_JOB_CLOSE` job; off Windows: the process group needs no
     /// stored authority). Read on Windows only (terminate/reap/job close);
@@ -507,6 +526,195 @@ impl ChildContainment {
     #[cfg(windows)]
     fn terminate(&self) {
         self.job.terminate();
+    }
+}
+
+/// Per-child reap publication + signal serialization (the terminal twin of
+/// faktor-pty's guarded `signal_group`, closing the same pid-reuse class).
+///
+/// The single reaper for a child publishes `reaped` under
+/// [`ReapState::serial`] the instant its `wait` consumed the child: from
+/// that moment the kernel may recycle the pid, so a later `kill(-pid, …)`
+/// could signal an unrelated process group that inherited the recycled id.
+/// Every kill path takes the same serial across its `[observe reaped →
+/// signal]` pair, so a signal is issued only:
+///
+/// - while the child is provably unreaped (`reaped == false`; the kernel
+///   cannot recycle a pid before its parent reaps it), or
+/// - for the one deliberate descendant-cleanup case, after the reap and
+///   only while the negative-pid probe proves the owned group still has a
+///   live member — a live group keeps its pgid allocated, so the signal can
+///   only reach the group that still contains our descendant
+///   ([`AfterReap::IfGroupAlive`]).
+struct ReapState {
+    /// Set by the single reaper the instant `wait` consumed the child.
+    reaped: AtomicBool,
+    /// Serializes the reaper's `[waitpid → publish reaped]` pair against
+    /// every kill path's `[observe reaped → signal]` pair, so Drop/reap/kill
+    /// are mutually exclusive and no signal can race a concurrent kill.
+    serial: Mutex<()>,
+    /// Test-only fault-injection counter: how many group signals this
+    /// child's guarded paths actually attempted. The adversarial tests pin
+    /// the `[waitpid → publish]` window and prove the counter stays frozen
+    /// once the child is reaped. Never compiled into production builds.
+    #[cfg(all(test, unix))]
+    signal_attempts: AtomicU64,
+}
+
+/// What a kill path may do once the single reaper consumed the child (its
+/// pid is recyclable at any moment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterReap {
+    /// Never signal after the reap: the target is only "the child" (Drop,
+    /// `kill`, `kill_child_pid`, deadline paths), and a reaped pid must
+    /// never be signalled again.
+    Suppress,
+    /// The caller holds evidence that the OWNED group still has a live
+    /// member (an inherited pipe is still held open by a descendant), which
+    /// is the only situation in which a descendant can still be cleaned. A
+    /// signal after the reap is then permitted only while the negative-pid
+    /// probe proves the group still exists: a live group keeps its pgid
+    /// allocated, so the signal cannot hit a recycled id.
+    IfGroupAlive,
+}
+
+impl ReapState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            reaped: AtomicBool::new(false),
+            serial: Mutex::new(()),
+            #[cfg(all(test, unix))]
+            signal_attempts: AtomicU64::new(0),
+        })
+    }
+
+    /// True once the single reaper consumed the child.
+    fn reaped(&self) -> bool {
+        self.reaped.load(Ordering::SeqCst)
+    }
+
+    /// Publish the reap under the signal serial: after this returns, only an
+    /// explicit [`AfterReap::IfGroupAlive`] signal with a live-group proof
+    /// may ever reference the pid again.
+    fn publish_reaped(&self, pid: u32) {
+        let _serial = self
+            .serial
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(all(test, unix))]
+        reap_injection::fire(pid);
+        #[cfg(not(all(test, unix)))]
+        let _ = pid;
+        self.reaped.store(true, Ordering::SeqCst);
+    }
+
+    /// THE guarded signal issuance for one registered unix child: hold the
+    /// serial across `[observe reaped → signal]`, honor [`AfterReap`], and
+    /// never signal pid 0. Returns whether a signal was actually attempted.
+    #[cfg(unix)]
+    fn try_signal_group(&self, pid: u32, signal: libc::c_int, after_reap: AfterReap) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        let _serial = self
+            .serial
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.reaped() && (after_reap == AfterReap::Suppress || group_gone(pid)) {
+            return false;
+        }
+        #[cfg(all(test, unix))]
+        self.signal_attempts.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: `pid` is the group leader of a supervisor-spawned child
+        // (non-zero checked above, pids fit `pid_t`), so the negative id
+        // addresses exactly that process group; the serial plus the `reaped`
+        // observation guarantee the pid was not recycled before this signal
+        // (unreaped), or that the group still has a live member whose
+        // membership keeps the pgid allocated.
+        unsafe {
+            libc::kill(-(pid as i32), signal);
+        }
+        true
+    }
+
+    #[cfg(all(test, unix))]
+    fn attempts(&self) -> u64 {
+        self.signal_attempts.load(Ordering::SeqCst)
+    }
+}
+
+/// Last-resort RAII tree cleanup for one async `run()` future. Declared
+/// AFTER the spawned child, so it drops BEFORE tokio's `kill_on_drop`: a
+/// future dropped by an outer timeout/unwind has not reaped its child, so
+/// this SIGKILLs the owned group WHILE the child is still unreaped (its pid
+/// cannot be recycled yet) and then publishes the reap — no later Drop/kill
+/// path can ever signal the consumed pid. Every deliberate run return path
+/// reaps first, so the guard is inert there.
+struct RunGroupGuard {
+    reap: Arc<ReapState>,
+    pid: u32,
+}
+
+impl Drop for RunGroupGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            if self.reap.reaped() {
+                return;
+            }
+            let _ = self
+                .reap
+                .try_signal_group(self.pid, libc::SIGKILL, AfterReap::Suppress);
+            self.reap.publish_reaped(self.pid);
+        }
+        #[cfg(not(unix))]
+        let _ = (&self.reap, self.pid);
+    }
+}
+
+/// Test-only fault-injection seam for the reap-publication window (mirrors
+/// faktor-pty's). The reaper invokes the hook registered for its child pid
+/// while holding the reap serial, AFTER `wait` consumed the child and BEFORE
+/// the `reaped` flag is published. A test can therefore pin the exact
+/// dangerous interleaving — "the child is reaped (its pid is now
+/// recyclable) but no kill path has observed it" — and prove a concurrent
+/// kill or Drop blocks on the serial and never signals the stale pid. Never
+/// compiled into production builds.
+#[cfg(all(test, unix))]
+pub(crate) mod reap_injection {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    static HOOKS: OnceLock<Mutex<HashMap<u32, Hook>>> = OnceLock::new();
+
+    fn hooks() -> &'static Mutex<HashMap<u32, Hook>> {
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(crate) fn register(pid: u32, hook: Hook) {
+        hooks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(pid, hook);
+    }
+
+    pub(crate) fn clear(pid: u32) {
+        hooks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&pid);
+    }
+
+    pub(crate) fn fire(pid: u32) {
+        let hook = hooks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&pid);
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
 
@@ -638,7 +846,7 @@ impl Drop for ProcessSupervisor {
                 .collect()
         };
         for (id, pid) in targets {
-            let _ = self.terminate_registered_sync(id, pid, 300);
+            let _ = self.terminate_registered_sync(id, pid, 300, AfterReap::Suppress);
         }
     }
 }
@@ -827,8 +1035,9 @@ impl ProcessSupervisor {
         owner: ProcessOwner,
         started_ms: i64,
         containment: ChildContainment,
-    ) -> u64 {
+    ) -> (u64, Arc<ReapState>) {
         let id = self.alloc_id();
+        let reap = ReapState::new();
         self.registry.lock().unwrap().insert(
             id,
             ChildState {
@@ -836,44 +1045,101 @@ impl ProcessSupervisor {
                 owner: owner.clone(),
                 started_ms,
                 exited: None,
+                reap: reap.clone(),
                 containment,
             },
         );
-        id
+        (id, reap)
+    }
+
+    /// The row's reap/signal serial. `None` once the row was collected by
+    /// [`ProcessSupervisor::reap`]: a collected row can never be signalled.
+    fn reap_state(&self, id: u64) -> Option<Arc<ReapState>> {
+        self.registry
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|state| state.reap.clone())
     }
 
     /// PRIMARY tree termination of one registered child (async paths): on
     /// Windows the child's kill-on-close job (the kernel enumerates
     /// membership — children of members are members, so this is the whole
     /// tree with no pid walk and no taskkill); on unix the owned process
-    /// group with SIGTERM→SIGKILL grace. Async so the unix grace wait never
-    /// blocks the runtime; the Windows job kill is immediate.
-    async fn terminate_registered(&self, id: u64, pid: u32, grace_ms: u64) {
+    /// group with SIGTERM→SIGKILL grace, issued ONLY through the child's
+    /// guarded [`ReapState::try_signal_group`]. Async so the unix grace wait
+    /// never blocks the runtime; the Windows job kill is immediate.
+    async fn terminate_registered(&self, id: u64, pid: u32, grace_ms: u64, after_reap: AfterReap) {
         #[cfg(windows)]
         {
-            let _ = (pid, grace_ms);
-            self.terminate_containment(id);
+            let _ = (pid, grace_ms, after_reap);
+            if self.reap_state(id).is_some() {
+                self.terminate_containment(id);
+            }
         }
         #[cfg(not(windows))]
         {
-            let _ = id;
-            let _ = kill_group_async(pid, grace_ms).await;
+            let Some(reap) = self.reap_state(id) else {
+                return;
+            };
+            if !reap.try_signal_group(pid, libc::SIGTERM, after_reap) {
+                return;
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
+            loop {
+                if group_gone(pid) {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            // A stubborn member survived SIGTERM: escalate. The guarded
+            // issuance re-checks the reap state under the serial; the group
+            // provably still had a live member microseconds ago, and a live
+            // member keeps the pgid allocated.
+            let _ = reap.try_signal_group(pid, libc::SIGKILL, AfterReap::IfGroupAlive);
         }
     }
 
     /// Sync twin of [`Self::terminate_registered`] for the sync, Drop and
     /// public kill paths.
-    fn terminate_registered_sync(&self, id: u64, pid: u32, grace_ms: u64) -> Result<(), Error> {
+    fn terminate_registered_sync(
+        &self,
+        id: u64,
+        pid: u32,
+        grace_ms: u64,
+        after_reap: AfterReap,
+    ) -> Result<(), Error> {
         #[cfg(windows)]
         {
-            let _ = (pid, grace_ms);
+            let _ = (pid, grace_ms, after_reap);
+            if self.reap_state(id).is_none() {
+                return Err(Error::not_found(format!("child {id}")));
+            }
             self.terminate_containment(id);
             Ok(())
         }
         #[cfg(not(windows))]
         {
-            let _ = id;
-            kill_group(pid, grace_ms)
+            let Some(reap) = self.reap_state(id) else {
+                return Err(Error::not_found(format!("child {id}")));
+            };
+            if !reap.try_signal_group(pid, libc::SIGTERM, after_reap) {
+                return Ok(());
+            }
+            let deadline = std::time::Instant::now() + Duration::from_millis(grace_ms);
+            while std::time::Instant::now() < deadline {
+                if group_gone(pid) {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // A stubborn member survived SIGTERM: escalate (see the async
+            // twin for the after-reap rule).
+            let _ = reap.try_signal_group(pid, libc::SIGKILL, AfterReap::IfGroupAlive);
+            Ok(())
         }
     }
 
@@ -980,7 +1246,15 @@ impl ProcessSupervisor {
         #[cfg(target_os = "linux")]
         mark_deny_all_proven(&cfg);
         let pid = child.id().unwrap_or(0);
-        let id = self.register(pid, cfg.owner.clone(), started_ms, containment);
+        let (id, reap) = self.register(pid, cfg.owner.clone(), started_ms, containment);
+        // Declared AFTER `child` so it drops BEFORE tokio's kill_on_drop:
+        // the outer-timeout/unwind path SIGKILLs the owned group while the
+        // child is still unreaped, then publishes the reap (see
+        // [`RunGroupGuard`]).
+        let _run_group_guard = RunGroupGuard {
+            reap: reap.clone(),
+            pid,
+        };
         self.timeline_spawn(
             id,
             pid,
@@ -1082,11 +1356,17 @@ impl ProcessSupervisor {
         // pgid cannot have been recycled) -> bounded final drain -> finish.
         let deadline_at = tokio::time::Instant::now() + effective_deadline;
         let outcome = tokio::select! {
-            s = child.wait() => RunOutcome::Exited(s.ok()),
+            s = child.wait() => {
+                // The single reaper consumed the child: publish the reap
+                // under the serial before anything else can observe it.
+                reap.publish_reaped(pid);
+                RunOutcome::Exited(s.ok())
+            }
             _ = tokio::time::sleep_until(deadline_at) => {
-                self.terminate_registered(id, pid, 2000).await;
+                self.terminate_registered(id, pid, 2000, AfterReap::Suppress).await;
                 let _ = child.kill().await;
                 let _ = child.wait().await;
+                reap.publish_reaped(pid);
                 // The child is gone WITH no exit code: mark it exited so
                 // reap() can collect the registry entry exactly once. The
                 // old `None` left the child permanently "alive" in the
@@ -1095,9 +1375,10 @@ impl ProcessSupervisor {
                 RunOutcome::TimedOut
             }
             _ = token.cancelled() => {
-                self.terminate_registered(id, pid, 500).await;
+                self.terminate_registered(id, pid, 500, AfterReap::Suppress).await;
                 let _ = child.kill().await;
                 let _ = child.wait().await;
+                reap.publish_reaped(pid);
                 self.mark_exited(id, Some(None));
                 RunOutcome::Cancelled
             }
@@ -1106,9 +1387,10 @@ impl ProcessSupervisor {
         // The direct child is gone. Drain its remaining output for the
         // bounded window; a reader that is STILL alive after the window
         // means a descendant keeps one of our pipes open (EOF can never
-        // arrive). Only then do we terminate the owned tree — at that
-        // moment a pipe-holding descendant exists, so the pgid is live and
-        // the kill cannot hit a recycled id.
+        // arrive). Only then do we terminate the owned tree: the leader was
+        // already consumed by the reaper, so the kill is gated on the
+        // live-group proof of [`AfterReap::IfGroupAlive`] — the held pipe is
+        // evidence that a descendant still keeps the owned group open.
         let mut reader = reader;
         let drain_done = {
             let mut r = reader.take();
@@ -1121,7 +1403,8 @@ impl ProcessSupervisor {
             .is_ok();
             if r.is_some() && !done {
                 // Descendant still owns the pipe: terminate the owned tree.
-                self.terminate_registered(id, pid, 1500).await;
+                self.terminate_registered(id, pid, 1500, AfterReap::IfGroupAlive)
+                    .await;
                 if let Some(r) = r {
                     r.abort();
                     let _ = r.await;
@@ -1284,7 +1567,7 @@ impl ProcessSupervisor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let started_ms = now_ms();
-        let (mut child, pid, id) = {
+        let (mut child, pid, id, reap) = {
             let _serial = self.spawn_serial.lock().unwrap();
             self.admit()?;
             // Windows containment: job BEFORE process, spawn suspended,
@@ -1298,9 +1581,9 @@ impl ProcessSupervisor {
             #[cfg(target_os = "linux")]
             mark_deny_all_proven(&cfg);
             let pid = child.id();
-            let id = self.register(pid, cfg.owner.clone(), started_ms, containment);
+            let (id, reap) = self.register(pid, cfg.owner.clone(), started_ms, containment);
             self.timeline_spawn(id, pid, argv, &cfg.owner);
-            (child, pid, id)
+            (child, pid, id, reap)
         };
         let (enforcement, _post_guard) = self.apply_spawn_budgets(pid, budgets.as_ref());
         // Dedicated reader threads: bounded head per stream, remainder
@@ -1325,26 +1608,25 @@ impl ProcessSupervisor {
             let _ = err_tx.send(res);
         });
         // The waiter owns reaping; the caller enforces the deadline. The
-        // reaped flag guards the kill: a reaped pid is never signalled (a
-        // recycled group must not die for our deadline).
-        let reaped = Arc::new(AtomicBool::new(false));
+        // reap publication under the child serial is what guards every kill:
+        // once the waiter consumed the child, no kill path may signal the
+        // (now recyclable) pid.
         let (exit_tx, exit_rx) = std::sync::mpsc::channel();
         {
-            let reaped = reaped.clone();
+            let reap = reap.clone();
             std::thread::spawn(move || {
                 let code = child.wait().ok().and_then(|s| s.code());
-                reaped.store(true, Ordering::SeqCst);
+                reap.publish_reaped(pid);
                 let _ = exit_tx.send(code);
             });
         }
         let (exit_code, timed_out) = match exit_rx.recv_timeout(effective_deadline) {
             Ok(code) => (code, false),
             Err(_) => {
-                // Deadline fired: kill the OWNED tree (only while the child
-                // is still ours), then give the reaper a bounded moment.
-                if !reaped.load(Ordering::SeqCst) {
-                    let _ = self.terminate_registered_sync(id, pid, 500);
-                }
+                // Deadline fired: guarded kill of the OWNED tree — if the
+                // waiter consumed the child first, the guard turns this into
+                // a no-op instead of a stale signal.
+                let _ = self.terminate_registered_sync(id, pid, 500, AfterReap::Suppress);
                 let code = exit_rx
                     .recv_timeout(Duration::from_millis(500))
                     .ok()
@@ -1358,12 +1640,18 @@ impl ProcessSupervisor {
         // Bounded settle: each reader finishes at pipe EOF. A grandchild
         // that inherited the pipe delays it — never the caller, never the
         // reader forever: past the drain bound the pipe-holding descendant
-        // is group-killed and the final heads are collected.
+        // is group-killed (gated on the live-group proof, because the leader
+        // was consumed by its reaper by now) and the final heads collected.
         let settle = Duration::from_millis(SYNC_DRAIN_MS);
         let mut out_head = out_rx.recv_timeout(settle).ok();
         let mut err_head = err_rx.recv_timeout(settle).ok();
         if out_head.is_none() || err_head.is_none() {
-            let _ = self.terminate_registered_sync(id, pid, SYNC_KILL_GRACE_MS);
+            let _ = self.terminate_registered_sync(
+                id,
+                pid,
+                SYNC_KILL_GRACE_MS,
+                AfterReap::IfGroupAlive,
+            );
             let grace = Duration::from_millis(500);
             if out_head.is_none() {
                 out_head = out_rx.recv_timeout(grace).ok();
@@ -1422,7 +1710,7 @@ impl ProcessSupervisor {
             .stderr
             .take()
             .ok_or_else(|| Error::internal("no stderr"))?;
-        let id = self.register(pid, cfg.owner.clone(), started_ms, containment);
+        let (id, reap) = self.register(pid, cfg.owner.clone(), started_ms, containment);
         self.timeline_spawn(
             id,
             pid,
@@ -1433,11 +1721,13 @@ impl ProcessSupervisor {
             &cfg.owner,
         );
         // Reaper thread (no zombies); the caller keeps the pipes. It also
-        // deletes the materialized cmd script once the child has exited.
+        // deletes the materialized cmd script once the child has exited, and
+        // publishes the reap BEFORE anything else can observe the pid.
         let registry = self.registry.clone();
         let script = cmd_script.disarm();
         std::thread::spawn(move || {
             let status = child.wait().ok();
+            reap.publish_reaped(pid);
             if let Some(path) = script {
                 let _ = std::fs::remove_file(path);
             }
@@ -1467,7 +1757,7 @@ impl ProcessSupervisor {
         let mut cmd = contain_on_create(self.command(&cfg));
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
         let started_ms = now_ms();
-        let (child, pid, id) = {
+        let (child, pid, id, reap) = {
             let _serial = self.spawn_serial.lock().unwrap();
             self.admit()?;
             let containment = prepare_containment()?;
@@ -1478,7 +1768,7 @@ impl ProcessSupervisor {
             #[cfg(target_os = "linux")]
             mark_deny_all_proven(&cfg);
             let pid = child.id();
-            let id = self.register(pid, cfg.owner.clone(), started_ms, containment);
+            let (id, reap) = self.register(pid, cfg.owner.clone(), started_ms, containment);
             self.timeline_spawn(
                 id,
                 pid,
@@ -1488,14 +1778,16 @@ impl ProcessSupervisor {
                     .collect(),
                 &cfg.owner,
             );
-            (child, pid, id)
+            (child, pid, id, reap)
         };
         // Reaper thread: waitpid is the only way to avoid zombies. It also
-        // deletes the materialized cmd script once the child has exited.
+        // deletes the materialized cmd script once the child has exited, and
+        // publishes the reap BEFORE anything else can observe the pid.
         let registry = self.registry.clone();
         let script = cmd_script.disarm();
         std::thread::spawn(move || {
             let status = child.wait_with_output().map(|o| o.status).ok();
+            reap.publish_reaped(pid);
             if let Some(path) = script {
                 let _ = std::fs::remove_file(path);
             }
@@ -1521,41 +1813,40 @@ impl ProcessSupervisor {
             .get(&id)
             .map(|c| c.pid)
             .ok_or_else(|| Error::not_found(format!("child {id}")))?;
-        self.terminate_registered_sync(id, pid, grace_ms)
+        self.terminate_registered_sync(id, pid, grace_ms, AfterReap::Suppress)
     }
 
     /// Kill a process by raw pid (process-group aware); used by MCP/LSP
-    /// clients that own their own child lifecycle. A pid that matches a
-    /// registered child is terminated through the SAME primary authority as
-    /// [`ProcessSupervisor::kill`] (the containment job on Windows, the
-    /// process group on unix); an unregistered pid keeps the platform
-    /// fallback.
+    /// clients that own their own child lifecycle. The pid MUST belong to a
+    /// registered, still-unreaped child: it is then terminated through the
+    /// same guarded authority as [`ProcessSupervisor::kill`] (the
+    /// containment job on Windows, the reap-serialized process group on
+    /// unix). A pid whose child was already consumed by its reaper — or one
+    /// this supervisor never owned — is refused typed: a raw pid may be
+    /// recycled at any moment, so it is NEVER signalled blindly.
     pub fn kill_child_pid(&self, pid: u32, grace_ms: u64) -> Result<(), Error> {
         if pid == 0 {
             return Err(Error::not_found("pid 0"));
         }
-        #[cfg(windows)]
-        {
-            let id = {
-                let reg = self.registry.lock().unwrap();
+        let (live_id, known) = {
+            let reg = self.registry.lock().unwrap();
+            (
                 reg.iter()
                     .find(|(_, s)| s.pid == pid && s.exited.is_none())
-                    .map(|(id, _)| *id)
-            };
-            match id {
-                Some(id) => {
-                    self.terminate_containment(id);
-                    Ok(())
-                }
-                // Never owned by this supervisor: the documented best-effort
-                // fallback (taskkill). The caller's own child lifecycle has
-                // no job of ours to close.
-                None => kill_group(pid, grace_ms),
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            kill_group(pid, grace_ms)
+                    .map(|(id, _)| *id),
+                reg.values().any(|s| s.pid == pid),
+            )
+        };
+        match (live_id, known) {
+            // The row's serial is the authority: if its reaper consumed the
+            // child in the meantime, the guarded kill becomes a no-op.
+            (Some(id), _) => self.terminate_registered_sync(id, pid, grace_ms, AfterReap::Suppress),
+            (None, true) => Err(Error::not_found(format!(
+                "child pid {pid} was already consumed by its reaper; refusing a stale signal"
+            ))),
+            (None, false) => Err(Error::not_found(format!(
+                "pid {pid} is not owned by this supervisor; raw pids are never signalled"
+            ))),
         }
     }
 
@@ -1624,7 +1915,7 @@ impl ProcessSupervisor {
         };
         let mut killed = Vec::with_capacity(targets.len());
         for (id, pid) in &targets {
-            let _ = self.terminate_registered_sync(*id, *pid, 2000);
+            let _ = self.terminate_registered_sync(*id, *pid, 2000, AfterReap::Suppress);
             killed.push(*id);
         }
         let mut reg = self.registry.lock().unwrap();
@@ -2034,9 +2325,15 @@ fn taskkill_best_effort(pid: u32) {
 
 /// Kill the whole process group on unix: SIGTERM, grace, SIGKILL. The
 /// grace wait exits early: the moment the group leader is gone the function
-/// returns instead of sleeping the full grace. On Windows the primary tree
-/// kill is the containment job ([`ChildContainment::terminate`]); this
-/// function only serves unowned pids and is a best-effort afterthought.
+/// returns instead of sleeping the full grace.
+///
+/// TEST-ONLY raw helper: production kill paths for REGISTERED children must
+/// go through [`ReapState::try_signal_group`], which holds the reap serial
+/// across the observation/signal pair; this raw form has no reap state and
+/// is exercised only by the budget tests, which own their unreaped fixture
+/// children directly. On Windows the primary tree kill is the containment
+/// job ([`ChildContainment::terminate`]).
+#[cfg(all(test, unix))]
 fn kill_group(pid: u32, grace_ms: u64) -> Result<(), Error> {
     #[cfg(unix)]
     {
@@ -2072,8 +2369,13 @@ fn kill_group(pid: u32, grace_ms: u64) -> Result<(), Error> {
 /// Async kill of the whole process group on unix: SIGTERM, then poll for
 /// exit every 25ms (no blocking sleep inside the runtime); at the grace
 /// deadline SIGKILL is sent. On Windows the primary tree kill is the
-/// containment job; this async form only serves unowned pids and delegates
-/// to the best-effort [`taskkill_best_effort`].
+/// containment job; this async form delegates to the best-effort
+/// [`taskkill_best_effort`].
+///
+/// RAW-pid helper: it has no reap state and must only be used for a pid the
+/// caller itself owns and can prove unreaped. Registered supervisor
+/// children always go through the guarded
+/// [`ReapState::try_signal_group`] path, never through this function.
 pub async fn kill_group_async(pid: u32, grace_ms: u64) -> Result<(), Error> {
     #[cfg(unix)]
     {
@@ -2653,6 +2955,301 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(gone, "daemon-shutdown Drop must kill live children");
+    }
+
+    // ============ pid-reuse discipline: reap serial + guarded signals =====
+
+    /// Wait until the owned process group has no member left.
+    fn wait_group_gone(pid: u32, what: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !group_gone(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: group {pid} must be gone"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Pin the single reaper inside its `[wait consumed the child → publish
+    /// reaped]` window (the exact instant the pid becomes recyclable). The
+    /// hook runs while the reaper holds the child's reap serial, so every
+    /// kill path must block behind it. Returns the "entered" receiver and
+    /// the release sender; the caller must release and clear.
+    fn pin_reap_window(pid: u32) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        reap_injection::register(
+            pid,
+            Arc::new(move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv();
+            }),
+        );
+        (entered_rx, release_tx)
+    }
+
+    /// ADVERSARIAL PID-REUSE BOUNDARY (deterministic fault injection): while
+    /// the single reaper sits in `[wait consumed the child → publish
+    /// reaped]`, the kernel may already recycle the pid, so ANY signal would
+    /// be able to hit an unrelated group. A concurrent `kill` must block on
+    /// the reap serial and must never attempt a signal — neither while
+    /// blocked nor after the reap is published. The blocking assertion is
+    /// load-bearing: the unguarded code signalled (or returned) immediately.
+    #[test]
+    fn concurrent_kill_blocks_on_the_reap_window_and_never_signals() {
+        let (_d, sup) = supervisor();
+        let h = sup.spawn(sh("sleep 0.3")).unwrap();
+        let reap = sup.reap_state(h.id).expect("registered row");
+        let (entered_rx, release_tx) = pin_reap_window(h.pid);
+        assert!(
+            entered_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "the reaper must reach its [wait → publish] window"
+        );
+        // The single reaper consumed the child: the pid is recyclable now.
+        assert!(pid_is_gone(h.pid), "the reaper consumed the child");
+        let before = reap.attempts();
+        let sup2 = Arc::clone(&sup);
+        let killer = std::thread::spawn(move || sup2.kill(h.id, 200));
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !killer.is_finished(),
+            "LOAD-BEARING: a kill must serialize behind the reap publication, not \
+             signal a recyclable pid"
+        );
+        assert_eq!(
+            reap.attempts(),
+            before,
+            "no signal may be attempted while the reap is unpublished"
+        );
+        release_tx.send(()).unwrap();
+        killer.join().unwrap().unwrap();
+        assert_eq!(
+            reap.attempts(),
+            before,
+            "no signal may ever reference a pid the reaper consumed"
+        );
+        reap_injection::clear(h.pid);
+    }
+
+    /// ADVERSARIAL PID-REUSE BOUNDARY (Drop twin): dropping the last
+    /// supervisor reference while a reaper sits in the publication window
+    /// must block on the serial and never signal the consumed pid. This is
+    /// the exact daemon-shutdown race that used to signal a recycled pid.
+    #[test]
+    fn supervisor_drop_blocks_on_the_reap_window_and_never_signals() {
+        let dir = tempdir().unwrap();
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = ProcessSupervisor::new(cas);
+        let h = sup.spawn(sh("sleep 0.3")).unwrap();
+        let reap = sup.reap_state(h.id).expect("registered row");
+        let (entered_rx, release_tx) = pin_reap_window(h.pid);
+        assert!(
+            entered_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "the reaper must reach its [wait → publish] window"
+        );
+        let before = reap.attempts();
+        let dropper = std::thread::spawn(move || drop(sup));
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !dropper.is_finished(),
+            "LOAD-BEARING: Drop must serialize behind the reap publication, not \
+             signal a recyclable pid"
+        );
+        assert_eq!(
+            reap.attempts(),
+            before,
+            "Drop must not signal while the reap is unpublished"
+        );
+        release_tx.send(()).unwrap();
+        dropper.join().unwrap();
+        assert_eq!(
+            reap.attempts(),
+            before,
+            "Drop must never signal a pid the reaper consumed"
+        );
+        reap_injection::clear(h.pid);
+    }
+
+    /// The raw-pid path takes the same serial and never signals a consumed
+    /// pid; an unowned pid is refused typed without any signal at all.
+    #[test]
+    fn kill_child_pid_is_guarded_and_refuses_unowned_pids() {
+        let (_d, sup) = supervisor();
+        let h = sup.spawn(sh("sleep 0.3")).unwrap();
+        let reap = sup.reap_state(h.id).expect("registered row");
+        let (entered_rx, release_tx) = pin_reap_window(h.pid);
+        assert!(
+            entered_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "the reaper must reach its [wait → publish] window"
+        );
+        let before = reap.attempts();
+        let sup2 = Arc::clone(&sup);
+        let pid = h.pid;
+        let killer = std::thread::spawn(move || sup2.kill_child_pid(pid, 200));
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !killer.is_finished(),
+            "the raw-pid path must take the same reap serial"
+        );
+        assert_eq!(
+            reap.attempts(),
+            before,
+            "no raw signal while the reap is unpublished"
+        );
+        release_tx.send(()).unwrap();
+        assert!(
+            killer.join().unwrap().is_ok(),
+            "the consumed child's guarded kill is an idempotent no-op"
+        );
+        assert_eq!(
+            reap.attempts(),
+            before,
+            "the raw-pid path must never signal a consumed pid"
+        );
+        reap_injection::clear(h.pid);
+        // A pid this supervisor never owned is refused typed — never a blind
+        // raw signal.
+        let err = sup.kill_child_pid(std::process::id(), 100).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::NotFound, "{err:?}");
+        assert!(sup.pid_alive(std::process::id()));
+    }
+
+    /// The normal order still works: a live child is signalled by an explicit
+    /// kill and by the supervisor's daemon-shutdown Drop.
+    #[test]
+    fn live_children_are_still_signalled_and_killed_by_kill_and_drop() {
+        let (_d, sup) = supervisor();
+        let h = sup.spawn(sh("sleep 30")).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        let reap = sup.reap_state(h.id).expect("registered row");
+        let before = reap.attempts();
+        sup.kill(h.id, 500).unwrap();
+        assert!(
+            reap.attempts() > before,
+            "an unreaped live child must be signalled"
+        );
+        wait_group_gone(h.pid, "explicit kill of a live child");
+        let h2 = sup.spawn(sh("sleep 30")).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        drop(sup);
+        wait_group_gone(h2.pid, "supervisor Drop of a live child");
+    }
+
+    /// Budget enforcement is a kill path too: the wall budget must still take
+    /// a live tree through the guarded deadline kill.
+    #[test]
+    fn budget_wall_deadline_still_kills_a_live_child() {
+        let (_d, sup) = supervisor();
+        let budgets = TreeBudgets {
+            wall_time_ms: 300,
+            ..TreeBudgets::disabled()
+        };
+        let (out, enforcement) = sup
+            .run_sync_with_budgets(sh("sleep 30"), budgets, Duration::from_secs(30), 4096, 4096)
+            .unwrap();
+        assert!(out.timed_out, "the wall budget must dominate");
+        assert_eq!(out.exit_code, None, "the tree was killed, not exited");
+        assert_eq!(enforcement.wall, LimitState::Enforced);
+        assert!(
+            sup.alive().is_empty(),
+            "no live child after the budget kill"
+        );
+        let mut collected = Vec::new();
+        for _ in 0..40 {
+            collected.extend(sup.reap());
+            if !collected.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(collected.len(), 1, "exactly one collectible child");
+        assert_eq!(sup.registered(), 0, "the budgeted child is collected");
+    }
+
+    /// ADVERSARIAL: the leader is consumed by its reaper while a detached
+    /// descendant keeps the owned group (and the leader's pipe) alive. The
+    /// descendant cleanup signal is gated on the live-group proof, so the
+    /// descendant dies WITHOUT a stale signal; once the group is gone, any
+    /// further kill is a no-op that attempts nothing.
+    #[test]
+    fn reaped_leader_with_surviving_descendants_is_cleaned_without_stale_signals() {
+        let (_d, sup) = supervisor();
+        let t0 = std::time::Instant::now();
+        let out = sup
+            .run_sync(
+                sh("(sleep 30) & echo done"),
+                Duration::from_secs(30),
+                4096,
+                4096,
+            )
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.stdout_head.contains("done"), "{:?}", out.stdout_head);
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "the pipe-holding descendant must be cleaned, never owned"
+        );
+        let timeline = sup.recent_spawns();
+        let (op_id, pid) = (timeline[0].op_id, timeline[0].pid);
+        wait_group_gone(pid, "descendant cleanup after a reaped leader");
+        let reap = sup.reap_state(op_id).expect("run_sync row until reap()");
+        assert!(
+            reap.reaped(),
+            "the leader was consumed by its single reaper"
+        );
+        let before = reap.attempts();
+        sup.kill(op_id, 200).unwrap();
+        assert_eq!(
+            reap.attempts(),
+            before,
+            "a consumed pid is never signalled again, even after its group died"
+        );
+    }
+
+    /// A `run()` future dropped by an outer timeout/unwind still takes the
+    /// whole owned group with it (the RAII guard SIGKILLs while the child is
+    /// unreaped) and publishes the reap, so the later supervisor Drop cannot
+    /// signal the consumed pid.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_run_future_kills_the_group_and_suppresses_later_signals() {
+        let (_d, sup) = supervisor();
+        let sup2 = Arc::clone(&sup);
+        let token = CancellationToken::new();
+        let task = tokio::spawn(async move {
+            sup2.run(
+                sh("(sleep 30) & echo started; sleep 30"),
+                Duration::from_secs(120),
+                token,
+            )
+            .await
+        });
+        let (op_id, pid) = loop {
+            let recent = sup.recent_spawns();
+            if let Some(t) = recent.first() {
+                if t.pid > 0 {
+                    break (t.op_id, t.pid);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let reap = sup.reap_state(op_id).expect("registered row");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        task.abort();
+        let _ = task.await;
+        wait_group_gone(pid, "RAII group guard on a dropped run future");
+        let before = reap.attempts();
+        assert!(before > 0, "the drop guard must SIGKILL the owned group");
+        sup.kill(op_id, 200).unwrap();
+        assert_eq!(
+            reap.attempts(),
+            before,
+            "nothing may signal a pid the drop guard consumed"
+        );
     }
 
     #[test]
@@ -4673,12 +5270,54 @@ mod containment_policy_tests {
             "taskkill must survive only as the single best-effort helper"
         );
         assert!(body(production, "fn taskkill_best_effort(").contains("taskkill"));
-        // kill_child_pid routes a registered pid through the containment job;
-        // the unowned-pid fallback is `kill_group`, whose non-unix body is
-        // exactly the documented taskkill afterthought.
+        // kill_child_pid routes a registered pid through the guarded kill;
+        // an unowned or already-consumed pid is refused typed and never
+        // raw-signalled.
         let kcp = body(production, "pub fn kill_child_pid(");
-        assert!(kcp.contains("terminate_containment"));
-        assert!(kcp.contains("kill_group"));
+        assert!(kcp.contains("terminate_registered_sync"));
+        assert!(!kcp.contains("kill_group"));
+        assert!(!kcp.contains("libc::kill"));
         assert!(body(production, "fn kill_group(").contains("taskkill_best_effort"));
+    }
+
+    /// Pid-reuse guard contract (portable source scan): the unix signal
+    /// issuance locks the reap serial BEFORE observing `reaped` and only
+    /// calls the kernel after both, and no supervisor kill path raw-signals
+    /// a stored pid anymore.
+    #[test]
+    fn unix_signals_are_reap_serialized_and_kill_paths_are_guarded() {
+        let src = include_str!("lib.rs");
+        let production = src
+            .split("mod containment_policy_tests")
+            .next()
+            .expect("test module split");
+        let issue = body(production, "fn try_signal_group(");
+        let i_serial = issue.find(".serial").expect("reap serial lock");
+        let i_reaped = issue.find("self.reaped()").expect("reaped observation");
+        let i_kill = issue.find("libc::kill").expect("guarded signal");
+        assert!(
+            i_serial < i_reaped && i_reaped < i_kill,
+            "the reap serial must cover [observe reaped → signal]"
+        );
+        for header in [
+            "async fn terminate_registered(",
+            "fn terminate_registered_sync(",
+            "pub fn kill_child_pid(",
+            "pub fn kill_all_for(",
+            "impl Drop for ProcessSupervisor {",
+        ] {
+            let inner = body(production, header);
+            assert!(
+                !inner.contains("libc::kill"),
+                "{header} must signal only through the guarded issuance"
+            );
+            assert!(
+                !inner.contains("kill_group(") && !inner.contains("kill_group_async("),
+                "{header} must not raw-signal a stored pid"
+            );
+        }
+        // The raw unix group helpers are test-only: production registered
+        // kills route through ReapState.
+        assert!(production.contains("#[cfg(all(test, unix))]\nfn kill_group("));
     }
 }
