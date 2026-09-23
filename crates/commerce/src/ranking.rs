@@ -15,9 +15,11 @@
 //! requested variant attributes) contributes full credit.
 
 use crate::matching::{match_offer, PartQuery};
-use crate::offer::CommercialOffer;
+use crate::offer::{CommercialOffer, StockState};
 use crate::quantity::Quantity;
-use crate::quote::{resolve_quote, PricingContext, QuoteStatus, VariantRequest};
+use crate::quote::{
+    effective_terms, resolve_quote, selected_scope, PricingContext, QuoteStatus, VariantRequest,
+};
 use crate::text::AccountScope;
 
 /// A named ranking component.
@@ -174,9 +176,8 @@ fn component(key: ScoreKey, normalized: i64) -> ScoreComponent {
     }
 }
 
-fn stock_component(offer: &CommercialOffer, quantity: Quantity) -> ScoreComponent {
-    use crate::offer::StockState;
-    let normalized = match offer.stock {
+fn stock_component(stock: StockState, quantity: Quantity) -> ScoreComponent {
+    let normalized = match stock {
         StockState::InStock {
             quantity: available,
         } => {
@@ -193,16 +194,22 @@ fn stock_component(offer: &CommercialOffer, quantity: Quantity) -> ScoreComponen
     component(ScoreKey::Stock, normalized)
 }
 
-fn moq_component(offer: &CommercialOffer, quantity: Quantity) -> ScoreComponent {
-    let normalized = match offer.moq {
+fn moq_component(
+    moq: Option<crate::quantity::NonZeroQuantity>,
+    quantity: Quantity,
+) -> ScoreComponent {
+    let normalized = match moq {
         Some(moq) if quantity < moq.as_quantity() => 0,
         _ => 1_000,
     };
     component(ScoreKey::Moq, normalized)
 }
 
-fn multiple_component(offer: &CommercialOffer, quantity: Quantity) -> ScoreComponent {
-    let normalized = match offer.order_multiple {
+fn multiple_component(
+    order_multiple: Option<crate::quantity::NonZeroQuantity>,
+    quantity: Quantity,
+) -> ScoreComponent {
+    let normalized = match order_multiple {
         Some(multiple) if !quantity.as_u64().is_multiple_of(multiple.get()) => 500,
         _ => 1_000,
     };
@@ -285,6 +292,11 @@ fn score_offer(query: &PartQuery, offer: &CommercialOffer, ctx: &RankingContext)
         tax: None,
         duty: None,
     };
+    // MOQ, order multiple and stock are scored from the SELECTED
+    // variant/packaging scope when the context selects one, exactly like the
+    // price; offer-level terms only apply when no scope was selected.
+    let (scope_variant, scope_packaging) = selected_scope(offer, &pricing_ctx);
+    let scoped_terms = effective_terms(offer, scope_variant, scope_packaging);
     let resolution = resolve_quote(offer, &pricing_ctx, ctx.quantity);
     let quantity_compatibility = component(
         ScoreKey::QuantityCompatibility,
@@ -341,9 +353,9 @@ fn score_offer(query: &PartQuery, offer: &CommercialOffer, ctx: &RankingContext)
         manufacturer,
         package,
         quantity_compatibility,
-        stock_component(offer, ctx.quantity),
-        moq_component(offer, ctx.quantity),
-        multiple_component(offer, ctx.quantity),
+        stock_component(scoped_terms.stock, ctx.quantity),
+        moq_component(scoped_terms.moq, ctx.quantity),
+        multiple_component(scoped_terms.order_multiple, ctx.quantity),
         lifecycle,
         price_completeness,
         source_confidence,

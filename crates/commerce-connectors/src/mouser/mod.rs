@@ -91,14 +91,17 @@ impl MouserConnector {
     }
 
     /// Build one bounded request. The API key travels in the documented
-    /// `apiKey` query parameter; [`crate::http::redact_url`] removes it from
-    /// every rendered form.
+    /// `apiKey` query parameter (the Mouser API defines it there, not as a
+    /// header). It is registered with the outbound scanner and declared on
+    /// the request, so the transport boundary permits exactly this
+    /// credential and refuses any other secret in the URL; every rendered
+    /// form goes through [`crate::http::redact_url`].
     fn request(&self, endpoint: &str, body: &[u8]) -> Result<HttpRequest, SourceError> {
         let url = format!(
             "{endpoint}?apiKey={}",
             crate::http::query_escape(self.api_key.expose())
         );
-        Ok(HttpRequest::post_json(&url, body)?)
+        Ok(HttpRequest::post_json(&url, body)?.with_url_credential(&self.api_key))
     }
 
     /// The exact part-number search body.

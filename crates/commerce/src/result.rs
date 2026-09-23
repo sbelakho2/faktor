@@ -132,6 +132,61 @@ pub fn scan_forbidden_bytes(bytes: &[u8]) -> Result<(), ForbiddenMaterial> {
     scan_forbidden(&String::from_utf8_lossy(bytes))
 }
 
+/// The frozen default secret policy of the shared `faktor-security` scrub
+/// utility (OpenAI/GitHub/AWS/Slack/PEM/Google patterns).
+static SCRUB_POLICY: std::sync::LazyLock<faktor_security::SecretPolicy> =
+    std::sync::LazyLock::new(faktor_security::SecretPolicy::default);
+
+/// Redact credential material from one piece of extracted text at the
+/// normalization/result boundary. Benign text is returned byte-identical;
+/// the replacement is `<redacted:kind>` and never contains JSON or markup
+/// metacharacters, so a scrubbed payload stays valid.
+pub fn scrub_secrets(text: &str) -> String {
+    faktor_security::redact(text, &SCRUB_POLICY)
+}
+
+fn scrub_text<const MAX: usize>(value: &mut Text<MAX>) {
+    let scrubbed = scrub_secrets(value.as_str());
+    if scrubbed != value.as_str() {
+        if let Ok(replacement) = Text::<MAX>::new(&scrubbed) {
+            *value = replacement;
+        }
+    }
+}
+
+/// Redact credentials echoed into any free-text field of an offer. Applied
+/// when an observation enters the runtime, so tool outcomes, cache payloads,
+/// snapshots and CAS artifacts can never carry an echoed key.
+pub fn scrub_offer(offer: &mut crate::offer::CommercialOffer) {
+    scrub_text(&mut offer.title);
+    if let Some(description) = &mut offer.description {
+        scrub_text(description);
+    }
+    if let Some(supplier) = &mut offer.supplier {
+        scrub_text(&mut supplier.name);
+    }
+    if let Some(manufacturer) = &mut offer.manufacturer {
+        scrub_text(&mut manufacturer.name);
+    }
+}
+
+/// Scrub every discovery of one search result.
+pub fn scrub_discoveries(discoveries: &mut [crate::connector::Discovery]) {
+    for discovery in discoveries {
+        scrub_text(&mut discovery.title);
+        if let Some(supplier) = &mut discovery.supplier {
+            scrub_text(&mut supplier.name);
+        }
+    }
+}
+
+/// Scrub the offers of every quote candidate.
+pub fn scrub_quote_candidates(candidates: &mut [crate::connector::QuoteCandidate]) {
+    for candidate in candidates {
+        scrub_offer(&mut candidate.offer);
+    }
+}
+
 /// Validate a BLAKE3 digest in bare or `blake3:`-prefixed 64-hex form.
 pub fn validate_digest(value: &str) -> Result<(), SourceError> {
     let bare = value.strip_prefix("blake3:").unwrap_or(value);

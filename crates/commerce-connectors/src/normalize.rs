@@ -119,13 +119,26 @@ pub fn money_from_raw(raw: &RawValue, currency: Currency) -> Result<Money, Norma
     parse_money_text(currency, &text)
 }
 
-/// Parse a decimal money string with optional currency affixes.
+/// Parse a decimal money string with optional currency affixes. When the
+/// text declares a currency through a symbol or ISO code, that declaration
+/// must equal `currency`: `"¥1.20"` is never parsed as USD. A conflict is a
+/// typed [`NormalizeError::CurrencyConflict`], never a silent reinterpretation.
 pub fn parse_money_text(currency: Currency, raw: &str) -> Result<Money, NormalizeError> {
-    let body = strip_currency_affixes(raw)?;
+    let (declared, body) = money_declared_currency(raw)?;
+    if let Some(declared) = declared {
+        if declared != currency {
+            return Err(NormalizeError::CurrencyConflict);
+        }
+    }
+    money_from_body(currency, &body)
+}
+
+/// Parse a numeric body (affixes already stripped) in the given currency.
+pub(crate) fn money_from_body(currency: Currency, body: &str) -> Result<Money, NormalizeError> {
     if body.contains(',') {
         // Grouped thousands: `1,234.56` (or `1,234`). A European decimal
         // comma is ambiguous and refused rather than guessed.
-        if !is_grouped_integer_form(&body) {
+        if !is_grouped_integer_form(body) {
             return Err(NormalizeError::InvalidMoney);
         }
     }
@@ -140,51 +153,21 @@ pub fn parse_money_text(currency: Currency, raw: &str) -> Result<Money, Normaliz
     Ok(money)
 }
 
-/// The byte length of a leading uppercase 3-letter currency code, when one
-/// is present.
-fn uppercase_code_prefix(text: &str) -> Option<usize> {
-    let chars: Vec<char> = text.chars().take(4).collect();
-    if chars.len() < 3 || !chars[..3].iter().all(char::is_ascii_uppercase) {
-        return None;
-    }
-    let boundary_ok = chars.len() == 3
-        || chars[3] == ' '
-        || chars[3].is_ascii_digit()
-        || CURRENCY_SYMBOLS.contains(&chars[3]);
-    if !boundary_ok {
-        return None;
-    }
-    Some(chars[..3].iter().map(|c| c.len_utf8()).sum())
-}
-
-/// The byte length of a trailing uppercase 3-letter currency code, when one
-/// is present.
-fn uppercase_code_suffix(text: &str) -> Option<usize> {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() < 3 {
-        return None;
-    }
-    let tail = &chars[chars.len() - 3..];
-    if !tail.iter().all(char::is_ascii_uppercase) {
-        return None;
-    }
-    let boundary_ok = chars.len() == 3
-        || chars[chars.len() - 4] == ' '
-        || chars[chars.len() - 4].is_ascii_digit()
-        || CURRENCY_SYMBOLS.contains(&chars[chars.len() - 4]);
-    if !boundary_ok {
-        return None;
-    }
-    Some(tail.iter().map(|c| c.len_utf8()).sum())
-}
-
-fn strip_currency_affixes(raw: &str) -> Result<String, NormalizeError> {
+/// Parse a money text that carries its own declaration: returns the declared
+/// currency (`None` for a bare amount) and the numeric body. Every affix is
+/// mapped through the documented symbol/code table; two different declared
+/// currencies in one token are a typed conflict, and an affix that maps to
+/// nothing is a typed refusal (it is never stripped as noise).
+pub(crate) fn money_declared_currency(
+    raw: &str,
+) -> Result<(Option<Currency>, String), NormalizeError> {
     let mut body = raw.trim();
     if body.is_empty() {
         return Err(NormalizeError::InvalidMoney);
     }
     let mut symbols = 0u8;
     let mut codes = 0u8;
+    let mut declared: Option<Currency> = None;
     // Leading affixes: whitespace, at most one currency symbol and at most
     // one uppercase 3-letter code. A stray word is refused, never skipped.
     loop {
@@ -198,6 +181,9 @@ fn strip_currency_affixes(raw: &str) -> Result<String, NormalizeError> {
             if symbols > 1 {
                 return Err(NormalizeError::InvalidMoney);
             }
+            let currency =
+                currency_from_symbol(&first.to_string()).ok_or(NormalizeError::InvalidMoney)?;
+            declare(&mut declared, currency)?;
             body = &trimmed[first.len_utf8()..];
             continue;
         }
@@ -209,14 +195,19 @@ fn strip_currency_affixes(raw: &str) -> Result<String, NormalizeError> {
             if symbols > 1 {
                 return Err(NormalizeError::InvalidMoney);
             }
+            let currency = currency_from_symbol(symbol).ok_or(NormalizeError::InvalidMoney)?;
+            declare(&mut declared, currency)?;
             body = &trimmed[symbol.len()..];
             continue;
         }
-        if let Some(skip) = uppercase_code_prefix(trimmed) {
+        if let Some((skip, currency)) = uppercase_code_prefix(trimmed) {
             codes += 1;
-            if codes > 1 {
+            // A prefix and a suffix code may both be present (`$1.23 USD`);
+            // `declare` refuses them when they disagree.
+            if codes > 2 {
                 return Err(NormalizeError::InvalidMoney);
             }
+            declare(&mut declared, currency)?;
             body = &trimmed[skip..];
             continue;
         }
@@ -238,6 +229,8 @@ fn strip_currency_affixes(raw: &str) -> Result<String, NormalizeError> {
             if symbols > 1 {
                 return Err(NormalizeError::InvalidMoney);
             }
+            let currency = currency_from_symbol(symbol).ok_or(NormalizeError::InvalidMoney)?;
+            declare(&mut declared, currency)?;
             body = &trimmed[..trimmed.len() - symbol.len()];
             continue;
         }
@@ -246,14 +239,18 @@ fn strip_currency_affixes(raw: &str) -> Result<String, NormalizeError> {
             if symbols > 1 {
                 return Err(NormalizeError::InvalidMoney);
             }
+            let currency =
+                currency_from_symbol(&last.to_string()).ok_or(NormalizeError::InvalidMoney)?;
+            declare(&mut declared, currency)?;
             body = &trimmed[..trimmed.len() - last.len_utf8()];
             continue;
         }
-        if let Some(cut) = uppercase_code_suffix(trimmed) {
+        if let Some((cut, currency)) = uppercase_code_suffix(trimmed) {
             codes += 1;
-            if codes > 1 {
+            if codes > 2 {
                 return Err(NormalizeError::InvalidMoney);
             }
+            declare(&mut declared, currency)?;
             body = &trimmed[..trimmed.len() - cut];
             continue;
         }
@@ -264,9 +261,67 @@ fn strip_currency_affixes(raw: &str) -> Result<String, NormalizeError> {
     if body.is_empty() {
         return Err(NormalizeError::InvalidMoney);
     }
-    Ok(body.to_string())
+    Ok((declared, body.to_string()))
 }
 
+/// Record one declared currency, refusing a token that declares two.
+fn declare(declared: &mut Option<Currency>, currency: Currency) -> Result<(), NormalizeError> {
+    match declared {
+        Some(existing) if *existing != currency => Err(NormalizeError::CurrencyConflict),
+        Some(_) => Ok(()),
+        None => {
+            *declared = Some(currency);
+            Ok(())
+        }
+    }
+}
+
+/// The byte length of a leading uppercase 3-letter currency code and its
+/// mapped currency, when one is present.
+fn uppercase_code_prefix(text: &str) -> Option<(usize, Currency)> {
+    let chars: Vec<char> = text.chars().take(4).collect();
+    if chars.len() < 3 || !chars[..3].iter().all(char::is_ascii_uppercase) {
+        return None;
+    }
+    let boundary_ok = chars.len() == 3
+        || chars[3] == ' '
+        || chars[3].is_ascii_digit()
+        || CURRENCY_SYMBOLS.contains(&chars[3]);
+    if !boundary_ok {
+        return None;
+    }
+    let code: String = chars[..3].iter().collect();
+    let currency = Currency::new(&code).ok()?;
+    Some((chars[..3].iter().map(|c| c.len_utf8()).sum(), currency))
+}
+
+/// The byte length of a trailing uppercase 3-letter currency code and its
+/// mapped currency, when one is present.
+fn uppercase_code_suffix(text: &str) -> Option<(usize, Currency)> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() < 3 {
+        return None;
+    }
+    let tail = &chars[chars.len() - 3..];
+    if !tail.iter().all(char::is_ascii_uppercase) {
+        return None;
+    }
+    let boundary_ok = chars.len() == 3
+        || chars[chars.len() - 4] == ' '
+        || chars[chars.len() - 4].is_ascii_digit()
+        || CURRENCY_SYMBOLS.contains(&chars[chars.len() - 4]);
+    if !boundary_ok {
+        return None;
+    }
+    let code: String = tail.iter().collect();
+    let currency = Currency::new(&code).ok()?;
+    Some((tail.iter().map(|c| c.len_utf8()).sum(), currency))
+}
+
+/// The documented grouped-integer rule: at least one grouping separator, a
+/// first group of 1..=3 digits that must not start with `0` (so `0,123` and
+/// `01,234` are refused, never read as 123/1234), and all following groups of
+/// exactly three digits. An optional fractional part is digits only.
 fn is_grouped_integer_form(body: &str) -> bool {
     let digits = body.strip_prefix('-').unwrap_or(body);
     let (integer, fraction) = match digits.split_once('.') {
@@ -283,7 +338,11 @@ fn is_grouped_integer_form(body: &str) -> bool {
         return false;
     }
     let first = groups[0];
-    if first.is_empty() || first.len() > 3 || !first.bytes().all(|b| b.is_ascii_digit()) {
+    if first.is_empty()
+        || first.len() > 3
+        || first.starts_with('0')
+        || !first.bytes().all(|b| b.is_ascii_digit())
+    {
         return false;
     }
     groups[1..]
@@ -619,8 +678,9 @@ pub fn currency_from_symbol(raw: &str) -> Option<Currency> {
 
 /// Parse a strict grouped integer (`1234`, `1,234`). The number must lead
 /// the text; a decimal point or exponent immediately after the integer run
-/// (`1.5`, `1e3`), a sign, or malformed grouping (`12,34`) is refused rather
-/// than truncated into a different quantity.
+/// (`1.5`, `1e3`), a sign, malformed grouping (`12,34`), or a leading-zero
+/// first group (`0,123`, `01,234`) is refused rather than truncated into a
+/// different quantity.
 pub fn parse_grouped_u64(raw: &str) -> Option<u64> {
     let trimmed = raw.trim();
     let first = trimmed.as_bytes().first().copied()?;
@@ -652,6 +712,7 @@ pub fn parse_grouped_u64(raw: &str) -> Option<u64> {
         [first, rest @ ..] => {
             !first.is_empty()
                 && first.len() <= 3
+                && !first.starts_with('0')
                 && first.bytes().all(|b| b.is_ascii_digit())
                 && rest
                     .iter()
@@ -808,45 +869,93 @@ mod tests {
     #[test]
     fn money_accepts_plain_and_affixed_decimals_exactly() {
         let cases = [
-            ("1.23", 1_230_000i64),
-            ("\"1.23\"", 1_230_000),
-            ("\"$1.23\"", 1_230_000),
-            ("\"US$ 1.23\"", 1_230_000),
-            ("\"1.23 USD\"", 1_230_000),
-            ("\"USD 1.23\"", 1_230_000),
-            ("\"¥0.0037\"", 3_700),
-            ("\"1,234.56\"", 1_234_560_000),
-            ("\"1,234\"", 1_234_000_000),
-            ("0", 0),
-            ("\"0.000001\"", 1),
+            ("1.23", Currency::USD, 1_230_000i64),
+            ("\"1.23\"", Currency::USD, 1_230_000),
+            ("\"$1.23\"", Currency::USD, 1_230_000),
+            ("\"US$ 1.23\"", Currency::USD, 1_230_000),
+            ("\"1.23 USD\"", Currency::USD, 1_230_000),
+            ("\"USD 1.23\"", Currency::USD, 1_230_000),
+            // The affix decides the currency: ¥ is never read as USD.
+            ("\"¥0.0037\"", Currency::CNY, 3_700),
+            ("\"CNY 100\"", Currency::CNY, 100_000_000),
+            ("\"€5\"", Currency::EUR, 5_000_000),
+            ("\"£2.50\"", Currency::GBP, 2_500_000),
+            ("\"1,234.56\"", Currency::USD, 1_234_560_000),
+            ("\"1,234\"", Currency::USD, 1_234_000_000),
+            ("0", Currency::USD, 0),
+            ("\"0.000001\"", Currency::USD, 1),
         ];
-        for (token, micros) in cases {
-            let money = money_from_raw(&raw(token), Currency::USD).expect(token);
+        for (token, currency, micros) in cases {
+            let money = money_from_raw(&raw(token), currency).expect(token);
             assert_eq!(money.micros, micros, "token {token}");
+            assert_eq!(money.currency, currency, "token {token}");
         }
     }
 
     #[test]
-    fn money_refuses_ambiguous_or_inexact_tokens() {
-        for token in [
-            "\"1.2345678\"",                  // more than six fractional digits
-            "\"1,23\"",                       // European decimal comma: ambiguous
-            "\"1.2.3\"",                      // two decimal points
-            "\"1e3\"",                        // exponent
-            "\"1.23%\"",                      // percent is not a price
-            "\"abc1.23\"",                    // stray word prefix
-            "\"1.23abc\"",                    // stray word suffix
-            "\"\"",                           // empty
-            "\"   \"",                        // whitespace
-            "\"$ 1.23 $\"",                   // two currency symbols
-            "\"-1.23\"",                      // negative
-            "null",                           // null is not a number token
-            "true",                           // wrong type
-            "\"9223372036854775808.000000\"", // out of i64 range
+    fn money_refuses_ambiguous_inexact_or_mismatched_tokens() {
+        for (token, currency) in [
+            ("\"1.2345678\"", Currency::USD), // more than six fractional digits
+            ("\"1,23\"", Currency::USD),      // European decimal comma: ambiguous
+            ("\"1.2.3\"", Currency::USD),     // two decimal points
+            ("\"1e3\"", Currency::USD),       // exponent
+            ("\"1.23%\"", Currency::USD),     // percent is not a price
+            ("\"abc1.23\"", Currency::USD),   // stray word prefix
+            ("\"1.23abc\"", Currency::USD),   // stray word suffix
+            ("\"\"", Currency::USD),          // empty
+            ("\"   \"", Currency::USD),       // whitespace
+            ("\"$ 1.23 $\"", Currency::USD),  // two currency symbols
+            ("\"-1.23\"", Currency::USD),     // negative
+            ("null", Currency::USD),          // null is not a number token
+            ("true", Currency::USD),          // wrong type
+            ("\"9223372036854775808.000000\"", Currency::USD), // out of i64 range
+            // A declared currency that disagrees with the caller's is a
+            // typed conflict, never a silent reinterpretation.
+            ("\"¥18.20\"", Currency::USD),
+            ("\"€5\"", Currency::USD),
+            ("\"CNY 100\"", Currency::USD),
+            ("\"$18.20\"", Currency::CNY),
+            // A token declaring two different currencies is ambiguous.
+            ("\"USD 1.23 EUR\"", Currency::USD),
+            ("\"$1.23 CNY\"", Currency::USD),
+            // Unmapped symbols are refused, never stripped as noise.
+            ("\"₩100\"", Currency::USD),
         ] {
-            let parsed = money_from_raw(&raw(token), Currency::USD);
+            let parsed = money_from_raw(&raw(token), currency);
             assert!(parsed.is_err(), "token {token} must be refused");
         }
+    }
+
+    #[test]
+    fn declared_currency_extraction_is_deterministic() {
+        assert_eq!(
+            money_declared_currency("¥ 18.20").unwrap(),
+            (Some(Currency::CNY), "18.20".to_string())
+        );
+        assert_eq!(
+            money_declared_currency("18.20 CNY").unwrap(),
+            (Some(Currency::CNY), "18.20".to_string())
+        );
+        assert_eq!(
+            money_declared_currency("€5").unwrap(),
+            (Some(Currency::EUR), "5".to_string())
+        );
+        assert_eq!(
+            money_declared_currency("$ 5").unwrap(),
+            (Some(Currency::USD), "5".to_string())
+        );
+        assert_eq!(
+            money_declared_currency(" 1.20 ").unwrap(),
+            (None, "1.20".to_string())
+        );
+        assert_eq!(
+            money_declared_currency("CNY 1.20 USD"),
+            Err(NormalizeError::CurrencyConflict)
+        );
+        assert_eq!(
+            money_declared_currency("USD EUR"),
+            Err(NormalizeError::CurrencyConflict)
+        );
     }
 
     #[test]
@@ -981,10 +1090,28 @@ mod tests {
         assert_eq!(parse_grouped_u64("1,234"), Some(1234));
         assert_eq!(parse_grouped_u64("1,234 In Stock"), Some(1234));
         assert_eq!(parse_grouped_u64("12,34"), None);
+        // A leading-zero first group is refused: `0,123` is not 123 units.
+        assert_eq!(parse_grouped_u64("0,123"), None);
+        assert_eq!(parse_grouped_u64("0,123 In Stock"), None);
+        assert_eq!(parse_grouped_u64("00,123"), None);
+        assert_eq!(parse_grouped_u64("01,234"), None);
+        assert_eq!(parse_grouped_u64(",123"), None);
         assert_eq!(parse_grouped_u64("1.5"), None);
         assert_eq!(parse_grouped_u64("1e3"), None);
         assert_eq!(parse_grouped_u64("-1"), None);
         assert_eq!(parse_grouped_u64(""), None);
+
+        // The same documented rule applies to grouped money.
+        assert_eq!(
+            parse_money_text(Currency::USD, "1,234.56").unwrap().micros,
+            1_234_560_000
+        );
+        for bad in ["0,123", ",123", "12,34", "00,123", "0,123.45"] {
+            assert!(
+                parse_money_text(Currency::USD, bad).is_err(),
+                "{bad:?} must never be read as a larger amount"
+            );
+        }
     }
 
     #[test]

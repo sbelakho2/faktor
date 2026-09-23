@@ -348,7 +348,13 @@ impl ProductRef {
         }
     }
 
-    /// A stable identity string for cache/digest purposes.
+    /// A stable identity string for cache/digest purposes. A bare part
+    /// number uses the canonical (NON-lossy) [`PartNumberNormalizer`] form:
+    /// punctuation that is part of one part number (`AB#123`) must never be
+    /// erased into another (`AB123`), while normalization-equivalent forms
+    /// (case, width, whitespace) still share one identity. Only a value that
+    /// cannot be normalized at all falls back to a raw (still non-lossy)
+    /// spelling.
     pub fn identity_key(&self) -> String {
         match self {
             Self::Url { url } => format!("url:{}", url.as_str()),
@@ -357,7 +363,13 @@ impl ProductRef {
                 format!("offer:{source}:{}", offer_id.as_str())
             }
             Self::PartNumber { part_number } => {
-                format!("mpn:{}", normalize_query(part_number.as_str()))
+                match PartNumberNormalizer::new().normalize(part_number.as_str()) {
+                    Ok(normalized) => format!("mpn:{}", normalized.canonical()),
+                    Err(_) => format!(
+                        "mpn-raw:{}",
+                        part_number.as_str().trim().to_ascii_uppercase()
+                    ),
+                }
             }
         }
     }
@@ -378,7 +390,9 @@ impl ProductRef {
 
 /// Deterministic query normalization used for identity/digest purposes only
 /// (never for display): lowercase ASCII, collapse whitespace, drop
-/// punctuation that is not part of a part number.
+/// punctuation that is not part of a part number. This is the FREE-TEXT
+/// search normalization; part-number and BOM-line identities use the
+/// non-lossy [`canonical_query`] instead.
 pub fn normalize_query(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut pending_space = false;
@@ -398,6 +412,29 @@ pub fn normalize_query(raw: &str) -> String {
             pending_space = false;
         }
         out.push(lowered);
+    }
+    out
+}
+
+/// The NON-LOSSY canonical form of one query used for line/job identity:
+/// ASCII letters lowercased, runs of whitespace collapsed to one space, and
+/// every other character preserved. Identity must never erase punctuation
+/// that distinguishes two queries — `AB#123` and `AB123` are different
+/// lines — while case/whitespace-equivalent spellings still share one
+/// identity.
+pub fn canonical_query(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut pending_space = false;
+    for ch in raw.chars() {
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(ch.to_ascii_lowercase());
     }
     out
 }
@@ -657,5 +694,27 @@ mod tests {
         assert_eq!(normalize_query("TPS5430-DDAR"), "tps5430-ddar");
         assert_eq!(normalize_query("100nF 0402 (10%)"), "100nf 0402 10");
         assert_eq!(normalize_query("A, B; C"), "a b c");
+    }
+
+    #[test]
+    fn part_number_identity_is_canonical_and_lossless() {
+        let with_hash = ProductRef::parse("AB#123", None).expect("ref");
+        let plain = ProductRef::parse("AB123", None).expect("ref");
+        assert_ne!(
+            with_hash.identity_key(),
+            plain.identity_key(),
+            "punctuation that is part of one part number must never be erased into another"
+        );
+        for spelling in [" tps5430ddar ", "TPS5430DDAR", "tps 5430ddar"] {
+            assert_eq!(
+                ProductRef::parse(spelling, None)
+                    .expect("ref")
+                    .identity_key(),
+                ProductRef::parse("TPS5430DDAR", None)
+                    .expect("ref")
+                    .identity_key(),
+                "{spelling} is normalization-equivalent"
+            );
+        }
     }
 }

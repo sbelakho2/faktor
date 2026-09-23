@@ -8,7 +8,8 @@ use std::sync::Arc;
 use faktor_cloud::billing::{
     task_id_text, CreditLedgerError, ALL_LIMITS, FEATURE_BYOK, FEATURE_CREDITS,
     FEATURE_MANAGED_PROVIDERS, LIMIT_MAX_ACTIVE_TASKS, LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD,
-    LIMIT_MAX_PROVIDER_ATTEMPTS_PER_TASK, LIMIT_MAX_TOKENS_PER_PERIOD, UNIT_PROVIDER_COST,
+    LIMIT_MAX_PROVIDER_ATTEMPTS_PER_TASK, LIMIT_MAX_TOKENS_PER_PERIOD,
+    LIMIT_MIN_CREDIT_BALANCE_MICRO, UNIT_PROVIDER_COST,
 };
 use faktor_cloud::{
     Admission, AdmissionBoundary, AdmissionRequest, BillingAccount, BillingAccountId,
@@ -229,6 +230,45 @@ fn corrections_are_new_events_the_base_row_is_never_mutated() {
         service.correct_usage(&foreign).unwrap_err(),
         faktor_cloud::ControlPlaneError::NotFound(_)
     ));
+}
+
+#[test]
+fn correction_winner_is_latest_by_time_then_id() {
+    let base = usage_event("uev_base");
+    // A correction with a later time but an id that sorts BEFORE the other
+    // correction's id: the TIME must decide, exactly like
+    // `UsageEvent::effective_state`.
+    let mut early = usage_event("uev_z");
+    early.correction_of = Some(base.id.clone());
+    early.provider_cost_micro = 60;
+    early.occurred_at_ms = 1_000;
+    early.reconciliation_state = ReconciliationState::Reconciled;
+    let mut late = usage_event("uev_a");
+    late.correction_of = Some(base.id.clone());
+    late.provider_cost_micro = 99;
+    late.occurred_at_ms = 2_000;
+    late.reconciliation_state = ReconciliationState::Reconciled;
+
+    let events = vec![base.clone(), early.clone(), late.clone()];
+    assert_eq!(
+        UsageEvent::effective_state(&base, &events),
+        late.reconciliation_state,
+        "the effective state and the fold must agree on the winner"
+    );
+    let fold = faktor_cloud::fold_usage(&org("org_a"), &events).unwrap();
+    assert_eq!(
+        fold.totals.provider_cost_micro, 99,
+        "the later correction wins even though its id sorts first"
+    );
+    assert_eq!(fold.totals.managed_cost_micro, 99);
+    assert_eq!(
+        fold.totals.events, 1,
+        "only the winning correction contributes to the totals"
+    );
+    assert_eq!(
+        fold.totals.corrected_events, 3,
+        "base + both corrections are accounted as corrected"
+    );
 }
 
 #[test]
@@ -631,6 +671,81 @@ fn quota_exhaustion_at_admission_names_the_exact_limit() {
     assert_eq!(denied.limit, "plan");
     assert!(ALL_LIMITS.contains(&LIMIT_MAX_ACTIVE_TASKS));
     assert!(ALL_LIMITS.contains(&denied.limit.as_str()) || denied.limit == "plan");
+}
+
+#[test]
+fn configured_min_credit_balance_floor_is_enforced_at_admission() {
+    let mut config = configured();
+    config
+        .plans
+        .get_mut("pro")
+        .expect("pro plan")
+        .limits
+        .insert(LIMIT_MIN_CREDIT_BALANCE_MICRO.to_string(), 500);
+    let service = EntitlementService::new(
+        Arc::new(MemoryBillingStore::new()),
+        Arc::new(ManualClock::new(1_000)),
+        config,
+    )
+    .expect("the floored config is valid");
+    let organization = org("org_a");
+    let acct = account("acct_1");
+    service
+        .ensure_account(&organization, &acct, "acct", true)
+        .unwrap();
+    subscribe(&service, &organization, None);
+
+    // Free balance 0 < configured floor 500: the NEW admission is refused
+    // naming the exact limit and both numbers.
+    let denied = service
+        .check_admission(
+            &organization,
+            &AdmissionRequest::boundary(AdmissionBoundary::NewTask),
+        )
+        .unwrap_err();
+    assert_eq!(denied.limit, LIMIT_MIN_CREDIT_BALANCE_MICRO);
+    assert_eq!(denied.limit_value, Some(500));
+    assert_eq!(denied.observed, 0);
+    assert_eq!(denied.boundary, AdmissionBoundary::NewTask);
+
+    // Balance 600 >= 500: admitted.
+    service
+        .grant_credits(&organization, &acct, 600, "seed", Some("g1"))
+        .unwrap();
+    assert_eq!(
+        service
+            .check_admission(
+                &organization,
+                &AdmissionRequest::boundary(AdmissionBoundary::NewTask)
+            )
+            .unwrap(),
+        Admission::Admitted
+    );
+
+    // A record-before-call hold that drops the FREE balance below the floor
+    // denies the next gated boundary — while a continuation of the in-flight
+    // transaction is never interrupted.
+    service
+        .consume_before_call(&organization, &acct, 200, None, "hold", Some("c1"))
+        .unwrap();
+    let denied = service
+        .check_admission(
+            &organization,
+            &AdmissionRequest::boundary(AdmissionBoundary::NewChildSpawn),
+        )
+        .unwrap_err();
+    assert_eq!(denied.limit, LIMIT_MIN_CREDIT_BALANCE_MICRO);
+    assert_eq!(denied.limit_value, Some(500));
+    assert_eq!(denied.observed, 400);
+    assert_eq!(
+        service
+            .check_admission(
+                &organization,
+                &AdmissionRequest::boundary(AdmissionBoundary::RollbackContinuation)
+            )
+            .unwrap(),
+        Admission::InFlightContinuation
+    );
 }
 
 #[test]

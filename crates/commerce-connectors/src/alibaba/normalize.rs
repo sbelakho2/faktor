@@ -59,10 +59,57 @@ fn quantity_of(resolved: &ResolvedField) -> Option<NonZeroQuantity> {
     resolved.value().and_then(FieldValue::as_quantity)
 }
 
-fn currency_of(resolved: &ResolvedField) -> Currency {
-    match text_of(resolved) {
-        Some(raw) => Currency::new(&raw.to_ascii_uppercase()).unwrap_or(Currency::USD),
-        None => Currency::USD,
+fn currency_of(resolved: &ResolvedField) -> Option<Currency> {
+    text_of(resolved).and_then(|raw| {
+        normalize::currency_from_symbol(&raw)
+            .or_else(|| Currency::new(&raw.to_ascii_uppercase()).ok())
+    })
+}
+
+/// Resolve the offer currency from the declared `Currency` field and every
+/// monetary observation:
+///
+/// * a declared currency must agree with every observed price, or the
+///   acquisition is refused typed (never a silent conversion),
+/// * without a declaration, the unique currency of the observed prices
+///   decides,
+/// * only an inquiry with no monetary observation at all falls back to the
+///   documented buyer-surface default (the currency is unused there).
+fn resolve_currency(
+    declared: Option<Currency>,
+    price: &ResolvedField,
+    variants: &[VariantEntry],
+    drafts: &[Draft],
+) -> Result<Currency, SourceError> {
+    let mut observed: Vec<Currency> = Vec::new();
+    if let Some(money) = money_of(price) {
+        observed.push(money.currency);
+    }
+    for variant in variants {
+        if let Some(money) = variant.unit_price {
+            observed.push(money.currency);
+        }
+    }
+    for draft in drafts {
+        for (_, money) in &draft.tiers {
+            observed.push(money.currency);
+        }
+    }
+    match declared {
+        Some(declared) => {
+            if observed.iter().any(|currency| *currency != declared) {
+                return Err(SourceError::ExtractionConflict);
+            }
+            Ok(declared)
+        }
+        None => {
+            let mut unique = observed.into_iter();
+            let first = unique.next();
+            if unique.any(|currency| Some(currency) != first) {
+                return Err(SourceError::ExtractionConflict);
+            }
+            Ok(first.unwrap_or(super::DEFAULT_CURRENCY))
+        }
     }
 }
 
@@ -104,12 +151,13 @@ pub fn assemble(
     let offer_id = resolve(&observations, Field::OfferId);
     let price = resolve(&observations, Field::Price);
     let inquiry = text_of(&resolve(&observations, Field::InquiryOnly)).is_some();
-    let currency = currency_of(&resolve(&observations, Field::Currency));
+    let declared_currency = currency_of(&resolve(&observations, Field::Currency));
 
     let title = text_of(&title).ok_or(SourceError::ExtractionIncomplete)?;
     let title = Text::<512>::new(&title).map_err(|_| SourceError::ExtractionIncomplete)?;
 
     let variants = variants_of(drafts, &mut conflicts);
+    let currency = resolve_currency(declared_currency, &price, &variants, drafts)?;
     let origin = strongest_origin(drafts);
 
     let moq = quantity_of(&resolve(&observations, Field::MinimumOrder));

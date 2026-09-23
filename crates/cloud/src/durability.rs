@@ -577,8 +577,13 @@ fn age_secs(path: &Path) -> u64 {
 }
 
 /// Every backup of `db_path` (rotating + migration restore points), newest
-/// by mtime first. In-progress snapshots carry a `.tmp-` suffix and are
-/// invisible here by construction.
+/// first. Ordering is by `(mtime, name sequence)`: mtimes can be equal (two
+/// publications in the same filesystem timestamp tick, coarse or frozen
+/// clocks), and a stable mtime-only sort then leaves the "not-yet-rotated
+/// newest" claim to chance — the monotonic `-ms-pid-seq` name tail written
+/// by [`unique_db_name`] breaks every tie so the just-written snapshot is
+/// provably newest and `latest_backup` names it. In-progress snapshots
+/// carry a `.tmp-` suffix and are invisible here by construction.
 pub fn list_backups(db_path: &Path) -> Vec<PathBuf> {
     let dir = backup_dir(db_path);
     let stem = db_stem(db_path);
@@ -594,13 +599,38 @@ pub fn list_backups(db_path: &Path) -> Vec<PathBuf> {
             name.starts_with(&prefix) && name.ends_with(".db") && !name.contains(".tmp-")
         })
         .collect();
-    out.sort_by_key(|p| {
-        std::fs::metadata(p)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::UNIX_EPOCH)
-    });
+    out.sort_by_key(|p| backup_order_key(p));
     out.reverse();
     out
+}
+
+/// The monotonic tail `-{now_ms}-{pid}-{seq}` of a backup name written by
+/// [`unique_db_name`] (migration restore points share the same tail). Any
+/// shape that does not parse contributes zeros: the mtime still dominates,
+/// and the name itself is the final tiebreaker.
+fn backup_name_sequence(name: &str) -> (u128, u32, u64) {
+    let base = name.strip_suffix(".db").unwrap_or(name);
+    let mut parts = base.rsplit('-');
+    let seq = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let pid = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let ms = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    (ms, pid, seq)
+}
+
+/// Total order for [`list_backups`]: publication mtime first, then the
+/// monotonic name tail, then the full name (never a partial order, so equal
+/// mtimes can never leave the newest-victim rule ambiguous).
+fn backup_order_key(path: &Path) -> (std::time::SystemTime, u128, u32, u64, String) {
+    let mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::UNIX_EPOCH);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+    let (ms, pid, seq) = backup_name_sequence(&name);
+    (mtime, ms, pid, seq, name)
 }
 
 /// The newest rotating backup (migration restore points excluded).
@@ -1171,6 +1201,64 @@ mod tests {
         let (newest, _) = latest_backup(&path).unwrap();
         let fp = canonical_fingerprint(&conn).unwrap();
         restore_verify(&newest, &fp).unwrap();
+    }
+
+    /// ADVERSARIAL (equal mtimes): snapshots published within the same
+    /// filesystem timestamp tick must still order deterministically by the
+    /// monotonic name sequence, so rotation never victimizes the just-written
+    /// snapshot and `latest_backup` names the highest sequence (the old
+    /// stable mtime-only sort could invert on a tie and name the wrong file).
+    #[test]
+    fn equal_mtime_rotation_keeps_the_newest_sequence_as_latest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.db");
+        let _conn = open_db(&path);
+        let backups = backup_dir(&path);
+        std::fs::create_dir_all(&backups).unwrap();
+        // MAX_BACKUP_FILES + 1 snapshots with IDENTICAL mtimes and identical
+        // ms/pid prefixes: only the monotonic seq tail can order them.
+        let frozen = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for seq in 0..(MAX_BACKUP_FILES as u64 + 1) {
+            let file_path = backups.join(format!("control-plane-1700000000000-4242-{seq}.db"));
+            std::fs::write(&file_path, b"snapshot").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&file_path)
+                .unwrap()
+                .set_modified(frozen)
+                .unwrap();
+            files.push(file_path);
+        }
+        let newest = files.last().unwrap().clone();
+        let oldest = files.first().unwrap().clone();
+        let listed = list_backups(&path);
+        assert_eq!(listed.len(), files.len());
+        assert_eq!(
+            listed[0], newest,
+            "the highest sequence must be newest on equal mtimes"
+        );
+        assert_eq!(
+            latest_backup(&path).unwrap().0,
+            newest,
+            "latest_backup must name the just-written snapshot, never a wrong tie winner"
+        );
+        rotate_rotating(&path);
+        let kept = list_rotating_backups(&path);
+        assert_eq!(kept.len(), MAX_BACKUP_FILES);
+        assert!(
+            kept.contains(&newest),
+            "the just-written (highest-seq) snapshot is never a victim: {kept:?}"
+        );
+        assert!(!oldest.exists(), "the lowest sequence is the victim");
+        let seqs: Vec<u64> = kept
+            .iter()
+            .map(|p| backup_name_sequence(p.file_name().unwrap().to_str().unwrap()).2)
+            .collect();
+        assert!(
+            seqs.windows(2).all(|window| window[0] > window[1]),
+            "equal-mtime listing is strictly newest-sequence first: {seqs:?}"
+        );
     }
 
     #[test]

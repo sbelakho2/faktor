@@ -122,17 +122,18 @@ impl Draft {
     }
 }
 
-/// Parse one exact amount from buyer-visible text (`US $1.20`, `$1.20`, `1.20`).
+/// Parse one exact amount from buyer-visible text (`US $1.20`, `$1.20`,
+/// `¥18.20`, `CNY 100`). The currency is taken from the token's own symbol or
+/// ISO code — a bare amount declares nothing and yields no observation, and
+/// an affix that contradicts another affix is refused. It is never silently
+/// read as USD.
 pub fn money_from_text(raw: &str) -> Option<faktor_commerce::Money> {
     // Buyer-visible text often separates the code from the symbol
     // (`US $1.20`); normalize that documented spelling, never guess.
     let trimmed = raw.trim().replace("US $", "US$").replace("CN ¥", "CN¥");
-    for currency in [Currency::USD, Currency::EUR, Currency::CNY, Currency::GBP] {
-        if let Ok(money) = normalize::parse_money_text(currency, &trimmed) {
-            return Some(money);
-        }
-    }
-    None
+    let (declared, body) = normalize::money_declared_currency(&trimmed).ok()?;
+    let currency = declared?;
+    normalize::money_from_body(currency, &body).ok()
 }
 
 /// Extract from a browser-network JSON payload (detail envelope).
@@ -513,6 +514,12 @@ fn extract_value(
     if let Some(title) = title {
         draft.push_text(source, Field::Title, &title, now_ms);
     }
+    // The payload-level currency is the only non-guessing source for bare
+    // JSON numbers; it is never defaulted to USD.
+    let declared = product
+        .get("currency")
+        .and_then(text_field)
+        .and_then(|raw| normalize::currency_from_symbol(&raw));
     if inquiry {
         draft.push_text(source, Field::InquiryOnly, "inquiry", now_ms);
     } else {
@@ -520,29 +527,29 @@ fn extract_value(
             draft.push_text(source, Field::Currency, &currency, now_ms);
         }
         if let Some(range) = product.get("priceRange") {
-            let currency = range
+            let range_currency = range
                 .get("currency")
                 .and_then(text_field)
-                .and_then(|raw| faktor_commerce::Currency::new(&raw.to_ascii_uppercase()).ok())
-                .unwrap_or(Currency::USD);
+                .and_then(|raw| normalize::currency_from_symbol(&raw))
+                .or(declared);
             if let Some(low) = range
                 .get("min")
                 .or_else(|| range.get("low"))
-                .and_then(|value| json_money(value, currency))
+                .and_then(|value| json_money(value, range_currency))
             {
                 draft.push_money(source, Field::PriceRangeLow, low, now_ms);
             }
             if let Some(high) = range
                 .get("max")
                 .or_else(|| range.get("high"))
-                .and_then(|value| json_money(value, currency))
+                .and_then(|value| json_money(value, range_currency))
             {
                 draft.push_money(source, Field::PriceRangeHigh, high, now_ms);
             }
         }
         if let Some(money) = product
             .get("price")
-            .and_then(|value| json_money(value, Currency::USD))
+            .and_then(|value| json_money(value, declared))
         {
             draft.push_money(source, Field::Price, money, now_ms);
         }
@@ -553,7 +560,7 @@ fn extract_value(
                         .or_else(|| tier.get("minQuantity"))
                         .and_then(Value::as_u64),
                     tier.get("price")
-                        .and_then(|value| json_money(value, Currency::USD)),
+                        .and_then(|value| json_money(value, declared)),
                 ) {
                     if let Ok(Some(quantity)) = normalize::nonzero_quantity(ladder) {
                         draft.tiers.push((quantity, price));
@@ -562,7 +569,7 @@ fn extract_value(
             }
         }
         // Variants are the authoritative price source when they carry prices.
-        draft.variants = variants_from_sku_options(product);
+        draft.variants = variants_from_sku_options(product, declared);
     }
     if let Some(moq) = product
         .get("moq")
@@ -617,7 +624,7 @@ fn extract_value(
     draft
 }
 
-fn variants_from_sku_options(product: &Value) -> Vec<VariantEntry> {
+fn variants_from_sku_options(product: &Value, declared: Option<Currency>) -> Vec<VariantEntry> {
     let Some(options) = product.get("skuOptions").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -645,7 +652,7 @@ fn variants_from_sku_options(product: &Value) -> Vec<VariantEntry> {
         }
         let price = option
             .get("price")
-            .and_then(|value| json_money(value, Currency::USD));
+            .and_then(|value| json_money(value, declared));
         let moq = option
             .get("moq")
             .and_then(Value::as_u64)
@@ -673,12 +680,29 @@ fn text_field(value: &Value) -> Option<String> {
     }
 }
 
-fn json_money(value: &Value, currency: Currency) -> Option<faktor_commerce::Money> {
+/// Parse one JSON money token deterministically:
+///
+/// * a string with its own symbol/code decides the currency; a conflicting
+///   payload-level declaration yields no observation,
+/// * a string without an affix uses the payload-level currency,
+/// * a bare JSON number has no affix and requires the payload-level
+///   currency; without it there is no observation (never a USD guess).
+fn json_money(value: &Value, declared: Option<Currency>) -> Option<faktor_commerce::Money> {
     match value {
-        Value::String(raw) => normalize::parse_money_text(currency, raw)
-            .ok()
-            .or_else(|| money_from_text(raw)),
-        Value::Number(number) => normalize::parse_money_text(currency, &number.to_string()).ok(),
+        Value::String(raw) => {
+            let (affix, body) = normalize::money_declared_currency(raw).ok()?;
+            let currency = match (affix, declared) {
+                (Some(affix), Some(declared)) if affix != declared => return None,
+                (Some(affix), _) => affix,
+                (None, Some(declared)) => declared,
+                (None, None) => return None,
+            };
+            normalize::money_from_body(currency, &body).ok()
+        }
+        Value::Number(number) => {
+            let currency = declared?;
+            normalize::money_from_body(currency, &number.to_string()).ok()
+        }
         _ => None,
     }
 }
@@ -757,4 +781,124 @@ pub fn variant_error() -> SourceError {
 pub fn variant_id_for(spec: &str) -> Result<VariantId, SourceError> {
     let attributes = attributes_from_spec(spec);
     crate::contract::extract::canonical_variant_id(&attributes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::alibaba::normalize::assemble;
+    use faktor_commerce::money::Money;
+    use faktor_commerce::text::CanonicalUrl;
+    use serde_json::json;
+
+    #[test]
+    fn buyer_text_currency_comes_from_the_affix_never_from_a_usd_guess() {
+        let cases = [
+            ("$18.20", Currency::USD, 18_200_000i64),
+            ("US $1.20", Currency::USD, 1_200_000),
+            ("¥18.20", Currency::CNY, 18_200_000),
+            ("CN ¥18.20", Currency::CNY, 18_200_000),
+            ("CNY 100", Currency::CNY, 100_000_000),
+            ("€5", Currency::EUR, 5_000_000),
+            ("5 EUR", Currency::EUR, 5_000_000),
+            ("£2.50", Currency::GBP, 2_500_000),
+        ];
+        for (raw, currency, micros) in cases {
+            let money = money_from_text(raw).unwrap_or_else(|| panic!("{raw} parses"));
+            assert_eq!(money.currency, currency, "{raw}");
+            assert_eq!(money.micros, micros, "{raw}");
+        }
+        // A bare amount declares nothing: no observation (never USD).
+        for raw in ["18.20", "1,234.56", "\u{a5}100 USD", "$1.23 CNY", "₩100"] {
+            assert!(money_from_text(raw).is_none(), "{raw} must not be a price");
+        }
+    }
+
+    #[test]
+    fn json_money_requires_agreement_between_affix_and_payload_currency() {
+        let usd = |value: serde_json::Value, declared| json_money(&value, declared);
+        // A bare number uses the payload's declared currency.
+        assert_eq!(
+            usd(json!(18.2), Some(Currency::CNY))
+                .expect("declared")
+                .currency,
+            Currency::CNY
+        );
+        // Without a declared currency, a bare number is never guessed.
+        assert!(usd(json!(18.2), None).is_none());
+        // An affix decides; agreement with the payload is required.
+        assert_eq!(
+            usd(json!("¥18.20"), Some(Currency::CNY))
+                .expect("affix")
+                .micros,
+            18_200_000
+        );
+        assert_eq!(
+            usd(json!("€5"), None).expect("affix alone").currency,
+            Currency::EUR
+        );
+        // Disagreement yields no observation (the assembly layer then refuses
+        // an uncovered price as ExtractionIncomplete, never a USD conversion).
+        assert!(usd(json!("¥18.20"), Some(Currency::USD)).is_none());
+        assert!(usd(json!("$18.20"), Some(Currency::CNY)).is_none());
+        // A token declaring two currencies is ambiguous.
+        assert!(usd(json!("USD 1.23 EUR"), Some(Currency::USD)).is_none());
+    }
+
+    #[test]
+    fn assembly_infers_the_currency_from_prices_and_refuses_conflicts() {
+        let source = SourceId::new("alibaba").expect("source");
+        let rig = crate::testsupport::Rig::new();
+        let ctx = rig.ctx();
+        let url = CanonicalUrl::parse("https://www.alibaba.com/product-detail/_1600123456789.html")
+            .expect("url");
+
+        let draft_with = |field_price: Option<Money>, declared: Option<&str>| {
+            let mut draft = Draft::success(Strategy::NetworkJson, None);
+            draft.push_text(&source, Field::Title, "USB Cable", 1);
+            if let Some(declared) = declared {
+                draft.push_text(&source, Field::Currency, declared, 1);
+            }
+            if let Some(price) = field_price {
+                draft.push_money(&source, Field::Price, price, 1);
+            }
+            draft
+        };
+
+        // No declared currency: the observed price's currency decides.
+        let offer = assemble(
+            &source,
+            &ctx,
+            &url,
+            &[draft_with(
+                Some(Money::from_micros(Currency::CNY, 18_200_000)),
+                None,
+            )],
+            1,
+        )
+        .expect("currency inferred from the price");
+        assert_eq!(offer.offer.currency, Currency::CNY);
+
+        // A declared currency that disagrees with the price refuses typed.
+        let error = assemble(
+            &source,
+            &ctx,
+            &url,
+            &[draft_with(
+                Some(Money::from_micros(Currency::USD, 5_000_000)),
+                Some("CNY"),
+            )],
+            1,
+        )
+        .expect_err("declared/price conflict must refuse");
+        assert_eq!(error, SourceError::ExtractionConflict);
+
+        // An inquiry with no monetary observation keeps the documented
+        // buyer-surface default (the currency is unused there).
+        let mut inquiry = Draft::success(Strategy::NetworkJson, None);
+        inquiry.push_text(&source, Field::Title, "USB Cable", 1);
+        inquiry.push_text(&source, Field::InquiryOnly, "inquiry", 1);
+        let offer = assemble(&source, &ctx, &url, &[inquiry], 1).expect("inquiry offer");
+        assert_eq!(offer.offer.currency, crate::alibaba::DEFAULT_CURRENCY);
+    }
 }

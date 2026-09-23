@@ -6319,6 +6319,7 @@ impl AgentRuntime {
                 let executed = self
                     .run_tool_calls(
                         handle,
+                        &tool_bundle,
                         op_id,
                         &mut detector,
                         &mut ledger,
@@ -7351,11 +7352,15 @@ impl AgentRuntime {
     }
 
     /// Execute tool calls in parallel via the scheduler, feeding results
-    /// back. Returns the number of tools actually executed.
+    /// back. Returns the number of tools actually executed. Every call must
+    /// be a MEMBER of `active_bundle` — the exact bundle the answered
+    /// request was planned with — or it is refused typed before the
+    /// permission hop (see the membership guard below).
     #[allow(clippy::too_many_arguments)]
     async fn run_tool_calls(
         self: &Arc<Self>,
         handle: &faktor_session::SessionHandle,
+        active_bundle: &ToolBundle,
         turn_op: OpId,
         detector: &mut LoopDetector,
         ledger: &mut TaskLedger,
@@ -7444,6 +7449,40 @@ impl AgentRuntime {
                     continue;
                 }
             };
+
+            // Active-bundle membership guard (docs/acquire.md §4 hardening):
+            // the model may only invoke tools the request it is answering
+            // actually carried. A REGISTERED tool that is not in the turn's
+            // constructed bundle — today the lazy `source_market` before its
+            // activation — is refused here with a typed denial BEFORE the
+            // permission hop and before any execution, so no permission
+            // prompt, no run row and no tool/service call can happen. The
+            // refusal reason names ONLY the tool the model itself used:
+            // schema and description never leak.
+            if !active_bundle.tools.iter().any(|spec| spec.name == name) {
+                let reason =
+                    format!("tool {name} is not part of the active tool bundle for this turn");
+                detector.record_error(&format!("inactive tool {name} refused"));
+                // Uniform journal outcome, exactly like the unknown-tool
+                // refusal: every refusal is durable audit, never a silent
+                // skip (the self-transition is legal from the batch-entry
+                // state).
+                handle
+                    .append_journal_event(
+                        faktor_core::event::EventKind::PermissionDenied,
+                        handle.state()?,
+                        Some(turn_op),
+                        Some(serde_json::json!({ "tool": name, "reason": reason })),
+                    )
+                    .await?;
+                denied.push(DeniedToolCall {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    kind: ToolDenialKind::NotInActiveBundle,
+                    reason,
+                });
+                continue;
+            }
 
             // Permission hop (journals ToolRequested).
             let capability = tool.capability.clone().unwrap_or(Capability::ExecuteShell {
@@ -12970,6 +13009,33 @@ enum DurableWriteIntent {
     },
 }
 
+/// Verdict of a durable-write marker's `session` field (the marker's ONLY
+/// authority to be applied). Strict on purpose: the previous `is_some_and`
+/// check treated an ABSENT or non-numeric field as "mine", so a corrupt or
+/// tampered marker could apply a cross-session Abort/RouteTaskState/
+/// FinishTurnRecord. Only [`MarkerSession::Ours`] may be replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerSession {
+    /// The marker names exactly this session and may be replayed.
+    Ours,
+    /// A well-formed id of a DIFFERENT session: retained for that session's
+    /// open (every open scans the whole directory), never applied here.
+    Foreign(u64),
+    /// Absent, non-numeric, out of range, or zero: corrupt/tampered.
+    /// Retained loudly; never applied anywhere.
+    Malformed,
+}
+
+/// Classify one marker's session identity against the opening session. Ids
+/// are non-zero by construction, so `0` is malformed, not a session.
+fn marker_session_verdict(marker: &serde_json::Value, session: u64) -> MarkerSession {
+    match marker.get("session").and_then(|value| value.as_u64()) {
+        Some(0) | None => MarkerSession::Malformed,
+        Some(other) if other == session => MarkerSession::Ours,
+        Some(other) => MarkerSession::Foreign(other),
+    }
+}
+
 impl AgentRuntime {
     /// Directory of the retry-on-next-open markers (see
     /// [`DURABLE_WRITE_MARKER_DIR`]).
@@ -13143,12 +13209,37 @@ impl AgentRuntime {
                     continue;
                 }
             };
-            if marker
-                .get("session")
-                .and_then(|s| s.as_u64())
-                .is_some_and(|s| s != handle.id().raw())
-            {
-                continue; // another session's marker (replayed at ITS open)
+            // The session identity field is the ONLY thing that decides
+            // whether a marker may be applied to this session. A missing,
+            // non-numeric, zero or otherwise unparseable value is a corrupt
+            // or tampered marker: applying it cross-session would let an
+            // attacker (or a partial write) abort/route/finish ANOTHER
+            // session's turn. Refuse it, keep it for forensics and surface
+            // it loudly; only a well-formed marker that names exactly this
+            // session may be replayed here.
+            match marker_session_verdict(&marker, handle.id().raw()) {
+                MarkerSession::Ours => {}
+                MarkerSession::Foreign(other) => {
+                    // Retained for that session's own open (every open scans
+                    // the whole directory). Never applied here, and the
+                    // refusal is surfaced — a marker whose session field is
+                    // a different id is never silently trusted.
+                    tracing::warn!(
+                        session = %handle.id(),
+                        marker_session = other,
+                        path = %path.display(),
+                        "durable-write marker belongs to another session; retaining it for that session's open, never applying it here"
+                    );
+                    continue;
+                }
+                MarkerSession::Malformed => {
+                    tracing::error!(
+                        session = %handle.id(),
+                        path = %path.display(),
+                        "durable-write marker carries no usable session field (absent/non-numeric/zero); retaining it and never applying it cross-session"
+                    );
+                    continue;
+                }
             }
             let status = marker
                 .get("status")
@@ -14345,6 +14436,10 @@ enum ToolDenialKind {
     SecretDetected,
     /// The task's ChangeBudget refused the declared write.
     ChangeBudgetRefused,
+    /// The model named a registered tool that is not in the active tool
+    /// bundle the request it answered actually carried (a lazy tool that
+    /// was never activated this session).
+    NotInActiveBundle,
 }
 
 impl ToolDenialKind {
@@ -14356,6 +14451,7 @@ impl ToolDenialKind {
             ToolDenialKind::HookDenied => "hook_denied",
             ToolDenialKind::SecretDetected => "secret_detected",
             ToolDenialKind::ChangeBudgetRefused => "change_budget_refused",
+            ToolDenialKind::NotInActiveBundle => "not_in_active_bundle",
         }
     }
 }
@@ -17284,16 +17380,98 @@ const TOOL_ACTIVATION_FACT_KEY: &str = "set";
 /// Newest-first page size of the bounded durable scan.
 const TOOL_ACTIVATION_PAGE: i64 = 200;
 /// Bounded page walk of the durable scan: a missed flag degrades to the
-/// in-turn deterministic detection, never to a wrong activation.
+/// in-turn deterministic detection, never to a wrong activation. Exhausting
+/// this bound without a decisive fact is diagnosed LOUDLY and falls back to
+/// the safe inactive default (never a silent revert).
 const TOOL_ACTIVATION_MAX_PAGES: usize = 16;
 
+/// Typed verdict of the bounded durable activation-fact scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolActivationScan {
+    /// The activation fact was found inside the bound (an explicit empty
+    /// set from `/source off` is still a decisive fact).
+    Found,
+    /// The walk reached the end of the fact table inside the bound: the
+    /// absence is decisive — the session is genuinely fresh.
+    Absent,
+    /// The page bound was exhausted while older pages still existed, so the
+    /// scan could NOT prove the session's set. The safe inactive default
+    /// applies and the exhaustion is emitted as a loud typed diagnostic —
+    /// never a silent revert to inactive.
+    BoundExhausted,
+    /// The durable read failed (already warned): the safe inactive default.
+    ReadFailed,
+}
+
+/// One load of the session's durable activation set with its typed scan
+/// verdict ([`ToolActivationScan`]).
+#[derive(Debug)]
+struct ToolActivationLoad {
+    set: ToolActivationSet,
+    scan: ToolActivationScan,
+}
+
+impl ToolActivationLoad {
+    /// Whether the durable flag exists (an empty [set](Self::set) still
+    /// counts: it is the explicit deactivation fact).
+    fn found(&self) -> bool {
+        self.scan == ToolActivationScan::Found
+    }
+}
+
+/// Test-only observation sink of the activation-scan diagnostics (see
+/// [`AgentRuntime::load_tool_activation`]): store-scoped so a concurrent
+/// test over its own store can never steal another test's event.
+#[cfg(test)]
+pub(crate) mod activation_scan_diagnostics {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    /// The loud diagnostic one bounded scan emitted.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Diagnostic {
+        /// The `pages x page_size` walk ended AT the bound while older pages
+        /// still existed and no activation fact was seen: the set could not
+        /// be proven, so the scan fell back to the safe inactive default.
+        BoundExhausted { pages: usize, page_size: i64 },
+    }
+
+    fn events() -> &'static Mutex<HashMap<PathBuf, Vec<Diagnostic>>> {
+        static EVENTS: OnceLock<Mutex<HashMap<PathBuf, Vec<Diagnostic>>>> = OnceLock::new();
+        EVENTS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub fn record(root: &Path, diagnostic: Diagnostic) {
+        events()
+            .lock()
+            .unwrap()
+            .entry(root.to_path_buf())
+            .or_default()
+            .push(diagnostic);
+    }
+
+    pub fn events_for(root: &Path) -> Vec<Diagnostic> {
+        events()
+            .lock()
+            .unwrap()
+            .get(root)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn clear(root: &Path) {
+        events().lock().unwrap().remove(root);
+    }
+}
+
 impl AgentRuntime {
-    /// Load the session's durable activation set; `found` reports whether the
-    /// durable flag exists (missing = fresh session, empty set).
-    fn load_tool_activation(
-        &self,
-        handle: &faktor_session::SessionHandle,
-    ) -> (ToolActivationSet, bool) {
+    /// Load the session's durable activation set with the typed scan verdict
+    /// ([`ToolActivationScan`]): `Found` reports the durable flag (missing =
+    /// fresh session, empty set), `Absent` proves it does not exist inside
+    /// the bound, `BoundExhausted` means the bound ran out with older pages
+    /// still present and the safe inactive default applies — LOUDLY.
+    fn load_tool_activation(&self, handle: &faktor_session::SessionHandle) -> ToolActivationLoad {
         let mut cursor: Option<(i64, String, String)> = None;
         for _ in 0..TOOL_ACTIVATION_MAX_PAGES {
             let page = match handle.memory_facts_page(cursor.as_ref(), TOOL_ACTIVATION_PAGE) {
@@ -17303,7 +17481,10 @@ impl AgentRuntime {
                         session = %handle.id(),
                         "tool activation read failed: {error}"
                     );
-                    return (ToolActivationSet::new(), false);
+                    return ToolActivationLoad {
+                        set: ToolActivationSet::new(),
+                        scan: ToolActivationScan::ReadFailed,
+                    };
                 }
             };
             for (kind, key, value) in &page.facts {
@@ -17313,15 +17494,52 @@ impl AgentRuntime {
                     for name in names {
                         set.activate(name);
                     }
-                    return (set, true);
+                    return ToolActivationLoad {
+                        set,
+                        scan: ToolActivationScan::Found,
+                    };
                 }
             }
             match page.cursor {
                 Some(next) if page.has_more => cursor = Some(next),
-                _ => break,
+                // The walk reached the end of the fact table: the absence is
+                // decisive, the session is genuinely fresh (or explicitly
+                // deactivated) and the empty set is the truth.
+                _ => {
+                    return ToolActivationLoad {
+                        set: ToolActivationSet::new(),
+                        scan: ToolActivationScan::Absent,
+                    }
+                }
             }
         }
-        (ToolActivationSet::new(), false)
+        // Bound exhausted and the last page still had older rows: the scan
+        // cannot prove the set. Keep the safe inactive default but make the
+        // degradation LOUD (a durable activation older than the window must
+        // never be silently reverted to inactive) and expose the same typed
+        // event to tests.
+        tracing::error!(
+            session = %handle.id(),
+            pages = TOOL_ACTIVATION_MAX_PAGES,
+            page_size = TOOL_ACTIVATION_PAGE,
+            "tool activation scan bound exhausted without a decisive fact; falling back to the \
+             safe inactive default (an activation fact older than the {}x{} newest-first window \
+             is not applied this turn)",
+            TOOL_ACTIVATION_MAX_PAGES,
+            TOOL_ACTIVATION_PAGE,
+        );
+        #[cfg(test)]
+        activation_scan_diagnostics::record(
+            self.deps.session.store().root(),
+            activation_scan_diagnostics::Diagnostic::BoundExhausted {
+                pages: TOOL_ACTIVATION_MAX_PAGES,
+                page_size: TOOL_ACTIVATION_PAGE,
+            },
+        );
+        ToolActivationLoad {
+            set: ToolActivationSet::new(),
+            scan: ToolActivationScan::BoundExhausted,
+        }
     }
 
     /// Persist the session's activation set. A failure is logged and the
@@ -17374,14 +17592,14 @@ impl AgentRuntime {
         history: &[RequestMessage],
         capabilities: &faktor_core::model::ModelCapabilities,
     ) -> ToolBundle {
-        let (activation, stored) = self.load_tool_activation(handle);
+        let load = self.load_tool_activation(handle);
         let text = Self::newest_user_text(history);
         let next = if text.is_empty() {
-            activation.clone()
+            load.set.clone()
         } else {
-            self.deps.tools.activation_for_text(&activation, &text)
+            self.deps.tools.activation_for_text(&load.set, &text)
         };
-        if next != activation || (!stored && !next.is_empty()) {
+        if next != load.set || (!load.found() && !next.is_empty()) {
             self.store_tool_activation(handle, &next);
         }
         self.deps.tools.bundle_for_phase_with_activation(
@@ -17993,16 +18211,20 @@ mod tests {
             .unwrap();
 
         // Fresh session: nothing stored, nothing active.
-        let (set, found) = runtime.load_tool_activation(&handle);
-        assert!(set.is_empty() && !found);
+        let load = runtime.load_tool_activation(&handle);
+        assert!(load.set.is_empty() && !load.found());
+        assert_eq!(load.scan, ToolActivationScan::Absent);
 
         // A signal turn activates and persists.
         runtime
             .run_turn(session, "source this part: TPS5430DDAR", &[])
             .await
             .unwrap();
-        let (set, found) = runtime.load_tool_activation(&handle);
-        assert!(found && set.is_active("source_market"), "{set:?}");
+        let load = runtime.load_tool_activation(&handle);
+        assert!(
+            load.found() && load.set.is_active("source_market"),
+            "{load:?}"
+        );
 
         // The flag is durable across a runtime restart over the same store.
         let facts = handle.memory_facts().unwrap();
@@ -18029,13 +18251,16 @@ mod tests {
 
         // `/source off` deactivates and the deactivation persists.
         runtime.run_turn(session, "/source off", &[]).await.unwrap();
-        let (set, found) = runtime.load_tool_activation(&handle);
-        assert!(found && set.is_empty(), "{set:?}");
+        let load = runtime.load_tool_activation(&handle);
+        assert!(load.found() && load.set.is_empty(), "{load:?}");
 
         // The explicit `/source on` flag re-activates and persists too.
         runtime.run_turn(session, "/source on", &[]).await.unwrap();
-        let (set, found) = runtime.load_tool_activation(&handle);
-        assert!(found && set.is_active("source_market"), "{set:?}");
+        let load = runtime.load_tool_activation(&handle);
+        assert!(
+            load.found() && load.set.is_active("source_market"),
+            "{load:?}"
+        );
     }
 
     /// `tools_bundle_for_turn` over an empty history and fresh session is
@@ -18066,6 +18291,273 @@ mod tests {
             serde_json::to_vec(&bundle).unwrap()
         );
         assert_eq!(baseline.bundle_hash(), bundle.bundle_hash());
+    }
+
+    /// A lazy `source_market` whose body counts executions; description and
+    /// schema carry canaries so the refusal tests can prove neither ever
+    /// leaks beyond the tool name the model itself used.
+    fn counting_lazy_market_tool(executions: Arc<std::sync::atomic::AtomicUsize>) -> Tool {
+        Tool {
+            name: "source_market".into(),
+            description: "SOURCE_MARKET_DESCRIPTION_CANARY".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "op": {"enum": ["search"]},
+                    "canary": {"const": "SOURCE_MARKET_SCHEMA_CANARY"}
+                },
+                "required": ["op"],
+                "additionalProperties": false
+            }),
+            resource_class: faktor_core::resource::ResourceClass::Network,
+            capability: None,
+            recovery_hint: RecoveryHint::Idempotent,
+            path_args: vec![],
+            execute: Arc::new(move |_ctx, _args| {
+                let executions = executions.clone();
+                Box::pin(async move {
+                    executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(ToolOutcome {
+                        text: "sourced".into(),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    })
+                })
+            }),
+        }
+    }
+
+    fn counting_lazy_registry(executions: Arc<std::sync::atomic::AtomicUsize>) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register_lazy(
+            counting_lazy_market_tool(executions),
+            crate::activation::ToolExposure::lazy(
+                crate::activation::acquire_source_phases(),
+                crate::activation::acquire_source_triggers(),
+            ),
+        );
+        registry
+    }
+
+    /// Dispatch membership guard: the model names a REGISTERED lazy tool
+    /// (`source_market`) that is NOT in the turn's active bundle. The call is
+    /// refused typed BEFORE the permission hop (no permission request row, no
+    /// `ToolRequested` event) and BEFORE any execution; the refusal names the
+    /// tool and answers the call (never dangling), and it never leaks the
+    /// tool's schema or description.
+    #[tokio::test]
+    async fn inactive_lazy_tool_named_by_the_model_is_refused_before_any_execution() {
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "market".into(),
+                    name: "source_market".into(),
+                    input: serde_json::json!({"op": "search", "q": "TPS5430DDAR"}),
+                },
+                ScriptedResponse::End,
+            ]),
+            vec![],
+        );
+        deps.tools = Arc::new(counting_lazy_registry(executions.clone()));
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        // An ordinary prompt carries no activation signal: the bundle the
+        // request was planned with cannot contain `source_market`.
+        let outcome = runtime
+            .run_turn(session, "fix the parser in src/parser.rs", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_refusal_answered(
+            &runtime,
+            session,
+            "market",
+            "not_in_active_bundle",
+            "source_market",
+            &executions,
+        );
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        // The permission hop itself was skipped: no ToolRequested event and
+        // no durable permission row can exist for the refused call.
+        let events = handle.events_range(1, None).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.kind == faktor_core::event::EventKind::ToolRequested),
+            "the membership guard must refuse before the permission hop"
+        );
+        // The refusal carries the NAME only: schema/description canaries stay
+        // out of the durable (model-visible) result.
+        let (excerpt, exit) = tool_result_for(&handle, "market").expect("answered");
+        assert_eq!(exit, Some(1));
+        assert!(
+            !excerpt.contains("CANARY"),
+            "the refusal must not leak schema/description: {excerpt}"
+        );
+    }
+
+    /// The guard does not weaken normal tools: in ONE mixed batch the
+    /// inactive lazy call is refused while a normal sibling executes, and the
+    /// turn continues lawfully.
+    #[tokio::test]
+    async fn membership_guard_refuses_inactive_lazy_call_but_normal_sibling_executes() {
+        let market_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let echo_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = counting_lazy_registry(market_execs.clone());
+        registry.register(counting_echo_tool(echo_execs.clone()));
+        let (mut deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "market".into(),
+                    name: "source_market".into(),
+                    input: serde_json::json!({"op": "search"}),
+                },
+                ScriptedResponse::ToolCall {
+                    id: "ok".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![],
+        );
+        deps.tools = Arc::new(registry);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime.run_turn(session, "use both", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(
+            market_execs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the inactive lazy call must never execute"
+        );
+        assert_eq!(
+            echo_execs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the normal sibling must be unaffected by the membership guard"
+        );
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let (echo_excerpt, echo_exit) = tool_result_for(&handle, "ok").expect("echo answered");
+        assert_eq!(echo_exit, Some(0));
+        assert_eq!(echo_excerpt, "echo: {\"x\":1}");
+        let (refusal, refusal_exit) = tool_result_for(&handle, "market").expect("refused");
+        assert_eq!(refusal_exit, Some(1));
+        assert!(
+            refusal.contains("tool call denied (not_in_active_bundle)"),
+            "{refusal}"
+        );
+        assert!(
+            !refusal.contains("CANARY"),
+            "the refusal must not leak schema/description: {refusal}"
+        );
+        assert!(dangling_tool_calls(&handle).is_empty());
+    }
+
+    /// The same call executes once the tool is ACTIVATED: a decisive signal
+    /// in the newest user text puts `source_market` into the bundle the
+    /// request is planned with, so dispatch accepts it.
+    #[tokio::test]
+    async fn activated_lazy_tool_is_dispatchable_and_executes() {
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "market".into(),
+                    name: "source_market".into(),
+                    input: serde_json::json!({"op": "search", "q": "TPS5430DDAR"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![],
+        );
+        deps.tools = Arc::new(counting_lazy_registry(executions.clone()));
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime
+            .run_turn(session, "please source this part: TPS5430DDAR", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an activated lazy tool must execute"
+        );
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let (excerpt, exit) = tool_result_for(&handle, "market").expect("answered");
+        assert_eq!(exit, Some(0));
+        assert_eq!(excerpt, "sourced");
+        assert!(dangling_tool_calls(&handle).is_empty());
+        let load = runtime.load_tool_activation(&handle);
+        assert!(load.found() && load.set.is_active("source_market"));
+    }
+
+    /// The bounded durable activation scan must stay LOUD when it cannot
+    /// reach the fact: 16x200 newest facts newer than the activation fact
+    /// push it out of the window. The scan keeps the safe inactive default
+    /// AND emits the typed diagnostic (observable here through the test
+    /// sink) — never a silent revert.
+    #[tokio::test]
+    async fn activation_scan_bound_exhaustion_is_loud_and_defaults_inactive() {
+        let (mut deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        deps.tools = Arc::new(lazy_registry());
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let root = runtime.deps().session.store().root().to_path_buf();
+        activation_scan_diagnostics::clear(&root);
+
+        // A decisive activation fact first ...
+        handle
+            .upsert_memory_fact(
+                TOOL_ACTIVATION_FACT_KIND,
+                TOOL_ACTIVATION_FACT_KEY,
+                "[\"source_market\"]",
+            )
+            .unwrap();
+        // ... then enough strictly-NEWER facts to exhaust the page bound.
+        let seeds: Vec<(String, String, String)> =
+            (0..TOOL_ACTIVATION_MAX_PAGES * TOOL_ACTIVATION_PAGE as usize + 1)
+                .map(|i| ("zzz_seed".to_string(), format!("k{i:05}"), "v".to_string()))
+                .collect();
+        let seed_refs: Vec<(&str, &str, &str)> = seeds
+            .iter()
+            .map(|(kind, key, value)| (kind.as_str(), key.as_str(), value.as_str()))
+            .collect();
+        runtime
+            .deps()
+            .session
+            .store()
+            .upsert_memory_facts(session, &seed_refs)
+            .unwrap();
+
+        let load = runtime.load_tool_activation(&handle);
+        assert_eq!(load.scan, ToolActivationScan::BoundExhausted);
+        assert!(!load.found());
+        assert!(
+            load.set.is_empty(),
+            "the safe inactive default must apply: {load:?}"
+        );
+        assert_eq!(
+            activation_scan_diagnostics::events_for(&root),
+            vec![activation_scan_diagnostics::Diagnostic::BoundExhausted {
+                pages: TOOL_ACTIVATION_MAX_PAGES,
+                page_size: TOOL_ACTIVATION_PAGE,
+            }],
+            "bound exhaustion must be observable, never silent"
+        );
+
+        // The turn's bundle honors the inactive default (the exhausted scan
+        // cannot resurrect the tool).
+        let caps = ModelCapabilities::default();
+        let bundle = runtime.tools_bundle_for_turn(&handle, &[], &caps);
+        assert!(
+            !bundle.tool_names().contains(&"source_market"),
+            "the safe inactive default must keep the lazy tool out of the bundle"
+        );
     }
 
     // ---- ChunkSink (audit 41): bounded channel + drop-oldest coalescing.
@@ -39670,6 +40162,150 @@ mod tests {
         // The production name tail varies per call even at the same
         // millisecond (pid + RandomState-seeded tag).
         assert_ne!(marker_random_tag(42, 1), marker_random_tag(42, 1));
+    }
+
+    /// Adversarial unit pin of the marker session-identity classifier: only
+    /// a numeric id that names THIS session is replayable; every absent,
+    /// mistyped, negative, zero, fractional or out-of-range shape is
+    /// Malformed (never "mine").
+    #[test]
+    fn marker_session_verdict_rejects_every_untrusted_shape() {
+        let ours = 42u64;
+        assert_eq!(
+            marker_session_verdict(&serde_json::json!({ "session": 42u64 }), ours),
+            MarkerSession::Ours
+        );
+        assert_eq!(
+            marker_session_verdict(&serde_json::json!({ "session": u64::MAX }), u64::MAX),
+            MarkerSession::Ours,
+            "the id high half round-trips"
+        );
+        assert_eq!(
+            marker_session_verdict(&serde_json::json!({ "session": 43 }), ours),
+            MarkerSession::Foreign(43)
+        );
+        for hostile in [
+            serde_json::json!({}),
+            serde_json::json!({ "session": "42" }),
+            serde_json::json!({ "session": "not-a-session" }),
+            serde_json::json!({ "session": -42 }),
+            serde_json::json!({ "session": -1 }),
+            serde_json::json!({ "session": 0 }),
+            serde_json::json!({ "session": 1.5 }),
+            serde_json::json!({ "session": null }),
+            serde_json::json!({ "session": [42] }),
+            serde_json::json!({ "session": { "id": 42 } }),
+            serde_json::json!({ "session": 1.8446744073709552e19f64 }),
+        ] {
+            assert_eq!(
+                marker_session_verdict(&hostile, ours),
+                MarkerSession::Malformed,
+                "hostile session shape must never be treated as ours: {hostile}"
+            );
+        }
+    }
+
+    /// ADVERSARIAL (hostile marker session identity): markers whose
+    /// `session` field is absent, non-numeric, negative, zero, fractional,
+    /// foreign or truncated must NEVER be applied to the opening session,
+    /// even though their intent (a fresh Abort) would otherwise apply; every
+    /// hostile marker is retained for inspection. A well-formed marker for
+    /// this session still replays (control).
+    #[tokio::test]
+    async fn hostile_session_fields_never_apply_and_are_retained() {
+        let (deps, _dir) = deps(scripted_provider(vec![]), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let manager = runtime.deps().session.clone();
+        let session = new_session(runtime.deps());
+        let handle = manager.get_session(session).unwrap().unwrap();
+        let _receipt = runtime.submit(session, "run", &[]).unwrap();
+        let record = handle.active_turn_record().unwrap().unwrap();
+        let root = manager.store().root().to_path_buf();
+        let dir = root.join(DURABLE_WRITE_MARKER_DIR);
+        let fresh_abort = |session_field: Option<serde_json::Value>| {
+            let mut value = serde_json::json!({
+                "status": "pending",
+                "attempts": 0,
+                "site": "test.hostile",
+                "at_ms": record.started_at + 1000,
+                "intent": {"write": "abort", "op_id": null},
+            });
+            if let Some(field) = session_field {
+                value["session"] = field;
+            }
+            value
+        };
+        write_raw_marker(&dir, "dw-hostile-missing.json", &fresh_abort(None));
+        write_raw_marker(
+            &dir,
+            "dw-hostile-string.json",
+            &fresh_abort(Some(serde_json::json!("not-a-session"))),
+        );
+        write_raw_marker(
+            &dir,
+            "dw-hostile-negative.json",
+            &fresh_abort(Some(serde_json::json!(-1))),
+        );
+        write_raw_marker(
+            &dir,
+            "dw-hostile-zero.json",
+            &fresh_abort(Some(serde_json::json!(0))),
+        );
+        write_raw_marker(
+            &dir,
+            "dw-hostile-float.json",
+            &fresh_abort(Some(serde_json::json!(1.5))),
+        );
+        let foreign = new_session(runtime.deps());
+        assert_ne!(foreign, session);
+        write_raw_marker(
+            &dir,
+            "dw-hostile-foreign.json",
+            &fresh_abort(Some(serde_json::json!(foreign.raw()))),
+        );
+        std::fs::write(
+            dir.join("dw-hostile-truncated.json"),
+            br#"{"status":"pending","session":"#,
+        )
+        .unwrap();
+        runtime.replay_durable_write_failures(&handle);
+        assert_eq!(
+            handle.active_turn_record().unwrap().map(|r| r.turn_op_id),
+            Some(record.turn_op_id),
+            "no hostile marker may abort this session's turn"
+        );
+        assert_eq!(handle.state().unwrap(), AgentState::Preparing);
+        let names: Vec<String> = marker_files(&root)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        for expected in [
+            "missing",
+            "string",
+            "negative",
+            "zero",
+            "float",
+            "foreign",
+            "truncated",
+        ] {
+            assert!(
+                names.iter().any(|n| n.contains(expected)),
+                "the {expected} marker must be retained: {names:?}"
+            );
+        }
+        // CONTROL: a marker that names THIS session with the same fresh
+        // Abort intent still replays.
+        write_raw_marker(
+            &dir,
+            "dw-hostile-control.json",
+            &fresh_abort(Some(serde_json::json!(session.raw()))),
+        );
+        runtime.replay_durable_write_failures(&handle);
+        assert_eq!(
+            handle.state().unwrap(),
+            AgentState::ReadyForNextTurn,
+            "a well-formed marker for this session still applies"
+        );
     }
 
     /// F11 (adversarial): markers are handled PER STATE — terminal states are

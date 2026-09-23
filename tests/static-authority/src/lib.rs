@@ -3156,9 +3156,12 @@ fn prod_only() {}
     }
 
     /// One dependency edge parsed from a crate manifest.
+    #[derive(Debug, Clone, PartialEq, Eq)]
     struct ManifestDep {
         /// The dependency target: the `package = "..."` rename when
-        /// present, else the dependency key.
+        /// present, else the dependency key (for a `workspace = true` entry
+        /// this is the workspace ALIAS, resolved against the root
+        /// `[workspace.dependencies]` table before the closure walk).
         target: String,
         /// The `path = "..."` value when the dependency is path-based.
         path: Option<String>,
@@ -3167,15 +3170,94 @@ fn prod_only() {}
         renamed: bool,
         /// True when the entry came from a `dev-dependencies` table.
         dev: bool,
+        /// True when the entry inherits from `[workspace.dependencies]`
+        /// (`alias.workspace = true` or `{ workspace = true }`): the alias
+        /// MUST resolve in the root table (an unresolvable alias is a hard
+        /// scan failure, never a silently skipped edge).
+        workspace: bool,
     }
 
-    /// Parse every dependency-table entry of one crate manifest. Sections
-    /// `[dependencies]`, `[build-dependencies]`, `[target.<cfg>.dependencies]`
-    /// (and their `dev-dependencies` variants, marked) are recognized; a
-    /// comment mention or a `[package]`/other table entry never counts.
+    /// Apply one property of a TABLE-form dependency body line
+    /// (`[dependencies.foo]` followed by `path = "..."` / `package = "..."`
+    /// / `workspace = true`).
+    fn apply_dep_property_line(dep: &mut ManifestDep, name: &str, value: &str) {
+        let value = value.trim();
+        if name == "workspace" {
+            dep.workspace = value == "true";
+            return;
+        }
+        if let Some(text) = manifest_quoted_strings(value).into_iter().next() {
+            match name {
+                "package" => {
+                    dep.target = text;
+                    dep.renamed = true;
+                }
+                "path" => dep.path = Some(text),
+                _ => {}
+            }
+        }
+    }
+
+    /// Apply one `name = value` property of an INLINE dependency entry
+    /// (`{ package = "...", path = "...", workspace = true }`).
+    fn apply_dep_property(dep: &mut ManifestDep, name: &str, value: &str) {
+        let inline = value.trim().trim_matches(|c| c == '{' || c == '}');
+        for entry in inline.split(',') {
+            let entry = entry.trim().trim_matches(|c| c == '{' || c == '}').trim();
+            let Some((entry_name, entry_value)) = entry.split_once('=') else {
+                continue;
+            };
+            if entry_name.trim() != name {
+                continue;
+            }
+            let entry_value = entry_value.trim();
+            if name == "workspace" {
+                dep.workspace = entry_value == "true";
+                continue;
+            }
+            if let Some(text) = manifest_quoted_strings(entry_value).into_iter().next() {
+                match name {
+                    "package" => {
+                        dep.target = text;
+                        dep.renamed = true;
+                    }
+                    "path" => dep.path = Some(text),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// The dependency class of one section path: the index of the FIRST
+    /// segment in `{dependencies, build-dependencies, dev-dependencies}`
+    /// that forms a well-formed dependency table (`[<class>]` or
+    /// `[target.<cfg>.<class>]`). Everything else (`[package]` keys, a
+    /// `[dependencies]` mention deeper in an unrelated section) is not a
+    /// dependency table.
+    fn dependency_class(section: &[String]) -> Option<usize> {
+        let at = section.iter().position(|part| {
+            matches!(
+                part.as_str(),
+                "dependencies" | "build-dependencies" | "dev-dependencies"
+            )
+        })?;
+        if at == 0 || (at == 2 && section[0] == "target") {
+            Some(at)
+        } else {
+            None
+        }
+    }
+
+    /// Parse every dependency-table entry of one crate manifest, including
+    /// the TABLE form (`[dependencies.foo]` /
+    /// `[target.'cfg(unix)'.dependencies.foo]`, whose `path` / `package` /
+    /// `workspace` properties follow as lines) and the dotted workspace
+    /// form (`foo.workspace = true`). A comment mention or an unrelated
+    /// table entry never counts.
     fn manifest_deps(src: &str) -> Vec<ManifestDep> {
-        let mut out = Vec::new();
-        let mut section = String::new();
+        let mut out: Vec<ManifestDep> = Vec::new();
+        let mut section: Vec<String> = Vec::new();
+        let mut table_dep: Option<usize> = None;
         for raw in src.lines() {
             let line = manifest_body(raw).trim();
             if line.is_empty() {
@@ -3184,69 +3266,179 @@ fn prod_only() {}
             if line.starts_with('[') {
                 section = line
                     .trim_matches(|c| c == '[' || c == ']')
-                    .trim()
-                    .to_string();
+                    .split('.')
+                    .map(|part| part.trim().trim_matches('"').trim_matches('\'').to_string())
+                    .collect();
+                table_dep = None;
+                if let Some(at) = dependency_class(&section) {
+                    if section.len() > at + 1 {
+                        out.push(ManifestDep {
+                            target: section[at + 1..].join("."),
+                            path: None,
+                            renamed: false,
+                            dev: section[at] == "dev-dependencies",
+                            workspace: false,
+                        });
+                        table_dep = Some(out.len() - 1);
+                    }
+                }
                 continue;
             }
-            let parts: Vec<&str> = section.split('.').collect();
-            let last = parts.last().copied().unwrap_or("");
-            if last != "dependencies" && last != "build-dependencies" && last != "dev-dependencies"
-            {
+            let Some(at) = dependency_class(&section) else {
                 continue;
-            }
-            let dev = last == "dev-dependencies" || parts.contains(&"dev-dependencies");
+            };
             let Some(eq) = line.find('=') else {
                 continue;
             };
-            let key = line[..eq].trim().trim_matches('"');
-            // `faktor-core.workspace = true` names the dependency before the
-            // first dot.
-            let key = key.split('.').next().unwrap_or(key);
+            let key_raw = line[..eq].trim().trim_matches('"');
             let value = &line[eq + 1..];
-            let mut renamed = false;
-            let mut target = key.to_string();
-            for entry in value.split(',') {
-                let entry = entry.trim().trim_matches(|c| c == '{' || c == '}').trim();
-                if let Some(rest) = entry.strip_prefix("package") {
-                    let rest = rest.trim_start();
-                    if let Some(rest) = rest.strip_prefix('=') {
-                        if let Some(name) = manifest_quoted_strings(rest).into_iter().next() {
-                            target = name;
-                            renamed = true;
-                        }
-                    }
-                }
+            if let Some(index) = table_dep {
+                apply_dep_property_line(&mut out[index], key_raw, value);
+                continue;
             }
-            let mut path = None;
-            for entry in value.split(',') {
-                let entry = entry.trim().trim_matches(|c| c == '{' || c == '}').trim();
-                if let Some(rest) = entry.strip_prefix("path") {
-                    let rest = rest.trim_start();
-                    if let Some(rest) = rest.strip_prefix('=') {
-                        path = manifest_quoted_strings(rest).into_iter().next();
-                    }
-                }
+            let (key, workspace) = match key_raw.split_once('.') {
+                Some((key, suffix)) if suffix.trim() == "workspace" => (key.trim(), true),
+                _ => (key_raw, false),
+            };
+            let mut dep = ManifestDep {
+                target: key.to_string(),
+                path: None,
+                renamed: false,
+                dev: section[at] == "dev-dependencies",
+                workspace,
+            };
+            apply_dep_property(&mut dep, "package", value);
+            apply_dep_property(&mut dep, "path", value);
+            if !workspace {
+                apply_dep_property(&mut dep, "workspace", value);
             }
-            out.push(ManifestDep {
-                target,
-                path,
-                renamed,
-                dev,
-            });
+            out.push(dep);
         }
         out
     }
 
-    /// `(offender chains, visited crates)` for the commerce-path dependency
-    /// closure. A forbidden crate anywhere in the closure is reported with
-    /// the full path that reached it.
-    fn commerce_dependency_offenders() -> (Vec<String>, usize) {
-        let root = repo_root();
-        let root_src =
-            std::fs::read_to_string(root.join("Cargo.toml")).expect("root Cargo.toml readable");
+    /// `alias -> (package_rename, path)` of the root
+    /// `[workspace.dependencies]` table. A member's `alias.workspace = true`
+    /// entry resolves through this table, so a workspace `package = "..."`
+    /// rename can never hide a dependency's real target from the scan.
+    fn workspace_dependencies(
+        src: &str,
+    ) -> std::collections::BTreeMap<String, (Option<String>, Option<String>)> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut in_table = false;
+        for raw in src.lines() {
+            let line = manifest_body(raw).trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('[') {
+                in_table =
+                    line.trim_matches(|c| c == '[' || c == ']').trim() == "workspace.dependencies";
+                continue;
+            }
+            if !in_table {
+                continue;
+            }
+            let Some(eq) = line.find('=') else {
+                continue;
+            };
+            let alias = line[..eq].trim().trim_matches('"').to_string();
+            if alias.is_empty() {
+                continue;
+            }
+            let mut dep = ManifestDep {
+                target: alias.clone(),
+                path: None,
+                renamed: false,
+                dev: false,
+                workspace: false,
+            };
+            apply_dep_property(&mut dep, "package", &line[eq + 1..]);
+            apply_dep_property(&mut dep, "path", &line[eq + 1..]);
+            let package = dep.renamed.then(|| dep.target.clone());
+            out.insert(alias, (package, dep.path));
+        }
+        out
+    }
+
+    /// One resolved dependency edge: the package name the scanner must
+    /// check, and (when a `path`/workspace-table path exists) the manifest
+    /// dir whose OWN dependencies must be walked — inside OR outside the
+    /// workspace member list (a non-member path dependency is not exempt).
+    struct ResolvedDep {
+        name: String,
+        dir: Option<std::path::PathBuf>,
+    }
+
+    /// Resolve one parsed dependency edge to its real package name and
+    /// manifest dir. Workspace-inherited entries resolve through the root
+    /// `[workspace.dependencies]` table (module path relative to the ROOT);
+    /// a direct `path` is relative to the depending manifest's dir.
+    fn resolve_manifest_dep(
+        root: &Path,
+        manifest_dir: &Path,
+        dep: &ManifestDep,
+        workspace_deps: &std::collections::BTreeMap<String, (Option<String>, Option<String>)>,
+    ) -> ResolvedDep {
+        let mut name = dep.target.clone();
+        let mut path = dep.path.clone();
+        let mut workspace_path = false;
+        if dep.workspace {
+            let Some((package, table_path)) = workspace_deps.get(&dep.target) else {
+                panic!(
+                    "{}: `{}` inherits from [workspace.dependencies] but the root table \
+                     does not define it; the scan cannot verify the edge",
+                    manifest_dir.display(),
+                    dep.target
+                );
+            };
+            if let Some(package) = package {
+                name = package.clone();
+            }
+            if path.is_none() {
+                path = table_path.clone();
+                workspace_path = true;
+            }
+        }
+        let dir = path.map(|path| {
+            if workspace_path {
+                root.join(path)
+            } else {
+                manifest_dir.join(path)
+            }
+        });
+        ResolvedDep { name, dir }
+    }
+
+    /// The commerce-path dependency closure: production-graph offender
+    /// chains that reach a forbidden model crate, dev-dependency offender
+    /// chains that reach one without an explicit classification, the number
+    /// of visited crates and the visited crate set.
+    struct CommerceClosure {
+        offenders: Vec<String>,
+        dev_offenders: Vec<String>,
+        /// Every resolved `(declaring crate, dev-dependency)` edge, so the
+        /// classification allowlist can be asserted load-bearing.
+        dev_edges: Vec<(String, String)>,
+        visited: usize,
+        crates: std::collections::BTreeSet<String>,
+    }
+
+    /// Walk the NORMAL dependency closure of [`COMMERCE_PATH_CRATES`] from
+    /// `root`, following workspace members AND non-member `path`
+    /// dependencies, resolving workspace aliases/renames, and classifying
+    /// every dev-dependency of every visited package. Fails LOUD on an edge
+    /// it cannot resolve (missing workspace alias, unreadable path
+    /// manifest, rename mismatch): an unverifiable edge is never silently
+    /// skipped, and neither are dev-dependencies.
+    fn commerce_dependency_closure_at(root: &Path) -> CommerceClosure {
+        let root_manifest = root.join("Cargo.toml");
+        let root_src = std::fs::read_to_string(&root_manifest)
+            .unwrap_or_else(|e| panic!("{} unreadable: {e}", root_manifest.display()));
         let members = workspace_members(&root_src);
         assert!(!members.is_empty(), "workspace members list parsed");
-        let mut packages: std::collections::BTreeMap<String, Vec<String>> =
+        let workspace_deps = workspace_dependencies(&root_src);
+        let mut packages: std::collections::BTreeMap<String, std::path::PathBuf> =
             std::collections::BTreeMap::new();
         for member in &members {
             let dir = root.join(member);
@@ -3255,25 +3447,7 @@ fn prod_only() {}
                 .unwrap_or_else(|e| panic!("{} unreadable: {e}", manifest.display()));
             let name = manifest_package_name(&src)
                 .unwrap_or_else(|| panic!("{} has no [package] name", manifest.display()));
-            let deps = manifest_deps(&src)
-                .into_iter()
-                .filter(|dep| !dep.dev)
-                .map(|dep| {
-                    if dep.renamed {
-                        return dep.target;
-                    }
-                    if let Some(path) = &dep.path {
-                        let path_manifest = dir.join(path).join("Cargo.toml");
-                        if let Ok(path_src) = std::fs::read_to_string(&path_manifest) {
-                            if let Some(path_name) = manifest_package_name(&path_src) {
-                                return path_name;
-                            }
-                        }
-                    }
-                    dep.target
-                })
-                .collect();
-            packages.insert(name, deps);
+            packages.insert(name, dir);
         }
         for crate_name in COMMERCE_PATH_CRATES {
             assert!(
@@ -3283,55 +3457,158 @@ fn prod_only() {}
             );
         }
         let mut offenders = Vec::new();
+        let mut dev_offenders = Vec::new();
+        let mut dev_edges = Vec::new();
         let mut visited: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let mut queue: std::collections::VecDeque<(String, Vec<String>)> = COMMERCE_PATH_CRATES
-            .iter()
-            .map(|c| (c.to_string(), vec![c.to_string()]))
-            .collect();
-        while let Some((crate_name, chain)) = queue.pop_front() {
+        let mut queue: std::collections::VecDeque<(String, std::path::PathBuf, Vec<String>)> =
+            COMMERCE_PATH_CRATES
+                .iter()
+                .map(|c| {
+                    (
+                        (*c).to_string(),
+                        packages[*c].clone(),
+                        vec![(*c).to_string()],
+                    )
+                })
+                .collect();
+        while let Some((crate_name, dir, chain)) = queue.pop_front() {
             if !visited.insert(crate_name.clone()) {
                 continue;
             }
-            let Some(deps) = packages.get(&crate_name) else {
-                continue; // external dependency: not a workspace member
-            };
-            for dep in deps {
+            let manifest = dir.join("Cargo.toml");
+            let src = std::fs::read_to_string(&manifest)
+                .unwrap_or_else(|e| panic!("{} unreadable: {e}", manifest.display()));
+            for dep in manifest_deps(&src) {
+                let resolved = resolve_manifest_dep(root, &dir, &dep, &workspace_deps);
+                let name = match &resolved.dir {
+                    Some(dep_dir) => {
+                        let dep_manifest = dep_dir.join("Cargo.toml");
+                        let dep_src = std::fs::read_to_string(&dep_manifest).unwrap_or_else(|e| {
+                            panic!("path dependency {} unreadable: {e}", dep_manifest.display())
+                        });
+                        let path_name = manifest_package_name(&dep_src).unwrap_or_else(|| {
+                            panic!("{} has no [package] name", dep_manifest.display())
+                        });
+                        if dep.renamed && path_name != resolved.name {
+                            panic!(
+                                "{}: path dependency rename {} does not match the package name \
+                                 {path_name} in {}",
+                                manifest.display(),
+                                resolved.name,
+                                dep_manifest.display()
+                            );
+                        }
+                        // Register the path package (member or NOT) so its own
+                        // dependency edges are walked.
+                        packages
+                            .entry(path_name.clone())
+                            .or_insert_with(|| dep_dir.clone());
+                        path_name
+                    }
+                    None => {
+                        if !packages.contains_key(&resolved.name)
+                            && resolved.name.starts_with("faktor-")
+                        {
+                            panic!(
+                                "{}: workspace crate {} cannot be resolved (no member and no \
+                                 path); the scan refuses to skip it",
+                                manifest.display(),
+                                resolved.name
+                            );
+                        }
+                        resolved.name
+                    }
+                };
                 let mut next = chain.clone();
-                next.push(dep.clone());
-                if COMMERCE_FORBIDDEN_DEPS.contains(&dep.as_str()) {
+                next.push(name.clone());
+                if dep.dev {
+                    dev_edges.push((crate_name.clone(), name.clone()));
+                    let classified = COMMERCE_DEV_DEP_ALLOWLIST.iter().any(
+                        |(declaring, dependency, justification)| {
+                            *declaring == crate_name.as_str()
+                                && *dependency == name.as_str()
+                                && !justification.trim().is_empty()
+                        },
+                    );
+                    if COMMERCE_FORBIDDEN_DEPS.contains(&name.as_str()) && !classified {
+                        dev_offenders.push(next.join(" -> "));
+                    }
+                    continue;
+                }
+                if COMMERCE_FORBIDDEN_DEPS.contains(&name.as_str()) {
                     offenders.push(next.join(" -> "));
                     continue;
                 }
-                queue.push_back((dep.clone(), next));
+                if let Some(next_dir) = packages.get(&name) {
+                    queue.push_back((name, next_dir.clone(), next));
+                }
             }
         }
-        // The parse must have walked a real graph: every commerce path
-        // reaches `faktor-core`, and the acquire engine reaches
-        // `faktor-provider`.
-        assert!(
-            visited.contains("faktor-core") && visited.contains("faktor-provider"),
-            "commerce dependency closure walked nothing (parser failure): {visited:?}"
-        );
-        (offenders, visited.len())
+        CommerceClosure {
+            offenders,
+            dev_offenders,
+            dev_edges,
+            visited: visited.len(),
+            crates: visited,
+        }
     }
+
+    /// Dev-dependencies of the commerce path that name a forbidden model
+    /// crate. EMPTY by construction (a model crate may never be a commerce
+    /// dev-dependency edge); any future entry MUST carry a written
+    /// justification and is asserted load-bearing by
+    /// [`commerce_dev_dependencies_are_classified_or_refused`].
+    const COMMERCE_DEV_DEP_ALLOWLIST: &[(&str, &str, &str)] = &[];
 
     #[test]
     fn commerce_dependency_closure_never_reaches_model_execution_or_adapters() {
-        let (offenders, visited) = commerce_dependency_offenders();
+        let closure = commerce_dependency_closure_at(&repo_root());
         assert!(
-            visited >= 10,
-            "commerce dependency closure suspiciously small: {visited} crates"
+            closure.visited >= 10,
+            "commerce dependency closure suspiciously small: {} crates",
+            closure.visited
         );
         assert!(
-            offenders.is_empty(),
+            closure.crates.contains("faktor-core") && closure.crates.contains("faktor-provider"),
+            "commerce dependency closure walked nothing (parser failure): {:?}",
+            closure.crates
+        );
+        assert!(
+            closure.offenders.is_empty(),
             "commerce dependency authority violations (a model execution/adapter crate is \
              reachable through normal dependencies):\n  {}",
-            offenders.join("\n  ")
+            closure.offenders.join("\n  ")
         );
     }
 
     #[test]
-    fn manifest_dependency_parser_is_rename_section_and_path_aware() {
+    fn commerce_dev_dependencies_are_classified_or_refused() {
+        let closure = commerce_dependency_closure_at(&repo_root());
+        assert!(
+            closure.dev_offenders.is_empty(),
+            "a commerce-path dev-dependency reaches a model crate without an explicit \
+             classification in COMMERCE_DEV_DEP_ALLOWLIST:\n  {}",
+            closure.dev_offenders.join("\n  ")
+        );
+        // Every classified entry must name a REAL dev-dependency edge with a
+        // written justification: a stale exemption is a red scan.
+        for (declaring, dependency, justification) in COMMERCE_DEV_DEP_ALLOWLIST {
+            assert!(
+                !justification.trim().is_empty(),
+                "{declaring} -> {dependency}: a classification requires a justification"
+            );
+            assert!(
+                closure
+                    .dev_edges
+                    .iter()
+                    .any(|(from, to)| from == declaring && to == dependency),
+                "{declaring} -> {dependency}: stale classification (no such dev-dependency edge)"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_dependency_parser_is_rename_section_table_and_path_aware() {
         let src = r#"
 [package]
 name = "faktor-commerce"
@@ -3352,6 +3629,16 @@ faktor-router = { path = "../router" }
 [target.'cfg(unix)'.dev-dependencies]
 faktor-ollama = { path = "../ollama" }
 
+[target.'cfg(windows)'.dependencies.winjob]
+path = "../winjob"
+
+[dependencies.agent]
+package = "faktor-agent"
+path = "../agent"
+
+[dev-dependencies."faktor-google"]
+path = "../google"
+
 # faktor-google = { path = "../google" }
 "#;
         let deps = manifest_deps(src);
@@ -3367,7 +3654,9 @@ faktor-ollama = { path = "../ollama" }
                 "serde",
                 "faktor-agent",
                 "client",
-                "faktor-router"
+                "faktor-router",
+                "winjob",
+                "faktor-agent"
             ]
         );
         let dev: Vec<&str> = deps
@@ -3375,12 +3664,36 @@ faktor-ollama = { path = "../ollama" }
             .filter(|d| d.dev)
             .map(|d| d.target.as_str())
             .collect();
-        assert_eq!(dev, vec!["faktor-openai", "tokio", "faktor-ollama"]);
+        assert_eq!(
+            dev,
+            vec!["faktor-openai", "tokio", "faktor-ollama", "faktor-google"]
+        );
         let renamed = deps
             .iter()
             .find(|d| d.target == "faktor-agent")
             .expect("rename parsed");
         assert!(renamed.renamed && renamed.path.as_deref() == Some("../agent"));
+        // Table form: the trailing section segment is the dependency key and
+        // the following lines are its properties.
+        let table = deps
+            .iter()
+            .find(|d| d.target == "winjob")
+            .expect("table-form dep parsed");
+        assert!(table.path.as_deref() == Some("../winjob"));
+        let table_rename = deps
+            .iter()
+            .find(|d| d.renamed && d.path.as_deref() == Some("../agent"));
+        assert!(table_rename.is_some(), "table-form package rename parsed");
+        // Workspace inheritance is flagged for resolution against the root
+        // `[workspace.dependencies]` table.
+        assert!(deps
+            .iter()
+            .find(|d| d.target == "faktor-core")
+            .is_some_and(|d| d.workspace));
+        assert!(deps
+            .iter()
+            .find(|d| d.target == "tokio")
+            .is_some_and(|d| d.workspace));
         assert_eq!(
             manifest_package_name(src).as_deref(),
             Some("faktor-commerce")
@@ -3391,6 +3704,232 @@ faktor-ollama = { path = "../ollama" }
         );
         assert!(manifest_deps("# faktor-agent = { path = \"../agent\" }\n").is_empty());
         assert!(manifest_deps("names = \"faktor-agent\"\n").is_empty());
+
+        // Workspace dependency table: alias -> (package rename, path).
+        let root = r#"
+[workspace]
+members = ["crates/acquire"]
+
+[workspace.dependencies]
+faktor-core = { path = "crates/core" }
+agent-alias = { package = "faktor-agent", path = "crates/agent" }
+"#;
+        let table = workspace_dependencies(root);
+        assert_eq!(
+            table.get("faktor-core"),
+            Some(&(None, Some("crates/core".into())))
+        );
+        assert_eq!(
+            table.get("agent-alias"),
+            Some(&(Some("faktor-agent".into()), Some("crates/agent".into())))
+        );
+    }
+
+    // ---- dependency-closure planted-evasion fixtures ---------------------
+
+    /// Write a synthetic workspace under the temp dir (this crate is
+    /// dependency-free on purpose, so no `tempfile`). Callers remove it.
+    fn synthetic_workspace(name: &str, files: &[(String, String)]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "faktor-static-authority-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for (rel, src) in files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().expect("fixture parent"))
+                .expect("fixture parent dir");
+            std::fs::write(&path, src).expect("fixture write");
+        }
+        root
+    }
+
+    /// The baseline commerce-path workspace every planted-evasion fixture
+    /// extends: the four member crates over `faktor-core`.
+    fn closure_fixture(
+        name: &str,
+        acquire_deps: &str,
+        acquire_dev_deps: &str,
+        root_workspace_deps: &str,
+        extra: &[(&str, &str)],
+    ) -> std::path::PathBuf {
+        let mut files: Vec<(String, String)> = vec![
+            (
+                "Cargo.toml".to_string(),
+                format!(
+                    "[workspace]\nmembers = [\"crates/core\", \"crates/acquire\", \
+                     \"crates/commerce\", \"crates/commerce-connectors\", \"crates/browser\"]\n\n\
+                     [workspace.dependencies]\nfaktor-core = {{ path = \"crates/core\" }}\n\
+                     {root_workspace_deps}\n"
+                ),
+            ),
+            (
+                "crates/core/Cargo.toml".to_string(),
+                "[package]\nname = \"faktor-core\"\n".to_string(),
+            ),
+            (
+                "crates/acquire/Cargo.toml".to_string(),
+                format!(
+                    "[package]\nname = \"faktor-acquire\"\n\n[dependencies]\n\
+                     faktor-core.workspace = true\n{acquire_deps}\n\n[dev-dependencies]\n\
+                     {acquire_dev_deps}\n"
+                ),
+            ),
+            (
+                "crates/commerce/Cargo.toml".to_string(),
+                "[package]\nname = \"faktor-commerce\"\n\n[dependencies]\n\
+                 faktor-core.workspace = true\n"
+                    .to_string(),
+            ),
+            (
+                "crates/commerce-connectors/Cargo.toml".to_string(),
+                "[package]\nname = \"faktor-commerce-connectors\"\n\n[dependencies]\n\
+                 faktor-commerce = { path = \"../commerce\" }\n"
+                    .to_string(),
+            ),
+            (
+                "crates/browser/Cargo.toml".to_string(),
+                "[package]\nname = \"faktor-browser\"\n\n[dependencies]\n\
+                 faktor-core.workspace = true\n"
+                    .to_string(),
+            ),
+        ];
+        for (rel, src) in extra {
+            files.push(((*rel).to_string(), (*src).to_string()));
+        }
+        synthetic_workspace(name, &files)
+    }
+
+    #[test]
+    fn planted_table_form_dependency_evasion_fails_the_closure_scan() {
+        let root = closure_fixture(
+            "table-form",
+            "\n[dependencies.faktor-agent]\npath = \"../agent\"\n",
+            "",
+            "",
+            &[(
+                "crates/agent/Cargo.toml",
+                "[package]\nname = \"faktor-agent\"\n",
+            )],
+        );
+        let closure = commerce_dependency_closure_at(&root);
+        assert!(
+            closure
+                .offenders
+                .iter()
+                .any(|chain| chain.contains("faktor-agent")),
+            "a table-form dependency on a forbidden crate must be reported: {:?}",
+            closure.offenders
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn planted_workspace_package_rename_evasion_fails_the_closure_scan() {
+        let root = closure_fixture(
+            "ws-rename",
+            "agent-alias.workspace = true\n",
+            "",
+            "agent-alias = { package = \"faktor-agent\", path = \"crates/agent\" }\n",
+            &[(
+                "crates/agent/Cargo.toml",
+                "[package]\nname = \"faktor-agent\"\n",
+            )],
+        );
+        let closure = commerce_dependency_closure_at(&root);
+        assert!(
+            closure
+                .offenders
+                .iter()
+                .any(|chain| chain.contains("faktor-agent")),
+            "a workspace package rename must not hide the real target: {:?}",
+            closure.offenders
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn planted_non_member_path_dependency_evasion_fails_the_closure_scan() {
+        let root = closure_fixture(
+            "path-dep",
+            "\nsneaky = { path = \"vendor/sneaky\" }\n",
+            "",
+            "",
+            &[
+                (
+                    "crates/acquire/vendor/sneaky/Cargo.toml",
+                    "[package]\nname = \"sneaky\"\n\n[dependencies]\n\
+                     faktor-router = { path = \"../router\" }\n",
+                ),
+                (
+                    "crates/acquire/vendor/router/Cargo.toml",
+                    "[package]\nname = \"faktor-router\"\n",
+                ),
+            ],
+        );
+        let closure = commerce_dependency_closure_at(&root);
+        assert!(
+            closure
+                .offenders
+                .iter()
+                .any(|chain| chain.contains("faktor-router")),
+            "a non-member path dependency must be walked, not skipped: {:?}",
+            closure.offenders
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn planted_model_dev_dependency_fails_the_classification_scan() {
+        let root = closure_fixture(
+            "dev-dep",
+            "",
+            "faktor-openai.workspace = true\n",
+            "faktor-openai = { path = \"vendor/openai\" }\n",
+            &[(
+                "vendor/openai/Cargo.toml",
+                "[package]\nname = \"faktor-openai\"\n",
+            )],
+        );
+        let closure = commerce_dependency_closure_at(&root);
+        assert!(
+            closure
+                .dev_offenders
+                .iter()
+                .any(|chain| chain.contains("faktor-openai")),
+            "a model-crate dev-dependency must be classified or refused: {:?}",
+            closure.dev_offenders
+        );
+        assert!(
+            closure
+                .dev_edges
+                .iter()
+                .any(|(_, to)| to == "faktor-openai"),
+            "the dev-dependency edge must be recorded for load-bearing classification"
+        );
+        assert!(
+            closure.offenders.is_empty(),
+            "dev-only edge is not a production edge"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_clean_fixture_workspace_certifies_with_no_offenders() {
+        let root = closure_fixture("clean", "", "", "", &[]);
+        let closure = commerce_dependency_closure_at(&root);
+        assert!(closure.offenders.is_empty(), "{:?}", closure.offenders);
+        assert!(
+            closure.dev_offenders.is_empty(),
+            "{:?}",
+            closure.dev_offenders
+        );
+        assert!(
+            closure.visited >= 5,
+            "fixture walk visited {}",
+            closure.visited
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Commerce-path production sources that must never construct an HTTP

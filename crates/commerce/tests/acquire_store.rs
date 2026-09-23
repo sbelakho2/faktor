@@ -16,8 +16,8 @@ use faktor_commerce::connector::{
 };
 use faktor_commerce::error::SourceError;
 use faktor_commerce::jobs::{
-    advance_job, submit_job, CommerceJobRequest, ItemOutcome, JobItemExecutor, JobItemState,
-    JobLine, JobState, JobWork,
+    advance_job, bom_line_key, job_digest, submit_job, CommerceJobRequest, ItemOutcome,
+    JobItemExecutor, JobItemState, JobLine, JobState, JobWork, MAX_JOB_ITEM_ATTEMPTS,
 };
 use faktor_commerce::offer::{
     CommercialOffer, LifecycleStatus, ObservationOrigin, OfferProvenance, PriceBreak,
@@ -32,7 +32,7 @@ use faktor_commerce::result::{
 };
 use faktor_commerce::service::{CommerceSourceService, ServiceConfig, ServiceError};
 use faktor_commerce::store::{
-    CommerceStore, CommerceStoreError, GcPolicy, NewCacheRow, NormalizedPayload,
+    CommerceStore, CommerceStoreError, GcPolicy, JobItemRow, NewCacheRow, NormalizedPayload,
     SnapshotDiagnostics, COMMERCE_MIGRATIONS, COMMERCE_SCHEMA_VERSION,
 };
 use faktor_commerce::text::AccountScope;
@@ -874,7 +874,7 @@ fn job_restart_recovery_does_not_repeat_settled_lines() {
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let artifacts = FakeArtifacts::default();
     let first = ScriptedExecutor::matched();
-    let crash_key = BomItem::new("PART-0002", 10).expect("line").key();
+    let crash_key = bom_line_key(2, &BomItem::new("PART-0002", 10).expect("line"));
     *first.fail_once.lock().expect("fail") = Some((crash_key.clone(), SourceError::NetworkTimeout));
     let outcome = runtime
         .block_on(advance_job(
@@ -892,8 +892,8 @@ fn job_restart_recovery_does_not_repeat_settled_lines() {
     assert_eq!(
         first.calls(),
         vec![
-            BomItem::new("PART-0000", 10).expect("line").key(),
-            BomItem::new("PART-0001", 10).expect("line").key(),
+            bom_line_key(0, &BomItem::new("PART-0000", 10).expect("line")),
+            bom_line_key(1, &BomItem::new("PART-0001", 10).expect("line")),
             crash_key.clone(),
         ]
     );
@@ -942,8 +942,8 @@ fn job_restart_recovery_does_not_repeat_settled_lines() {
         second.calls(),
         vec![
             crash_key,
-            BomItem::new("PART-0003", 10).expect("line").key(),
-            BomItem::new("PART-0004", 10).expect("line").key(),
+            bom_line_key(3, &BomItem::new("PART-0003", 10).expect("line")),
+            bom_line_key(4, &BomItem::new("PART-0004", 10).expect("line")),
         ],
         "no settled line was re-executed"
     );
@@ -966,6 +966,281 @@ fn job_restart_recovery_does_not_repeat_settled_lines() {
         1,
         "no duplicate artifact"
     );
+}
+
+#[test]
+fn job_item_attempts_round_trip_and_honor_the_caller_count() {
+    let dir = temp_dir();
+    let store = open_store(&dir);
+    let request = bom_request(bom(&[("PART-A", 10)]));
+    let (job, _) = submit_job(&store, request, &[], None, 1_000).expect("submit");
+    let key = bom_line_key(0, &BomItem::new("PART-A", 10).expect("line"));
+    let row = |attempts: u64, label: &str| JobItemRow {
+        job_id: job.id.clone(),
+        item_key: key.clone(),
+        ordinal: 0,
+        state: JobItemState::Pending,
+        attempts,
+        result: None,
+        error_label: Some(label.to_string()),
+        updated_ms: 1_001,
+    };
+    store
+        .upsert_job_item(&row(7, "network_timeout"))
+        .expect("upsert");
+    let item = store
+        .job_items(&job.id)
+        .expect("items")
+        .into_iter()
+        .find(|item| item.item_key == key)
+        .expect("item");
+    assert_eq!(item.attempts, 7, "the caller's attempt count is persisted");
+    // A second upsert persists the caller's NEW count verbatim: the store
+    // never force-increments or resets it.
+    store
+        .upsert_job_item(&row(3, "rate_limited"))
+        .expect("upsert");
+    let item = store
+        .job_items(&job.id)
+        .expect("items")
+        .into_iter()
+        .find(|item| item.item_key == key)
+        .expect("item");
+    assert_eq!(item.attempts, 3);
+    assert_eq!(item.error_label.as_deref(), Some("rate_limited"));
+}
+
+#[test]
+fn transient_failures_are_capped_and_never_requeued_forever() {
+    let dir = temp_dir();
+    let store = open_store(&dir);
+    let request = bom_request(bom(&[("FLAKY", 1)]));
+    let (job, _) = submit_job(&store, request, &[], None, 1_000).expect("submit");
+    let key = bom_line_key(0, &BomItem::new("FLAKY", 1).expect("line"));
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let artifacts = FakeArtifacts::default();
+    let executor = ScriptedExecutor::matched();
+
+    // Each pass consumes one attempt and returns a running outcome, until
+    // the documented per-line bound is reached.
+    for round in 1..=MAX_JOB_ITEM_ATTEMPTS {
+        *executor.fail_once.lock().expect("fail") =
+            Some((key.clone(), SourceError::NetworkTimeout));
+        let outcome = runtime
+            .block_on(advance_job(
+                &store,
+                &test_ctx(),
+                &job.id,
+                &executor,
+                &artifacts,
+                2_000 + round,
+            ))
+            .expect("advance");
+        if round < MAX_JOB_ITEM_ATTEMPTS {
+            assert_eq!(outcome.job.state, JobState::Running, "round {round}");
+            assert_eq!(outcome.compact.status, CompactStatus::Running);
+        } else {
+            assert_eq!(outcome.job.state, JobState::Completed);
+            assert_eq!(outcome.compact.status, CompactStatus::Completed);
+            assert_eq!(outcome.compact.unmatched, 1);
+        }
+    }
+    assert_eq!(
+        executor.calls().len() as u64,
+        MAX_JOB_ITEM_ATTEMPTS,
+        "a permanently failing line executes at most the documented bound"
+    );
+    let item = store
+        .job_items(&job.id)
+        .expect("items")
+        .pop()
+        .expect("item");
+    assert_eq!(item.state, JobItemState::Failed);
+    assert_eq!(item.attempts, MAX_JOB_ITEM_ATTEMPTS);
+    assert_eq!(
+        item.error_label.as_deref(),
+        Some("network_timeout"),
+        "the LAST typed error is the durable diagnostic"
+    );
+    let detail = item.result.expect("failed payload").as_str().to_string();
+    assert!(detail.contains("network_timeout"));
+    let parsed: faktor_commerce::jobs::JobItemResult =
+        serde_json::from_str(&detail).expect("failed result payload");
+    assert_eq!(parsed.state, JobItemState::Failed);
+    assert!(parsed
+        .detail
+        .as_str()
+        .contains(&format!("\"attempts\":{MAX_JOB_ITEM_ATTEMPTS}")));
+    // A re-entry after the terminal state consumes no further work.
+    let outcome = runtime
+        .block_on(advance_job(
+            &store,
+            &test_ctx(),
+            &job.id,
+            &executor,
+            &artifacts,
+            9_000,
+        ))
+        .expect("replay");
+    assert_eq!(outcome.job.state, JobState::Completed);
+    assert_eq!(executor.calls().len() as u64, MAX_JOB_ITEM_ATTEMPTS);
+    assert_eq!(artifacts.puts.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn terminal_job_without_compact_json_reports_the_true_state() {
+    let dir = temp_dir();
+    let store = open_store(&dir);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let artifacts = FakeArtifacts::default();
+    let mut job_ids = Vec::new();
+    for (terminal, expected) in [
+        (JobState::Failed, CompactStatus::Failed),
+        (JobState::Cancelled, CompactStatus::Cancelled),
+    ] {
+        let request = bom_request(bom(&[(&format!("T{terminal:?}"), 1)]));
+        let (job, _) = submit_job(&store, request, &[], None, 1_000).expect("submit");
+        store
+            .update_job_state(&job.id, JobState::Running, 1_001)
+            .expect("running");
+        store
+            .update_job_state(&job.id, terminal, 1_002)
+            .expect("terminal");
+        let outcome = runtime
+            .block_on(advance_job(
+                &store,
+                &test_ctx(),
+                &job.id,
+                &ScriptedExecutor::matched(),
+                &artifacts,
+                2_000,
+            ))
+            .expect("advance");
+        assert_eq!(outcome.job.state, terminal);
+        assert_eq!(
+            outcome.compact.status, expected,
+            "a terminal job is never reported as running"
+        );
+        assert!(outcome.compact.artifact.is_none());
+        assert!(
+            outcome
+                .compact
+                .important
+                .iter()
+                .any(|entry| entry.key.as_str() == "job-error"),
+            "the refusal carries a typed diagnostic"
+        );
+        job_ids.push(job.id);
+    }
+
+    // The same true state is reported by `job_status`.
+    let service = CommerceSourceService::open(
+        dir.path(),
+        ServiceConfig::default(),
+        Arc::new(FakeArtifacts::default()),
+    )
+    .expect("service");
+    let failed = service.job_status(&job_ids[0]).expect("failed status");
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(failed.compact.status, CompactStatus::Failed);
+    let cancelled = service.job_status(&job_ids[1]).expect("cancelled status");
+    assert_eq!(cancelled.state, JobState::Cancelled);
+    assert_eq!(cancelled.compact.status, CompactStatus::Cancelled);
+}
+
+#[test]
+fn duplicate_bom_lines_each_execute_and_count() {
+    let dir = temp_dir();
+    let store = open_store(&dir);
+    // Three identically-normalizing lines requested; each is a real line
+    // (the user asked to buy it three times).
+    let request = bom_request(bom(&[("DUP", 10), ("DUP", 10), ("dup", 10), ("OTHER", 10)]));
+    let (job, _) = submit_job(&store, request, &[], None, 1_000).expect("submit");
+    assert_eq!(
+        store.job_item_count(&job.id).expect("items"),
+        4,
+        "duplicate BOM lines never collapse into one durable item"
+    );
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let artifacts = FakeArtifacts::default();
+    let executor = ScriptedExecutor::matched();
+    let outcome = runtime
+        .block_on(advance_job(
+            &store,
+            &test_ctx(),
+            &job.id,
+            &executor,
+            &artifacts,
+            2_000,
+        ))
+        .expect("advance");
+    assert_eq!(outcome.job.state, JobState::Completed);
+    assert_eq!(outcome.compact.lines, 4);
+    assert_eq!(outcome.compact.matched, 4);
+    let calls = executor.calls();
+    assert_eq!(calls.len(), 4, "every line executed");
+    let distinct: std::collections::BTreeSet<&String> = calls.iter().collect();
+    assert_eq!(distinct.len(), 4, "each line has its own stable key");
+    let bytes = artifacts.last.lock().expect("last").clone().expect("bytes");
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    assert_eq!(
+        text.matches("\"ordinal\":").count(),
+        4,
+        "the artifact carries one entry per requested line"
+    );
+}
+
+#[test]
+fn job_digest_is_source_order_insensitive_and_punctuation_exact() {
+    let mut request = bom_request(bom(&[("TPS5430DDAR", 100)]));
+    request.sources = SourceSet::named(vec![source("mouser"), source("lcsc")]).expect("sources");
+    let mut permuted = request.clone();
+    permuted.sources = SourceSet::named(vec![source("lcsc"), source("mouser")]).expect("sources");
+    assert_eq!(
+        job_digest(&request, &[], None),
+        job_digest(&permuted, &[], None),
+        "a permuted source set is the same request"
+    );
+
+    let dir = temp_dir();
+    let store = open_store(&dir);
+    let (job, _) = submit_job(&store, request, &[], None, 1_000).expect("submit");
+    let (attached_job, attached) = submit_job(&store, permuted, &[], None, 1_001).expect("submit");
+    assert!(attached, "the permuted request attaches to the same job");
+    assert_eq!(attached_job.id, job.id);
+
+    // Punctuation that is part of one part number must not collide with the
+    // stripped spelling: the digest (and therefore the job and cache
+    // identity) separates them.
+    let mut with_hash = bom_request(bom(&[("x", 1)]));
+    with_hash.work = JobWork::Product {
+        reference: ProductRef::parse("AB#123", None).expect("ref"),
+    };
+    let mut plain = with_hash.clone();
+    plain.work = JobWork::Product {
+        reference: ProductRef::parse("AB123", None).expect("ref"),
+    };
+    assert_ne!(
+        job_digest(&with_hash, &[], None),
+        job_digest(&plain, &[], None)
+    );
+
+    // ...and a single-line BOM is no exception.
+    let hash_bom = bom_request(bom(&[("AB#123", 1)]));
+    let plain_bom = bom_request(bom(&[("AB123", 1)]));
+    assert_ne!(
+        job_digest(&hash_bom, &[], None),
+        job_digest(&plain_bom, &[], None)
+    );
+    let (hash_job, hash_attached) = submit_job(&store, hash_bom, &[], None, 2_000).expect("submit");
+    assert!(!hash_attached);
+    let (plain_job, plain_attached) =
+        submit_job(&store, plain_bom, &[], None, 2_001).expect("submit");
+    assert!(
+        !plain_attached,
+        "punctuation-distinct BOMs are distinct jobs"
+    );
+    assert_ne!(hash_job.id, plain_job.id);
 }
 
 #[test]
@@ -1379,6 +1654,7 @@ struct FakeConnector {
     discover_calls: AtomicU64,
     product_calls: AtomicU64,
     quote_calls: AtomicU64,
+    quote_requests: Mutex<Vec<QuoteRequest>>,
 }
 
 struct Behavior {
@@ -1397,6 +1673,7 @@ impl FakeConnector {
             discover_calls: AtomicU64::new(0),
             product_calls: AtomicU64::new(0),
             quote_calls: AtomicU64::new(0),
+            quote_requests: Mutex::new(Vec::new()),
         })
     }
 
@@ -1485,14 +1762,44 @@ impl CommerceConnector for FakeConnector {
     async fn quote(
         &self,
         _ctx: &faktor_commerce::connector::AcquireCtx,
-        _req: QuoteRequest,
+        req: QuoteRequest,
     ) -> Result<Vec<QuoteCandidate>, SourceError> {
         self.quote_calls.fetch_add(1, Ordering::SeqCst);
+        self.quote_requests
+            .lock()
+            .expect("quote requests")
+            .push(req.clone());
         let behavior = self.behavior.lock().expect("behavior");
         if behavior.fail {
             return Err(SourceError::ApiUnavailable);
         }
-        Ok(behavior.candidates.clone())
+        if !behavior.candidates.is_empty() {
+            return Ok(behavior.candidates.clone());
+        }
+        // No scripted candidates: resolve from the product offer using the
+        // request's variant/packaging (so a pass-through defect changes the
+        // status the service observes).
+        let Some(offer) = &behavior.product else {
+            return Err(SourceError::ProductNotFound);
+        };
+        let quantity =
+            Quantity::new(req.quantity.get()).map_err(|_| SourceError::InvalidRequest)?;
+        let variant = req
+            .variant
+            .as_ref()
+            .map(|variant| faktor_commerce::quote::VariantRequest::Id(variant.as_str()))
+            .unwrap_or(faktor_commerce::quote::VariantRequest::None);
+        let pricing = faktor_commerce::quote::PricingContext {
+            variant,
+            packaging: req.packaging,
+            ..faktor_commerce::quote::PricingContext::default()
+        };
+        let resolution = faktor_commerce::quote::resolve_quote(offer, &pricing, quantity);
+        Ok(vec![QuoteCandidate {
+            offer: offer.clone(),
+            resolution,
+            freshness: Freshness::Live,
+        }])
     }
 }
 
@@ -1862,6 +2169,222 @@ async fn service_freshness_never_labels_a_miss_as_data() {
             class: CacheClass::Price
         }
     ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn quote_job_passes_the_requested_variant_and_packaging_through() {
+    let dir = temp_dir();
+    let mut offer = offer("mouser", "TPS5430DDAR", 1_000_000);
+    offer.price_breaks = Vec::new();
+    offer.variants = vec![faktor_commerce::VariantOffer {
+        variant_id: VariantId::new("v1").expect("variant"),
+        attributes: Vec::new(),
+        packaging: Some(PackagingType::TapeAndReel),
+        moq: None,
+        order_multiple: None,
+        standard_pack: None,
+        stock: StockState::InStock {
+            quantity: NonZeroQuantity::new(5_000).expect("qty"),
+        },
+        price_breaks: vec![PriceBreak {
+            min_quantity: NonZeroQuantity::new(1).expect("qty"),
+            max_quantity: None,
+            unit_price: Money::from_micros(Currency::USD, 17_500),
+            visibility: PriceVisibility::Public,
+            account_scope: None,
+            promotion: None,
+        }],
+        lead_time: None,
+    }];
+    let connector = FakeConnector::new(
+        "mouser",
+        Behavior {
+            discoveries: Vec::new(),
+            product: Some(offer),
+            candidates: Vec::new(),
+            fail: false,
+            delay_ms: 0,
+        },
+    );
+    let (service, _artifacts) = enabled_service(&dir, connector.clone());
+    let request = CommerceJobRequest {
+        work: JobWork::Quote {
+            reference: ProductRef::parse("TPS5430DDAR", None).expect("ref"),
+            quantity: NonZeroQuantity::new(100).expect("qty"),
+            packaging: Some(PackagingType::TapeAndReel),
+            variant: Some(VariantId::new("v1").expect("variant")),
+        },
+        sources: SourceSet::auto(),
+        freshness: FreshnessMode::Live,
+        detail: DetailLevel::Compact,
+        account: None,
+    };
+    let outcome = service
+        .submit_and_advance(&test_ctx(), request)
+        .await
+        .expect("quote job");
+    assert_eq!(outcome.job.state, JobState::Completed);
+    assert_eq!(
+        outcome.compact.matched, 1,
+        "the requested variant/packaging resolves instead of VariantAmbiguous"
+    );
+    let requests = connector.quote_requests.lock().expect("requests");
+    let recorded = requests
+        .last()
+        .expect("a quote request reached the connector");
+    assert_eq!(recorded.variant.as_ref().map(|v| v.as_str()), Some("v1"));
+    assert_eq!(recorded.packaging, Some(PackagingType::TapeAndReel));
+    assert_eq!(recorded.quantity.get(), 100);
+}
+
+const PLANTED_KEY: &str = "ghp_0123456789abcdefghijklmnopqrstuvwx";
+
+#[tokio::test(start_paused = true)]
+async fn extracted_secrets_are_scrubbed_before_results_and_artifacts() {
+    // The shared scrub utility replaces the credential value...
+    let scrubbed = faktor_commerce::scrub_secrets(&format!("token {PLANTED_KEY} end"));
+    assert_eq!(scrubbed, "token <redacted:github_token> end");
+    // ...and the normalized-payload door both scrubs values and keeps
+    // refusing the forbidden marker strings.
+    let payload = NormalizedPayload::from_json(format!("{{\"description\":\"{PLANTED_KEY}\"}}"))
+        .expect("payload");
+    assert!(!payload.as_str().contains(PLANTED_KEY));
+    assert!(payload.as_str().contains("<redacted:github_token>"));
+    assert!(NormalizedPayload::from_json(
+        "{\"description\":\"refresh_token: rt_abc\"}".to_string()
+    )
+    .is_err());
+
+    // A connector echoing the key in a title/description: the search,
+    // product and quote results that leave the service are scrubbed.
+    let dir = temp_dir();
+    let mut tainted_offer = offer("mouser", "TPS5430DDAR", 1_000_000);
+    tainted_offer.title =
+        Text::<512>::new(&format!("TPS5430 converter {PLANTED_KEY}")).expect("title");
+    tainted_offer.description =
+        Some(Text::<4096>::new(&format!("credentials {PLANTED_KEY}")).expect("desc"));
+    let mut tainted_discovery = discovery("mouser", "TPS5430DDAR");
+    tainted_discovery.title =
+        Text::<512>::new(&format!("TPS5430 converter {PLANTED_KEY}")).expect("title");
+    let candidate = quote_candidate("mouser", "TPS5430DDAR", 100);
+    let mut candidate = QuoteCandidate {
+        offer: tainted_offer.clone(),
+        ..candidate
+    };
+    candidate.resolution = faktor_commerce::quote::price_at_quantity(
+        &candidate.offer,
+        faktor_commerce::quote::VariantRequest::None,
+        Quantity::new(100).expect("qty"),
+    );
+    let connector = FakeConnector::new(
+        "mouser",
+        Behavior {
+            discoveries: vec![tainted_discovery],
+            product: Some(tainted_offer),
+            candidates: vec![candidate],
+            fail: false,
+            delay_ms: 0,
+        },
+    );
+    let (service, artifacts) = enabled_service(&dir, connector);
+    let live = test_ctx().with_freshness(FreshnessMode::Live);
+    let search = service
+        .search(&live, search_request_mode("TPS5430", FreshnessMode::Live))
+        .await
+        .expect("search");
+    let title = search.discoveries[0].title.as_str();
+    assert!(
+        !title.contains(PLANTED_KEY),
+        "search title scrubbed: {title}"
+    );
+    assert!(title.contains("<redacted:github_token>"));
+    let product = service
+        .product(
+            &live,
+            ProductRequest::new(
+                ProductRef::parse("TPS5430DDAR", None).expect("ref"),
+                FreshnessMode::Live,
+                DetailLevel::Compact,
+            )
+            .expect("request"),
+        )
+        .await
+        .expect("product");
+    assert!(!product.offer.title.as_str().contains(PLANTED_KEY));
+    assert!(!product
+        .offer
+        .description
+        .as_ref()
+        .expect("description")
+        .as_str()
+        .contains(PLANTED_KEY));
+    let quote = service
+        .quote(
+            &live,
+            QuoteRequest::new(
+                ProductRef::parse("TPS5430DDAR", None).expect("ref"),
+                100,
+                None,
+                None,
+                None,
+                FreshnessMode::Live,
+            )
+            .expect("request"),
+        )
+        .await
+        .expect("quote");
+    assert!(!quote.candidates[0]
+        .offer
+        .title
+        .as_str()
+        .contains(PLANTED_KEY));
+
+    // A job whose executor echoes the key in its detail payload: the CAS
+    // artifact never carries it.
+    let request = bom_request(bom(&[("KEYECHO", 1)]));
+    let (job, _) = submit_job(&store_of(&service), request, &[], None, 1_000).expect("submit");
+    let outcome = advance_job(
+        &store_of(&service),
+        &test_ctx(),
+        &job.id,
+        &KeyEchoExecutor,
+        artifacts.as_ref(),
+        2_000,
+    )
+    .await
+    .expect("advance");
+    assert_eq!(outcome.job.state, JobState::Completed);
+    assert_eq!(outcome.compact.matched, 1);
+    let bytes = artifacts.last.lock().expect("last").clone().expect("bytes");
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    assert!(!text.contains(PLANTED_KEY), "artifact scrubbed: {text}");
+    assert!(text.contains("<redacted:github_token>"));
+    assert!(scan_forbidden_bytes(&bytes).is_ok());
+}
+
+fn store_of(service: &CommerceSourceService) -> Arc<CommerceStore> {
+    service.store().expect("store").clone()
+}
+
+/// An executor that tries to echo a planted credential in its detail payload.
+struct KeyEchoExecutor;
+
+#[async_trait::async_trait]
+impl JobItemExecutor for KeyEchoExecutor {
+    async fn execute(
+        &self,
+        _ctx: &faktor_commerce::connector::AcquireCtx,
+        _job: &faktor_commerce::jobs::CommerceJob,
+        _line: &JobLine,
+    ) -> Result<ItemOutcome, SourceError> {
+        Ok(ItemOutcome {
+            state: JobItemState::Matched,
+            label: None,
+            important: None,
+            detail: NormalizedPayload::from_json(format!("{{\"note\":\"{PLANTED_KEY}\"}}"))
+                .map_err(|_| SourceError::Store)?,
+        })
+    }
 }
 
 #[tokio::test(start_paused = true)]

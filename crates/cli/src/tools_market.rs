@@ -52,7 +52,11 @@ use faktor_core::error::{Error, ErrorKind};
 use faktor_core::hash::FileHash;
 use faktor_core::resource::ResourceClass;
 use faktor_provider::egress::{
-    execute_raw, EgressError, HttpTransport as EgressTransport, RawRequest,
+    execute_raw, EgressError, HttpTransport as EgressTransport, OutboundScanConfig,
+    PolicyCheckedHttpTransport, RawRequest,
+};
+use faktor_security::destination::{
+    Decision, DestinationPolicy as EgressDestinationPolicy, RequestTarget,
 };
 
 use crate::config::{
@@ -93,11 +97,26 @@ pub fn source_market_exposure() -> ToolExposure {
 // The tool
 // --------------------------------------------------------------------------
 
-/// The `source_market` tool over the daemon's ONE commerce service. The
-/// service is injected — constructing it, or anything it owns, inside this
-/// factory would mint a second authority and is exactly what the daemon
-/// graph forbids.
+/// The `source_market` tool over the daemon's ONE commerce service WITHOUT
+/// the registered-value guard: TEST-ONLY, the direct service-level seam used
+/// by focused tests that inject already-sanitized fixtures. The production
+/// daemon graph builds the tool through
+/// [`source_market_tool_with_secrets`], which scrubs the final result text.
+#[cfg(test)]
 pub fn source_market_tool(service: Arc<CommerceSourceService>) -> Tool {
+    source_market_tool_with_secrets(service, None)
+}
+
+/// The production `source_market` tool: `secrets` is the SAME
+/// registered-value guard the connectors registered their credentials with
+/// at construction, and the final result text passes through it before it
+/// can reach the model — a credential echoed by a hostile/echoing
+/// marketplace (or by the browser extraction path) is redacted even if it
+/// survived extraction.
+pub fn source_market_tool_with_secrets(
+    service: Arc<CommerceSourceService>,
+    secrets: Option<Arc<connectors::SecretGuard>>,
+) -> Tool {
     Tool {
         name: SOURCE_MARKET_TOOL.into(),
         description: "Acquire commerce data from first-party marketplaces (1688, Alibaba, \
@@ -127,7 +146,8 @@ pub fn source_market_tool(service: Arc<CommerceSourceService>) -> Tool {
         path_args: vec![],
         execute: Arc::new(move |ctx, args| {
             let service = service.clone();
-            Box::pin(async move { execute_source_market(service, ctx, args).await })
+            let secrets = secrets.clone();
+            Box::pin(async move { execute_source_market(service, secrets, ctx, args).await })
         }),
     }
 }
@@ -243,6 +263,7 @@ fn acquire_context(
 
 async fn execute_source_market(
     service: Arc<CommerceSourceService>,
+    secrets: Option<Arc<connectors::SecretGuard>>,
     ctx: ToolRunCtx,
     args: serde_json::Value,
 ) -> Result<ToolOutcome, Error> {
@@ -374,8 +395,17 @@ async fn execute_source_market(
             compact_job_status("job", &status)
         }
     };
+    // The last-mile scrub: the same registered-value guard the connectors
+    // use for diagnostics, applied to the FINAL bounded result text, so no
+    // credential value can reach the model through any acquisition path
+    // (API extraction, browser extraction, cached observation or artifact).
+    let text = tool_text(&value)?;
+    let text = match &secrets {
+        Some(secrets) => bound_text(secrets.scrub(&text)),
+        None => text,
+    };
     Ok(ToolOutcome {
-        text: tool_text(&value)?,
+        text,
         exit_code: Some(0),
         // All acquired text is untrusted tool DATA (docs/acquire.md §2): the
         // ordinary tool provenance carries that boundary; it is never
@@ -816,32 +846,142 @@ fn compact_job_status(op: &str, status: &JobStatus) -> serde_json::Value {
 }
 
 // --------------------------------------------------------------------------
+// Per-source destination policy (docs/acquire.md §10)
+// --------------------------------------------------------------------------
+
+/// The first-party destinations of `1688`: the Open Platform API host (the
+/// connector's signed API path) plus the two browser-path hosts.
+pub const DESTINATIONS_1688: &[&str] = &[
+    "https://gw.open.1688.com:443",
+    "https://s.1688.com:443",
+    "https://detail.1688.com:443",
+];
+/// The first-party destinations of `alibaba`: the buyer-visible Open API
+/// host plus the browser-path host.
+pub const DESTINATIONS_ALIBABA: &[&str] = &[
+    "https://openapi.alibaba.com:443",
+    "https://www.alibaba.com:443",
+];
+/// The LCSC API host.
+pub const DESTINATIONS_LCSC: &[&str] = &["https://wmsc.lcsc.com:443"];
+/// The Mouser API host.
+pub const DESTINATIONS_MOUSER: &[&str] = &["https://api.mouser.com:443"];
+/// The DigiKey API host (token + product endpoints share it).
+pub const DESTINATIONS_DIGIKEY: &[&str] = &["https://api.digikey.com:443"];
+
+/// The first-party destination allowlist of one source id. An unknown source
+/// resolves to the empty slice: nothing is admitted (fail closed).
+pub fn source_destinations(source: &str) -> &'static [&'static str] {
+    match source {
+        "1688" => DESTINATIONS_1688,
+        "alibaba" => DESTINATIONS_ALIBABA,
+        "lcsc" => DESTINATIONS_LCSC,
+        "mouser" => DESTINATIONS_MOUSER,
+        "digikey" => DESTINATIONS_DIGIKEY,
+        _ => &[],
+    }
+}
+
+/// The parsed destination policy of the production commerce egress: the
+/// exact first-party hosts of every CONFIGURED+ENABLED source in the strict
+/// `[commerce]` section, assembled from the per-source [`source_destinations`]
+/// tables and parsed through the shared parsed-destination gate.
+///
+/// Fail closed: a bad rule is a startup error (never silently permissive),
+/// no configured source yields the EMPTY policy (deny everything), and a
+/// browser-gated source whose `[commerce.browser]` block is disabled is not
+/// admitted (it registers Disabled and must not be dialable).
+pub fn commerce_destination_policy(cfg: &CommerceCfg) -> Result<EgressDestinationPolicy, String> {
+    let mut rules: Vec<&'static str> = Vec::new();
+    if cfg.enabled {
+        for (source, credential) in cfg.connectors.enabled() {
+            if matches!(credential, ConnectorCredential::Profile(_)) && !cfg.browser.enabled {
+                continue;
+            }
+            for rule in source_destinations(source) {
+                if !rules.contains(rule) {
+                    rules.push(rule);
+                }
+            }
+        }
+    }
+    EgressDestinationPolicy::parse_lines(rules)
+        .map_err(|error| format!("commerce destinations: {error}"))
+}
+
+/// Whether one connector request target passes the parsed per-source
+/// destination gate. Uses the PARSED scheme/host/port of the bounded
+/// [`CanonicalUrl`] (never a re-split string) and fails closed on any
+/// target that cannot be represented.
+fn destination_allowed(policy: &EgressDestinationPolicy, url: &CanonicalUrl) -> bool {
+    let explicit_port = url
+        .origin()
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok());
+    let (is_ipv4, ip) = match url.host().parse::<std::net::Ipv4Addr>() {
+        Ok(v4) => (true, Some(v4.octets())),
+        Err(_) => (false, None),
+    };
+    match RequestTarget::from_parts(Some(url.scheme()), url.host(), explicit_port, is_ipv4, ip) {
+        Ok(target) => matches!(target.check_against(policy), Decision::Allowed),
+        Err(_) => false,
+    }
+}
+
+// --------------------------------------------------------------------------
 // Service construction (daemon graph, never a tool factory)
 // --------------------------------------------------------------------------
 
 /// CAS-backed [`ArtifactStore`] for bulk job results: artifacts are
-/// content-addressed, size-bounded and never carry cookies/credentials
-/// (the commerce layer scans every payload).
+/// content-addressed, size-bounded and never carry cookies/credentials.
+/// With a registered-value [`connectors::SecretGuard`] installed, every
+/// artifact is scrubbed BEFORE it is stored (the connectors register each
+/// configured credential at construction), so a hostile/echoing marketplace
+/// response can never land a credential in CAS. Artifacts are UTF-8 JSON by
+/// construction (`assemble_artifact`); with a guard installed, bytes that
+/// are not UTF-8 are refused typed rather than stored unscanned.
 pub struct CasArtifacts {
     cas: Arc<faktor_cas::Cas>,
+    secrets: Option<Arc<connectors::SecretGuard>>,
 }
 
 impl CasArtifacts {
+    /// Direct construction WITHOUT the registered-value guard: the seam
+    /// focused tests use. The daemon graph builds
+    /// [`CasArtifacts::with_secrets`] so production artifacts are scrubbed.
     pub fn new(cas: Arc<faktor_cas::Cas>) -> Self {
-        Self { cas }
+        Self { cas, secrets: None }
+    }
+
+    /// Production construction: every stored artifact is scrubbed through
+    /// the shared registered-value guard.
+    pub fn with_secrets(cas: Arc<faktor_cas::Cas>, secrets: Arc<connectors::SecretGuard>) -> Self {
+        Self {
+            cas,
+            secrets: Some(secrets),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl ArtifactStore for CasArtifacts {
     async fn put(&self, bytes: &[u8]) -> Result<ArtifactRef, SourceError> {
+        let scrubbed;
+        let payload = match &self.secrets {
+            Some(secrets) => {
+                let text = std::str::from_utf8(bytes).map_err(|_| SourceError::Store)?;
+                scrubbed = secrets.scrub(text);
+                scrubbed.as_bytes()
+            }
+            None => bytes,
+        };
         let hash = self
             .cas
-            .put_bounded(bytes, MAX_ARTIFACT_BYTES)
+            .put_bounded(payload, MAX_ARTIFACT_BYTES)
             .map_err(|_| SourceError::Store)?;
         Ok(ArtifactRef {
             digest: hash.to_hex(),
-            bytes: bytes.len() as u64,
+            bytes: payload.len() as u64,
         })
     }
 
@@ -924,20 +1064,35 @@ pub fn open_commerce_service_with(
 
 /// The daemon's checked-egress → connector transport adapter (spec §10):
 /// every connector request is rebuilt as a
-/// [`faktor_provider::egress::RawRequest`] and executed through the SAME
-/// policy-checked + secret-scanned `faktor-provider` transport the model
-/// adapters use, so destination validation, the sandbox network policy,
-/// body scanning and the response bound all sit below this seam. The
-/// connector-side request bounds (URL, headers, body, timeout) are enforced
-/// by the connector builders before this point.
+/// [`faktor_provider::egress::RawRequest`] and executed through a
+/// policy-checked + secret-scanned `faktor-provider` transport whose
+/// installed allowlist is the parsed COMMERCE destination policy
+/// ([`commerce_destination_policy`]). The adapter additionally re-checks the
+/// parsed target against the same policy BEFORE dispatching, so a
+/// non-allowlisted host is refused typed with zero requests even if a future
+/// inner transport lost its own gate; redirect hops are re-validated by the
+/// checked inner transport (per-hop), and the connector-side request bounds
+/// (URL, headers, body, timeout) are enforced by the connector builders
+/// before this point.
 pub struct CommerceEgress {
     inner: Arc<dyn EgressTransport>,
+    destinations: EgressDestinationPolicy,
 }
 
 impl CommerceEgress {
-    /// Wrap the daemon's ONE checked egress transport.
-    pub fn new(inner: Arc<dyn EgressTransport>) -> Arc<Self> {
-        Arc::new(Self { inner })
+    /// Wrap the daemon's ONE checked egress transport under an explicit,
+    /// already-parsed destination policy. There is deliberately no
+    /// constructor without a policy: a commerce egress with no installed
+    /// allowlist would be the permissive default this seam exists to
+    /// forbid.
+    pub fn new(
+        inner: Arc<dyn EgressTransport>,
+        destinations: EgressDestinationPolicy,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            destinations,
+        })
     }
 }
 
@@ -967,6 +1122,12 @@ impl connectors::HttpTransport for CommerceEgress {
         &self,
         request: connectors::HttpRequest,
     ) -> Result<connectors::HttpResponse, connectors::TransportError> {
+        // Per-request destination gate on the PARSED target: a
+        // non-allowlisted host is refused typed before any request object is
+        // built, let alone executed.
+        if !destination_allowed(&self.destinations, request.url()) {
+            return Err(connectors::TransportError::DestinationDenied);
+        }
         let mut raw = RawRequest::new(request.method().as_str(), request.url().as_str());
         for header in request.headers() {
             raw = raw.header(header.name(), header.value());
@@ -1249,21 +1410,43 @@ impl connectors::BrowserExtraction for CommerceBrowser {
             .deadline_ms()
             .unwrap_or_else(|| now.saturating_add(COMMERCE_BROWSER_DEFAULT_DEADLINE_MS));
         let deadline = faktor_core::time::Deadline::at(deadline_ms.min(i64::MAX as u64) as i64);
+        if ctx.is_cancelled() {
+            return Err(SourceError::Cancelled);
+        }
+        // Propagate the REAL caller cancellation into the browser authority's
+        // own token: the bridge task is aborted when the capture finishes, so
+        // a cancel mid-capture releases the page slot instead of leaking it.
+        // The connector cancellation token is a synchronous probe (the
+        // connector layer has no runtime dependency), so the bridge samples
+        // it at a bounded interval.
         let cancel = faktor_core::cancellation::CancellationToken::new();
-        let page = manager
-            .acquire_page(
-                source.as_str(),
-                &identity,
-                policy,
-                &PagePurpose::new("acquire"),
-                deadline,
-                &cancel,
-            )
-            .await
-            .map_err(browser_source_error)?;
-        let captured = self.capture_page(ctx, url, &page, deadline, &cancel).await;
-        let _ = page.close().await;
-        captured
+        let observed = ctx.cancellation().clone();
+        let bridge_cancel = cancel.clone();
+        let bridge = tokio::spawn(async move {
+            while !observed.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            bridge_cancel.cancel();
+        });
+        let result = async {
+            let page = manager
+                .acquire_page(
+                    source.as_str(),
+                    &identity,
+                    policy,
+                    &PagePurpose::new("acquire"),
+                    deadline,
+                    &cancel,
+                )
+                .await
+                .map_err(browser_source_error)?;
+            let captured = self.capture_page(ctx, url, &page, deadline, &cancel).await;
+            let _ = page.close().await;
+            captured
+        }
+        .await;
+        bridge.abort();
+        result
     }
 }
 
@@ -1337,6 +1520,11 @@ pub struct CommerceSeams {
     pub credentials: Arc<dyn connectors::CredentialProvider>,
     /// The connector diagnostics sink (defaults to a tracing adapter).
     pub diagnostics: Option<Arc<dyn connectors::Diagnostics>>,
+    /// The shared registered-value secret guard of this commerce surface:
+    /// every connector registers its credential here at construction, the
+    /// extraction/result/artifact paths scrub through it, and it is the SAME
+    /// guard the daemon-owned surfaces (tool gateway, CAS artifact store) hold.
+    pub secrets: Arc<connectors::SecretGuard>,
 }
 
 impl Default for CommerceSeams {
@@ -1346,6 +1534,7 @@ impl Default for CommerceSeams {
             browser: None,
             credentials: Arc::new(connectors::ProcessEnvCredentials),
             diagnostics: None,
+            secrets: Arc::new(connectors::SecretGuard::new()),
         }
     }
 }
@@ -1456,7 +1645,12 @@ pub fn register_commerce_connectors(
     seams: &CommerceSeams,
 ) -> Result<CommerceRegistration, String> {
     cfg.validate()?;
-    let secrets = Arc::new(connectors::SecretGuard::new());
+    // The SHARED registered-value guard of this commerce surface: the
+    // connectors register every resolved credential here at construction
+    // and the daemon-owned tool/artifact surfaces scrub through the SAME
+    // Arc, so a credential echoed by a marketplace can never reach a tool
+    // result, an artifact, a diagnostic or a log.
+    let secrets = seams.secrets.clone();
     let quota = Arc::new(connectors::QuotaState::new());
     let diagnostics: Arc<dyn connectors::Diagnostics> = seams
         .diagnostics
@@ -1476,9 +1670,13 @@ pub fn register_commerce_connectors(
         }
         runtime
     };
-    let policy = faktor_commerce::connector::ConnectorPolicy {
+    // Per-source policy: the source's OWN first-party destination allowlist
+    // (spec §10) rides its policy into the registry, so the per-source
+    // policy claim and the egress allowlist are the same declaration.
+    let policy_for = |source: &str| faktor_commerce::connector::ConnectorPolicy {
         api_enabled: true,
         browser_enabled: cfg.browser.enabled,
+        destinations: source_destinations(source),
         ..Default::default()
     };
     let mut rows: Vec<ConnectorRegistration> = Vec::new();
@@ -1502,7 +1700,7 @@ pub fn register_commerce_connectors(
                         "1688",
                         connector,
                         make_runtime(),
-                        policy,
+                        policy_for("1688"),
                         format!(
                             "profile={}",
                             site_config
@@ -1536,7 +1734,7 @@ pub fn register_commerce_connectors(
                         "alibaba",
                         connector,
                         make_runtime(),
-                        policy,
+                        policy_for("alibaba"),
                         format!(
                             "profile={}",
                             site_config
@@ -1566,7 +1764,7 @@ pub fn register_commerce_connectors(
                 "lcsc",
                 connector,
                 make_runtime(),
-                policy,
+                policy_for("lcsc"),
                 "api_key".to_string(),
             )?),
             Err(error) => {
@@ -1587,7 +1785,7 @@ pub fn register_commerce_connectors(
                 "mouser",
                 connector,
                 make_runtime(),
-                policy,
+                policy_for("mouser"),
                 "api_key".to_string(),
             )?),
             Err(error) => {
@@ -1614,7 +1812,7 @@ pub fn register_commerce_connectors(
                 "digikey",
                 connector,
                 make_runtime(),
-                policy,
+                policy_for("digikey"),
                 "oauth".to_string(),
             )?),
             Err(error) => {
@@ -1637,19 +1835,42 @@ fn profile_connector_config(
     })
 }
 
-/// The daemon seams for [`open_commerce_service_with`]: the daemon's ONE
-/// checked egress transport, the lazy browser authority when
-/// `[commerce.browser]` is enabled, and process-environment credentials.
-/// Disabled commerce builds none of them.
+/// The production commerce checked transport: the daemon's parsed COMMERCE
+/// destination policy ([`commerce_destination_policy`]) installed on the
+/// shared policy-checked + secret-scanned transport, so every connector
+/// request (and every redirect hop) passes the parsed destination gate
+/// before a connect and every request body passes the daemon's outbound
+/// whole-payload secret scan. A configured-but-destinationless section
+/// yields the EMPTY policy: deny everything, never default-allow.
+pub fn commerce_egress_transport(
+    cfg: &CommerceCfg,
+    outbound_scan: OutboundScanConfig,
+) -> Result<Arc<PolicyCheckedHttpTransport>, String> {
+    let destinations = commerce_destination_policy(cfg)?;
+    Ok(Arc::new(PolicyCheckedHttpTransport::with_policy_and_scan(
+        Some(destinations),
+        Some(outbound_scan),
+    )))
+}
+
+/// The daemon seams for [`open_commerce_service_with`]: the commerce
+/// checked egress transport over the parsed per-source destination policy
+/// (built here, never default-allow), the lazy browser authority when
+/// `[commerce.browser]` is enabled, process-environment credentials and the
+/// shared registered-value secret guard. Disabled commerce builds none of
+/// them.
 pub fn commerce_seams(
     cfg: &CommerceCfg,
     data_dir: &Path,
-    transport: Arc<dyn EgressTransport>,
+    outbound_scan: OutboundScanConfig,
     supervisor: &Arc<faktor_terminal::ProcessSupervisor>,
 ) -> Result<CommerceSeams, String> {
     if !cfg.enabled {
         return Ok(CommerceSeams::default());
     }
+    let destinations = commerce_destination_policy(cfg)?;
+    let checked = commerce_egress_transport(cfg, outbound_scan)?;
+    let transport: Arc<dyn connectors::HttpTransport> = CommerceEgress::new(checked, destinations);
     let browser: Option<connectors::SharedBrowserExtraction> = if cfg.browser.enabled {
         let authority: Arc<dyn connectors::BrowserExtraction> =
             CommerceBrowser::new(supervisor.clone(), cfg, data_dir)?;
@@ -1658,10 +1879,11 @@ pub fn commerce_seams(
         None
     };
     Ok(CommerceSeams {
-        transport: CommerceEgress::new(transport),
+        transport,
         browser,
         credentials: Arc::new(connectors::ProcessEnvCredentials),
         diagnostics: None,
+        secrets: Arc::new(connectors::SecretGuard::new()),
     })
 }
 
@@ -2904,6 +3126,7 @@ mod tests {
             browser,
             credentials,
             diagnostics: None,
+            secrets: Arc::new(connectors::SecretGuard::new()),
         };
         register_commerce_connectors(service, cfg, &seams).expect("registration")
     }
@@ -2943,6 +3166,7 @@ mod tests {
             browser: Some(Arc::new(UnusedBrowser)),
             credentials: five_connector_credentials(),
             diagnostics: None,
+            secrets: Arc::new(connectors::SecretGuard::new()),
         };
         assert!(register_commerce_connectors(&service, &cfg, &seams).is_err());
     }
@@ -3091,6 +3315,7 @@ mod tests {
             browser: None,
             credentials: five_connector_credentials(),
             diagnostics: None,
+            secrets: Arc::new(connectors::SecretGuard::new()),
         };
         let service =
             open_commerce_service_with(dir.path(), &cfg, artifacts_for(dir.path()), seams)
@@ -3122,11 +3347,13 @@ mod tests {
     #[test]
     fn commerce_egress_maps_the_checked_transport_contract() {
         let rt = tokio::runtime::Runtime::new().unwrap();
+        let destinations =
+            EgressDestinationPolicy::parse_lines(["https://api.mouser.com:443"]).expect("policy");
         let inner = Arc::new(faktor_provider::egress::MockHttpTransport::new(
             200,
             r#"{"ok":true}"#,
         ));
-        let egress = CommerceEgress::new(inner.clone());
+        let egress = CommerceEgress::new(inner.clone(), destinations.clone());
         let request =
             connectors::HttpRequest::get("https://api.mouser.com/api/v1/search/partnumber")
                 .expect("request");
@@ -3140,11 +3367,26 @@ mod tests {
                 "https://api.mouser.com/api/v1/search/partnumber".to_string()
             )]
         );
-        let failing = CommerceEgress::new(Arc::new(
-            faktor_provider::egress::MockHttpTransport::denying(EgressError::Transport(
-                "connect reset".to_string(),
+        // A non-allowlisted host is refused typed BEFORE the inner transport
+        // is even consulted (zero requests).
+        let denied =
+            connectors::HttpRequest::get("https://api.digikey.com/products/v4/search/keyword")
+                .expect("request");
+        assert_eq!(
+            rt.block_on(egress.execute(denied)),
+            Err(connectors::TransportError::DestinationDenied)
+        );
+        assert_eq!(
+            inner.request_count(),
+            1,
+            "no request left for a denied host"
+        );
+        let failing = CommerceEgress::new(
+            Arc::new(faktor_provider::egress::MockHttpTransport::denying(
+                EgressError::Transport("connect reset".to_string()),
             )),
-        ));
+            destinations,
+        );
         let request =
             connectors::HttpRequest::get("https://api.mouser.com/api/v1/search/partnumber")
                 .expect("request");
@@ -3152,5 +3394,435 @@ mod tests {
             rt.block_on(failing.execute(request)),
             Err(connectors::TransportError::Protocol)
         );
+    }
+
+    // ---- Faktor Acquire destination gate (spec §10, audit finding 1) ------
+
+    fn leak_rule(text: String) -> &'static str {
+        Box::leak(text.into_boxed_str())
+    }
+
+    fn parsed_policy(rules: &[&'static str]) -> EgressDestinationPolicy {
+        EgressDestinationPolicy::parse_lines(rules.to_vec()).expect("test policy parses")
+    }
+
+    /// The production checked transport (the REAL shared destination policy
+    /// + `PolicyCheckedHttpTransport`) behind [`CommerceEgress`].
+    fn checked_egress(
+        destinations: EgressDestinationPolicy,
+    ) -> (Arc<CommerceEgress>, EgressDestinationPolicy) {
+        let checked: Arc<dyn EgressTransport> =
+            Arc::new(PolicyCheckedHttpTransport::with_policy_and_scan(
+                Some(destinations.clone()),
+                Some(OutboundScanConfig::default()),
+            ));
+        (
+            CommerceEgress::new(checked, destinations.clone()),
+            destinations,
+        )
+    }
+
+    #[test]
+    fn the_parsed_destination_policy_admits_exactly_the_configured_sources_hosts() {
+        let mut cfg = CommerceCfg {
+            enabled: true,
+            ..CommerceCfg::default()
+        };
+        cfg.connectors.mouser = Some(api_connector("FAKTOR_TEST_MOUSER_KEY"));
+        cfg.connectors.lcsc = Some(api_connector("FAKTOR_TEST_LCSC_KEY"));
+        let policy = commerce_destination_policy(&cfg).expect("policy");
+        for allowed in [
+            "https://api.mouser.com/api/v1/search/partnumber",
+            "https://wmsc.lcsc.com/wmsc/search/global",
+        ] {
+            let url = reqwest::Url::parse(allowed).expect("url");
+            assert!(
+                faktor_provider::egress::check_url(Some(&policy), &url).is_ok(),
+                "{allowed} must pass the parsed commerce gate"
+            );
+        }
+        for denied in [
+            // Configured-source sibling: not configured, never admitted.
+            "https://api.digikey.com/v1/oauth2/token",
+            // A model-provider endpoint is never a commerce destination.
+            "https://api.openai.com/v1/chat/completions",
+            // Scheme downgrade of an admitted host is denied (rule-pinned).
+            "http://api.mouser.com/api/v1/search/partnumber",
+            // Off-allowlist host.
+            "https://evil.example/collect",
+        ] {
+            let url = reqwest::Url::parse(denied).expect("url");
+            assert!(
+                matches!(
+                    faktor_provider::egress::check_url(Some(&policy), &url),
+                    Err(EgressError::Denied { .. })
+                ),
+                "{denied} must be denied by the parsed commerce gate"
+            );
+        }
+
+        // No configured source at all => the EMPTY policy: deny everything
+        // (a missing config is never a permissive default).
+        let empty = commerce_destination_policy(&CommerceCfg {
+            enabled: true,
+            browser: crate::config::CommerceBrowserCfg {
+                enabled: true,
+                ..Default::default()
+            },
+            ..CommerceCfg::default()
+        })
+        .expect("empty policy");
+        let url = reqwest::Url::parse("https://api.mouser.com/x").expect("url");
+        assert!(matches!(
+            faktor_provider::egress::check_url(Some(&empty), &url),
+            Err(EgressError::Denied { .. })
+        ));
+
+        // A browser-gated source with `[commerce.browser]` disabled registers
+        // Disabled and is not dialable.
+        let mut browser_off = CommerceCfg {
+            enabled: true,
+            ..CommerceCfg::default()
+        };
+        browser_off.connectors.china1688 = Some(profile_connector("procurement-cn"));
+        let policy = commerce_destination_policy(&browser_off).expect("policy");
+        let url = reqwest::Url::parse("https://gw.open.1688.com/openapi").expect("url");
+        assert!(matches!(
+            faktor_provider::egress::check_url(Some(&policy), &url),
+            Err(EgressError::Denied { .. })
+        ));
+    }
+
+    #[test]
+    fn the_production_commerce_transport_installs_the_parsed_source_policy() {
+        let mut cfg = CommerceCfg {
+            enabled: true,
+            ..CommerceCfg::default()
+        };
+        cfg.connectors.mouser = Some(api_connector("FAKTOR_TEST_MOUSER_KEY"));
+        let transport =
+            commerce_egress_transport(&cfg, OutboundScanConfig::default()).expect("transport");
+        let policy = transport.policy().expect("policy installed").clone();
+        let url =
+            reqwest::Url::parse("https://api.mouser.com/api/v1/search/partnumber").expect("url");
+        assert!(faktor_provider::egress::check_url(Some(&policy), &url).is_ok());
+        // And the CommerceEgress pre-check over the production policy refuses
+        // a non-allowlisted host before the inner transport is consulted.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let inner = Arc::new(faktor_provider::egress::MockHttpTransport::new(
+            200,
+            r#"{"ok":true}"#,
+        ));
+        let egress = CommerceEgress::new(inner.clone(), policy);
+        let request =
+            connectors::HttpRequest::get("https://api.mouser.com/api/v1/search/partnumber")
+                .expect("request");
+        rt.block_on(egress.execute(request)).expect("allowed");
+        assert_eq!(inner.request_count(), 1);
+        let denied = connectors::HttpRequest::get("https://evil.example/collect").expect("request");
+        assert_eq!(
+            rt.block_on(egress.execute(denied)),
+            Err(connectors::TransportError::DestinationDenied)
+        );
+        assert_eq!(inner.request_count(), 1);
+
+        // Enabled commerce with zero configured sources installs the EMPTY
+        // policy: every destination is denied (never default-allow).
+        let empty = commerce_egress_transport(
+            &CommerceCfg {
+                enabled: true,
+                ..CommerceCfg::default()
+            },
+            OutboundScanConfig::default(),
+        )
+        .expect("transport");
+        let policy = empty.policy().expect("policy installed");
+        let url = reqwest::Url::parse("https://api.mouser.com/x").expect("url");
+        assert!(matches!(
+            faktor_provider::egress::check_url(Some(policy), &url),
+            Err(EgressError::Denied { .. })
+        ));
+    }
+
+    #[test]
+    fn every_documented_connector_endpoint_is_covered_by_its_sources_allowlist() {
+        fn assert_covered(source: &str, url: &str) {
+            let rest = url
+                .strip_prefix("https://")
+                .unwrap_or_else(|| panic!("{url} must be https"));
+            let host = rest.split(['/', '?']).next().expect("host");
+            let rule = format!("https://{host}:443");
+            assert!(
+                source_destinations(source).contains(&rule.as_str()),
+                "source {source} must admit {url} (missing rule {rule})"
+            );
+        }
+        for url in [
+            connectors::mouser::SEARCH_PARTNUMBER_URL,
+            connectors::mouser::SEARCH_KEYWORD_URL,
+        ] {
+            assert_covered("mouser", url);
+        }
+        for url in [
+            connectors::digikey::TOKEN_URL,
+            connectors::digikey::KEYWORD_SEARCH_URL,
+            connectors::digikey::PRODUCT_DETAILS_BASE,
+            connectors::digikey::PRICING_BASE,
+        ] {
+            assert_covered("digikey", url);
+        }
+        for url in [
+            connectors::lcsc::SEARCH_URL,
+            connectors::lcsc::PRODUCT_DETAIL_URL,
+        ] {
+            assert_covered("lcsc", url);
+        }
+        for url in [
+            connectors::china1688::OPEN_PLATFORM_PRODUCT_URL,
+            connectors::china1688::OPEN_PLATFORM_SEARCH_URL,
+            connectors::china1688::BROWSER_SEARCH_URL,
+            connectors::china1688::BROWSER_DETAIL_PREFIX,
+        ] {
+            assert_covered("1688", url);
+        }
+        for url in [
+            connectors::alibaba::OPEN_API_PRODUCT_URL,
+            connectors::alibaba::OPEN_API_SEARCH_URL,
+            connectors::alibaba::BROWSER_SEARCH_URL,
+            connectors::alibaba::BROWSER_DETAIL_PREFIX,
+        ] {
+            assert_covered("alibaba", url);
+        }
+        // Unknown sources admit nothing.
+        assert!(source_destinations("unknown-source").is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_real_gate_admits_allowlisted_responders_and_refuses_others_before_any_request() {
+        let allow = crate::test_http::MockServer::start().await;
+        let deny = crate::test_http::MockServer::start().await;
+        allow.push(
+            "GET",
+            "/api/v1/search/partnumber",
+            crate::test_http::Reply::json(200, serde_json::json!({"ok": true})),
+        );
+        let (egress, _policy) = checked_egress(parsed_policy(&[leak_rule(allow.base())]));
+
+        let request =
+            connectors::HttpRequest::get(&format!("{}/api/v1/search/partnumber", allow.base()))
+                .expect("request");
+        let response = egress.execute(request).await.expect("allowed response");
+        assert_eq!(response.status(), 200);
+        assert_eq!(allow.request_count(), 1);
+
+        let denied =
+            connectors::HttpRequest::get(&format!("{}/api/v1/search/partnumber", deny.base()))
+                .expect("request");
+        assert_eq!(
+            egress.execute(denied).await,
+            Err(connectors::TransportError::DestinationDenied),
+            "a non-allowlisted host is refused typed"
+        );
+        assert_eq!(
+            deny.request_count(),
+            0,
+            "the refused request must never reach the responder"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_real_gate_refuses_a_cross_host_redirect_hop_to_a_non_allowlisted_host() {
+        let origin = crate::test_http::MockServer::start().await;
+        let leak = crate::test_http::MockServer::start().await;
+        origin.push(
+            "GET",
+            "/start",
+            crate::test_http::Reply {
+                status: 302,
+                headers: vec![("location".to_string(), format!("{}/leak", leak.base()))],
+                body: String::new(),
+            },
+        );
+        let (egress, _policy) = checked_egress(parsed_policy(&[leak_rule(origin.base())]));
+        let request =
+            connectors::HttpRequest::get(&format!("{}/start", origin.base())).expect("request");
+        assert_eq!(
+            egress.execute(request).await,
+            Err(connectors::TransportError::DestinationDenied),
+            "the redirect hop to a non-allowlisted host is refused"
+        );
+        assert_eq!(origin.request_count(), 1);
+        assert_eq!(leak.request_count(), 0, "the leak hop was never sent");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_real_gate_follows_a_redirect_to_an_allowlisted_host() {
+        let origin = crate::test_http::MockServer::start().await;
+        let next = crate::test_http::MockServer::start().await;
+        origin.push(
+            "GET",
+            "/start",
+            crate::test_http::Reply {
+                status: 302,
+                headers: vec![("location".to_string(), format!("{}/next", next.base()))],
+                body: String::new(),
+            },
+        );
+        next.push(
+            "GET",
+            "/next",
+            crate::test_http::Reply::json(200, serde_json::json!({"ok": true})),
+        );
+        let (egress, _policy) = checked_egress(parsed_policy(&[
+            leak_rule(origin.base()),
+            leak_rule(next.base()),
+        ]));
+        let request =
+            connectors::HttpRequest::get(&format!("{}/start", origin.base())).expect("request");
+        let response = egress.execute(request).await.expect("followed redirect");
+        assert_eq!(response.status(), 200);
+        assert_eq!(origin.request_count(), 1);
+        assert_eq!(next.request_count(), 1);
+    }
+
+    // ---- commerce credential registration + scrubbing (finding 2) --------
+
+    #[test]
+    fn a_planted_credential_in_a_fixture_response_never_reaches_results_artifacts_or_errors() {
+        const PLANTED: &str = "mouser-planted-credential-9f3a41";
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = CommerceCfg {
+            enabled: true,
+            ..CommerceCfg::default()
+        };
+        cfg.connectors.mouser = Some(api_connector("FAKTOR_TEST_MOUSER_PLANTED"));
+        // Plant the credential in a response field the Mouser extraction maps
+        // into the model-visible discovery title.
+        let fixture = connectors::testing::fixture("mouser/partnumber_search.json")
+            .expect("fixture")
+            .into_bytes();
+        let mut value: serde_json::Value = serde_json::from_slice(&fixture).expect("json");
+        value["SearchResults"]["Parts"][0]["Description"] =
+            serde_json::json!(format!("Buck regulator key {PLANTED} 3A"));
+        let body = serde_json::to_vec(&value).unwrap();
+        let transport = Arc::new(FixtureTransport::new().enqueue(CannedResponse::new(200, body)));
+        let secrets = Arc::new(connectors::SecretGuard::new());
+        let seams = CommerceSeams {
+            transport: transport.clone(),
+            browser: None,
+            credentials: Arc::new(
+                MapCredentials::new().with("FAKTOR_TEST_MOUSER_PLANTED", PLANTED),
+            ),
+            diagnostics: None,
+            secrets: secrets.clone(),
+        };
+        let service =
+            open_commerce_service_with(dir.path(), &cfg, artifacts_for(dir.path()), seams)
+                .unwrap()
+                .expect("enabled service");
+        assert!(
+            secrets.registered_len() >= 1,
+            "the connector must register its configured credential with the shared guard"
+        );
+        assert!(secrets.contains_secret(PLANTED));
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let outcome = rt
+            .block_on(async {
+                let ctx = run_ctx();
+                let tool = source_market_tool_with_secrets(service.clone(), Some(secrets.clone()));
+                (tool.execute)(
+                    ctx,
+                    serde_json::json!({"op": "search", "q": "TPS5430DDAR", "sources": ["mouser"]}),
+                )
+                .await
+            })
+            .expect("search through the tool gateway");
+        assert_eq!(transport.request_count(), 1);
+        assert!(
+            !outcome.text.contains(PLANTED),
+            "the planted credential must never appear in the tool result: {}",
+            outcome.text
+        );
+        assert!(
+            outcome.text.contains("<redacted:configured_secret>"),
+            "the result must carry the redaction marker: {}",
+            outcome.text
+        );
+
+        // Artifacts: the CAS store scrubs through the SAME guard before put.
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("artifact-cas")).unwrap());
+        let store = CasArtifacts::with_secrets(cas, secrets.clone());
+        let artifact =
+            serde_json::to_vec(&serde_json::json!({"note": format!("echo {PLANTED}")})).unwrap();
+        let reference = rt.block_on(store.put(&artifact)).expect("artifact put");
+        let stored = rt
+            .block_on(store.get(&reference.digest))
+            .expect("artifact get")
+            .expect("stored artifact");
+        let stored_text = String::from_utf8(stored).expect("utf8 artifact");
+        assert!(!stored_text.contains(PLANTED), "{stored_text}");
+        assert!(stored_text.contains("<redacted:configured_secret>"));
+
+        // Errors are typed labels only: no error rendering can carry it.
+        let error = rt
+            .block_on(run(
+                disabled(),
+                serde_json::json!({"op": "search", "q": "TPS5430DDAR"}),
+            ))
+            .expect_err("disabled service refuses typed");
+        assert!(!format!("{error}").contains(PLANTED));
+        assert!(!format!("{error:?}").contains(PLANTED));
+        // Logs/diagnostics: the connector diagnostics detail path is scrubbed
+        // by the same guard before any sink sees it.
+        assert!(
+            !secrets
+                .scrub(&format!("diagnostic detail: {PLANTED}"))
+                .contains(PLANTED),
+            "the shared guard must redact the credential in diagnostic text"
+        );
+    }
+
+    // ---- inactive lazy dispatch membership (finding 4) --------------------
+
+    /// Certification for the intended lazy-dispatch membership rule: a tool
+    /// call is dispatchable ONLY when its name is present in the turn's
+    /// bundle. `ToolRegistry::get` resolves a lazy tool's spec for
+    /// introspection/rendering even while inactive, so dispatch must consult
+    /// activation membership (the runtime dispatch site is owned by the
+    /// runtime agent; this pins the contract it must wire).
+    #[test]
+    fn an_inactive_lazy_tool_is_absent_from_turn_bundles_and_must_not_be_dispatchable() {
+        let mut registry = faktor_agent::ToolRegistry::new();
+        registry.register(crate::tools::read_file_tool());
+        registry.register_lazy(source_market_tool(disabled()), source_market_exposure());
+        let caps = faktor_core::model::ModelCapabilities::default();
+        let inactive = ToolActivationSet::new();
+        for phase in [
+            faktor_core::model::RouterPhase::Plan,
+            faktor_core::model::RouterPhase::Explore,
+            faktor_core::model::RouterPhase::Retrieve,
+            faktor_core::model::RouterPhase::Implement,
+            faktor_core::model::RouterPhase::Debug,
+        ] {
+            let bundle = registry.bundle_for_phase_with_activation(phase, &caps, &inactive);
+            assert!(
+                !bundle.tool_names().contains(&SOURCE_MARKET_TOOL),
+                "{phase:?}: an inactive lazy tool must not be in the turn bundle"
+            );
+        }
+        // The registry still resolves the spec (introspection): this is
+        // exactly why dispatch must gate on bundle membership, not on get().
+        assert!(registry.is_lazy(SOURCE_MARKET_TOOL));
+        assert!(registry.get(SOURCE_MARKET_TOOL).is_some());
+        let active =
+            registry.activation_for_text(&inactive, "find LCSC and Mouser prices for TPS5430DDAR");
+        assert!(active.is_active(SOURCE_MARKET_TOOL));
+        let bundle = registry.bundle_for_phase_with_activation(
+            faktor_core::model::RouterPhase::Plan,
+            &caps,
+            &active,
+        );
+        assert!(bundle.tool_names().contains(&SOURCE_MARKET_TOOL));
     }
 }

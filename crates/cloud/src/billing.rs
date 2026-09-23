@@ -1281,8 +1281,9 @@ pub fn fold_usage(
     events: &[UsageEvent],
 ) -> Result<UsageFold, CreditLedgerError> {
     // The winning correction of each base event id: latest by
-    // (occurred_at_ms, id) — deterministic and stable across read order.
-    let mut winning: BTreeMap<&str, &str> = BTreeMap::new();
+    // (occurred_at_ms, id) — the SAME order [`UsageEvent::effective_state`]
+    // uses, deterministic and stable across read order.
+    let mut winning: BTreeMap<&str, (i64, &str)> = BTreeMap::new();
     for event in events {
         let Some(base) = &event.correction_of else {
             continue;
@@ -1291,16 +1292,16 @@ pub fn fold_usage(
         let candidate = (event.occurred_at_ms, event.id.as_str());
         let replace = match winning.get(key) {
             None => true,
-            Some(current) => *current < candidate.1,
+            Some(current) => *current < candidate,
         };
         if replace {
-            winning.insert(key, candidate.1);
+            winning.insert(key, candidate);
         }
     }
     let mut superseded: BTreeSet<&str> = BTreeSet::new();
     for event in events {
         if let Some(base) = &event.correction_of {
-            if winning.get(base.as_str()) == Some(&event.id.as_str()) {
+            if winning.get(base.as_str()) == Some(&(event.occurred_at_ms, event.id.as_str())) {
                 // The winning correction supersedes its base row.
                 superseded.insert(base.as_str());
             } else {

@@ -102,6 +102,36 @@ fn a_contradicted_manufacturer_is_a_mismatch_even_with_an_exact_mpn() {
 }
 
 #[test]
+fn a_contradicted_manufacturer_is_never_softened_by_title_overlap() {
+    // {part: C1234, mfr: Acme} against an offer whose source part number is
+    // C1234 but whose manufacturer is Beta: the signals contradict, so the
+    // classification must stay Mismatch no matter how loudly the title
+    // repeats "C1234 ACME".
+    let mut offer = base_offer();
+    offer.identity.manufacturer_part_number = None;
+    offer.identity.source_part_number = Some(text("C1234"));
+    offer.identity.manufacturer = Some(text("Beta"));
+    offer.title = text("C1234 ACME low dropout regulator");
+    let result = match_offer(&query("C1234", Some("Acme")), &offer, 0);
+    assert_eq!(result.signals.title_token_overlap_bp, Some(10_000));
+    assert!(result.signals.source_part_exact);
+    assert!(result.signals.manufacturer_conflict);
+    assert_eq!(
+        result.certainty,
+        MatchCertainty::Mismatch,
+        "a contradicting manufacturer must survive the title-overlap fallback"
+    );
+
+    // The same guard holds on the identifier-less fallback path.
+    offer.identity.source_part_number = None;
+    offer.identity.offer_id = Some(text("offer-1"));
+    let result = match_offer(&query("C1234", Some("Acme")), &offer, 0);
+    assert!(result.signals.manufacturer_conflict);
+    assert_eq!(result.signals.title_token_overlap_bp, Some(10_000));
+    assert_eq!(result.certainty, MatchCertainty::Mismatch);
+}
+
+#[test]
 fn a_different_part_number_is_a_mismatch() {
     let offer = base_offer();
     let result = match_offer(
@@ -414,6 +444,83 @@ fn ranking_prefers_evidence_over_absence() {
 
     let order = ranked_identity_order(&[weak, exact], 500);
     assert_eq!(order[0], "exact");
+}
+
+#[test]
+fn ranking_scores_moq_and_stock_from_the_selected_scope() {
+    fn component(score: &RankScore, key: ScoreKey) -> i64 {
+        score
+            .components
+            .iter()
+            .find(|component| component.key == key)
+            .expect("component")
+            .normalized
+    }
+
+    // Variant scope: the offer is generous, the selected variant is not.
+    let mut variant_offer = base_offer();
+    variant_offer.moq = Some(nz(1));
+    variant_offer.stock = StockState::InStock {
+        quantity: nz(1_000_000),
+    };
+    let mut v = variant("v1", None, vec![tier(1, "20.00")]);
+    v.attributes = vec![attribute("grade", "industrial")];
+    v.moq = Some(nz(500));
+    v.stock = StockState::OutOfStock;
+    variant_offer.variants = vec![v];
+
+    // Packaging scope: same construction through a packaging option.
+    let mut packaging_offer = base_offer();
+    packaging_offer.moq = Some(nz(1));
+    packaging_offer.stock = StockState::InStock {
+        quantity: nz(1_000_000),
+    };
+    let mut option = packaging_option(PackagingType::Tray, vec![tier(1, "20.00")]);
+    option.moq = Some(nz(300));
+    option.stock = StockState::OutOfStock;
+    packaging_offer.packaging = vec![option];
+
+    let ctx = RankingContext::at_quantity(qty(100));
+
+    let mut variant_query = query("STM32F407VGT6", Some("STMicroelectronics"));
+    variant_query.attributes = vec![attribute("grade", "industrial")];
+    let ranked = rank_offers(&variant_query, std::slice::from_ref(&variant_offer), &ctx);
+    assert_eq!(
+        component(&ranked[0].score, ScoreKey::Moq),
+        0,
+        "the variant MOQ (500) applies at quantity 100"
+    );
+    assert_eq!(
+        component(&ranked[0].score, ScoreKey::Stock),
+        0,
+        "the variant stock (out of stock) is the selected stock"
+    );
+
+    // Without the scope selection the offer-level terms apply.
+    let plain_query = query("STM32F407VGT6", Some("STMicroelectronics"));
+    let ranked = rank_offers(&plain_query, std::slice::from_ref(&variant_offer), &ctx);
+    assert_eq!(component(&ranked[0].score, ScoreKey::Moq), 1_000);
+    assert_eq!(component(&ranked[0].score, ScoreKey::Stock), 1_000);
+
+    let packaging_ctx = RankingContext {
+        packaging: Some(PackagingType::Tray),
+        ..RankingContext::at_quantity(qty(100))
+    };
+    let ranked = rank_offers(
+        &plain_query,
+        std::slice::from_ref(&packaging_offer),
+        &packaging_ctx,
+    );
+    assert_eq!(
+        component(&ranked[0].score, ScoreKey::Moq),
+        0,
+        "the selected packaging MOQ (300) applies at quantity 100"
+    );
+    assert_eq!(
+        component(&ranked[0].score, ScoreKey::Stock),
+        0,
+        "the selected packaging stock is the selected stock"
+    );
 }
 
 #[test]

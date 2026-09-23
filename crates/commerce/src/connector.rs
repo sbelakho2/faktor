@@ -680,6 +680,15 @@ pub struct ConnectorPolicy {
     pub max_consecutive_failures: u32,
     /// How long a breaker stays open after tripping.
     pub cooldown_ms: u64,
+    /// The source's first-party destination allowlist (docs/acquire.md §10):
+    /// one strict `scheme://host[:port]` rule per admitted destination. The
+    /// daemon parses these rules into the shared parsed-destination policy
+    /// installed on the checked transport every connector request executes
+    /// through, so scheme and (when present) port are part of the rule —
+    /// there is no scheme/port widening. The DEFAULT is the empty slice: a
+    /// policy that declares no destination admits NOTHING (fail closed,
+    /// never a permissive default).
+    pub destinations: &'static [&'static str],
 }
 
 impl Default for ConnectorPolicy {
@@ -689,6 +698,7 @@ impl Default for ConnectorPolicy {
             browser_enabled: true,
             max_consecutive_failures: 3,
             cooldown_ms: 60_000,
+            destinations: &[],
         }
     }
 }

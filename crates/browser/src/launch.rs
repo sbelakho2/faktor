@@ -61,6 +61,9 @@ const FORBIDDEN_EXTRA_ARG_PREFIXES: &[&str] = &[
     "--allow-running-insecure-content",
     "--disable-features",
     "--enable-features",
+    // Sandbox removal is never an operational flag: a browser authority that
+    // disables its own sandbox is refused typed (fail closed).
+    "--no-sandbox",
 ];
 
 /// Validate caller-supplied extra flags. A refused flag is a typed config
@@ -427,12 +430,13 @@ mod tests {
             "--disable-web-security",
             "--ignore-certificate-errors",
             "--disable-features=WebRtcHideLocalIpsWithMdns",
+            "--no-sandbox",
         ] {
             let err = validate_extra_args(&[bad.to_string()])
                 .expect_err("a hostile extra arg must be refused typed");
             assert_eq!(err.code(), "invalid_config", "{bad}");
         }
-        validate_extra_args(&["--no-sandbox".to_string(), "--disable-gpu".to_string()])
+        validate_extra_args(&["--disable-gpu".to_string()])
             .expect("benign operational flags stay allowed");
     }
 

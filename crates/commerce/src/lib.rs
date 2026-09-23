@@ -113,18 +113,19 @@ pub use connector::{
     TransportBody, TransportRequest, TransportResponse, UnavailableBrowser, UnavailableTransport,
 };
 pub use jobs::{
-    advance_job, bom_request, job_digest, submit_job, CommerceJob, CommerceJobRequest, ItemOutcome,
-    JobId, JobItemExecutor, JobItemResult, JobItemState, JobLine, JobOutcome, JobState,
-    JobSubmitOutcome, JobWork,
+    advance_job, bom_line_key, bom_request, job_digest, submit_job, terminal_outcome, CommerceJob,
+    CommerceJobRequest, ItemOutcome, JobId, JobItemExecutor, JobItemResult, JobItemState, JobLine,
+    JobOutcome, JobState, JobSubmitOutcome, JobWork, MAX_JOB_ITEM_ATTEMPTS,
 };
 pub use query::{
-    DetailLevel, FreshnessMode, Op, ProductRef, ProductRequest, QuoteRequest, RequestError,
-    SearchRequest, SourceSet, MAX_BOM_LINES as MAX_BOM_LINES_QUERY, MAX_LIMIT, MAX_QUERY_BYTES,
-    MAX_REF_BYTES, MAX_SOURCES,
+    canonical_query, DetailLevel, FreshnessMode, Op, ProductRef, ProductRequest, QuoteRequest,
+    RequestError, SearchRequest, SourceSet, MAX_BOM_LINES as MAX_BOM_LINES_QUERY, MAX_LIMIT,
+    MAX_QUERY_BYTES, MAX_REF_BYTES, MAX_SOURCES,
 };
 pub use result::{
-    artifact_digest, scan_forbidden, scan_forbidden_bytes, validate_digest, ArtifactRef,
-    ArtifactStore, CompactResult, CompactStatus, ForbiddenMaterial, ImportantEntry, ResultCounts,
+    artifact_digest, scan_forbidden, scan_forbidden_bytes, scrub_discoveries, scrub_offer,
+    scrub_quote_candidates, scrub_secrets, validate_digest, ArtifactRef, ArtifactStore,
+    CompactResult, CompactStatus, ForbiddenMaterial, ImportantEntry, ResultCounts,
     COMPACT_RESULT_HARD_MAX_BYTES, COMPACT_RESULT_TARGET_MAX_BYTES,
     COMPACT_RESULT_TARGET_MIN_BYTES, MAX_ARTIFACT_BYTES,
 };

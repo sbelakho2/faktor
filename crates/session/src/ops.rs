@@ -761,13 +761,15 @@ impl SessionHandle {
     ///
     /// A model tool batch is durable BEFORE any permission hop: every call of
     /// the batch is an assistant `tool_call` part, and the batch's results are
-    /// written only after every call resolved. So a wire-visible `tool_call`
-    /// part with no answering `tool_result` (other than the denied call
-    /// itself) is exactly "the batch is still open"; a still-running
-    /// `tool_run` row is the second, direct signal (a sibling already
-    /// executing). The scan is bounded and mirrors the runtime's
-    /// dangling-call repair: newest-first, stopping at the first message with
-    /// no tool part (the batch cluster is contiguous at the tail) and capped.
+    /// written only after every call resolved. So a `tool_call` part with no
+    /// answering `tool_result` (other than the denied call itself) is exactly
+    /// "the batch is still open" — regardless of the call's part state (a
+    /// `pending`/`running` sibling is just as unresolved as a wire-visible
+    /// `completed`/`error` one without a result); a still-running `tool_run`
+    /// row is the second, direct signal (a sibling already executing). The
+    /// scan is bounded and uses the runtime dangling-call repair's
+    /// newest-first cluster walk, deliberately wider than that repair: every
+    /// unresolved `tool_call` counts, not only the wire-visible states.
     fn open_batch_has_pending_siblings(&self) -> faktor_core::Result<bool> {
         if !self.pending_tool_runs()?.is_empty() {
             return Ok(true);
@@ -798,19 +800,16 @@ impl SessionHandle {
                         continue;
                     };
                     match part.kind.as_str() {
-                        // Only the call states the wire carries can be
-                        // pending on the wire (same filter as the runtime's
-                        // dangling-call repair).
-                        "tool_call"
-                            if matches!(
-                                part.data.get("state").and_then(|v| v.as_str()),
-                                Some("completed") | Some("error")
-                            ) =>
-                        {
+                        // A batch call part that has no answering result is
+                        // unresolved whatever its state: `completed`/`error`
+                        // are the wire-visible states, and any OTHER state
+                        // (`pending`/`running`/…) is a still-open sibling by
+                        // construction. Counting only completed|error made a
+                        // pending sibling invisible to the denial landing.
+                        "tool_call" => {
                             calls.insert(call_id.to_string());
                             saw_tool_part = true;
                         }
-                        "tool_call" => saw_tool_part = true,
                         "tool_result" => {
                             answered.insert(call_id.to_string());
                             saw_tool_part = true;
@@ -1328,6 +1327,87 @@ mod tests {
         s.resolve_permission(req2.id, faktor_core::capability::PermissionDecision::Allow)
             .unwrap();
         assert_eq!(s.state().unwrap(), AgentState::ExecutingTool);
+    }
+
+    #[test]
+    fn denied_call_with_a_still_pending_sibling_keeps_the_batch_executing() {
+        // DEFECT REPRODUCER (mixed permission batch, non-terminal sibling):
+        // the sibling's tool_call part is still `pending` (its permission hop
+        // has not even happened), which the old completed|error-only filter
+        // ignored — the denial then landed ReadyForNextTurn while the batch
+        // was still open and stranding the pending sibling.
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        to_streaming(&s);
+        let turn_op = s.ops().all()[0];
+        let mid = s
+            .put_message(
+                s.proposed_message_seq().unwrap(),
+                "assistant",
+                serde_json::json!({ "parts": [] }),
+            )
+            .unwrap();
+        s.put_tool_call_part(mid, "c1", "read_file", serde_json::json!({}), "completed")
+            .unwrap();
+        s.put_tool_call_part(mid, "c2", "write_file", serde_json::json!({}), "pending")
+            .unwrap();
+        let req = s
+            .request_permission(
+                turn_op,
+                &Capability::ReadWorkspace {
+                    path: "/w/p".into(),
+                },
+            )
+            .unwrap();
+        s.resolve_permission(req.id, faktor_core::capability::PermissionDecision::Deny)
+            .unwrap();
+        assert_eq!(
+            s.state().unwrap(),
+            AgentState::ExecutingTool,
+            "a still-PENDING sibling keeps the batch executing"
+        );
+        // The pending sibling's own permission hop stays legal.
+        let req2 = s
+            .request_permission(
+                turn_op,
+                &Capability::ReadWorkspace {
+                    path: "/w/q".into(),
+                },
+            )
+            .unwrap();
+        s.resolve_permission(req2.id, faktor_core::capability::PermissionDecision::Allow)
+            .unwrap();
+        assert_eq!(s.state().unwrap(), AgentState::ExecutingTool);
+
+        // CONTROL: a deny-only batch whose single (denied) call is itself
+        // still `pending` has NO sibling and keeps the documented landing.
+        let s2 = session(&m);
+        to_streaming(&s2);
+        let turn_op2 = s2.ops().all()[0];
+        let mid2 = s2
+            .put_message(
+                s2.proposed_message_seq().unwrap(),
+                "assistant",
+                serde_json::json!({ "parts": [] }),
+            )
+            .unwrap();
+        s2.put_tool_call_part(mid2, "only", "read_file", serde_json::json!({}), "pending")
+            .unwrap();
+        let req3 = s2
+            .request_permission(
+                turn_op2,
+                &Capability::ReadWorkspace {
+                    path: "/w/r".into(),
+                },
+            )
+            .unwrap();
+        s2.resolve_permission(req3.id, faktor_core::capability::PermissionDecision::Deny)
+            .unwrap();
+        assert_eq!(
+            s2.state().unwrap(),
+            AgentState::ReadyForNextTurn,
+            "the denied call alone is not a sibling"
+        );
     }
 
     #[test]

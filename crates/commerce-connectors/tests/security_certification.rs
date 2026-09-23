@@ -255,6 +255,81 @@ fn million_node_dom_fixture_stays_bounded_and_inert() {
     assert_eq!(injected.attr("class"), Some("price"));
 }
 
+/// The Mouser API key rides the documented `apiKey` query parameter (the
+/// Mouser API defines no header form). The transport boundary scans the URL
+/// with the same outbound scanner as headers and bodies: exactly the
+/// declared credential is permitted, any other registered secret refuses
+/// before dispatch, and no returned result, artifact, diagnostic or error
+/// rendering carries a planted key.
+#[tokio::test]
+async fn planted_api_key_never_surfaces_and_url_queries_are_scanned() {
+    let harness = Harness::new();
+    // A second registered secret that the connector never declares: if a
+    // URL ever carried it, the seam must refuse before dispatch.
+    let planted = "PLANTED-SECRET-9f8e7d6c5b4a0123";
+    harness.secrets.register(planted);
+
+    let body = serde_json::json!({
+        "Errors": [],
+        "SearchResults": {
+            "NumberOfResult": 1,
+            "Parts": [{
+                "MouserPartNumber": "595-TPS5430DDAR",
+                "ManufacturerPartNumber": "TPS5430DDAR",
+                "Manufacturer": "Texas Instruments",
+                "Description": format!("Voltage Regulator {MOUSER_KEY}"),
+                "Availability": "10 In Stock",
+                "AvailabilityInStock": "10",
+                "Min": "1",
+                "Mult": "1",
+                "PriceBreaks": [{"Quantity": 1, "Price": "4.9200", "Currency": "USD"}]
+            }]
+        }
+    });
+    harness
+        .transport
+        .push(CannedResponse::json(&body.to_string()));
+    let connector = mouser_connector(&harness.secrets);
+    let discoveries = connector
+        .discover(&harness.ctx(), Harness::search("TPS5430DDAR"))
+        .await
+        .expect("discover");
+
+    // The documented apiKey parameter IS on the wire URL...
+    let wire_url = harness.transport.request_url(0).expect("recorded request");
+    assert!(
+        wire_url.contains(MOUSER_KEY),
+        "the API call must use the documented apiKey parameter"
+    );
+    // ...but every rendered or returned form is scrubbed or redacted.
+    let rendered_requests = harness.transport.rendered_requests();
+    let rendered_results = format!("{discoveries:?}");
+    let diagnostics = harness.diagnostics.joined();
+    for (surface, text) in [
+        ("wire-request rendering", &rendered_requests),
+        ("acquired results", &rendered_results),
+        ("diagnostics", &diagnostics),
+    ] {
+        assert!(!text.contains(MOUSER_KEY), "{surface} leaked the API key");
+        assert!(
+            !text.contains(planted),
+            "{surface} leaked the planted secret"
+        );
+    }
+    // The scanner covers the URL query itself: the wire URL scrubs clean.
+    let scrubbed = harness.secrets.scrub(&wire_url);
+    assert!(
+        !scrubbed.contains(MOUSER_KEY),
+        "URL query not scanner-covered"
+    );
+    assert!(!scrubbed.contains(planted));
+    // The connector-visible Debug form never contains either value.
+    assert!(
+        !format!("{:?}", harness.transport.requests()).contains(MOUSER_KEY),
+        "HttpRequest Debug leaked the key"
+    );
+}
+
 /// The live canary is OPT-IN and network-only: it requires an explicit
 /// operator key, is `#[ignore]`-gated, and never runs in CI. It drives the
 /// REAL Mouser connector over a curl-backed transport, with the same

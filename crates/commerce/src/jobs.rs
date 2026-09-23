@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::bom::Bom;
+use crate::bom::{Bom, BomItem};
 use crate::connector::{AcquireCtx, ProfileIdentity};
 use crate::error::SourceError;
 use crate::quantity::{NonZeroQuantity, MAX_ORDER_QUANTITY};
@@ -33,6 +33,15 @@ const JOB_DIGEST_DOMAIN: &[u8] = b"faktor-commerce.job-digest/v1\0";
 const JOB_ID_DOMAIN: &[u8] = b"faktor-commerce.job-id/v1\0";
 /// Domain separator for synthetic single-item job item keys.
 const JOB_ITEM_DOMAIN: &[u8] = b"faktor-commerce.job-item/v1\0";
+/// Domain separator for per-line BOM item keys.
+const BOM_LINE_KEY_DOMAIN: &[u8] = b"faktor-commerce.bom-line-item/v1\0";
+
+/// The per-line retry bound of a job. A transient, rate-limited or
+/// quota-exhausted line is re-queued at most this many times within one job;
+/// on the final failure the line is settled [`JobItemState::Failed`] with the
+/// last typed error, so a permanently failing line can never consume work
+/// forever and the rest of the job can still terminate.
+pub const MAX_JOB_ITEM_ATTEMPTS: u64 = 5;
 
 /// A job identifier (`job_` + 32 hex characters).
 pub type JobId = String;
@@ -249,7 +258,7 @@ impl JobWork {
                 .iter()
                 .enumerate()
                 .map(|(ordinal, item)| JobLine {
-                    item_key: item.key(),
+                    item_key: bom_line_key(ordinal as u32, item),
                     ordinal: ordinal as u32,
                     query: Some(item.q.clone()),
                     quantity: Some(item.qty),
@@ -289,6 +298,21 @@ fn synthetic_item_key(canonical: &str) -> String {
     hasher.update(JOB_ITEM_DOMAIN);
     hasher.update(&(canonical.len() as u64).to_le_bytes());
     hasher.update(canonical.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+/// The stable, per-line unique key of BOM line `ordinal`: the line's content
+/// key bound to its requested position. Two duplicate (or
+/// identically-normalizing) lines therefore remain two distinct durable job
+/// items — the `(job_id, item_key)` primary key can never collapse requested
+/// lines — while [`Bom::digest`] stays the content digest of the request.
+pub fn bom_line_key(ordinal: u32, item: &BomItem) -> String {
+    let content = item.key();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(BOM_LINE_KEY_DOMAIN);
+    hasher.update(&ordinal.to_le_bytes());
+    hasher.update(&(content.len() as u64).to_le_bytes());
+    hasher.update(content.as_bytes());
     hasher.finalize().to_hex().to_string()
 }
 
@@ -370,12 +394,16 @@ pub fn job_digest(
     let mut hasher = blake3::Hasher::new();
     hasher.update(JOB_DIGEST_DOMAIN);
     put(&mut hasher, 1, Some(&request.work.canonical_identity()));
-    let requested: Vec<String> = request
+    let mut requested: Vec<String> = request
         .sources
         .as_slice()
         .iter()
         .map(|source| source.as_str().to_string())
         .collect();
+    // The requested set is order-insensitive: the same sources in any order
+    // are the same request and must attach to the same job.
+    requested.sort();
+    requested.dedup();
     put(
         &mut hasher,
         2,
@@ -514,7 +542,11 @@ impl ItemOutcome {
         let label = match self.label {
             None => None,
             Some(label) => {
+                // Bound, then scrub credential values, then re-bound and
+                // refuse forbidden material.
                 let bounded = Text::<256>::new(&label).map_err(|_| SourceError::Store)?;
+                let scrubbed = crate::result::scrub_secrets(bounded.as_str());
+                let bounded = Text::<256>::new(&scrubbed).map_err(|_| SourceError::Store)?;
                 if crate::result::scan_forbidden(bounded.as_str()).is_err() {
                     return Err(SourceError::Store);
                 }
@@ -572,6 +604,49 @@ pub fn running_outcome(job: &CommerceJob, now_ms: u64) -> JobOutcome {
     }
 }
 
+/// The compact result of a terminal job whose persisted compact JSON is
+/// missing. A failed or cancelled job can be terminal without a compact
+/// result (for example a cancellation between state transitions); it is
+/// reported with its TRUE terminal [`CompactStatus`] and the typed
+/// `last_error` diagnostic, never as a fabricated `running`. A `completed`
+/// job always persists its compact result, so its absence is durable
+/// corruption and a typed error.
+pub fn terminal_outcome(
+    job: &CommerceJob,
+    counts: ResultCounts,
+    last_error: Option<&str>,
+) -> Result<JobOutcome, SourceError> {
+    let status = match job.state {
+        JobState::Failed => CompactStatus::Failed,
+        JobState::Cancelled => CompactStatus::Cancelled,
+        _ => return Err(SourceError::Store),
+    };
+    let mut important: Vec<ImportantEntry> = Vec::new();
+    let diagnostic = last_error
+        .map(bounded_diagnostic)
+        .unwrap_or_else(|| job.state.as_str().to_string());
+    if let Ok(entry) = ImportantEntry::new("job-error", &diagnostic) {
+        important.push(entry);
+    }
+    Ok(JobOutcome {
+        job: job.clone(),
+        compact: CompactResult::new(status, counts, None, important)?,
+    })
+}
+
+/// Bound one typed diagnostic to the `important`-entry value limit on a char
+/// boundary.
+fn bounded_diagnostic(value: &str) -> String {
+    if value.len() <= crate::result::MAX_IMPORTANT_VALUE_BYTES {
+        return value.to_string();
+    }
+    let mut end = crate::result::MAX_IMPORTANT_VALUE_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
 /// Advance one job deterministically. Every settled line is committed
 /// durably before the next line runs; a re-entry after a crash skips settled
 /// lines and never repeats their external work (a line that was in flight
@@ -595,7 +670,13 @@ pub async fn advance_job(
                 compact,
             });
         }
-        return Ok(running_outcome(&job_from_row(row)?, now_ms));
+        let counts = ResultCounts {
+            matched: row.matched,
+            ambiguous: row.ambiguous,
+            unmatched: row.unmatched,
+        };
+        let last_error = row.last_error.clone();
+        return terminal_outcome(&job_from_row(row)?, counts, last_error.as_deref());
     }
     store.update_job_state(job_id, JobState::Running, now_ms)?;
     let job = job_from_row(store.job(job_id)?.ok_or(SourceError::Store)?)?;
@@ -656,13 +737,12 @@ pub async fn advance_job(
                 })?;
             }
             Err(error) => {
+                let class = error.retry_class();
                 let permanent = matches!(
-                    error.retry_class(),
+                    class,
                     crate::error::SourceRetryClass::Permanent
                         | crate::error::SourceRetryClass::HumanRequired
                 );
-                let retry_class_aborted =
-                    matches!(error.retry_class(), crate::error::SourceRetryClass::Aborted);
                 if permanent {
                     let payload = NormalizedPayload::from_serializable(&JobItemResult {
                         state: JobItemState::Failed,
@@ -685,23 +765,63 @@ pub async fn advance_job(
                     })?;
                     continue;
                 }
-                // Transient / rate-limited / cancelled: leave the line
-                // pending and return a running outcome. Nothing completed is
-                // re-acquired on the next pass.
+                if matches!(class, crate::error::SourceRetryClass::Aborted) {
+                    // Cancellation/deadline is a job-level abort, not a
+                    // per-line failure: the line stays pending, consumes no
+                    // retry budget and returns a running outcome.
+                    store.upsert_job_item(&JobItemRow {
+                        job_id: job_id.to_string(),
+                        item_key: item.item_key.clone(),
+                        ordinal: item.ordinal,
+                        state: JobItemState::Pending,
+                        attempts: item.attempts,
+                        result: None,
+                        error_label: Some(error.as_str().to_string()),
+                        updated_ms: now_ms,
+                    })?;
+                    let fresh = store.job(job_id)?.ok_or(SourceError::Store)?;
+                    return Ok(running_outcome(&job_from_row(fresh)?, now_ms));
+                }
+                // Transient / rate-limited / quota-exhausted: consume one
+                // attempt. Below the documented bound the line stays pending
+                // (nothing completed is re-acquired on the next pass); at the
+                // bound the line is settled `Failed` with the LAST typed
+                // error, so a permanently failing line stops consuming work
+                // and the job can terminate.
+                let attempts = item.attempts.saturating_add(1);
+                if attempts >= MAX_JOB_ITEM_ATTEMPTS {
+                    let payload = NormalizedPayload::from_serializable(&JobItemResult {
+                        state: JobItemState::Failed,
+                        label: None,
+                        important: None,
+                        detail: NormalizedPayload::from_json(format!(
+                            "{{\"error\":\"{}\",\"attempts\":{attempts}}}",
+                            error.as_str()
+                        ))?,
+                        observed_at_ms: now_ms,
+                    })?;
+                    store.upsert_job_item(&JobItemRow {
+                        job_id: job_id.to_string(),
+                        item_key: item.item_key.clone(),
+                        ordinal: item.ordinal,
+                        state: JobItemState::Failed,
+                        attempts,
+                        result: Some(payload),
+                        error_label: Some(error.as_str().to_string()),
+                        updated_ms: now_ms,
+                    })?;
+                    continue;
+                }
                 store.upsert_job_item(&JobItemRow {
                     job_id: job_id.to_string(),
                     item_key: item.item_key.clone(),
                     ordinal: item.ordinal,
                     state: JobItemState::Pending,
-                    attempts: item.attempts + 1,
+                    attempts,
                     result: None,
                     error_label: Some(error.as_str().to_string()),
                     updated_ms: now_ms,
                 })?;
-                if retry_class_aborted {
-                    let fresh = store.job(job_id)?.ok_or(SourceError::Store)?;
-                    return Ok(running_outcome(&job_from_row(fresh)?, now_ms));
-                }
                 let fresh = store.job(job_id)?.ok_or(SourceError::Store)?;
                 return Ok(running_outcome(&job_from_row(fresh)?, now_ms));
             }
@@ -784,12 +904,20 @@ fn assemble_artifact(job: &CommerceJob, items: &[JobItemRow]) -> Result<Vec<u8>,
         lines: Vec<ArtifactLine<'a>>,
     }
     let mut lines = Vec::new();
-    for item in items {
+    let details: Vec<Option<String>> = items
+        .iter()
+        .map(|item| {
+            item.result
+                .as_ref()
+                .map(|payload| crate::result::scrub_secrets(payload.as_str()))
+        })
+        .collect();
+    for (item, detail) in items.iter().zip(&details) {
         lines.push(ArtifactLine {
             key: &item.item_key,
             ordinal: item.ordinal,
             state: item.state.as_str(),
-            detail: item.result.as_ref().map(|payload| payload.as_str()),
+            detail: detail.as_deref(),
         });
     }
     let body = ArtifactBody {

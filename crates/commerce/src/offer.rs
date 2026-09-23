@@ -13,7 +13,9 @@
 //!   [`CommercialOffer::currency`];
 //! - [`PriceVisibility::InquiryRequired`] (and `Unknown`) means *no price
 //!   at all*: such an offer can never carry a fabricated price;
-//! - price tiers never overlap and never repeat a minimum quantity;
+//! - price tiers never overlap and never repeat a minimum quantity within
+//!   one visibility scope; an account-specific tier may share a minimum with
+//!   a public tier (quote resolution then prefers the account tier);
 //! - prices are never negative;
 //! - a promotion never discounts a tier below zero;
 //! - variant ids and attribute names are unique.
@@ -574,7 +576,12 @@ fn validate_promotion(promotion: &Promotion, unit_price: Money) -> Result<(), Of
     Ok(())
 }
 
-/// Validate a list of tiers: no duplicate minimum, no overlap.
+/// Validate a list of tiers: no duplicate minimum within one visibility
+/// scope, no overlap. An account-specific tier MAY share a minimum with a
+/// public tier (or with a tier of a different account scope): at most one of
+/// them applies to any given requester, and quote resolution prefers the
+/// account-specific tier at the same minimum. Two tiers with the same
+/// minimum and the same `account_scope` remain a duplicate.
 pub fn validate_price_breaks(
     breaks: &[PriceBreak],
     expected_currency: Currency,
@@ -598,9 +605,14 @@ pub fn validate_price_breaks(
         let first = &breaks[window[0]];
         let second = &breaks[window[1]];
         if first.min_quantity == second.min_quantity {
-            return Err(OfferError::DuplicateTier {
-                min: first.min_quantity.get(),
-            });
+            if first.account_scope == second.account_scope {
+                return Err(OfferError::DuplicateTier {
+                    min: first.min_quantity.get(),
+                });
+            }
+            // Distinct scopes: per-requester applicability cannot collide,
+            // and the scoped double minimum is not an overlap.
+            continue;
         }
         if let Some(max) = first.max_quantity {
             if max >= second.min_quantity {

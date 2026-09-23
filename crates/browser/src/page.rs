@@ -116,7 +116,7 @@ pub trait PageHost: Send + Sync {
     fn stop_automation(&self, signal: VerificationSignal);
 }
 
-struct PageInner {
+pub(crate) struct PageInner {
     target_id: String,
     session_id: String,
     client: CdpClient,
@@ -131,6 +131,49 @@ struct PageInner {
     closed: AtomicBool,
     host: Weak<dyn PageHost>,
     pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// Backstop for abandoned pages: a cancelled capture whose future (and thus
+/// its last [`Page`] handle) is dropped without [`Page::close`] must still
+/// release the profile slot synchronously, and must not keep its CDP target
+/// alive. The manager's page set holds weak handles, so this `Drop` is what
+/// makes the slot release automatic.
+impl Drop for PageInner {
+    fn drop(&mut self) {
+        let was_closed = self.closed.swap(true, Ordering::SeqCst);
+        let pump = self
+            .pump
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(pump) = pump {
+            pump.abort();
+        }
+        if let Some(host) = self.host.upgrade() {
+            host.release_page(&self.target_id);
+        }
+        if was_closed || self.client.is_closed() {
+            return;
+        }
+        // Best-effort target teardown. `Drop` cannot await; when no runtime
+        // is entered (process teardown) the browser child is killed by the
+        // manager's owner-scoped teardown anyway.
+        let client = self.client.clone();
+        let target_id = self.target_id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = client
+                    .send(
+                        None,
+                        "Target.closeTarget",
+                        json!({ "targetId": target_id }),
+                        deadline_in(2_000),
+                        &CancellationToken::new(),
+                    )
+                    .await;
+            });
+        }
+    }
 }
 
 /// A page handle. Cloning shares the same target session.
@@ -190,6 +233,19 @@ impl Page {
 
     pub fn target_id(&self) -> &str {
         &self.inner.target_id
+    }
+
+    /// A weak handle to the same page session. The manager's page set holds
+    /// weak handles, so dropping the caller's last [`Page`] releases the
+    /// profile slot even when the caller never calls [`Page::close`]
+    /// (abandoned/cancelled captures).
+    pub(crate) fn downgrade(&self) -> Weak<PageInner> {
+        Arc::downgrade(&self.inner)
+    }
+
+    /// Upgrade a weak handle back into a page, when it is still alive.
+    pub(crate) fn upgrade(weak: &Weak<PageInner>) -> Option<Page> {
+        weak.upgrade().map(|inner| Page { inner })
     }
 
     pub fn session_id(&self) -> &str {

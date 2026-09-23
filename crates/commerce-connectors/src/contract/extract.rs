@@ -441,15 +441,17 @@ impl ResolvedField {
 /// Reconcile observations of one field with the documented authority
 /// ordering. Conflicting amounts are **never averaged**: the conflict is
 /// recorded and the strongest strategy's value is selected.
+///
+/// Ranking happens over **all** observations; truncation to
+/// [`MAX_OBSERVATIONS_PER_FIELD`] only ever drops the tail *after* ranking,
+/// so a stronger later observation can never be silently discarded. If any
+/// dropped observation disagrees with the selected value, the field is
+/// recorded as a [`ResolvedField::Conflict`] rather than a clean value.
 pub fn reconcile(observations: &[FieldObservation]) -> ResolvedField {
     if observations.is_empty() {
         return ResolvedField::Missing;
     }
-    let mut ordered: Vec<FieldObservation> = observations
-        .iter()
-        .take(MAX_OBSERVATIONS_PER_FIELD)
-        .cloned()
-        .collect();
+    let mut ordered: Vec<FieldObservation> = observations.to_vec();
     ordered.sort_by(|left, right| {
         right
             .strategy
@@ -457,11 +459,21 @@ pub fn reconcile(observations: &[FieldObservation]) -> ResolvedField {
             .cmp(&left.strategy.authority_rank())
             .then_with(|| left.field.as_str().cmp(right.field.as_str()))
     });
+    let truncated = ordered.len() > MAX_OBSERVATIONS_PER_FIELD;
+    let dropped: Vec<FieldObservation> = if truncated {
+        ordered.split_off(MAX_OBSERVATIONS_PER_FIELD)
+    } else {
+        Vec::new()
+    };
     let authority = ordered[0].strategy;
     let first_key = ordered[0].value.canonical_key();
-    if ordered
+    let dropped_disagrees = dropped
         .iter()
-        .all(|observation| observation.value.canonical_key() == first_key)
+        .any(|observation| observation.value.canonical_key() != first_key);
+    if !dropped_disagrees
+        && ordered
+            .iter()
+            .all(|observation| observation.value.canonical_key() == first_key)
     {
         let mut corroborated_by: Vec<Strategy> = Vec::new();
         for observation in ordered.iter().skip(1) {
@@ -800,6 +812,56 @@ mod tests {
             }
             other => panic!("expected conflict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn truncation_never_drops_a_stronger_later_observation() {
+        // Nine weaker RenderedText observations, then a stronger NetworkJson
+        // observation that a pre-sort `take(8)` window would silently drop.
+        let mut observations: Vec<FieldObservation> = (0..=MAX_OBSERVATIONS_PER_FIELD)
+            .map(|index| {
+                observation(
+                    Field::Price,
+                    1_000_000 + index as i64,
+                    Strategy::RenderedText,
+                )
+            })
+            .collect();
+        observations.push(observation(Field::Price, 36_000_000, Strategy::NetworkJson));
+        let resolved = reconcile(&observations);
+        assert_eq!(
+            resolved
+                .value()
+                .and_then(FieldValue::as_money)
+                .expect("money")
+                .micros,
+            36_000_000,
+            "ranking must run before truncation"
+        );
+        match &resolved {
+            ResolvedField::Conflict { authority, .. } => {
+                assert_eq!(*authority, Strategy::NetworkJson);
+            }
+            other => panic!("expected a recorded conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dropped_agreeing_observations_do_not_fabricate_a_conflict() {
+        let observations: Vec<FieldObservation> = (0..MAX_OBSERVATIONS_PER_FIELD + 4)
+            .map(|_| observation(Field::Price, 36_000_000, Strategy::RenderedText))
+            .collect();
+        let resolved = reconcile(&observations);
+        assert!(!resolved.is_conflict());
+        assert_eq!(
+            resolved
+                .value()
+                .and_then(FieldValue::as_money)
+                .expect("money")
+                .micros,
+            36_000_000
+        );
+        assert_eq!(resolved.observations().len(), 0);
     }
 
     #[test]
