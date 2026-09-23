@@ -15,20 +15,31 @@
 //! * **Accounting** — requests, blocked requests, tunnels, bytes each way,
 //!   per-destination counts, all atomic and monotonic.
 //! * **Health** — a typed snapshot the daemon can surface.
+//! * **Request framing** — the forward path frames exactly one HTTP/1
+//!   request body per connection (fixed-length or chunked), refuses
+//!   ambiguous or conflicting framing (CL+TE, unequal duplicate CL,
+//!   unsupported codings, pipeline residue), and re-emits one canonical
+//!   `Content-Length` so no framing metadata can desync an upstream.
+//! * **Owned teardown** — every connection is owned by the accept loop's
+//!   `JoinSet`; `shutdown().await` returns only once all broker-owned
+//!   sockets and authorized tunnels are closed (`BrokerState::Stopped`
+//!   is never reported with live connections).
 //!
 //! The broker is not an anti-bot subsystem and does not inspect payloads
-//! beyond the request head it must route.
+//! beyond the request head and framing it must route.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
+use tokio::task::JoinSet;
 
 use faktor_core::cancellation::CancellationToken;
 use faktor_security::destination::RequestTarget;
@@ -512,18 +523,27 @@ pub struct BrokerConfig {
     pub bind: SocketAddr,
     pub policy: DestinationPolicy,
     pub upstream: UpstreamSelector,
-    /// Request-head byte cap (headers only; bodies stream through).
+    /// Request-head byte cap (headers only; bodies are framed and bounded
+    /// separately by [`BrokerConfig::max_request_body_bytes`]).
     pub max_request_bytes: usize,
+    /// Maximum decoded request body the forward path admits. A fixed-length
+    /// or chunked body over this bound is refused with a typed 413 before
+    /// any destination socket is opened.
+    pub max_request_body_bytes: usize,
     /// Concurrent connection ceiling.
     pub max_connections: usize,
     /// TCP connect timeout to destinations/upstreams.
     pub connect_timeout_ms: u64,
-    /// Idle timeout for one direction of a tunneled/forwarded copy: a peer
-    /// that stalls for this long loses its connection (and its
-    /// `max_connections` permit).
+    /// Idle timeout for one direction of a tunneled/forwarded copy (and for
+    /// one request-body read/write): a peer that stalls for this long loses
+    /// its connection (and its `max_connections` permit).
     pub copy_idle_timeout_ms: u64,
-    /// Total lifetime of one tunneled/forwarded copy.
+    /// Total lifetime of one tunneled/forwarded copy (and of one request
+    /// body read).
     pub copy_max_ms: u64,
+    /// Bounded grace the broker gives its live connection tasks after
+    /// shutdown is requested, before aborting and reaping stragglers.
+    pub shutdown_grace_ms: u64,
 }
 
 impl Default for BrokerConfig {
@@ -533,10 +553,12 @@ impl Default for BrokerConfig {
             policy: DestinationPolicy::first_party_only(Vec::new()),
             upstream: UpstreamSelector::default(),
             max_request_bytes: 32 * 1024,
+            max_request_body_bytes: 8 * 1024 * 1024,
             max_connections: 64,
             connect_timeout_ms: 10_000,
             copy_idle_timeout_ms: 30_000,
             copy_max_ms: 600_000,
+            shutdown_grace_ms: 2_000,
         }
     }
 }
@@ -549,12 +571,19 @@ impl BrokerConfig {
                 self.bind
             )));
         }
-        if self.max_request_bytes == 0 || self.max_connections == 0 {
+        if self.max_request_bytes == 0
+            || self.max_request_body_bytes == 0
+            || self.max_connections == 0
+        {
             return Err(BrowserError::invalid_config(
-                "broker request/connection bounds must be > 0",
+                "broker request/body/connection bounds must be > 0",
             ));
         }
-        if self.connect_timeout_ms == 0 || self.copy_idle_timeout_ms == 0 || self.copy_max_ms == 0 {
+        if self.connect_timeout_ms == 0
+            || self.copy_idle_timeout_ms == 0
+            || self.copy_max_ms == 0
+            || self.shutdown_grace_ms == 0
+        {
             return Err(BrowserError::invalid_config("broker timeouts must be > 0"));
         }
         if self.copy_max_ms < self.copy_idle_timeout_ms {
@@ -580,10 +609,22 @@ pub struct EgressAccounting {
     pub per_host: BTreeMap<String, u64>,
 }
 
+/// The broker lifecycle state. Terminal states are final: `Stopped` is only
+/// ever set by the accept loop after every broker-owned connection task has
+/// ended, so health can never report `Stopped` with live connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrokerState {
+    /// Accepting connections and serving them.
     Running,
+    /// Shutdown requested: the listener is closing and live connection
+    /// tasks are ending. New connections are refused.
+    Draining,
+    /// Clean terminal state: every owned connection task is joined and every
+    /// broker-owned socket/tunnel is closed (`active_connections == 0`).
     Stopped,
+    /// Terminal state without a completed graceful drain (the owner dropped
+    /// or aborted the broker): connection tasks were aborted.
+    Failed,
 }
 
 /// A typed health snapshot.
@@ -602,15 +643,30 @@ struct BrokerInner {
     policy: DestinationPolicy,
     upstream: UpstreamSelector,
     max_request_bytes: usize,
+    max_request_body_bytes: usize,
     connect_timeout: Duration,
     copy_idle_timeout: Duration,
     copy_max: Duration,
+    shutdown_grace: Duration,
     accounting: Mutex<AccountingCounters>,
     active: AtomicUsize,
     started_ms: i64,
-    running: AtomicBool,
+    state: Mutex<BrokerState>,
     last_error: Mutex<Option<String>>,
     shutdown: CancellationToken,
+    /// Fired once when the state reaches a terminal value, so concurrent
+    /// `shutdown()` callers can wait for the drain they did not own.
+    terminal: Notify,
+}
+
+/// Decrements the active-connection counter exactly once, on every exit path
+/// of the owning connection task (including panics).
+struct ActiveConnectionGuard(Arc<BrokerInner>);
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Default)]
@@ -669,10 +725,34 @@ impl BrokerInner {
             per_host: counters.per_host.clone(),
         }
     }
+
+    fn state(&self) -> BrokerState {
+        *self.state.lock().unwrap()
+    }
+
+    /// Move to `next` unless the state is already terminal (terminal is
+    /// final: a clean stop is never downgraded to `Failed`, and `Failed`
+    /// never becomes `Stopped`). Reaching a terminal state wakes every
+    /// concurrent `shutdown()` waiter.
+    fn transition(&self, next: BrokerState) {
+        let mut state = self.state.lock().unwrap();
+        if matches!(*state, BrokerState::Stopped | BrokerState::Failed) {
+            return;
+        }
+        *state = next;
+        if matches!(next, BrokerState::Stopped | BrokerState::Failed) {
+            self.terminal.notify_waiters();
+        }
+    }
 }
 
-/// A running broker. Dropping the handle aborts the accept loop; explicit
-/// [`BrokerHandle::shutdown`] awaits it.
+/// A running broker. The handle owns the accept task, and the accept task
+/// owns every connection task it accepted (via a `JoinSet`), so there is no
+/// detached connection work: [`BrokerHandle::shutdown`] returns only after
+/// all broker-owned sockets and tunnels are closed. Dropping the handle is
+/// the last-resort path: it aborts the accept task (which aborts its
+/// connection tasks) and records [`BrokerState::Failed`] (the drain was not
+/// awaited).
 pub struct BrokerHandle {
     inner: Arc<BrokerInner>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -707,11 +787,7 @@ impl BrokerHandle {
 
     pub fn health(&self) -> BrokerHealth {
         BrokerHealth {
-            state: if self.inner.running.load(Ordering::SeqCst) {
-                BrokerState::Running
-            } else {
-                BrokerState::Stopped
-            },
+            state: self.inner.state(),
             addr: self.inner.addr,
             active_connections: self.inner.active.load(Ordering::SeqCst),
             accounting: self.inner.snapshot(),
@@ -720,14 +796,40 @@ impl BrokerHandle {
         }
     }
 
-    /// Stop the broker: the listener closes, in-flight copies finish, and
-    /// the accept task is joined.
+    /// Stop the broker and own the teardown: cancel, stop accepting, let
+    /// live copies observe cancellation and end, drain the connection
+    /// `JoinSet` within the configured grace, abort/reap stragglers, and only
+    /// then report `Stopped`. When this future returns:
+    ///
+    /// * no connection task is live (`health().active_connections == 0`),
+    /// * every broker-owned client/destination socket is closed, and
+    /// * no authorized tunnel is still transferring.
+    ///
+    /// Idempotent and concurrency-safe: sequential repeats are no-ops, and a
+    /// concurrent caller waits for the same terminal state.
     pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
-        self.inner.running.store(false, Ordering::SeqCst);
+        self.inner.transition(BrokerState::Draining);
         let task = self.task.lock().unwrap().take();
         if let Some(task) = task {
-            let _ = task.await;
+            if task.await.is_err() {
+                // The accept task panicked or was aborted: the drain never
+                // completed and terminal state must say so.
+                self.inner.transition(BrokerState::Failed);
+            }
+        } else {
+            // Another caller owns (or already finished) the join. Wait for
+            // the terminal state it will record.
+            loop {
+                let terminal = self.inner.terminal.notified();
+                if matches!(
+                    self.inner.state(),
+                    BrokerState::Stopped | BrokerState::Failed
+                ) {
+                    break;
+                }
+                terminal.await;
+            }
         }
     }
 }
@@ -735,7 +837,11 @@ impl BrokerHandle {
 impl Drop for BrokerHandle {
     fn drop(&mut self) {
         self.inner.shutdown.cancel();
-        self.inner.running.store(false, Ordering::SeqCst);
+        // Cannot await the drain here: abort the accept task, which drops
+        // its JoinSet and aborts every connection task (sockets close at
+        // their next poll). Terminal state records that no graceful drain
+        // was owned.
+        self.inner.transition(BrokerState::Failed);
         if let Some(task) = self.task.lock().unwrap().take() {
             task.abort();
         }
@@ -771,24 +877,40 @@ impl EgressBroker {
             policy: config.policy.clone(),
             upstream: config.upstream.clone(),
             max_request_bytes: config.max_request_bytes,
+            max_request_body_bytes: config.max_request_body_bytes,
             connect_timeout: Duration::from_millis(config.connect_timeout_ms),
             copy_idle_timeout: Duration::from_millis(config.copy_idle_timeout_ms),
             copy_max: Duration::from_millis(config.copy_max_ms),
+            shutdown_grace: Duration::from_millis(config.shutdown_grace_ms),
             accounting: Mutex::new(AccountingCounters::default()),
             active: AtomicUsize::new(0),
             started_ms: now_ms(),
-            running: AtomicBool::new(true),
+            state: Mutex::new(BrokerState::Running),
             last_error: Mutex::new(None),
             shutdown: CancellationToken::new(),
+            terminal: Notify::new(),
         });
         let max_connections = config.max_connections;
         let accept_inner = inner.clone();
         let task = tokio::spawn(async move {
             let permits = Arc::new(tokio::sync::Semaphore::new(max_connections));
+            // Every accepted connection is owned here, never detached.
+            let mut connections: JoinSet<Result<(), String>> = JoinSet::new();
             loop {
                 tokio::select! {
                     biased;
                     _ = accept_inner.shutdown.cancelled() => break,
+                    joined = connections.join_next(), if !connections.is_empty() => {
+                        match joined {
+                            Some(Ok(Ok(()))) => {}
+                            Some(Ok(Err(error))) => accept_inner.account_error(error),
+                            Some(Err(join_error)) if join_error.is_panic() => {
+                                accept_inner.account_error("connection task panicked");
+                            }
+                            Some(Err(_)) => {}
+                            None => {}
+                        }
+                    }
                     accepted = listener.accept() => {
                         match accepted {
                             Ok((stream, _peer)) => {
@@ -797,14 +919,13 @@ impl EgressBroker {
                                     drop(stream);
                                     continue;
                                 };
+                                accept_inner.active.fetch_add(1, Ordering::SeqCst);
                                 let conn_inner = accept_inner.clone();
-                                tokio::spawn(async move {
-                                    conn_inner.active.fetch_add(1, Ordering::SeqCst);
-                                    if let Err(error) = serve_connection(stream, conn_inner.clone()).await {
-                                        conn_inner.account_error(error);
-                                    }
-                                    conn_inner.active.fetch_sub(1, Ordering::SeqCst);
+                                connections.spawn(async move {
+                                    let _guard = ActiveConnectionGuard(conn_inner.clone());
+                                    let result = serve_connection(stream, conn_inner.clone()).await;
                                     drop(permit);
+                                    result
                                 });
                             }
                             Err(e) => {
@@ -815,6 +936,26 @@ impl EgressBroker {
                     }
                 }
             }
+            // Stop accepting first: dropping the listener closes the bound
+            // socket before the drain so no new connection can arrive.
+            drop(listener);
+            accept_inner.transition(BrokerState::Draining);
+            // Bounded graceful drain: connection tasks observe the cancel
+            // token and end promptly; anything still live at the deadline is
+            // aborted and reaped. Only after the set is empty (i.e. every
+            // guard decremented `active` and every socket was dropped) is the
+            // terminal state recorded.
+            let deadline = tokio::time::Instant::now() + accept_inner.shutdown_grace;
+            while !connections.is_empty() {
+                match tokio::time::timeout_at(deadline, connections.join_next()).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+            accept_inner.transition(BrokerState::Stopped);
         });
         Ok(BrokerHandle {
             inner,
@@ -835,23 +976,36 @@ enum HeadError {
 
 /// Read an HTTP request/response head (through `\r\n\r\n`), returning the
 /// head text and any leftover bytes already read past it.
+///
+/// The bound is never exceeded, not even transiently: a read is capped at
+/// the exact remaining allowance, and once the allowance is exhausted
+/// without a terminator the head is typed [`HeadError::TooLarge`] (the
+/// terminator necessarily lies beyond the bound). A head whose terminator
+/// ends exactly at `max_bytes` is accepted.
 async fn read_head(
     stream: &mut TcpStream,
     max_bytes: usize,
 ) -> Result<(String, Vec<u8>), HeadError> {
-    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    let mut buf: Vec<u8> = Vec::with_capacity(max_bytes.min(1024).saturating_add(4));
     let mut chunk = [0u8; 4096];
     loop {
         if let Some(pos) = find_head_end(&buf) {
+            if pos > max_bytes {
+                return Err(HeadError::TooLarge(pos));
+            }
             let head = String::from_utf8_lossy(&buf[..pos]).to_string();
             let leftover = buf[pos..].to_vec();
             return Ok((head, leftover));
         }
-        if buf.len() > max_bytes {
+        if buf.len() >= max_bytes {
+            // No terminator within the allowance: any terminator would end
+            // beyond it. Never read the overage.
             return Err(HeadError::TooLarge(buf.len()));
         }
+        let remaining = max_bytes - buf.len();
+        let want = remaining.min(chunk.len());
         let read = stream
-            .read(&mut chunk)
+            .read(&mut chunk[..want])
             .await
             .map_err(|e| HeadError::Io(e.to_string()))?;
         if read == 0 {
@@ -861,6 +1015,8 @@ async fn read_head(
             return Err(HeadError::Io("connection closed mid-head".to_string()));
         }
         buf.extend_from_slice(&chunk[..read]);
+        // The loop re-checks both the terminator and the bound after every
+        // extend, so an over-bound terminator can never be accepted.
     }
 }
 
@@ -1021,6 +1177,441 @@ fn parse_head(head: &str) -> Result<ParsedRequest, HeadError> {
     })
 }
 
+/// How one request carries its body, decided strictly from the head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyFraming {
+    /// No `Content-Length` and no `Transfer-Encoding`: the request has no
+    /// body, and any byte beyond the head is pipeline residue (refused).
+    None,
+    /// One authoritative decimal `Content-Length` (equal duplicates are
+    /// canonicalized to this value).
+    Fixed(u64),
+    /// A single `chunked` transfer coding: the body is decoded into a
+    /// canonical, bounded byte string.
+    Chunked,
+}
+
+/// A typed request-body refusal. Every variant maps to one explicit status
+/// code and is refused before any destination socket is opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BodyError {
+    /// Contradictory or malformed framing metadata (`400`).
+    Malformed(String),
+    /// A transfer coding other than a single `chunked` (`501`).
+    UnsupportedEncoding(String),
+    /// The framed body exceeds `max_request_body_bytes` (`413`).
+    TooLarge,
+    /// The client closed or stalled before the declared body arrived (`400`).
+    Incomplete(String),
+    /// Bytes beyond the single framed request body (HTTP pipelining). The
+    /// broker forwards exactly one logical request, so residue is refused
+    /// before the destination socket opens (`400`). Bytes that arrive after
+    /// the body was forwarded are never relayed to the destination either:
+    /// the client→destination direction ends at the framed body.
+    PipelineResidue,
+    /// Shutdown was requested while reading; the connection ends quietly.
+    Shutdown,
+}
+
+impl BodyError {
+    fn status(&self) -> &'static str {
+        match self {
+            BodyError::Malformed(_) | BodyError::Incomplete(_) | BodyError::PipelineResidue => {
+                "400 Bad Request"
+            }
+            BodyError::UnsupportedEncoding(_) => "501 Not Implemented",
+            BodyError::TooLarge => "413 Payload Too Large",
+            BodyError::Shutdown => "503 Service Unavailable",
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            BodyError::Malformed(detail)
+            | BodyError::UnsupportedEncoding(detail)
+            | BodyError::Incomplete(detail) => detail.clone(),
+            BodyError::TooLarge => "request body exceeds the configured bound".to_string(),
+            BodyError::PipelineResidue => {
+                "bytes beyond the single framed request body were sent (HTTP pipeline \
+                 residue); refusing"
+                    .to_string()
+            }
+            BodyError::Shutdown => "broker is shutting down".to_string(),
+        }
+    }
+}
+
+/// Decide the body framing of one request head, strictly:
+///
+/// * `Transfer-Encoding` and `Content-Length` together are ambiguous and
+///   refused;
+/// * the only accepted transfer coding is a single `chunked` (final and
+///   only); any other coding list is refused with a typed `501`;
+/// * duplicate `Content-Length` values must be numerically equal (they
+///   canonicalize to one value); unequal duplicates are refused;
+/// * a non-decimal or overflowing `Content-Length` is refused.
+fn request_body_framing(headers: &[(String, String)]) -> Result<BodyFraming, BodyError> {
+    let mut content_lengths: Vec<u64> = Vec::new();
+    let mut transfer_encodings: Vec<String> = Vec::new();
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-length") {
+            if value.contains(',') {
+                return Err(BodyError::Malformed(format!(
+                    "Content-Length must be one decimal value, got {value:?}"
+                )));
+            }
+            let trimmed = value.trim();
+            if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(BodyError::Malformed(format!(
+                    "invalid Content-Length {value:?}"
+                )));
+            }
+            let parsed: u64 = trimmed.parse().map_err(|_| {
+                BodyError::Malformed(format!("Content-Length overflows u64: {value:?}"))
+            })?;
+            content_lengths.push(parsed);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            for token in value.split(',') {
+                let token = token.trim();
+                if token.is_empty() {
+                    return Err(BodyError::Malformed(
+                        "empty transfer coding in Transfer-Encoding".to_string(),
+                    ));
+                }
+                transfer_encodings.push(token.to_ascii_lowercase());
+            }
+        }
+    }
+    if !transfer_encodings.is_empty() {
+        if !content_lengths.is_empty() {
+            return Err(BodyError::Malformed(
+                "Content-Length and Transfer-Encoding present together; ambiguous framing \
+                 refused"
+                    .to_string(),
+            ));
+        }
+        if transfer_encodings.len() != 1 || transfer_encodings[0] != "chunked" {
+            return Err(BodyError::UnsupportedEncoding(format!(
+                "unsupported transfer coding list {:?}; only a single `chunked` is accepted",
+                transfer_encodings.join(", ")
+            )));
+        }
+        return Ok(BodyFraming::Chunked);
+    }
+    let mut lengths = content_lengths.iter().copied();
+    if let Some(first) = lengths.next() {
+        if lengths.any(|other| other != first) {
+            return Err(BodyError::Malformed(
+                "conflicting duplicate Content-Length values; refused".to_string(),
+            ));
+        }
+        return Ok(BodyFraming::Fixed(first));
+    }
+    Ok(BodyFraming::None)
+}
+
+/// `Expect: 100-continue` is answered locally (the broker is the only
+/// endpoint the client talks to) and never forwarded. Any other Expect value
+/// is refused rather than guessed at.
+fn expects_continue(headers: &[(String, String)]) -> Result<bool, BodyError> {
+    let mut found = false;
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("expect") {
+            if !value.eq_ignore_ascii_case("100-continue") {
+                return Err(BodyError::Malformed(format!(
+                    "unsupported Expect value {value:?}; only 100-continue is accepted"
+                )));
+            }
+            found = true;
+        }
+    }
+    Ok(found)
+}
+
+fn find_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\r\n")
+}
+
+/// Bytes one chunk-size line (including extensions) or one trailer line may
+/// occupy.
+const MAX_CHUNK_LINE: usize = 1024;
+/// Total trailer-section bound (validated, then discarded; `Trailer` is
+/// hop-by-hop and never forwarded).
+const MAX_TRAILER_BYTES: usize = 16 * 1024;
+
+/// A bounded, cancellation-aware reader over the client's framed body. It
+/// owns the post-head leftover, never reads more from the wire than the raw
+/// bound, and applies the copy idle/total bounds to body reads too.
+struct BodyReader<'a> {
+    stream: &'a mut TcpStream,
+    shutdown: &'a CancellationToken,
+    buf: Vec<u8>,
+    start: usize,
+    wire: u64,
+    wire_max: u64,
+    idle: Duration,
+    deadline: tokio::time::Instant,
+    closed: bool,
+}
+
+impl<'a> BodyReader<'a> {
+    fn new(
+        stream: &'a mut TcpStream,
+        leftover: Vec<u8>,
+        wire_max: u64,
+        idle: Duration,
+        total: Duration,
+        shutdown: &'a CancellationToken,
+    ) -> Self {
+        Self {
+            stream,
+            shutdown,
+            buf: leftover,
+            start: 0,
+            wire: 0,
+            wire_max,
+            idle,
+            deadline: tokio::time::Instant::now() + total,
+            closed: false,
+        }
+    }
+
+    fn buffered(&self) -> &[u8] {
+        &self.buf[self.start..]
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.start += n;
+        if self.start == self.buf.len() {
+            self.buf.clear();
+            self.start = 0;
+        } else if self.start >= 64 * 1024 {
+            self.buf.drain(..self.start);
+            self.start = 0;
+        }
+    }
+
+    /// Read one more wire chunk into the buffer, bounded by the idle/total
+    /// budget and by the raw wire allowance.
+    async fn fill(&mut self) -> Result<(), BodyError> {
+        if self.closed {
+            return Err(BodyError::Incomplete(
+                "client closed before the declared request body arrived".to_string(),
+            ));
+        }
+        let now = tokio::time::Instant::now();
+        if now >= self.deadline {
+            return Err(BodyError::Incomplete(
+                "request body deadline exceeded".to_string(),
+            ));
+        }
+        let wait = self.idle.min(self.deadline - now);
+        let mut chunk = [0u8; 16 * 1024];
+        let read = tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => return Err(BodyError::Shutdown),
+            read = tokio::time::timeout(wait, self.stream.read(&mut chunk)) => read,
+        };
+        match read {
+            Err(_) => Err(BodyError::Incomplete(
+                "idle timeout reading the request body".to_string(),
+            )),
+            Ok(Err(e)) => Err(BodyError::Malformed(format!(
+                "request body read failed: {e}"
+            ))),
+            Ok(Ok(0)) => {
+                self.closed = true;
+                Err(BodyError::Incomplete(
+                    "client closed before the declared request body arrived".to_string(),
+                ))
+            }
+            Ok(Ok(n)) => {
+                self.wire = self.wire.saturating_add(n as u64);
+                if self.wire > self.wire_max {
+                    return Err(BodyError::TooLarge);
+                }
+                self.buf.extend_from_slice(&chunk[..n]);
+                Ok(())
+            }
+        }
+    }
+
+    async fn ensure(&mut self, n: usize) -> Result<(), BodyError> {
+        while self.buffered().len() < n {
+            self.fill().await?;
+        }
+        Ok(())
+    }
+
+    /// Read through one CRLF, bounded by `max_line` (excluding the CRLF).
+    /// A bare LF is not a line terminator and makes the line malformed at
+    /// the caller's parser, never a split point.
+    async fn read_line(&mut self, max_line: usize) -> Result<Vec<u8>, BodyError> {
+        loop {
+            if let Some(pos) = find_crlf(self.buffered()) {
+                if pos > max_line {
+                    return Err(BodyError::Malformed(
+                        "chunk framing line exceeds its bound".to_string(),
+                    ));
+                }
+                let line = self.buffered()[..pos].to_vec();
+                self.consume(pos + 2);
+                return Ok(line);
+            }
+            if self.buffered().len() > max_line {
+                return Err(BodyError::Malformed(
+                    "chunk framing line exceeds its bound".to_string(),
+                ));
+            }
+            self.fill().await?;
+        }
+    }
+
+    async fn read_exact_into(&mut self, n: usize, out: &mut Vec<u8>) -> Result<(), BodyError> {
+        while self.buffered().len() < n {
+            self.fill().await?;
+        }
+        out.extend_from_slice(&self.buffered()[..n]);
+        self.consume(n);
+        Ok(())
+    }
+}
+
+/// Decode one chunked body into `body`, enforcing the decoded bound before
+/// each append and the raw (wire) bound inside [`BodyReader`]. Extensions
+/// are validated and ignored; trailers are validated and discarded.
+async fn read_chunked_body(
+    reader: &mut BodyReader<'_>,
+    max_body: usize,
+) -> Result<Vec<u8>, BodyError> {
+    let mut body = Vec::new();
+    loop {
+        let line = reader.read_line(MAX_CHUNK_LINE).await?;
+        let size_part = match line.iter().position(|&b| b == b';') {
+            Some(pos) => {
+                let extension = &line[pos + 1..];
+                if extension
+                    .iter()
+                    .any(|&b| b == 0x00 || b == 0x7f || !(0x20..=0x7e).contains(&b))
+                {
+                    return Err(BodyError::Malformed(
+                        "control character in a chunk extension".to_string(),
+                    ));
+                }
+                &line[..pos]
+            }
+            None => &line[..],
+        };
+        let size_text = std::str::from_utf8(size_part)
+            .map_err(|_| BodyError::Malformed("non-ASCII chunk size".to_string()))?
+            .trim();
+        if size_text.is_empty()
+            || size_text.len() > 16
+            || !size_text.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(BodyError::Malformed(format!(
+                "invalid chunk size {:?}",
+                String::from_utf8_lossy(size_part)
+            )));
+        }
+        let size = u64::from_str_radix(size_text, 16)
+            .map_err(|_| BodyError::Malformed("chunk size overflow".to_string()))?;
+        if size == 0 {
+            read_trailers(reader).await?;
+            return Ok(body);
+        }
+        if body.len() as u64 + size > max_body as u64 {
+            return Err(BodyError::TooLarge);
+        }
+        reader.read_exact_into(size as usize, &mut body).await?;
+        reader.ensure(2).await?;
+        if &reader.buffered()[..2] != b"\r\n" {
+            return Err(BodyError::Malformed(
+                "chunk data is not followed by CRLF".to_string(),
+            ));
+        }
+        reader.consume(2);
+    }
+}
+
+async fn read_trailers(reader: &mut BodyReader<'_>) -> Result<(), BodyError> {
+    let mut total = 0usize;
+    loop {
+        let line = reader.read_line(MAX_CHUNK_LINE).await?;
+        if line.is_empty() {
+            return Ok(());
+        }
+        total = total.saturating_add(line.len() + 2);
+        if total > MAX_TRAILER_BYTES {
+            return Err(BodyError::Malformed(
+                "trailer section exceeds its bound".to_string(),
+            ));
+        }
+        let text = std::str::from_utf8(&line)
+            .map_err(|_| BodyError::Malformed("non-ASCII trailer line".to_string()))?;
+        let Some((name, value)) = text.split_once(':') else {
+            return Err(BodyError::Malformed(format!(
+                "malformed trailer line {text:?}"
+            )));
+        };
+        if !is_token(name) {
+            return Err(BodyError::Malformed(format!(
+                "invalid trailer name {name:?}"
+            )));
+        }
+        let value = value.trim_matches(|c| c == ' ' || c == '\t');
+        if !is_header_value(value) {
+            return Err(BodyError::Malformed(
+                "trailer value carries control characters".to_string(),
+            ));
+        }
+    }
+}
+
+/// Read exactly the one framed request body, then require that nothing else
+/// is buffered: the broker forwards exactly one logical request, so
+/// pipelined residue is refused rather than appended to the body.
+async fn read_request_body(
+    client: &mut TcpStream,
+    leftover: Vec<u8>,
+    framing: BodyFraming,
+    inner: &BrokerInner,
+) -> Result<Vec<u8>, BodyError> {
+    let max_body = inner.max_request_body_bytes;
+    // Raw wire allowance: the decoded bound plus an equal allowance for
+    // chunk framing/headers plus a fixed slack. Exceeding either bound is a
+    // typed `TooLarge`, so framing overhead can never grow without bound.
+    let wire_max = (max_body as u64).saturating_mul(2).saturating_add(4096);
+    let mut reader = BodyReader::new(
+        client,
+        leftover,
+        wire_max,
+        inner.copy_idle_timeout,
+        inner.copy_max,
+        &inner.shutdown,
+    );
+    let body = match framing {
+        BodyFraming::None => Vec::new(),
+        BodyFraming::Fixed(length) => {
+            if length > max_body as u64 {
+                return Err(BodyError::TooLarge);
+            }
+            let mut body = Vec::with_capacity(length as usize);
+            reader.read_exact_into(length as usize, &mut body).await?;
+            body
+        }
+        BodyFraming::Chunked => read_chunked_body(&mut reader, max_body).await?,
+    };
+    if !reader.buffered().is_empty() {
+        return Err(BodyError::PipelineResidue);
+    }
+    Ok(body)
+}
+
+async fn write_refusal(stream: &mut TcpStream, error: &BodyError) {
+    write_error(stream, error.status(), &error.detail()).await;
+}
+
 async fn write_denial(stream: &mut TcpStream, status: &str, reason: BlockReason) {
     let body = format!("blocked by egress policy: {reason}\n");
     let response = format!(
@@ -1042,7 +1633,14 @@ async fn write_error(stream: &mut TcpStream, status: &str, detail: &str) {
 }
 
 async fn serve_connection(mut client: TcpStream, inner: Arc<BrokerInner>) -> Result<(), String> {
-    let (head, leftover) = match read_head(&mut client, inner.max_request_bytes).await {
+    // A connection parked in the head read must still end promptly when the
+    // broker is shutting down.
+    let head = tokio::select! {
+        biased;
+        _ = inner.shutdown.cancelled() => return Ok(()),
+        head = read_head(&mut client, inner.max_request_bytes) => head,
+    };
+    let (head, leftover) = match head {
         Ok(pair) => pair,
         Err(HeadError::Closed) => return Ok(()),
         Err(HeadError::TooLarge(size)) => {
@@ -1102,46 +1700,116 @@ async fn serve_connect(
     let upstream = inner.upstream.select(&host);
     let mut target = match connect_destination(upstream, &host, port, &inner).await {
         Ok(stream) => stream,
+        Err(_detail) if inner.shutdown.is_cancelled() => return Ok(()),
         Err(detail) => {
             inner.account_error(detail.clone());
             write_error(&mut client, "502 Bad Gateway", &detail).await;
             return Ok(());
         }
     };
-    if upstream.is_some() {
-        // The upstream proxy expects its own CONNECT; credentials are added
-        // here and never travel to the client.
-        if let Err(detail) = send_upstream_connect(&mut target, upstream, &host, port).await {
+    // The upstream proxy expects its own CONNECT; credentials are added here
+    // and never travel to the client. Any post-header bytes the upstream
+    // sent are early tunnel bytes and must be relayed to the client intact.
+    let early = match send_upstream_connect(
+        &mut target,
+        upstream,
+        &host,
+        port,
+        inner.copy_idle_timeout,
+        &inner.shutdown,
+    )
+    .await
+    {
+        Ok(early) => early,
+        Err(_detail) if inner.shutdown.is_cancelled() => return Ok(()),
+        Err(detail) => {
             inner.account_error(detail.clone());
             write_error(&mut client, "502 Bad Gateway", &detail).await;
             return Ok(());
         }
-    }
+    };
     inner.account_tunnel();
+    let mut established = b"HTTP/1.1 200 Connection Established\r\n\r\n".to_vec();
+    established.extend_from_slice(&early);
     client
-        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .write_all(&established)
         .await
         .map_err(|e| format!("client write failed: {e}"))?;
-    let (up, down) = copy_bidirectional_bounded(
+    match copy_bidirectional_bounded(
         &mut client,
         &mut target,
         inner.copy_idle_timeout,
         inner.copy_max,
+        &inner.shutdown,
     )
     .await
-    .map_err(|detail| format!("tunnel copy failed: {detail}"))?;
-    inner.account_bytes(up, down);
-    Ok(())
+    {
+        Ok(stats) => {
+            inner.account_bytes(stats.up, stats.down);
+            Ok(())
+        }
+        Err(CopyAbort::Cancelled { up, down }) => {
+            inner.account_bytes(up, down);
+            Ok(())
+        }
+        Err(CopyAbort::Failed(detail)) => Err(format!("tunnel copy failed: {detail}")),
+    }
 }
 
+/// Upstream CONNECT response head bound.
+const UPSTREAM_HEAD_LIMIT: usize = 32 * 1024;
+
+/// Strict status-line parse: `HTTP/1.0|HTTP/1.1 SP 3DIGIT [SP reason]`, where
+/// the reason (if present) is visible ASCII. Substring heuristics like
+/// `" 200"` are deliberately not used: `HTTP/1.1 2000 OK` or `XD 200 OK`
+/// must never pass. Returns `(code, sanitized reason)`.
+fn parse_status_line(line: &str) -> Option<(u16, String)> {
+    let (version, rest) = line.split_once(' ')?;
+    if version != "HTTP/1.0" && version != "HTTP/1.1" {
+        return None;
+    }
+    let (code_text, reason) = match rest.split_once(' ') {
+        Some((code, reason)) => (code, reason),
+        None => (rest, ""),
+    };
+    if code_text.len() != 3 || !code_text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if reason.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return None;
+    }
+    let code: u16 = code_text.parse().ok()?;
+    Some((code, reason.to_string()))
+}
+
+/// Replace non-visible bytes and cap the length, so an adversarial upstream
+/// status line can never inject control characters into a broker response.
+fn sanitize_status_line(line: &str) -> String {
+    line.chars()
+        .take(120)
+        .map(|c| {
+            if (' '..='\u{7e}').contains(&c) {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+/// Send the broker→upstream CONNECT and require a strict, exact `200` status
+/// line. Returns any bytes already read past the upstream response head so
+/// the caller can inject them into the downstream tunnel (never dropped).
 async fn send_upstream_connect(
     upstream_stream: &mut TcpStream,
     upstream: Option<&UpstreamProxy>,
     host: &str,
     port: u16,
-) -> Result<(), String> {
+    idle: Duration,
+    shutdown: &CancellationToken,
+) -> Result<Vec<u8>, String> {
     let Some(upstream) = upstream else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let mut head = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
     if let Some(credentials) = &upstream.credentials {
@@ -1155,14 +1823,34 @@ async fn send_upstream_connect(
         .write_all(head.as_bytes())
         .await
         .map_err(|e| format!("upstream CONNECT write failed: {e}"))?;
-    let (response, _) = read_head(upstream_stream, 32 * 1024)
-        .await
-        .map_err(|e| format!("upstream CONNECT response failed: {e:?}"))?;
-    let status = response.lines().next().unwrap_or_default();
-    if !status.contains(" 200") {
-        return Err(format!("upstream proxy refused CONNECT: {status}"));
+    let read = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return Err("broker shutting down".to_string()),
+        read = tokio::time::timeout(idle, read_head(upstream_stream, UPSTREAM_HEAD_LIMIT)) => read,
+    };
+    let (response, early) = match read {
+        Err(_) => {
+            return Err("upstream CONNECT response timed out".to_string());
+        }
+        Ok(Err(error)) => {
+            return Err(format!("upstream CONNECT response failed: {error:?}"));
+        }
+        Ok(Ok(pair)) => pair,
+    };
+    let status_line = response.split("\r\n").next().unwrap_or_default();
+    let Some((code, reason)) = parse_status_line(status_line) else {
+        return Err(format!(
+            "upstream proxy sent a malformed status line: {:?}",
+            sanitize_status_line(status_line)
+        ));
+    };
+    if code != 200 {
+        return Err(format!(
+            "upstream proxy refused CONNECT with status {code} {}",
+            sanitize_status_line(&reason)
+        ));
     }
-    Ok(())
+    Ok(early)
 }
 
 async fn serve_forward(
@@ -1231,9 +1919,52 @@ async fn serve_forward(
             return Ok(());
         }
     };
+    // Frame exactly one request body from the head. Contradictory metadata
+    // (CL+TE, unequal duplicate CL), unsupported transfer codings, and
+    // malformed framing are typed refusals issued before any destination
+    // socket exists.
+    let framing = match request_body_framing(&request.headers) {
+        Ok(framing) => framing,
+        Err(error) => {
+            inner.account_blocked();
+            tracing::info!(detail = %error.detail(), "egress: request framing refused");
+            write_refusal(&mut client, &error).await;
+            return Ok(());
+        }
+    };
+    let expect_continue = match expects_continue(&request.headers) {
+        Ok(value) => value,
+        Err(error) => {
+            inner.account_blocked();
+            tracing::info!(detail = %error.detail(), "egress: Expect header refused");
+            write_refusal(&mut client, &error).await;
+            return Ok(());
+        }
+    };
+    if expect_continue {
+        // The broker is the only endpoint the client talks to, so answer
+        // locally; the Expect header itself is never forwarded.
+        client
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await
+            .map_err(|e| format!("client write failed: {e}"))?;
+    }
+    // Read exactly the framed body (bounded, canonical, cancellation-aware);
+    // pipelined residue is refused, never appended to the body.
+    let body = match read_request_body(&mut client, leftover, framing, &inner).await {
+        Ok(body) => body,
+        Err(BodyError::Shutdown) => return Ok(()),
+        Err(error) => {
+            inner.account_blocked();
+            tracing::info!(detail = %error.detail(), "egress: request body refused");
+            write_refusal(&mut client, &error).await;
+            return Ok(());
+        }
+    };
     let upstream = inner.upstream.select(&host);
     let mut target = match connect_destination(upstream, &host, port, &inner).await {
         Ok(stream) => stream,
+        Err(_detail) if inner.shutdown.is_cancelled() => return Ok(()),
         Err(detail) => {
             inner.account_error(detail.clone());
             write_error(&mut client, "502 Bad Gateway", &detail).await;
@@ -1250,7 +1981,11 @@ async fn serve_forward(
         out.push_str(&format!("{} {} HTTP/1.1\r\n", request.method, origin_form));
     }
     for (name, value) in &request.headers {
-        if is_hop_by_hop(name, &connection_listed) {
+        if is_hop_by_hop(name, &connection_listed)
+            || name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("expect")
+        {
             continue;
         }
         out.push_str(&format!("{name}: {value}\r\n"));
@@ -1263,6 +1998,10 @@ async fn serve_forward(
             ));
         }
     }
+    // Exactly one authoritative Content-Length describes the canonical body,
+    // whatever framing the client used; `Connection: close` keeps the single
+    // logical request unambiguous on the upstream leg.
+    out.push_str(&format!("Content-Length: {}\r\n", body.len()));
     out.push_str("Connection: close\r\n\r\n");
     tracing::debug!(
         method = %request.method,
@@ -1270,26 +2009,45 @@ async fn serve_forward(
         path = %crate::capture::redact_url(&origin_form),
         "egress: request allowed"
     );
-    target
-        .write_all(out.as_bytes())
-        .await
-        .map_err(|e| format!("upstream write failed: {e}"))?;
-    if !leftover.is_empty() {
-        target
-            .write_all(&leftover)
-            .await
-            .map_err(|e| format!("upstream body write failed: {e}"))?;
+    let write = async {
+        target.write_all(out.as_bytes()).await?;
+        if !body.is_empty() {
+            target.write_all(&body).await?;
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    match tokio::select! {
+        biased;
+        _ = inner.shutdown.cancelled() => return Ok(()),
+        result = tokio::time::timeout(inner.copy_idle_timeout, write) => result,
+    } {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(format!("upstream write failed: {e}")),
+        Err(_) => return Err("idle timeout writing the request to the target leg".to_string()),
     }
-    let (up, down) = copy_bidirectional_bounded(
-        &mut client,
+    // Exactly one logical request was forwarded. Only the response is
+    // relayed back; the client→destination direction ended at the framed
+    // body, so pipelined bytes arriving later can never reach the
+    // destination.
+    match relay_response_bounded(
         &mut target,
+        &mut client,
         inner.copy_idle_timeout,
         inner.copy_max,
+        &inner.shutdown,
     )
     .await
-    .map_err(|detail| format!("forward copy failed: {detail}"))?;
-    inner.account_bytes(up, down);
-    Ok(())
+    {
+        Ok(down) => {
+            inner.account_bytes(body.len() as u64, down);
+            Ok(())
+        }
+        Err(CopyAbort::Cancelled { down, .. }) => {
+            inner.account_bytes(body.len() as u64, down);
+            Ok(())
+        }
+        Err(CopyAbort::Failed(detail)) => Err(format!("forward copy failed: {detail}")),
+    }
 }
 
 async fn connect_destination(
@@ -1303,7 +2061,12 @@ async fn connect_destination(
         None => (host.to_string(), port),
     };
     let attempt = TcpStream::connect((connect_host.as_str(), connect_port));
-    match tokio::time::timeout(inner.connect_timeout, attempt).await {
+    let result = tokio::select! {
+        biased;
+        _ = inner.shutdown.cancelled() => return Err("broker shutting down".to_string()),
+        result = tokio::time::timeout(inner.connect_timeout, attempt) => result,
+    };
+    match result {
         Ok(Ok(stream)) => Ok(stream),
         Ok(Err(e)) => Err(format!("cannot connect {connect_host}:{connect_port}: {e}")),
         Err(_) => Err(format!(
@@ -1312,16 +2075,35 @@ async fn connect_destination(
     }
 }
 
-/// Bounded bidirectional copy: one idle timeout per read/write and a total
-/// copy deadline. Both directions half-close on EOF. On timeout or error the
-/// sockets are left for the caller to drop (the typed reason is returned),
+/// Bytes copied by one finished copy.
+struct CopyStats {
+    up: u64,
+    down: u64,
+}
+
+/// Why a copy ended before EOF on both legs.
+enum CopyAbort {
+    /// The broker was shutting down: the copy observed the cancel token and
+    /// ended at an arbitrary transfer point. Bytes copied so far are
+    /// reported for accounting.
+    Cancelled { up: u64, down: u64 },
+    /// A real failure (timeout, I/O error, deadline): the reason the permit
+    /// is being released.
+    Failed(String),
+}
+
+/// Bounded bidirectional copy (CONNECT tunnels): one idle timeout per
+/// read/write, a total copy deadline, and prompt termination when the
+/// broker's shutdown token fires. Both directions half-close on EOF. On
+/// timeout/error/cancellation the sockets are left for the caller to drop,
 /// so a stalled peer can never pin a `max_connections` permit indefinitely.
 async fn copy_bidirectional_bounded(
     client: &mut TcpStream,
     target: &mut TcpStream,
     idle: Duration,
     total: Duration,
-) -> Result<(u64, u64), String> {
+    shutdown: &CancellationToken,
+) -> Result<CopyStats, CopyAbort> {
     let deadline = tokio::time::Instant::now() + total;
     let mut client_open = true;
     let mut target_open = true;
@@ -1332,23 +2114,27 @@ async fn copy_bidirectional_bounded(
     while client_open || target_open {
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return Err(format!("copy deadline of {}ms exceeded", total.as_millis()));
+            return Err(CopyAbort::Failed(format!(
+                "copy deadline of {}ms exceeded",
+                total.as_millis()
+            )));
         }
         let wait = idle.min(deadline - now);
         tokio::select! {
             biased;
+            _ = shutdown.cancelled() => return Err(CopyAbort::Cancelled { up, down }),
             read = tokio::time::timeout(wait, client.read(&mut client_buf)), if client_open => {
                 match read {
-                    Err(_) => return Err("idle timeout on the client leg".to_string()),
-                    Ok(Err(e)) => return Err(format!("client read failed: {e}")),
+                    Err(_) => return Err(CopyAbort::Failed("idle timeout on the client leg".to_string())),
+                    Ok(Err(e)) => return Err(CopyAbort::Failed(format!("client read failed: {e}"))),
                     Ok(Ok(0)) => {
                         client_open = false;
                         let _ = target.shutdown().await;
                     }
                     Ok(Ok(n)) => {
                         match tokio::time::timeout(wait, target.write_all(&client_buf[..n])).await {
-                            Err(_) => return Err("idle timeout writing to the target leg".to_string()),
-                            Ok(Err(e)) => return Err(format!("target write failed: {e}")),
+                            Err(_) => return Err(CopyAbort::Failed("idle timeout writing to the target leg".to_string())),
+                            Ok(Err(e)) => return Err(CopyAbort::Failed(format!("target write failed: {e}"))),
                             Ok(Ok(())) => up = up.saturating_add(n as u64),
                         }
                     }
@@ -1356,16 +2142,16 @@ async fn copy_bidirectional_bounded(
             }
             read = tokio::time::timeout(wait, target.read(&mut target_buf)), if target_open => {
                 match read {
-                    Err(_) => return Err("idle timeout on the target leg".to_string()),
-                    Ok(Err(e)) => return Err(format!("target read failed: {e}")),
+                    Err(_) => return Err(CopyAbort::Failed("idle timeout on the target leg".to_string())),
+                    Ok(Err(e)) => return Err(CopyAbort::Failed(format!("target read failed: {e}"))),
                     Ok(Ok(0)) => {
                         target_open = false;
                         let _ = client.shutdown().await;
                     }
                     Ok(Ok(n)) => {
                         match tokio::time::timeout(wait, client.write_all(&target_buf[..n])).await {
-                            Err(_) => return Err("idle timeout writing to the client leg".to_string()),
-                            Ok(Err(e)) => return Err(format!("client write failed: {e}")),
+                            Err(_) => return Err(CopyAbort::Failed("idle timeout writing to the client leg".to_string())),
+                            Ok(Err(e)) => return Err(CopyAbort::Failed(format!("client write failed: {e}"))),
                             Ok(Ok(())) => down = down.saturating_add(n as u64),
                         }
                     }
@@ -1373,7 +2159,60 @@ async fn copy_bidirectional_bounded(
             }
         }
     }
-    Ok((up, down))
+    Ok(CopyStats { up, down })
+}
+
+/// Relay exactly the response leg of one forwarded request
+/// (destination→client) with the same idle/total bounds and shutdown
+/// observation as the tunnel copy. The client→destination direction is
+/// deliberately absent: the single framed request body was already
+/// forwarded, so any later client bytes stay local and are discarded when
+/// the connection closes.
+async fn relay_response_bounded(
+    target: &mut TcpStream,
+    client: &mut TcpStream,
+    idle: Duration,
+    total: Duration,
+    shutdown: &CancellationToken,
+) -> Result<u64, CopyAbort> {
+    let deadline = tokio::time::Instant::now() + total;
+    let mut down = 0u64;
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(CopyAbort::Failed(format!(
+                "copy deadline of {}ms exceeded",
+                total.as_millis()
+            )));
+        }
+        let wait = idle.min(deadline - now);
+        let read = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Err(CopyAbort::Cancelled { up: 0, down }),
+            read = tokio::time::timeout(wait, target.read(&mut buf)) => read,
+        };
+        match read {
+            Err(_) => {
+                return Err(CopyAbort::Failed(
+                    "idle timeout on the target leg".to_string(),
+                ))
+            }
+            Ok(Err(e)) => return Err(CopyAbort::Failed(format!("target read failed: {e}"))),
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => match tokio::time::timeout(wait, client.write_all(&buf[..n])).await {
+                Err(_) => {
+                    return Err(CopyAbort::Failed(
+                        "idle timeout writing to the client leg".to_string(),
+                    ))
+                }
+                Ok(Err(e)) => return Err(CopyAbort::Failed(format!("client write failed: {e}"))),
+                Ok(Ok(())) => down = down.saturating_add(n as u64),
+            },
+        }
+    }
+    let _ = client.shutdown().await;
+    Ok(down)
 }
 
 /// The origin-form path+query of an absolute URI.
@@ -1683,5 +2522,101 @@ mod tests {
         assert!(!is_hop_by_hop("Content-Type", &tokens));
         // A malformed token list is refused, never guessed at.
         assert!(connection_tokens(&[("connection".to_string(), "bad token".to_string())]).is_err());
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn request_body_framing_is_strict() {
+        assert_eq!(request_body_framing(&[]).unwrap(), BodyFraming::None);
+        assert_eq!(
+            request_body_framing(&headers(&[("Content-Length", "4")])).unwrap(),
+            BodyFraming::Fixed(4)
+        );
+        // Numerically equal duplicates canonicalize to one value.
+        assert_eq!(
+            request_body_framing(&headers(&[
+                ("Content-Length", "4"),
+                ("Content-Length", "04")
+            ]))
+            .unwrap(),
+            BodyFraming::Fixed(4)
+        );
+        assert!(matches!(
+            request_body_framing(&headers(&[
+                ("Content-Length", "4"),
+                ("Content-Length", "5")
+            ])),
+            Err(BodyError::Malformed(_))
+        ));
+        assert!(matches!(
+            request_body_framing(&headers(&[
+                ("Content-Length", "4"),
+                ("Transfer-Encoding", "chunked")
+            ])),
+            Err(BodyError::Malformed(_))
+        ));
+        assert!(matches!(
+            request_body_framing(&headers(&[("Transfer-Encoding", "gzip, chunked")])),
+            Err(BodyError::UnsupportedEncoding(_))
+        ));
+        assert!(matches!(
+            request_body_framing(&headers(&[("Transfer-Encoding", "chunked, chunked")])),
+            Err(BodyError::UnsupportedEncoding(_))
+        ));
+        assert_eq!(
+            request_body_framing(&headers(&[("Transfer-Encoding", "Chunked")])).unwrap(),
+            BodyFraming::Chunked
+        );
+        assert!(matches!(
+            request_body_framing(&headers(&[("Content-Length", "4x")])),
+            Err(BodyError::Malformed(_))
+        ));
+        assert!(matches!(
+            request_body_framing(&headers(&[("Content-Length", "18446744073709551616")])),
+            Err(BodyError::Malformed(_))
+        ));
+        assert!(matches!(
+            request_body_framing(&headers(&[("Content-Length", "4, 4")])),
+            Err(BodyError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn status_line_parse_is_strict() {
+        assert_eq!(
+            parse_status_line("HTTP/1.1 200 OK"),
+            Some((200, "OK".to_string()))
+        );
+        assert_eq!(
+            parse_status_line("HTTP/1.0 200"),
+            Some((200, String::new()))
+        );
+        assert_eq!(
+            parse_status_line("HTTP/1.1 200 "),
+            Some((200, String::new()))
+        );
+        assert_eq!(
+            parse_status_line("HTTP/1.1 407 Proxy Authentication Required").map(|(code, _)| code),
+            Some(407)
+        );
+        for bad in [
+            "HTTP/1.1 2000 OK",
+            "XD 200 OK",
+            "HTTP/9 200 OK",
+            "HTTP/1.1 20 OK",
+            "HTTP/1.1 200OK",
+            "HTTP/1.1  200 OK",
+            "HTTP/2 200 OK",
+            "HTTP/1.1\t200 OK",
+            "",
+        ] {
+            assert!(parse_status_line(bad).is_none(), "{bad:?}");
+        }
     }
 }

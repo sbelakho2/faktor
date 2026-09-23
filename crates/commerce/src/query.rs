@@ -717,4 +717,33 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn url_ref_identity_key_ignores_fragments() {
+        let one = ProductRef::parse("https://x.test/product#one", None).expect("ref");
+        let two = ProductRef::parse("https://x.test/product#two", None).expect("ref");
+        let plain = ProductRef::parse("https://x.test/product", None).expect("ref");
+        assert_eq!(
+            one.identity_key(),
+            two.identity_key(),
+            "different fragments are the same cache identity"
+        );
+        assert_eq!(plain.identity_key(), one.identity_key());
+        assert!(
+            matches!(&one, ProductRef::Url { url } if url.as_str() == "https://x.test/product")
+        );
+        // Query/path identity still distinguishes real differences.
+        assert_ne!(
+            ProductRef::parse("https://x.test/product?v=1", None)
+                .expect("ref")
+                .identity_key(),
+            plain.identity_key()
+        );
+        assert_ne!(
+            ProductRef::parse("https://x.test/other", None)
+                .expect("ref")
+                .identity_key(),
+            plain.identity_key()
+        );
+    }
 }

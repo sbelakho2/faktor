@@ -2,7 +2,9 @@
 //! accounting, upstream proxy selection and credential isolation, health and
 //! shutdown. No external network is used.
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -409,11 +411,15 @@ async fn smuggled_header_lines_and_connection_tokens_never_reach_the_upstream() 
     .unwrap();
     // Connection-listed tokens, the fixed hop-by-hop set and client-supplied
     // proxy credentials are all stripped.
+    // `Transfer-Encoding: chunked` with its (empty) chunked body: the framing
+    // metadata is consumed and canonicalized to one Content-Length, so the
+    // upstream leg sees neither the header nor the chunk framing.
     let response = send_raw(
         broker.addr(),
         "GET http://127.0.0.1:9/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\
          Connection: keep-alive, X-Custom-Hop\r\nX-Custom-Hop: value\r\n\
-         Proxy-Authorization: Basic ZXZpbA==\r\nTransfer-Encoding: chunked\r\n\r\n",
+         Proxy-Authorization: Basic ZXZpbA==\r\nTransfer-Encoding: chunked\r\n\r\n\
+         0\r\n\r\n",
     )
     .await;
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
@@ -549,5 +555,753 @@ async fn stalled_tunnel_releases_the_connection_permit_within_bound() {
         "typed close reason: {:?}",
         health.last_error
     );
+    broker.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for the shutdown-ownership, framing and CONNECT-handshake tests.
+// ---------------------------------------------------------------------------
+
+/// A request as the fake upstream received it (head text plus, if the head
+/// declared a Content-Length, exactly that many body bytes).
+#[derive(Clone, Debug)]
+struct RecordedRequest {
+    head: String,
+    body: Vec<u8>,
+}
+
+fn content_length_of(head: &str) -> Option<usize> {
+    for line in head.split("\r\n") {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                return value.trim().parse().ok();
+            }
+        }
+    }
+    None
+}
+
+fn count_occurrences(text: &str, needle: &str) -> usize {
+    text.matches(needle).count()
+}
+
+/// Fake upstream proxy that reads one request (head + declared body) and
+/// records it.
+async fn spawn_recording_upstream(seen: Arc<Mutex<Vec<RecordedRequest>>>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let head = read_one_head(&mut stream).await;
+                let mut body = Vec::new();
+                if let Some(length) = content_length_of(&head) {
+                    body.resize(length, 0);
+                    if stream.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                }
+                seen.lock().unwrap().push(RecordedRequest { head, body });
+                let response =
+                    "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nupstream-ok";
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    addr
+}
+
+/// Fake origin whose accepted tunnel sockets are read to EOF; `closed`
+/// becomes true once the broker's socket to the origin is gone.
+async fn spawn_closing_origin(closed: Arc<AtomicBool>, seen: Arc<Mutex<Vec<u8>>>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let closed = closed.clone();
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => seen.lock().unwrap().extend_from_slice(&buf[..n]),
+                    }
+                }
+                closed.store(true, Ordering::SeqCst);
+            });
+        }
+    });
+    addr
+}
+
+/// Fake origin that streams one byte every 10ms until the broker's socket
+/// closes (which sets `closed`), keeping a copy genuinely mid-transfer.
+async fn spawn_streaming_origin(closed: Arc<AtomicBool>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let closed = closed.clone();
+            tokio::spawn(async move {
+                let (mut read_half, mut write_half) = stream.into_split();
+                let reader = tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match read_half.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                    closed.store(true, Ordering::SeqCst);
+                });
+                let mut counter = 0u8;
+                loop {
+                    if write_half
+                        .write_all(&[b'a'.wrapping_add(counter % 26)])
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    counter = counter.wrapping_add(1);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let _ = reader.await;
+            });
+        }
+    });
+    addr
+}
+
+/// Fake upstream proxy that answers each accepted CONNECT with the next
+/// scripted response, then echoes whatever the broker tunnels.
+async fn spawn_scripted_upstream(responses: Vec<&'static str>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let responses = Arc::new(responses);
+    let counter = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let index = counter.fetch_add(1, Ordering::SeqCst);
+            let Some(response) = responses.get(index).copied() else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => head.push(byte[0]),
+                    }
+                }
+                let _ = stream.write_all(response.as_bytes()).await;
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+fn upstream_config(upstream: SocketAddr) -> BrokerConfig {
+    BrokerConfig {
+        policy: policy(vec![HostPattern::parse("127.0.0.1").unwrap()])
+            .with_allowed_ports(vec![9, 80, 443]),
+        upstream: UpstreamSelector::new(Some(UpstreamProxy::new("127.0.0.1", upstream.port()))),
+        ..BrokerConfig::default()
+    }
+}
+
+async fn send_raw_bytes(addr: SocketAddr, request: &[u8], half_close: bool) -> String {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request).await.unwrap();
+    if half_close {
+        stream.shutdown().await.unwrap();
+    }
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await;
+    String::from_utf8_lossy(&buf).to_string()
+}
+
+async fn wait_for_flag(flag: &AtomicBool, bound: Duration) -> bool {
+    let deadline = std::time::Instant::now() + bound;
+    while std::time::Instant::now() < deadline {
+        if flag.load(Ordering::SeqCst) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    flag.load(Ordering::SeqCst)
+}
+
+// ---------------------------------------------------------------------------
+// P1: broker-owned connection tasks and honest terminal state.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn shutdown_owns_the_established_tunnel_and_reports_terminal_after_drain() {
+    let closed = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let origin = spawn_closing_origin(closed.clone(), seen).await;
+    let broker = EgressBroker::start(BrokerConfig {
+        policy: policy(vec![HostPattern::parse("127.0.0.1").unwrap()])
+            .with_allowed_ports(vec![origin.port()]),
+        ..BrokerConfig::default()
+    })
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(broker.addr()).await.unwrap();
+    client
+        .write_all(
+            format!(
+                "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+                origin.port(),
+                origin.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let head = read_one_head(&mut client).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(broker.health().state, BrokerState::Running);
+    assert_eq!(broker.health().active_connections, 1);
+
+    // The first poll issues the cancel and moves Running -> Draining without
+    // yielding to the accept task (current-thread runtime), making the
+    // transition observable deterministically.
+    let waker = futures_util::task::noop_waker();
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut shutdown = Box::pin(broker.shutdown());
+    assert!(Future::poll(shutdown.as_mut(), &mut context).is_pending());
+    assert_eq!(broker.health().state, BrokerState::Draining);
+
+    let started = std::time::Instant::now();
+    let joined = tokio::time::timeout(Duration::from_secs(2), shutdown).await;
+    assert!(joined.is_ok(), "shutdown must return within the bound");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let health = broker.health();
+    assert_eq!(health.state, BrokerState::Stopped);
+    assert_eq!(health.active_connections, 0);
+
+    // Zero broker-owned sockets: the fake origin saw its socket close and
+    // the tunnel client observes EOF.
+    assert!(
+        wait_for_flag(&closed, Duration::from_secs(2)).await,
+        "the origin must observe the broker socket closing"
+    );
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await;
+    assert!(
+        matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+        "the tunnel client must observe close: {read:?}"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_interrupts_a_copy_mid_transfer_within_bound() {
+    let closed = Arc::new(AtomicBool::new(false));
+    let origin = spawn_streaming_origin(closed.clone()).await;
+    let broker = EgressBroker::start(BrokerConfig {
+        policy: policy(vec![HostPattern::parse("127.0.0.1").unwrap()])
+            .with_allowed_ports(vec![origin.port()]),
+        ..BrokerConfig::default()
+    })
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(broker.addr()).await.unwrap();
+    client
+        .write_all(
+            format!(
+                "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+                origin.port(),
+                origin.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let head = read_one_head(&mut client).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    // Drain the tunnel so the copy is genuinely transferring when shutdown
+    // fires.
+    let eof = Arc::new(AtomicBool::new(false));
+    let eof_flag = eof.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            match client.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        eof_flag.store(true, Ordering::SeqCst);
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let started = std::time::Instant::now();
+    let joined = tokio::time::timeout(Duration::from_secs(2), broker.shutdown()).await;
+    assert!(joined.is_ok(), "shutdown must return within the bound");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let health = broker.health();
+    assert_eq!(health.state, BrokerState::Stopped);
+    assert_eq!(health.active_connections, 0);
+    assert!(
+        wait_for_flag(&closed, Duration::from_secs(2)).await,
+        "the origin must observe the broker socket closing"
+    );
+    assert!(
+        wait_for_flag(&eof, Duration::from_secs(2)).await,
+        "the tunnel client must observe close"
+    );
+}
+
+#[tokio::test]
+async fn dropping_the_handle_aborts_connections_within_bound() {
+    let closed = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let origin = spawn_closing_origin(closed.clone(), seen).await;
+    let broker = EgressBroker::start(BrokerConfig {
+        policy: policy(vec![HostPattern::parse("127.0.0.1").unwrap()])
+            .with_allowed_ports(vec![origin.port()]),
+        ..BrokerConfig::default()
+    })
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(broker.addr()).await.unwrap();
+    client
+        .write_all(
+            format!(
+                "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+                origin.port(),
+                origin.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let head = read_one_head(&mut client).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(broker.health().active_connections, 1);
+
+    drop(broker);
+    assert!(
+        wait_for_flag(&closed, Duration::from_secs(2)).await,
+        "Drop must abort the tunnel and close the broker-owned socket"
+    );
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await;
+    assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "{read:?}");
+}
+
+#[tokio::test]
+async fn repeated_and_concurrent_shutdowns_are_idempotent() {
+    let broker = EgressBroker::start(BrokerConfig {
+        policy: policy(vec![HostPattern::parse("127.0.0.1").unwrap()]),
+        ..BrokerConfig::default()
+    })
+    .await
+    .unwrap();
+    tokio::join!(broker.shutdown(), broker.shutdown());
+    broker.shutdown().await;
+    broker.shutdown().await;
+    let health = broker.health();
+    assert_eq!(health.state, BrokerState::Stopped);
+    assert_eq!(health.active_connections, 0);
+}
+
+// ---------------------------------------------------------------------------
+// P1: HTTP/1 request-body framing on the forward path.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn chunked_request_bodies_are_decoded_to_one_canonical_content_length() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_recording_upstream(seen.clone()).await;
+    let broker = EgressBroker::start(upstream_config(upstream))
+        .await
+        .unwrap();
+    let response = send_raw(
+        broker.addr(),
+        "POST http://127.0.0.1:9/upload HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+         Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let head = seen[0].head.to_ascii_lowercase();
+    assert!(!head.contains("transfer-encoding"), "{head}");
+    assert_eq!(count_occurrences(&head, "content-length:"), 1, "{head}");
+    assert!(head.contains("content-length: 11"), "{head}");
+    assert_eq!(seen[0].body, b"hello world");
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn ambiguous_or_conflicting_framing_is_refused_before_upstream() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_recording_upstream(seen.clone()).await;
+    let broker = EgressBroker::start(upstream_config(upstream))
+        .await
+        .unwrap();
+    let cases = [
+        (
+            "cl+te",
+            "POST http://127.0.0.1:9/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "400",
+        ),
+        (
+            "unequal duplicate cl",
+            "POST http://127.0.0.1:9/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Content-Length: 4\r\nContent-Length: 5\r\n\r\nBODY",
+            "400",
+        ),
+        (
+            "non-decimal cl",
+            "POST http://127.0.0.1:9/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Content-Length: 4x\r\n\r\nBODY",
+            "400",
+        ),
+        (
+            "unsupported coding",
+            "POST http://127.0.0.1:9/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Transfer-Encoding: gzip, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+            "501",
+        ),
+        (
+            "duplicate chunked coding",
+            "POST http://127.0.0.1:9/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "501",
+        ),
+        (
+            "short cl leaves residue",
+            "POST http://127.0.0.1:9/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Content-Length: 3\r\n\r\nabcdef",
+            "400",
+        ),
+        (
+            "pipelined second request",
+            "POST http://127.0.0.1:9/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Content-Length: 4\r\n\r\nBODYGET http://127.0.0.1:9/second HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\n\r\n",
+            "400",
+        ),
+    ];
+    for (name, request, expected) in cases {
+        let response = send_raw(broker.addr(), request).await;
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {expected}")),
+            "{name}: {response}"
+        );
+    }
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "no ambiguous/conflicting request may reach the upstream"
+    );
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn equal_duplicate_content_length_is_canonicalized_to_one() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_recording_upstream(seen.clone()).await;
+    let broker = EgressBroker::start(upstream_config(upstream))
+        .await
+        .unwrap();
+    let response = send_raw(
+        broker.addr(),
+        "POST http://127.0.0.1:9/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+         Content-Length: 4\r\nContent-Length: 4\r\n\r\nBODY",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let head = seen[0].head.to_ascii_lowercase();
+    assert_eq!(count_occurrences(&head, "content-length:"), 1, "{head}");
+    assert!(head.contains("content-length: 4"), "{head}");
+    assert_eq!(seen[0].body, b"BODY");
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn overlong_content_length_is_typed_without_hanging() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_recording_upstream(seen.clone()).await;
+    let broker = EgressBroker::start(upstream_config(upstream))
+        .await
+        .unwrap();
+    // Declared longer than supplied, then half-close: typed 400, no hang.
+    let response = send_raw_bytes(
+        broker.addr(),
+        b"POST http://127.0.0.1:9/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+          Content-Length: 100\r\n\r\nabc",
+        true,
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+
+    // Declared beyond the configured body bound: typed 413 before any read.
+    let tight = EgressBroker::start(BrokerConfig {
+        max_request_body_bytes: 16,
+        ..upstream_config(upstream)
+    })
+    .await
+    .unwrap();
+    let response = send_raw(
+        tight.addr(),
+        "POST http://127.0.0.1:9/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+         Content-Length: 64\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+    assert!(seen.lock().unwrap().is_empty());
+    tight.shutdown().await;
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn chunk_extensions_and_trailers_are_consumed_and_malformed_framing_refused() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_recording_upstream(seen.clone()).await;
+    let broker = EgressBroker::start(upstream_config(upstream))
+        .await
+        .unwrap();
+    let response = send_raw(
+        broker.addr(),
+        "POST http://127.0.0.1:9/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+         Transfer-Encoding: chunked\r\n\r\n5;a=b\r\nhello\r\n0\r\nX-Trailer: v\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].body, b"hello");
+        let head = seen[0].head.to_ascii_lowercase();
+        assert!(head.contains("content-length: 5"), "{head}");
+        assert!(!head.contains("x-trailer"), "{head}");
+    }
+    // Invalid chunk size.
+    let response = send_raw(
+        broker.addr(),
+        "POST http://127.0.0.1:9/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+         Transfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    // A bare LF is never a chunk-size terminator.
+    let response = send_raw(
+        broker.addr(),
+        "POST http://127.0.0.1:9/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+         Transfer-Encoding: chunked\r\n\r\n5\nhello\r\n0\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    // Chunk data not followed by CRLF.
+    let response = send_raw(
+        broker.addr(),
+        "POST http://127.0.0.1:9/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+         Transfer-Encoding: chunked\r\n\r\n5\r\nhelloxx0\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "only the well-formed request may reach the upstream"
+    );
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn oversized_chunked_body_is_typed_at_the_bound() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_recording_upstream(seen.clone()).await;
+    let broker = EgressBroker::start(BrokerConfig {
+        max_request_body_bytes: 8,
+        ..upstream_config(upstream)
+    })
+    .await
+    .unwrap();
+    let response = send_raw(
+        broker.addr(),
+        "POST http://127.0.0.1:9/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+         Transfer-Encoding: chunked\r\n\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+    assert!(seen.lock().unwrap().is_empty());
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn expect_100_continue_is_answered_locally_and_not_forwarded() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_recording_upstream(seen.clone()).await;
+    let broker = EgressBroker::start(upstream_config(upstream))
+        .await
+        .unwrap();
+    let response = send_raw(
+        broker.addr(),
+        "POST http://127.0.0.1:9/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+         Expect: 100-continue\r\nContent-Length: 4\r\n\r\nBODY",
+    )
+    .await;
+    assert!(response.contains("HTTP/1.1 100 Continue"), "{response}");
+    assert!(response.contains("HTTP/1.1 200 OK"), "{response}");
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(
+        !seen[0].head.to_ascii_lowercase().contains("expect"),
+        "{}",
+        seen[0].head
+    );
+    assert_eq!(seen[0].body, b"BODY");
+    broker.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// P2: exact head bound and strict upstream CONNECT status parsing.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn request_head_bound_is_exact_and_terminator_overage_is_typed() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let bound = 128usize;
+    let broker = EgressBroker::start(BrokerConfig {
+        max_request_bytes: bound,
+        policy: policy(vec![HostPattern::parse("127.0.0.1").unwrap()])
+            .with_allowed_ports(vec![closed_port]),
+        ..BrokerConfig::default()
+    })
+    .await
+    .unwrap();
+    let prefix =
+        format!("GET http://127.0.0.1:{closed_port}/x HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Pad: ");
+    let suffix = "\r\n\r\n";
+    let exact_pad = bound - prefix.len() - suffix.len();
+    assert!(exact_pad > 2);
+    // Exactly at the bound: accepted (the destination connect may fail, but
+    // the head itself is never typed 431).
+    let exact = format!("{prefix}{}{suffix}", "a".repeat(exact_pad));
+    assert_eq!(exact.len(), bound);
+    let accepted = send_raw(broker.addr(), &exact).await;
+    assert!(!accepted.starts_with("HTTP/1.1 431"), "{accepted}");
+    // One byte over the bound.
+    let over = format!("{prefix}{}{suffix}", "a".repeat(exact_pad + 1));
+    assert_eq!(over.len(), bound + 1);
+    let refused = send_raw(broker.addr(), &over).await;
+    assert!(refused.starts_with("HTTP/1.1 431"), "{refused}");
+    // Head content exactly at the bound, terminator landing in the overage:
+    // still typed 431, never accepted.
+    let crossing = format!("{prefix}{}{suffix}", "a".repeat(bound - prefix.len() - 2));
+    assert_eq!(crossing.len(), bound + 2);
+    let refused = send_raw(broker.addr(), &crossing).await;
+    assert!(refused.starts_with("HTTP/1.1 431"), "{refused}");
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn upstream_connect_status_lines_are_parsed_strictly() {
+    // Every one of these contains the substring " 200" but is not a strict
+    // `HTTP/1.x SP 200` status line (the last is a real non-200).
+    let responses = vec![
+        "HTTP/1.1 2000 OK\r\n\r\n",
+        "XD 200 OK\r\n\r\n",
+        "HTTP/9 200 OK\r\n\r\n",
+        "HTTP/1.1 20 OK\r\n\r\n",
+        "HTTP/1.1 200OK\r\n\r\n",
+        "HTTP/1.1  200 OK\r\n\r\n",
+        "HTTP/1.1 407 Proxy Authentication Required\r\n\r\n",
+    ];
+    let upstream = spawn_scripted_upstream(responses).await;
+    let broker = EgressBroker::start(BrokerConfig {
+        upstream: UpstreamSelector::new(Some(UpstreamProxy::new("127.0.0.1", upstream.port()))),
+        ..upstream_config(upstream)
+    })
+    .await
+    .unwrap();
+    for _ in 0..7 {
+        let response = send_raw(
+            broker.addr(),
+            "CONNECT 127.0.0.1:9 HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+    }
+    assert_eq!(
+        broker.accounting().tunnels_total,
+        0,
+        "no tunnel may be authorized on a malformed or non-200 status"
+    );
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn upstream_connect_accepts_exact_200_and_relays_early_tunnel_bytes() {
+    let responses = vec![
+        "HTTP/1.0 200 Connection Established\r\n\r\n",
+        "HTTP/1.1 200 OK\r\n\r\nEARLY-DATA",
+    ];
+    let upstream = spawn_scripted_upstream(responses).await;
+    let broker = EgressBroker::start(upstream_config(upstream))
+        .await
+        .unwrap();
+    // HTTP/1.0 exact 200: tunnel established, echo works.
+    let mut first = TcpStream::connect(broker.addr()).await.unwrap();
+    first
+        .write_all(b"CONNECT 127.0.0.1:9 HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n")
+        .await
+        .unwrap();
+    let head = read_one_head(&mut first).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    first.write_all(b"ping").await.unwrap();
+    let mut echoed = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(2), first.read_exact(&mut echoed))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&echoed, b"ping");
+    // HTTP/1.1 exact 200 with post-header bytes: early tunnel bytes are
+    // delivered to the client intact, then the tunnel still carries data.
+    let mut second = TcpStream::connect(broker.addr()).await.unwrap();
+    second
+        .write_all(b"CONNECT 127.0.0.1:9 HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n")
+        .await
+        .unwrap();
+    let head = read_one_head(&mut second).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let mut early = [0u8; 10];
+    tokio::time::timeout(Duration::from_secs(2), second.read_exact(&mut early))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&early, b"EARLY-DATA");
+    second.write_all(b"ping").await.unwrap();
+    let mut echoed = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(2), second.read_exact(&mut echoed))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&echoed, b"ping");
+    assert_eq!(broker.accounting().tunnels_total, 2);
     broker.shutdown().await;
 }
