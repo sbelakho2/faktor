@@ -66,6 +66,7 @@ mod streams_tests {
     use faktor_google::{GoogleConfig, GoogleProvider};
     use faktor_ollama::{OllamaConfig, OllamaProvider};
     use faktor_openai::{OpenAiConfig, OpenAiProvider};
+    use faktor_provider::config::ExtraHeaders;
     use faktor_provider::testing::{MockAction, MockServer};
     use faktor_provider::{
         ContentPart, GenericAgentRequest, ProviderChunk, ProviderError, ProviderErrorKind,
@@ -1797,7 +1798,7 @@ mod streams_tests {
             id: "gw".into(),
             base_url: format!("{base}/v1"),
             api_key: None,
-            extra_headers: vec![("x-gw-test".into(), "1".into())],
+            extra_headers: ExtraHeaders::try_new([("x-gw-test", "1")]).unwrap(),
             route_prefixes: vec![],
             default_caps: ModelCapabilities::default(),
         };
@@ -1943,7 +1944,7 @@ mod streams_tests {
             id: "gw".into(),
             base_url: format!("http://{addr}/v1"),
             api_key: None,
-            extra_headers: vec![("x-gw-test".into(), "1".into())],
+            extra_headers: ExtraHeaders::try_new([("x-gw-test", "1")]).unwrap(),
             route_prefixes: vec![],
             default_caps: ModelCapabilities::default(),
         };
@@ -1985,7 +1986,7 @@ mod streams_tests {
             id: "gw".into(),
             base_url: format!("{base}/v1"),
             api_key: None,
-            extra_headers: vec![("x-gw-test".into(), "1".into())],
+            extra_headers: ExtraHeaders::try_new([("x-gw-test", "1")]).unwrap(),
             route_prefixes: vec![],
             default_caps: ModelCapabilities::default(),
         };

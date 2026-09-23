@@ -19,6 +19,7 @@ tracing.workspace = true
 tempfile.workspace = true
 base64 = "0.22"
 blake3.workspace = true
+zeroize.workspace = true
 
 [features]
 # Test-only: exposes the default-allow `PolicyCheckedHttpTransport::permissive`

@@ -137,6 +137,9 @@ pub enum BlockReason {
     ResourceTypeBlocked,
     /// The destination port is not in the policy's explicit port allowlist.
     PortNotAllowed,
+    /// The policy does not permit CONNECT tunnels at all (no HTTPS/WSS
+    /// support, or an explicit denial).
+    ConnectNotAllowed,
 }
 
 impl BlockReason {
@@ -148,6 +151,7 @@ impl BlockReason {
             BlockReason::Malformed => "malformed",
             BlockReason::ResourceTypeBlocked => "resource_type_blocked",
             BlockReason::PortNotAllowed => "port_not_allowed",
+            BlockReason::ConnectNotAllowed => "connect_not_allowed",
         }
     }
 }
@@ -179,6 +183,27 @@ fn default_allowed_ports() -> Vec<u16> {
     DEFAULT_ALLOWED_PORTS.to_vec()
 }
 
+/// Derive the CONNECT dimension from scheme support: a tunnel is only
+/// meaningful when HTTPS or WSS is permitted. The derived value is stored
+/// explicitly in the policy (never re-derived at decision time).
+fn schemes_allow_connect(schemes: &[String]) -> bool {
+    schemes
+        .iter()
+        .any(|scheme| scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("wss"))
+}
+
+/// Which wire shape one proxied request takes. The wire paths decide with
+/// [`DestinationPolicy::decide_proxy_target`], so the request kind is part of
+/// the policy decision and never bypassed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyRequestKind {
+    /// One absolute-form HTTP request forwarded by the broker.
+    ForwardHttp,
+    /// A CONNECT tunnel (the wire shape HTTPS/WSS uses through a proxy).
+    ConnectTunnel,
+}
+
 /// The per-connector destination policy (spec §9). Default posture: deny
 /// everything that is not explicitly first-party; deny every port outside
 /// the explicit allowlist (80/443 unless widened); block video/audio/images/
@@ -200,20 +225,52 @@ pub struct DestinationPolicy {
     /// when its host is first-party. Defaults to 80/443.
     #[serde(default = "default_allowed_ports")]
     pub allowed_ports: Vec<u16>,
+    /// Whether CONNECT tunnels are permitted at all. This is a first-class
+    /// policy dimension (a CONNECT to `example.com:443` is not an HTTP
+    /// request to that host): a policy that only supports HTTP must deny it.
+    /// Constructors derive it from HTTPS/WSS support and the explicit result
+    /// is persisted here; a deserialized policy that omits the field denies
+    /// CONNECT (fail closed).
+    #[serde(default)]
+    pub allow_connect: bool,
+    /// The explicit loopback address-class rule for this connector: the
+    /// broker resolves every destination hostname exactly ONCE, classifies
+    /// every answer and refuses the whole set when any address is outside
+    /// the permitted classes (global-only by default). `true` opts into
+    /// loopback (a local first-party service); every other special class —
+    /// private, link-local (cloud metadata), CGNAT, documentation,
+    /// multicast, unspecified, reserved — stays refused either way. Default
+    /// `false`: a remote first-party host resolving onto loopback is a
+    /// DNS-rebinding signal.
+    #[serde(default)]
+    pub allow_loopback: bool,
 }
 
 impl DestinationPolicy {
     /// The strict default: only the listed first-party hosts, http/https,
     /// the 80/443 port allowlist, with the aggressive default resource-type
-    /// drop set.
+    /// drop set. CONNECT is derived from the https scheme support and
+    /// persisted as an explicit `allow_connect: true`.
     pub fn first_party_only(hosts: Vec<HostPattern>) -> Self {
+        let allow_schemes = vec!["http".to_string(), "https".to_string()];
         Self {
             first_party: hosts,
             blocked_hosts: Vec::new(),
             blocked_resource_types: ResourceType::default_blocked(),
-            allow_schemes: vec!["http".to_string(), "https".to_string()],
+            allow_connect: schemes_allow_connect(&allow_schemes),
+            allow_loopback: false,
+            allow_schemes,
             allowed_ports: default_allowed_ports(),
         }
+    }
+
+    /// The explicit loopback address-class rule (wire config): when set,
+    /// the broker's connect vetting admits loopback answers for this
+    /// connector. Default false — a remote first-party host resolving onto
+    /// loopback is refused.
+    pub fn with_allow_loopback(mut self, allow: bool) -> Self {
+        self.allow_loopback = allow;
+        self
     }
 
     /// Add explicit deny patterns (deny always wins).
@@ -225,6 +282,21 @@ impl DestinationPolicy {
     /// Set the explicit port allowlist (replaces the 80/443 default).
     pub fn with_allowed_ports(mut self, ports: Vec<u16>) -> Self {
         self.allowed_ports = ports;
+        self
+    }
+
+    /// Replace the permitted schemes, deriving `allow_connect` from
+    /// HTTPS/WSS support (the derived result is stored explicitly).
+    pub fn with_allow_schemes(mut self, schemes: Vec<String>) -> Self {
+        self.allow_connect = schemes_allow_connect(&schemes);
+        self.allow_schemes = schemes;
+        self
+    }
+
+    /// Set the CONNECT dimension explicitly. [`DestinationPolicy::validate`]
+    /// refuses a policy that allows CONNECT without HTTPS/WSS support.
+    pub fn with_allow_connect(mut self, allow: bool) -> Self {
+        self.allow_connect = allow;
         self
     }
 
@@ -250,6 +322,12 @@ impl DestinationPolicy {
                 )));
             }
         }
+        if self.allow_connect && !schemes_allow_connect(&self.allow_schemes) {
+            return Err(BrowserError::invalid_config(
+                "destination policy allows CONNECT but permits no HTTPS/WSS scheme; \
+                 CONNECT is only meaningful for TLS destinations",
+            ));
+        }
         if self.allowed_ports.is_empty() {
             return Err(BrowserError::invalid_config(
                 "destination policy must allow at least one port (default: 80, 443)",
@@ -264,8 +342,8 @@ impl DestinationPolicy {
     }
 
     /// Decide a bare host (no port), for host-level diagnostics. The wire
-    /// path always uses [`DestinationPolicy::decide_destination`] with the
-    /// real port.
+    /// path always uses [`DestinationPolicy::decide_proxy_target`] with the
+    /// real port and request kind.
     pub fn decide_host(&self, host: &str) -> DestinationDecision {
         let Some(canonical) = canonical_host(host) else {
             return DestinationDecision::Blocked {
@@ -302,16 +380,43 @@ impl DestinationPolicy {
     /// IPv6) so alternate spellings cannot bypass a rule. Deny wins; an
     /// unknown host or an unlisted port is refused.
     ///
-    /// Residual (honest): DNS-rebinding IP pinning is **not** implemented.
-    /// The policy decides the canonical *name*; name resolution and connect
-    /// happen afterwards, so a name that resolves to an unlisted address is
-    /// not re-checked against an IP allowlist.
+    /// DNS-rebinding closure: the broker resolves the permitted hostname
+    /// exactly once at connect time ([`connect_destination`]), bounds the
+    /// answer set, classifies EVERY address and refuses the whole set when
+    /// any answer is outside the permitted classes (see [`IpClass`] and the
+    /// parity note above it). A stale "resolved by name later" bypass no
+    /// longer exists: the connect uses the vetted [`std::net::SocketAddr`]
+    /// list only.
     pub fn decide_destination(&self, host: &str, port: u16) -> DestinationDecision {
         let Some(canonical) = canonical_host(host) else {
             return DestinationDecision::Blocked {
                 reason: BlockReason::Malformed,
             };
         };
+        self.decide_canonical(&canonical, Some(port))
+    }
+
+    /// The single decision function for the broker's wire paths. Both the
+    /// forward path and the CONNECT tunnel path call this, so the request
+    /// kind (a first-class policy dimension) can never be bypassed: a policy
+    /// that does not allow CONNECT refuses `ConnectTunnel` even when the
+    /// host and port are first-party.
+    pub fn decide_proxy_target(
+        &self,
+        kind: ProxyRequestKind,
+        host: &str,
+        port: u16,
+    ) -> DestinationDecision {
+        let Some(canonical) = canonical_host(host) else {
+            return DestinationDecision::Blocked {
+                reason: BlockReason::Malformed,
+            };
+        };
+        if kind == ProxyRequestKind::ConnectTunnel && !self.allow_connect {
+            return DestinationDecision::Blocked {
+                reason: BlockReason::ConnectNotAllowed,
+            };
+        }
         self.decide_canonical(&canonical, Some(port))
     }
 
@@ -354,26 +459,30 @@ impl DestinationPolicy {
 }
 
 /// Split `scheme://authority/...` into (scheme, authority): path, query and
-/// fragment are dropped, userinfo (hostile input) is stripped. The authority
-/// is returned verbatim; canonicalization is the shared authority's job.
+/// fragment are dropped. An authority carrying userinfo (`user@host`) is
+/// rejected outright — a hostile ambiguous target is never transformed into
+/// a valid one. The authority is returned verbatim; canonicalization is the
+/// shared authority's job.
 pub(crate) fn split_absolute_target(url: &str) -> Option<(&str, &str)> {
     let (scheme, rest) = url.split_once("://")?;
     if scheme.is_empty() {
         return None;
     }
     let authority = rest.split(['/', '?', '#']).next()?;
-    let authority = authority.rsplit('@').next()?; // strip userinfo if hostile
-    if authority.is_empty() {
+    if authority.is_empty() || authority.contains('@') {
         return None;
     }
     Some((scheme, authority))
 }
 
 /// Parse a CONNECT authority (`host:port`, `[v6]:port`) into a canonical
-/// destination. The port defaults to 443. A URL-shaped or unparseable target
-/// is refused (fail closed).
+/// destination. The port defaults to 443. A URL-shaped, userinfo-carrying or
+/// unparseable target is refused (fail closed); userinfo is never stripped
+/// into a valid destination.
 pub(crate) fn parse_connect_target(target: &str) -> Option<(String, u16)> {
-    let target = target.rsplit('@').next()?;
+    if target.contains('@') {
+        return None;
+    }
     let parsed = RequestTarget::parse(target).ok()?;
     if !parsed.scheme.is_empty() {
         return None;
@@ -1654,7 +1763,7 @@ async fn serve_connection(mut client: TcpStream, inner: Arc<BrokerInner>) -> Res
         }
         Err(HeadError::Io(e)) => return Err(format!("head read failed: {e}")),
         Err(HeadError::Malformed(detail)) => {
-            return Err(format!("head read reported malformed input: {detail}"))
+            return Err(format!("head read reported malformed input: {detail}"));
         }
     };
     let request = match parse_head(&head) {
@@ -1686,7 +1795,9 @@ async fn serve_connect(
         return Ok(());
     };
     inner.account_request(&host);
-    let decision = inner.policy.decide_destination(&host, port);
+    let decision = inner
+        .policy
+        .decide_proxy_target(ProxyRequestKind::ConnectTunnel, &host, port);
     if let DestinationDecision::Blocked { reason } = &decision {
         inner.account_blocked();
         tracing::info!(host = %host, port, reason = %reason, "egress: CONNECT blocked by policy");
@@ -1811,7 +1922,14 @@ async fn send_upstream_connect(
     let Some(upstream) = upstream else {
         return Ok(Vec::new());
     };
-    let mut head = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+    // CONNECT authority form always carries a port; IPv6 literals are
+    // bracketed (the canonical host is unbracketed).
+    let authority = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let mut head = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
     if let Some(credentials) = &upstream.credentials {
         head.push_str(&format!(
             "Proxy-Authorization: {}\r\n",
@@ -1897,7 +2015,9 @@ async fn serve_forward(
     };
     let host = parsed.host;
     inner.account_request(&host);
-    let decision = inner.policy.decide_destination(&host, port);
+    let decision = inner
+        .policy
+        .decide_proxy_target(ProxyRequestKind::ForwardHttp, &host, port);
     if let DestinationDecision::Blocked { reason } = &decision {
         inner.account_blocked();
         tracing::info!(host = %host, port, reason = %reason, "egress: request blocked by policy");
@@ -1980,16 +2100,23 @@ async fn serve_forward(
     } else {
         out.push_str(&format!("{} {} HTTP/1.1\r\n", request.method, origin_form));
     }
+    // The broker owns the Host header: every incoming Host is stripped
+    // (conflicting/duplicate spellings included) and exactly one canonical
+    // Host is synthesized from the policy-checked destination. Default ports
+    // are omitted and IPv6 literals are bracketed.
+    let host_header = canonical_authority(&host, port, &scheme);
     for (name, value) in &request.headers {
         if is_hop_by_hop(name, &connection_listed)
             || name.eq_ignore_ascii_case("content-length")
             || name.eq_ignore_ascii_case("transfer-encoding")
             || name.eq_ignore_ascii_case("expect")
+            || name.eq_ignore_ascii_case("host")
         {
             continue;
         }
         out.push_str(&format!("{name}: {value}\r\n"));
     }
+    out.push_str(&format!("Host: {host_header}\r\n"));
     if let Some(upstream) = upstream {
         if let Some(credentials) = &upstream.credentials {
             out.push_str(&format!(
@@ -2050,6 +2177,183 @@ async fn serve_forward(
     }
 }
 
+// ---------------------------------------------------------- resolver mirror
+//
+// PARITY NOTE: this is a deliberate MIRROR of the central egress resolver in
+// the `faktor-provider` crate (`crates/provider/src/resolver.rs`).
+// faktor-browser does not depend on the model-provider hub (it must stay
+// model-free), so the address classification table, the answer-set bound and
+// the "refuse the whole mixed set, never filter" rule are kept in lockstep
+// by hand — same ranges, same defaults, same adversarial tests. Any change
+// to the provider's `AddressClass` / `EgressAddressPolicy` must land here
+// too (and in this module's tests).
+
+/// Default hard bound on the number of addresses one broker connect may
+/// consume (mirrors the provider resolver's `DEFAULT_MAX_DNS_ANSWERS`).
+pub const MAX_RESOLVED_ADDRESSES: usize = 16;
+
+/// Address class of one resolved IP (mirror of the provider's
+/// `AddressClass`; `Global` is the only class any policy permits besides the
+/// explicit loopback rule).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IpClass {
+    Global,
+    Loopback,
+    Private,
+    LinkLocal,
+    Cgnat,
+    Documentation,
+    Benchmark,
+    Multicast,
+    Unspecified,
+    Reserved,
+}
+
+impl IpClass {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            IpClass::Global => "global",
+            IpClass::Loopback => "loopback",
+            IpClass::Private => "private",
+            IpClass::LinkLocal => "link_local",
+            IpClass::Cgnat => "cgnat",
+            IpClass::Documentation => "documentation",
+            IpClass::Benchmark => "benchmark",
+            IpClass::Multicast => "multicast",
+            IpClass::Unspecified => "unspecified",
+            IpClass::Reserved => "reserved",
+        }
+    }
+}
+
+/// Classify one IP exactly like the provider resolver (including embedded
+/// IPv4 in mapped/compatible/6to4/NAT64 forms).
+pub(crate) fn classify_ip(ip: std::net::IpAddr) -> IpClass {
+    match ip {
+        std::net::IpAddr::V4(v4) => classify_v4(v4),
+        std::net::IpAddr::V6(v6) => classify_v6(v6),
+    }
+}
+
+fn classify_v4(v4: std::net::Ipv4Addr) -> IpClass {
+    let o = v4.octets();
+    if v4.is_unspecified() {
+        return IpClass::Unspecified;
+    }
+    if v4.is_loopback() {
+        return IpClass::Loopback;
+    }
+    if v4.is_link_local() {
+        return IpClass::LinkLocal;
+    }
+    if v4.is_private() {
+        return IpClass::Private;
+    }
+    if v4.is_multicast() {
+        return IpClass::Multicast;
+    }
+    if o[0] == 100 && (64..=127).contains(&o[1]) {
+        return IpClass::Cgnat;
+    }
+    if v4.is_documentation() {
+        return IpClass::Documentation;
+    }
+    if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
+        return IpClass::Benchmark;
+    }
+    if o[0] == 0
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+        || (o[0] == 192 && o[1] == 88 && o[2] == 99)
+        || o[0] >= 240
+    {
+        return IpClass::Reserved;
+    }
+    IpClass::Global
+}
+
+fn classify_v6(v6: std::net::Ipv6Addr) -> IpClass {
+    let s = v6.segments();
+    if v6.is_unspecified() {
+        return IpClass::Unspecified;
+    }
+    if v6.is_loopback() {
+        return IpClass::Loopback;
+    }
+    if v6.is_multicast() {
+        return IpClass::Multicast;
+    }
+    if (s[0] & 0xffc0) == 0xfe80 {
+        return IpClass::LinkLocal;
+    }
+    if (s[0] & 0xfe00) == 0xfc00 {
+        return IpClass::Private;
+    }
+    if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0xffff {
+        return classify_v4(embedded_v4(s[6], s[7]));
+    }
+    if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
+        return classify_v4(embedded_v4(s[6], s[7]));
+    }
+    if s[0] == 0x2002 {
+        return classify_v4(embedded_v4(s[1], s[2]));
+    }
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
+        return classify_v4(embedded_v4(s[6], s[7]));
+    }
+    if s[0] == 0x2001 && s[1] == 0x0db8 {
+        return IpClass::Documentation;
+    }
+    if s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0 {
+        return IpClass::Benchmark;
+    }
+    if (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
+        || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0010)
+        || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0020)
+    {
+        return IpClass::Reserved;
+    }
+    IpClass::Global
+}
+
+fn embedded_v4(hi: u16, lo: u16) -> std::net::Ipv4Addr {
+    std::net::Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8)
+}
+
+/// May an address of this class be connected to? Global always; loopback
+/// only under the connector's explicit `allow_loopback` rule; nothing else.
+pub(crate) fn class_permitted(class: IpClass, allow_loopback: bool) -> bool {
+    matches!(class, IpClass::Global) || (allow_loopback && matches!(class, IpClass::Loopback))
+}
+
+/// Vet one resolution: bound the answer set and classify EVERY address; any
+/// refused class refuses the WHOLE set (a mixed public/private answer set is
+/// a rebinding signal, never filtered into a racing subset).
+pub(crate) fn vet_resolved_answers(
+    host: &str,
+    answers: Vec<SocketAddr>,
+    allow_loopback: bool,
+) -> Result<Vec<SocketAddr>, String> {
+    if answers.is_empty() {
+        return Err(format!("DNS for {host} returned no addresses"));
+    }
+    if answers.len() > MAX_RESOLVED_ADDRESSES {
+        return Err(format!(
+            "DNS for {host} answered with {} addresses, over the bound of              {MAX_RESOLVED_ADDRESSES}",
+            answers.len()
+        ));
+    }
+    for addr in &answers {
+        let class = classify_ip(addr.ip());
+        if !class_permitted(class, allow_loopback) {
+            return Err(format!(
+                "DNS for {host} resolved to a {} address, which the egress address                  policy refuses",
+                class.as_str()
+            ));
+        }
+    }
+    Ok(answers)
+}
+
 async fn connect_destination(
     upstream: Option<&UpstreamProxy>,
     host: &str,
@@ -2060,7 +2364,38 @@ async fn connect_destination(
         Some(upstream) => (upstream.host.clone(), upstream.port),
         None => (host.to_string(), port),
     };
-    let attempt = TcpStream::connect((connect_host.as_str(), connect_port));
+    let allow_loopback = inner.policy.allow_loopback;
+    // A literal-IP destination cannot be rebound: the broker policy already
+    // decided that exact address upstream (explicit naming), so it connects
+    // directly. A NAME is resolved EXACTLY ONCE, its full answer set is
+    // vetted, and the connect uses only those `SocketAddr`s — no second
+    // resolution between the decision and the socket (the upstream proxy
+    // leg is vetted identically).
+    let literal: Option<std::net::IpAddr> = connect_host.parse().ok();
+    let attempt = async {
+        let vetted = if let Some(ip) = literal {
+            vec![SocketAddr::new(ip, connect_port)]
+        } else {
+            let answers = tokio::net::lookup_host((connect_host.as_str(), connect_port))
+                .await
+                .map(|addrs| addrs.collect::<Vec<SocketAddr>>())
+                .map_err(|_| format!("cannot resolve {connect_host}:{connect_port}"))?;
+            vet_resolved_answers(&connect_host, answers, allow_loopback)?
+        };
+        let mut last_error: Option<std::io::Error> = None;
+        for addr in vetted {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => last_error = Some(e),
+            }
+        }
+        Err(format!(
+            "cannot connect {connect_host}:{connect_port}: {}",
+            last_error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "no vetted address".to_string())
+        ))
+    };
     let result = tokio::select! {
         biased;
         _ = inner.shutdown.cancelled() => return Err("broker shutting down".to_string()),
@@ -2068,7 +2403,7 @@ async fn connect_destination(
     };
     match result {
         Ok(Ok(stream)) => Ok(stream),
-        Ok(Err(e)) => Err(format!("cannot connect {connect_host}:{connect_port}: {e}")),
+        Ok(Err(detail)) => Err(detail),
         Err(_) => Err(format!(
             "connect to {connect_host}:{connect_port} timed out"
         )),
@@ -2196,7 +2531,7 @@ async fn relay_response_bounded(
             Err(_) => {
                 return Err(CopyAbort::Failed(
                     "idle timeout on the target leg".to_string(),
-                ))
+                ));
             }
             Ok(Err(e)) => return Err(CopyAbort::Failed(format!("target read failed: {e}"))),
             Ok(Ok(0)) => break,
@@ -2204,7 +2539,7 @@ async fn relay_response_bounded(
                 Err(_) => {
                     return Err(CopyAbort::Failed(
                         "idle timeout writing to the client leg".to_string(),
-                    ))
+                    ));
                 }
                 Ok(Err(e)) => return Err(CopyAbort::Failed(format!("client write failed: {e}"))),
                 Ok(Ok(())) => down = down.saturating_add(n as u64),
@@ -2213,6 +2548,25 @@ async fn relay_response_bounded(
     }
     let _ = client.shutdown().await;
     Ok(down)
+}
+
+/// The canonical `Host`/authority value for one policy-checked destination:
+/// the default port for the scheme is omitted, IPv6 literals are bracketed.
+fn canonical_authority(host: &str, port: u16, scheme: &str) -> String {
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let default_port = (scheme.eq_ignore_ascii_case("http") && port == 80)
+        || (scheme.eq_ignore_ascii_case("https") && port == 443)
+        || (scheme.eq_ignore_ascii_case("ws") && port == 80)
+        || (scheme.eq_ignore_ascii_case("wss") && port == 443);
+    if default_port {
+        host
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 /// The origin-form path+query of an absolute URI.
@@ -2253,6 +2607,8 @@ pub fn policy_snapshot(policy: &DestinationPolicy) -> serde_json::Value {
         "blocked_resource_types": policy.blocked_resource_types,
         "allow_schemes": policy.allow_schemes,
         "allowed_ports": policy.allowed_ports,
+        "allow_connect": policy.allow_connect,
+        "allow_loopback": policy.allow_loopback,
     })
 }
 
@@ -2471,16 +2827,101 @@ mod tests {
             .is_allowed());
         // Patterns carry no ports: ports live in `allowed_ports`.
         assert!(HostPattern::parse("example.com:8443").is_err());
-        // A hostile userinfo never becomes the host.
-        assert!(policy
-            .decide_url("https://evil.test@example.com/x")
-            .is_allowed());
+        // A hostile userinfo target is rejected outright: it is never
+        // stripped into a valid destination that the policy then allows.
+        assert_eq!(
+            policy.decide_url("https://evil.test@example.com/x"),
+            DestinationDecision::Blocked {
+                reason: BlockReason::Malformed
+            }
+        );
         assert_eq!(
             policy.decide_url("https://example.com@evil.test/x"),
             DestinationDecision::Blocked {
-                reason: BlockReason::NotFirstParty
+                reason: BlockReason::Malformed
             }
         );
+        assert_eq!(split_absolute_target("http://user@example.com:80/x"), None);
+        assert_eq!(
+            split_absolute_target("http://user:pass@example.com:80"),
+            None
+        );
+        assert_eq!(parse_connect_target("user@example.com:443"), None);
+        assert_eq!(parse_connect_target("user:pass@example.com:443"), None);
+        assert!(parse_connect_target("example.com:443").is_some());
+    }
+
+    #[test]
+    fn canonical_authority_omits_default_ports_and_brackets_ipv6() {
+        assert_eq!(
+            canonical_authority("example.com", 80, "http"),
+            "example.com"
+        );
+        assert_eq!(
+            canonical_authority("example.com", 443, "https"),
+            "example.com"
+        );
+        assert_eq!(
+            canonical_authority("example.com", 8443, "https"),
+            "example.com:8443"
+        );
+        assert_eq!(
+            canonical_authority("example.com", 8080, "http"),
+            "example.com:8080"
+        );
+        assert_eq!(canonical_authority("::1", 80, "http"), "[::1]");
+        assert_eq!(canonical_authority("::1", 8443, "http"), "[::1]:8443");
+    }
+
+    #[test]
+    fn connect_is_a_first_class_policy_dimension() {
+        // A policy that only ever needed HTTP denies CONNECT outright, even
+        // for an allowed host on an allowed port: a tunnel is not a forward
+        // request to that host.
+        let http_only =
+            DestinationPolicy::first_party_only(vec![HostPattern::parse("example.com").unwrap()])
+                .with_allow_schemes(vec!["http".to_string()]);
+        assert!(!http_only.allow_connect, "derived from the scheme set");
+        assert!(http_only.validate().is_ok());
+        assert_eq!(
+            http_only.decide_proxy_target(ProxyRequestKind::ConnectTunnel, "example.com", 443),
+            DestinationDecision::Blocked {
+                reason: BlockReason::ConnectNotAllowed
+            }
+        );
+        assert!(http_only
+            .decide_proxy_target(ProxyRequestKind::ForwardHttp, "example.com", 80)
+            .is_allowed());
+        // The default https-capable policy allows the tunnel explicitly.
+        let https =
+            DestinationPolicy::first_party_only(vec![HostPattern::parse("example.com").unwrap()]);
+        assert!(https.allow_connect);
+        assert!(https
+            .decide_proxy_target(ProxyRequestKind::ConnectTunnel, "example.com", 443)
+            .is_allowed());
+        // A malformed CONNECT authority is still malformed, not "not
+        // allowed".
+        assert_eq!(
+            https.decide_proxy_target(ProxyRequestKind::ConnectTunnel, "bad host", 443),
+            DestinationDecision::Blocked {
+                reason: BlockReason::Malformed
+            }
+        );
+        // Explicit denial wins even with https support.
+        let denied = https.clone().with_allow_connect(false);
+        assert_eq!(
+            denied.decide_proxy_target(ProxyRequestKind::ConnectTunnel, "example.com", 443),
+            DestinationDecision::Blocked {
+                reason: BlockReason::ConnectNotAllowed
+            }
+        );
+        // An inconsistent policy (CONNECT allowed without HTTPS/WSS) is a
+        // configuration error, never a silent allow.
+        let inconsistent = DestinationPolicy {
+            allow_connect: true,
+            ..http_only
+        };
+        assert!(inconsistent.validate().is_err());
     }
 
     #[test]
@@ -2618,5 +3059,102 @@ mod tests {
         ] {
             assert!(parse_status_line(bad).is_none(), "{bad:?}");
         }
+    }
+
+    // --- resolver mirror (parity with crates/provider/src/resolver.rs) ---
+
+    fn ip(text: &str) -> std::net::IpAddr {
+        text.parse().expect("test IP")
+    }
+
+    fn sa(text: &str, port: u16) -> SocketAddr {
+        SocketAddr::new(ip(text), port)
+    }
+
+    #[test]
+    fn mirrored_classification_covers_the_special_ranges() {
+        for (text, want) in [
+            ("8.8.8.8", IpClass::Global),
+            ("127.0.0.1", IpClass::Loopback),
+            ("169.254.169.254", IpClass::LinkLocal),
+            ("10.0.0.1", IpClass::Private),
+            ("192.168.1.1", IpClass::Private),
+            ("100.64.0.1", IpClass::Cgnat),
+            ("192.0.2.1", IpClass::Documentation),
+            ("198.18.0.1", IpClass::Benchmark),
+            ("224.0.0.1", IpClass::Multicast),
+            ("0.0.0.0", IpClass::Unspecified),
+            ("240.0.0.1", IpClass::Reserved),
+            ("::1", IpClass::Loopback),
+            ("fe80::1", IpClass::LinkLocal),
+            ("fc00::1", IpClass::Private),
+            ("ff02::1", IpClass::Multicast),
+            ("2001:db8::1", IpClass::Documentation),
+            ("2606:4700::1111", IpClass::Global),
+            ("::ffff:127.0.0.1", IpClass::Loopback),
+            ("::ffff:169.254.169.254", IpClass::LinkLocal),
+            ("64:ff9b::7f00:1", IpClass::Loopback),
+            ("2002:7f00:1::", IpClass::Loopback),
+        ] {
+            assert_eq!(classify_ip(ip(text)), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn mirror_vetting_refuses_malicious_and_mixed_answers_wholesale() {
+        for (label, answer) in [
+            ("loopback", "127.0.0.1"),
+            ("metadata", "169.254.169.254"),
+            ("private", "10.0.0.1"),
+            ("v6 loopback", "::1"),
+            ("v6 link-local", "fe80::1"),
+        ] {
+            let err = vet_resolved_answers("allowed.test", vec![sa(answer, 443)], false)
+                .expect_err(label);
+            assert!(err.contains("refuses"), "{label}: {err}");
+        }
+        // Mixed public/private: the whole set is refused, never filtered.
+        let err = vet_resolved_answers(
+            "allowed.test",
+            vec![sa("93.184.216.34", 443), sa("127.0.0.1", 443)],
+            false,
+        )
+        .expect_err("mixed set");
+        assert!(err.contains("refuses"), "{err}");
+        // The explicit loopback rule admits loopback and nothing else.
+        assert_eq!(
+            vet_resolved_answers("local.test", vec![sa("127.0.0.1", 11434)], true).unwrap(),
+            vec![sa("127.0.0.1", 11434)]
+        );
+        let err =
+            vet_resolved_answers("local.test", vec![sa("169.254.169.254", 80)], true).unwrap_err();
+        assert!(err.contains("link_local"), "{err}");
+        // Answer-set bound, empty set.
+        let flood: Vec<SocketAddr> = (1..=MAX_RESOLVED_ADDRESSES + 1)
+            .map(|i| sa(&format!("93.184.216.{i}"), 443))
+            .collect();
+        let err = vet_resolved_answers("flood.test", flood, false).unwrap_err();
+        assert!(err.contains("over the bound"), "{err}");
+        let err = vet_resolved_answers("empty.test", Vec::new(), false).unwrap_err();
+        assert!(err.contains("no addresses"), "{err}");
+    }
+
+    #[test]
+    fn mirror_policy_defaults_to_external_only_and_opt_in_installs_the_rule() {
+        let policy =
+            DestinationPolicy::first_party_only(vec![HostPattern::parse("example.com").unwrap()]);
+        assert!(!policy.allow_loopback);
+        assert!(policy.clone().with_allow_loopback(true).allow_loopback);
+        // The rule is a first-class snapshot field: config round-trips it.
+        let snapshot = policy_snapshot(&policy.clone().with_allow_loopback(true));
+        assert_eq!(snapshot["allow_loopback"], serde_json::json!(true));
+        let http_only =
+            DestinationPolicy::first_party_only(vec![HostPattern::parse("example.com").unwrap()])
+                .with_allow_schemes(vec!["http".to_string()])
+                .with_allow_loopback(true);
+        assert!(
+            http_only.validate().is_ok(),
+            "the rule never weakens validation"
+        );
     }
 }

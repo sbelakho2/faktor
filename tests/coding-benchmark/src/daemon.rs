@@ -523,7 +523,15 @@ fn random_hex() -> String {
         .unwrap_or_default()
         .as_nanos()
         .hash(&mut h);
-    format!("{:016x}{:016x}", h.finish(), h.finish())
+    // The canonical 64-hex (256-bit) form the frontends generate and the
+    // daemon now REQUIRES for FAKTOR_SERVER_PASSWORD.
+    format!(
+        "{:016x}{:016x}{:016x}{:016x}",
+        h.finish(),
+        h.finish(),
+        h.finish(),
+        h.finish()
+    )
 }
 
 // ---------------------------------------------------------------- JSON reads

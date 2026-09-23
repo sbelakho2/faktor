@@ -24,3 +24,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Test-only: the checked-transport tests build the permissive (no allowlist,
+# loopback-address-rule) client behind the test-utils gate.
+faktor-provider = { workspace = true, features = ["test-utils"] }

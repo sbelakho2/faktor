@@ -86,8 +86,17 @@ pub enum BrowserError {
     /// The destination is not permitted by the connector's destination
     /// policy (first-party only by default).
     DestinationBlocked { host: String, reason: String },
-    /// A download was refused (downloads are disabled by default).
+    /// A download was refused (downloads are disabled by default). The URL is
+    /// redacted at the logging boundary, never here.
     DownloadBlocked { url: String },
+    /// A download failed enforcement or capture (malformed progress fields,
+    /// over-bound stream, unsafe filename, storage failure). Download
+    /// enforcement fails closed: anything unverifiable is refused.
+    DownloadRejected { url: String, detail: String },
+    /// The instance is retiring (idle shutdown or an operational retire
+    /// raced this acquisition). No page was opened; a retry starts a fresh
+    /// browser.
+    Retiring { detail: String },
     /// A response/body exceeded a configured bound. `observed_bytes` is
     /// `None` when the size was rejected before decoding.
     ResponseTooLarge {
@@ -96,6 +105,10 @@ pub enum BrowserError {
     },
     /// Profile storage failure (permissions, traversal, corrupt layout).
     Profile { detail: String },
+    /// The CDP event stream lost events: the observation history is
+    /// incomplete and no complete-history answer can be given. `skipped` is
+    /// the number of events known to be missing.
+    EventStreamLagged { skipped: u64 },
     /// A configured bound (pages, browsers, records) was reached.
     Bound { detail: String },
     /// Anything else, with context.
@@ -133,6 +146,12 @@ impl BrowserError {
         }
     }
 
+    pub fn retiring(detail: impl Into<String>) -> Self {
+        BrowserError::Retiring {
+            detail: detail.into(),
+        }
+    }
+
     /// Machine-readable, stable error code (snake_case) for logs and the
     /// protocol boundary.
     pub fn code(&self) -> &'static str {
@@ -152,8 +171,11 @@ impl BrowserError {
             BrowserError::EgressUnavailable { .. } => "egress_unavailable",
             BrowserError::DestinationBlocked { .. } => "destination_blocked",
             BrowserError::DownloadBlocked { .. } => "download_blocked",
+            BrowserError::DownloadRejected { .. } => "download_rejected",
+            BrowserError::Retiring { .. } => "retiring",
             BrowserError::ResponseTooLarge { .. } => "response_too_large",
             BrowserError::Profile { .. } => "profile",
+            BrowserError::EventStreamLagged { .. } => "event_stream_lagged",
             BrowserError::Bound { .. } => "bound",
             BrowserError::Internal { .. } => "internal",
         }
@@ -169,6 +191,7 @@ impl BrowserError {
                 | BrowserError::EgressUnavailable { .. }
                 | BrowserError::LaunchTimeout { .. }
                 | BrowserError::Deadline { .. }
+                | BrowserError::Retiring { .. }
         )
     }
 }
@@ -210,6 +233,12 @@ impl fmt::Display for BrowserError {
             BrowserError::DownloadBlocked { url } => {
                 write!(f, "download blocked by policy: {url}")
             }
+            BrowserError::DownloadRejected { url, detail } => {
+                write!(f, "download rejected: {url} ({detail})")
+            }
+            BrowserError::Retiring { detail } => {
+                write!(f, "browser instance is retiring: {detail}")
+            }
             BrowserError::ResponseTooLarge {
                 limit_bytes,
                 observed_bytes,
@@ -218,6 +247,9 @@ impl fmt::Display for BrowserError {
                 None => write!(f, "response too large: limit {limit_bytes} bytes"),
             },
             BrowserError::Profile { detail } => write!(f, "profile failure: {detail}"),
+            BrowserError::EventStreamLagged { skipped } => {
+                write!(f, "cdp event stream lagged: {skipped} events lost")
+            }
             BrowserError::Bound { detail } => write!(f, "browser bound reached: {detail}"),
             BrowserError::Internal { detail } => write!(f, "internal browser failure: {detail}"),
         }

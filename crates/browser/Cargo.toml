@@ -8,6 +8,7 @@ description = "Faktor Browser authority: supervised Chromium/CDP, profiles, inte
 
 [dependencies]
 faktor-core.workspace = true
+faktor-fs.workspace = true
 faktor-security.workspace = true
 faktor-terminal.workspace = true
 tokio.workspace = true

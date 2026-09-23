@@ -10,7 +10,10 @@
 #   docker compose up -d
 services:
   woodpecker-server:
-    image: woodpeckerci/woodpecker-server:v3
+    # Digest-pinned (woodpeckerci/woodpecker-server:v3 index digest recorded
+    # 2026-09-23). Bump deliberately: docker buildx imagetools inspect
+    # woodpeckerci/woodpecker-server:v3
+    image: woodpeckerci/woodpecker-server:v3@sha256:58dafbe56bb3529d78b48ee8d56a1f4b0886748763fd04ac23c01cc06c3dd24e
     restart: unless-stopped
     ports:
       - "8000:8000" # UI/API
@@ -35,7 +38,10 @@ services:
       - woodpecker-data:/var/lib/woodpecker
 
   woodpecker-agent:
-    image: woodpeckerci/woodpecker-agent:v3
+    # Digest-pinned (woodpeckerci/woodpecker-agent:v3 index digest recorded
+    # 2026-09-23). Bump deliberately: docker buildx imagetools inspect
+    # woodpeckerci/woodpecker-agent:v3
+    image: woodpeckerci/woodpecker-agent:v3@sha256:73ee7cc63161b40bfefa4a26eae45c518a09124ab34f7e3c5e781df85e1ba4ac
     restart: unless-stopped
     depends_on:
       - woodpecker-server
@@ -58,7 +64,7 @@ services:
   # documented reference only. See setup.md §5 for the native install.
   #
   # woodpecker-agent-selfhosted:
-  #   image: woodpeckerci/woodpecker-agent:v3
+  #   image: woodpeckerci/woodpecker-agent:v3@sha256:73ee7cc63161b40bfefa4a26eae45c518a09124ab34f7e3c5e781df85e1ba4ac
   #   restart: unless-stopped
   #   network_mode: host
   #   environment:

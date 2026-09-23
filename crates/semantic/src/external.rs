@@ -1829,9 +1829,9 @@ mod tests {
         // failure, and no frame is inspected.
         let env = SemanticClientEnv {
             supervisor: supervisor(dir.path()),
-            transport: Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
+            transport: Arc::new(PolicyCheckedHttpTransport::with_policy_for_tests(
                 faktor_security::destination::DestinationPolicy::empty(),
-            ))),
+            )),
             caps: SemanticResponseCaps::default(),
         };
         let provider = http_config("http://provider.example/context", None)
@@ -1847,7 +1847,7 @@ mod tests {
         // A mock denial (the transport seam's own typed refusal) maps the
         // same way.
         let mock = MockHttpTransport::denying(faktor_provider::egress::EgressError::Denied {
-            url: "http://provider.example/context".to_string(),
+            url: "http://provider.example/context".into(),
             reason: DeniedReason {
                 rule_fired: None,
                 matched: RuleMatch::None,

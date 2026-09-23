@@ -86,7 +86,7 @@ async fn resolved_redirects_cannot_diverge_from_the_parsed_gate() {
         );
         // The textual authority the old string-based validator would have
         // inspected is gone: the origin is exactly the parsed one.
-        let before = check_url(Some(&policy), &parsed);
+        let before = check_url(&policy, &parsed);
         // 2. A hand-built RawRequest executes through the mock; the
         // transport observes the request's OWN parsed URL.
         let transport = MockHttpTransport::new(200, "{}");
@@ -105,7 +105,7 @@ async fn resolved_redirects_cannot_diverge_from_the_parsed_gate() {
         // decision on the resolver's output (same parser, same bytes).
         let observed_url = reqwest::Url::parse(observed).unwrap();
         assert_eq!(
-            check_url(Some(&policy), &observed_url).is_ok(),
+            check_url(&policy, &observed_url).is_ok(),
             before.is_ok(),
             "gate decision must not change between resolution and send"
         );
@@ -135,7 +135,7 @@ async fn backslash_authority_shapes_land_on_the_canonical_origin_not_a_smuggled_
                     "{location:?} must canonicalize to the allowed host, got {resolved:?}"
                 );
                 assert!(
-                    check_url(Some(&policy), &parsed).is_ok(),
+                    check_url(&policy, &parsed).is_ok(),
                     "{location:?} -> {resolved:?} must be allowed by the parsed gate"
                 );
                 let transport = MockHttpTransport::new(200, "{}");
@@ -165,7 +165,7 @@ async fn backslash_authority_shapes_land_on_the_canonical_origin_not_a_smuggled_
             .unwrap_or_else(|e| panic!("{location:?} must resolve to a URL: {e}"));
         let parsed = reqwest::Url::parse(&resolved).unwrap();
         assert!(
-            check_url(Some(&policy), &parsed).is_err(),
+            check_url(&policy, &parsed).is_err(),
             "{location:?} -> {resolved:?} must be denied"
         );
         let transport = MockHttpTransport::new(200, "{}");
@@ -174,6 +174,6 @@ async fn backslash_authority_shapes_land_on_the_canonical_origin_not_a_smuggled_
         // parsed URL:
         let _ = execute_raw(&transport, RawRequest::new("GET", resolved.clone())).await;
         assert_eq!(transport.requests()[0].1, resolved);
-        assert!(check_url(Some(&policy), &parsed).is_err());
+        assert!(check_url(&policy, &parsed).is_err());
     }
 }

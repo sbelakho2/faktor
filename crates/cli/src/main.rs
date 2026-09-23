@@ -21,7 +21,9 @@ use faktor_agent::{AgentDeps, AgentRuntime, ToolCallMode, ToolRegistry};
 use faktor_core::id::SessionId;
 use faktor_core::time::SystemClock;
 use faktor_core::CapabilitySet;
-use faktor_provider::egress::{HttpTransport, OutboundScanConfig, PolicyCheckedHttpTransport};
+use faktor_provider::egress::{
+    EgressAddressPolicy, HttpTransport, OutboundScanConfig, PolicyCheckedHttpTransport,
+};
 use faktor_provider::{Provider, ProviderRegistry};
 use faktor_security::registry::SecretRegistry;
 use faktor_server::permission::ChannelPermissionRequester;
@@ -924,7 +926,7 @@ fn daemon_outbound_scan(config: &config::Config) -> OutboundScanConfig {
     let mut registry = SecretRegistry::new();
     for p in &config.providers {
         if let Some(key) = p.key() {
-            registry.register(key.as_bytes());
+            registry.register(key.expose().as_bytes());
         }
     }
     if config.commerce.enabled {
@@ -968,13 +970,27 @@ fn register_commerce_credential(
 /// policy-checked with the daemon's SandboxPolicy network gate installed
 /// (default-deny on any destination the allowlist does not match, BEFORE a
 /// connect) and the outbound whole-payload secret scan attached.
+///
+/// The destination policy is REQUIRED: a sandbox gate that installed no
+/// allowlist fails closed to the EMPTY policy (deny everything) instead of
+/// silently default-allowing every destination. `addresses` carries the
+/// explicit address-class rule — external-only by default; a provider entry
+/// whose typed config says `allow_loopback` gets the one explicit loopback
+/// exception, and nothing else.
 fn daemon_egress_transport(
     policy: &faktor_sandbox::SandboxPolicy,
     scan: OutboundScanConfig,
+    addresses: EgressAddressPolicy,
 ) -> Arc<dyn HttpTransport> {
-    Arc::new(PolicyCheckedHttpTransport::with_policy_and_scan(
-        policy.network.installed().cloned(),
+    let destinations = policy
+        .network
+        .installed()
+        .cloned()
+        .unwrap_or_else(faktor_security::destination::DestinationPolicy::empty);
+    Arc::new(PolicyCheckedHttpTransport::with_policy_scan_and_addresses(
+        destinations,
         Some(scan),
+        addresses,
     ))
 }
 
@@ -1219,17 +1235,32 @@ fn build_daemon_core(
     // The scan config is shared: the provider transport and the commerce
     // checked transport each install their own destination policy over the
     // SAME configured-secret registry (provider keys + commerce credentials).
-    let transport = daemon_egress_transport(&sandbox_policy, egress.clone());
+    let transport = daemon_egress_transport(
+        &sandbox_policy,
+        egress.clone(),
+        EgressAddressPolicy::EXTERNAL,
+    );
+    // A second client object with the ONE explicit loopback exception,
+    // built ONLY for entries whose typed config asked for it
+    // (`allow_loopback`): every other entry keeps the external-only
+    // transport, and no address class is ever allowed globally.
+    let loopback_transport =
+        daemon_egress_transport(&sandbox_policy, egress.clone(), EgressAddressPolicy::LOCAL);
     // Steps 5-6 — provider registry + catalog/pricing: every configured
-    // adapter is built through the checked transport; Ollama providers are
-    // kept CONCRETE for live probing (spec §10: warm-up must reach the
-    // instance the registry serves). Catalog/pricing rows (built-in
-    // tables + configured overrides/ceilings) ride the adapter
-    // constructions and the registry's catalog rows.
+    // adapter is built through the checked transport its entry selected;
+    // Ollama providers are kept CONCRETE for live probing (spec §10:
+    // warm-up must reach the instance the registry serves). Catalog/pricing
+    // rows (built-in tables + configured overrides/ceilings) ride the
+    // adapter constructions and the registry's catalog rows.
     let mut providers = ProviderRegistry::new();
     let mut ollama_warmers: Vec<Arc<faktor_ollama::OllamaProvider>> = Vec::new();
     for p in &config.providers {
-        if let Some(ollama) = p.build_ollama(transport.clone()) {
+        let provider_transport = if p.allows_loopback() {
+            loopback_transport.clone()
+        } else {
+            transport.clone()
+        };
+        if let Some(ollama) = p.build_ollama(provider_transport.clone()) {
             let dyn_arc: Arc<dyn Provider> = ollama.clone();
             providers
                 .try_register(dyn_arc)
@@ -1237,7 +1268,7 @@ fn build_daemon_core(
             ollama_warmers.push(ollama);
             continue;
         }
-        match p.build(transport.clone()) {
+        match p.build(provider_transport) {
             Ok(provider) => providers
                 .try_register(provider)
                 .map_err(|e| format!("provider {} failed to register: {e}", p.id()))?,
@@ -2954,7 +2985,8 @@ async fn serve_impl(
             .map_err(|e| format!("sandbox config: {e}"))?
             .network
             .installed()
-            .cloned();
+            .cloned()
+            .unwrap_or_else(faktor_security::destination::DestinationPolicy::empty);
         let store = Arc::new(
             faktor_updater::SqliteUpdaterStore::open(&db)
                 .map_err(|e| format!("updater store {}: {e}", db.display()))?,
@@ -3321,8 +3353,10 @@ async fn serve_impl(
     // `deps.semantic` (no parallel registry exists anywhere).
     deps = deps.with_semantic_registry(graph.semantic.clone());
     // The frontend generates the secret and passes it via env; the
-    // daemon reads it here and never prints it.
-    deps.server_password = ServerPassword::from_env();
+    // daemon reads it here and never prints it. An explicitly supplied
+    // value that is not the canonical 64-hex form fails startup loudly —
+    // never a silent downgrade to weaker auth.
+    deps.server_password = ServerPassword::try_from_env().map_err(|e| e.to_string())?;
     // The workspace root rides the global event envelope.
     deps.directory = std::env::current_dir()
         .ok()
@@ -4155,7 +4189,7 @@ impl faktor_updater::HealthProbe for CliDoctorProbe {
 fn build_local_updater(
     cfg: &config::UpdaterCfg,
     data_dir: &std::path::Path,
-    policy: Option<faktor_security::destination::DestinationPolicy>,
+    policy: faktor_security::destination::DestinationPolicy,
     probe: Arc<dyn faktor_updater::HealthProbe>,
 ) -> Result<faktor_updater::Updater, String> {
     if !cfg.enabled {
@@ -4227,7 +4261,11 @@ async fn updater_command(action: UpdaterAction, data_dir: PathBuf, config_path: 
         data_dir: data_dir.clone(),
     });
     let policy = match config.sandbox_policy() {
-        Ok(policy) => policy.network.installed().cloned(),
+        Ok(policy) => policy
+            .network
+            .installed()
+            .cloned()
+            .unwrap_or_else(faktor_security::destination::DestinationPolicy::empty),
         Err(e) => {
             eprintln!("faktor updater: sandbox config: {e}");
             std::process::exit(1);
@@ -4595,7 +4633,7 @@ async fn enterprise_command(
                         other => {
                             return Err(format!(
                                 "deletion: scope {other:?} must be organization|account"
-                            ))
+                            ));
                         }
                     };
                     service
@@ -10072,6 +10110,9 @@ mod tests {
                 "id": "mocked",
                 "base_url": base,
                 "api_key_env": key_env,
+                // The tests below target loopback mock servers, so the
+                // entry carries the explicit loopback address-class rule.
+                "allow_loopback": true,
             }],
         });
         if let Some(rows) = rows {

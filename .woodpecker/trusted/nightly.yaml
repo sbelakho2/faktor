@@ -27,6 +27,12 @@
 # applies (default 60 min, max settable 120 min). Raise it (setup.md §6):
 #   server:  WOODPECKER_MAX_PIPELINE_TIMEOUT=1560
 #   project: PATCH /api/repos/{trusted_repo_id} {"timeout":1560}
+# Toolchain authority: `rust-toolchain.toml` pins channel 1.98.0 with
+# components rustfmt+clippy (profile minimal). Every `rust:1.98` image below
+# is only a rustup baseline; the cargo/rustc shims resolve the exact channel
+# from the toolchain file. Non-Rust images are pinned by multi-arch index
+# digest (comment records the original tag and the date).
+#
 # Commit-status context (default format): ci/woodpecker/cron/nightly
 
 labels:
@@ -38,7 +44,7 @@ when:
 
 steps:
   - name: fault-scale
-    image: rust:1.98
+    image: rust:1.98 # rustup baseline only; rust-toolchain.toml is authoritative
     environment:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
@@ -66,7 +72,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"fault-scale","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/fault-scale.json
   - name: longrun
-    image: rust:1.98
+    image: rust:1.98 # rustup baseline only; rust-toolchain.toml is authoritative
     environment:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
@@ -94,7 +100,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"longrun","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/longrun.json
   - name: efficiency
-    image: rust:1.98
+    image: rust:1.98 # rustup baseline only; rust-toolchain.toml is authoritative
     environment:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
@@ -122,7 +128,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"efficiency","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/efficiency.json
   - name: economy
-    image: rust:1.98
+    image: rust:1.98 # rustup baseline only; rust-toolchain.toml is authoritative
     environment:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
@@ -150,7 +156,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"economy","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/economy.json
   - name: coding-benchmark
-    image: rust:1.98
+    image: rust:1.98 # rustup baseline only; rust-toolchain.toml is authoritative
     environment:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
@@ -178,7 +184,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"coding-benchmark","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/coding-benchmark.json
   - name: coding-benchmark-real-model
-    image: rust:1.98
+    image: rust:1.98 # rustup baseline only; rust-toolchain.toml is authoritative
     environment:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
@@ -226,7 +232,7 @@ steps:
           "$status" "$reason" "$CI_COMMIT_SHA" "$tree" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" > target/certification/lanes/coding-benchmark-real-model.json
         echo "coding-benchmark-real-model: $status ${reason:+(recorded skip)}"
   - name: supply-chain
-    image: rust:1.98
+    image: rust:1.98 # rustup baseline only; rust-toolchain.toml is authoritative
     environment:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
@@ -254,7 +260,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"supply-chain","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/supply-chain.json
   - name: certificate-nightly
-    image: node:24
+    image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     depends_on:
       - fault-scale
       - longrun

@@ -53,6 +53,19 @@
 # rustup-init binary after verifying its published SHA-256; no step pipes a
 # remote script into a shell.
 #
+# Toolchain authority: `rust-toolchain.toml` pins channel 1.98.0 with
+# components rustfmt+clippy (profile minimal). The `rust:1.98` image is only
+# a rustup baseline: the cargo/rustc shims resolve the exact channel from the
+# toolchain file, and the linux lane asserts that resolution before running
+# the gates. The JetBrains smoke lane derives its rustup-init
+# `--default-toolchain` from the same file — never a second hard-coded Rust
+# version.
+#
+# Image pinning: every non-Rust container image is pinned by its multi-arch
+# index digest (the trailing comment records the original tag and the date
+# the digest was recorded). `rust:1.98` intentionally stays tag-based
+# because the toolchain file, not the image, is the Rust version authority.
+#
 # Commit-status contexts (default `WOODPECKER_STATUS_CONTEXT_FORMAT`):
 #   push: ci/woodpecker/push/trusted   tag: ci/woodpecker/tag/trusted
 
@@ -81,7 +94,7 @@ steps:
   # doctor. Protocol/stream tests ride the --workspace all-features run.
   # Long lanes stay #[ignore]-gated.
   - name: linux
-    image: rust:1.98
+    image: rust:1.98 # rustup baseline only; rust-toolchain.toml is authoritative
     when:
       matrix:
         platform: linux/amd64
@@ -94,6 +107,8 @@ steps:
       - faktor-trusted-target-linux:/woodpecker-cache/target
     commands:
       - apt-get update && apt-get install -y --no-install-recommends python3 procps ca-certificates
+      # rust-toolchain.toml is authoritative; fail loudly if the shim does not resolve it.
+      - rustup show active-toolchain
       - rustup component add rustfmt clippy
       - cargo fmt --check
       - cargo check --workspace --all-features
@@ -105,6 +120,7 @@ steps:
         mkdir -p target/certification/lanes
         CMDS="$(cat <<'CMDS'
         apt-get update && apt-get install -y --no-install-recommends python3 procps ca-certificates
+        rustup show active-toolchain
         rustup component add rustfmt clippy
         cargo fmt --check
         cargo check --workspace --all-features
@@ -124,7 +140,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"linux","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/linux.json
   - name: static
-    image: rust:1.98
+    image: rust:1.98 # rustup baseline only; rust-toolchain.toml is authoritative
     when:
       matrix:
         platform: linux/amd64
@@ -161,7 +177,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"static","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/static.json
   - name: docs
-    image: rust:1.98
+    image: rust:1.98 # rustup baseline only; rust-toolchain.toml is authoritative
     when:
       matrix:
         platform: linux/amd64
@@ -196,7 +212,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"docs","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/docs.json
   - name: vscode
-    image: node:24
+    image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     when:
       matrix:
         platform: linux/amd64
@@ -208,7 +224,7 @@ steps:
       - npm ci
       - npm run build
       - node scripts/selftest.mjs
-      - npx --yes @vscode/vsce package --out faktor-ci.vsix
+      - npx --no-install vsce package --out faktor-ci.vsix
       - node scripts/verify-vsix.mjs faktor-ci.vsix --min-media-files 4
       - rm -rf /tmp/faktor-vsix && mkdir -p /tmp/faktor-vsix && unzip -q faktor-ci.vsix -d /tmp/faktor-vsix
       - node scripts/verify-vsix.mjs faktor-ci.vsix --extract-dir /tmp/faktor-vsix/extension
@@ -224,7 +240,7 @@ steps:
         npm ci
         npm run build
         node scripts/selftest.mjs
-        npx --yes @vscode/vsce package --out faktor-ci.vsix
+        npx --no-install vsce package --out faktor-ci.vsix
         node scripts/verify-vsix.mjs faktor-ci.vsix --min-media-files 4
         rm -rf /tmp/faktor-vsix && mkdir -p /tmp/faktor-vsix && unzip -q faktor-ci.vsix -d /tmp/faktor-vsix
         node scripts/verify-vsix.mjs faktor-ci.vsix --extract-dir /tmp/faktor-vsix/extension
@@ -246,7 +262,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"vscode","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/vscode.json
   - name: jetbrains-build
-    image: eclipse-temurin:17-jdk
+    image: eclipse-temurin:17-jdk@sha256:bc033b57e11b773c3043babfd664e7a5ef110805548b921cbfc3e8c67a0725d6 # eclipse-temurin:17-jdk @ 2026-09-23
     when:
       matrix:
         platform: linux/amd64
@@ -283,7 +299,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"jetbrains-build","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/jetbrains-build.json
   - name: jetbrains-smoke
-    image: ubuntu:24.04
+    image: ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3 # ubuntu:24.04 @ 2026-09-23
     when:
       matrix:
         platform: linux/amd64
@@ -300,7 +316,9 @@ steps:
         curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init
         printf '%s  %s\n' 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c /tmp/rustup-init | sha256sum -c -
         chmod +x /tmp/rustup-init
-        /tmp/rustup-init -y --profile minimal --default-toolchain 1.98.0
+        RUST_CHANNEL="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+        [ -n "$RUST_CHANNEL" ] || { echo "rust-toolchain.toml: missing channel" >&2; exit 1; }
+        /tmp/rustup-init -y --profile minimal --default-toolchain "$RUST_CHANNEL"
       - . "$HOME/.cargo/env"
       - bash apps/jetbrains/compile-and-smoke.sh
       - |
@@ -312,7 +330,9 @@ steps:
         curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init
         printf '%s  %s\n' 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c /tmp/rustup-init | sha256sum -c -
         chmod +x /tmp/rustup-init
-        /tmp/rustup-init -y --profile minimal --default-toolchain 1.98.0
+        RUST_CHANNEL="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+        [ -n "$RUST_CHANNEL" ] || { echo "rust-toolchain.toml: missing channel" >&2; exit 1; }
+        /tmp/rustup-init -y --profile minimal --default-toolchain "$RUST_CHANNEL"
         . "$HOME/.cargo/env"
         bash apps/jetbrains/compile-and-smoke.sh
         CMDS
@@ -328,7 +348,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"jetbrains-smoke","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/jetbrains-smoke.json
   - name: perf
-    image: rust:1.98
+    image: rust:1.98 # rustup baseline only; rust-toolchain.toml is authoritative
     depends_on: [linux, static, docs]
     when:
       matrix:
@@ -361,7 +381,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"perf","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/perf.json
   - name: darwin-check
-    image: bash
+    image: bash@sha256:61962062d969cb46dfc2bad061d36342406fa485f64f246aa7e95693ca07df1f # bash:latest @ 2026-09-23
     when:
       matrix:
         platform: darwin/arm64
@@ -385,7 +405,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"darwin-check","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/darwin-check.json
   - name: darwin-test
-    image: bash
+    image: bash@sha256:61962062d969cb46dfc2bad061d36342406fa485f64f246aa7e95693ca07df1f # bash:latest @ 2026-09-23
     when:
       matrix:
         platform: darwin/arm64
@@ -409,7 +429,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"darwin-test","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/darwin-test.json
   - name: darwin-doctor
-    image: bash
+    image: bash@sha256:61962062d969cb46dfc2bad061d36342406fa485f64f246aa7e95693ca07df1f # bash:latest @ 2026-09-23
     when:
       matrix:
         platform: darwin/arm64
@@ -433,7 +453,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"darwin-doctor","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/darwin-doctor.json
   - name: windows-check
-    image: powershell
+    image: powershell # powershell:latest stays tag-based: no docker.io library image exists to record a digest from (self-hosted Windows agents)
     when:
       matrix:
         platform: windows/amd64
@@ -465,7 +485,7 @@ steps:
         } | ConvertTo-Json -Compress -Depth 6
         Set-Content -Path target/certification/lanes/windows-check.json -Value $marker
   - name: windows-test
-    image: powershell
+    image: powershell # powershell:latest stays tag-based: no docker.io library image exists to record a digest from (self-hosted Windows agents)
     when:
       matrix:
         platform: windows/amd64
@@ -497,7 +517,7 @@ steps:
         } | ConvertTo-Json -Compress -Depth 6
         Set-Content -Path target/certification/lanes/windows-test.json -Value $marker
   - name: certificate
-    image: node:24
+    image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     depends_on:
       - linux
       - static
@@ -514,7 +534,7 @@ steps:
       - node scripts/certification/evidence.mjs verify-markers --workflow trusted --yaml-dir .woodpecker/trusted --lanes-dir target/certification/lanes --out target/certification/ci-certification.json --pipeline-status "$CI_PIPELINE_STATUS" --run-id "$CI_PIPELINE_NUMBER"
       - node scripts/certification/evidence.mjs write --kind ci_certification_trusted --status passed --from-markers target/certification/lanes --commands "woodpecker trusted linux workflow certificate"
   - name: certificate-darwin
-    image: bash
+    image: bash@sha256:61962062d969cb46dfc2bad061d36342406fa485f64f246aa7e95693ca07df1f # bash:latest @ 2026-09-23
     depends_on: [darwin-check, darwin-test, darwin-doctor]
     when:
       matrix:
@@ -545,7 +565,7 @@ steps:
         echo "certification=$st platform=darwin"
         [ "$rc" -eq 0 ]
   - name: certificate-windows
-    image: powershell
+    image: powershell # powershell:latest stays tag-based: no docker.io library image exists to record a digest from (self-hosted Windows agents)
     depends_on: [windows-check, windows-test]
     when:
       matrix:

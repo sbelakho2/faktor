@@ -26,6 +26,27 @@ pub struct NetworkLimits {
     pub hard_max_body_bytes: usize,
 }
 
+/// Independent per-field byte caps. A record can never grow without bound
+/// through any single attacker-controlled field.
+pub const MAX_REQUEST_ID_BYTES: usize = 256;
+pub const MAX_URL_BYTES: usize = 8 * 1024;
+pub const MAX_METHOD_BYTES: usize = 32;
+pub const MAX_MIME_BYTES: usize = 256;
+pub const MAX_FAILURE_TEXT_BYTES: usize = 2 * 1024;
+pub const MAX_BLOCKED_REASON_BYTES: usize = 256;
+
+/// UTF-8-safe truncation over one field, with an explicit truncation flag.
+fn bound_field(raw: &str, cap: usize) -> (String, bool) {
+    if raw.len() <= cap {
+        return (raw.to_string(), false);
+    }
+    let mut end = cap;
+    while end > 0 && !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    (raw[..end].to_string(), true)
+}
+
 impl Default for NetworkLimits {
     fn default() -> Self {
         let capture = CaptureLimits::default();
@@ -64,6 +85,9 @@ pub struct NetworkRequest {
     pub encoded_data_length: Option<u64>,
     pub failed: Option<String>,
     pub blocked_reason: Option<String>,
+    /// At least one stored field was truncated at its configured byte cap.
+    /// The record is kept for diagnostics; the full value was not retained.
+    pub truncated: bool,
 }
 
 /// A notice produced while applying an event (failed/blocked requests).
@@ -85,12 +109,17 @@ pub enum NetworkNotice {
     },
 }
 
-/// Bounded per-page network tracker.
+/// Bounded per-page network tracker. Every stored field is independently
+/// capped and every stored URL passes through the structural credential
+/// sanitizer; a lost observation event latches an `event_gap` so
+/// completeness-gated consumers refuse to answer from partial history.
 pub struct NetworkTracker {
     limits: NetworkLimits,
     order: VecDeque<String>,
     records: HashMap<String, NetworkRequest>,
     dropped_records: u64,
+    invalidated_events: u64,
+    event_gap: u64,
 }
 
 impl NetworkTracker {
@@ -100,6 +129,8 @@ impl NetworkTracker {
             order: VecDeque::new(),
             records: HashMap::new(),
             dropped_records: 0,
+            invalidated_events: 0,
+            event_gap: 0,
         }
     }
 
@@ -111,25 +142,57 @@ impl NetworkTracker {
         self.dropped_records
     }
 
+    /// Events dropped because their protocol identity (request id) was over
+    /// the bound: an oversized id can never be correlated.
+    pub fn invalidated_events(&self) -> u64 {
+        self.invalidated_events
+    }
+
+    /// Record that the observation stream lost `skipped` events. Sticky: the
+    /// history is incomplete from here on.
+    pub fn record_event_gap(&mut self, skipped: u64) {
+        self.event_gap = self.event_gap.saturating_add(skipped);
+    }
+
+    /// Number of observation events known to be missing (0 = complete).
+    pub fn event_gap(&self) -> u64 {
+        self.event_gap
+    }
+
+    /// Reject an event whose request-id identity exceeds the bound.
+    fn bounded_request_id(&mut self, params: &Value) -> Option<String> {
+        let raw = params.get("requestId").and_then(Value::as_str)?;
+        if raw.len() > MAX_REQUEST_ID_BYTES {
+            // The id is a protocol identity: truncating it would silently
+            // alias unrelated requests, so the whole event is invalid.
+            self.invalidated_events = self.invalidated_events.saturating_add(1);
+            return None;
+        }
+        Some(raw.to_string())
+    }
+
     /// Apply one CDP event. Unknown events are ignored (the caller routes
     /// only `Network.*` here, but this stays total).
     pub fn apply(&mut self, event: &CdpEvent) -> Option<NetworkNotice> {
         let params = &event.params;
-        let request_id = params.get("requestId").and_then(Value::as_str)?.to_string();
+        let request_id = self.bounded_request_id(params)?;
         match event.method.as_str() {
             "Network.requestWillBeSent" => {
-                let url = params
+                let raw_url = params
                     .get("request")
                     .and_then(|r| r.get("url"))
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let method = params
-                    .get("request")
-                    .and_then(|r| r.get("method"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
+                    .unwrap_or_default();
+                let (url, url_truncated) =
+                    bound_field(&crate::capture::redact_url(raw_url), MAX_URL_BYTES);
+                let (method, method_truncated) = bound_field(
+                    params
+                        .get("request")
+                        .and_then(|r| r.get("method"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    MAX_METHOD_BYTES,
+                );
                 let resource_type = ResourceType::parse(
                     params
                         .get("type")
@@ -137,10 +200,11 @@ impl NetworkTracker {
                         .unwrap_or("Other"),
                 );
                 self.insert(NetworkRequest {
-                    request_id: request_id.clone(),
+                    request_id,
                     url,
                     method,
                     resource_type,
+                    truncated: url_truncated || method_truncated,
                     ..NetworkRequest::default()
                 });
                 None
@@ -149,10 +213,11 @@ impl NetworkTracker {
                 if let Some(record) = self.records.get_mut(&request_id) {
                     let response = params.get("response").cloned().unwrap_or(Value::Null);
                     record.status = response.get("status").and_then(Value::as_i64);
-                    record.mime_type = response
-                        .get("mimeType")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
+                    if let Some(raw_mime) = response.get("mimeType").and_then(Value::as_str) {
+                        let (mime, truncated) = bound_field(raw_mime, MAX_MIME_BYTES);
+                        record.truncated |= truncated;
+                        record.mime_type = Some(mime);
+                    }
                     record.from_cache = response
                         .get("fromDiskCache")
                         .and_then(Value::as_bool)
@@ -179,26 +244,33 @@ impl NetworkTracker {
                 })
             }
             "Network.loadingFailed" => {
-                let error_text = params
-                    .get("errorText")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown network failure")
-                    .to_string();
+                let (error_text, error_truncated) = bound_field(
+                    params
+                        .get("errorText")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown network failure"),
+                    MAX_FAILURE_TEXT_BYTES,
+                );
                 let blocked_reason = params
                     .get("blockedReason")
                     .and_then(Value::as_str)
-                    .map(str::to_string);
+                    .map(|raw| bound_field(raw, MAX_BLOCKED_REASON_BYTES));
                 let url = self
                     .records
                     .get(&request_id)
                     .map(|r| r.url.clone())
                     .unwrap_or_default();
                 if let Some(record) = self.records.get_mut(&request_id) {
+                    record.truncated |= error_truncated
+                        || blocked_reason
+                            .as_ref()
+                            .map(|(_, truncated)| *truncated)
+                            .unwrap_or(false);
                     record.failed = Some(error_text.clone());
-                    record.blocked_reason = blocked_reason.clone();
+                    record.blocked_reason = blocked_reason.as_ref().map(|(value, _)| value.clone());
                 }
                 match blocked_reason {
-                    Some(reason) => Some(NetworkNotice::Blocked {
+                    Some((reason, _)) => Some(NetworkNotice::Blocked {
                         request_id,
                         url,
                         reason,
@@ -230,7 +302,10 @@ impl NetworkTracker {
         self.records.insert(id, record);
     }
 
-    /// Bounded snapshot in observation order.
+    /// Bounded snapshot in observation order. Lossy on its own: callers that
+    /// need a complete history must check [`NetworkTracker::event_gap`] (or
+    /// use [`NetworkTracker::json_candidates`] / `Page::network`, which
+    /// refuse after a gap).
     pub fn requests(&self) -> Vec<NetworkRequest> {
         self.order
             .iter()
@@ -251,8 +326,15 @@ impl NetworkTracker {
     }
 
     /// XHR/fetch JSON responses are the primary extraction surface; this
-    /// returns them newest-first, bounded by `limit`.
-    pub fn json_candidates(&self, limit: usize) -> Vec<NetworkRequest> {
+    /// returns them newest-first, bounded by `limit`. After an observation
+    /// gap the history is incomplete and the call refuses typed instead of
+    /// answering from partial data.
+    pub fn json_candidates(&self, limit: usize) -> Result<Vec<NetworkRequest>, BrowserError> {
+        if self.event_gap > 0 {
+            return Err(BrowserError::EventStreamLagged {
+                skipped: self.event_gap,
+            });
+        }
         let mut out: Vec<NetworkRequest> = self
             .requests()
             .into_iter()
@@ -273,7 +355,7 @@ impl NetworkTracker {
             .collect();
         out.reverse();
         out.truncate(limit);
-        out
+        Ok(out)
     }
 }
 
@@ -418,7 +500,8 @@ mod tests {
         assert_eq!(record.mime_type.as_deref(), Some("application/json"));
         assert!(record.from_cache);
         assert_eq!(record.encoded_data_length, Some(123));
-        assert_eq!(tracker.json_candidates(10).len(), 1);
+        assert!(!record.truncated);
+        assert_eq!(tracker.json_candidates(10).unwrap().len(), 1);
 
         tracker.apply(&event(
             "Network.requestWillBeSent",
@@ -447,5 +530,155 @@ mod tests {
             json!({"requestId": "ghost", "errorText": "net::ERR_FAILED"}),
         ));
         assert!(matches!(notice, Some(NetworkNotice::Failed { .. })));
+    }
+
+    #[test]
+    fn oversized_request_id_invalidates_the_whole_event() {
+        let mut tracker = NetworkTracker::new(NetworkLimits::default());
+        let huge_id = "r".repeat(MAX_REQUEST_ID_BYTES + 1);
+        let notice = tracker.apply(&event(
+            "Network.requestWillBeSent",
+            json!({
+                "requestId": huge_id,
+                "type": "XHR",
+                "request": {"url": "https://first.test/api", "method": "GET"}
+            }),
+        ));
+        assert!(notice.is_none());
+        assert_eq!(tracker.len(), 0, "an uncorrelatable id is never stored");
+        assert_eq!(tracker.invalidated_events(), 1);
+        // The same oversized id on a response cannot alias or update state.
+        tracker.apply(&event(
+            "Network.responseReceived",
+            json!({"requestId": huge_id, "response": {"status": 200}}),
+        ));
+        assert_eq!(tracker.invalidated_events(), 2);
+        // Exactly at the bound is still a valid identity.
+        let exact = "r".repeat(MAX_REQUEST_ID_BYTES);
+        tracker.apply(&event(
+            "Network.requestWillBeSent",
+            json!({
+                "requestId": exact,
+                "type": "XHR",
+                "request": {"url": "https://first.test/ok", "method": "GET"}
+            }),
+        ));
+        assert_eq!(tracker.len(), 1);
+        assert_eq!(tracker.invalidated_events(), 2);
+    }
+
+    #[test]
+    fn oversized_fields_are_truncated_utf8_safe_with_a_flag() {
+        let mut tracker = NetworkTracker::new(NetworkLimits::default());
+        let long_url = format!("https://first.test/{}", "é".repeat(MAX_URL_BYTES));
+        let long_method = "M".repeat(MAX_METHOD_BYTES + 10);
+        tracker.apply(&event(
+            "Network.requestWillBeSent",
+            json!({
+                "requestId": "trunc",
+                "type": "XHR",
+                "request": {"url": long_url, "method": long_method}
+            }),
+        ));
+        let record = tracker.get("trunc").unwrap();
+        assert!(record.truncated, "truncation must be flagged");
+        assert!(record.url.len() <= MAX_URL_BYTES);
+        assert!(record.url.starts_with("https://first.test/"));
+        assert!(std::str::from_utf8(record.url.as_bytes()).is_ok());
+        assert_eq!(record.method.len(), MAX_METHOD_BYTES);
+        // Response fields have their own independent caps.
+        let long_mime = "application/x-".repeat(64);
+        tracker.apply(&event(
+            "Network.responseReceived",
+            json!({
+                "requestId": "trunc",
+                "response": {"status": 200, "mimeType": long_mime}
+            }),
+        ));
+        assert!(tracker.get("trunc").unwrap().truncated);
+        assert!(
+            tracker
+                .get("trunc")
+                .unwrap()
+                .mime_type
+                .as_deref()
+                .unwrap()
+                .len()
+                <= MAX_MIME_BYTES
+        );
+        // Failure text and blocked reason are separately bounded.
+        tracker.apply(&event(
+            "Network.loadingFailed",
+            json!({
+                "requestId": "trunc",
+                "errorText": "E".repeat(MAX_FAILURE_TEXT_BYTES + 100),
+                "blockedReason": "B".repeat(MAX_BLOCKED_REASON_BYTES + 100)
+            }),
+        ));
+        let record = tracker.get("trunc").unwrap();
+        assert!(record.truncated);
+        assert_eq!(
+            record.failed.as_deref().unwrap().len(),
+            MAX_FAILURE_TEXT_BYTES
+        );
+        assert_eq!(
+            record.blocked_reason.as_deref().unwrap().len(),
+            MAX_BLOCKED_REASON_BYTES
+        );
+    }
+
+    #[test]
+    fn credential_query_parameters_are_masked_in_stored_records() {
+        let mut tracker = NetworkTracker::new(NetworkLimits::default());
+        tracker.apply(&event(
+            "Network.requestWillBeSent",
+            json!({
+                "requestId": "creds",
+                "type": "XHR",
+                "request": {
+                    "url": "https://first.test/api?token=SECRET123&q=shoes&api_key=XYZ",
+                    "method": "GET"
+                }
+            }),
+        ));
+        let record = tracker.get("creds").unwrap();
+        assert!(!record.url.contains("SECRET123"), "{}", record.url);
+        assert!(!record.url.contains("XYZ"), "{}", record.url);
+        assert!(record.url.contains("q=shoes"));
+        assert!(record.url.contains("token=[redacted]"));
+    }
+
+    #[test]
+    fn event_gap_latches_and_gates_complete_history() {
+        let mut tracker = NetworkTracker::new(NetworkLimits::default());
+        tracker.apply(&event(
+            "Network.requestWillBeSent",
+            json!({
+                "requestId": "r1",
+                "type": "XHR",
+                "request": {"url": "https://first.test/api.json", "method": "GET"}
+            }),
+        ));
+        tracker.apply(&event(
+            "Network.responseReceived",
+            json!({
+                "requestId": "r1",
+                "response": {"status": 200, "mimeType": "application/json"}
+            }),
+        ));
+        assert_eq!(tracker.event_gap(), 0);
+        assert_eq!(tracker.json_candidates(10).unwrap().len(), 1);
+        tracker.record_event_gap(7);
+        assert_eq!(tracker.event_gap(), 7);
+        assert_eq!(
+            tracker.json_candidates(10),
+            Err(BrowserError::EventStreamLagged { skipped: 7 })
+        );
+        // Gaps accumulate; the refusal always reports the full loss.
+        tracker.record_event_gap(3);
+        assert_eq!(
+            tracker.json_candidates(10),
+            Err(BrowserError::EventStreamLagged { skipped: 10 })
+        );
     }
 }

@@ -33,6 +33,16 @@ use crate::catalog::{ModelCatalogEntry, PricingState, Provenance, QualityPrior};
 
 pub mod catalog;
 
+/// Provider configuration hardening: wrapped credentials
+/// ([`config::SecretValue`]), validated extra headers
+/// ([`config::ExtraHeaders`]) and redacted configuration errors
+/// ([`config::ProviderConfigError`]).
+pub mod config;
+pub mod resolver;
+/// Provider error-body sanitization: every adapter passes upstream error
+/// text through the shared registered secret scrubber before storing it.
+pub mod sanitize;
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {

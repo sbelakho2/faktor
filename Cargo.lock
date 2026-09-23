@@ -913,6 +913,7 @@ dependencies = [
  "base64 0.22.1",
  "faktor-cas",
  "faktor-core",
+ "faktor-fs",
  "faktor-security",
  "faktor-terminal",
  "futures-util",
@@ -1045,6 +1046,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -1408,6 +1410,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -1504,6 +1507,7 @@ dependencies = [
  "idna",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
@@ -1546,6 +1550,7 @@ dependencies = [
  "faktor-pty",
  "faktor-sandbox",
  "faktor-scm",
+ "faktor-security",
  "faktor-semantic",
  "faktor-session",
  "faktor-snapshot",

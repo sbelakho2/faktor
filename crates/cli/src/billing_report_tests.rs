@@ -19,8 +19,9 @@ use crate::test_http::{MockServer, Reply};
 
 const VENDOR_PATH: &str = "/v1/usage-reports";
 
+#[cfg(test)]
 fn transport() -> Arc<dyn faktor_provider::egress::HttpTransport> {
-    Arc::new(PolicyCheckedHttpTransport::with_policy(None))
+    Arc::new(PolicyCheckedHttpTransport::permissive())
 }
 
 fn policy() -> ReportPolicy {

@@ -15,9 +15,11 @@ use tokio::sync::{broadcast, watch};
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::time::Deadline;
 
-use crate::capture::{bound_bytes, bound_text, CaptureLimits, CapturedBytes, CapturedText};
-use crate::cdp::{CdpClient, CdpEvent};
-use crate::download::DownloadPolicy;
+use crate::capture::{
+    bound_bytes, bound_text, redact_url_query_values, CaptureLimits, CapturedBytes, CapturedText,
+};
+use crate::cdp::{CdpClient, CdpEvent, EventStreamError, SessionEvents};
+use crate::download::{is_response_stage, DownloadManager, DownloadOutcome};
 use crate::error::{BrowserError, VerificationKind};
 use crate::interception::Interceptor;
 use crate::network::{BodyCapturer, CapturedBody, NetworkLimits, NetworkNotice, NetworkTracker};
@@ -122,13 +124,20 @@ pub(crate) struct PageInner {
     client: CdpClient,
     tracker: Mutex<NetworkTracker>,
     interceptor: Interceptor,
-    downloads: DownloadPolicy,
+    downloads: Arc<DownloadManager>,
     capture: CaptureLimits,
+    /// The profile's page-admission permit. Dropping the last `Page` handle
+    /// releases it synchronously, which is what makes an abandoned capture
+    /// free its slot (and what lets idle retirement prove no page is in
+    /// flight). An explicit `close`/crash also releases it immediately.
+    permit: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
     state: Mutex<PageState>,
     lifecycle: watch::Sender<Lifecycle>,
     last_navigation_error: Mutex<Option<String>>,
-    last_download_error: Mutex<Option<BrowserError>>,
     closed: AtomicBool,
+    /// Set when the critical event stream failed: the page state is
+    /// unknowable and every subsequent complete-history query refuses.
+    critical_failure: Mutex<Option<u64>>,
     host: Weak<dyn PageHost>,
     pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -199,10 +208,11 @@ impl Page {
         target_id: String,
         session_id: String,
         interceptor: Interceptor,
-        downloads: DownloadPolicy,
+        downloads: Arc<DownloadManager>,
         capture: CaptureLimits,
         network: NetworkLimits,
         host: Weak<dyn PageHost>,
+        permit: tokio::sync::OwnedSemaphorePermit,
     ) -> Self {
         let (lifecycle, _) = watch::channel(Lifecycle::Idle);
         let inner = Arc::new(PageInner {
@@ -213,19 +223,20 @@ impl Page {
             interceptor,
             downloads,
             capture,
+            permit: Mutex::new(Some(permit)),
             state: Mutex::new(PageState::Open),
             lifecycle,
             last_navigation_error: Mutex::new(None),
-            last_download_error: Mutex::new(None),
             closed: AtomicBool::new(false),
+            critical_failure: Mutex::new(None),
             host,
             pump: Mutex::new(None),
         });
         let pump_inner = Arc::downgrade(&inner);
         // Subscribe BEFORE spawning the pump: a subscription created inside
-        // the task races the first navigation, and a broadcast send with no
-        // subscriber is dropped.
-        let events = inner.client.subscribe();
+        // the task races the first navigation, and events with no subscriber
+        // are dropped.
+        let events = inner.client.subscribe_session(&inner.session_id);
         let handle = tokio::spawn(pump_events(pump_inner, events));
         *inner.pump.lock().unwrap() = Some(handle);
         Self { inner }
@@ -264,18 +275,39 @@ impl Page {
         *self.inner.lifecycle.borrow()
     }
 
-    /// Bounded snapshot of observed network requests.
-    pub fn network(&self) -> Vec<crate::network::NetworkRequest> {
-        self.inner.tracker.lock().unwrap().requests()
+    /// Bounded snapshot of observed network requests. Refuses typed once the
+    /// observation stream lost events: an incomplete history can never be
+    /// presented as a complete one.
+    pub fn network(&self) -> Result<Vec<crate::network::NetworkRequest>, BrowserError> {
+        self.ensure_history_complete()?;
+        Ok(self.inner.tracker.lock().unwrap().requests())
+    }
+
+    /// The typed error to surface when this page's event history is
+    /// incomplete (critical stream failure, or a lost observation event).
+    fn history_error(&self) -> Option<BrowserError> {
+        if let Some(skipped) = *self.inner.critical_failure.lock().unwrap() {
+            return Some(BrowserError::EventStreamLagged { skipped });
+        }
+        let skipped = self.inner.tracker.lock().unwrap().event_gap();
+        (skipped > 0).then_some(BrowserError::EventStreamLagged { skipped })
+    }
+
+    fn ensure_history_complete(&self) -> Result<(), BrowserError> {
+        match self.history_error() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     pub fn interceptor_stats(&self) -> crate::interception::InterceptionStats {
         self.inner.interceptor.stats()
     }
 
-    /// A download denial observed for this page, if any (typed).
+    /// The latest download enforcement failure observed for this profile
+    /// (downloads are profile-scoped; the page is only a view).
     pub fn last_download_error(&self) -> Option<BrowserError> {
-        self.inner.last_download_error.lock().unwrap().clone()
+        self.inner.downloads.last_error()
     }
 
     /// Navigate and wait for the load lifecycle. Cancellation stops loading,
@@ -321,8 +353,13 @@ impl Page {
         }
         let mut lifecycle = self.inner.lifecycle.subscribe();
         loop {
-            if *lifecycle.borrow_and_update() == Lifecycle::Loaded {
-                break;
+            match *lifecycle.borrow_and_update() {
+                Lifecycle::Loaded => break,
+                Lifecycle::Failed => {
+                    self.set_state(PageState::Crashed);
+                    return Err(self.failure_error());
+                }
+                _ => {}
             }
             tokio::select! {
                 biased;
@@ -333,7 +370,7 @@ impl Page {
                 changed = lifecycle.changed() => {
                     if changed.is_err() {
                         self.set_state(PageState::Crashed);
-                        return Err(self.closed_error());
+                        return Err(self.failure_error());
                     }
                 }
                 _ = tokio::time::sleep_until(deadline_instant(deadline)) => {
@@ -349,7 +386,7 @@ impl Page {
             .ok()
             .and_then(|value| value.as_str().map(str::to_string))
             .unwrap_or_else(|| url.to_string());
-        let status = self.document_status();
+        let status = self.document_status()?;
         Ok(NavigationOutcome {
             url: final_url,
             status,
@@ -528,6 +565,7 @@ impl Page {
         deadline: Deadline,
         cancel: &CancellationToken,
     ) -> Result<CapturedBody, BrowserError> {
+        self.ensure_history_complete()?;
         let url = self
             .inner
             .tracker
@@ -555,6 +593,7 @@ impl Page {
             return Ok(());
         }
         self.set_state(PageState::Closed);
+        self.release_permit();
         if let Some(pump) = self.inner.pump.lock().unwrap().take() {
             pump.abort();
         }
@@ -579,11 +618,23 @@ impl Page {
     pub(crate) fn mark_crashed(&self) {
         if !self.inner.closed.swap(true, Ordering::SeqCst) {
             self.set_state(PageState::Crashed);
+            self.release_permit();
             let _ = self.inner.lifecycle.send(Lifecycle::Failed);
             if let Some(host) = self.inner.host.upgrade() {
                 host.release_page(&self.inner.target_id);
             }
         }
+    }
+
+    /// Release the profile slot now (idempotent). The permit is otherwise
+    /// released when the last `Page` handle drops.
+    pub(crate) fn release_permit(&self) {
+        let _ = self
+            .inner
+            .permit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
     }
 
     fn stop_automation(&self, signal: VerificationSignal) {
@@ -605,10 +656,15 @@ impl Page {
         match self.state() {
             PageState::Open | PageState::Navigating => Ok(()),
             PageState::Closed => Err(self.closed_error()),
-            PageState::Crashed => Err(BrowserError::BrowserCrashed {
-                detail: "page session died with the browser".to_string(),
-            }),
+            PageState::Crashed => Err(self.failure_error()),
         }
+    }
+
+    /// The typed error for a page whose event stream failed: the lag is
+    /// surfaced before the generic "closed" state so callers can distinguish
+    /// unknowable state from an orderly close.
+    fn failure_error(&self) -> BrowserError {
+        self.history_error().unwrap_or_else(|| self.closed_error())
     }
 
     fn closed_error(&self) -> BrowserError {
@@ -628,7 +684,8 @@ impl Page {
         }
     }
 
-    fn document_status(&self) -> Option<i64> {
+    fn document_status(&self) -> Result<Option<i64>, BrowserError> {
+        self.ensure_history_complete()?;
         let tracker = self.inner.tracker.lock().unwrap();
         let mut best: Option<i64> = None;
         for record in tracker.requests() {
@@ -638,7 +695,55 @@ impl Page {
                 }
             }
         }
-        best
+        Ok(best)
+    }
+}
+
+impl PageInner {
+    /// Record lost observation events. The history is incomplete from here
+    /// on; complete-history queries refuse typed.
+    fn record_observation_gap(&self, skipped: u64) {
+        self.tracker.lock().unwrap().record_event_gap(skipped);
+    }
+
+    /// The critical stream failed: mark the page failed (never continue with
+    /// unknowable state), release its slot, and tear down the CDP target so
+    /// no `Fetch.requestPaused` is left waiting on a page nobody will serve.
+    fn fail_stream(&self, skipped: u64) {
+        {
+            let mut slot = self.critical_failure.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(skipped);
+            }
+        }
+        self.record_observation_gap(skipped);
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            *self.state.lock().unwrap() = PageState::Crashed;
+            let _ = self
+                .permit
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            let _ = self.lifecycle.send(Lifecycle::Failed);
+            if let Some(host) = self.host.upgrade() {
+                host.release_page(&self.target_id);
+            }
+        }
+        let client = self.client.clone();
+        let target_id = self.target_id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = client
+                    .send(
+                        None,
+                        "Target.closeTarget",
+                        json!({ "targetId": target_id }),
+                        deadline_in(2_000),
+                        &CancellationToken::new(),
+                    )
+                    .await;
+            });
+        }
     }
 }
 
@@ -668,28 +773,56 @@ pub fn classify_probe(probe: &Value) -> Option<VerificationSignal> {
 }
 
 /// Per-page event pump: routes network, interception, lifecycle and download
-/// events for one CDP session. The pump holds a `Weak` page, so a closed
-/// page's pump exits instead of leaking.
-async fn pump_events(page: Weak<PageInner>, mut events: broadcast::Receiver<CdpEvent>) {
+/// events for one CDP session. Critical events arrive on their dedicated
+/// bounded queue; ordinary observation events arrive on the lossy broadcast
+/// and a lag merely latches a history gap. A critical overflow fails the page
+/// loudly (the pump never continues with unknowable state). The pump holds a
+/// `Weak` page, so a closed page's pump exits instead of leaking.
+async fn pump_events(page: Weak<PageInner>, mut events: SessionEvents) {
     loop {
-        let event = match events.recv().await {
-            Ok(event) => event,
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::warn!(skipped, "page event pump lagged; events dropped");
-                continue;
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
-        };
-        let Some(inner) = page.upgrade() else {
-            break;
-        };
-        if inner.closed.load(Ordering::SeqCst) {
-            break;
+        tokio::select! {
+            biased;
+            critical = events.critical.recv() => match critical {
+                Ok(event) => {
+                    let Some(inner) = page.upgrade() else { break };
+                    if inner.closed.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if event.session_id.as_deref() != Some(inner.session_id.as_str()) {
+                        continue;
+                    }
+                    handle_page_event(&inner, event).await;
+                }
+                Err(EventStreamError::Lagged { skipped }) => {
+                    if let Some(inner) = page.upgrade() {
+                        inner.fail_stream(skipped);
+                    }
+                    break;
+                }
+                Err(EventStreamError::Closed) => break,
+            },
+            observation = events.observations.recv() => match observation {
+                Ok(event) => {
+                    let Some(inner) = page.upgrade() else { break };
+                    if inner.closed.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if event.session_id.as_deref() != Some(inner.session_id.as_str()) {
+                        continue;
+                    }
+                    handle_page_event(&inner, event).await;
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    let Some(inner) = page.upgrade() else { break };
+                    inner.record_observation_gap(skipped);
+                    tracing::warn!(
+                        skipped,
+                        "page observation stream lagged; history marked incomplete"
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
         }
-        if event.session_id.as_deref() != Some(inner.session_id.as_str()) {
-            continue;
-        }
-        handle_page_event(&inner, event).await;
     }
 }
 
@@ -704,16 +837,48 @@ async fn handle_page_event(inner: &Arc<PageInner>, event: CdpEvent) {
                 url, error_text, ..
             }) = notice
             {
-                tracing::debug!(url = %crate::capture::redact_url(&url), error = %error_text, "page network failure");
+                tracing::debug!(url = %redact_url_query_values(&url), error = %error_text, "page network failure");
             }
         }
         "Fetch.requestPaused" => {
-            let decision = inner
-                .interceptor
-                .handle_request_paused(&event.params, deadline_in(5_000), &CancellationToken::new())
-                .await;
-            if let Err(error) = decision {
-                tracing::warn!(error = %error, "interception handling failed");
+            if is_response_stage(&event.params) {
+                // Response stage: download capture/denial is owned by the
+                // profile's central download manager (a browser-level
+                // authority), not by the per-page request interceptor.
+                match inner
+                    .downloads
+                    .handle_paused(
+                        &inner.client,
+                        &inner.session_id,
+                        &event.params,
+                        deadline_in(30_000),
+                        &CancellationToken::new(),
+                    )
+                    .await
+                {
+                    Ok(DownloadOutcome::Continued) => {}
+                    Ok(DownloadOutcome::Denied { url }) => {
+                        tracing::info!(url = %crate::capture::redact_url(&url), "download denied at the response stage");
+                    }
+                    Ok(DownloadOutcome::Captured { path, bytes }) => {
+                        tracing::info!(bytes, path = %path.display(), "download captured");
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "download capture failed");
+                    }
+                }
+            } else {
+                let decision = inner
+                    .interceptor
+                    .handle_request_paused(
+                        &event.params,
+                        deadline_in(5_000),
+                        &CancellationToken::new(),
+                    )
+                    .await;
+                if let Err(error) = decision {
+                    tracing::warn!(error = %error, "interception handling failed");
+                }
             }
         }
         "Page.frameNavigated" => {
@@ -732,49 +897,6 @@ async fn handle_page_event(inner: &Arc<PageInner>, event: CdpEvent) {
         }
         "Page.loadEventFired" => {
             let _ = inner.lifecycle.send(Lifecycle::Loaded);
-        }
-        "Browser.downloadWillBegin" => {
-            let decision = inner.downloads.decide(&event.params);
-            if let crate::download::DownloadDecision::Denied { url } = decision {
-                *inner.last_download_error.lock().unwrap() =
-                    Some(BrowserError::DownloadBlocked { url: url.clone() });
-                tracing::info!(url = %crate::capture::redact_url(&url), "download denied by policy");
-                let guid = event
-                    .params
-                    .get("guid")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                if !guid.is_empty() {
-                    let _ = inner
-                        .client
-                        .send(
-                            None,
-                            "Browser.cancelDownload",
-                            json!({ "guid": guid }),
-                            deadline_in(3_000),
-                            &CancellationToken::new(),
-                        )
-                        .await;
-                }
-            }
-        }
-        "Browser.downloadProgress" => {
-            if let Some(guid) = inner.downloads.over_bound_guid(&event.params) {
-                *inner.last_download_error.lock().unwrap() = Some(BrowserError::DownloadBlocked {
-                    url: format!("download {guid} exceeded the configured byte bound"),
-                });
-                let _ = inner
-                    .client
-                    .send(
-                        None,
-                        "Browser.cancelDownload",
-                        json!({ "guid": guid }),
-                        deadline_in(3_000),
-                        &CancellationToken::new(),
-                    )
-                    .await;
-            }
         }
         "Runtime.exceptionThrown" => {
             let text = event

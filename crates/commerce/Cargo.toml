@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 faktor-core.workspace = true
 faktor-security.workspace = true
+url = "2"
 serde.workspace = true
 thiserror.workspace = true
 blake3.workspace = true

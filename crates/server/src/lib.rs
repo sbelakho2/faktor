@@ -21,7 +21,7 @@ pub use api::{
     drain_chunk_stream, empty_evidence_store, serve, serve_arc, EvidenceStoreHandle, ServerDeps,
     ServerDepsError, ServerHandle, ServerServeError, ServerShutdownError, ServerStatus,
 };
-pub use auth::{check_bearer, check_password, AuthToken, ServerPassword};
+pub use auth::{check_bearer, check_password, AuthConfigError, AuthToken, ServerPassword};
 pub use permission::{ChannelPermissionRequester, PendingPermission};
 pub use worker_plane::{
     serve_worker_plane, WorkerPlaneAuth, WorkerPlaneBindConfig, WorkerPlaneBoundaryRefusal,

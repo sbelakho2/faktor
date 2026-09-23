@@ -18,6 +18,7 @@ use faktor_core::model::ModelCapabilities;
 use faktor_openai::{OpenAiConfig, OpenAiFamily, OpenAiProvider, OpenAiQuirks};
 use faktor_provider::egress::HttpTransport;
 use faktor_provider::Provider;
+use faktor_security::secret::SecretValue;
 
 #[derive(Debug, Clone)]
 pub enum DeepSeekProfile {
@@ -34,16 +35,29 @@ pub enum DeepSeekProfile {
     LocalDerivative { base_url: String },
 }
 
-#[derive(Debug, Clone)]
+/// DeepSeek adapter configuration. `api_key` is wrapped in
+/// [`SecretValue`]; the custom [`std::fmt::Debug`] below can never print it.
+#[derive(Clone)]
 pub struct DeepSeekConfig {
     pub profile: DeepSeekProfile,
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretValue>,
     /// Capability overrides; defaults follow the DeepSeek model family.
     pub model_overrides: std::collections::HashMap<String, ModelCapabilities>,
 }
 
+impl std::fmt::Debug for DeepSeekConfig {
+    /// Redacting `Debug`: the API key prints `SecretValue([redacted])`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeepSeekConfig")
+            .field("profile", &self.profile)
+            .field("api_key", &self.api_key)
+            .field("model_overrides", &self.model_overrides)
+            .finish()
+    }
+}
+
 impl DeepSeekConfig {
-    pub fn direct(api_key: Option<String>) -> Self {
+    pub fn direct(api_key: Option<SecretValue>) -> Self {
         Self {
             profile: DeepSeekProfile::Direct,
             api_key,
@@ -51,7 +65,7 @@ impl DeepSeekConfig {
         }
     }
 
-    pub fn compatible(base_url: impl Into<String>, api_key: Option<String>) -> Self {
+    pub fn compatible(base_url: impl Into<String>, api_key: Option<SecretValue>) -> Self {
         Self {
             profile: DeepSeekProfile::Compatible {
                 base_url: base_url.into(),
@@ -434,9 +448,9 @@ mod tests {
     // ------------------------------------------------------- egress (P0-36)
 
     fn allow_only(port: u16) -> Arc<dyn HttpTransport> {
-        Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
+        Arc::new(PolicyCheckedHttpTransport::with_policy_for_tests(
             DestinationPolicy::parse_lines([&format!("http://127.0.0.1:{port}")]).unwrap(),
-        )))
+        ))
     }
 
     #[tokio::test]
@@ -656,5 +670,30 @@ mod tests {
                 ),
             ]
         }
+    }
+
+    /// P0 plaintext-secret lock: the DeepSeek config's planted key never
+    /// renders through Debug, panic formatting or serialized diagnostics.
+    #[test]
+    fn config_debug_never_renders_the_api_key() {
+        const PLANTED: &str = "sk-PLANTED-deepseek-key-0123456789";
+        let cfg = DeepSeekConfig::direct(Some(SecretValue::new(PLANTED)));
+        let mut rendered = vec![format!("{cfg:?}")];
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("deepseek config: {cfg:?}")
+        }))
+        .expect_err("must panic");
+        if let Some(message) = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        {
+            rendered.push(message);
+        }
+        rendered.push(serde_json::to_string(&format!("{cfg:?}")).unwrap());
+        for text in &rendered {
+            assert!(!text.contains(PLANTED), "deepseek api key leaked: {text}");
+        }
+        assert!(rendered[0].contains("[redacted]"));
     }
 }

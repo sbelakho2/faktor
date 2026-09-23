@@ -9,12 +9,17 @@
 //!   terminal escape or a NUL into logs),
 //! - Unicode bidirectional control characters are rejected (no spoofed
 //!   part numbers via RTL overrides),
-//! - [`CanonicalUrl`] accepts only absolute `http`/`https` URLs with a
-//!   plain host, no userinfo (credentials can never hide in a canonical
-//!   URL), no fragment (the fragment is stripped during canonicalization: it
-//!   is never sent in a request and never participates in identity), and a
+//! - [`CanonicalUrl`] is produced by the same trusted URL parser used at
+//!   transport boundaries (the `url` crate), never a second parser, with
+//!   the host canonicalized through the shared destination authority:
+//!   only absolute `http`/`https` URLs, no userinfo (credentials can never
+//!   hide in a canonical URL), UTS-46 punycode/IDN hosts, canonical
+//!   IPv4/IPv6, default ports removed, empty path normalized to `/`, no
+//!   fragment (the fragment is stripped during canonicalization: it is
+//!   never sent in a request and never participates in identity), and a
 //!   bounded length.
 
+use faktor_security::destination::canonicalize_request_host;
 use serde::de::{self, Deserializer};
 use serde::{Serialize, Serializer};
 use std::fmt;
@@ -324,16 +329,10 @@ pub enum UrlError {
     /// Longer than [`MAX_URL_BYTES`].
     #[error("url exceeds {MAX_URL_BYTES} bytes (got {actual})")]
     TooLong { actual: usize },
-    /// Contains a non-ASCII character (IDN hosts must be punycode).
-    #[error("url contains a non-ASCII character at byte {at}")]
-    NonAscii { at: usize },
     /// Contains a control character.
     #[error("url contains a control character at byte {at}")]
     ControlChar { at: usize },
-    /// Contains whitespace or a character that is never valid in a URL.
-    #[error("url contains an invalid character at byte {at}")]
-    InvalidChar { at: usize },
-    /// No `scheme://` prefix.
+    /// No `scheme://` prefix and no absolute URL.
     #[error("url has no scheme://authority")]
     MissingScheme,
     /// A scheme other than `http` or `https`.
@@ -345,33 +344,72 @@ pub enum UrlError {
     /// Userinfo (`user:password@host`) is never allowed in a canonical URL.
     #[error("url carries userinfo; credentials are never part of a canonical url")]
     UserInfo,
-    /// A host label is empty or contains a disallowed character.
+    /// The host fails the shared destination-authority canonicalization
+    /// (invalid label, malformed IP literal, ambiguous numeric label).
     #[error("url host is invalid")]
     InvalidHost,
-    /// A port is empty, non-numeric, zero or above 65535.
+    /// Port zero, which is never a dialable destination.
     #[error("url port is invalid")]
     InvalidPort,
+    /// The trusted URL parser rejected the input (bad percent-escape,
+    /// forbidden host code point, malformed IP literal, ...).
+    #[error("url rejected by the URL parser: {reason}")]
+    Malformed { reason: String },
 }
 
-/// An absolute, credential-free `http`/`https` URL.
+/// THE canonical marketplace URL.
 ///
-/// This is a strict parser for hostile input, not a general URL library: it
-/// accepts exactly what a marketplace product reference can be. The scheme
-/// and host are normalized to lowercase; path/query keep their original
-/// case.
+/// There is no second URL parser here: the input is parsed by the same
+/// trusted parser used at transport/egress boundaries (the `url` crate),
+/// then the host is canonicalized through the shared destination authority
+/// ([`faktor_security::destination::canonicalize_request_host`]) so
+/// marketplace identity and egress can never disagree on host semantics:
+/// ASCII lowercase, one trailing dot stripped, UTS-46 punycode for IDNs,
+/// canonical dotted-quad IPv4 and canonical unbracketed IPv6.
 ///
-/// The fragment is stripped during canonicalization — RFC 3986 fragments are
-/// never sent in HTTP requests, so they must not participate in identity.
-/// `Eq`/`Hash`/`Ord`, every identity key and every digest therefore see the
-/// fragment-free canonical form `scheme://host[:port]/path?query` only:
-/// `https://x.test/product#one` and `https://x.test/product#two` are the
-/// same value. The raw input fragment is deliberately not retained; no
+/// Rejected: non-`http(s)` schemes, userinfo (credentials can never hide in
+/// a canonical URL), port `0`, and hosts the shared authority refuses.
+/// Default ports are removed, an empty path becomes `/`, and the fragment
+/// is stripped — RFC 3986 fragments are never sent in an HTTP request, so
+/// they must not participate in identity. The canonical serialization is
+/// `scheme://host[:port]/path?query`; `Eq`/`Hash`/`Ord`, every identity key
+/// and every digest therefore see the fragment-free canonical form only:
+/// `https://x.test:443/product#one` and `https://x.test/product#two` are
+/// the same value. The raw input fragment is deliberately not retained; no
 /// caller in the workspace needs it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct CanonicalUrl(String);
+pub struct CanonicalUrl {
+    /// The one canonical serialization.
+    text: String,
+    /// Canonical host only, unbracketed (punycode name, dotted-quad IPv4,
+    /// or canonical IPv6 text).
+    host: String,
+    /// The origin prefix `scheme://host[:port]` (never a path or query).
+    origin: String,
+    /// Always `"http"` or `"https"`.
+    scheme: &'static str,
+}
+
+fn map_parse_error(error: url::ParseError) -> UrlError {
+    use url::ParseError as P;
+    match error {
+        P::EmptyHost => UrlError::MissingHost,
+        P::InvalidPort | P::Overflow => UrlError::InvalidPort,
+        P::InvalidIpv4Address | P::InvalidIpv6Address | P::InvalidDomainCharacter => {
+            UrlError::InvalidHost
+        }
+        P::IdnaError => UrlError::InvalidHost,
+        P::RelativeUrlWithoutBase | P::RelativeUrlWithCannotBeABaseBase => UrlError::MissingScheme,
+        other => UrlError::Malformed {
+            reason: other.to_string(),
+        },
+    }
+}
 
 impl CanonicalUrl {
-    /// Parse and validate.
+    /// Parse and canonicalize. The only input lexing here is the control
+    /// character rejection; scheme/host/port/path/query semantics come from
+    /// the trusted parser.
     pub fn parse(raw: &str) -> Result<Self, UrlError> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -382,124 +420,102 @@ impl CanonicalUrl {
                 actual: trimmed.len(),
             });
         }
-        for (at, ch) in trimmed.char_indices() {
-            if !ch.is_ascii() {
-                return Err(UrlError::NonAscii { at });
-            }
-            if ch.is_control() {
-                return Err(UrlError::ControlChar { at });
-            }
-            if ch == ' ' || matches!(ch, '"' | '<' | '>' | '\\' | '^' | '`' | '{' | '|' | '}') {
-                return Err(UrlError::InvalidChar { at });
-            }
+        if let Some((at, _)) = trimmed.char_indices().find(|(_, ch)| ch.is_control()) {
+            return Err(UrlError::ControlChar { at });
         }
-        let (scheme, rest) = trimmed.split_once("://").ok_or(UrlError::MissingScheme)?;
-        let scheme = scheme.to_ascii_lowercase();
-        if scheme != "http" && scheme != "https" {
-            return Err(UrlError::UnsupportedScheme { scheme });
-        }
-        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        let authority = &rest[..authority_end];
-        let tail = &rest[authority_end..];
-        if authority.is_empty() {
-            return Err(UrlError::MissingHost);
-        }
-        if authority.contains('@') {
+        let mut parsed = url::Url::parse(trimmed).map_err(map_parse_error)?;
+        let scheme = match parsed.scheme() {
+            "http" => "http",
+            "https" => "https",
+            other => {
+                return Err(UrlError::UnsupportedScheme {
+                    scheme: other.to_string(),
+                })
+            }
+        };
+        if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err(UrlError::UserInfo);
         }
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) => (host, Some(port)),
-            None => (authority, None),
+        let Some(host) = parsed.host() else {
+            return Err(UrlError::MissingHost);
         };
-        validate_host(host)?;
-        if let Some(port) = port {
-            validate_port(port)?;
+        let (host_text, is_ipv4, ip) = match host {
+            url::Host::Domain(name) => (name.to_string(), false, None),
+            url::Host::Ipv4(v4) => (v4.to_string(), true, Some(v4.octets())),
+            url::Host::Ipv6(v6) => (v6.to_string(), false, None),
+        };
+        let canonical_host = canonicalize_request_host(&host_text, is_ipv4, ip)
+            .map_err(|_| UrlError::InvalidHost)?;
+        // Port 0 is never a dialable destination; the parser already keeps
+        // non-default ports and drops default ones (`:443` on https).
+        if parsed.port() == Some(0) {
+            return Err(UrlError::InvalidPort);
         }
-        let host = host.to_ascii_lowercase();
-        // The fragment starts at the first `#` and ends the URL; it is never
-        // sent and never part of identity, so it is dropped here. A `?` or
-        // `/` inside the fragment is fragment data, not path or query.
-        let path_query = tail.split_once('#').map_or(tail, |(before, _)| before);
-        let normalized = match port {
-            Some(port) => format!("{scheme}://{host}:{port}{path_query}"),
-            None => format!("{scheme}://{host}{path_query}"),
+        let set_host = if canonical_host.contains(':') {
+            // IPv6: `Url::set_host` takes the bracketed literal.
+            format!("[{canonical_host}]")
+        } else {
+            canonical_host.clone()
         };
-        Ok(Self(normalized))
+        parsed.set_host(Some(&set_host)).map_err(map_parse_error)?;
+        parsed.set_fragment(None);
+        // The parser normalized the empty path to `/` for http(s) already;
+        // re-serializing the host-swapped URL is the one canonical form.
+        let text = parsed.to_string();
+        if text.len() > MAX_URL_BYTES {
+            return Err(UrlError::TooLong { actual: text.len() });
+        }
+        // The serialization is exactly `origin + path + "?" + query`; derive
+        // the origin slice from the parsed parts (never a re-split of text).
+        let tail_len = parsed.path().len() + parsed.query().map(|q| q.len() + 1).unwrap_or(0);
+        let origin_end = text
+            .len()
+            .checked_sub(tail_len)
+            .ok_or(UrlError::Malformed {
+                reason: "serialized url shorter than its path".into(),
+            })?;
+        let origin = text[..origin_end].to_string();
+        Ok(Self {
+            text,
+            host: canonical_host,
+            origin,
+            scheme,
+        })
     }
 
-    /// The normalized canonical URL:
-    /// `scheme://host[:port]/path?query`. The fragment is not part of the
-    /// canonical form (it is stripped at parse time).
+    /// The canonical URL: `scheme://host[:port]/path?query`. The fragment
+    /// is not part of the canonical form (it is stripped at parse time).
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.text
     }
 
     /// The scheme (always `http` or `https`).
     pub fn scheme(&self) -> &str {
-        self.0.split_once("://").map(|(s, _)| s).unwrap_or("")
+        self.scheme
     }
 
-    /// The lowercased host (without port).
+    /// The canonical host without port: lowercase, trailing-dot-free,
+    /// punycode for IDNs, canonical IPv4/IPv6 text (IPv6 unbracketed).
     pub fn host(&self) -> &str {
-        let rest = self.0.split_once("://").map(|(_, r)| r).unwrap_or("");
-        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        let authority = &rest[..authority_end];
-        authority
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(authority)
+        &self.host
     }
 
     /// The origin (`scheme://host[:port]`), the part that never varies with
     /// path/query.
     pub fn origin(&self) -> &str {
-        let rest = self.0.split_once("://").map(|(_, r)| r).unwrap_or("");
-        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        &self.0[..self.0.len() - rest.len() + authority_end]
+        &self.origin
     }
-}
-
-fn validate_host(host: &str) -> Result<(), UrlError> {
-    if host.is_empty() || host.len() > 253 {
-        return Err(UrlError::InvalidHost);
-    }
-    for label in host.split('.') {
-        if label.is_empty() || label.len() > 63 {
-            return Err(UrlError::InvalidHost);
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            return Err(UrlError::InvalidHost);
-        }
-        if !label
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        {
-            return Err(UrlError::InvalidHost);
-        }
-    }
-    Ok(())
-}
-
-fn validate_port(port: &str) -> Result<(), UrlError> {
-    if port.is_empty() || port.len() > 5 || !port.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(UrlError::InvalidPort);
-    }
-    let value: u32 = port.parse().map_err(|_| UrlError::InvalidPort)?;
-    if value == 0 || value > 65_535 {
-        return Err(UrlError::InvalidPort);
-    }
-    Ok(())
 }
 
 impl fmt::Display for CanonicalUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.text)
     }
 }
 
 impl Serialize for CanonicalUrl {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
+        serializer.serialize_str(&self.text)
     }
 }
 
@@ -601,12 +617,11 @@ mod tests {
                 .as_str(),
             "http://localhost:8080/a"
         );
-        assert_eq!(
-            CanonicalUrl::parse("https://good.com:0443/")
-                .expect("valid")
-                .origin(),
-            "https://good.com:0443"
-        );
+        // A default port is not identity: `:443` (even zero-padded) is
+        // removed and serialized exactly like the bare origin.
+        let default_port = CanonicalUrl::parse("https://good.com:0443/").expect("valid");
+        assert_eq!(default_port.as_str(), "https://good.com/");
+        assert_eq!(default_port.origin(), "https://good.com");
     }
 
     #[test]
@@ -648,11 +663,13 @@ mod tests {
                 .as_str(),
             "https://x.test/a"
         );
+        // An empty path is normalized to `/`, so the fragment-free form of a
+        // bare origin is the origin + `/`.
         assert_eq!(
             CanonicalUrl::parse("https://x.test#frag")
                 .expect("valid")
                 .as_str(),
-            "https://x.test"
+            "https://x.test/"
         );
 
         // Path/query canonicalization rules are untouched, and an encoded
@@ -678,30 +695,141 @@ mod tests {
     }
 
     #[test]
+    fn url_identity_equivalence_classes() {
+        use std::cmp::Ordering;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let hash = |url: &CanonicalUrl| {
+            let mut hasher = DefaultHasher::new();
+            url.hash(&mut hasher);
+            hasher.finish()
+        };
+        let same = |a: &str, b: &str| {
+            let ua = CanonicalUrl::parse(a).expect(a);
+            let ub = CanonicalUrl::parse(b).expect(b);
+            assert_eq!(ua, ub, "{a} and {b} must be the same value");
+            assert_eq!(ua.as_str(), ub.as_str(), "{a} vs {b}: one serialization");
+            assert_eq!(ua.cmp(&ub), Ordering::Equal, "{a} vs {b}: one order");
+            assert_eq!(hash(&ua), hash(&ub), "{a} vs {b}: one hash");
+        };
+
+        // Default ports (both schemes) and empty path vs `/`.
+        same("https://x.test:443/p", "https://x.test/p");
+        same("http://x.test:80/p", "http://x.test/p");
+        same("https://x.test", "https://x.test/");
+        // Host case and trailing dot (one dot is stripped by the shared
+        // destination authority).
+        same("https://X.TEST/p", "https://x.test/p");
+        same("https://x.test./p", "https://x.test/p");
+        // Canonical IPv4: alternate spellings collapse to dotted octets.
+        same("https://127.000.000.001/p", "https://127.0.0.1/p");
+        // IPv6 literals: full form == compressed canonical form.
+        same("https://[0:0:0:0:0:0:0:1]/p", "https://[::1]/p");
+        // IDN == punycode.
+        same("https://ex\u{e4}mple.com/p", "https://xn--exmple-cua.com/p");
+
+        // Distinct hosts/ports stay distinct.
+        assert_ne!(
+            CanonicalUrl::parse("https://x.test:8443/p").expect("valid"),
+            CanonicalUrl::parse("https://x.test/p").expect("valid")
+        );
+        assert_ne!(
+            CanonicalUrl::parse("https://x.test:443/p").expect("valid"),
+            CanonicalUrl::parse("http://x.test/p").expect("valid")
+        );
+        // The canonical host accessor is the shared authority's text.
+        assert_eq!(
+            CanonicalUrl::parse("https://ex\u{e4}mple.com./p")
+                .expect("valid")
+                .host(),
+            "xn--exmple-cua.com"
+        );
+        assert_eq!(
+            CanonicalUrl::parse("https://[0:0:0:0:0:0:0:1]:8443/p")
+                .expect("valid")
+                .origin(),
+            "https://[::1]:8443"
+        );
+    }
+
+    /// Marketplace identity and egress must agree: the egress gate parses
+    /// the SAME canonical pieces (scheme/host/port) into one
+    /// [`faktor_security::destination::RequestTarget`], so a host that is
+    /// one identity value can never be a different egress destination.
+    #[test]
+    fn marketplace_identity_and_egress_share_host_semantics() {
+        use faktor_security::destination::{Decision, DestinationPolicy, RequestTarget};
+
+        let url = CanonicalUrl::parse("https://Ex\u{e4}mple.com.:443/a").expect("valid");
+        let explicit_port = url
+            .origin()
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok());
+        assert_eq!(explicit_port, None, "a default port is not explicit");
+        let target =
+            RequestTarget::from_parts(Some(url.scheme()), url.host(), explicit_port, false, None)
+                .expect("canonical host is a valid target");
+        assert_eq!(target.host, url.host());
+        assert_eq!(target.host, "xn--exmple-cua.com");
+        assert_eq!(target.port, Some(443), "egress resolves the scheme default");
+        let policy =
+            DestinationPolicy::parse_lines(["https://xn--exmple-cua.com:443"]).expect("policy");
+        assert!(matches!(target.check_against(&policy), Decision::Allowed));
+
+        // Every identity-equivalent spelling lands on the same target.
+        for raw in [
+            "HTTPS://EX\u{c4}MPLE.COM/a",
+            "https://xn--exmple-cua.com./a",
+            "https://ex\u{e4}mple.com:0443/a",
+        ] {
+            let other = CanonicalUrl::parse(raw).expect(raw);
+            assert_eq!(other.host(), url.host(), "{raw}");
+            let target =
+                RequestTarget::from_parts(Some(other.scheme()), other.host(), None, false, None)
+                    .expect("target");
+            assert!(target.check_against(&policy).is_allowed(), "{raw}");
+        }
+    }
+
+    #[test]
     fn url_rejects_credentials_and_hostile_shapes() {
         assert!(matches!(
             CanonicalUrl::parse("https://user:pass@evil.com/"),
             Err(UrlError::UserInfo)
         ));
         assert!(matches!(
+            CanonicalUrl::parse("https://user@evil.com/"),
+            Err(UrlError::UserInfo)
+        ));
+        assert!(matches!(
             CanonicalUrl::parse("javascript:alert(1)"),
-            Err(UrlError::MissingScheme)
+            Err(UrlError::UnsupportedScheme { .. })
         ));
         assert!(matches!(
             CanonicalUrl::parse("file:///etc/passwd"),
             Err(UrlError::UnsupportedScheme { .. })
         ));
         assert!(matches!(
+            CanonicalUrl::parse("detail.1688.com/offer/1.html"),
+            Err(UrlError::MissingScheme)
+        ));
+        assert!(matches!(
             CanonicalUrl::parse("https://"),
             Err(UrlError::MissingHost)
         ));
-        assert!(matches!(
-            CanonicalUrl::parse("https://evil.com\\@good.com/"),
-            Err(UrlError::InvalidChar { .. })
-        ));
+        // A backslash is a path separator for special schemes (the URL
+        // parser's semantics, shared with egress); it can never smuggle a
+        // second authority or a userinfo.
+        assert_eq!(
+            CanonicalUrl::parse("https://evil.com\\@good.com/")
+                .expect("url parser semantics")
+                .as_str(),
+            "https://evil.com/@good.com/"
+        );
         assert!(matches!(
             CanonicalUrl::parse("https://good.com%00.evil/"),
-            Err(UrlError::InvalidHost)
+            Err(UrlError::InvalidHost | UrlError::Malformed { .. })
         ));
         assert!(matches!(
             CanonicalUrl::parse("https://-bad.com/"),
@@ -713,7 +841,7 @@ mod tests {
         ));
         assert!(matches!(
             CanonicalUrl::parse("https://a..b/"),
-            Err(UrlError::InvalidHost)
+            Err(UrlError::InvalidHost | UrlError::Malformed { .. })
         ));
         assert!(matches!(
             CanonicalUrl::parse("https://good.com:0/"),
@@ -724,20 +852,8 @@ mod tests {
             Err(UrlError::InvalidPort)
         ));
         assert!(matches!(
-            CanonicalUrl::parse("https://good.com:/"),
-            Err(UrlError::InvalidPort)
-        ));
-        assert!(matches!(
             CanonicalUrl::parse("https://good.com:80x/"),
             Err(UrlError::InvalidPort)
-        ));
-        assert!(matches!(
-            CanonicalUrl::parse("https://ex\u{e4}mple.com/"),
-            Err(UrlError::NonAscii { .. })
-        ));
-        assert!(matches!(
-            CanonicalUrl::parse("https://good.com/a b"),
-            Err(UrlError::InvalidChar { .. })
         ));
         assert!(matches!(
             CanonicalUrl::parse("https://good.com/\u{0}"),

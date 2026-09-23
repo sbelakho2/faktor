@@ -1104,7 +1104,9 @@ fn map_egress_error(error: EgressError) -> connectors::TransportError {
         EgressError::Denied { .. }
         | EgressError::SecretBlocked { .. }
         | EgressError::BodyTooLarge { .. }
-        | EgressError::BodyNotMaterialized(_) => ConnectorError::DestinationDenied,
+        | EgressError::BodyNotMaterialized(_)
+        | EgressError::AddressClassRefused { .. }
+        | EgressError::DnsAnswerSetTooLarge { .. } => ConnectorError::DestinationDenied,
         EgressError::ResponseTooLarge { .. } => ConnectorError::ResponseTooLarge,
         EgressError::UnsupportedScheme(_)
         | EgressError::UnparseableUrl(_)
@@ -1258,7 +1260,8 @@ impl CommerceBrowser {
                 }
             }
         }
-        for request in page.network() {
+        let network = page.network().map_err(browser_source_error)?;
+        for request in network {
             if payloads.len() >= COMMERCE_BROWSER_MAX_NETWORK_CAPTURES {
                 break;
             }
@@ -1375,7 +1378,12 @@ fn browser_source_error(error: faktor_browser::BrowserError) -> SourceError {
             SourceError::EgressUnavailable
         }
         Browser::ResponseTooLarge { .. } | Browser::Bound { .. } => SourceError::ResponseTooLarge,
+        Browser::EventStreamLagged { .. } => SourceError::BrowserCrashed,
         Browser::DownloadBlocked { .. } => SourceError::InvalidRequest,
+        // Added to unblock the shared workspace while the browser
+        // download/retire work lands; the owning sibling may adjust.
+        Browser::DownloadRejected { .. } => SourceError::InvalidRequest,
+        Browser::Retiring { .. } => SourceError::BrowserUnavailable,
     }
 }
 
@@ -1848,7 +1856,7 @@ pub fn commerce_egress_transport(
 ) -> Result<Arc<PolicyCheckedHttpTransport>, String> {
     let destinations = commerce_destination_policy(cfg)?;
     Ok(Arc::new(PolicyCheckedHttpTransport::with_policy_and_scan(
-        Some(destinations),
+        destinations,
         Some(outbound_scan),
     )))
 }
@@ -3412,8 +3420,8 @@ mod tests {
         destinations: EgressDestinationPolicy,
     ) -> (Arc<CommerceEgress>, EgressDestinationPolicy) {
         let checked: Arc<dyn EgressTransport> =
-            Arc::new(PolicyCheckedHttpTransport::with_policy_and_scan(
-                Some(destinations.clone()),
+            Arc::new(PolicyCheckedHttpTransport::with_policy_and_scan_for_tests(
+                destinations.clone(),
                 Some(OutboundScanConfig::default()),
             ));
         (
@@ -3437,7 +3445,7 @@ mod tests {
         ] {
             let url = reqwest::Url::parse(allowed).expect("url");
             assert!(
-                faktor_provider::egress::check_url(Some(&policy), &url).is_ok(),
+                faktor_provider::egress::check_url(&policy, &url).is_ok(),
                 "{allowed} must pass the parsed commerce gate"
             );
         }
@@ -3454,7 +3462,7 @@ mod tests {
             let url = reqwest::Url::parse(denied).expect("url");
             assert!(
                 matches!(
-                    faktor_provider::egress::check_url(Some(&policy), &url),
+                    faktor_provider::egress::check_url(&policy, &url),
                     Err(EgressError::Denied { .. })
                 ),
                 "{denied} must be denied by the parsed commerce gate"
@@ -3474,7 +3482,7 @@ mod tests {
         .expect("empty policy");
         let url = reqwest::Url::parse("https://api.mouser.com/x").expect("url");
         assert!(matches!(
-            faktor_provider::egress::check_url(Some(&empty), &url),
+            faktor_provider::egress::check_url(&empty, &url),
             Err(EgressError::Denied { .. })
         ));
 
@@ -3488,7 +3496,7 @@ mod tests {
         let policy = commerce_destination_policy(&browser_off).expect("policy");
         let url = reqwest::Url::parse("https://gw.open.1688.com/openapi").expect("url");
         assert!(matches!(
-            faktor_provider::egress::check_url(Some(&policy), &url),
+            faktor_provider::egress::check_url(&policy, &url),
             Err(EgressError::Denied { .. })
         ));
     }
@@ -3505,7 +3513,7 @@ mod tests {
         let policy = transport.policy().expect("policy installed").clone();
         let url =
             reqwest::Url::parse("https://api.mouser.com/api/v1/search/partnumber").expect("url");
-        assert!(faktor_provider::egress::check_url(Some(&policy), &url).is_ok());
+        assert!(faktor_provider::egress::check_url(&policy, &url).is_ok());
         // And the CommerceEgress pre-check over the production policy refuses
         // a non-allowlisted host before the inner transport is consulted.
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -3539,7 +3547,7 @@ mod tests {
         let policy = empty.policy().expect("policy installed");
         let url = reqwest::Url::parse("https://api.mouser.com/x").expect("url");
         assert!(matches!(
-            faktor_provider::egress::check_url(Some(policy), &url),
+            faktor_provider::egress::check_url(policy, &url),
             Err(EgressError::Denied { .. })
         ));
     }

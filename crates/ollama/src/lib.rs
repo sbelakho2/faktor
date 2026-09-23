@@ -26,6 +26,7 @@ use faktor_provider::catalog::{
 #[cfg(test)]
 use faktor_provider::egress::PolicyCheckedHttpTransport;
 use faktor_provider::egress::{execute_get, execute_post_json, EgressError, HttpTransport};
+use faktor_provider::sanitize::ErrorScrubber;
 use faktor_provider::transport::{
     guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES, PROVIDER_CEILING_MS,
 };
@@ -751,6 +752,8 @@ impl Provider for OllamaProvider {
         let body = self.embed_wire_body(&req);
         let url = format!("{}/api/embed", self.config.base_url);
         let transport = self.transport.clone();
+        let scrubber =
+            ErrorScrubber::new().with_request_credentials(&reqwest::header::HeaderMap::new(), &url);
         let bound_ms = if req.deadline_ms() > 0 {
             req.deadline_ms().min(PROVIDER_CEILING_MS)
         } else {
@@ -774,7 +777,7 @@ impl Provider for OllamaProvider {
                         .await
                         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                         .unwrap_or_default();
-                    return Err(status_to_provider_error(status, text));
+                    return Err(status_to_provider_error(status, text, &scrubber));
                 }
                 let bytes = read_body_bounded(resp, EMBED_RESPONSE_MAX_BYTES).await?;
                 let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
@@ -849,6 +852,13 @@ pub(crate) fn ollama_chat_stream(
 ) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
     use futures::StreamExt as _;
     type LineStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
+
+    // Registered secret scrubber for this request (credential-named query
+    // parameters plus the frozen pattern policy; the native adapter sends
+    // no credential headers).
+    let scrubber =
+        ErrorScrubber::new().with_request_credentials(&reqwest::header::HeaderMap::new(), &url);
+
     enum Stage {
         Fresh,
         Streaming {
@@ -868,6 +878,7 @@ pub(crate) fn ollama_chat_stream(
         let deadlines = deadlines;
         let cancel = cancel.clone();
         let body = body.clone();
+        let scrubber = scrubber.clone();
         async move {
             let (mut lines, mut pending, mut finished) = match stage {
                 Stage::Fresh => {
@@ -892,7 +903,7 @@ pub(crate) fn ollama_chat_stream(
                                 )
                                 .await;
                                 return Some((
-                                    Err(status_to_provider_error(status, text)),
+                                    Err(status_to_provider_error(status, text, &scrubber)),
                                     Stage::Done,
                                 ));
                             }
@@ -1264,8 +1275,14 @@ fn native_image_payload(url: &str) -> String {
 /// Map a non-success HTTP status onto the typed provider error class the
 /// retry policy consumes: 401/403 Auth, 429 RateLimited, 408/504 Timeout,
 /// any 5xx Server (all retryable except Auth/BadRequest), everything else
-/// BadRequest — terminal, so a hostile/refusing call is never hammered.
-fn status_to_provider_error(status: reqwest::StatusCode, text: String) -> ProviderError {
+/// BadRequest — terminal, so a hostile/refusing call is never hammered. The
+/// message is the scrubbed, bounded diagnostic: raw upstream bodies never
+/// reach the error, and auth failures withhold the body entirely.
+fn status_to_provider_error(
+    status: reqwest::StatusCode,
+    text: String,
+    scrubber: &ErrorScrubber,
+) -> ProviderError {
     let kind = match status.as_u16() {
         401 | 403 => ProviderErrorKind::Auth,
         429 => ProviderErrorKind::RateLimited,
@@ -1273,7 +1290,8 @@ fn status_to_provider_error(status: reqwest::StatusCode, text: String) -> Provid
         500..=599 => ProviderErrorKind::Server,
         _ => ProviderErrorKind::BadRequest,
     };
-    ProviderError::with_code(kind, status.as_u16().to_string(), text)
+    let code = status.as_u16();
+    ProviderError::with_code(kind, code.to_string(), scrubber.diagnostic(code, &text))
 }
 
 /// Re-apply the provider's embedding batch bounds to a directly-constructed
@@ -3161,9 +3179,9 @@ mod tests {
     // ------------------------------------------------------- egress (P0-36)
 
     fn allow_only(port: u16) -> Arc<dyn HttpTransport> {
-        Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
+        Arc::new(PolicyCheckedHttpTransport::with_policy_for_tests(
             DestinationPolicy::parse_lines([&format!("http://127.0.0.1:{port}")]).unwrap(),
-        )))
+        ))
     }
 
     async fn first_error(mut stream: ProviderStream) -> ProviderError {
@@ -3212,9 +3230,9 @@ mod tests {
         // https-to-http mismatch against an https-only rule: pre-connect deny.
         let mismatch = OllamaProvider::new(
             OllamaConfig::new(Some(base.clone())),
-            Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
+            Arc::new(PolicyCheckedHttpTransport::with_policy_for_tests(
                 DestinationPolicy::parse_lines([&format!("https://127.0.0.1:{port}")]).unwrap(),
-            ))),
+            )),
         );
         let err = first_error(mismatch.stream(req("qwen3.8"))).await;
         assert!(err.message.contains("denied"), "{}", err.message);
@@ -3448,7 +3466,9 @@ mod tests {
         let policy_err = OllamaProvider::new(
             OllamaConfig::new(Some("http://mock.invalid".into())),
             Arc::new(MockHttpTransport::denying(
-                faktor_provider::egress::EgressError::UnparseableUrl("nope".into()),
+                faktor_provider::egress::EgressError::UnparseableUrl(
+                    faktor_provider::egress::UrlRejectReason::ParseError,
+                ),
             )),
         )
         .embed(embed_req("m", &["a"]))
@@ -3795,5 +3815,94 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err.kind, ErrorKind::Timeout), "{err:?}");
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// Adversarial: a daemon/gateway error body that echoes request
+    /// credentials must never reach the error in raw form — a
+    /// credential-named URL parameter and pattern-shaped secrets are
+    /// scrubbed, bounded diagnostics survive, and 401 bodies are withheld
+    /// entirely.
+    #[tokio::test]
+    async fn error_bodies_are_scrubbed_and_auth_bodies_withheld() {
+        const EXACT: &str = "exact-credential-value-9f2a";
+        const PATTERN: &str = "sk-abcdefghijklmnopqrstuvwx";
+        fn body(sentinel: &str) -> String {
+            format!(r#"{{"error":"{sentinel} {EXACT} {PATTERN}"}}"#)
+        }
+        fn transport() -> Arc<dyn HttpTransport> {
+            Arc::new(PolicyCheckedHttpTransport::permissive())
+        }
+
+        // Non-auth: scrubbed bounded diagnostic, status preserved.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/api/chat",
+            MockAction::Respond {
+                status: 429,
+                body: body("RATE-BODY-SENTINEL"),
+            },
+        );
+        let base = server.base_url().await;
+        let mut stream = Box::pin(ollama_chat_stream(
+            transport(),
+            format!("{base}/api/chat?token={EXACT}"),
+            serde_json::json!({"model": "m"}),
+            0,
+            StreamDeadlines::default(),
+            None,
+        ));
+        let err = stream
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("429 must fail");
+        assert_eq!(err.kind, ProviderErrorKind::RateLimited);
+        assert_eq!(err.code.as_deref(), Some("429"));
+        let serialized = serde_json::to_string(&err.message).expect("serialize");
+        let rendered = format!("{err}|{err:?}|{serialized}");
+        for secret in [EXACT, PATTERN] {
+            assert!(!rendered.contains(secret), "secret leaked: {rendered}");
+        }
+        assert!(err.message.contains("HTTP 429"), "{}", err.message);
+        assert!(
+            err.message.len() <= faktor_provider::sanitize::MAX_ERROR_DIAGNOSTIC_BYTES + 128,
+            "diagnostic must stay bounded: {}",
+            err.message.len()
+        );
+
+        // Auth: the arbitrary upstream body is not preserved at all.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/api/chat",
+            MockAction::Respond {
+                status: 401,
+                body: body("AUTH-BODY-SENTINEL"),
+            },
+        );
+        let base = server.base_url().await;
+        let mut stream = Box::pin(ollama_chat_stream(
+            transport(),
+            format!("{base}/api/chat?token={EXACT}"),
+            serde_json::json!({"model": "m"}),
+            0,
+            StreamDeadlines::default(),
+            None,
+        ));
+        let err = stream
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("401 must fail");
+        assert_eq!(err.kind, ProviderErrorKind::Auth);
+        let rendered = format!(
+            "{err}|{err:?}|{}",
+            serde_json::to_string(&err.message).unwrap()
+        );
+        for leaked in ["AUTH-BODY-SENTINEL", EXACT, PATTERN] {
+            assert!(!rendered.contains(leaked), "auth body leaked: {rendered}");
+        }
+        assert!(err.message.contains("withheld"), "{}", err.message);
     }
 }

@@ -22,7 +22,10 @@ use tokio::sync::mpsc;
 pub mod atomic;
 pub mod entry_state;
 mod platform;
+pub mod rooted;
 pub mod tree_manifest;
+
+pub use rooted::RootedDir;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsEventKind {

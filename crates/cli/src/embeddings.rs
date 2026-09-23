@@ -391,7 +391,9 @@ mod tests {
         // no wire byte (the mock transport records only executed requests,
         // and a denial happens before any connect).
         let mock = Arc::new(MockHttpTransport::denying(
-            faktor_provider::egress::EgressError::UnparseableUrl("nope".into()),
+            faktor_provider::egress::EgressError::UnparseableUrl(
+                faktor_provider::egress::UrlRejectReason::ParseError,
+            ),
         ));
         let denied = OllamaProvider::new(
             OllamaConfig::new(Some("http://mock.invalid".into())),

@@ -72,7 +72,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.98"
+rust-version = "1.98.0"
 
 [workspace.dependencies]
 faktor-core = { path = "crates/core" }
@@ -140,6 +140,7 @@ tempfile = "3"
 futures-util = "0.3"
 tower = "0.5"
 futures = "0.3"
+zeroize = "1"
 
 [profile.release]
 lto = "thin"

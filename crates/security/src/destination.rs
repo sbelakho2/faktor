@@ -458,7 +458,13 @@ fn validate_ascii_labels(host: &str) -> Result<(), String> {
 /// the parsed URL's host (e.g. `reqwest::Url`); when the caller already
 /// parsed the address, the octets win over the textual spelling so that
 /// any alternate IPv4 text (`127.000.0.01`, …) compares canonical.
-fn canonicalize_request_host(
+///
+/// This is THE shared host canonicalizer: the destination gate and
+/// marketplace identity (`faktor-commerce`'s `CanonicalUrl`) both call it,
+/// so a host parsed for identity and a host checked for egress can never
+/// disagree. IPv6 literals are unbracketed canonical text, exactly as URL
+/// parsers emit them.
+pub fn canonicalize_request_host(
     host: &str,
     is_ipv4: bool,
     ip: Option<[u8; 4]>,
@@ -1559,6 +1565,34 @@ mod tests {
             let t = RequestTarget::parse(raw).unwrap();
             assert!(t.check_against(&p).is_allowed(), "{raw}");
         }
+    }
+
+    #[test]
+    fn shared_host_canonicalizer_is_the_identity_contract() {
+        // Trailing dot + case + IDN all fold onto one canonical host text;
+        // IPv4 alternate spellings reduce to canonical octets and IPv6
+        // literals to canonical unbracketed lowercase text.
+        assert_eq!(
+            canonicalize_request_host("EXAMPLE.com.", false, None).unwrap(),
+            "example.com"
+        );
+        assert_eq!(
+            canonicalize_request_host("exämple.com", false, None).unwrap(),
+            "xn--exmple-cua.com"
+        );
+        assert_eq!(
+            canonicalize_request_host("127.000.0.01", true, Some([127, 0, 0, 1])).unwrap(),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            canonicalize_request_host("0:0:0:0:0:0:0:1", false, None).unwrap(),
+            "::1"
+        );
+        assert_eq!(
+            canonicalize_request_host("::1", false, None).unwrap(),
+            "::1"
+        );
+        assert!(canonicalize_request_host("-bad.com", false, None).is_err());
     }
 
     #[test]

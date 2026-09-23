@@ -10,9 +10,11 @@ use faktor_core::model::ModelCapabilities;
 #[cfg(test)]
 use faktor_provider::egress::PolicyCheckedHttpTransport;
 use faktor_provider::egress::{execute_post_json, EgressError, HttpTransport};
+use faktor_provider::sanitize::{auth_shaped_text, ErrorScrubber};
 use faktor_provider::transport::{
     guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES, PROVIDER_CEILING_MS,
 };
+use faktor_security::secret::SecretValue;
 use futures::Stream;
 
 /// Stream hang controls: first-byte / idle bounds from the transport
@@ -138,15 +140,28 @@ async fn read_error_body_bounded(mut resp: reqwest::Response, cap: usize, bound_
     text
 }
 
-#[derive(Debug, Clone)]
+/// Gemini adapter configuration. `api_key` is wrapped in [`SecretValue`];
+/// the custom [`std::fmt::Debug`] below can never print it.
+#[derive(Clone)]
 pub struct GoogleConfig {
     pub base_url: String,
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretValue>,
     pub model_caps: HashMap<String, ModelCapabilities>,
 }
 
+impl std::fmt::Debug for GoogleConfig {
+    /// Redacting `Debug`: the API key prints `SecretValue([redacted])`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoogleConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key)
+            .field("model_caps", &self.model_caps)
+            .finish()
+    }
+}
+
 impl GoogleConfig {
-    pub fn new(api_key: Option<String>) -> Self {
+    pub fn new(api_key: Option<SecretValue>) -> Self {
         Self {
             base_url: "https://generativelanguage.googleapis.com".into(),
             api_key,
@@ -338,7 +353,15 @@ impl Provider for GoogleProvider {
             return faktor_provider::provider_error_stream(e);
         }
         let body = self.wire_body(&req);
-        let key = self.config.api_key.clone().unwrap_or_default();
+        // The explicit accessor is the only way the key reaches the URL
+        // (Gemini authenticates by query parameter, not header); a missing
+        // key stays the keyless request it always was.
+        let key = self
+            .config
+            .api_key
+            .as_ref()
+            .map(SecretValue::expose)
+            .unwrap_or("");
         let url = format!(
             "{}/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
             self.config.base_url, req.model, key
@@ -359,6 +382,13 @@ pub(crate) fn google_stream(
 ) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
     use futures::StreamExt as _;
     type LineStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
+
+    // Registered secret scrubber for this request: Gemini authenticates by
+    // query parameter, so the `key=` value is registered from the URL (plus
+    // the frozen pattern policy).
+    let scrubber =
+        ErrorScrubber::new().with_request_credentials(&reqwest::header::HeaderMap::new(), &url);
+
     enum Stage {
         Fresh,
         Streaming { lines: LineStream },
@@ -370,6 +400,7 @@ pub(crate) fn google_stream(
         let deadlines = deadlines;
         let cancel = cancel.clone();
         let body = body.clone();
+        let scrubber = scrubber.clone();
         async move {
             let mut lines = match stage {
                 Stage::Fresh => {
@@ -400,11 +431,12 @@ pub(crate) fn google_stream(
                                     500..=599 => ProviderErrorKind::Server,
                                     _ => ProviderErrorKind::BadRequest,
                                 };
+                                let code = status.as_u16();
                                 return Some((
                                     Err(ProviderError::with_code(
                                         kind,
-                                        status.as_u16().to_string(),
-                                        text,
+                                        code.to_string(),
+                                        scrubber.diagnostic(code, &text),
                                     )),
                                     Stage::Done,
                                 ));
@@ -448,7 +480,11 @@ pub(crate) fn google_stream(
                     return Some((
                         Err(ProviderError::new(
                             ProviderErrorKind::Malformed,
-                            format!("bad gemini SSE: {data:?}"),
+                            scrubber.event_diagnostic(
+                                "bad gemini SSE",
+                                data,
+                                auth_shaped_text(data),
+                            ),
                         )),
                         Stage::Done,
                     ));
@@ -1110,9 +1146,9 @@ mod tests {
     // ------------------------------------------------------- egress (P0-36)
 
     fn allow_only(port: u16) -> Arc<dyn HttpTransport> {
-        Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
+        Arc::new(PolicyCheckedHttpTransport::with_policy_for_tests(
             DestinationPolicy::parse_lines([&format!("http://127.0.0.1:{port}")]).unwrap(),
-        )))
+        ))
     }
 
     async fn first_error(mut stream: ProviderStream) -> ProviderError {
@@ -1167,9 +1203,9 @@ mod tests {
         // https-to-http mismatch against an https-only rule: pre-connect deny.
         let mismatch = GoogleProvider::build(
             GoogleConfig::new(None).with_base(&base),
-            Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
+            Arc::new(PolicyCheckedHttpTransport::with_policy_for_tests(
                 DestinationPolicy::parse_lines([&format!("https://127.0.0.1:{port}")]).unwrap(),
-            ))),
+            )),
         );
         let err = first_error(mismatch.stream(req("gemini-x"))).await;
         assert!(err.message.contains("denied"), "{}", err.message);
@@ -1402,5 +1438,201 @@ mod tests {
             .expect_err("no response headers is an error");
         assert_eq!(err.kind, ProviderErrorKind::Timeout, "{err:?}");
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// P0 plaintext-secret lock: the Gemini config's planted key never
+    /// renders through Debug, panic formatting or serialized diagnostics.
+    #[test]
+    fn config_debug_never_renders_the_api_key() {
+        const PLANTED: &str = "AIzaPLANTED-google-key-0123456789";
+        let cfg = GoogleConfig::new(Some(SecretValue::new(PLANTED)));
+        let mut rendered = vec![format!("{cfg:?}")];
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("google config: {cfg:?}")
+        }))
+        .expect_err("must panic");
+        if let Some(message) = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        {
+            rendered.push(message);
+        }
+        rendered.push(serde_json::to_string(&format!("{cfg:?}")).unwrap());
+        for text in &rendered {
+            assert!(!text.contains(PLANTED), "google api key leaked: {text}");
+        }
+        assert!(rendered[0].contains("[redacted]"));
+    }
+
+    /// Adversarial: a provider/gateway error body that echoes request
+    /// credentials must never reach the error in raw form — the Gemini
+    /// `key=` query credential and pattern-shaped secrets are scrubbed,
+    /// bounded diagnostics survive, and 401/403 bodies are withheld
+    /// entirely.
+    #[tokio::test]
+    async fn error_bodies_are_scrubbed_and_auth_bodies_withheld() {
+        const EXACT: &str = "exact-credential-value-9f2a";
+        const PATTERN: &str = "sk-abcdefghijklmnopqrstuvwx";
+        fn body(sentinel: &str) -> String {
+            format!(r#"{{"error":{{"code":429,"message":"{sentinel} {EXACT} {PATTERN}"}}}}"#)
+        }
+        fn transport() -> Arc<dyn HttpTransport> {
+            Arc::new(PolicyCheckedHttpTransport::permissive())
+        }
+        let url_for = |base: &str| {
+            format!("{base}/v1beta/models/gemini-x:streamGenerateContent?alt=sse&key={EXACT}")
+        };
+
+        // Non-auth: scrubbed bounded diagnostic, status preserved.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/v1beta/models/gemini-x:streamGenerateContent",
+            MockAction::Respond {
+                status: 429,
+                body: body("RATE-BODY-SENTINEL"),
+            },
+        );
+        let base = server.base_url().await;
+        let mut stream = Box::pin(google_stream(
+            transport(),
+            url_for(&base),
+            serde_json::json!({"contents": []}),
+            StreamDeadlines::default(),
+            None,
+        ));
+        let err = stream
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("429 must fail");
+        assert_eq!(err.kind, ProviderErrorKind::RateLimited);
+        assert_eq!(err.code.as_deref(), Some("429"));
+        let serialized = serde_json::to_string(&err.message).expect("serialize");
+        let rendered = format!("{err}|{err:?}|{serialized}");
+        for secret in [EXACT, PATTERN] {
+            assert!(!rendered.contains(secret), "secret leaked: {rendered}");
+        }
+        assert!(err.message.contains("HTTP 429"), "{}", err.message);
+        assert!(
+            err.message.len() <= faktor_provider::sanitize::MAX_ERROR_DIAGNOSTIC_BYTES + 128,
+            "diagnostic must stay bounded: {}",
+            err.message.len()
+        );
+
+        // Auth: the arbitrary upstream body is not preserved at all.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/v1beta/models/gemini-x:streamGenerateContent",
+            MockAction::Respond {
+                status: 403,
+                body: body("AUTH-BODY-SENTINEL"),
+            },
+        );
+        let base = server.base_url().await;
+        let mut stream = Box::pin(google_stream(
+            transport(),
+            url_for(&base),
+            serde_json::json!({"contents": []}),
+            StreamDeadlines::default(),
+            None,
+        ));
+        let err = stream
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("403 must fail");
+        assert_eq!(err.kind, ProviderErrorKind::Auth);
+        let rendered = format!(
+            "{err}|{err:?}|{}",
+            serde_json::to_string(&err.message).unwrap()
+        );
+        for leaked in ["AUTH-BODY-SENTINEL", EXACT, PATTERN] {
+            assert!(!rendered.contains(leaked), "auth body leaked: {rendered}");
+        }
+        assert!(err.message.contains("withheld"), "{}", err.message);
+    }
+
+    /// Adversarial: an in-stream error payload under an HTTP 2xx (a data
+    /// line the SSE parser cannot parse) is hostile text too. The planted
+    /// exact credential (registered from the request URL's `key=` query
+    /// parameter) and the pattern secret never reach `message`, `Display`,
+    /// `Debug` or the JSON-serialized message; an auth-shaped payload is
+    /// withheld entirely; the diagnostic stays bounded.
+    #[tokio::test]
+    async fn in_stream_2xx_error_payloads_are_scrubbed_or_withheld() {
+        const EXACT: &str = "exact-credential-value-9f2a";
+        const PATTERN: &str = "sk-abcdefghijklmnopqrstuvwx";
+        fn transport() -> Arc<dyn HttpTransport> {
+            Arc::new(PolicyCheckedHttpTransport::permissive())
+        }
+        fn assert_no_secret(err: &ProviderError, sentinels: &[&str]) {
+            let rendered = format!(
+                "{err}|{err:?}|{}|{:?}",
+                serde_json::to_string(&err.message).expect("serialize message"),
+                serde_json::to_string(&err.code).expect("serialize code"),
+            );
+            for secret in [EXACT, PATTERN].iter().chain(sentinels) {
+                assert!(!rendered.contains(secret), "secret leaked: {rendered}");
+            }
+        }
+        async fn stream_err(events: Vec<String>) -> ProviderError {
+            let server = MockServer::new();
+            server.route(
+                "POST",
+                "/v1beta/models/gemini-x:streamGenerateContent",
+                MockAction::Sse {
+                    status: 200,
+                    events,
+                },
+            );
+            let base = server.base_url().await;
+            let mut stream = Box::pin(google_stream(
+                transport(),
+                format!("{base}/v1beta/models/gemini-x:streamGenerateContent?alt=sse&key={EXACT}"),
+                serde_json::json!({"contents": []}),
+                StreamDeadlines::default(),
+                None,
+            ));
+            stream
+                .next()
+                .await
+                .expect("one item")
+                .expect_err("malformed 2xx payload must fail the stream")
+        }
+
+        // Non-auth: scrubbed and bounded, plain non-secret text visible.
+        let body = serde_json::json!({
+            "error": {
+                "code": 500,
+                "message": format!("GEM-SENTINEL {EXACT} {PATTERN}"),
+            },
+        })
+        .to_string();
+        let err = stream_err(vec![format!("data: {body} trailing-garbage\n\n")]).await;
+        assert_eq!(err.kind, ProviderErrorKind::Malformed);
+        assert!(err.message.contains("GEM-SENTINEL"), "{}", err.message);
+        assert!(
+            err.message.len() <= faktor_provider::sanitize::MAX_ERROR_DIAGNOSTIC_BYTES + 128,
+            "diagnostic must stay bounded: {}",
+            err.message.len()
+        );
+        assert_no_secret(&err, &[]);
+
+        // Auth-shaped: the upstream payload is withheld entirely.
+        let body = serde_json::json!({
+            "error": {
+                "code": 403,
+                "status": "PERMISSION_DENIED",
+                "message": format!("AUTH-GEM-SENTINEL {EXACT} {PATTERN}"),
+            },
+        })
+        .to_string();
+        let err = stream_err(vec![format!("data: {body} trailing-garbage\n\n")]).await;
+        assert_eq!(err.kind, ProviderErrorKind::Malformed);
+        assert!(err.message.contains("withheld"), "{}", err.message);
+        assert_no_secret(&err, &["AUTH-GEM-SENTINEL"]);
     }
 }

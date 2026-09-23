@@ -457,7 +457,7 @@ fn parse_edit_ops(args: &serde_json::Value) -> Result<Vec<ToolEditOp>, Error> {
                         return Err(Error::malformed(format!(
                             "{}`position` must be \"before\" or \"after\"",
                             prefix("insert")
-                        )))
+                        )));
                     }
                 };
                 ToolEditOp::Insert {
@@ -501,7 +501,7 @@ fn parse_edit_ops(args: &serde_json::Value) -> Result<Vec<ToolEditOp>, Error> {
             other => {
                 return Err(Error::malformed(format!(
                     "{no_name}unknown operation type {other:?}"
-                )))
+                )));
             }
         };
         // Per-op payload bound, then the whole-call total.
@@ -594,7 +594,9 @@ fn apply_edit_op(buf: &mut String, op: &ToolEditOp, idx: usize) -> Result<(), Er
             if *unique && matches > 1 {
                 return Err(fail(
                     ErrorKind::Conflict,
-                    format!("search text is ambiguous ({matches} matches); widen the context or set unique: false"),
+                    format!(
+                        "search text is ambiguous ({matches} matches); widen the context or set unique: false"
+                    ),
                 ));
             }
             let start = buf.find(search.as_str()).expect("non-zero matches");

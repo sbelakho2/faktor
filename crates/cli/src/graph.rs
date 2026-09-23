@@ -745,7 +745,7 @@ mod tests {
     }
 
     fn open_transport() -> Arc<dyn faktor_provider::egress::HttpTransport> {
-        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::with_policy(None))
+        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::permissive())
     }
 
     #[test]
@@ -989,6 +989,7 @@ mod tests {
                 pricing_ceiling_micro_usd_per_million_tokens: Some(42_000_000),
                 ..Default::default()
             }),
+            allow_loopback: true,
         };
         let mut registry = ProviderRegistry::new();
         registry
@@ -1313,6 +1314,7 @@ mod tests {
                 api_key_env: None,
                 api: None,
                 pricing: Some(pricing),
+                allow_loopback: true,
             };
             registry
                 .try_register(cfg.build(open_transport()).unwrap())
@@ -1362,6 +1364,7 @@ mod tests {
             id: "ollama".into(),
             base_url: None,
             pricing: None,
+            allow_loopback: true,
         };
         let mut registry = ProviderRegistry::new();
         registry
@@ -1383,6 +1386,7 @@ mod tests {
                 output_micro_usd_per_million_tokens: Some(60_000_000),
                 ..Default::default()
             }),
+            allow_loopback: true,
         };
         let e = match hostile.build(open_transport()) {
             Ok(_) => panic!("ollama pricing refused"),
@@ -2344,9 +2348,9 @@ mod tests {
                     for (idx, l) in lines.iter().enumerate() {
                         if l.contains("ServerDeps::new(") {
                             assert!(
-                            allowed(idx, &regions),
-                            "main.rs:{idx}: ServerDeps::new( (a second runtime) only in test code"
-                        );
+                                allowed(idx, &regions),
+                                "main.rs:{idx}: ServerDeps::new( (a second runtime) only in test code"
+                            );
                         }
                     }
                     covered.push("server");
@@ -2425,10 +2429,10 @@ mod tests {
                         && !allowed(idx, &regions)
                     {
                         panic!(
-                        "{name}:{}: {t:?} is constructed outside the graph construction region \
+                            "{name}:{}: {t:?} is constructed outside the graph construction region \
                          (graph module / build_daemon* / cfg(test))",
-                        idx + 1
-                    );
+                            idx + 1
+                        );
                     }
                 }
             }

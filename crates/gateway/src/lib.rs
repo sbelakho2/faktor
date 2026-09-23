@@ -4,34 +4,58 @@
 //! headers. BYOK is preserved: the gateway key is configured per provider
 //! and never persisted by the runtime.
 
+use std::fmt;
 use std::sync::Arc;
 
 use faktor_core::model::ModelCapabilities;
 use faktor_openai::{OpenAiConfig, OpenAiProvider};
+use faktor_provider::config::ExtraHeaders;
 use faktor_provider::egress::HttpTransport;
 #[cfg(test)]
 use faktor_provider::egress::PolicyCheckedHttpTransport;
-use faktor_provider::Provider;
+use faktor_provider::{Provider, ProviderError, ProviderErrorKind};
+use faktor_security::secret::SecretValue;
 
-#[derive(Debug, Clone)]
+/// Gateway adapter configuration. `api_key` is wrapped in
+/// [`SecretValue`]; `extra_headers` is the validated [`ExtraHeaders`] type
+/// whose `Debug` masks auth/secret-shaped values. The custom [`fmt::Debug`]
+/// below keeps routing configuration inspectable while rendering no
+/// credential material.
+#[derive(Clone)]
 pub struct GatewayConfig {
     pub id: String,
     pub base_url: String,
-    pub api_key: Option<String>,
-    /// Extra headers forwarded verbatim (e.g. OpenRouter referer/title).
-    pub extra_headers: Vec<(String, String)>,
+    pub api_key: Option<SecretValue>,
+    /// Extra headers forwarded verbatim (e.g. OpenRouter referer/title),
+    /// validated at construction.
+    pub extra_headers: ExtraHeaders,
     /// Route-by-prefix model mapping: (prefix, target model).
     pub route_prefixes: Vec<(String, String)>,
     pub default_caps: ModelCapabilities,
 }
 
+impl fmt::Debug for GatewayConfig {
+    /// Redacting `Debug`: the key prints `SecretValue([redacted])` and
+    /// [`ExtraHeaders`] masks auth-shaped values.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GatewayConfig")
+            .field("id", &self.id)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key)
+            .field("extra_headers", &self.extra_headers)
+            .field("route_prefixes", &self.route_prefixes)
+            .field("default_caps", &self.default_caps)
+            .finish()
+    }
+}
+
 impl GatewayConfig {
-    pub fn openrouter(api_key: Option<String>) -> Self {
+    pub fn openrouter(api_key: Option<SecretValue>) -> Self {
         Self {
             id: "openrouter".into(),
             base_url: "https://openrouter.ai/api/v1".into(),
             api_key,
-            extra_headers: vec![],
+            extra_headers: ExtraHeaders::empty(),
             route_prefixes: vec![],
             default_caps: ModelCapabilities {
                 context: 128_000,
@@ -85,12 +109,12 @@ pub fn permissive_for_tests(config: GatewayConfig) -> Arc<dyn Provider> {
 
 struct HeaderGateway {
     inner: Arc<dyn Provider>,
-    extra_headers: Vec<(String, String)>,
+    extra_headers: ExtraHeaders,
     route_prefixes: Vec<(String, String)>,
     default_caps: ModelCapabilities,
     transport: Arc<dyn HttpTransport>,
     base_url: String,
-    api_key: Option<String>,
+    api_key: Option<SecretValue>,
 }
 
 impl Provider for HeaderGateway {
@@ -128,7 +152,18 @@ impl Provider for HeaderGateway {
         let body =
             faktor_openai::chat_completions_body(&req, &faktor_openai::OpenAiQuirks::default());
         let url = format!("{}/chat/completions", self.base_url);
-        let headers = faktor_openai::authorization_headers(self.api_key.as_deref());
+        // An unencodable credential fails the request with a typed terminal
+        // error instead of silently dropping the Authorization header (an
+        // anonymous request against an authenticated gateway).
+        let headers = match faktor_openai::authorization_headers(self.api_key.as_ref()) {
+            Ok(headers) => headers,
+            Err(e) => {
+                return faktor_provider::provider_error_stream(ProviderError::new(
+                    ProviderErrorKind::Auth,
+                    e.to_string(),
+                ));
+            }
+        };
         let transport = self.transport.clone();
         let deadlines = faktor_provider::transport::StreamDeadlines::default();
         let cancel = req.meta.cancellation.clone();
@@ -199,7 +234,7 @@ mod tests {
             id: "gw".into(),
             base_url: base.clone(),
             api_key: None,
-            extra_headers: vec![],
+            extra_headers: ExtraHeaders::empty(),
             route_prefixes: vec![("deepseek/".into(), "routed-model".into())],
             default_caps: ModelCapabilities::default(),
         };
@@ -240,11 +275,12 @@ mod tests {
             id: "gw".into(),
             base_url: format!("{base}/v1"),
             api_key: Some("sk".into()),
-            extra_headers: vec![
-                ("X-Title".into(), "Faktor".into()),
-                ("X-Referer".into(), "https://gateway.example.com".into()),
-                ("authorization".into(), "sk-extra-override".into()),
-            ],
+            extra_headers: ExtraHeaders::try_new([
+                ("X-Title", "Faktor"),
+                ("X-Referer", "https://gateway.example.com"),
+                ("authorization", "sk-extra-override"),
+            ])
+            .unwrap(),
             route_prefixes: vec![],
             default_caps: ModelCapabilities::default(),
         };
@@ -308,9 +344,9 @@ mod tests {
     // ------------------------------------------------------- egress (P0-36)
 
     fn allow_only(port: u16) -> Arc<dyn HttpTransport> {
-        Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
+        Arc::new(PolicyCheckedHttpTransport::with_policy_for_tests(
             DestinationPolicy::parse_lines([&format!("http://127.0.0.1:{port}")]).unwrap(),
-        )))
+        ))
     }
 
     #[tokio::test]
@@ -334,9 +370,9 @@ mod tests {
             base_url: base.clone(),
             api_key: None,
             extra_headers: if extra {
-                vec![("X-Title".into(), "Faktor".into())]
+                ExtraHeaders::try_new([("X-Title", "Faktor")]).unwrap()
             } else {
-                vec![]
+                ExtraHeaders::empty()
             },
             route_prefixes: vec![],
             default_caps: ModelCapabilities::default(),
@@ -407,7 +443,7 @@ mod tests {
             id: "gw".into(),
             base_url: "http://mock.invalid".into(),
             api_key: None,
-            extra_headers: vec![("X-Title".into(), "Faktor".into())],
+            extra_headers: ExtraHeaders::try_new([("X-Title", "Faktor")]).unwrap(),
             route_prefixes: vec![],
             default_caps: ModelCapabilities::default(),
         };
@@ -510,7 +546,7 @@ mod tests {
             provider: |base: String| {
                 let mut cfg = GatewayConfig::openrouter(None);
                 cfg.base_url = base;
-                cfg.extra_headers = vec![("x-title".into(), "Faktor".into())];
+                cfg.extra_headers = ExtraHeaders::try_new([("x-title", "Faktor")]).unwrap();
                 cfg.default_caps.tools = true;
                 permissive_for_tests(cfg)
             },
@@ -552,5 +588,57 @@ mod tests {
                 ),
             ]
         }
+    }
+
+    /// P0 plaintext-secret lock for the gateway config: key and
+    /// auth-shaped extra-header values never render; an unencodable key
+    /// fails the request typed instead of going anonymous.
+    #[tokio::test]
+    async fn gateway_config_redacts_and_invalid_key_fails_typed() {
+        const PLANTED: &str = "sk-PLANTED-gateway-secret-0123456789abcdef";
+        let cfg = GatewayConfig {
+            id: "gw".into(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: Some(SecretValue::new(PLANTED)),
+            extra_headers: ExtraHeaders::try_new([("Authorization", PLANTED)]).unwrap(),
+            route_prefixes: vec![],
+            default_caps: ModelCapabilities::default(),
+        };
+        let mut rendered = vec![format!("{cfg:?}")];
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("gateway config: {cfg:?}")
+        }))
+        .expect_err("must panic");
+        if let Some(message) = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        {
+            rendered.push(message);
+        }
+        rendered.push(serde_json::to_string(&format!("{cfg:?}")).unwrap());
+        for text in &rendered {
+            assert!(!text.contains(PLANTED), "gateway secret leaked: {text}");
+        }
+        assert!(rendered[0].contains("[redacted]"));
+
+        // Unencodable key: the gateway request path yields the typed Auth
+        // error, never a silently keyless request.
+        let bad_cfg = GatewayConfig {
+            id: "gw".into(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: Some(SecretValue::new("sk-bad\r\nX-Injected: yes")),
+            extra_headers: ExtraHeaders::try_new([("X-Title", "Faktor")]).unwrap(),
+            route_prefixes: vec![],
+            default_caps: ModelCapabilities::default(),
+        };
+        let mut stream = permissive_for_tests(bad_cfg).stream(req("m"));
+        let err = stream
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("invalid key must fail typed");
+        assert_eq!(err.kind, ProviderErrorKind::Auth, "{err:?}");
+        assert!(!err.message.contains("Injected"), "{}", err.message);
     }
 }

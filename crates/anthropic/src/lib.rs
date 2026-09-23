@@ -8,12 +8,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use faktor_core::model::ModelCapabilities;
+use faktor_provider::config::{bearer_auth_header, ProviderConfigError};
 #[cfg(test)]
 use faktor_provider::egress::PolicyCheckedHttpTransport;
 use faktor_provider::egress::{execute_post_json, EgressError, HttpTransport};
+use faktor_provider::sanitize::{auth_shaped_text, ErrorScrubber};
 use faktor_provider::transport::{
     guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES, PROVIDER_CEILING_MS,
 };
+use faktor_security::secret::SecretValue;
 use futures::Stream;
 
 /// Stream hang controls: first-byte / idle bounds from the transport
@@ -139,16 +142,30 @@ async fn read_error_body_bounded(mut resp: reqwest::Response, cap: usize, bound_
     text
 }
 
-#[derive(Debug, Clone)]
+/// Anthropic adapter configuration. `api_key` is wrapped in
+/// [`SecretValue`]; the custom [`std::fmt::Debug`] below can never print it.
+#[derive(Clone)]
 pub struct AnthropicConfig {
     pub base_url: String,
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretValue>,
     pub model_caps: HashMap<String, ModelCapabilities>,
     pub default_caps: ModelCapabilities,
 }
 
+impl std::fmt::Debug for AnthropicConfig {
+    /// Redacting `Debug`: the API key prints `SecretValue([redacted])`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnthropicConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key)
+            .field("model_caps", &self.model_caps)
+            .field("default_caps", &self.default_caps)
+            .finish()
+    }
+}
+
 impl AnthropicConfig {
-    pub fn new(api_key: Option<String>) -> Self {
+    pub fn new(api_key: Option<SecretValue>) -> Self {
         Self {
             base_url: "https://api.anthropic.com".into(),
             api_key,
@@ -306,17 +323,19 @@ impl AnthropicProvider {
         body
     }
 
-    fn headers(&self) -> reqwest::header::HeaderMap {
+    /// Request headers. An unencodable credential is a typed
+    /// [`faktor_provider::config::ProviderConfigError`] — the request MUST
+    /// fail, never silently go anonymous.
+    fn headers(&self) -> Result<reqwest::header::HeaderMap, ProviderConfigError> {
         let mut h = reqwest::header::HeaderMap::new();
         if let Some(key) = &self.config.api_key {
-            if let Ok(v) = format!("Bearer {key}").parse() {
-                h.insert("authorization", v);
-            }
-            if let Ok(v) = "faktor-plus/0.1".parse() {
-                h.insert("anthropic-version", v);
-            }
+            h.insert("authorization", bearer_auth_header(key)?);
+            h.insert(
+                "anthropic-version",
+                reqwest::header::HeaderValue::from_static("faktor-plus/0.1"),
+            );
         }
-        h
+        Ok(h)
     }
 }
 
@@ -373,7 +392,17 @@ impl Provider for AnthropicProvider {
         let body = self.wire_body(&req);
         let url = format!("{}/v1/messages", self.config.base_url);
         let transport = self.transport.clone();
-        let headers = self.headers();
+        // An unencodable credential must fail the request with a typed
+        // terminal error, never silently drop the Authorization header.
+        let headers = match self.headers() {
+            Ok(headers) => headers,
+            Err(e) => {
+                return faktor_provider::provider_error_stream(ProviderError::new(
+                    ProviderErrorKind::Auth,
+                    e.to_string(),
+                ));
+            }
+        };
         let deadlines = stream_deadlines(&req);
         let cancel = req.meta.cancellation.clone();
         Box::pin(anthropic_stream(
@@ -397,6 +426,12 @@ pub(crate) fn anthropic_stream(
 ) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
     use futures::StreamExt as _;
     type LineStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
+
+    // Registered secret scrubber for this request: credentials the request
+    // actually carries (authorization header, credential-named query
+    // parameters) plus the frozen pattern policy.
+    let scrubber = ErrorScrubber::new().with_request_credentials(&headers, &url);
+
     enum Stage {
         Fresh,
         Streaming {
@@ -414,6 +449,7 @@ pub(crate) fn anthropic_stream(
         let cancel = cancel.clone();
         let headers = headers.clone();
         let body = body.clone();
+        let scrubber = scrubber.clone();
         async move {
             let (mut lines, mut tool_id, mut tool_name, mut tool_args) = match stage {
                 Stage::Fresh => {
@@ -439,11 +475,12 @@ pub(crate) fn anthropic_stream(
                                     500..=599 => ProviderErrorKind::Server,
                                     _ => ProviderErrorKind::BadRequest,
                                 };
+                                let code = status.as_u16();
                                 return Some((
                                     Err(ProviderError::with_code(
                                         kind,
-                                        status.as_u16().to_string(),
-                                        text,
+                                        code.to_string(),
+                                        scrubber.diagnostic(code, &text),
                                     )),
                                     Stage::Done,
                                 ));
@@ -515,7 +552,11 @@ pub(crate) fn anthropic_stream(
                     return Some((
                         Err(ProviderError::new(
                             ProviderErrorKind::Malformed,
-                            format!("bad anthropic SSE: {data:?}"),
+                            scrubber.event_diagnostic(
+                                "bad anthropic SSE",
+                                data,
+                                auth_shaped_text(data),
+                            ),
                         )),
                         Stage::Done,
                     ));
@@ -1224,9 +1265,9 @@ mod tests {
     // ------------------------------------------------------- egress (P0-36)
 
     fn allow_only(port: u16) -> Arc<dyn HttpTransport> {
-        Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
+        Arc::new(PolicyCheckedHttpTransport::with_policy_for_tests(
             DestinationPolicy::parse_lines([&format!("http://127.0.0.1:{port}")]).unwrap(),
-        )))
+        ))
     }
 
     async fn first_error(mut stream: ProviderStream) -> ProviderError {
@@ -1287,9 +1328,9 @@ mod tests {
         // connect as well.
         let mismatch = AnthropicProvider::build(
             AnthropicConfig::new(None).with_base(&base),
-            Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
+            Arc::new(PolicyCheckedHttpTransport::with_policy_for_tests(
                 DestinationPolicy::parse_lines([&format!("https://127.0.0.1:{port}")]).unwrap(),
-            ))),
+            )),
         );
         let err = first_error(mismatch.stream(req("claude-x"))).await;
         assert!(err.message.contains("denied"), "{}", err.message);
@@ -1525,5 +1566,238 @@ mod tests {
             .expect_err("no response headers is an error");
         assert_eq!(err.kind, ProviderErrorKind::Timeout, "{err:?}");
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// P0 plaintext-secret lock: the planted key never renders and an
+    /// unencodable key fails the header build AND the request typed —
+    /// never a silently anonymous Messages call.
+    #[tokio::test]
+    async fn config_redacts_key_and_invalid_key_fails_typed() {
+        const PLANTED: &str = "sk-ant-PLANTED-key-0123456789abcdef";
+        let cfg = AnthropicConfig::new(Some(SecretValue::new(PLANTED)));
+        let mut rendered = vec![format!("{cfg:?}")];
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("anthropic config: {cfg:?}")
+        }))
+        .expect_err("must panic");
+        if let Some(message) = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        {
+            rendered.push(message);
+        }
+        rendered.push(serde_json::to_string(&format!("{cfg:?}")).unwrap());
+        for text in &rendered {
+            assert!(!text.contains(PLANTED), "anthropic key leaked: {text}");
+        }
+        assert!(rendered[0].contains("[redacted]"));
+
+        // `headers()` refuses the unencodable credential typed.
+        let bad = AnthropicProvider {
+            config: AnthropicConfig::new(Some(SecretValue::new("sk-bad\r\nX-Injected: yes"))),
+            transport: Arc::new(PolicyCheckedHttpTransport::permissive()),
+        };
+        let err = bad.headers().unwrap_err();
+        for text in [format!("{err}"), format!("{err:?}")] {
+            assert!(!text.contains("Injected"), "credential leaked: {text}");
+        }
+        // The request path yields the typed Auth error, not an anonymous
+        // request.
+        let provider = AnthropicProvider::build(
+            bad.config.clone(),
+            Arc::new(PolicyCheckedHttpTransport::permissive()),
+        );
+        let mut stream = provider.stream(req("m"));
+        let err = stream
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("invalid key must fail typed");
+        assert_eq!(err.kind, ProviderErrorKind::Auth, "{err:?}");
+    }
+
+    /// Adversarial: a provider/gateway error body that echoes request
+    /// credentials must never reach the error in raw form — exact
+    /// registered credentials and pattern-shaped secrets are scrubbed,
+    /// bounded diagnostics survive, and 401/403 bodies are withheld
+    /// entirely.
+    #[tokio::test]
+    async fn error_bodies_are_scrubbed_and_auth_bodies_withheld() {
+        const EXACT: &str = "exact-credential-value-9f2a";
+        const PATTERN: &str = "sk-abcdefghijklmnopqrstuvwx";
+        fn body(sentinel: &str) -> String {
+            format!(
+                r#"{{"error":{{"type":"overloaded_error","message":"{sentinel} {EXACT} {PATTERN}"}}}}"#
+            )
+        }
+        fn transport() -> Arc<dyn HttpTransport> {
+            Arc::new(PolicyCheckedHttpTransport::permissive())
+        }
+        fn headers() -> reqwest::header::HeaderMap {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert("authorization", format!("Bearer {EXACT}").parse().unwrap());
+            h
+        }
+
+        // Non-auth: scrubbed bounded diagnostic, status preserved.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/v1/messages",
+            MockAction::Respond {
+                status: 429,
+                body: body("RATE-BODY-SENTINEL"),
+            },
+        );
+        let base = server.base_url().await;
+        let mut stream = Box::pin(anthropic_stream(
+            transport(),
+            format!("{base}/v1/messages"),
+            headers(),
+            serde_json::json!({"model": "m"}),
+            StreamDeadlines::default(),
+            None,
+        ));
+        let err = stream
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("429 must fail");
+        assert_eq!(err.kind, ProviderErrorKind::RateLimited);
+        assert_eq!(err.code.as_deref(), Some("429"));
+        let serialized = serde_json::to_string(&err.message).expect("serialize");
+        let rendered = format!("{err}|{err:?}|{serialized}");
+        for secret in [EXACT, PATTERN] {
+            assert!(!rendered.contains(secret), "secret leaked: {rendered}");
+        }
+        assert!(err.message.contains("HTTP 429"), "{}", err.message);
+        assert!(
+            err.message.len() <= faktor_provider::sanitize::MAX_ERROR_DIAGNOSTIC_BYTES + 128,
+            "diagnostic must stay bounded: {}",
+            err.message.len()
+        );
+
+        // Auth: the arbitrary upstream body is not preserved at all.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/v1/messages",
+            MockAction::Respond {
+                status: 401,
+                body: body("AUTH-BODY-SENTINEL"),
+            },
+        );
+        let base = server.base_url().await;
+        let mut stream = Box::pin(anthropic_stream(
+            transport(),
+            format!("{base}/v1/messages"),
+            headers(),
+            serde_json::json!({"model": "m"}),
+            StreamDeadlines::default(),
+            None,
+        ));
+        let err = stream
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("401 must fail");
+        assert_eq!(err.kind, ProviderErrorKind::Auth);
+        let rendered = format!(
+            "{err}|{err:?}|{}",
+            serde_json::to_string(&err.message).unwrap()
+        );
+        for leaked in ["AUTH-BODY-SENTINEL", EXACT, PATTERN] {
+            assert!(!rendered.contains(leaked), "auth body leaked: {rendered}");
+        }
+        assert!(err.message.contains("withheld"), "{}", err.message);
+    }
+
+    /// Adversarial: an in-stream error payload under an HTTP 2xx (a data
+    /// line the SSE parser cannot parse) is hostile text too. The planted
+    /// exact credential (registered from the request's Authorization
+    /// header) and the pattern secret never reach `message`, `Display`,
+    /// `Debug` or the JSON-serialized message; an auth-shaped payload is
+    /// withheld entirely; the diagnostic stays bounded.
+    #[tokio::test]
+    async fn in_stream_2xx_error_payloads_are_scrubbed_or_withheld() {
+        const EXACT: &str = "exact-credential-value-9f2a";
+        const PATTERN: &str = "sk-abcdefghijklmnopqrstuvwx";
+        fn transport() -> Arc<dyn HttpTransport> {
+            Arc::new(PolicyCheckedHttpTransport::permissive())
+        }
+        fn headers() -> reqwest::header::HeaderMap {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert("authorization", format!("Bearer {EXACT}").parse().unwrap());
+            h
+        }
+        fn assert_no_secret(err: &ProviderError, sentinels: &[&str]) {
+            let rendered = format!(
+                "{err}|{err:?}|{}|{:?}",
+                serde_json::to_string(&err.message).expect("serialize message"),
+                serde_json::to_string(&err.code).expect("serialize code"),
+            );
+            for secret in [EXACT, PATTERN].iter().chain(sentinels) {
+                assert!(!rendered.contains(secret), "secret leaked: {rendered}");
+            }
+        }
+        async fn stream_err(events: Vec<String>) -> ProviderError {
+            let server = MockServer::new();
+            server.route(
+                "POST",
+                "/v1/messages",
+                MockAction::Sse {
+                    status: 200,
+                    events,
+                },
+            );
+            let base = server.base_url().await;
+            let mut stream = Box::pin(anthropic_stream(
+                transport(),
+                format!("{base}/v1/messages"),
+                headers(),
+                serde_json::json!({"model": "m"}),
+                StreamDeadlines::default(),
+                None,
+            ));
+            stream
+                .next()
+                .await
+                .expect("one item")
+                .expect_err("malformed 2xx payload must fail the stream")
+        }
+
+        // Non-auth: scrubbed and bounded, plain non-secret text visible.
+        let body = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "overloaded_error",
+                "message": format!("ANTH-SENTINEL {EXACT} {PATTERN}"),
+            },
+        })
+        .to_string();
+        let err = stream_err(vec![format!("data: {body} trailing-garbage\n\n")]).await;
+        assert_eq!(err.kind, ProviderErrorKind::Malformed);
+        assert!(err.message.contains("ANTH-SENTINEL"), "{}", err.message);
+        assert!(
+            err.message.len() <= faktor_provider::sanitize::MAX_ERROR_DIAGNOSTIC_BYTES + 128,
+            "diagnostic must stay bounded: {}",
+            err.message.len()
+        );
+        assert_no_secret(&err, &[]);
+
+        // Auth-shaped: the upstream payload is withheld entirely.
+        let body = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "authentication_error",
+                "message": format!("AUTH-ANTH-SENTINEL {EXACT} {PATTERN}"),
+            },
+        })
+        .to_string();
+        let err = stream_err(vec![format!("data: {body} trailing-garbage\n\n")]).await;
+        assert_eq!(err.kind, ProviderErrorKind::Malformed);
+        assert!(err.message.contains("withheld"), "{}", err.message);
+        assert_no_secret(&err, &["AUTH-ANTH-SENTINEL"]);
     }
 }

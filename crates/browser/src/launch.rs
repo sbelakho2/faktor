@@ -12,12 +12,15 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::AsyncBufReadExt;
 
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::time::Deadline;
+use faktor_fs::RootedDir;
 use faktor_terminal::{browser_env_spec, ProcessOwner, ProcessSupervisor, SpawnConfig};
 
 use crate::error::BrowserError;
@@ -34,6 +37,12 @@ pub struct LaunchOptions {
     /// Scratch dir used for HOME/TMPDIR/XDG so Chromium never reads the
     /// operator's real home.
     pub scratch_dir: PathBuf,
+    /// Anchored authority for the scratch base: every scratch directory is
+    /// created through it, so a symlink-swapped scratch entry is refused
+    /// instead of followed.
+    pub scratch_root: RootedDir,
+    /// The scratch base relative to `scratch_root`.
+    pub scratch_rel: PathBuf,
     /// The local egress broker address — the ONLY egress Chromium gets.
     pub proxy_addr: std::net::SocketAddr,
     pub owner_source: String,
@@ -176,7 +185,11 @@ pub fn resolve_executable(configured: Option<&Path>) -> Result<PathBuf, BrowserE
 }
 
 /// A supervised, launched browser child.
-#[derive(Debug, Clone)]
+///
+/// Ownership is explicit: an explicit [`LaunchedBrowser::kill`] (or
+/// [`LaunchedBrowser::disarm`]) disarms the `Drop` backstop, so a launch
+/// transaction that fails after the spawn can never leave a supervised
+/// Chromium alive, even on an error path that forgot to kill it.
 pub struct LaunchedBrowser {
     pub pid: u32,
     pub child_id: u64,
@@ -185,6 +198,20 @@ pub struct LaunchedBrowser {
     /// Bounded tail of the child's stderr (diagnostics only).
     pub stderr_tail: Vec<String>,
     pub started_ms: i64,
+    supervisor: Arc<ProcessSupervisor>,
+    armed: AtomicBool,
+}
+
+impl std::fmt::Debug for LaunchedBrowser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchedBrowser")
+            .field("pid", &self.pid)
+            .field("child_id", &self.child_id)
+            .field("owner", &self.owner)
+            .field("started_ms", &self.started_ms)
+            .field("armed", &self.armed.load(Ordering::SeqCst))
+            .finish()
+    }
 }
 
 impl LaunchedBrowser {
@@ -195,16 +222,107 @@ impl LaunchedBrowser {
             .any(|handle| handle.id == self.child_id)
     }
 
-    /// Whole-tree kill through the supervisor (never a raw `kill`).
+    /// Whole-tree kill through the supervisor (never a raw `kill`). Disarms
+    /// the `Drop` backstop.
     pub fn kill(&self, supervisor: &ProcessSupervisor, grace_ms: u64) -> Result<(), BrowserError> {
+        self.disarm();
         supervisor
             .kill(self.child_id, grace_ms)
             .map_err(|e| BrowserError::internal(format!("supervisor kill failed: {e}")))
+    }
+
+    /// Disarm the `Drop` backstop without killing (ownership was transferred
+    /// to another explicit teardown path).
+    pub fn disarm(&self) {
+        self.armed.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for LaunchedBrowser {
+    /// Backstop: a spawned child whose launch transaction failed must never
+    /// outlive its `LaunchedBrowser`. The kill is the supervisor's bounded
+    /// whole-tree terminate (never a raw signal), and every explicit path
+    /// disarms first so this is a no-op there.
+    fn drop(&mut self) {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            let _ = self.supervisor.kill(self.child_id, KILL_GRACE_MS);
+        }
     }
 }
 
 const STDERR_TAIL_LINES: usize = 40;
 const DEVTOOLS_PREFIX: &str = "DevTools listening on ws://";
+
+/// Validate the DevTools endpoint Chromium announced on stderr. The endpoint
+/// is attacker-influenced output, so it is parsed strictly and never handed
+/// to a dialer verbatim:
+///
+/// * scheme must be exactly `ws`;
+/// * no userinfo, no query, no fragment;
+/// * the host must be a loopback **literal** (`127.0.0.0/8` or `::1`);
+///   names such as `localhost` are refused (a name can be re-pointed between
+///   validation and dial);
+/// * the port must be explicit and non-zero;
+/// * the path must be the expected DevTools browser path
+///   (`/devtools/browser/<id>`).
+///
+/// Chromium legitimately announces exactly
+/// `ws://127.0.0.1:<port>/devtools/browser/<uuid>`, which this accepts.
+pub fn validate_devtools_ws_url(url: &str) -> Result<(), String> {
+    let Some(rest) = url.strip_prefix("ws://") else {
+        return Err("announced endpoint is not a ws:// URL".to_string());
+    };
+    if rest.contains('@') {
+        return Err("announced endpoint carries userinfo".to_string());
+    }
+    if rest.contains('?') || rest.contains('#') {
+        return Err("announced endpoint carries a query or fragment".to_string());
+    }
+    let Some((authority, path)) = rest.split_once('/') else {
+        return Err("announced endpoint has no DevTools path".to_string());
+    };
+    let (host, port) = split_authority(authority)
+        .ok_or_else(|| "announced endpoint has no explicit host:port".to_string())?;
+    if port == 0 {
+        return Err("announced endpoint uses port 0".to_string());
+    }
+    let address: std::net::IpAddr = host
+        .parse()
+        .map_err(|_| format!("announced endpoint host {host:?} is not an IP literal"))?;
+    if !address.is_loopback() {
+        return Err(format!(
+            "announced endpoint host {host:?} is not a loopback literal"
+        ));
+    }
+    let Some(id) = path.strip_prefix("devtools/browser/") else {
+        return Err(format!(
+            "announced endpoint path {path:?} is not a DevTools browser path"
+        ));
+    };
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("announced DevTools browser id is malformed".to_string());
+    }
+    Ok(())
+}
+
+/// Split `host:port` / `[v6]:port`; returns `None` without an explicit port.
+fn split_authority(authority: &str) -> Option<(&str, u16)> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        let port = tail.strip_prefix(':')?;
+        return Some((host, port.parse().ok()?));
+    }
+    let (host, port) = authority.rsplit_once(':')?;
+    if host.is_empty() || host.contains(':') {
+        return None;
+    }
+    Some((host, port.parse().ok()?))
+}
 
 /// Launches Chromium through the supervisor and waits for its DevTools
 /// endpoint.
@@ -313,7 +431,20 @@ impl ChromiumLauncher {
             let trimmed = line.trim().to_string();
             if let Some(rest) = trimmed.strip_prefix(DEVTOOLS_PREFIX) {
                 let url = format!("ws://{rest}");
-                break url;
+                match validate_devtools_ws_url(&url) {
+                    Ok(()) => break url,
+                    Err(detail) => {
+                        // The announced endpoint is hostile/malformed: kill
+                        // the child and never dial. The raw URL is not
+                        // echoed (it may carry attacker-chosen userinfo).
+                        self.kill_quietly(child_id);
+                        return Err(BrowserError::BrowserUnavailable {
+                            detail: format!(
+                                "chromium announced an unusable DevTools endpoint: {detail}"
+                            ),
+                        });
+                    }
+                }
             }
             if !trimmed.is_empty() {
                 if tail.len() >= STDERR_TAIL_LINES {
@@ -332,6 +463,8 @@ impl ChromiumLauncher {
             devtools_ws_url: ws_url,
             stderr_tail: tail,
             started_ms,
+            supervisor: self.supervisor.clone(),
+            armed: AtomicBool::new(true),
         })
     }
 
@@ -342,22 +475,37 @@ impl ChromiumLauncher {
 
 /// The exact environment entries the browser child gets on top of the
 /// allowlist: a scratch HOME and TMPDIR plus XDG homes, all inside the
-/// profile's scratch directory.
+/// profile's scratch directory and all created through the anchored
+/// [`RootedDir`] authority (a symlink swap fails typed instead of being
+/// followed).
 fn browser_scratch_env(options: &LaunchOptions) -> Result<Vec<(OsString, OsString)>, BrowserError> {
     let mut entries = Vec::new();
-    let mut dirs = vec![
-        ("HOME", options.scratch_dir.clone()),
-        ("TMPDIR", options.scratch_dir.join("tmp")),
-        ("XDG_CONFIG_HOME", options.scratch_dir.join("config")),
-        ("XDG_CACHE_HOME", options.scratch_dir.join("cache")),
-        ("XDG_DATA_HOME", options.scratch_dir.join("data")),
+    let dirs: [(&str, &str); 5] = [
+        ("HOME", ""),
+        ("TMPDIR", "tmp"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_CACHE_HOME", "cache"),
+        ("XDG_DATA_HOME", "data"),
     ];
-    for (name, dir) in dirs.drain(..) {
-        std::fs::create_dir_all(&dir).map_err(|e| {
-            BrowserError::profile(format!("cannot create browser scratch dir {dir:?}: {e}"))
+    for (name, sub) in dirs {
+        let rel = if sub.is_empty() {
+            options.scratch_rel.clone()
+        } else {
+            options.scratch_rel.join(sub)
+        };
+        options.scratch_root.create_dir_all(&rel).map_err(|e| {
+            BrowserError::profile(format!("cannot create browser scratch dir: {e}"))
         })?;
-        crate::profile::restrict_dir(&dir)?;
-        entries.push((OsString::from(name), OsString::from(dir)));
+        options
+            .scratch_root
+            .restrict_owner_only(&rel)
+            .map_err(|e| {
+                BrowserError::profile(format!("cannot restrict browser scratch dir: {e}"))
+            })?;
+        entries.push((
+            OsString::from(name),
+            OsString::from(options.scratch_root.join(&rel)),
+        ));
     }
     Ok(entries)
 }
@@ -387,11 +535,15 @@ mod tests {
     use super::*;
 
     fn options() -> LaunchOptions {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch_root = RootedDir::create(tmp.path()).unwrap();
         LaunchOptions {
             executable: PathBuf::from("/bin/true"),
             headless: true,
             profile_dir: PathBuf::from("/tmp/kp-profile"),
             scratch_dir: PathBuf::from("/tmp/kp-scratch"),
+            scratch_root,
+            scratch_rel: PathBuf::from("scratch"),
             proxy_addr: "127.0.0.1:34567".parse().unwrap(),
             owner_source: "example-source".to_string(),
             owner_profile: "procurement-cn".to_string(),
@@ -448,5 +600,40 @@ mod tests {
         assert_eq!(resolve_executable(Some(&exe)).unwrap(), exe);
         let err = resolve_executable(Some(&tmp.path().join("missing"))).unwrap_err();
         assert_eq!(err.code(), "browser_unavailable");
+    }
+
+    #[test]
+    fn devtools_endpoint_validation_only_accepts_literal_loopback() {
+        assert!(validate_devtools_ws_url("ws://127.0.0.1:9222/devtools/browser/abc-123").is_ok());
+        assert!(validate_devtools_ws_url("ws://127.8.9.10:1/devtools/browser/a").is_ok());
+        assert!(validate_devtools_ws_url("ws://[::1]:9222/devtools/browser/abc").is_ok());
+        for hostile in [
+            // Scheme.
+            "wss://127.0.0.1:9222/devtools/browser/x",
+            "http://127.0.0.1:9222/devtools/browser/x",
+            // Non-literal loopback or non-loopback literal.
+            "ws://localhost:9222/devtools/browser/x",
+            "ws://attacker.example:9222/devtools/browser/x",
+            "ws://128.0.0.1:9222/devtools/browser/x",
+            "ws://[::2]:9222/devtools/browser/x",
+            // Userinfo / query / fragment.
+            "ws://user:pass@127.0.0.1:9222/devtools/browser/x",
+            "ws://127.0.0.1:9222/devtools/browser/x?y=1",
+            "ws://127.0.0.1:9222/devtools/browser/x#frag",
+            // Ports.
+            "ws://127.0.0.1:0/devtools/browser/x",
+            "ws://127.0.0.1/devtools/browser/x",
+            "ws://[::1]/devtools/browser/x",
+            // Paths.
+            "ws://127.0.0.1:9222/devtools/page/x",
+            "ws://127.0.0.1:9222/",
+            "ws://127.0.0.1:9222/devtools/browser/",
+            "ws://127.0.0.1:9222/devtools/browser/a/b",
+        ] {
+            assert!(
+                validate_devtools_ws_url(hostile).is_err(),
+                "must be refused: {hostile}"
+            );
+        }
     }
 }

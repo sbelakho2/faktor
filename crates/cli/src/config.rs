@@ -12,6 +12,7 @@ use faktor_provider::catalog::{BillingOriginProvider, PricingOverrides};
 use faktor_provider::egress::HttpTransport;
 use faktor_provider::Provider;
 use faktor_sandbox::{NetworkGate, SandboxGuarantee, SandboxPolicy};
+use faktor_security::secret::SecretValue;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Config {
@@ -203,7 +204,7 @@ impl<'de> serde::Deserialize<'de> for CompletionCfg {
                                     "pr_program",
                                     "pr_args",
                                 ],
-                            ))
+                            ));
                         }
                     }
                 }
@@ -1974,7 +1975,7 @@ impl WorkersCfg {
             Some(other) => {
                 return Err(format!(
                     "workers: network {other:?} must be one of none|egress_restricted|full"
-                ))
+                ));
             }
         };
         let mut requirements = faktor_worker::JobRequirements {
@@ -2414,7 +2415,7 @@ impl WorkerNodeCfg {
             Some(other) => {
                 return Err(format!(
                     "worker_node: network {other:?} must be one of none|egress_restricted|full"
-                ))
+                ));
             }
         };
         let cpu_cores = if self.cpu_cores > 0 {
@@ -3052,12 +3053,26 @@ pub enum OpenAiApi {
     Responses,
 }
 
+/// The typed default of [`ProviderCfg::Ollama::allow_loopback`]: the local
+/// runtime's own documented endpoint is loopback.
+fn default_ollama_allow_loopback() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderCfg {
     Ollama {
         id: String,
         base_url: Option<String>,
+        /// Explicit loopback address-class rule for this LOCAL runtime: its
+        /// documented default endpoint is `http://127.0.0.1:11434`, so the
+        /// typed default is `true`. Set `false` to refuse loopback for this
+        /// entry. Never a global exception: every other special address
+        /// class (private, link-local/metadata, CGNAT, documentation, ...)
+        /// stays refused for every provider.
+        #[serde(default = "default_ollama_allow_loopback")]
+        allow_loopback: bool,
         #[serde(default)]
         pricing: Option<ProviderPricingCfg>,
     },
@@ -3072,18 +3087,39 @@ pub enum ProviderCfg {
         /// `chat`/`responses` always wins; any other value fails to parse.
         #[serde(default)]
         api: Option<OpenAiApi>,
+        /// Explicit loopback address-class rule (default `false`: a remote
+        /// endpoint whose host resolves onto loopback is a rebinding
+        /// signal). `true` is the deliberate opt-in for a local
+        /// OpenAI-compatible proxy/runtime. Only loopback can be opted
+        /// into; no other special class is ever allowed.
+        #[serde(default)]
+        allow_loopback: bool,
         #[serde(default)]
         pricing: Option<ProviderPricingCfg>,
     },
     Anthropic {
         id: String,
         api_key_env: Option<String>,
+        /// Explicit loopback address-class rule (default `false`: a remote
+        /// endpoint whose host resolves onto loopback is a rebinding
+        /// signal). `true` is the deliberate opt-in for a local
+        /// OpenAI-compatible proxy/runtime. Only loopback can be opted
+        /// into; no other special class is ever allowed.
+        #[serde(default)]
+        allow_loopback: bool,
         #[serde(default)]
         pricing: Option<ProviderPricingCfg>,
     },
     Google {
         id: String,
         api_key_env: Option<String>,
+        /// Explicit loopback address-class rule (default `false`: a remote
+        /// endpoint whose host resolves onto loopback is a rebinding
+        /// signal). `true` is the deliberate opt-in for a local
+        /// OpenAI-compatible proxy/runtime. Only loopback can be opted
+        /// into; no other special class is ever allowed.
+        #[serde(default)]
+        allow_loopback: bool,
         #[serde(default)]
         pricing: Option<ProviderPricingCfg>,
     },
@@ -3092,6 +3128,13 @@ pub enum ProviderCfg {
         profile: String,
         base_url: Option<String>,
         api_key_env: Option<String>,
+        /// Explicit loopback address-class rule (default `false`: a remote
+        /// endpoint whose host resolves onto loopback is a rebinding
+        /// signal). `true` is the deliberate opt-in for a local
+        /// OpenAI-compatible proxy/runtime. Only loopback can be opted
+        /// into; no other special class is ever allowed.
+        #[serde(default)]
+        allow_loopback: bool,
         #[serde(default)]
         pricing: Option<ProviderPricingCfg>,
     },
@@ -3099,6 +3142,13 @@ pub enum ProviderCfg {
         id: String,
         base_url: String,
         api_key_env: Option<String>,
+        /// Explicit loopback address-class rule (default `false`: a remote
+        /// endpoint whose host resolves onto loopback is a rebinding
+        /// signal). `true` is the deliberate opt-in for a local
+        /// OpenAI-compatible proxy/runtime. Only loopback can be opted
+        /// into; no other special class is ever allowed.
+        #[serde(default)]
+        allow_loopback: bool,
         #[serde(default)]
         pricing: Option<ProviderPricingCfg>,
     },
@@ -3305,6 +3355,34 @@ impl ProviderCfg {
         }
     }
 
+    /// The explicit loopback address-class rule this entry wires into its
+    /// egress transport: `true` ONLY when this entry's typed config expects
+    /// loopback (the local Ollama runtime by default, or a local
+    /// OpenAI-compatible proxy that opted in). Everything else stays
+    /// external-only; no other special address class is configurable.
+    pub fn allows_loopback(&self) -> bool {
+        match self {
+            ProviderCfg::Ollama { allow_loopback, .. }
+            | ProviderCfg::OpenAi { allow_loopback, .. }
+            | ProviderCfg::Anthropic { allow_loopback, .. }
+            | ProviderCfg::Google { allow_loopback, .. }
+            | ProviderCfg::DeepSeek { allow_loopback, .. }
+            | ProviderCfg::Gateway { allow_loopback, .. } => *allow_loopback,
+        }
+    }
+
+    /// The configured endpoint URL of this entry, when it has one (the
+    /// config-load destination-class validation inspects literal IPs here).
+    fn configured_base_url(&self) -> Option<&str> {
+        match self {
+            ProviderCfg::Ollama { base_url, .. } => base_url.as_deref(),
+            ProviderCfg::OpenAi { base_url, .. } => Some(base_url.as_str()),
+            ProviderCfg::Anthropic { .. } | ProviderCfg::Google { .. } => None,
+            ProviderCfg::DeepSeek { base_url, .. } => base_url.as_deref(),
+            ProviderCfg::Gateway { base_url, .. } => Some(base_url.as_str()),
+        }
+    }
+
     /// The transport family of this entry (used to gate the pricing
     /// override surface: local runtimes refuse override tables).
     fn kind(&self) -> &'static str {
@@ -3410,12 +3488,91 @@ impl ProviderCfg {
         }
     }
 
+    /// Config-load destination-class validation for a LITERAL base_url:
+    /// a non-global literal endpoint is reachable only when the operator
+    /// explicitly named it — either as an exact `[sandbox] network` rule
+    /// for that destination or, for loopback, through this entry's
+    /// `allow_loopback` rule (which also covers a NAME base_url that
+    /// resolves onto loopback at connect time). Every other non-global
+    /// literal is a typed startup error instead of a confusing runtime
+    /// denial. Hostname base URLs cannot be judged without DNS and are
+    /// enforced at connect time by the central resolver.
+    fn validate_endpoint_address_class(
+        &self,
+        sandbox: Option<&faktor_security::destination::DestinationPolicy>,
+    ) -> Result<(), String> {
+        let Some(raw) = self.configured_base_url() else {
+            return Ok(());
+        };
+        // Best-effort authority extraction: URL shape validation happens
+        // where the adapter is built; this method only classifies a LITERAL
+        // host, and anything that does not reduce to one falls through.
+        let Some((scheme, rest)) = raw.split_once("://") else {
+            return Ok(());
+        };
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+        let authority = authority.rsplit('@').next().unwrap_or(authority);
+        let (host, port_text) = if let Some(bracketed) = authority.strip_prefix('[') {
+            match bracketed.split_once(']') {
+                Some((host, tail)) => (host, tail.strip_prefix(':')),
+                None => return Ok(()),
+            }
+        } else {
+            match authority.split_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (authority, None),
+            }
+        };
+        let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+            return Ok(());
+        };
+        let port: Option<u16> = port_text.and_then(|p| p.parse().ok());
+        let class = faktor_provider::resolver::AddressClass::classify(ip);
+        if class == faktor_provider::resolver::AddressClass::Global {
+            return Ok(());
+        }
+        // An exact allowlist entry for this destination is the operator
+        // explicitly naming the literal, so it admits the destination.
+        let (is_ipv4, octets) = match ip {
+            std::net::IpAddr::V4(v4) => (true, Some(v4.octets())),
+            std::net::IpAddr::V6(_) => (false, None),
+        };
+        // No installed allowlist (allow-all gate) admits every destination,
+        // so a literal is admitted too.
+        let Some(sandbox) = sandbox else {
+            return Ok(());
+        };
+        if let Ok(target) = faktor_security::destination::RequestTarget::from_parts(
+            Some(scheme),
+            host,
+            port,
+            is_ipv4,
+            octets,
+        ) {
+            if matches!(
+                target.check_against(sandbox),
+                faktor_security::destination::Decision::Allowed
+            ) {
+                return Ok(());
+            }
+        }
+        if class == faktor_provider::resolver::AddressClass::Loopback && self.allows_loopback() {
+            return Ok(());
+        }
+        Err(format!(
+            "base_url is a {class} address, which the egress address policy refuses unless \
+             this entry sets `\"allow_loopback\": true` (loopback only) or the [sandbox] \
+             network section allowlists that exact destination"
+        ))
+    }
+
     /// The configured key read from its env var (never stored in the file;
     /// the runtime never logs or persists the value). `None` when the entry
-    /// carries no key env or the env var is unset. Exposed for the daemon's
-    /// outbound secret registry, which registers the SAME values the
-    /// adapter builds from.
-    pub(crate) fn key(&self) -> Option<String> {
+    /// carries no key env or the env var is unset. Wrapped in
+    /// [`SecretValue`] (redacted `Debug`, zeroized on drop, explicit
+    /// `expose()`); exposed for the daemon's outbound secret registry,
+    /// which registers the SAME values the adapter builds from.
+    pub(crate) fn key(&self) -> Option<SecretValue> {
         let env = match self {
             ProviderCfg::Ollama { .. } => return None,
             ProviderCfg::OpenAi { api_key_env, .. }
@@ -3424,7 +3581,9 @@ impl ProviderCfg {
             | ProviderCfg::DeepSeek { api_key_env, .. }
             | ProviderCfg::Gateway { api_key_env, .. } => api_key_env,
         };
-        env.as_ref().and_then(|name| std::env::var(name).ok())
+        env.as_ref()
+            .and_then(|name| std::env::var(name).ok())
+            .map(SecretValue::new)
     }
 
     /// Build the adapter for this config entry over an explicit egress
@@ -3535,7 +3694,7 @@ impl ProviderCfg {
                     id: "gateway".into(),
                     base_url: base_url.clone(),
                     api_key: self.key(),
-                    extra_headers: vec![],
+                    extra_headers: faktor_provider::config::ExtraHeaders::empty(),
                     route_prefixes: vec![],
                     default_caps: ModelCapabilities::default(),
                 };
@@ -3600,7 +3759,8 @@ impl Config {
     /// override tables on local runtimes).
     pub fn validate(&self) -> Result<(), String> {
         self.mcp_servers()?;
-        self.sandbox_policy()
+        let sandbox = self
+            .sandbox_policy()
             .map_err(|e| format!("sandbox config: {e}"))?;
         let mut seen = std::collections::HashSet::new();
         let mut dupes: Vec<String> = Vec::new();
@@ -3617,6 +3777,8 @@ impl Config {
         }
         for p in &self.providers {
             p.validate_pricing()
+                .map_err(|e| format!("provider {}: {e}", p.id()))?;
+            p.validate_endpoint_address_class(sandbox.network.installed())
                 .map_err(|e| format!("provider {}: {e}", p.id()))?;
         }
         if let Some(embeddings) = &self.embeddings {
@@ -4540,11 +4702,13 @@ mod tests {
                     id: "dup".into(),
                     base_url: None,
                     pricing: None,
+                    allow_loopback: true,
                 },
                 ProviderCfg::Ollama {
                     id: "other".into(),
                     base_url: None,
                     pricing: None,
+                    allow_loopback: true,
                 },
                 ProviderCfg::OpenAi {
                     id: "dup".into(),
@@ -4552,6 +4716,7 @@ mod tests {
                     api_key_env: None,
                     api: None,
                     pricing: None,
+                    allow_loopback: true,
                 },
             ],
             ..Default::default()
@@ -4570,11 +4735,114 @@ mod tests {
                     api_key_env: None,
                     api: None,
                     pricing: None,
+                    allow_loopback: true,
                 },
             ],
             ..Default::default()
         };
         cfg.validate().expect("distinct provider ids are fine");
+    }
+
+    /// The explicit loopback rule and the never-permitted address classes
+    /// are enforced at config load for LITERAL endpoint addresses.
+    #[test]
+    fn endpoint_address_class_requires_explicit_naming_of_non_global_literals() {
+        let mk = |base: &str, allow_loopback: bool, rows: Option<Vec<String>>| Config {
+            providers: vec![ProviderCfg::OpenAi {
+                id: "p".into(),
+                base_url: base.into(),
+                api_key_env: None,
+                api: None,
+                allow_loopback,
+                pricing: None,
+            }],
+            sandbox: SandboxCfg {
+                network: rows,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // A loopback literal without the explicit rule or an exact sandbox
+        // rule is refused at load.
+        let err = mk("http://127.0.0.1:11434", false, None)
+            .validate()
+            .expect_err("loopback literal without any explicit naming");
+        assert!(err.contains("allow_loopback"), "{err}");
+        // The entry's explicit rule admits it.
+        mk("http://127.0.0.1:11434", true, None)
+            .validate()
+            .expect("the explicit entry rule admits loopback");
+        // Naming the exact destination in [sandbox] network is equally
+        // explicit (the operator wrote the literal address).
+        mk(
+            "http://127.0.0.1:11434",
+            false,
+            Some(vec!["http://127.0.0.1:11434".to_string()]),
+        )
+        .validate()
+        .expect("an exact sandbox rule admits the literal");
+        let err = mk("http://[::1]:11434", false, None)
+            .validate()
+            .expect_err("ipv6 loopback without any explicit naming");
+        assert!(err.contains("loopback"), "{err}");
+        mk("http://[::1]:11434", true, None)
+            .validate()
+            .expect("the explicit entry rule admits ipv6 loopback");
+        // Metadata / RFC1918 / link-local literals are refused without an
+        // exact sandbox rule; the loopback rule never covers them.
+        for base in [
+            "http://169.254.169.254",
+            "http://10.0.0.1",
+            "http://192.168.1.1",
+            "http://100.64.0.1",
+        ] {
+            let err = mk(base, true, None)
+                .validate()
+                .expect_err("special literal without an exact rule");
+            let flat = err.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(flat.contains("refuses unless"), "{base}: {err}");
+        }
+        // A globally routable literal and a hostname need no rule (a
+        // hostname is class-checked at connect time by the resolver).
+        mk("https://93.184.216.34", false, None)
+            .validate()
+            .expect("global literal");
+        mk("https://api.example.com", false, None)
+            .validate()
+            .expect("hostname");
+    }
+
+    /// Serde defaults wire the explicit loopback rule: the LOCAL Ollama
+    /// runtime defaults to `true` (its documented endpoint is loopback);
+    /// every remote vendor defaults to `false`.
+    #[test]
+    fn loopback_rule_defaults_are_typed_per_variant() {
+        let ollama: ProviderCfg = serde_json::from_value(serde_json::json!({
+            "kind": "ollama",
+            "id": "local",
+        }))
+        .unwrap();
+        assert!(ollama.allows_loopback(), "Ollama is the local runtime");
+        let open_ai: ProviderCfg = serde_json::from_value(serde_json::json!({
+            "kind": "open_ai",
+            "id": "remote",
+            "base_url": "https://api.example.com",
+        }))
+        .unwrap();
+        assert!(!open_ai.allows_loopback(), "remote defaults external-only");
+        let anthropic: ProviderCfg = serde_json::from_value(serde_json::json!({
+            "kind": "anthropic",
+            "id": "remote",
+        }))
+        .unwrap();
+        assert!(!anthropic.allows_loopback());
+        // The rule is a strict bool; a string is a config error.
+        assert!(serde_json::from_value::<ProviderCfg>(serde_json::json!({
+            "kind": "ollama",
+            "id": "local",
+            "allow_loopback": "yes",
+        }))
+        .is_err());
     }
 
     #[test]
@@ -4662,6 +4930,7 @@ mod tests {
                 id: "o".into(),
                 base_url: None,
                 pricing: None,
+                allow_loopback: true,
             }
             .openai_family(),
             None
@@ -4707,6 +4976,7 @@ mod tests {
             api_key_env: None,
             api,
             pricing: None,
+            allow_loopback: true,
         };
         let request = || GenericAgentRequest {
             model: "m".into(),
@@ -5006,6 +5276,7 @@ mod tests {
                 output_micro_usd_per_million_tokens: Some(60_000_000),
                 ..Default::default()
             }),
+            allow_loopback: true,
         };
         let e = ollama
             .validate_pricing()
@@ -5063,8 +5334,12 @@ mod tests {
             api_key_env: Some("KP_TEST_KEY".into()),
             api: None,
             pricing: None,
+            allow_loopback: true,
         };
-        assert_eq!(cfg.key().as_deref(), Some("secret-value"));
+        assert_eq!(
+            cfg.key().as_ref().map(SecretValue::expose),
+            Some("secret-value")
+        );
         std::env::remove_var("KP_TEST_KEY");
         assert_eq!(
             cfg.key(),
@@ -5079,6 +5354,7 @@ mod tests {
             id: "ollama".into(),
             base_url: None,
             pricing: None,
+            allow_loopback: true,
         };
         assert_eq!(cfg.id(), "ollama");
     }
@@ -5097,6 +5373,7 @@ mod tests {
                 api_key_env: None,
                 api: None,
                 pricing: None,
+                allow_loopback: true,
             };
             registry
                 .try_register(cfg.build(open_transport()).unwrap())
@@ -5131,6 +5408,7 @@ mod tests {
                 base_url: base.map(|b| b.to_string()),
                 api_key_env: None,
                 pricing: None,
+                allow_loopback: true,
             };
             let provider = cfg
                 .build(open_transport())
@@ -5147,6 +5425,7 @@ mod tests {
             base_url: None,
             api_key_env: None,
             pricing: None,
+            allow_loopback: true,
         };
         assert!(cfg.build(open_transport()).is_err());
         // A gateway without an explicit endpoint is refused: the config
@@ -5157,6 +5436,7 @@ mod tests {
             base_url: None,
             api_key_env: None,
             pricing: None,
+            allow_loopback: true,
         };
         let err = cfg
             .build(open_transport())
@@ -5180,6 +5460,7 @@ mod tests {
             api_key_env: None,
             api: None,
             pricing: None,
+            allow_loopback: true,
         };
         let official_openai_slash = ProviderCfg::OpenAi {
             id: "a2".into(),
@@ -5187,6 +5468,7 @@ mod tests {
             api_key_env: None,
             api: None,
             pricing: None,
+            allow_loopback: true,
         };
         let custom_openai = ProviderCfg::OpenAi {
             id: "corp-proxy".into(),
@@ -5194,6 +5476,7 @@ mod tests {
             api_key_env: None,
             api: None,
             pricing: None,
+            allow_loopback: true,
         };
         assert_eq!(
             official_openai.billing_origin(),
@@ -5213,6 +5496,7 @@ mod tests {
                 id: "anthropic".into(),
                 api_key_env: None,
                 pricing: None,
+                allow_loopback: true,
             }
             .billing_origin(),
             BillingOrigin::OfficialAnthropic
@@ -5222,6 +5506,7 @@ mod tests {
                 id: "google".into(),
                 api_key_env: None,
                 pricing: None,
+                allow_loopback: true,
             }
             .billing_origin(),
             BillingOrigin::OfficialGoogle
@@ -5232,6 +5517,7 @@ mod tests {
             base_url: base.map(str::to_string),
             api_key_env: None,
             pricing: None,
+            allow_loopback: true,
         };
         assert_eq!(
             deepseek("direct", None).billing_origin(),
@@ -5259,6 +5545,7 @@ mod tests {
                 base_url: "https://gateway.example.com".into(),
                 api_key_env: None,
                 pricing: None,
+                allow_loopback: true,
             }
             .billing_origin(),
             BillingOrigin::Gateway
@@ -5268,6 +5555,7 @@ mod tests {
                 id: "ollama".into(),
                 base_url: None,
                 pricing: None,
+                allow_loopback: true,
             }
             .billing_origin(),
             BillingOrigin::Local
@@ -5280,6 +5568,7 @@ mod tests {
             api_key_env: None,
             api: None,
             pricing: None,
+            allow_loopback: true,
         };
         assert_ne!(custom_openai.id(), same_custom_other_id.id());
         assert_eq!(
@@ -5303,6 +5592,7 @@ mod tests {
             api_key_env: None,
             api: None,
             pricing: None,
+            allow_loopback: true,
         }
         .build(open_transport())
         .unwrap();
@@ -5347,6 +5637,7 @@ mod tests {
             id: "anthropic".into(),
             api_key_env: None,
             pricing: None,
+            allow_loopback: true,
         }
         .build(open_transport())
         .unwrap();
@@ -5440,7 +5731,7 @@ mod tests {
     /// (the daemon always passes the policy-checked transport built from
     /// its SandboxPolicy; these tests never exercise egress).
     fn open_transport() -> Arc<dyn HttpTransport> {
-        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::with_policy(None))
+        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::permissive())
     }
 
     #[test]

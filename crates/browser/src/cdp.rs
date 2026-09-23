@@ -6,16 +6,17 @@
 //! fails every in-flight command typed (never a hang); the supervisor's
 //! registry remains the authority on whether the child actually died.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex, Notify};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
 
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::time::Deadline;
@@ -23,13 +24,25 @@ use faktor_core::time::Deadline;
 use crate::error::BrowserError;
 use crate::timeutil::deadline_instant;
 
+/// Absolute ceilings for CDP capacities. A configured bound above these (or
+/// zero) is a configuration error, never a silently unbounded stream.
+pub const CDP_MAX_MESSAGE_CEILING_BYTES: usize = 64 * 1024 * 1024;
+pub const CDP_MAX_CAPACITY_CEILING: usize = 65_536;
+
 /// CDP client bounds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CdpConfig {
-    /// Maximum accepted inbound message size (CDP events/bodies).
+    /// Maximum accepted inbound message size (CDP events/bodies). Applied at
+    /// the WebSocket layer (`max_message_size`/`max_frame_size`) AND as an
+    /// application-level check (defense in depth).
     pub max_message_bytes: usize,
-    /// Bounded event fan-out capacity; a lagging consumer is told it lagged.
+    /// Bounded observation fan-out capacity; a lagging consumer is told it
+    /// lagged.
     pub event_capacity: usize,
+    /// Bounded per-session queue for critical events. On overflow the
+    /// session is failed: the page must never continue with unknowable
+    /// state.
+    pub critical_event_capacity: usize,
 }
 
 impl Default for CdpConfig {
@@ -37,8 +50,152 @@ impl Default for CdpConfig {
         Self {
             max_message_bytes: 8 * 1024 * 1024,
             event_capacity: 2048,
+            critical_event_capacity: 256,
         }
     }
+}
+
+impl CdpConfig {
+    /// Zero, inverted or absurd capacities are typed configuration errors.
+    pub fn validate(&self) -> Result<(), BrowserError> {
+        if self.max_message_bytes == 0 || self.max_message_bytes > CDP_MAX_MESSAGE_CEILING_BYTES {
+            return Err(BrowserError::invalid_config(format!(
+                "cdp max_message_bytes must be 1..={CDP_MAX_MESSAGE_CEILING_BYTES}"
+            )));
+        }
+        if self.event_capacity == 0 || self.event_capacity > CDP_MAX_CAPACITY_CEILING {
+            return Err(BrowserError::invalid_config(format!(
+                "cdp event_capacity must be 1..={CDP_MAX_CAPACITY_CEILING}"
+            )));
+        }
+        if self.critical_event_capacity == 0
+            || self.critical_event_capacity > CDP_MAX_CAPACITY_CEILING
+        {
+            return Err(BrowserError::invalid_config(format!(
+                "cdp critical_event_capacity must be 1..={CDP_MAX_CAPACITY_CEILING}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// How a CDP event must be handled for loss safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventClass {
+    /// Loss leaves the page in an unknowable state (a paused request that is
+    /// never resumed, a missed termination or lifecycle transition). These
+    /// travel on a dedicated bounded per-session queue.
+    Critical,
+    /// Observation-only events (network records, downloads, JS exceptions).
+    /// They may stay lossy, but a gap is recorded and anything needing a
+    /// complete history refuses to answer afterwards.
+    Observation,
+}
+
+/// Classify one CDP event method.
+pub fn classify_event(method: &str) -> EventClass {
+    match method {
+        "Fetch.requestPaused"
+        | "Target.targetCrashed"
+        | "Target.detachedFromTarget"
+        | "Inspector.detached"
+        | "Page.frameNavigated"
+        | "Page.domContentEventFired"
+        | "Page.loadEventFired" => EventClass::Critical,
+        _ => EventClass::Observation,
+    }
+}
+
+/// Why a per-session critical event stream stopped being usable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EventStreamError {
+    /// The bounded queue overflowed: the session's state is unknowable.
+    Lagged { skipped: u64 },
+    /// The client closed.
+    Closed,
+}
+
+struct CriticalState {
+    queue: VecDeque<CdpEvent>,
+    skipped: u64,
+    failed: bool,
+    closed: bool,
+}
+
+/// A bounded, per-session queue for critical events. Overflow latches the
+/// queue failed (all pending events are abandoned) and wakes the consumer
+/// with an explicit lag; the stream never silently continues.
+pub(crate) struct CriticalQueue {
+    capacity: usize,
+    state: Mutex<CriticalState>,
+    notify: Notify,
+}
+
+impl CriticalQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            state: Mutex::new(CriticalState {
+                queue: VecDeque::new(),
+                skipped: 0,
+                failed: false,
+                closed: false,
+            }),
+            notify: Notify::new(),
+        }
+    }
+
+    fn push(&self, event: CdpEvent) {
+        let mut state = self.state.lock().unwrap();
+        if state.failed {
+            return;
+        }
+        if state.queue.len() >= self.capacity {
+            // Abandon every queued event plus this one: the session state is
+            // unknowable from here on.
+            state.skipped = state.queue.len() as u64 + 1;
+            state.queue.clear();
+            state.failed = true;
+        } else {
+            state.queue.push_back(event);
+        }
+        drop(state);
+        self.notify.notify_one();
+    }
+
+    fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.notify.notify_one();
+    }
+
+    pub(crate) async fn recv(&self) -> Result<CdpEvent, EventStreamError> {
+        loop {
+            // A permit is stored by `notify_one`, so a push between the check
+            // and the await can never be lost.
+            let notified = self.notify.notified();
+            {
+                let mut state = self.state.lock().unwrap();
+                if state.failed {
+                    return Err(EventStreamError::Lagged {
+                        skipped: state.skipped.max(1),
+                    });
+                }
+                if let Some(event) = state.queue.pop_front() {
+                    return Ok(event);
+                }
+                if state.closed {
+                    return Err(EventStreamError::Closed);
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+/// The two event streams of one attached session.
+pub(crate) struct SessionEvents {
+    pub(crate) critical: Arc<CriticalQueue>,
+    pub(crate) observations: broadcast::Receiver<CdpEvent>,
 }
 
 /// One CDP event (`method` + `params`), routed to its session when the
@@ -64,6 +221,7 @@ struct CdpInner {
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, oneshot::Sender<CdpOutcome>>>,
     events: broadcast::Sender<CdpEvent>,
+    session_critical: Mutex<HashMap<String, Arc<CriticalQueue>>>,
     closed: AtomicBool,
     closed_reason: Mutex<Option<String>>,
     writer: AsyncMutex<Option<WsSink>>,
@@ -83,6 +241,9 @@ impl CdpInner {
                 *slot = Some(reason);
             }
         }
+        for queue in self.session_critical.lock().unwrap().values() {
+            queue.close();
+        }
         let pending: Vec<(u64, oneshot::Sender<CdpOutcome>)> = {
             let mut map = self.pending.lock().unwrap();
             map.drain().collect()
@@ -93,6 +254,15 @@ impl CdpInner {
                 message: "cdp connection closed".to_string(),
             });
         }
+    }
+
+    fn critical_queue(&self, session: &str) -> Arc<CriticalQueue> {
+        self.session_critical
+            .lock()
+            .unwrap()
+            .entry(session.to_string())
+            .or_insert_with(|| Arc::new(CriticalQueue::new(self.config.critical_event_capacity)))
+            .clone()
     }
 }
 
@@ -113,25 +283,35 @@ impl std::fmt::Debug for CdpClient {
 
 impl CdpClient {
     /// Connect to a `ws://` DevTools endpoint. Cancellation and deadline are
-    /// honored during the handshake.
+    /// honored during the handshake. The URL is revalidated here (defense in
+    /// depth: only a loopback DevTools browser endpoint is ever dialed), and
+    /// the configured message bound is applied at the WebSocket layer as
+    /// well as in the application checks.
     pub async fn connect(
         ws_url: &str,
         cancel: &CancellationToken,
         deadline: Deadline,
         config: CdpConfig,
     ) -> Result<Self, BrowserError> {
+        config.validate()?;
+        crate::launch::validate_devtools_ws_url(ws_url)
+            .map_err(|detail| BrowserError::cdp(format!("refusing cdp endpoint: {detail}")))?;
         let (events, _) = broadcast::channel(config.event_capacity.max(1));
         let inner = Arc::new(CdpInner {
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             events,
+            session_critical: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             closed_reason: Mutex::new(None),
             writer: AsyncMutex::new(None),
             reader: AsyncMutex::new(None),
             config: config.clone(),
         });
-        let connect = connect_async(ws_url);
+        let ws_config = WebSocketConfig::default()
+            .max_message_size(Some(config.max_message_bytes))
+            .max_frame_size(Some(config.max_message_bytes));
+        let connect = connect_async_with_config(ws_url, Some(ws_config), false);
         tokio::pin!(connect);
         let (ws, _response) = tokio::select! {
             biased;
@@ -237,10 +417,23 @@ impl CdpClient {
         }
     }
 
-    /// Subscribe to CDP events. A lagging subscriber observes `Lagged` and
-    /// must resynchronize (bounded fan-out, never unbounded buffering).
+    /// Subscribe to the observation (non-critical) event fan-out. A lagging
+    /// subscriber observes `Lagged` and must record the gap (bounded
+    /// fan-out, never unbounded buffering).
     pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {
         self.inner.events.subscribe()
+    }
+
+    /// Subscribe to one attached session's event streams: a dedicated
+    /// bounded critical queue plus the shared observation fan-out. Critical
+    /// events (paused requests, target/session termination, lifecycle
+    /// transitions) are delivered exactly once through the queue and never
+    /// through the lossy broadcast.
+    pub(crate) fn subscribe_session(&self, session_id: &str) -> SessionEvents {
+        SessionEvents {
+            critical: self.inner.critical_queue(session_id),
+            observations: self.inner.events.subscribe(),
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -338,17 +531,43 @@ fn route_message(value: Value, inner: &Arc<CdpInner>) {
     let Some(method) = value.get("method").and_then(Value::as_str) else {
         return;
     };
+    let params = value.get("params").cloned().unwrap_or(Value::Null);
+    let session_id = value
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let event = CdpEvent {
-        session_id: value
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        session_id: session_id.clone(),
         method: method.to_string(),
-        params: value.get("params").cloned().unwrap_or(Value::Null),
+        params: params.clone(),
     };
-    // A full broadcast channel drops for the slowest receiver only; the
-    // send error here means "no subscribers", which is not an error.
-    let _ = inner.events.send(event);
+    match classify_event(method) {
+        EventClass::Critical => {
+            // Session-scoped critical events go to their session's bounded
+            // queue only: never the lossy broadcast. `Target.detachedFromTarget`
+            // arrives on the parent session and names the dying session in
+            // its params; route it to that session.
+            let key = match method {
+                "Target.detachedFromTarget" => params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or(session_id),
+                _ => session_id,
+            };
+            if let Some(key) = key {
+                inner.critical_queue(&key).push(event);
+            } else {
+                tracing::debug!(method = %method, "cdp: browser-level critical event has no session");
+            }
+        }
+        EventClass::Observation => {
+            // A full broadcast channel drops for the slowest receiver only;
+            // the send error here means "no subscribers", which is not an
+            // error.
+            let _ = inner.events.send(event);
+        }
+    }
 }
 
 /// Await a CDP command with a small convenience timeout derived from a
@@ -373,10 +592,257 @@ pub async fn send_with_timeout(
 mod tests {
     use super::*;
 
+    fn inner(config: CdpConfig) -> Arc<CdpInner> {
+        let (events, _) = broadcast::channel(config.event_capacity.max(1));
+        Arc::new(CdpInner {
+            next_id: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            events,
+            session_critical: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+            closed_reason: Mutex::new(None),
+            writer: AsyncMutex::new(None),
+            reader: AsyncMutex::new(None),
+            config,
+        })
+    }
+
     #[test]
     fn cdp_config_defaults_are_bounded() {
         let config = CdpConfig::default();
         assert!(config.max_message_bytes > 0);
         assert!(config.event_capacity > 0);
+        assert!(config.critical_event_capacity > 0);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn cdp_config_refuses_zero_and_absurd_capacities() {
+        for bad in [
+            CdpConfig {
+                max_message_bytes: 0,
+                ..CdpConfig::default()
+            },
+            CdpConfig {
+                max_message_bytes: CDP_MAX_MESSAGE_CEILING_BYTES + 1,
+                ..CdpConfig::default()
+            },
+            CdpConfig {
+                event_capacity: 0,
+                ..CdpConfig::default()
+            },
+            CdpConfig {
+                event_capacity: CDP_MAX_CAPACITY_CEILING + 1,
+                ..CdpConfig::default()
+            },
+            CdpConfig {
+                critical_event_capacity: 0,
+                ..CdpConfig::default()
+            },
+            CdpConfig {
+                critical_event_capacity: CDP_MAX_CAPACITY_CEILING + 1,
+                ..CdpConfig::default()
+            },
+        ] {
+            let error = bad.validate().expect_err("must be a configuration error");
+            assert_eq!(error.code(), "invalid_config", "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn event_classification_separates_critical_from_observation() {
+        for critical in [
+            "Fetch.requestPaused",
+            "Target.targetCrashed",
+            "Target.detachedFromTarget",
+            "Inspector.detached",
+            "Page.frameNavigated",
+            "Page.domContentEventFired",
+            "Page.loadEventFired",
+        ] {
+            assert_eq!(classify_event(critical), EventClass::Critical, "{critical}");
+        }
+        for observation in [
+            "Network.requestWillBeSent",
+            "Network.responseReceived",
+            "Browser.downloadWillBegin",
+            "Runtime.exceptionThrown",
+            "Unknown.method",
+        ] {
+            assert_eq!(
+                classify_event(observation),
+                EventClass::Observation,
+                "{observation}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn critical_queue_overflow_latches_and_reports_the_lag() {
+        let queue = CriticalQueue::new(2);
+        queue.push(CdpEvent {
+            session_id: Some("s1".into()),
+            method: "Fetch.requestPaused".into(),
+            params: json!({"requestId": "r1"}),
+        });
+        queue.push(CdpEvent {
+            session_id: Some("s1".into()),
+            method: "Fetch.requestPaused".into(),
+            params: json!({"requestId": "r2"}),
+        });
+        // Third event: overflow abandons both queued events plus itself.
+        queue.push(CdpEvent {
+            session_id: Some("s1".into()),
+            method: "Fetch.requestPaused".into(),
+            params: json!({"requestId": "r3"}),
+        });
+        let error = queue.recv().await.expect_err("overflow must latch");
+        assert_eq!(error, EventStreamError::Lagged { skipped: 3 });
+        // The lag is sticky: the stream never silently continues.
+        assert_eq!(
+            queue.recv().await.expect_err("sticky lag"),
+            EventStreamError::Lagged { skipped: 3 }
+        );
+    }
+
+    #[tokio::test]
+    async fn critical_events_never_ride_the_lossy_broadcast() {
+        let config = CdpConfig {
+            event_capacity: 8,
+            critical_event_capacity: 4,
+            ..CdpConfig::default()
+        };
+        let inner = inner(config);
+        let queue = inner.critical_queue("s1");
+        let mut observations = inner.events.subscribe();
+        route_message(
+            json!({
+                "method": "Fetch.requestPaused",
+                "sessionId": "s1",
+                "params": {"requestId": "r1"}
+            }),
+            &inner,
+        );
+        route_message(
+            json!({
+                "method": "Network.requestWillBeSent",
+                "sessionId": "s1",
+                "params": {"requestId": "r1"}
+            }),
+            &inner,
+        );
+        let critical = queue.recv().await.expect("critical event delivered");
+        assert_eq!(critical.method, "Fetch.requestPaused");
+        let observation = observations.recv().await.expect("observation delivered");
+        assert_eq!(observation.method, "Network.requestWillBeSent");
+        // The critical event is not on the broadcast: the next message is the
+        // only observation event.
+        route_message(
+            json!({
+                "method": "Network.loadingFinished",
+                "sessionId": "s1",
+                "params": {"requestId": "r1"}
+            }),
+            &inner,
+        );
+        let next = observations.recv().await.expect("second observation");
+        assert_eq!(next.method, "Network.loadingFinished");
+    }
+
+    #[tokio::test]
+    async fn detached_target_is_routed_to_the_dying_session() {
+        let config = CdpConfig {
+            critical_event_capacity: 4,
+            ..CdpConfig::default()
+        };
+        let inner = inner(config);
+        let queue = inner.critical_queue("dying");
+        route_message(
+            json!({
+                "method": "Target.detachedFromTarget",
+                "params": {"sessionId": "dying", "targetId": "t1"}
+            }),
+            &inner,
+        );
+        let event = queue.recv().await.expect("routed by params.sessionId");
+        assert_eq!(event.method, "Target.detachedFromTarget");
+    }
+
+    #[tokio::test]
+    async fn oversized_inbound_messages_close_the_transport_at_the_ws_limit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let oversized = "x".repeat(4096);
+            let _ = ws.send(Message::text(oversized)).await;
+            // Keep the socket open so the client-side cap (not EOF) is what
+            // closes the connection.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let config = CdpConfig {
+            max_message_bytes: 1024,
+            ..CdpConfig::default()
+        };
+        let client = CdpClient::connect(
+            &format!("ws://{addr}/devtools/browser/limit-test"),
+            &CancellationToken::new(),
+            Deadline::now_plus(&faktor_core::time::SystemClock, 5_000),
+            config,
+        )
+        .await
+        .expect("handshake succeeds");
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !client.is_closed() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            client.is_closed(),
+            "a message over the WS-layer limit must close the transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_refuses_hostile_endpoints_before_dialing() {
+        for hostile in [
+            "wss://127.0.0.1:9222/devtools/browser/x",
+            "ws://attacker.example:9222/devtools/browser/x",
+            "ws://localhost:9222/devtools/browser/x",
+            "ws://user:pass@127.0.0.1:9222/devtools/browser/x",
+            "ws://127.0.0.1:0/devtools/browser/x",
+            "ws://127.0.0.1:9222/devtools/page/x",
+            "ws://127.0.0.1:9222/devtools/browser/x?y=1",
+        ] {
+            let error = CdpClient::connect(
+                hostile,
+                &CancellationToken::new(),
+                Deadline::now_plus(&faktor_core::time::SystemClock, 1_000),
+                CdpConfig::default(),
+            )
+            .await
+            .expect_err("hostile endpoint must be refused");
+            assert!(matches!(
+                error,
+                BrowserError::Cdp { .. } | BrowserError::InvalidConfig { .. }
+            ));
+        }
+        // Zero/absurd caps are configuration errors, not a dial.
+        let error = CdpClient::connect(
+            "ws://127.0.0.1:9222/devtools/browser/x",
+            &CancellationToken::new(),
+            Deadline::now_plus(&faktor_core::time::SystemClock, 1_000),
+            CdpConfig {
+                max_message_bytes: 0,
+                ..CdpConfig::default()
+            },
+        )
+        .await
+        .expect_err("zero cap must be refused");
+        assert_eq!(error.code(), "invalid_config");
     }
 }
