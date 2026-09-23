@@ -289,7 +289,9 @@ mod tests {
             AcquisitionError::ResponseTooLarge { limit_bytes: 4096 }
         );
         assert!(matches!(
-            AcquisitionError::from(EgressError::UnparseableUrl("x".into())),
+            AcquisitionError::from(EgressError::UnparseableUrl(
+                faktor_provider::egress::UrlRejectReason::ParseError
+            )),
             AcquisitionError::InvalidRequest { .. }
         ));
     }

@@ -376,7 +376,12 @@ impl ServerDeps {
             tasks,
             budgets,
             auth_token: AuthToken::generate(),
-            server_password: ServerPassword::from_env(),
+            // The CLI startup path overrides this with the frontend-generated
+            // `FAKTOR_SERVER_PASSWORD` via `ServerPassword::try_from_env`
+            // (which fails loudly on a malformed explicit value). The library
+            // default is a fresh ephemeral 256-bit secret — never a weak or
+            // empty password.
+            server_password: ServerPassword::generate(),
             directory: None,
             version: faktor_core::VERSION.to_string(),
             fs: None,

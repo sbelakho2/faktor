@@ -8,6 +8,7 @@ rust-version.workspace = true
 faktor-core.workspace = true
 faktor-provider.workspace = true
 faktor-openai.workspace = true
+faktor-security.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls", "http2"] }
 tokio.workspace = true
 serde.workspace = true
@@ -17,5 +18,4 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-faktor-security.workspace = true
 faktor-provider = { workspace = true, features = ["test-utils"] }

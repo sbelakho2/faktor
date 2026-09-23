@@ -394,7 +394,7 @@ fi
 VSIX_NAME="faktor-$VERSION.vsix"
 VSIX_PATH="$ART_DIR/$VSIX_NAME"
 VSIX_APP="$ROOT/apps/vscode"
-VSIX_RETRY="cd apps/vscode && npm ci && npm run build && npx --yes @vscode/vsce package --out $(rel_path "$VSIX_PATH")"
+VSIX_RETRY="cd apps/vscode && npm ci && npm run build && npx --no-install vsce package --out $(rel_path "$VSIX_PATH")"
 
 if [ "$SKIP_VSIX" = "1" ]; then
     add_skip "$VSIX_NAME" "PACKAGE_SKIP_VSIX=1: VSIX packaging not attempted"
@@ -406,7 +406,7 @@ elif ! command -v npx >/dev/null 2>&1; then
     add_skip "$VSIX_NAME" "npx not on PATH; retry: $VSIX_RETRY"
 else
     VSIX_OK=1
-    if [ ! -d "$VSIX_APP/node_modules" ]; then
+    if [ ! -d "$VSIX_APP/node_modules" ] || [ ! -x "$VSIX_APP/node_modules/.bin/vsce" ]; then
         if (cd "$VSIX_APP" && npm ci) >"$LOG_DIR/package-vsix-npm-ci.log" 2>&1; then
             printf '[package] npm ci (apps/vscode): ok\n'
         else
@@ -443,7 +443,7 @@ else
         fi
     fi
     if [ "$VSIX_OK" = "1" ]; then
-        if (cd "$VSIX_APP" && npx --yes @vscode/vsce package --out "$VSIX_PATH") \
+        if (cd "$VSIX_APP" && npx --no-install vsce package --out "$VSIX_PATH") \
             >"$LOG_DIR/package-vsix-vsce.log" 2>&1; then
             add_artifact "$VSIX_NAME" vsix "$VSIX_PATH" "built" \
                 "vsce package ok (build: $BUILD_DETAIL)"

@@ -17,6 +17,11 @@ use crate::test_http::{MockServer, Reply};
 const WEBHOOK_SECRET: &[u8] = b"hook-secret";
 const INSTALLATION_ID: u64 = 7;
 
+#[cfg(test)]
+fn permissive_transport() -> Arc<dyn faktor_provider::egress::HttpTransport> {
+    Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::permissive())
+}
+
 fn stage_payload(root: &Path, name: &str, body: &[u8]) {
     std::fs::create_dir_all(root).unwrap();
     let path = root.join(name);
@@ -118,8 +123,7 @@ async fn missing_private_key_refuses_with_the_exact_path_and_builds_no_scm() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = github_app_cfg("http://127.0.0.1:9");
     let store: Arc<dyn ScmStore> = Arc::new(SqliteScmStore::open(&store_path(dir.path())).unwrap());
-    let transport =
-        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::with_policy(None));
+    let transport = permissive_transport();
     let err = build_scm_daemon(&cfg, dir.path(), store.clone(), transport).unwrap_err();
     let expected = dir.path().join("payloads").join("app.pem");
     assert!(
@@ -150,8 +154,7 @@ async fn world_readable_private_key_is_refused() {
     .unwrap();
     let cfg = github_app_cfg("http://127.0.0.1:9");
     let store: Arc<dyn ScmStore> = Arc::new(SqliteScmStore::open(&store_path(dir.path())).unwrap());
-    let transport =
-        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::with_policy(None));
+    let transport = permissive_transport();
     let err = build_scm_daemon(&cfg, dir.path(), store, transport).unwrap_err();
     assert!(err.contains("0600"), "{err}");
 }
@@ -164,8 +167,7 @@ async fn corrupt_private_key_is_refused_typed() {
     stage_payload(&payloads, "hook.secret", WEBHOOK_SECRET);
     let cfg = github_app_cfg("http://127.0.0.1:9");
     let store: Arc<dyn ScmStore> = Arc::new(SqliteScmStore::open(&store_path(dir.path())).unwrap());
-    let transport =
-        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::with_policy(None));
+    let transport = permissive_transport();
     let err = build_scm_daemon(&cfg, dir.path(), store, transport).unwrap_err();
     assert!(err.contains("PRIVATE KEY"), "{err}");
 }
@@ -174,8 +176,7 @@ async fn corrupt_private_key_is_refused_typed() {
 async fn disabled_github_app_builds_nothing_and_reads_no_payload() {
     let dir = tempfile::tempdir().unwrap();
     let store: Arc<dyn ScmStore> = Arc::new(SqliteScmStore::open(&store_path(dir.path())).unwrap());
-    let transport =
-        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::with_policy(None));
+    let transport = permissive_transport();
     let mut cfg = github_app_cfg("http://127.0.0.1:9");
     cfg.github_app.as_mut().unwrap().enabled = false;
     assert!(build_scm_daemon(&cfg, dir.path(), store, transport)
@@ -204,8 +205,7 @@ async fn mock_github_syncs_installations_and_repositories_durably() {
 
     let path = store_path(dir.path());
     let store = Arc::new(SqliteScmStore::open(&path).unwrap());
-    let transport =
-        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::with_policy(None));
+    let transport = permissive_transport();
     let cfg = github_app_cfg(&mock.base());
     let daemon = build_scm_daemon(&cfg, dir.path(), store.clone(), transport)
         .unwrap()
@@ -260,8 +260,7 @@ async fn webhook_delivery_resyncs_idempotently_and_bad_signatures_never_claim() 
     mock.push("GET", "/installation/repositories", repositories_reply());
 
     let store = Arc::new(SqliteScmStore::open(&store_path(dir.path())).unwrap());
-    let transport =
-        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::with_policy(None));
+    let transport = permissive_transport();
     let cfg = github_app_cfg(&mock.base());
     let daemon = build_scm_daemon(&cfg, dir.path(), store.clone(), transport)
         .unwrap()
@@ -345,8 +344,7 @@ async fn webhook_installation_id_hostile_values_are_refused_before_any_claim() {
     stage_payload(&payloads, "app.pem", TEST_PRIVATE_KEY.as_bytes());
     stage_payload(&payloads, "hook.secret", WEBHOOK_SECRET);
     let store = Arc::new(SqliteScmStore::open(&store_path(dir.path())).unwrap());
-    let transport =
-        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::with_policy(None));
+    let transport = permissive_transport();
     let cfg = github_app_cfg("http://127.0.0.1:9");
     let daemon = build_scm_daemon(&cfg, dir.path(), store.clone(), transport)
         .unwrap()
@@ -517,8 +515,7 @@ async fn timer_and_webhook_syncs_coalesce_and_never_duplicate_rows() {
         mock.push("GET", "/installation/repositories", repositories_reply());
     }
     let store = Arc::new(SqliteScmStore::open(&store_path(dir.path())).unwrap());
-    let transport =
-        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::with_policy(None));
+    let transport = permissive_transport();
     let mut cfg = github_app_cfg(&mock.base());
     cfg.github_app.as_mut().unwrap().reconcile = Some(crate::config::CloudGithubAppReconcileCfg {
         enabled: true,

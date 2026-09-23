@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 serde.workspace = true
 idna = "1"
+zeroize.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

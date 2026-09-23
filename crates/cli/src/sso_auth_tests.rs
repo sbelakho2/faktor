@@ -15,8 +15,9 @@ use super::build_sso_authority;
 use crate::config::CloudSsoCfg;
 use crate::test_http::{MockServer, Reply};
 
+#[cfg(test)]
 fn transport() -> Arc<dyn HttpTransport> {
-    Arc::new(PolicyCheckedHttpTransport::with_policy(None))
+    Arc::new(PolicyCheckedHttpTransport::permissive())
 }
 
 fn discovery_reply(base: &str) -> Reply {

@@ -246,9 +246,14 @@ Defense-in-depth (not the boundary):
   server-side settings.
 - No CI step pipes a remote script into a shell: the JetBrains smoke
   bootstraps Rust from the pinned rustup-init binary after verifying its
-  published SHA-256, and the toolchain comes from pinned image tags
-  (`rust:1.98`, `node:24`, `ubuntu:24.04`). The remaining PR fetches are
-  package-manager downloads (`npx @vscode/vsce`); they never pipe to a
+  published SHA-256, and reads the toolchain channel from
+  `rust-toolchain.toml` (never a second hard-coded version). The
+  `rust:1.98` image is only a rustup baseline — the toolchain file is the
+  version authority — and every other container image is pinned by its
+  multi-arch index digest (see `docs/ci-enforcement.md`). The remaining PR
+  fetches are the lockfile-pinned dependency install (`npm ci`;
+  `@vscode/vsce` is exact in `apps/vscode/package-lock.json` and invoked
+  as `npx --no-install vsce`); they never pipe to a
   shell, and their output is gated by the VSIX panel-surface verifier and
   the packaged selftest.
   Audit with `rg -n '\|[[:space:]]*(bash|sh)([[:space:]]|$)' .woodpecker/`.
@@ -441,6 +446,8 @@ CI covers the platform lanes; `bash scripts/certify-local.sh fast`
 
 ```sh
 woodpecker-cli lint .woodpecker/            # one pass over all workflow files
+# No local binary? The official CLI image works the same (Docker daemon required):
+docker run --rm -v "$PWD":/repo -w /repo woodpeckerci/woodpecker-cli:v3 lint .woodpecker/
 bash scripts/woodpecker/verify-boundary.sh  # layout guards (offline) + server settings (with credentials)
 python3 - <<'PY'                            # dependency-light parse gate
 import glob, yaml

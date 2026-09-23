@@ -71,7 +71,9 @@ pub(crate) mod timeutil;
 
 pub use capture::{bound_bytes, bound_text, redact_headers, redact_url, CaptureLimits};
 pub use cdp::{CdpClient, CdpConfig, CdpEvent, CdpOutcome};
-pub use download::{DownloadDecision, DownloadPolicy};
+pub use download::{
+    DownloadManager, DownloadOutcome, DownloadPolicy, DownloadRecord, DownloadState, DownloadStats,
+};
 pub use egress::{
     BlockReason, BrokerConfig, BrokerHandle, BrokerHealth, BrokerState, DestinationDecision,
     DestinationPolicy, EgressAccounting, EgressBroker, HostPattern, ProxyCredentials,
@@ -83,7 +85,8 @@ pub use interception::{
 };
 pub use launch::{chromium_args, ChromiumLauncher, LaunchOptions, LaunchedBrowser};
 pub use manager::{
-    BrowserConfig, BrowserHealth, BrowserIdentity, BrowserManager, BrowserState, PagePurpose,
+    BrowserConfig, BrowserHealth, BrowserIdentity, BrowserInstanceId, BrowserManager, BrowserMode,
+    BrowserState, LifecycleSeam, PagePurpose,
 };
 pub use network::{BodyCapturer, CapturedBody, NetworkLimits, NetworkRequest, NetworkTracker};
 pub use page::{Lifecycle, NavigationOutcome, Page, PageState, VerificationSignal};

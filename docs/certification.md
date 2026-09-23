@@ -23,7 +23,7 @@ an LLM: everything below is deterministic and offline.
 | `cargo test -p faktor-tests-fault --release -- --ignored` | long lane | The full `[fault]` campaigns (also part of `full`). |
 | `cargo test -p faktor-tests-performance --release -- --ignored` | long lane | The `[perf]` distribution gates (also part of `full`). |
 | `cargo test -p faktor-tests-fuzz-seeds` | long lane | Seeded pseudo-fuzz harnesses + bounded deterministic campaign; owned by the Woodpecker `static` job and manual runs. |
-| `bash scripts/package-artifacts.sh` | packaging (part of `full`) | Builds the release daemon bundle (`tar.gz`), the VS Code VSIX (via `npx @vscode/vsce`) and copies the JetBrains plugin zip when present; writes `target/certification/artifacts.json` with `{name, path, sha256, size, commit, status, detail}` per artifact, recording exact errors and retry commands for anything not produced. |
+| `bash scripts/package-artifacts.sh` | packaging (part of `full`) | Builds the release daemon bundle (`tar.gz`), the VS Code VSIX (via the lockfile-pinned `npx --no-install vsce`) and copies the JetBrains plugin zip when present; writes `target/certification/artifacts.json` with `{name, path, sha256, size, commit, status, detail}` per artifact, recording exact errors and retry commands for anything not produced. |
 | `node scripts/install-matrix.mjs` | matrix (part of `full`) | Installs/verifies every built artifact on this host into clean temp prefixes: daemon extraction + `faktor-cli doctor --data-dir <tmp>`, VSIX zip/manifest structure, JetBrains `plugin.xml` id/version; writes `target/certification/install-matrix.json`. Non-zero on any verification failure. |
 | `TAMPER=1 node scripts/install-matrix.mjs` | matrix self-test | Copies a built artifact, flips one byte, and requires the verifier to reject the copy (sha256 mismatch); exits 0 only on rejection. Evidence: `target/certification/install-matrix-tamper.json`. |
 | `bash scripts/certify.sh` | legacy wrapper | The older 8-gate release wrapper; `certify-local.sh full` supersedes it with the manifest. Kept for compatibility. |
@@ -109,7 +109,7 @@ when CI migrated (historical note only, no workflow files remain under
 | `linux` | linux/amd64 | fmt; clippy `--workspace --all-targets --all-features -D warnings`; `check` + tests `--workspace --all-features` (protocol/stream codecs ride this run); `doctor` smoke |
 | `static` | linux/amd64 | static-authority scans; security suite; seeded fuzz; supply-chain SBOM/checksums/advisories with recorded skips |
 | `docs` | linux/amd64 | `cargo doc --workspace --all-features --no-deps`; branding scan; docs-sync guard |
-| `vscode` | linux/amd64 | `npm ci` + build; offline Faktor panel selftest; `vsce` VSIX; unzip + panel-surface verify + packaged selftest; IDE-load record (recorded skip when no `code` CLI exists) |
+| `vscode` | linux/amd64 | `npm ci` + build; offline Faktor panel selftest; lockfile-pinned `vsce` VSIX; unzip + panel-surface verify + packaged selftest; IDE-load record (recorded skip when no `code` CLI exists) |
 | `jetbrains-build` | linux/amd64 | `./gradlew :frontend:buildPlugin --no-daemon --stacktrace` |
 | `jetbrains-smoke` | linux/amd64 | kotlinc split-mode compile + wire/native smokes against a real daemon |
 | `perf` | linux/amd64 | release `[perf]` gates; serialized after the other Rust lanes so budgets do not race a loaded agent |
@@ -337,8 +337,10 @@ bound to the same commit as the rest of the manifest.
     (`bin/faktor-cli` plus `checksums.txt` and `RELEASE` metadata). The
     daemon is built with `cargo build --release -p faktor-cli`.
   - `faktor-<version>.vsix` — the VS Code extension, built with
-    `npm ci` (only when `node_modules` is absent) + `npm run build` and
-    packaged with `npx --yes @vscode/vsce package`. If node/npm/vsce or the
+    `npm ci` (only when `node_modules` is absent or the lockfile-pinned
+    `vsce` binary is missing) + `npm run build` and
+    packaged with `npx --no-install vsce package` (never an unpinned
+    registry fetch). If node/npm/vsce or the
     registry is unavailable, the exact error and the runnable retry command
     are recorded as a skip, never silently claimed.
   - `faktor-jetbrains-plugin-<version>.zip` — a copy of the Gradle plugin
@@ -504,7 +506,10 @@ shell: the JetBrains smoke installs the pinned rustup-init binary after
 verifying its published SHA-256
 (`20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c`,
 rustup 1.28.2, `x86_64-unknown-linux-gnu`) and pins the `1.98.0` toolchain;
-the remaining PR fetches are package-manager downloads (`npx @vscode/vsce`)
+the remaining PR fetches are the lockfile-pinned dependency install
+(`npm ci`; `@vscode/vsce` is pinned exactly in
+`apps/vscode/package-lock.json` and consumed as `vsce` from
+`node_modules/.bin`)
 whose output is gated by the VSIX panel-surface verifier and the packaged
 selftest.
 

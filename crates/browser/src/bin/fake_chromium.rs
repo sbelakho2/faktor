@@ -33,12 +33,26 @@ struct Scenario {
     eval_value: Value,
     network: Vec<Value>,
     pause_requests: bool,
+    pause_response: bool,
     body_bytes: usize,
     body_text: Option<String>,
     exit_on_method: Option<String>,
     exit_after_ms: Option<u64>,
     suppress_lifecycle: bool,
     download_will_begin: Option<Value>,
+    /// Methods that must answer with an injected CDP error.
+    fail_methods: Vec<String>,
+    /// Result fields to omit from a successful reply (`method -> [field]`),
+    /// so malformed-reply paths can be exercised.
+    omit_result_fields: HashMap<String, Vec<String>>,
+    /// Browser-domain events emitted after a navigation (no session id).
+    browser_events: Vec<Value>,
+    /// The scripted response-body stream served through
+    /// `Fetch.takeResponseBodyAsStream` + `IO.read`.
+    stream_body_bytes: usize,
+    stream_body_text: Option<String>,
+    /// Maximum bytes per `IO.read` reply (forces one or more reads).
+    stream_chunk: usize,
 }
 
 impl Scenario {
@@ -71,6 +85,10 @@ impl Scenario {
                 .get("pause_requests")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            pause_response: value
+                .get("pause_response")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             body_bytes: value.get("body_bytes").and_then(Value::as_u64).unwrap_or(0) as usize,
             body_text: value
                 .get("body_text")
@@ -86,7 +104,65 @@ impl Scenario {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             download_will_begin: value.get("download_will_begin").cloned(),
+            fail_methods: value
+                .get("fail_methods")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            omit_result_fields: value
+                .get("omit_result_fields")
+                .and_then(Value::as_object)
+                .map(|map| {
+                    map.iter()
+                        .map(|(method, fields)| {
+                            (
+                                method.clone(),
+                                fields
+                                    .as_array()
+                                    .map(|items| {
+                                        items
+                                            .iter()
+                                            .filter_map(Value::as_str)
+                                            .map(str::to_string)
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            browser_events: value
+                .get("browser_events")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            stream_body_bytes: value
+                .get("stream_body_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize,
+            stream_body_text: value
+                .get("stream_body_text")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            stream_chunk: value
+                .get("stream_chunk")
+                .and_then(Value::as_u64)
+                .unwrap_or(64 * 1024) as usize,
         }
+    }
+
+    fn stream_bytes(&self) -> Vec<u8> {
+        if let Some(text) = &self.stream_body_text {
+            return text.as_bytes().to_vec();
+        }
+        vec![b'A'; self.stream_body_bytes]
     }
 
     fn body_for(&self, request_id: &str) -> String {
@@ -132,6 +208,12 @@ impl Journal {
     }
 }
 
+#[derive(Default)]
+struct StreamState {
+    bytes: Vec<u8>,
+    pos: usize,
+}
+
 struct Server {
     scenario: Scenario,
     next_target: AtomicU64,
@@ -139,6 +221,7 @@ struct Server {
     next_context: AtomicU64,
     sessions: Mutex<HashMap<String, String>>,
     targets: Mutex<HashMap<String, String>>,
+    streams: Mutex<HashMap<String, StreamState>>,
 }
 
 fn arg_value(args: &[String], prefix: &str) -> Option<String> {
@@ -194,6 +277,7 @@ async fn main() {
         next_context: AtomicU64::new(1),
         sessions: Mutex::new(HashMap::new()),
         targets: Mutex::new(HashMap::new()),
+        streams: Mutex::new(HashMap::new()),
     });
     // Share the same journal handle across connections.
     let journal = journal.clone();
@@ -245,6 +329,18 @@ async fn serve_connection(stream: TcpStream, server: Arc<Server>, journal: Arc<J
         if server.scenario.exit_on_method.as_deref() == Some(method.as_str()) {
             std::process::exit(9);
         }
+        if server.scenario.fail_methods.iter().any(|m| m == &method) {
+            let payload = error_reply(
+                id.clone(),
+                session.clone(),
+                -32000,
+                format!("injected failure: {method}"),
+            );
+            if sink.send(Message::text(payload)).await.is_err() {
+                break;
+            }
+            continue;
+        }
         if method == "Browser.close" {
             let _ = sink
                 .send(Message::text(reply(id, session, json!({}))))
@@ -253,7 +349,16 @@ async fn serve_connection(stream: TcpStream, server: Arc<Server>, journal: Arc<J
         }
         let response = handle_command(&server, &method, &params, &journal);
         let payload = match response {
-            Ok(result) => reply(id, session.clone(), result),
+            Ok(mut result) => {
+                if let Some(fields) = server.scenario.omit_result_fields.get(&method) {
+                    if let Some(object) = result.as_object_mut() {
+                        for field in fields {
+                            object.remove(field);
+                        }
+                    }
+                }
+                reply(id, session.clone(), result)
+            }
             Err((code, message)) => error_reply(id, session.clone(), code, message),
         };
         if sink.send(Message::text(payload)).await.is_err() {
@@ -305,6 +410,56 @@ fn handle_command(
         })),
         "Browser.setDownloadBehavior" => Ok(json!({})),
         "Browser.cancelDownload" => Ok(json!({})),
+        "Fetch.takeResponseBodyAsStream" => {
+            let request_id = params
+                .get("requestId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let handle = format!("io-{request_id}");
+            server.streams.lock().unwrap().insert(
+                handle.clone(),
+                StreamState {
+                    bytes: server.scenario.stream_bytes(),
+                    pos: 0,
+                },
+            );
+            Ok(json!({ "stream": handle }))
+        }
+        "IO.read" => {
+            let handle = params
+                .get("handle")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let size = params
+                .get("size")
+                .and_then(Value::as_u64)
+                .unwrap_or(64 * 1024) as usize;
+            let mut streams = server.streams.lock().unwrap();
+            let Some(stream) = streams.get_mut(&handle) else {
+                return Err((-32000, format!("unknown stream handle: {handle}")));
+            };
+            let chunk = server.scenario.stream_chunk.max(1).min(size);
+            let remaining = stream.bytes.len().saturating_sub(stream.pos);
+            let take = remaining.min(chunk);
+            let data = stream.bytes[stream.pos..stream.pos + take].to_vec();
+            stream.pos += take;
+            let eof = stream.pos >= stream.bytes.len();
+            use base64::Engine as _;
+            Ok(json!({
+                "data": base64::engine::general_purpose::STANDARD.encode(data),
+                "base64Encoded": true,
+                "eof": eof,
+            }))
+        }
+        "IO.close" => {
+            if let Some(handle) = params.get("handle").and_then(Value::as_str) {
+                server.streams.lock().unwrap().remove(handle);
+            }
+            Ok(json!({}))
+        }
+        "Fetch.continueResponse" | "Fetch.continueRequest" | "Fetch.failRequest" => Ok(json!({})),
         "Target.createBrowserContext" => {
             let id = format!("bc{}", server.next_context.fetch_add(1, Ordering::SeqCst));
             Ok(json!({ "browserContextId": id }))
@@ -377,7 +532,6 @@ fn handle_command(
                 .unwrap_or_default();
             Ok(json!({ "body": server.scenario.body_for(request_id), "base64Encoded": true }))
         }
-        "Fetch.continueRequest" | "Fetch.failRequest" => Ok(json!({})),
         other => {
             journal.write(json!({"dir": "unknown", "method": other}));
             Err((-32601, format!("method not found: {other}")))
@@ -386,10 +540,12 @@ fn handle_command(
 }
 
 /// Emit the scripted navigation lifecycle, network and interception events
-/// for the session that issued `Page.navigate`.
+/// for the session that issued `Page.navigate`. Browser-domain events
+/// (`browser_events`, download announcements) carry **no** session id,
+/// exactly like real Chromium.
 fn navigation_events(server: &Arc<Server>, session: Option<&str>) -> Vec<Value> {
     let mut events = Vec::new();
-    let mut push = |method: &str, params: Value| {
+    let mut push = |session: Option<&str>, method: &str, params: Value| {
         let mut event = json!({ "method": method, "params": params });
         if let Some(session) = session {
             event["sessionId"] = json!(session);
@@ -398,10 +554,15 @@ fn navigation_events(server: &Arc<Server>, session: Option<&str>) -> Vec<Value> 
     };
     if !server.scenario.suppress_lifecycle {
         push(
+            session,
             "Page.frameNavigated",
             json!({ "frame": { "id": "f1", "url": server.scenario.page_url } }),
         );
-        push("Page.domContentEventFired", json!({ "timestamp": 1.0 }));
+        push(
+            session,
+            "Page.domContentEventFired",
+            json!({ "timestamp": 1.0 }),
+        );
     }
     for (index, item) in server.scenario.network.iter().enumerate() {
         let request_id = item
@@ -415,6 +576,7 @@ fn navigation_events(server: &Arc<Server>, session: Option<&str>) -> Vec<Value> 
             .and_then(Value::as_str)
             .unwrap_or("Other");
         push(
+            session,
             "Network.requestWillBeSent",
             json!({
                 "requestId": request_id,
@@ -424,6 +586,7 @@ fn navigation_events(server: &Arc<Server>, session: Option<&str>) -> Vec<Value> 
         );
         if server.scenario.pause_requests {
             push(
+                session,
                 "Fetch.requestPaused",
                 json!({
                     "requestId": request_id,
@@ -431,8 +594,35 @@ fn navigation_events(server: &Arc<Server>, session: Option<&str>) -> Vec<Value> 
                     "request": { "url": url, "method": "GET" }
                 }),
             );
+        } else if server.scenario.pause_response {
+            // Response-stage pause: the download capture path sees response
+            // headers (and may take the body stream); the ordinary request
+            // interceptor never sees these.
+            let mut headers = Vec::new();
+            if let Some(disposition) = item.get("content_disposition").and_then(Value::as_str) {
+                headers.push(json!({ "name": "Content-Disposition", "value": disposition }));
+            }
+            if let Some(length) = item.get("content_length").and_then(Value::as_u64) {
+                headers.push(json!({ "name": "Content-Length", "value": length.to_string() }));
+            }
+            if let Some(raw) = item.get("content_length_raw").and_then(Value::as_str) {
+                headers.push(json!({ "name": "Content-Length", "value": raw }));
+            }
+            push(
+                session,
+                "Fetch.requestPaused",
+                json!({
+                    "requestId": request_id,
+                    "resourceType": resource_type,
+                    "request": { "url": url, "method": "GET" },
+                    "responseStatusCode": item.get("status").and_then(Value::as_i64).unwrap_or(200),
+                    "responseStatusText": "OK",
+                    "responseHeaders": headers,
+                }),
+            );
         } else {
             push(
+                session,
                 "Network.responseReceived",
                 json!({
                     "requestId": request_id,
@@ -444,16 +634,25 @@ fn navigation_events(server: &Arc<Server>, session: Option<&str>) -> Vec<Value> 
                 }),
             );
             push(
+                session,
                 "Network.loadingFinished",
                 json!({ "requestId": request_id, "encodedDataLength": 42 }),
             );
         }
     }
+    for event in &server.scenario.browser_events {
+        let method = event
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let params = event.get("params").cloned().unwrap_or(Value::Null);
+        push(None, method, params);
+    }
     if let Some(download) = &server.scenario.download_will_begin {
-        push("Browser.downloadWillBegin", download.clone());
+        push(None, "Browser.downloadWillBegin", download.clone());
     }
     if !server.scenario.suppress_lifecycle {
-        push("Page.loadEventFired", json!({ "timestamp": 2.0 }));
+        push(session, "Page.loadEventFired", json!({ "timestamp": 2.0 }));
     }
     events
 }

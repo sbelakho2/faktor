@@ -2,29 +2,47 @@
 //!
 //! Every app-level outbound call must decide on a **parsed** destination
 //! before the connection is attempted. [`CheckedHttpClient`] wraps a
-//! `reqwest::Client` with an optional installed [`DestinationPolicy`]
+//! `reqwest::Client` built HERE with an installed [`DestinationPolicy`]
 //! (security crate): the decision runs against the `reqwest::Url` of the
 //! *exact request object* that will be sent — scheme, host and port pulled
-//! from the parsed URL, never from strings — and the connection goes to
-//! that same request (`execute` sends the checked `reqwest::Request`
-//! itself: there is no resolve-then-connect split, so a DNS rebinding that
-//! changes what a hostname resolves to between decision and connect cannot
-//! bypass the gate; the host rule already compared the URL's host text).
+//! from the parsed URL, never from strings.
 //!
-//! Semantics (documented, identical to the security crate):
+//! # DNS rebinding is closed by the central resolver
 //!
-//! | policy state                          | outcome |
-//! |---------------------------------------|---------|
-//! | `None` (no policy installed)          | allow (default-allow) |
-//! | installed allowlist, rule matches     | allow |
-//! | installed allowlist (even empty)      | deny before connect |
+//! The host-text allowlist alone cannot stop a permitted hostname from
+//! RESOLVING to `127.0.0.1`, `169.254.169.254`, an RFC1918 address, `::1`
+//! or `fe80::1`. Every production client installed by this module pins
+//! [`crate::resolver::EgressResolver`] as its `dns_resolver`: the host is
+//! resolved EXACTLY ONCE, the answer set is bounded, EVERY address is
+//! classified (see [`crate::resolver::AddressClass`]) and the whole
+//! resolution is refused when any answer is outside the permitted classes
+//! (external-only by default; a local provider entry may carry the explicit
+//! `allow_loopback` rule). The connector then connects to those vetted
+//! `SocketAddr`s — there is no second resolution. Literal-IP URLs never
+//! reach a resolver, so [`check_url`] classifies a literal host directly.
+//!
+//! Semantics (identical to the security crate, with the policy REQUIRED in
+//! production):
+//!
+//! | policy state                              | outcome |
+//! |-------------------------------------------|---------|
+//! | production constructors (policy required) | allowlist governs |
+//! | installed allowlist, rule matches         | allow |
+//! | installed allowlist (even empty)          | deny before connect |
+//! | no policy = test-only `permissive()`      | allow (never in production) |
 //!
 //! A denied destination returns a typed [`EgressError::Denied`] carrying
-//! which rule fired and how far its match got. The authoritative check runs
-//! at `execute` time on the final request object (so no caller can
-//! construct a request that bypasses the gate); `get`/`post` validate the
-//! URL shape up front with typed errors, and [`CheckedHttpClient::check`]
-//! exposes the same decision for callers that want to refuse early.
+//! which rule fired and how far its match got — as a credential-free
+//! [`SafeUrlDiagnostic`] (scheme, canonical host, effective port, bounded
+//! path; userinfo dropped, query masked, fragment dropped), never a raw
+//! URL. The authoritative check runs at `execute` time on the final request
+//! object (so no caller can construct a request that bypasses the gate);
+//! `get`/`post` validate the URL shape up front with typed errors, and
+//! [`CheckedHttpClient::check`] exposes the same decision for callers that
+//! want to refuse early. Production constructors build the client
+//! internally (redirect policy applied last, resolver pinned) and never
+//! accept or expose an arbitrary `reqwest::Client`; only
+//! `cfg(test)`/`test-utils` constructors wrap an injected client.
 //!
 //! Provider egress is config-derived (a configured `base_url` is trusted
 //! config, not prompt-derived data); [`validate_provider_base_url`] is the
@@ -65,6 +83,16 @@
 //! that still follows redirects internally is detected on every response
 //! (its final URL differs from the checked hop URL) and fails closed with
 //! [`EgressError::UncheckedRedirectFollowed`].
+//!
+//! # Error size
+//!
+//! [`EgressError`] carries bounded, pre-redacted [`SafeUrlDiagnostic`]
+//! values (scheme/host/port + a capped path) rather than raw URLs, and the
+//! diagnostic payload itself lives behind one `Box`, so the error — and
+//! every `Result<_, EgressError>` in the transport seam — stays small
+//! enough for `clippy::result_large_err` without any lint allowance.
+//! Redaction is carried by the payload type, not by its inline size; no
+//! error route is allowed to fall back to echoing a raw URL.
 
 use futures::future::BoxFuture;
 use reqwest::header::{
@@ -75,10 +103,197 @@ use reqwest::{Body, Method, Request, RequestBuilder, Response, ResponseBuilderEx
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+pub use crate::resolver::{AddressClass, EgressAddressPolicy};
+use crate::resolver::{EgressResolveError, EgressResolver, ReqwestDnsResolver};
 use crate::{ProviderError, ProviderErrorKind};
 use faktor_security::destination::{Decision, DeniedReason, DestinationPolicy, RequestTarget};
 use faktor_security::payload::{scan_payload, ScanOutcome, ScanPolicy};
 use faktor_security::registry::SecretRegistry;
+
+/// Hard bound on the path fragment a [`SafeUrlDiagnostic`] renders, so a
+/// hostile URL cannot inflate a log line or error message.
+pub const MAX_DIAGNOSTIC_PATH_CHARS: usize = 256;
+
+/// Bounded, credential-free rendering of a URL for diagnostics.
+///
+/// Carries ONLY the scheme, the canonical parsed host, the effective port
+/// (scheme default resolved) and the path. Userinfo is dropped, the query is
+/// reduced to a presence marker (`?<redacted>`) so no query name or value —
+/// plain or percent-encoded — can ever be echoed, the fragment is dropped,
+/// and the path is bounded. [`SafeUrlDiagnostic::from_raw`] never returns
+/// unparseable input either: it reports `<unparseable>` instead. Both
+/// `Debug` and `Display` produce this form, so no error route can regress
+/// into echoing a credential-bearing URL.
+///
+/// The fields live behind one `Box` so the value carried in every URL-bearing
+/// [`EgressError`] variant (and therefore every `Result<_, EgressError>`)
+/// stays small; diagnostics are constructed only on rejection paths, so the
+/// single allocation is never on a success path. `Serialize`/`Deserialize`
+/// are transparent over the box (the wire shape is the flat field object,
+/// unchanged), and `From`/`Display`/`Debug` ergonomics are untouched.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SafeUrlDiagnostic {
+    fields: Box<SafeUrlFields>,
+}
+
+/// The boxed payload of a [`SafeUrlDiagnostic`].
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SafeUrlFields {
+    scheme: String,
+    host: String,
+    port: u16,
+    path: String,
+    query_present: bool,
+}
+
+impl SafeUrlDiagnostic {
+    /// Diagnostic of an already-parsed URL (canonical host, port resolved).
+    pub fn from_url(url: &Url) -> Self {
+        let path = url.path();
+        let path = if path.chars().count() > MAX_DIAGNOSTIC_PATH_CHARS {
+            let truncated: String = path.chars().take(MAX_DIAGNOSTIC_PATH_CHARS).collect();
+            format!("{truncated}<truncated>")
+        } else {
+            path.to_string()
+        };
+        Self {
+            fields: Box::new(SafeUrlFields {
+                scheme: url.scheme().to_string(),
+                host: url.host_str().unwrap_or("<no-host>").to_string(),
+                port: url.port_or_known_default().unwrap_or(0),
+                path,
+                query_present: url.query().is_some(),
+            }),
+        }
+    }
+
+    /// Diagnostic of a raw URL string. Parse failure yields a fixed
+    /// `<unparseable>` marker — the hostile input is never echoed.
+    pub fn from_raw(raw: &str) -> Self {
+        match Url::parse(raw) {
+            Ok(url) => Self::from_url(&url),
+            Err(_) => Self {
+                fields: Box::new(SafeUrlFields {
+                    scheme: String::new(),
+                    host: "<unparseable>".to_string(),
+                    port: 0,
+                    path: String::new(),
+                    query_present: false,
+                }),
+            },
+        }
+    }
+
+    pub fn scheme(&self) -> &str {
+        &self.fields.scheme
+    }
+
+    /// The canonical host (no userinfo, no brackets for IPv6).
+    pub fn host(&self) -> &str {
+        &self.fields.host
+    }
+
+    /// The effective connection port (`0` when unknown).
+    pub fn port(&self) -> u16 {
+        self.fields.port
+    }
+
+    /// The path only — never the query or fragment.
+    pub fn path(&self) -> &str {
+        &self.fields.path
+    }
+
+    pub fn query_present(&self) -> bool {
+        self.fields.query_present
+    }
+}
+
+impl From<&str> for SafeUrlDiagnostic {
+    fn from(raw: &str) -> Self {
+        Self::from_raw(raw)
+    }
+}
+
+impl From<String> for SafeUrlDiagnostic {
+    fn from(raw: String) -> Self {
+        Self::from_raw(&raw)
+    }
+}
+
+impl std::fmt::Display for SafeUrlDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let fields = &self.fields;
+        if fields.scheme.is_empty() {
+            return write!(f, "{}", fields.host);
+        }
+        let host = if fields.host.contains(':') {
+            format!("[{}]", fields.host)
+        } else {
+            fields.host.clone()
+        };
+        write!(
+            f,
+            "{}://{}:{}{}",
+            fields.scheme, host, fields.port, fields.path
+        )?;
+        if fields.query_present {
+            write!(f, "?<redacted>")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for SafeUrlDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+/// Why a URL was rejected at the egress boundary. A typed reason only — the
+/// hostile input, its query, userinfo or path text are NEVER carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UrlRejectReason {
+    /// `Url::parse` refused the string.
+    ParseError,
+    /// The parsed URL has no host.
+    MissingHost,
+    /// The parsed URL has an empty host.
+    EmptyHost,
+    /// The URL carries userinfo (`user:pass@host`), which would smuggle
+    /// credentials.
+    UserinfoNotAllowed,
+    /// Explicit port 0.
+    PortZero,
+    /// A redirect `Location` header is not valid header text.
+    RedirectLocationNotText,
+    /// A redirect `Location` does not resolve to a valid absolute URL.
+    RedirectTargetUnparseable,
+    /// A redirect target carries userinfo.
+    RedirectUserinfoNotAllowed,
+}
+
+impl std::fmt::Display for UrlRejectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            UrlRejectReason::ParseError => "not a parseable URL",
+            UrlRejectReason::MissingHost => "URL has no host",
+            UrlRejectReason::EmptyHost => "URL has an empty host",
+            UrlRejectReason::UserinfoNotAllowed => "URL must not carry userinfo",
+            UrlRejectReason::PortZero => "URL port 0 is invalid",
+            UrlRejectReason::RedirectLocationNotText => {
+                "redirect Location is not valid header text"
+            }
+            UrlRejectReason::RedirectTargetUnparseable => {
+                "redirect Location does not resolve to a valid absolute URL"
+            }
+            UrlRejectReason::RedirectUserinfoNotAllowed => {
+                "redirect target must not carry userinfo"
+            }
+        })
+    }
+}
 
 /// Outbound full-body secret-scan configuration (audit P0-37/P0-38).
 /// `None` on a client/transport = no secret scanning (historical
@@ -162,45 +377,75 @@ pub struct PolicyCheckedHttpTransport {
 }
 
 impl PolicyCheckedHttpTransport {
-    /// Wrap an explicit client with an optional allowlist. The `inner`
-    /// client MUST be built with [`reqwest::redirect::Policy::none()`] (the
-    /// constructors here all are): [`CheckedHttpClient::execute`] follows
-    /// redirects itself so each hop is re-validated; a client that still
-    /// follows internally fails closed with
-    /// [`EgressError::UncheckedRedirectFollowed`].
-    pub fn new(inner: reqwest::Client, policy: Option<DestinationPolicy>) -> Self {
+    /// TEST-ONLY: explicit allowlist + loopback address rule.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_policy_for_tests(policy: DestinationPolicy) -> Self {
         Self {
-            inner: CheckedHttpClient::new(inner, policy),
+            inner: CheckedHttpClient::with_policy_for_tests(policy),
         }
     }
 
-    /// The default-allow transport with the adapter-standard connect
-    /// timeout and NO installed policy. TEST-ONLY: gated behind `cfg(test)`
-    /// or the `test-utils` feature (enabled solely by dependent crates'
-    /// dev-dependencies), so a production build has no default-allow
-    /// constructor to call — the daemon must inject the policy-checked
-    /// transport ([`PolicyCheckedHttpTransport::with_policy`]).
+    /// TEST-ONLY: explicit allowlist + scan + loopback address rule.
     #[cfg(any(test, feature = "test-utils"))]
-    pub fn permissive() -> Self {
-        Self::new(default_timeout_client(), None)
+    pub fn with_policy_and_scan_for_tests(
+        policy: DestinationPolicy,
+        outbound_scan: Option<OutboundScanConfig>,
+    ) -> Self {
+        Self {
+            inner: CheckedHttpClient::with_policy_and_scan_for_tests(policy, outbound_scan),
+        }
     }
 
-    /// A transport with the given allowlist installed (`None` keeps
-    /// default-allow; `Some(DestinationPolicy::empty())` denies everything
-    /// before connect).
-    pub fn with_policy(policy: Option<DestinationPolicy>) -> Self {
-        Self::new(default_timeout_client(), policy)
+    /// The test-only permissive transport: no destination allowlist
+    /// installed and the explicit loopback address rule (mock servers are
+    /// loopback). Gated behind `cfg(test)` or the `test-utils` feature
+    /// (enabled solely by dependent crates' dev-dependencies), so a
+    /// production build has no default-allow constructor to call — the
+    /// daemon must inject the policy-checked transport.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn permissive() -> Self {
+        Self {
+            inner: CheckedHttpClient::permissive(),
+        }
+    }
+
+    /// A transport with the given allowlist installed. The policy is
+    /// REQUIRED: there is no production default-allow constructor, and the
+    /// address-class rule defaults to external-only (loopback refused).
+    pub fn with_policy(policy: DestinationPolicy) -> Self {
+        Self {
+            inner: CheckedHttpClient::with_policy(policy),
+        }
     }
 
     /// A transport with the given allowlist AND an installed outbound
     /// secret scan (audit P0-37/P0-38): every request body passes the
     /// full-payload scan before any connect (see [`OutboundScanConfig`]).
     pub fn with_policy_and_scan(
-        policy: Option<DestinationPolicy>,
+        policy: DestinationPolicy,
         outbound_scan: Option<OutboundScanConfig>,
     ) -> Self {
         Self {
             inner: CheckedHttpClient::with_policy_and_scan(policy, outbound_scan),
+        }
+    }
+
+    /// A transport with an explicit address-class rule in addition to the
+    /// allowlist and scan. The only production use is a LOCAL provider
+    /// (Ollama) whose typed config carries `allow_loopback`: every other
+    /// special class stays refused, so no address class is ever allowed
+    /// globally.
+    pub fn with_policy_scan_and_addresses(
+        policy: DestinationPolicy,
+        outbound_scan: Option<OutboundScanConfig>,
+        addresses: EgressAddressPolicy,
+    ) -> Self {
+        Self {
+            inner: CheckedHttpClient::with_policy_scan_and_addresses(
+                policy,
+                outbound_scan,
+                addresses,
+            ),
         }
     }
 
@@ -209,9 +454,15 @@ impl PolicyCheckedHttpTransport {
         self.inner.outbound_scan()
     }
 
-    /// The installed allowlist (`None` = default-allow).
+    /// The installed allowlist (`None` only for test-only permissive
+    /// construction).
     pub fn policy(&self) -> Option<&DestinationPolicy> {
         self.inner.policy()
+    }
+
+    /// The installed address-class rule.
+    pub fn address_policy(&self) -> EgressAddressPolicy {
+        self.inner.address_policy()
     }
 }
 
@@ -233,26 +484,32 @@ impl HttpTransport for CheckedHttpClient {
 }
 
 /// The adapter-standard client: connect-timeout only (the streaming hang
-/// controls live in the adapter transport guards, never here) and
-/// redirects DISABLED — [`CheckedHttpClient::execute`] follows redirects
-/// itself so every hop passes the destination/scan gate.
-fn default_timeout_client() -> reqwest::Client {
+/// controls live in the adapter transport guards, never here), the central
+/// egress resolver pinned as the DNS seam (one resolution per host, every
+/// answer class-checked, connect to the vetted address set), and redirects
+/// DISABLED — [`CheckedHttpClient::execute`] follows redirects itself so
+/// every hop passes the destination/scan gate. The redirect policy is
+/// applied LAST and is not overridable by callers.
+fn default_timeout_client(resolver: EgressResolver) -> reqwest::Client {
     reqwest::Client::builder()
+        .dns_resolver(Arc::new(ReqwestDnsResolver::new(resolver.clone())))
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
-        .unwrap_or_else(|_| redirect_disabled_client())
+        .unwrap_or_else(|_| redirect_disabled_client(resolver))
 }
 
-/// A client with automatic redirects disabled (no connect timeout). The
-/// fallback for [`default_timeout_client`] keeps `Policy::none()` even when
-/// the preferred build fails: a plain `reqwest::Client::new()` would
-/// silently reintroduce the unchecked internal follower.
-fn redirect_disabled_client() -> reqwest::Client {
+/// A resolver-pinned client with automatic redirects disabled (no connect
+/// timeout). The fallback for [`default_timeout_client`] keeps BOTH the
+/// `Policy::none()` redirect policy and the checked resolver even when the
+/// preferred build fails: a plain `reqwest::Client::new()` would silently
+/// reintroduce the unchecked internal follower and the OS resolver.
+fn redirect_disabled_client(resolver: EgressResolver) -> reqwest::Client {
     reqwest::Client::builder()
+        .dns_resolver(Arc::new(ReqwestDnsResolver::new(resolver)))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .expect("redirect-disabled HTTP client build")
+        .expect("redirect-disabled resolver-pinned HTTP client build")
 }
 
 /// Execute a GET through a transport. Request building and the raw
@@ -262,7 +519,7 @@ pub async fn execute_get(
     transport: &dyn HttpTransport,
     url: &str,
 ) -> Result<Response, EgressError> {
-    let parsed = Url::parse(url).map_err(|e| EgressError::UnparseableUrl(e.to_string()))?;
+    let parsed = parse_fetch_url(url)?;
     transport.execute(Request::new(Method::GET, parsed)).await
 }
 
@@ -273,32 +530,34 @@ pub async fn execute_post_json(
     headers: HeaderMap,
     body: &serde_json::Value,
 ) -> Result<Response, EgressError> {
-    execute_post_json_with_extras(transport, url, headers, &[], body).await
+    execute_post_json_with_extras(
+        transport,
+        url,
+        headers,
+        &crate::config::ExtraHeaders::empty(),
+        body,
+    )
+    .await
 }
 
-/// Execute a JSON POST through a transport with extra name/value headers
+/// Execute a JSON POST through a transport with validated extra headers
 /// applied OVER `headers` (per-name replace, exactly the semantics the
 /// gateway path relied on when it layered extra headers after the auth
-/// headers). The content-type is forced to `application/json` last, exactly
-/// like `RequestBuilder::json` did.
+/// headers). The extra headers were validated at configuration time
+/// ([`crate::config::ExtraHeaders`]), so an invalid one can never be
+/// silently dropped here. The content-type is forced to
+/// `application/json` last, exactly like `RequestBuilder::json` did.
 pub async fn execute_post_json_with_extras(
     transport: &dyn HttpTransport,
     url: &str,
     headers: HeaderMap,
-    extra_headers: &[(String, String)],
+    extra_headers: &crate::config::ExtraHeaders,
     body: &serde_json::Value,
 ) -> Result<Response, EgressError> {
-    let parsed = Url::parse(url).map_err(|e| EgressError::UnparseableUrl(e.to_string()))?;
+    let parsed = parse_fetch_url(url)?;
     let mut request = Request::new(Method::POST, parsed);
     *request.headers_mut() = headers;
-    for (name, value) in extra_headers {
-        if let (Ok(k), Ok(v)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            request.headers_mut().insert(k, v);
-        }
-    }
+    extra_headers.apply(request.headers_mut());
     request
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -473,7 +732,7 @@ pub async fn execute_raw(
 ) -> Result<RawResponse, EgressError> {
     let method = Method::from_bytes(request.method.as_bytes())
         .map_err(|e| EgressError::Build(format!("invalid method {:?}: {e}", request.method)))?;
-    let url = Url::parse(&request.url).map_err(|e| EgressError::UnparseableUrl(e.to_string()))?;
+    let url = parse_fetch_url(&request.url)?;
     let mut built = Request::new(method, url);
     for (name, value) in &request.headers {
         let name = HeaderName::from_bytes(name.as_bytes())
@@ -500,7 +759,7 @@ pub async fn execute_raw(
     let mut stream = response.bytes_stream();
     let mut body: Vec<u8> = Vec::new();
     while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
-        let chunk = chunk.map_err(|e| EgressError::Transport(e.to_string()))?;
+        let chunk = chunk.map_err(|e| EgressError::Transport(e.without_url().to_string()))?;
         if body.len().saturating_add(chunk.len()) > MAX_RAW_RESPONSE_BYTES {
             return Err(EgressError::ResponseTooLarge {
                 limit_bytes: MAX_RAW_RESPONSE_BYTES as u64,
@@ -586,11 +845,21 @@ impl HttpTransport for MockHttpTransport {
 }
 
 /// Why an outbound call refused to leave the process.
+///
+/// Every URL-bearing variant stores a [`SafeUrlDiagnostic`] (scheme,
+/// canonical host, effective port, bounded path; query masked, userinfo and
+/// fragment dropped) — never a raw URL string. Transport errors are
+/// stringified only after `reqwest::Error::without_url()`, so a credential
+/// planted in a query, userinfo, path or `Location` header can never leak
+/// through `Debug`, `Display` or the `ProviderError` conversion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EgressError {
     /// The installed allowlist denied the destination before any connect.
-    /// `url` is the parsed request target (never a re-split string).
-    Denied { url: String, reason: DeniedReason },
+    /// `url` is the credential-free parsed-target diagnostic.
+    Denied {
+        url: SafeUrlDiagnostic,
+        reason: DeniedReason,
+    },
     /// The outbound secret scan found hits and `block_on_secret` is set.
     /// `kinds` carries only canonical kind labels (never snippets or
     /// candidate bytes), so logs cannot leak secret material.
@@ -602,18 +871,36 @@ pub enum EgressError {
     /// Secret scanning is configured but the request body is a stream that
     /// is not fully materialized, so the FULL payload cannot be inspected.
     /// Fail closed: refused before any connect.
-    BodyNotMaterialized(String),
+    BodyNotMaterialized(SafeUrlDiagnostic),
     /// The URL scheme is not fetchable through this seam (only http/https
     /// are; a `ws`/`wss` policy may exist for websocket tools, but this
     /// client does not speak them).
     UnsupportedScheme(String),
     /// The URL (or provider base URL) does not parse / is not a valid
-    /// absolute http(s) URL.
-    UnparseableUrl(String),
-    /// Building the request object failed.
+    /// absolute http(s) URL. Carries the typed reason only — never the
+    /// hostile input.
+    UnparseableUrl(UrlRejectReason),
+    /// The destination's IP sits in a class the [`EgressAddressPolicy`]
+    /// refuses (loopback/private/link-local/CGNAT/documentation/...).
+    /// A literal-IP URL is classified at check time; a hostname is
+    /// classified by the resolver at connect time. Refused before any
+    /// connect.
+    AddressClassRefused {
+        url: SafeUrlDiagnostic,
+        class: AddressClass,
+    },
+    /// The resolver answered with more addresses than the configured bound
+    /// (a hostile or broken DNS answer). Refused before any connect.
+    DnsAnswerSetTooLarge {
+        url: SafeUrlDiagnostic,
+        count: usize,
+        limit: usize,
+    },
+    /// Building the request object failed (URL-free message).
     Build(String),
     /// The transport itself failed (connect/io); the request was allowed
-    /// by the policy.
+    /// by the policy. The message is URL-free by construction (reqwest
+    /// errors are stripped with `without_url()` before stringifying).
     Transport(String),
     /// A materialized response exceeded [`MAX_RAW_RESPONSE_BYTES`]; the
     /// adapter refuses to buffer it (bounded everything), and the partial
@@ -622,17 +909,23 @@ pub enum EgressError {
     /// A redirect chain exceeded [`MAX_REDIRECT_HOPS`]. Each hop is a fresh
     /// policy-checked request, so a chain that long is refused typed; the
     /// hop that would exceed the bound is never sent.
-    TooManyRedirects { limit: usize, url: String },
+    TooManyRedirects {
+        limit: usize,
+        url: SafeUrlDiagnostic,
+    },
     /// A 307/308 redirect (or a non-POST 301/302) would have to replay a
     /// body that is not materialized (a stream); refused typed instead of
     /// silently re-sending it body-less or converting it to GET.
-    RedirectBodyNotReplayable { url: String },
+    RedirectBodyNotReplayable { url: SafeUrlDiagnostic },
     /// The wrapped `reqwest::Client` followed a redirect itself (its
     /// builder installed something other than
     /// [`reqwest::redirect::Policy::none()`]), so the final hop never
     /// passed the per-hop destination gate. Fail closed: the caller must
     /// not consume a response obtained through an unchecked redirect.
-    UncheckedRedirectFollowed { from: String, to: String },
+    UncheckedRedirectFollowed {
+        from: SafeUrlDiagnostic,
+        to: SafeUrlDiagnostic,
+    },
 }
 
 impl std::fmt::Display for EgressError {
@@ -670,7 +963,17 @@ impl std::fmt::Display for EgressError {
                     "egress denied: unsupported scheme {s:?} (http/https only)"
                 )
             }
-            EgressError::UnparseableUrl(s) => write!(f, "not a parseable http(s) URL: {s}"),
+            EgressError::UnparseableUrl(reason) => write!(f, "{reason}"),
+            EgressError::AddressClassRefused { url, class } => write!(
+                f,
+                "egress denied before connect: {url} is a {class} address, which the egress \
+                 address policy refuses"
+            ),
+            EgressError::DnsAnswerSetTooLarge { url, count, limit } => write!(
+                f,
+                "egress denied before connect: DNS for {url} answered with {count} addresses, \
+                 over the bound of {limit}"
+            ),
             EgressError::Build(s) => write!(f, "request build failed: {s}"),
             EgressError::Transport(s) => write!(f, "transport error: {s}"),
             EgressError::ResponseTooLarge { limit_bytes } => write!(
@@ -701,23 +1004,41 @@ impl std::error::Error for EgressError {}
 
 /// The request-time destination gate, shared by the checked client and any
 /// adapter that wants the defense-in-depth check before its own send.
-/// `policy: None` means **no policy installed → default-allow**
-/// (documented); `Some(policy)` means the allowlist governs (default-deny
-/// on no full scheme+host+port match).
-pub fn check_url(policy: Option<&DestinationPolicy>, url: &Url) -> Result<(), EgressError> {
+///
+/// `policy` is REQUIRED in production (the explicit allowlist governs;
+/// default-deny on no full scheme+host+port match) — the test-only
+/// permissive constructors install no allowlist.
+///
+/// Literal-IP hosts and hostnames are handled differently, deliberately:
+///
+/// - A literal-IP host is not rebindable — the URL itself names the address
+///   — so the allowlist decision is the operator's explicit choice and is
+///   authoritative. `http://127.0.0.1:11434` is reachable only when a rule
+///   allows exactly that destination (a hostile name cannot become it).
+/// - A hostname is checked by name here and class-checked at connect time
+///   by the central resolver (see [`crate::resolver`]): the name must
+///   resolve through the ONE vetted resolution, every answer must be in a
+///   permitted class (external-only by default; the explicit
+///   `allow_loopback` rule for local endpoints), and the connect uses only
+///   those vetted addresses. That is where loopback/private/link-local/
+///   CGNAT/documentation answers are refused.
+pub fn check_url(policy: &DestinationPolicy, url: &Url) -> Result<(), EgressError> {
+    check_url_with(Some(policy), url)
+}
+
+/// The shared implementation behind [`check_url`] and
+/// [`CheckedHttpClient::check`] (the latter may hold no allowlist when built
+/// by a test-only permissive constructor).
+fn check_url_with(policy: Option<&DestinationPolicy>, url: &Url) -> Result<(), EgressError> {
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" {
         return Err(EgressError::UnsupportedScheme(scheme.to_string()));
     }
     let Some(host) = url.host_str() else {
-        return Err(EgressError::UnparseableUrl(format!(
-            "URL has no host: {url}"
-        )));
+        return Err(EgressError::UnparseableUrl(UrlRejectReason::MissingHost));
     };
     if host.is_empty() {
-        return Err(EgressError::UnparseableUrl(format!(
-            "URL has an empty host: {url}"
-        )));
+        return Err(EgressError::UnparseableUrl(UrlRejectReason::EmptyHost));
     }
     // Pull scheme/host/port from the PARSED url — never from strings. When
     // the URL layer already parsed an IPv4 address, its octets beat any
@@ -730,17 +1051,16 @@ pub fn check_url(policy: Option<&DestinationPolicy>, url: &Url) -> Result<(), Eg
     };
     let explicit_port = url.port();
     let target = RequestTarget::from_parts(Some(scheme), host, explicit_port, is_ipv4, ip)
-        .map_err(EgressError::UnparseableUrl)?;
-    match policy {
-        None => Ok(()), // default-allow: no destination policy installed
-        Some(policy) => match target.check_against(policy) {
-            Decision::Allowed => Ok(()),
-            Decision::Denied(reason) => Err(EgressError::Denied {
-                url: target.describe(),
+        .map_err(|_| EgressError::UnparseableUrl(UrlRejectReason::ParseError))?;
+    if let Some(policy) = policy {
+        if let Decision::Denied(reason) = target.check_against(policy) {
+            return Err(EgressError::Denied {
+                url: SafeUrlDiagnostic::from_url(url),
                 reason,
-            }),
-        },
+            });
+        }
     }
+    Ok(())
 }
 
 /// `reqwest::Client` whose every send first passes the parsed destination
@@ -752,12 +1072,20 @@ pub fn check_url(policy: Option<&DestinationPolicy>, url: &Url) -> Result<(), Eg
 /// Redirects are followed here, not by `reqwest`: the wrapped client is
 /// built with [`reqwest::redirect::Policy::none()`] and
 /// [`CheckedHttpClient::execute`] re-runs the destination + scan gate on
-/// every hop before that hop is sent (see the module docs).
+/// every hop before that hop is sent (see the module docs). Production
+/// constructors take an EXPLICIT [`DestinationPolicy`] and build the client
+/// internally (redirect policy applied last, central resolver pinned); the
+/// wrapped client is never injectable in production and never exposed.
 #[derive(Debug, Clone)]
 pub struct CheckedHttpClient {
     inner: reqwest::Client,
+    /// `None` only for test-only permissive construction; every production
+    /// constructor installs `Some(policy)`.
     policy: Option<DestinationPolicy>,
     outbound_scan: Option<OutboundScanConfig>,
+    /// The central resolver pinned into `inner` (connect-time address-class
+    /// gate and one-resolution rule).
+    resolver: EgressResolver,
 }
 
 /// The hard bound on redirect hops one checked request may follow. A
@@ -830,39 +1158,124 @@ fn same_url(a: &Url, b: &Url) -> bool {
 }
 
 impl CheckedHttpClient {
-    /// Wrap a client with an optional allowlist. `None` = no policy
-    /// installed = default-allow (documented). No secret scanning.
-    ///
-    /// `inner` MUST have been built with
-    /// [`reqwest::redirect::Policy::none()`]: this client follows redirects
-    /// itself so every hop is re-validated. A client that still follows
-    /// internally is detected on the response and refused with
-    /// [`EgressError::UncheckedRedirectFollowed`] (fail closed). Prefer
-    /// [`CheckedHttpClient::with_policy`] /
-    /// [`CheckedHttpClient::with_policy_and_scan`], which build a compliant
-    /// client.
-    pub fn new(inner: reqwest::Client, policy: Option<DestinationPolicy>) -> CheckedHttpClient {
+    /// TEST-ONLY: wrap an arbitrary pre-built client with an optional
+    /// allowlist. `None` = no allowlist (permissive); the client MUST be
+    /// built with [`reqwest::redirect::Policy::none()`] or every response
+    /// fails closed with [`EgressError::UncheckedRedirectFollowed`], and it
+    /// carries no central resolver (the OS resolver applies). Production
+    /// construction never accepts an external client.
+    #[cfg(test)]
+    pub(crate) fn new(
+        inner: reqwest::Client,
+        policy: Option<DestinationPolicy>,
+    ) -> CheckedHttpClient {
         CheckedHttpClient {
             inner,
             policy,
             outbound_scan: None,
+            resolver: EgressResolver::system(EgressAddressPolicy::LOCAL),
         }
     }
 
-    /// A default redirect-disabled client with the given allowlist.
-    pub fn with_policy(policy: Option<DestinationPolicy>) -> CheckedHttpClient {
-        CheckedHttpClient::new(redirect_disabled_client(), policy)
+    /// The test-only permissive client: no allowlist and the explicit
+    /// loopback address rule (mock servers are loopback). Gated behind
+    /// `cfg(test)` or the `test-utils` feature; a production build must
+    /// construct with an explicit [`DestinationPolicy`].
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn permissive() -> CheckedHttpClient {
+        let resolver = EgressResolver::system(EgressAddressPolicy::LOCAL);
+        CheckedHttpClient {
+            inner: default_timeout_client(resolver.clone()),
+            policy: None,
+            outbound_scan: None,
+            resolver,
+        }
+    }
+
+    /// A redirect-disabled, resolver-pinned client with the given REQUIRED
+    /// allowlist (external address-class rule: loopback refused).
+    pub fn with_policy(policy: DestinationPolicy) -> CheckedHttpClient {
+        CheckedHttpClient::with_policy_scan_and_addresses(
+            policy,
+            None,
+            EgressAddressPolicy::EXTERNAL,
+        )
     }
 
     /// A client with the given allowlist AND an installed outbound secret
     /// scan (see [`OutboundScanConfig`]).
     pub fn with_policy_and_scan(
-        policy: Option<DestinationPolicy>,
+        policy: DestinationPolicy,
         outbound_scan: Option<OutboundScanConfig>,
     ) -> CheckedHttpClient {
-        let mut client = CheckedHttpClient::with_policy(policy);
-        client.outbound_scan = outbound_scan;
-        client
+        CheckedHttpClient::with_policy_scan_and_addresses(
+            policy,
+            outbound_scan,
+            EgressAddressPolicy::EXTERNAL,
+        )
+    }
+
+    /// TEST-ONLY: explicit allowlist + the loopback address rule (mock
+    /// servers are loopback). Production construction goes through
+    /// [`CheckedHttpClient::with_policy`] / [`CheckedHttpClient::with_policy_scan_and_addresses`].
+    /// `test-utils` exposes it to dependent crates' dev-dependencies only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_policy_for_tests(policy: DestinationPolicy) -> CheckedHttpClient {
+        CheckedHttpClient::with_policy_scan_and_addresses(policy, None, EgressAddressPolicy::LOCAL)
+    }
+
+    /// TEST-ONLY: production-part-equivalent client with an INJECTED
+    /// resolver, so malicious DNS answers (an allowlisted hostname resolving
+    /// to loopback/metadata/private addresses) can be driven without real
+    /// DNS. Everything else matches production construction: redirect
+    /// policy applied last, resolver pinned.
+    #[cfg(test)]
+    pub(crate) fn with_injected_resolver_for_tests(
+        policy: DestinationPolicy,
+        addresses: EgressAddressPolicy,
+        resolver: Arc<dyn crate::resolver::HostResolver>,
+        max_answers: usize,
+    ) -> CheckedHttpClient {
+        let resolver = EgressResolver::with_resolver(resolver, addresses, max_answers);
+        CheckedHttpClient {
+            inner: default_timeout_client(resolver.clone()),
+            policy: Some(policy),
+            outbound_scan: None,
+            resolver,
+        }
+    }
+
+    /// TEST-ONLY twin of [`CheckedHttpClient::with_policy_for_tests`] with
+    /// an installed outbound scan.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_policy_and_scan_for_tests(
+        policy: DestinationPolicy,
+        outbound_scan: Option<OutboundScanConfig>,
+    ) -> CheckedHttpClient {
+        CheckedHttpClient::with_policy_scan_and_addresses(
+            policy,
+            outbound_scan,
+            EgressAddressPolicy::LOCAL,
+        )
+    }
+
+    /// A client with an explicit address-class rule in addition to the
+    /// allowlist and scan (the local-provider `allow_loopback` seam). The
+    /// client is built HERE with the central resolver and
+    /// [`reqwest::redirect::Policy::none()`] applied last — neither is
+    /// overridable by any caller.
+    pub fn with_policy_scan_and_addresses(
+        policy: DestinationPolicy,
+        outbound_scan: Option<OutboundScanConfig>,
+        addresses: EgressAddressPolicy,
+    ) -> CheckedHttpClient {
+        let resolver = EgressResolver::system(addresses);
+        CheckedHttpClient {
+            inner: default_timeout_client(resolver.clone()),
+            policy: Some(policy),
+            outbound_scan,
+            resolver,
+        }
     }
 
     /// Install (or clear) the outbound secret scan on this client.
@@ -875,14 +1288,21 @@ impl CheckedHttpClient {
         self.outbound_scan.as_ref()
     }
 
-    /// The installed allowlist (`None` = default-allow).
+    /// The installed allowlist (`None` only for test-only permissive
+    /// construction).
     pub fn policy(&self) -> Option<&DestinationPolicy> {
         self.policy.as_ref()
     }
 
-    /// The typed pre-send check for one parsed request URL.
+    /// The installed address-class rule.
+    pub fn address_policy(&self) -> EgressAddressPolicy {
+        self.resolver.policy()
+    }
+
+    /// The typed pre-send check for one parsed request URL: parsed
+    /// allowlist (when installed) plus the literal-IP class gate.
     pub fn check(&self, url: &Url) -> Result<(), EgressError> {
-        check_url(self.policy.as_ref(), url)
+        check_url_with(self.policy.as_ref(), url)
     }
 
     /// Start a GET on a raw URL string. The URL is parsed strictly here
@@ -907,7 +1327,7 @@ impl CheckedHttpClient {
     pub async fn send_checked(&self, builder: RequestBuilder) -> Result<Response, EgressError> {
         let request = builder
             .build()
-            .map_err(|e| EgressError::Build(e.to_string()))?;
+            .map_err(|e| EgressError::Build(e.without_url().to_string()))?;
         self.execute(request).await
     }
 
@@ -943,15 +1363,15 @@ impl CheckedHttpClient {
                 .inner
                 .execute(request)
                 .await
-                .map_err(|e| EgressError::Transport(format!("{hop_url}: {e}")))?;
+                .map_err(|e| self.transport_failure(&hop_url, e))?;
 
             // Fail closed when the wrapped client followed a redirect
             // itself: its final URL differs from the hop that was checked,
             // so the bypass would otherwise skip every per-hop gate.
             if !same_url(response.url(), &hop_url) {
                 return Err(EgressError::UncheckedRedirectFollowed {
-                    from: hop_url.to_string(),
-                    to: response.url().to_string(),
+                    from: SafeUrlDiagnostic::from_url(&hop_url),
+                    to: SafeUrlDiagnostic::from_url(response.url()),
                 });
             }
 
@@ -966,32 +1386,28 @@ impl CheckedHttpClient {
             if hops >= MAX_REDIRECT_HOPS {
                 return Err(EgressError::TooManyRedirects {
                     limit: MAX_REDIRECT_HOPS,
-                    url: hop_url.to_string(),
+                    url: SafeUrlDiagnostic::from_url(&hop_url),
                 });
             }
             let location = location.to_str().map_err(|_| {
-                EgressError::UnparseableUrl(format!(
-                    "redirect Location is not valid header text on {hop_url}"
-                ))
+                EgressError::UnparseableUrl(UrlRejectReason::RedirectLocationNotText)
             })?;
-            let next_url = hop_url.join(location).map_err(|e| {
-                EgressError::UnparseableUrl(format!(
-                    "redirect Location {location:?} on {hop_url}: {e}"
-                ))
+            let next_url = hop_url.join(location).map_err(|_| {
+                EgressError::UnparseableUrl(UrlRejectReason::RedirectTargetUnparseable)
             })?;
             // A Location carrying userinfo would smuggle embedded
             // credentials past the credential-stripping rule.
             if !next_url.username().is_empty() || next_url.password().is_some() {
-                return Err(EgressError::UnparseableUrl(format!(
-                    "redirect target must not carry userinfo: {next_url}"
-                )));
+                return Err(EgressError::UnparseableUrl(
+                    UrlRejectReason::RedirectUserinfoNotAllowed,
+                ));
             }
 
             let mut next = match replay {
                 Some(replayed) => replayed,
                 None if !drop_body => {
                     return Err(EgressError::RedirectBodyNotReplayable {
-                        url: hop_url.to_string(),
+                        url: SafeUrlDiagnostic::from_url(&hop_url),
                     });
                 }
                 None => {
@@ -1037,10 +1453,9 @@ impl CheckedHttpClient {
             return Ok(()); // no body (e.g. GET): nothing to scan
         };
         let Some(bytes) = body.as_bytes() else {
-            return Err(EgressError::BodyNotMaterialized(format!(
-                "{}",
-                request.url()
-            )));
+            return Err(EgressError::BodyNotMaterialized(
+                SafeUrlDiagnostic::from_url(request.url()),
+            ));
         };
         let outcome = scan_payload(bytes, &cfg.policy);
         let too_large = outcome == ScanOutcome::TooLargeForPolicy;
@@ -1081,34 +1496,76 @@ impl CheckedHttpClient {
         Ok(())
     }
 
-    /// The wrapped client (for callers that need other builder families).
-    pub fn inner(&self) -> &reqwest::Client {
-        &self.inner
+    /// Map one `reqwest` send failure onto a typed refusal. A resolver
+    /// class refusal survives the hyper/reqwest error chain as the source
+    /// of the connect error and is re-typed here (non-retryable); every
+    /// other failure is a `Transport` error stringified only AFTER
+    /// `without_url()`, so the failing URL (which may carry credentials)
+    /// never enters the message.
+    fn transport_failure(&self, hop_url: &Url, e: reqwest::Error) -> EgressError {
+        if let Some(refusal) = find_resolve_refusal(&e) {
+            match refusal {
+                EgressResolveError::AddressClassRefused { class, .. } => {
+                    return EgressError::AddressClassRefused {
+                        url: SafeUrlDiagnostic::from_url(hop_url),
+                        class: *class,
+                    };
+                }
+                EgressResolveError::TooManyAnswers { count, limit } => {
+                    return EgressError::DnsAnswerSetTooLarge {
+                        url: SafeUrlDiagnostic::from_url(hop_url),
+                        count: *count,
+                        limit: *limit,
+                    };
+                }
+                EgressResolveError::EmptyHost
+                | EgressResolveError::HostTooLong { .. }
+                | EgressResolveError::LookupFailed
+                | EgressResolveError::NoAddresses => {}
+            }
+        }
+        EgressError::Transport(e.without_url().to_string())
     }
 }
 
+/// Walk a `reqwest` error's source chain for a typed resolver refusal.
+/// `reqwest::dns::Resolve` errors are boxed through hyper's connector, so
+/// the class decision arrives as a nested source; the chain walk is
+/// depth-bounded (a hostile error chain cannot spin here).
+fn find_resolve_refusal<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a EgressResolveError> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    for _ in 0..16 {
+        let e = current?;
+        if let Some(refusal) = e.downcast_ref::<EgressResolveError>() {
+            return Some(refusal);
+        }
+        current = e.source();
+    }
+    None
+}
+
 /// Parse one fetch URL strictly: absolute, http/https only, host present,
-/// no userinfo, no port 0.
+/// no userinfo, no port 0. Every refusal is a typed reason — the raw input
+/// (which may itself carry a planted secret) is never echoed.
 fn parse_fetch_url(raw: &str) -> Result<Url, EgressError> {
-    let url = Url::parse(raw).map_err(|e| EgressError::UnparseableUrl(e.to_string()))?;
+    let url =
+        Url::parse(raw).map_err(|_| EgressError::UnparseableUrl(UrlRejectReason::ParseError))?;
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" {
         return Err(EgressError::UnsupportedScheme(scheme.to_string()));
     }
     if url.host_str().is_none_or(str::is_empty) {
-        return Err(EgressError::UnparseableUrl(format!(
-            "URL has no host: {raw}"
-        )));
+        return Err(EgressError::UnparseableUrl(UrlRejectReason::MissingHost));
     }
     if url.username() != "" || url.password().is_some() {
-        return Err(EgressError::UnparseableUrl(format!(
-            "URL must not carry userinfo: {raw}"
-        )));
+        return Err(EgressError::UnparseableUrl(
+            UrlRejectReason::UserinfoNotAllowed,
+        ));
     }
     if url.port() == Some(0) {
-        return Err(EgressError::UnparseableUrl(format!(
-            "URL port 0 is invalid: {raw}"
-        )));
+        return Err(EgressError::UnparseableUrl(UrlRejectReason::PortZero));
     }
     Ok(url)
 }
@@ -1141,7 +1598,7 @@ mod tests {
         } else {
             allowed_port + 1
         };
-        let client = CheckedHttpClient::with_policy(Some(policy_for(allowed_port)));
+        let client = CheckedHttpClient::with_policy_for_tests(policy_for(allowed_port));
         let base = format!("http://127.0.0.1:{allowed_port}");
 
         // 1. Policy allows only http://127.0.0.1:<allowed>: allowed and
@@ -1311,13 +1768,13 @@ mod tests {
         let url = format!("http://{addr}/probe");
 
         // No policy installed => default-allow (documented).
-        let open = CheckedHttpClient::with_policy(None);
+        let open = CheckedHttpClient::permissive();
         let resp = open.send_checked(open.get(&url).unwrap()).await.unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(server.request_count(), 1);
 
         // Installed empty policy => default-deny, before connect.
-        let closed = CheckedHttpClient::with_policy(Some(DestinationPolicy::empty()));
+        let closed = CheckedHttpClient::with_policy_for_tests(DestinationPolicy::empty());
         let err = closed
             .send_checked(closed.get(&url).unwrap())
             .await
@@ -1343,7 +1800,7 @@ mod tests {
         );
         let (addr, _handle) = server.serve().await;
         let policy = DestinationPolicy::parse_lines([&format!("http://{addr}")]).unwrap();
-        let client = CheckedHttpClient::with_policy(Some(policy));
+        let client = CheckedHttpClient::with_policy_for_tests(policy);
 
         // A request built directly (bypassing get()/post()) is still gated
         // at execute(): the URL object of the SENT request is what runs
@@ -1411,7 +1868,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_schemes_are_rejected_at_parse_and_at_execute() {
-        let client = CheckedHttpClient::with_policy(Some(DestinationPolicy::empty()));
+        let client = CheckedHttpClient::with_policy_for_tests(DestinationPolicy::empty());
         // get() rejects non-http(s) schemes at builder time.
         let err = client.get("ftp://example.com/file").unwrap_err();
         assert!(matches!(err, EgressError::UnsupportedScheme(_)), "{err:?}");
@@ -1460,10 +1917,54 @@ mod tests {
     #[test]
     fn checked_client_policy_is_visible_and_default_allow() {
         let p = DestinationPolicy::parse_lines(["https://example.com"]).unwrap();
-        let c = CheckedHttpClient::with_policy(Some(p.clone()));
+        let c = CheckedHttpClient::with_policy_for_tests(p.clone());
         assert_eq!(c.policy(), Some(&p));
-        let c = CheckedHttpClient::with_policy(None);
+        let c = CheckedHttpClient::permissive();
         assert_eq!(c.policy(), None);
+    }
+
+    /// The boxed-diagnostic size contract: `Result<_, EgressError>` must
+    /// stay under clippy's large-error threshold WITHOUT any lint allowance
+    /// (a regression to inline diagnostics re-fires `result_large_err`), and
+    /// the serde shape must stay the flat field object so durable/wire JSON
+    /// is byte-compatible with the pre-boxing form.
+    #[test]
+    fn egress_error_is_small_and_diagnostic_serialization_is_unchanged() {
+        assert!(
+            std::mem::size_of::<EgressError>() < 128,
+            "EgressError grew to {} bytes; box oversized payloads",
+            std::mem::size_of::<EgressError>()
+        );
+        assert_eq!(
+            std::mem::size_of::<SafeUrlDiagnostic>(),
+            std::mem::size_of::<Box<()>>(),
+            "the diagnostic fields must live behind the box"
+        );
+        let url = Url::parse("https://user:pass@api.example.com:8443/v1/chat?api_key=SECRET#frag")
+            .unwrap();
+        let diag = SafeUrlDiagnostic::from_url(&url);
+        let json = serde_json::to_value(&diag).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "scheme": "https",
+                "host": "api.example.com",
+                "port": 8443,
+                "path": "/v1/chat",
+                "query_present": true,
+            }),
+            "the wire shape is the flat field object (userinfo/query/fragment dropped)"
+        );
+        let back: SafeUrlDiagnostic = serde_json::from_value(json).unwrap();
+        assert_eq!(back, diag);
+        // Credential masking survives the boxing: neither the planted query
+        // value nor the userinfo may appear in any rendering.
+        for rendered in [diag.to_string(), format!("{diag:?}")] {
+            assert!(!rendered.contains("SECRET"), "{rendered}");
+            assert!(!rendered.contains("pass"), "{rendered}");
+            assert!(rendered.contains("api.example.com:8443"), "{rendered}");
+            assert!(rendered.contains("?<redacted>"), "{rendered}");
+        }
     }
 
     // ------------------------------------------------------------ transport
@@ -1497,9 +1998,9 @@ mod tests {
             },
         );
         let (addr, _handle) = server.serve().await;
-        let allowed: Arc<dyn HttpTransport> = Arc::new(PolicyCheckedHttpTransport::with_policy(
-            Some(policy_for_port(addr.port())),
-        ));
+        let allowed: Arc<dyn HttpTransport> = Arc::new(
+            PolicyCheckedHttpTransport::with_policy_for_tests(policy_for_port(addr.port())),
+        );
         // Allowed: same parsed destination, streams normally.
         let resp = execute_once(
             allowed.as_ref(),
@@ -1514,9 +2015,10 @@ mod tests {
 
         // Denied (installed policy, wrong port): refused BEFORE any network
         // byte — the live mock never sees the request.
-        let denied: Arc<dyn HttpTransport> = Arc::new(PolicyCheckedHttpTransport::with_policy(
-            Some(policy_for_port(addr.port().wrapping_add(1))),
-        ));
+        let denied: Arc<dyn HttpTransport> =
+            Arc::new(PolicyCheckedHttpTransport::with_policy_for_tests(
+                policy_for_port(addr.port().wrapping_add(1)),
+            ));
         let err = execute_once(
             denied.as_ref(),
             &format!("http://127.0.0.1:{}/probe", addr.port()),
@@ -1560,7 +2062,7 @@ mod tests {
             transport.as_ref(),
             &format!("http://{addr}/json"),
             auth,
-            &[("authorization".into(), "Bearer extra".into())],
+            &crate::config::ExtraHeaders::try_new([("authorization", "Bearer extra")]).unwrap(),
             &json,
         )
         .await
@@ -1635,7 +2137,7 @@ mod tests {
 
     #[test]
     fn checked_http_client_is_a_transport_and_reuses_the_execute_gate() {
-        let client = CheckedHttpClient::with_policy(Some(DestinationPolicy::empty()));
+        let client = CheckedHttpClient::with_policy_for_tests(DestinationPolicy::empty());
         let transport: &dyn HttpTransport = &client;
         let url = reqwest::Url::parse("http://127.0.0.1:9/probe").unwrap();
         let req = reqwest::Request::new(reqwest::Method::GET, url);
@@ -2372,8 +2874,8 @@ fn build(config: C) -> P {
         // `with_policy(None)`) is caught by the same prefix scan.
         let self_built = r#"
 pub fn build(config: C) -> P {
-    let c = CheckedHttpClient::with_policy(None);
-    let t = PolicyCheckedHttpTransport::with_policy(None);
+    let c = CheckedHttpClient::permissive();
+    let t = PolicyCheckedHttpTransport::permissive();
     let _ = (c, t);
     build_over(config)
 }
@@ -2564,8 +3066,8 @@ mod outbound_scan_tests {
             },
         );
         let (addr, _handle) = server.serve().await;
-        let client = CheckedHttpClient::with_policy_and_scan(
-            Some(allowed_policy_for(addr.port())),
+        let client = CheckedHttpClient::with_policy_and_scan_for_tests(
+            allowed_policy_for(addr.port()),
             Some(blocking_scan()),
         );
         let body = serde_json::json!({
@@ -2622,8 +3124,8 @@ mod outbound_scan_tests {
             },
         );
         let (addr, _handle) = server.serve().await;
-        let client = CheckedHttpClient::with_policy_and_scan(
-            Some(allowed_policy_for(addr.port())),
+        let client = CheckedHttpClient::with_policy_and_scan_for_tests(
+            allowed_policy_for(addr.port()),
             Some(OutboundScanConfig {
                 registry: Some(Arc::new(registry)),
                 ..blocking_scan()
@@ -2669,8 +3171,8 @@ mod outbound_scan_tests {
             },
         );
         let (addr, _handle) = server.serve().await;
-        let client = CheckedHttpClient::with_policy_and_scan(
-            Some(allowed_policy_for(addr.port())),
+        let client = CheckedHttpClient::with_policy_and_scan_for_tests(
+            allowed_policy_for(addr.port()),
             Some(OutboundScanConfig {
                 policy: ScanPolicy {
                     max_payload_bytes: Some(16),
@@ -2710,8 +3212,8 @@ mod outbound_scan_tests {
             },
         );
         let (addr, _handle) = server.serve().await;
-        let client = CheckedHttpClient::with_policy_and_scan(
-            Some(allowed_policy_for(addr.port())),
+        let client = CheckedHttpClient::with_policy_and_scan_for_tests(
+            allowed_policy_for(addr.port()),
             Some(OutboundScanConfig {
                 block_on_secret: false,
                 ..blocking_scan()
@@ -2745,8 +3247,8 @@ mod outbound_scan_tests {
             },
         );
         let (addr, _handle) = server.serve().await;
-        let client = CheckedHttpClient::with_policy_and_scan(
-            Some(allowed_policy_for(addr.port())),
+        let client = CheckedHttpClient::with_policy_and_scan_for_tests(
+            allowed_policy_for(addr.port()),
             Some(blocking_scan()),
         );
         // The body holds an actual secret — but as an un-materialized
@@ -2788,8 +3290,8 @@ mod outbound_scan_tests {
             },
         );
         let (addr, _handle) = server.serve().await;
-        let transport = PolicyCheckedHttpTransport::with_policy_and_scan(
-            Some(allowed_policy_for(addr.port())),
+        let transport = PolicyCheckedHttpTransport::with_policy_and_scan_for_tests(
+            allowed_policy_for(addr.port()),
             Some(blocking_scan()),
         );
         assert!(transport.outbound_scan().is_some());
@@ -3023,7 +3525,7 @@ mod redirect_tests {
             format!("http://127.0.0.1:{}", first_addr.port()),
             format!("http://127.0.0.1:{}", second_addr.port()),
         ]);
-        let client = CheckedHttpClient::with_policy(Some(policy));
+        let client = CheckedHttpClient::with_policy_for_tests(policy);
 
         let err = client
             .send_checked(
@@ -3036,7 +3538,7 @@ mod redirect_tests {
         match &err {
             EgressError::Denied { url, reason } => {
                 assert_eq!(reason.matched, RuleMatch::None, "{err}");
-                assert!(url.contains("localhost"), "{err}");
+                assert_eq!(url.host(), "localhost", "{err}");
             }
             other => panic!("expected a typed Denied, got {other:?}"),
         }
@@ -3057,10 +3559,10 @@ mod redirect_tests {
         server.route("GET", "/a", Route::redirect(302, "/b"));
         server.route("GET", "/b", Route::redirect(301, "/c"));
         server.route("GET", "/c", Route::respond(200, "done"));
-        let client = CheckedHttpClient::with_policy(Some(policy_for([format!(
+        let client = CheckedHttpClient::with_policy_for_tests(policy_for([format!(
             "http://127.0.0.1:{}",
             addr.port()
-        )])));
+        )]));
 
         let resp = client
             .send_checked(
@@ -3099,7 +3601,7 @@ mod redirect_tests {
             format!("http://127.0.0.1:{}", first_addr.port()),
             format!("http://127.0.0.1:{}", second_addr.port()),
         ]);
-        let client = CheckedHttpClient::with_policy(Some(policy));
+        let client = CheckedHttpClient::with_policy_for_tests(policy);
 
         let err = client
             .send_checked(
@@ -3122,10 +3624,10 @@ mod redirect_tests {
         let server = RedirectServer::new();
         let addr = server.serve().await;
         server.route("GET", "/loop", Route::redirect(302, "/loop"));
-        let client = CheckedHttpClient::with_policy(Some(policy_for([format!(
+        let client = CheckedHttpClient::with_policy_for_tests(policy_for([format!(
             "http://127.0.0.1:{}",
             addr.port()
-        )])));
+        )]));
 
         let err = client
             .send_checked(
@@ -3139,7 +3641,7 @@ mod redirect_tests {
             err,
             EgressError::TooManyRedirects {
                 limit: MAX_REDIRECT_HOPS,
-                url: format!("http://127.0.0.1:{}/loop", addr.port()),
+                url: SafeUrlDiagnostic::from_raw(&format!("http://127.0.0.1:{}/loop", addr.port())),
             }
         );
         assert_eq!(
@@ -3177,10 +3679,10 @@ mod redirect_tests {
             Route::redirect(303, "/done-head"),
         );
         server.route("HEAD", "/done-head", Route::respond(200, ""));
-        let client = CheckedHttpClient::with_policy(Some(policy_for([format!(
+        let client = CheckedHttpClient::with_policy_for_tests(policy_for([format!(
             "http://127.0.0.1:{}",
             addr.port()
-        )])));
+        )]));
         let base = format!("http://127.0.0.1:{}", addr.port());
 
         for path in [
@@ -3279,7 +3781,7 @@ mod redirect_tests {
             format!("http://127.0.0.1:{}", first_addr.port()),
             format!("http://127.0.0.1:{}", second_addr.port()),
         ]);
-        let client = CheckedHttpClient::with_policy(Some(policy));
+        let client = CheckedHttpClient::with_policy_for_tests(policy);
         let base = format!("http://127.0.0.1:{}", first_addr.port());
 
         // Port change => cross-origin: credentials stripped.
@@ -3331,10 +3833,10 @@ mod redirect_tests {
         let server = RedirectServer::new();
         let addr = server.serve().await;
         server.route("GET", "/noloc", Route::respond(302, "moved but nowhere"));
-        let client = CheckedHttpClient::with_policy(Some(policy_for([format!(
+        let client = CheckedHttpClient::with_policy_for_tests(policy_for([format!(
             "http://127.0.0.1:{}",
             addr.port()
-        )])));
+        )]));
         let resp = client
             .send_checked(
                 client
@@ -3356,10 +3858,10 @@ mod redirect_tests {
         let addr = server.serve().await;
         server.route("POST", "/stream", Route::redirect(307, "/target"));
         server.route("POST", "/target", Route::respond(200, "ok"));
-        let client = CheckedHttpClient::with_policy(Some(policy_for([format!(
+        let client = CheckedHttpClient::with_policy_for_tests(policy_for([format!(
             "http://127.0.0.1:{}",
             addr.port()
-        )])));
+        )]));
         let stream = futures::stream::iter(vec![Ok::<_, std::io::Error>(&b"chunk"[..])]);
         let request = client
             .post(&format!("http://127.0.0.1:{}/stream", addr.port()))
@@ -3369,7 +3871,7 @@ mod redirect_tests {
             .unwrap();
         let err = client.execute(request).await.unwrap_err();
         assert!(
-            matches!(&err, EgressError::RedirectBodyNotReplayable { url } if url.ends_with("/stream")),
+            matches!(&err, EgressError::RedirectBodyNotReplayable { url } if url.path().ends_with("/stream")),
             "{err:?}"
         );
         assert_eq!(server.count(), 1, "only the checked first hop was sent");
@@ -3384,8 +3886,8 @@ mod redirect_tests {
         let addr = server.serve().await;
         server.route("POST", "/send", Route::redirect(307, "/final"));
         server.route("POST", "/final", Route::respond(200, "ok"));
-        let client = CheckedHttpClient::with_policy_and_scan(
-            Some(policy_for([format!("http://127.0.0.1:{}", addr.port())])),
+        let client = CheckedHttpClient::with_policy_and_scan_for_tests(
+            policy_for([format!("http://127.0.0.1:{}", addr.port())]),
             Some(OutboundScanConfig {
                 policy: faktor_security::payload::ScanPolicy::default(),
                 block_on_secret: true,
@@ -3426,12 +3928,12 @@ mod redirect_tests {
         server.route("GET", "/final", Route::respond(200, "final"));
         let url = format!("http://127.0.0.1:{}/go", addr.port());
 
-        let raw = default_timeout_client();
+        let raw = default_timeout_client(EgressResolver::system(EgressAddressPolicy::LOCAL));
         let resp = raw.get(&url).send().await.unwrap();
         assert_eq!(resp.status(), 302, "default_timeout_client must not follow");
 
-        let checked = CheckedHttpClient::with_policy(None);
-        let resp = checked.inner().get(&url).send().await.unwrap();
+        let checked = CheckedHttpClient::permissive();
+        let resp = checked.inner.get(&url).send().await.unwrap();
         assert_eq!(
             resp.status(),
             302,
@@ -3461,8 +3963,8 @@ mod redirect_tests {
             .unwrap_err();
         match &err {
             EgressError::UncheckedRedirectFollowed { from, to } => {
-                assert!(from.ends_with("/go"), "{err}");
-                assert!(to.ends_with("/final"), "{err}");
+                assert!(from.path().ends_with("/go"), "{err}");
+                assert!(to.path().ends_with("/final"), "{err}");
             }
             other => panic!("expected UncheckedRedirectFollowed, got {other:?}"),
         }
@@ -3471,5 +3973,606 @@ mod redirect_tests {
             2,
             "the inner client did follow; we refuse the result"
         );
+    }
+
+    /// Planted credential in a redirect `Location`: the denial, the hop
+    /// bound, the replay refusal and the unchecked-follower detection must
+    /// all render without it.
+    #[tokio::test]
+    async fn redirect_locations_never_leak_planted_secrets() {
+        const SECRET: &str = "REDIRECT-SECRET-77aa";
+        let first = RedirectServer::new();
+        let second = RedirectServer::new();
+        let first_addr = first.serve().await;
+        let second_addr = second.serve().await;
+        let policy = policy_for([format!("http://127.0.0.1:{}", first_addr.port())]);
+        let client = CheckedHttpClient::with_policy_for_tests(policy);
+        let base = format!("http://127.0.0.1:{}", first_addr.port());
+        let asserts = |err: &EgressError, route: &str| {
+            for rendered in [format!("{err}"), format!("{err:?}"), {
+                let converted: ProviderError = err.clone().into();
+                format!("{converted} / {converted:?}")
+            }] {
+                assert!(
+                    !rendered.contains(SECRET),
+                    "{route}: Location secret leaked: {rendered}"
+                );
+            }
+        };
+
+        // 1. Cross-host Location with a secret query/fragment: denied on the
+        //    redirect target.
+        first.route(
+            "GET",
+            "/secret-deny",
+            Route::redirect(
+                302,
+                &format!(
+                    "http://localhost:{}/exfil?token={SECRET}#{SECRET}",
+                    second_addr.port()
+                ),
+            ),
+        );
+        let err = client
+            .send_checked(client.get(&format!("{base}/secret-deny")).unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EgressError::Denied { .. }), "{err:?}");
+        asserts(&err, "denied redirect target");
+        assert_eq!(second.count(), 0);
+
+        // 2. TooManyRedirects: the hop URL carries the secret query.
+        first.route(
+            "GET",
+            "/secret-loop",
+            Route::redirect(302, &format!("/secret-loop?token={SECRET}")),
+        );
+        let err = client
+            .send_checked(client.get(&format!("{base}/secret-loop")).unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EgressError::TooManyRedirects { .. }),
+            "{err:?}"
+        );
+        asserts(&err, "too many redirects");
+
+        // 3. Streamed-body replay refusal from a hop URL with the secret.
+        first.route("POST", "/secret-stream", Route::redirect(307, "/target"));
+        let stream = futures::stream::iter(vec![Ok::<_, std::io::Error>(&b"chunk"[..])]);
+        let request = client
+            .post(&format!("{base}/secret-stream?token={SECRET}"))
+            .unwrap()
+            .body(reqwest::Body::wrap_stream(stream))
+            .build()
+            .unwrap();
+        let err = client.execute(request).await.unwrap_err();
+        assert!(
+            matches!(err, EgressError::RedirectBodyNotReplayable { .. }),
+            "{err:?}"
+        );
+        asserts(&err, "redirect body not replayable");
+
+        // 4. Unchecked follower: `from`/`to` diagnostics mask the target's
+        //    query even though the injected client followed it itself.
+        let server = RedirectServer::new();
+        let addr = server.serve().await;
+        server.route(
+            "GET",
+            "/go",
+            Route::redirect(302, &format!("/final?token={SECRET}#{SECRET}")),
+        );
+        server.route("GET", "/final", Route::respond(200, "unchecked"));
+        let injected = CheckedHttpClient::new(reqwest::Client::new(), None);
+        let err = injected
+            .send_checked(
+                injected
+                    .get(&format!("http://127.0.0.1:{}/go", addr.port()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EgressError::UncheckedRedirectFollowed { .. }),
+            "{err:?}"
+        );
+        asserts(&err, "unchecked redirect");
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_leak_tests {
+    use super::*;
+    use faktor_security::destination::{DeniedReason, RuleMatch};
+
+    /// One planted credential value reused across every credential-bearing
+    /// URL position (query value, percent-encoded query NAME, userinfo,
+    /// fragment). Every failure route must render without it.
+    const SECRET: &str = "P0-SECRET-4f2a-QUERY";
+
+    /// Run one error through every consumer-facing rendering an operator,
+    /// log line or `ProviderError` conversion can hit.
+    fn assert_secret_free(err: &EgressError, route: &str) {
+        for (what, rendered) in [
+            ("Display", format!("{err}")),
+            ("Debug", format!("{err:?}")),
+            ("ProviderError::from", {
+                let converted: ProviderError = err.clone().into();
+                format!("{converted} / {converted:?}")
+            }),
+        ] {
+            assert!(
+                !rendered.contains(SECRET),
+                "{route}: planted secret leaked through {what}: {rendered}"
+            );
+        }
+    }
+
+    fn denied_reason() -> DeniedReason {
+        DeniedReason {
+            rule_fired: None,
+            matched: RuleMatch::None,
+        }
+    }
+
+    fn hostile_diagnostic() -> SafeUrlDiagnostic {
+        let raw = format!(
+            "https://user:{SECRET}@allowed.example:8443/benign?a={SECRET}&%73ecret={SECRET}#frag-{SECRET}"
+        );
+        SafeUrlDiagnostic::from_raw(&raw)
+    }
+
+    #[test]
+    fn every_url_bearing_variant_is_secret_free_through_all_renderings() {
+        let diag = hostile_diagnostic();
+        for (route, err) in [
+            (
+                "Denied",
+                EgressError::Denied {
+                    url: diag.clone(),
+                    reason: denied_reason(),
+                },
+            ),
+            (
+                "BodyNotMaterialized",
+                EgressError::BodyNotMaterialized(diag.clone()),
+            ),
+            (
+                "AddressClassRefused",
+                EgressError::AddressClassRefused {
+                    url: diag.clone(),
+                    class: AddressClass::Loopback,
+                },
+            ),
+            (
+                "DnsAnswerSetTooLarge",
+                EgressError::DnsAnswerSetTooLarge {
+                    url: diag.clone(),
+                    count: 17,
+                    limit: 16,
+                },
+            ),
+            (
+                "TooManyRedirects",
+                EgressError::TooManyRedirects {
+                    limit: 10,
+                    url: diag.clone(),
+                },
+            ),
+            (
+                "RedirectBodyNotReplayable",
+                EgressError::RedirectBodyNotReplayable { url: diag.clone() },
+            ),
+            (
+                "UncheckedRedirectFollowed",
+                EgressError::UncheckedRedirectFollowed {
+                    from: diag.clone(),
+                    to: diag.clone(),
+                },
+            ),
+            (
+                "UnparseableUrl",
+                EgressError::UnparseableUrl(UrlRejectReason::ParseError),
+            ),
+        ] {
+            assert_secret_free(&err, route);
+        }
+        // The diagnostic itself keeps only the safe shape: userinfo gone,
+        // query masked to a marker, fragment gone.
+        let rendered = format!("{diag}");
+        assert_eq!(rendered, "https://allowed.example:8443/benign?<redacted>");
+        assert!(!format!("{diag:?}").contains(SECRET));
+    }
+
+    #[test]
+    fn hostile_raw_inputs_never_reach_any_message() {
+        // A raw string that does not parse at all: only the typed reason.
+        let hostile = format!("not a url at all?{SECRET}={SECRET}");
+        assert_secret_free(
+            &EgressError::UnparseableUrl(UrlRejectReason::ParseError),
+            "unparseable",
+        );
+        assert!(!hostile.is_empty());
+        // A raw userinfo URL: the diagnostic drops the userinfo, the query
+        // and the fragment entirely (the path is rendered by design, so
+        // this hostile URL plants nothing there).
+        let diag = SafeUrlDiagnostic::from_raw(&format!(
+            "https://user:{SECRET}@allowed.example/benign%2f?{SECRET}#{SECRET}"
+        ));
+        assert!(!diag.host().contains(SECRET));
+        assert!(!format!("{diag}").contains(SECRET));
+        // Percent-encoded query NAMES are dropped with the whole query.
+        let diag = SafeUrlDiagnostic::from_raw(&format!(
+            "https://allowed.example/ok?%73ecret%2dname={SECRET}&plain={SECRET}"
+        ));
+        let rendered = format!("{diag}");
+        assert_eq!(rendered, "https://allowed.example:443/ok?<redacted>");
+    }
+
+    #[tokio::test]
+    async fn live_parse_refusals_are_secret_free() {
+        let client = CheckedHttpClient::with_policy_for_tests(
+            DestinationPolicy::parse_lines(["https://allowed.example"]).unwrap(),
+        );
+        for (route, url) in [
+            ("userinfo", format!("https://u:{SECRET}@allowed.example/x")),
+            ("port0", format!("https://allowed.example:0/x?q={SECRET}")),
+            (
+                "unparseable",
+                format!("definitely not a url ?q={SECRET}&{SECRET}"),
+            ),
+        ] {
+            let err = client.get(&url).unwrap_err();
+            assert_secret_free(&err, route);
+        }
+    }
+
+    #[tokio::test]
+    async fn live_policy_denial_is_secret_free() {
+        let client = CheckedHttpClient::with_policy_for_tests(
+            DestinationPolicy::parse_lines(["https://allowed.example"]).unwrap(),
+        );
+        let err = client
+            .send_checked(
+                client
+                    .get(&format!(
+                        "https://evil.example/collect?token={SECRET}#{SECRET}"
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EgressError::Denied { .. }), "{err:?}");
+        assert_secret_free(&err, "denied");
+    }
+
+    #[tokio::test]
+    async fn live_body_not_materialized_is_secret_free() {
+        let client = CheckedHttpClient::with_policy_and_scan_for_tests(
+            DestinationPolicy::parse_lines(["http://allowed.example:80"]).unwrap(),
+            Some(OutboundScanConfig::default()),
+        );
+        let stream = futures::stream::iter(vec![Ok::<_, std::io::Error>(&b"payload"[..])]);
+        let request = client
+            .post(&format!("http://allowed.example/send?token={SECRET}"))
+            .unwrap()
+            .body(reqwest::Body::wrap_stream(stream))
+            .build()
+            .unwrap();
+        let err = client.execute(request).await.unwrap_err();
+        assert!(
+            matches!(&err, EgressError::BodyNotMaterialized(_)),
+            "{err:?}"
+        );
+        assert_secret_free(&err, "body-not-materialized");
+    }
+
+    #[tokio::test]
+    async fn live_transport_failure_is_url_free() {
+        // A real connect failure: the query carries the planted secret and
+        // the message must not (reqwest errors are stripped with
+        // `without_url()` before stringifying).
+        let client = CheckedHttpClient::with_policy_for_tests(
+            DestinationPolicy::parse_lines(["http://localhost:1"]).unwrap(),
+        );
+        let err = client
+            .send_checked(
+                client
+                    .get(&format!("http://localhost:1/x?token={SECRET}#{SECRET}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EgressError::Transport(_)), "{err:?}");
+        assert_secret_free(&err, "transport");
+    }
+
+    #[test]
+    fn safe_url_diagnostic_bounds_the_path() {
+        let long_path = "p".repeat(MAX_DIAGNOSTIC_PATH_CHARS * 2);
+        let diag = SafeUrlDiagnostic::from_raw(&format!("https://allowed.example/{long_path}"));
+        assert!(diag.path().len() <= MAX_DIAGNOSTIC_PATH_CHARS + "<truncated>".len());
+        assert!(diag.path().ends_with("<truncated>"));
+    }
+}
+
+#[cfg(test)]
+mod resolver_rebinding_tests {
+    use super::*;
+    use crate::resolver::{HostResolver, DEFAULT_MAX_DNS_ANSWERS};
+    use crate::testing::{MockAction, MockServer};
+    use std::collections::VecDeque;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// Counting scripted DNS: one canned answer set per call, so a test can
+    /// assert both the vetted outcome and that exactly ONE resolution
+    /// happened (no re-resolution between decision and connect).
+    #[derive(Debug, Default)]
+    struct ScriptedResolver {
+        answers: Mutex<VecDeque<Vec<SocketAddr>>>,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedResolver {
+        fn answering(answers: Vec<SocketAddr>) -> Arc<Self> {
+            let resolver = ScriptedResolver::default();
+            resolver.answers.lock().unwrap().push_back(answers);
+            Arc::new(resolver)
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        /// Queue one more canned answer set (each request resolves once).
+        fn queue(&self, answers: Vec<SocketAddr>) {
+            self.answers.lock().unwrap().push_back(answers);
+        }
+    }
+
+    impl HostResolver for ScriptedResolver {
+        fn resolve(
+            &self,
+            _host: &str,
+            _port: u16,
+        ) -> BoxFuture<'_, Result<Vec<SocketAddr>, String>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let next = self.answers.lock().unwrap().pop_front().unwrap_or_default();
+            Box::pin(async move { Ok(next) })
+        }
+    }
+
+    fn sa(ip: &str, port: u16) -> SocketAddr {
+        SocketAddr::new(ip.parse().expect("test IP"), port)
+    }
+
+    async fn probe_server() -> (Arc<MockServer>, u16) {
+        let server = MockServer::new();
+        server.route(
+            "GET",
+            "/probe",
+            MockAction::Respond {
+                status: 200,
+                body: "ok".into(),
+            },
+        );
+        let (addr, _handle) = server.serve().await;
+        (server, addr.port())
+    }
+
+    #[tokio::test]
+    async fn explicit_literal_is_admitted_while_a_name_resolving_there_is_not() {
+        let (server, port) = probe_server().await;
+        // The policy explicitly names BOTH the literal loopback address and
+        // a hostname; only the hostname can be rebound.
+        let policy = DestinationPolicy::parse_lines([
+            &format!("http://127.0.0.1:{port}"),
+            &format!("http://allowed.example:{port}"),
+        ])
+        .unwrap();
+        let literal_url = format!("http://127.0.0.1:{port}/probe");
+        let name = "allowed.example";
+
+        // A literal-IP host cannot be rebound: the exact allowlist rule is
+        // the operator explicitly naming that address, so it is admitted
+        // even under the external-only address rule.
+        let external = CheckedHttpClient::with_policy(policy.clone());
+        let resp = external
+            .send_checked(external.get(&literal_url).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(server.request_count(), 1);
+
+        // The SAME external rule refuses the hostname once it resolves onto
+        // loopback: that is the rebinding vector the resolver closes.
+        let resolver = ScriptedResolver::answering(vec![sa("127.0.0.1", port)]);
+        let client = CheckedHttpClient::with_injected_resolver_for_tests(
+            policy.clone(),
+            EgressAddressPolicy::EXTERNAL,
+            resolver.clone(),
+            DEFAULT_MAX_DNS_ANSWERS,
+        );
+        let err = client
+            .send_checked(client.get(&format!("http://{name}:{port}/probe")).unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                EgressError::AddressClassRefused {
+                    class: AddressClass::Loopback,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(server.request_count(), 1, "the name never connected");
+        assert_eq!(resolver.calls(), 1);
+
+        // The explicit address-class rule admits the resolved local case
+        // (one more resolution for the second request).
+        resolver.queue(vec![sa("127.0.0.1", port)]);
+        let local = CheckedHttpClient::with_injected_resolver_for_tests(
+            policy,
+            EgressAddressPolicy::LOCAL,
+            resolver,
+            DEFAULT_MAX_DNS_ANSWERS,
+        );
+        let resp = local
+            .send_checked(local.get(&format!("http://{name}:{port}/probe")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(server.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn malicious_dns_answers_never_connect_under_an_external_rule() {
+        let (server, port) = probe_server().await;
+        let policy =
+            DestinationPolicy::parse_lines([&format!("http://allowed.example:{port}")]).unwrap();
+        let url = format!("http://allowed.example:{port}/probe");
+
+        for (label, answer) in [
+            ("loopback", "127.0.0.1"),
+            ("cloud metadata", "169.254.169.254"),
+            ("rfc1918 private", "10.0.0.1"),
+            ("ipv6 loopback", "::1"),
+            ("ipv6 link-local", "fe80::1"),
+        ] {
+            let resolver = ScriptedResolver::answering(vec![sa(answer, port)]);
+            let client = CheckedHttpClient::with_injected_resolver_for_tests(
+                policy.clone(),
+                EgressAddressPolicy::EXTERNAL,
+                resolver.clone(),
+                DEFAULT_MAX_DNS_ANSWERS,
+            );
+            let err = client
+                .send_checked(client.get(&url).unwrap())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, EgressError::AddressClassRefused { .. }),
+                "{label}: expected a class refusal, got {err:?}"
+            );
+            assert_eq!(server.request_count(), 0, "{label}: no connect");
+            assert_eq!(resolver.calls(), 1, "{label}: exactly one resolution");
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_public_and_private_answers_are_refused_wholesale() {
+        let (server, port) = probe_server().await;
+        let policy =
+            DestinationPolicy::parse_lines([&format!("http://allowed.example:{port}")]).unwrap();
+        let url = format!("http://allowed.example:{port}/probe");
+        // Public first: a filtering implementation would race the hostile
+        // answer; the whole set must be refused.
+        let resolver =
+            ScriptedResolver::answering(vec![sa("93.184.216.34", port), sa("127.0.0.1", port)]);
+        let client = CheckedHttpClient::with_injected_resolver_for_tests(
+            policy,
+            EgressAddressPolicy::EXTERNAL,
+            resolver.clone(),
+            DEFAULT_MAX_DNS_ANSWERS,
+        );
+        let err = client
+            .send_checked(client.get(&url).unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EgressError::AddressClassRefused { .. }),
+            "{err:?}"
+        );
+        assert_eq!(server.request_count(), 0);
+        assert_eq!(resolver.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_allow_loopback_permits_only_the_configured_local_case() {
+        let (server, port) = probe_server().await;
+        let policy =
+            DestinationPolicy::parse_lines([&format!("http://allowed.example:{port}")]).unwrap();
+        let url = format!("http://allowed.example:{port}/probe");
+
+        let resolver = ScriptedResolver::answering(vec![sa("127.0.0.1", port)]);
+        let client = CheckedHttpClient::with_injected_resolver_for_tests(
+            policy.clone(),
+            EgressAddressPolicy::LOCAL,
+            resolver.clone(),
+            DEFAULT_MAX_DNS_ANSWERS,
+        );
+        let resp = client
+            .send_checked(client.get(&url).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(server.request_count(), 1);
+        assert_eq!(resolver.calls(), 1, "no re-resolution during connect");
+
+        // The same explicit rule never opens link-local/metadata.
+        let resolver = ScriptedResolver::answering(vec![sa("169.254.169.254", port)]);
+        let client = CheckedHttpClient::with_injected_resolver_for_tests(
+            policy,
+            EgressAddressPolicy::LOCAL,
+            resolver,
+            DEFAULT_MAX_DNS_ANSWERS,
+        );
+        let err = client
+            .send_checked(client.get(&url).unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                EgressError::AddressClassRefused {
+                    class: AddressClass::LinkLocal,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(server.request_count(), 1, "metadata still refused locally");
+    }
+
+    #[tokio::test]
+    async fn answer_set_bound_is_enforced_through_the_client() {
+        let (server, port) = probe_server().await;
+        let policy =
+            DestinationPolicy::parse_lines([&format!("http://allowed.example:{port}")]).unwrap();
+        let url = format!("http://allowed.example:{port}/probe");
+        let answers: Vec<SocketAddr> = (1..=DEFAULT_MAX_DNS_ANSWERS + 1)
+            .map(|i| sa(&format!("93.184.216.{i}"), port))
+            .collect();
+        let resolver = ScriptedResolver::answering(answers);
+        let client = CheckedHttpClient::with_injected_resolver_for_tests(
+            policy,
+            EgressAddressPolicy::EXTERNAL,
+            resolver.clone(),
+            DEFAULT_MAX_DNS_ANSWERS,
+        );
+        let err = client
+            .send_checked(client.get(&url).unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                EgressError::DnsAnswerSetTooLarge {
+                    count,
+                    limit,
+                    ..
+                } if *count == DEFAULT_MAX_DNS_ANSWERS + 1 && *limit == DEFAULT_MAX_DNS_ANSWERS
+            ),
+            "{err:?}"
+        );
+        assert_eq!(server.request_count(), 0);
+        assert_eq!(resolver.calls(), 1);
+        // DNS refusals are security refusals: never retried.
+        let converted: ProviderError = err.into();
+        assert!(!converted.retryable, "{}", converted.message);
     }
 }

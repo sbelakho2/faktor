@@ -9,6 +9,29 @@
 //! `max_pages_per_profile`) refuse with typed errors before a process
 //! exists. A crashed child is detected from the supervisor registry, its
 //! profile stops accepting work, and no zombie is left behind.
+//!
+//! # Instance identity and admission
+//!
+//! Every map entry is keyed by [`BrowserInstanceId`] (identity + mode), so a
+//! persistent profile and an incognito context with the same account/profile
+//! /egress label are two distinct browsers that can never shadow each other.
+//!
+//! Each instance owns a small lifecycle state machine (`Live` -> `Retiring`
+//! -> `Dead`, under its own async mutex) plus a semaphore of
+//! `max_pages_per_profile` permits. `Page` owns one permit, so a dropped or
+//! abandoned page releases its slot synchronously. Page admission and idle
+//! retirement meet on the lifecycle lock: retirement only flips to
+//! `Retiring` when no permit is held (no page in flight) and removes the
+//! exact map entry; acquisitions that raced it observe `Retiring` and refuse
+//! typed instead of receiving a page whose browser is being closed
+//! underneath.
+//!
+//! # Launch transaction
+//!
+//! Construction is an explicit transaction: anything created after the
+//! broker starts (context, CDP client, supervised child, temporary profile)
+//! is rolled back by one `rollback_launch` on every error path, and
+//! [`LaunchedBrowser`] additionally kills an armed child on drop.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -21,17 +44,18 @@ use faktor_terminal::{ProcessOwner, ProcessSupervisor};
 
 use crate::capture::CaptureLimits;
 use crate::cdp::{CdpClient, CdpConfig};
-use crate::download::DownloadPolicy;
+use crate::download::{DownloadManager, DownloadPolicy};
 use crate::egress::{
     BrokerConfig, BrokerHandle, DestinationPolicy, EgressBroker, UpstreamSelector,
 };
 use crate::error::BrowserError;
-use crate::interception::Interceptor;
+use crate::interception::{InterceptionPolicy, Interceptor};
 use crate::launch::{
     resolve_executable, ChromiumLauncher, LaunchOptions, LaunchedBrowser, KILL_GRACE_MS,
 };
 use crate::page::{Page, PageHost, PageInner, PageState, VerificationSignal};
 use crate::profile::{validate_profile_name, IncognitoProfile, ProfileStore, MAX_ACCOUNT_BYTES};
+use crate::timeutil::deadline_in;
 
 /// Runtime configuration (mirrors spec §13 `commerce.browser`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +71,12 @@ pub struct BrowserConfig {
     pub max_pages_per_profile: usize,
     pub launch_timeout_ms: u64,
     pub navigation_timeout_ms: u64,
+    /// Bounded observation fan-out capacity (lossy; a lag only latches a
+    /// history gap on the page).
+    pub cdp_event_capacity: usize,
+    /// Bounded per-session critical CDP event queue (paused requests,
+    /// lifecycle, termination). An overflow fails the page loudly.
+    pub cdp_critical_event_capacity: usize,
     /// Operational extra Chromium flags (validated: egress/control-plane
     /// overrides are refused).
     pub extra_args: Vec<String>,
@@ -65,6 +95,8 @@ impl Default for BrowserConfig {
             max_pages_per_profile: 1,
             launch_timeout_ms: 20_000,
             navigation_timeout_ms: 30_000,
+            cdp_event_capacity: 2048,
+            cdp_critical_event_capacity: 256,
             extra_args: Vec::new(),
             capture: CaptureLimits::default(),
             downloads: DownloadPolicy::default(),
@@ -97,7 +129,30 @@ impl BrowserConfig {
                 "navigation_timeout_ms must be 100..=600000",
             ));
         }
+        if self.cdp_event_capacity == 0
+            || self.cdp_event_capacity > crate::cdp::CDP_MAX_CAPACITY_CEILING
+        {
+            return Err(BrowserError::invalid_config(format!(
+                "cdp_event_capacity must be 1..={}",
+                crate::cdp::CDP_MAX_CAPACITY_CEILING
+            )));
+        }
+        if self.cdp_critical_event_capacity == 0
+            || self.cdp_critical_event_capacity > crate::cdp::CDP_MAX_CAPACITY_CEILING
+        {
+            return Err(BrowserError::invalid_config(format!(
+                "cdp_critical_event_capacity must be 1..={}",
+                crate::cdp::CDP_MAX_CAPACITY_CEILING
+            )));
+        }
         self.capture.validate()?;
+        CdpConfig {
+            max_message_bytes: self.capture.max_cdp_message_bytes,
+            event_capacity: self.cdp_event_capacity,
+            critical_event_capacity: self.cdp_critical_event_capacity,
+        }
+        .validate()?;
+        self.downloads.validate()?;
         crate::launch::validate_extra_args(&self.extra_args)?;
         Ok(())
     }
@@ -141,6 +196,58 @@ impl BrowserIdentity {
 
     fn key(&self) -> String {
         format!("{}\u{1}{}\u{1}{}", self.account, self.profile, self.egress)
+    }
+}
+
+/// Whether an instance serves the persistent profile directory or a
+/// temporary incognito context. The mode is part of every instance key, so
+/// the two can never be conflated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BrowserMode {
+    Persistent,
+    Incognito,
+}
+
+impl BrowserMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BrowserMode::Persistent => "persistent",
+            BrowserMode::Incognito => "incognito",
+        }
+    }
+}
+
+/// The full address of one live browser instance: the stable identity plus
+/// the isolation mode. Every manager map operation is keyed by this type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BrowserInstanceId {
+    pub identity: BrowserIdentity,
+    pub mode: BrowserMode,
+}
+
+impl BrowserInstanceId {
+    pub fn persistent(identity: BrowserIdentity) -> Self {
+        Self {
+            identity,
+            mode: BrowserMode::Persistent,
+        }
+    }
+
+    pub fn incognito(identity: BrowserIdentity) -> Self {
+        Self {
+            identity,
+            mode: BrowserMode::Incognito,
+        }
+    }
+
+    pub fn mode(&self) -> BrowserMode {
+        self.mode
+    }
+
+    /// The stable textual key used for diagnostics and drop-time owner
+    /// scoping (`\u{1}` separators keep components unambiguous).
+    pub fn key(&self) -> String {
+        format!("{}\u{1}{}", self.identity.key(), self.mode.as_str())
     }
 }
 
@@ -217,6 +324,7 @@ pub struct BrowserHealth {
     pub account: String,
     pub profile: String,
     pub egress: String,
+    pub mode: BrowserMode,
     pub pid: u32,
     pub child_id: u64,
     pub state: BrowserState,
@@ -239,12 +347,63 @@ pub enum BrowserState {
     Crashed,
 }
 
+/// Per-instance lifecycle under one async mutex. `Retiring` is the point of
+/// no return: no new permit may be taken, and an already-admitted page (a
+/// held permit) keeps the instance from ever entering `Retiring` through the
+/// idle path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstanceLifecycle {
+    Live,
+    Retiring,
+    Dead,
+}
+
+/// A deterministic test seam for the admission/retirement decision points.
+/// Production code only ever checks for its presence; integration tests
+/// install one to drive the exact interleavings by hand.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct LifecycleSeam {
+    profile: String,
+    reached: tokio::sync::mpsc::UnboundedSender<&'static str>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl LifecycleSeam {
+    /// Build a seam for one profile plus the receiver that reports each
+    /// reached pause point.
+    pub fn new(
+        profile: impl Into<String>,
+    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<&'static str>) {
+        let (reached, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Self {
+                profile: profile.into(),
+                reached,
+                release: Arc::new(tokio::sync::Semaphore::new(0)),
+            },
+            receiver,
+        )
+    }
+
+    /// Release `count` paused pause points.
+    pub fn grant(&self, count: usize) {
+        self.release.add_permits(count);
+    }
+
+    async fn pause(&self, profile: &str, point: &'static str) {
+        if profile != self.profile {
+            return;
+        }
+        let _ = self.reached.send(point);
+        let _ = self.release.acquire().await;
+    }
+}
+
 /// A live browser instance.
 pub struct BrowserInstance {
+    id: BrowserInstanceId,
     source: String,
-    identity: BrowserIdentity,
-    /// The manager map key (includes the incognito discriminator).
-    key: String,
     launched: LaunchedBrowser,
     client: CdpClient,
     broker: BrokerHandle,
@@ -255,28 +414,28 @@ pub struct BrowserInstance {
     context_id: Option<String>,
     policy: DestinationPolicy,
     /// Live pages as weak handles: an abandoned/cancelled capture whose last
-    /// `Page` handle drops releases its profile slot automatically (see
-    /// `PageInner`'s `Drop`). A dead entry can never occupy a slot.
+    /// `Page` handle drops releases its profile slot automatically (the
+    /// permit lives in `PageInner`; see `Page::attach`).
     pages: Mutex<HashMap<String, Weak<PageInner>>>,
     stop: Mutex<Option<VerificationSignal>>,
     crashed: AtomicBool,
     last_used_ms: AtomicI64,
     clock: Arc<dyn Clock>,
-}
-
-/// The manager map key for an identity: the incognito flag is part of the
-/// key, so an incognito request can never reuse (or be reused by) a
-/// persistent profile. `PagePurpose::name` is a diagnostic label, not an
-/// isolation boundary.
-fn instance_key(identity: &BrowserIdentity, incognito: bool) -> String {
-    if incognito {
-        format!("{}\u{1}incognito", identity.key())
-    } else {
-        identity.key()
-    }
+    /// The per-instance lifecycle state machine.
+    lifecycle: tokio::sync::Mutex<InstanceLifecycle>,
+    /// The page-admission permits (one `Page` owns one permit).
+    admission: Arc<tokio::sync::Semaphore>,
+    /// The root-session event pump (browser-domain download events).
+    event_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Central download authority for this profile.
+    downloads: Arc<DownloadManager>,
 }
 
 impl BrowserInstance {
+    fn identity(&self) -> &BrowserIdentity {
+        &self.id.identity
+    }
+
     fn touch(&self) {
         self.last_used_ms
             .store(self.clock.now_ms(), Ordering::SeqCst);
@@ -320,7 +479,7 @@ impl BrowserInstance {
             return Err(BrowserError::BrowserCrashed {
                 detail: format!(
                     "browser for profile {} crashed earlier",
-                    self.identity.profile
+                    self.identity().profile
                 ),
             });
         }
@@ -337,7 +496,8 @@ impl BrowserInstance {
             return Err(BrowserError::BrowserCrashed {
                 detail: format!(
                     "browser pid {} for profile {} is gone: {reason}",
-                    self.launched.pid, self.identity.profile
+                    self.launched.pid,
+                    self.identity().profile
                 ),
             });
         }
@@ -357,7 +517,7 @@ impl PageHost for BrowserInstance {
         }
         drop(stop);
         tracing::info!(
-            profile = %self.identity.profile,
+            profile = %self.identity().profile,
             signal = signal.kind().as_str(),
             "browser profile stopped: human verification required"
         );
@@ -370,6 +530,10 @@ impl PageHost for BrowserInstance {
                 .collect()
         };
         for page in pages {
+            // Release the slot synchronously (the old drain semantics): a
+            // stopped profile refuses new work, and the slot must never stay
+            // occupied by a page the human is about to re-do by hand.
+            page.release_permit();
             tokio::spawn(async move {
                 let _ = page.close().await;
             });
@@ -383,14 +547,11 @@ pub struct BrowserManager {
     config: BrowserConfig,
     profiles: ProfileStore,
     launcher: ChromiumLauncher,
-    browsers: Mutex<HashMap<String, Arc<BrowserInstance>>>,
+    browsers: Mutex<HashMap<BrowserInstanceId, Arc<BrowserInstance>>>,
     egress_routes: Mutex<HashMap<String, UpstreamSelector>>,
     create_serial: tokio::sync::Mutex<()>,
-    /// Serializes the page admission check and the target open, so
-    /// concurrent acquisitions for one profile can never overshoot
-    /// `max_pages_per_profile`.
-    page_admission: tokio::sync::Mutex<()>,
     clock: Arc<dyn Clock>,
+    lifecycle_seam: Mutex<Option<LifecycleSeam>>,
 }
 
 impl std::fmt::Debug for BrowserManager {
@@ -428,8 +589,8 @@ impl BrowserManager {
             browsers: Mutex::new(HashMap::new()),
             egress_routes: Mutex::new(HashMap::new()),
             create_serial: tokio::sync::Mutex::new(()),
-            page_admission: tokio::sync::Mutex::new(()),
             clock,
+            lifecycle_seam: Mutex::new(None),
         }))
     }
 
@@ -439,6 +600,19 @@ impl BrowserManager {
 
     pub fn profiles(&self) -> &ProfileStore {
         &self.profiles
+    }
+
+    /// Install (or clear) the deterministic lifecycle seam.
+    #[doc(hidden)]
+    pub fn set_lifecycle_seam(&self, seam: Option<LifecycleSeam>) {
+        *self.lifecycle_seam.lock().unwrap() = seam;
+    }
+
+    async fn pause_seam(&self, profile: &str, point: &'static str) {
+        let seam = self.lifecycle_seam.lock().unwrap().clone();
+        if let Some(seam) = seam {
+            seam.pause(profile, point).await;
+        }
     }
 
     /// Register an upstream egress route (operational configuration, never
@@ -477,27 +651,39 @@ impl BrowserManager {
         let instance = self
             .instance_for(source, identity, &policy, purpose, deadline, cancel)
             .await?;
-        // Admission and target open are ONE critical section: the check and
-        // the insert must not interleave, or N concurrent acquisitions all
-        // pass the check before any page exists and the bound is exceeded.
-        let _admission = self.page_admission.lock().await;
-        if let Err(error) = instance.check_alive(&self.supervisor) {
-            self.drop_instance(&instance);
-            return Err(error);
-        }
-        if let Some(signal) = instance.stop_signal() {
-            return Err(signal.error());
-        }
-        if instance.page_count() >= self.config.max_pages_per_profile {
-            return Err(BrowserError::bound(format!(
-                "profile {} already has {} open page(s); max_pages_per_profile is {}",
-                identity.profile,
-                instance.page_count(),
-                self.config.max_pages_per_profile
-            )));
-        }
+        self.pause_seam(&identity.profile, "admission-begin").await;
+        let permit = {
+            let state = instance.lifecycle.lock().await;
+            if let Some(signal) = instance.stop_signal() {
+                return Err(signal.error());
+            }
+            if *state != InstanceLifecycle::Live {
+                return Err(BrowserError::retiring(format!(
+                    "browser for profile {} is retiring; retry starts a fresh browser",
+                    identity.profile
+                )));
+            }
+            if let Err(error) = instance.check_alive(&self.supervisor) {
+                drop(state);
+                self.drop_instance(&instance);
+                return Err(error);
+            }
+            match instance.admission.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let open =
+                        self.config.max_pages_per_profile - instance.admission.available_permits();
+                    return Err(BrowserError::bound(format!(
+                        "profile {} already has {open} open page(s); max_pages_per_profile is {}",
+                        identity.profile, self.config.max_pages_per_profile
+                    )));
+                }
+            }
+        };
+        instance.touch();
+        self.pause_seam(&identity.profile, "admission-permit").await;
         let page = self
-            .open_page(&instance, &policy, deadline, cancel)
+            .open_page(&instance, &policy, deadline, cancel, permit)
             .await
             .map_err(|error| {
                 // A failed page open on a dead browser must not leave the
@@ -507,16 +693,21 @@ impl BrowserManager {
                 }
                 error
             })?;
-        instance.touch();
         Ok(page)
     }
 
+    /// Open one target and initialize it transactionally: once a target id
+    /// exists, every remaining init step runs in one result block, and any
+    /// failure closes the target with a fresh cancellation token and a
+    /// bounded cleanup deadline. The cleanup is disarmed only when the page
+    /// has been inserted into instance ownership.
     async fn open_page(
         &self,
         instance: &Arc<BrowserInstance>,
         policy: &DestinationPolicy,
         deadline: Deadline,
         cancel: &CancellationToken,
+        permit: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<Page, BrowserError> {
         let client = instance.client.clone();
         let mut create_params = serde_json::json!({ "url": "about:blank" });
@@ -526,87 +717,98 @@ impl BrowserManager {
         let created = client
             .send(None, "Target.createTarget", create_params, deadline, cancel)
             .await?;
+        // Before this point there is no target to clean up; from here on the
+        // transaction owns it.
         let target_id = created
             .get("targetId")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| BrowserError::cdp("Target.createTarget returned no targetId"))?
             .to_string();
-        let attached = match client
-            .send(
-                None,
-                "Target.attachToTarget",
-                serde_json::json!({ "targetId": target_id, "flatten": true }),
-                deadline,
-                cancel,
-            )
-            .await
-        {
-            Ok(value) => value,
+        let initialized = async {
+            let attached = client
+                .send(
+                    None,
+                    "Target.attachToTarget",
+                    serde_json::json!({ "targetId": target_id, "flatten": true }),
+                    deadline,
+                    cancel,
+                )
+                .await?;
+            let session_id = attached
+                .get("sessionId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| BrowserError::cdp("Target.attachToTarget returned no sessionId"))?
+                .to_string();
+            for method in ["Page.enable", "Network.enable", "Runtime.enable"] {
+                client
+                    .send(
+                        Some(&session_id),
+                        method,
+                        serde_json::json!({}),
+                        deadline,
+                        cancel,
+                    )
+                    .await?;
+            }
+            let interceptor = Interceptor::new(
+                client.clone(),
+                session_id.clone(),
+                InterceptionPolicy::new(policy.clone()),
+            );
+            let (enable_method, mut enable_params) = interceptor.enable_command();
+            enable_params["patterns"] = instance.downloads.fetch_patterns();
+            client
+                .send(
+                    Some(&session_id),
+                    enable_method,
+                    enable_params,
+                    deadline,
+                    cancel,
+                )
+                .await?;
+            let host: Weak<dyn PageHost> = Arc::downgrade(&(instance.clone() as Arc<dyn PageHost>));
+            Ok::<_, BrowserError>(Page::attach(
+                client.clone(),
+                target_id.clone(),
+                session_id,
+                interceptor,
+                instance.downloads.clone(),
+                self.config.capture.clone(),
+                crate::network::NetworkLimits {
+                    max_records: self.config.capture.max_network_records,
+                    max_body_bytes: self.config.capture.max_body_bytes,
+                    hard_max_body_bytes: self.config.capture.hard_max_body_bytes,
+                },
+                host,
+                permit,
+            ))
+        }
+        .await;
+        match initialized {
+            Ok(page) => {
+                instance
+                    .pages
+                    .lock()
+                    .unwrap()
+                    .insert(target_id, page.downgrade());
+                Ok(page)
+            }
             Err(error) => {
+                // Fresh cleanup token + bounded deadline: the caller's token
+                // may already be cancelled, but the created target must
+                // still die.
                 let _ = client
                     .send(
                         None,
                         "Target.closeTarget",
                         serde_json::json!({ "targetId": target_id }),
-                        crate::timeutil::deadline_in(2_000),
+                        deadline_in(2_000),
                         &CancellationToken::new(),
                     )
                     .await;
-                return Err(error);
+                Err(error)
             }
-        };
-        let session_id = attached
-            .get("sessionId")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| BrowserError::cdp("Target.attachToTarget returned no sessionId"))?
-            .to_string();
-        for method in ["Page.enable", "Network.enable", "Runtime.enable"] {
-            client
-                .send(
-                    Some(&session_id),
-                    method,
-                    serde_json::json!({}),
-                    deadline,
-                    cancel,
-                )
-                .await?;
         }
-        let interceptor = Interceptor::new(
-            client.clone(),
-            session_id.clone(),
-            crate::interception::InterceptionPolicy::new(policy.clone()),
-        );
-        let (enable_method, enable_params) = interceptor.enable_command();
-        client
-            .send(
-                Some(&session_id),
-                enable_method,
-                enable_params,
-                deadline,
-                cancel,
-            )
-            .await?;
-        let host: Weak<dyn PageHost> = Arc::downgrade(&(instance.clone() as Arc<dyn PageHost>));
-        let page = Page::attach(
-            client,
-            target_id.clone(),
-            session_id,
-            interceptor,
-            self.config.downloads.clone(),
-            self.config.capture.clone(),
-            crate::network::NetworkLimits {
-                max_records: self.config.capture.max_network_records,
-                max_body_bytes: self.config.capture.max_body_bytes,
-                hard_max_body_bytes: self.config.capture.hard_max_body_bytes,
-            },
-            host,
-        );
-        instance
-            .pages
-            .lock()
-            .unwrap()
-            .insert(target_id, page.downgrade());
-        Ok(page)
     }
 
     /// Get the live instance for an identity, creating (and launching) it
@@ -622,8 +824,15 @@ impl BrowserManager {
         cancel: &CancellationToken,
     ) -> Result<Arc<BrowserInstance>, BrowserError> {
         let _serial = self.create_serial.lock().await;
-        let key = instance_key(identity, purpose.incognito);
-        if let Some(instance) = self.browsers.lock().unwrap().get(&key).cloned() {
+        let id = BrowserInstanceId {
+            identity: identity.clone(),
+            mode: if purpose.incognito {
+                BrowserMode::Incognito
+            } else {
+                BrowserMode::Persistent
+            },
+        };
+        if let Some(instance) = self.browsers.lock().unwrap().get(&id).cloned() {
             if instance.policy != *policy {
                 return Err(BrowserError::invalid_config(
                     "destination policy changed for a live browser identity; retire the browser \
@@ -635,9 +844,9 @@ impl BrowserManager {
                     "browser source changed for a live browser identity; retire the browser first",
                 ));
             }
-            // Belt-and-braces: the key already carries the incognito flag,
-            // so a persistent page can never be handed to an incognito
-            // request (or vice versa).
+            // Belt-and-braces: the id already carries the mode, so a
+            // persistent page can never be handed to an incognito request
+            // (or vice versa).
             if instance.context_id.is_some() != purpose.incognito {
                 return Err(BrowserError::invalid_config(
                     "page purpose isolation changed for a live browser identity; retire the \
@@ -656,21 +865,22 @@ impl BrowserManager {
             }
         }
         let instance = self
-            .launch_instance(source, identity, policy, purpose, deadline, cancel)
+            .launch_instance(source, &id, policy, purpose, deadline, cancel)
             .await?;
-        self.browsers.lock().unwrap().insert(key, instance.clone());
+        self.browsers.lock().unwrap().insert(id, instance.clone());
         Ok(instance)
     }
 
     async fn launch_instance(
         &self,
         source: &str,
-        identity: &BrowserIdentity,
+        id: &BrowserInstanceId,
         policy: &DestinationPolicy,
         purpose: &PagePurpose,
         deadline: Deadline,
         cancel: &CancellationToken,
     ) -> Result<Arc<BrowserInstance>, BrowserError> {
+        let identity = &id.identity;
         let upstream = {
             let routes = self.egress_routes.lock().unwrap();
             match routes.get(&identity.egress).cloned() {
@@ -683,6 +893,8 @@ impl BrowserManager {
                 }
             }
         };
+        // From here on the broker exists: every error path must shut it down
+        // (and drop any temporary profile already created).
         let broker = EgressBroker::start(BrokerConfig {
             bind: "127.0.0.1:0".parse().expect("loopback literal"),
             policy: policy.clone(),
@@ -690,31 +902,43 @@ impl BrowserManager {
             ..BrokerConfig::default()
         })
         .await?;
-        let executable = resolve_executable(self.config.executable.as_deref())?;
-        let (profile_dir, incognito, scratch_dir) = if purpose.incognito {
-            let incognito = self.profiles.incognito(&identity.profile)?;
-            let dir = incognito.dir().to_path_buf();
-            let scratch = dir.join("scratch");
-            std::fs::create_dir_all(&scratch).map_err(|e| {
-                BrowserError::profile(format!("cannot create incognito scratch: {e}"))
-            })?;
-            crate::profile::restrict_dir(&scratch)?;
-            (dir, Some(incognito), scratch)
-        } else {
-            let dir = self.profiles.profile_dir(&identity.profile)?;
-            let scratch = self.profiles.scratch_dir(&identity.profile)?;
-            (dir, None, scratch)
+        let executable = match resolve_executable(self.config.executable.as_deref()) {
+            Ok(executable) => executable,
+            Err(error) => {
+                broker.shutdown().await;
+                return Err(error);
+            }
         };
-        self.config.downloads.validate(&profile_dir)?;
-        self.config.downloads.prepare()?;
+        let mut profiles = match self.prepare_profiles(id, purpose) {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                broker.shutdown().await;
+                return Err(error);
+            }
+        };
+        let downloads = match DownloadManager::new(
+            self.config.downloads.clone(),
+            self.profiles.rooted().clone(),
+            &profiles.profile_rel,
+        ) {
+            Ok(downloads) => downloads,
+            Err(error) => {
+                profiles.cleanup();
+                broker.shutdown().await;
+                return Err(error);
+            }
+        };
+        let scratch_dir = self.profiles.rooted().join(&profiles.scratch_rel);
         let launch = self
             .launcher
             .launch(
                 LaunchOptions {
                     executable,
                     headless: self.config.headless,
-                    profile_dir: profile_dir.clone(),
+                    profile_dir: profiles.profile_dir.clone(),
                     scratch_dir,
+                    scratch_root: self.profiles.rooted().clone(),
+                    scratch_rel: profiles.scratch_rel.clone(),
                     proxy_addr: broker.addr(),
                     owner_source: source.to_string(),
                     owner_profile: identity.profile.clone(),
@@ -727,25 +951,28 @@ impl BrowserManager {
         let launched = match launch {
             Ok(launched) => launched,
             Err(error) => {
+                profiles.cleanup();
                 broker.shutdown().await;
                 return Err(error);
             }
         };
+        // Post-spawn transaction: one rollback for every failure.
         let connect = CdpClient::connect(
             &launched.devtools_ws_url,
             cancel,
             deadline,
             CdpConfig {
                 max_message_bytes: self.config.capture.max_cdp_message_bytes,
-                event_capacity: 2048,
+                event_capacity: self.config.cdp_event_capacity,
+                critical_event_capacity: self.config.cdp_critical_event_capacity,
             },
         )
         .await;
         let client = match connect {
             Ok(client) => client,
             Err(error) => {
-                let _ = launched.kill(&self.supervisor, KILL_GRACE_MS);
-                broker.shutdown().await;
+                self.rollback_launch(launched, None, None, profiles.take_incognito(), broker)
+                    .await;
                 return Err(error);
             }
         };
@@ -759,23 +986,33 @@ impl BrowserManager {
             )
             .await
         {
-            let _ = launched.kill(&self.supervisor, KILL_GRACE_MS);
-            let _ = client.close().await;
-            broker.shutdown().await;
+            self.rollback_launch(
+                launched,
+                Some(client),
+                None,
+                profiles.take_incognito(),
+                broker,
+            )
+            .await;
             return Err(error);
         }
-        let (behavior_method, behavior_params) = self.config.downloads.set_behavior_command();
+        let (behavior_method, behavior_params) = downloads.behavior_command();
         if let Err(error) = client
             .send(None, behavior_method, behavior_params, deadline, cancel)
             .await
         {
-            let _ = launched.kill(&self.supervisor, KILL_GRACE_MS);
-            let _ = client.close().await;
-            broker.shutdown().await;
+            self.rollback_launch(
+                launched,
+                Some(client),
+                None,
+                profiles.take_incognito(),
+                broker,
+            )
+            .await;
             return Err(error);
         }
         let context_id = if purpose.incognito {
-            let created = client
+            match client
                 .send(
                     None,
                     "Target.createBrowserContext",
@@ -783,26 +1020,56 @@ impl BrowserManager {
                     deadline,
                     cancel,
                 )
-                .await?;
-            Some(
-                created
-                    .get("browserContextId")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| BrowserError::cdp("Target.createBrowserContext returned no id"))?
-                    .to_string(),
-            )
+                .await
+            {
+                Ok(created) => {
+                    match created
+                        .get("browserContextId")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        Some(context_id) => Some(context_id.to_string()),
+                        None => {
+                            // The context may exist without an id: it
+                            // cannot be disposed, but the child, socket,
+                            // broker and temporary profile are still torn
+                            // down.
+                            self.rollback_launch(
+                                launched,
+                                Some(client),
+                                None,
+                                profiles.take_incognito(),
+                                broker,
+                            )
+                            .await;
+                            return Err(BrowserError::cdp(
+                                "Target.createBrowserContext returned no id",
+                            ));
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.rollback_launch(
+                        launched,
+                        Some(client),
+                        None,
+                        profiles.take_incognito(),
+                        broker,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            }
         } else {
             None
         };
-        Ok(Arc::new(BrowserInstance {
+        let instance = Arc::new(BrowserInstance {
+            id: id.clone(),
             source: source.to_string(),
-            identity: identity.clone(),
-            key: instance_key(identity, purpose.incognito),
             launched,
             client,
             broker,
-            profile_dir,
-            incognito,
+            profile_dir: profiles.profile_dir,
+            incognito: profiles.incognito,
             context_id,
             policy: policy.clone(),
             pages: Mutex::new(HashMap::new()),
@@ -810,30 +1077,130 @@ impl BrowserManager {
             crashed: AtomicBool::new(false),
             last_used_ms: AtomicI64::new(self.clock.now_ms()),
             clock: self.clock.clone(),
-        }))
+            lifecycle: tokio::sync::Mutex::new(InstanceLifecycle::Live),
+            admission: Arc::new(tokio::sync::Semaphore::new(
+                self.config.max_pages_per_profile,
+            )),
+            event_task: Mutex::new(None),
+            downloads,
+        });
+        let task = spawn_root_event_pump(&instance);
+        *instance.event_task.lock().unwrap() = Some(task);
+        Ok(instance)
+    }
+
+    /// One rollback for every post-spawn launch failure: dispose a created
+    /// browser context, close the CDP socket, kill the supervised child,
+    /// await broker shutdown and remove the temporary (incognito) profile.
+    async fn rollback_launch(
+        &self,
+        launched: LaunchedBrowser,
+        client: Option<CdpClient>,
+        context_id: Option<String>,
+        incognito: Option<IncognitoProfile>,
+        broker: BrokerHandle,
+    ) {
+        if let (Some(client), Some(context_id)) = (&client, &context_id) {
+            let _ = client
+                .send(
+                    None,
+                    "Target.disposeBrowserContext",
+                    serde_json::json!({ "browserContextId": context_id }),
+                    deadline_in(2_000),
+                    &CancellationToken::new(),
+                )
+                .await;
+        }
+        if let Some(client) = &client {
+            let _ = client.close().await;
+        }
+        let _ = launched.kill(&self.supervisor, KILL_GRACE_MS);
+        broker.shutdown().await;
+        if let Some(incognito) = incognito {
+            incognito.remove();
+        }
+    }
+
+    /// Create the profile/scratch layout for one instance through the
+    /// anchored authority.
+    fn prepare_profiles(
+        &self,
+        id: &BrowserInstanceId,
+        purpose: &PagePurpose,
+    ) -> Result<PreparedProfiles, BrowserError> {
+        let identity = &id.identity;
+        if purpose.incognito {
+            let incognito = self.profiles.incognito(&identity.profile)?;
+            let profile_rel = incognito.rel().to_path_buf();
+            let scratch_rel = profile_rel.join("scratch");
+            self.profiles
+                .rooted()
+                .create_dir_all(&scratch_rel)
+                .map_err(|e| {
+                    BrowserError::profile(format!("cannot create incognito scratch: {e}"))
+                })?;
+            self.profiles
+                .rooted()
+                .restrict_owner_only(&scratch_rel)
+                .map_err(|e| {
+                    BrowserError::profile(format!("cannot restrict incognito scratch: {e}"))
+                })?;
+            Ok(PreparedProfiles {
+                profile_dir: incognito.dir(),
+                profile_rel,
+                scratch_rel,
+                incognito: Some(incognito),
+            })
+        } else {
+            let profile_dir = self.profiles.profile_dir(&identity.profile)?;
+            let rel = PathBuf::from(&identity.profile);
+            let scratch_rel = rel.join("scratch");
+            self.profiles.scratch_dir(&identity.profile)?;
+            Ok(PreparedProfiles {
+                profile_dir,
+                profile_rel: rel,
+                scratch_rel,
+                incognito: None,
+            })
+        }
     }
 
     /// Shut down every browser unused for at least `idle_shutdown_s` **and
-    /// with no open page** (a browser mid-work is never killed by the idle
-    /// path). Returns the profiles that were stopped. The whole tree is
-    /// killed through the supervisor, so no orphan survives.
+    /// with no page (and no in-flight admission)**: retirement and page
+    /// admission meet on the instance lifecycle lock, so a browser can never
+    /// be closed underneath a page that was just admitted. Returns the
+    /// profiles that were stopped. The whole tree is killed through the
+    /// supervisor, so no orphan survives.
     pub async fn shutdown_idle(&self) -> Vec<String> {
         let now = self.clock.now_ms();
         let idle_ms = (self.config.idle_shutdown_s as i64).saturating_mul(1000);
-        let victims: Vec<Arc<BrowserInstance>> = self
-            .browsers
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|instance| {
-                instance.page_count() == 0
-                    && now.saturating_sub(instance.last_used_ms.load(Ordering::SeqCst)) >= idle_ms
-            })
-            .cloned()
-            .collect();
+        let candidates: Vec<Arc<BrowserInstance>> =
+            self.browsers.lock().unwrap().values().cloned().collect();
         let mut stopped = Vec::new();
-        for instance in victims {
-            stopped.push(instance.identity.profile.clone());
+        for instance in candidates {
+            let profile = instance.identity().profile.clone();
+            let mut state = instance.lifecycle.lock().await;
+            if *state != InstanceLifecycle::Live {
+                continue;
+            }
+            if now.saturating_sub(instance.last_used_ms.load(Ordering::SeqCst)) < idle_ms {
+                continue;
+            }
+            // No page may be in flight, and none may slip in after this
+            // check: both sides serialize on the lifecycle lock.
+            if instance.page_count() != 0
+                || instance.admission.available_permits() != self.config.max_pages_per_profile
+            {
+                continue;
+            }
+            self.pause_seam(&profile, "retire-decision").await;
+            if *state != InstanceLifecycle::Live {
+                continue;
+            }
+            *state = InstanceLifecycle::Retiring;
+            self.remove_exact_instance(&instance);
+            drop(state);
+            stopped.push(profile);
             self.shutdown_instance(&instance).await;
         }
         stopped
@@ -848,8 +1215,28 @@ impl BrowserManager {
         }
     }
 
+    /// Remove the map entry only when it still points at this exact
+    /// instance (never evict a replacement launched in the meantime).
+    fn remove_exact_instance(&self, instance: &Arc<BrowserInstance>) {
+        let mut map = self.browsers.lock().unwrap();
+        if let Some(existing) = map.get(&instance.id) {
+            if Arc::ptr_eq(existing, instance) {
+                map.remove(&instance.id);
+            }
+        }
+    }
+
     async fn shutdown_instance(&self, instance: &Arc<BrowserInstance>) {
-        self.browsers.lock().unwrap().remove(&instance.key);
+        {
+            let mut state = instance.lifecycle.lock().await;
+            if *state == InstanceLifecycle::Live {
+                *state = InstanceLifecycle::Retiring;
+            }
+        }
+        self.remove_exact_instance(instance);
+        if let Some(task) = instance.event_task.lock().unwrap().take() {
+            task.abort();
+        }
         let pages = instance.pages_snapshot();
         for page in pages {
             let _ = page.close().await;
@@ -860,31 +1247,67 @@ impl BrowserManager {
                 None,
                 "Browser.close",
                 serde_json::json!({}),
-                crate::timeutil::deadline_in(2_000),
+                deadline_in(2_000),
                 &CancellationToken::new(),
             )
             .await;
         let _ = instance.launched.kill(&self.supervisor, KILL_GRACE_MS);
         let _ = instance.client.close().await;
         instance.broker.shutdown().await;
+        {
+            let mut state = instance.lifecycle.lock().await;
+            *state = InstanceLifecycle::Dead;
+        }
+        if let Some(incognito) = &instance.incognito {
+            incognito.remove();
+        }
     }
 
     fn drop_instance(&self, instance: &Arc<BrowserInstance>) {
-        self.browsers.lock().unwrap().remove(&instance.key);
+        self.remove_exact_instance(instance);
         let _ = instance.launched.kill(&self.supervisor, KILL_GRACE_MS);
     }
 
-    /// Retire a live browser for operational reasons (egress change, profile
-    /// reset). The next acquisition starts a fresh child.
+    /// Retire every live browser for an identity — **both** modes — for
+    /// operational reasons (egress change, profile reset). The next
+    /// acquisition starts a fresh child.
     pub async fn retire(&self, identity: &BrowserIdentity) -> Result<(), BrowserError> {
-        let instance = self.browsers.lock().unwrap().get(&identity.key()).cloned();
+        let ids: Vec<BrowserInstanceId> = self
+            .browsers
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|id| id.identity == *identity)
+            .cloned()
+            .collect();
+        if ids.is_empty() {
+            return Err(BrowserError::Bound {
+                detail: format!("no live browser for profile {}", identity.profile),
+            });
+        }
+        for id in ids {
+            let instance = self.browsers.lock().unwrap().get(&id).cloned();
+            if let Some(instance) = instance {
+                self.shutdown_instance(&instance).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Retire one exact instance (mode-qualified). The next acquisition for
+    /// that id starts a fresh child.
+    pub async fn retire_instance(&self, id: &BrowserInstanceId) -> Result<(), BrowserError> {
+        let instance = self.browsers.lock().unwrap().get(id).cloned();
         match instance {
             Some(instance) => {
                 self.shutdown_instance(&instance).await;
                 Ok(())
             }
             None => Err(BrowserError::Bound {
-                detail: format!("no live browser for profile {}", identity.profile),
+                detail: format!(
+                    "no live {:?} browser for profile {}",
+                    id.mode, id.identity.profile
+                ),
             }),
         }
     }
@@ -895,7 +1318,7 @@ impl BrowserManager {
         validate_profile_name(profile)?;
         let mut resumed = false;
         for instance in self.browsers.lock().unwrap().values() {
-            if instance.identity.profile == profile {
+            if instance.identity().profile == profile {
                 *instance.stop.lock().unwrap() = None;
                 resumed = true;
             }
@@ -928,9 +1351,10 @@ impl BrowserManager {
                 };
                 let accounting = instance.broker.accounting();
                 BrowserHealth {
-                    account: instance.identity.account.clone(),
-                    profile: instance.identity.profile.clone(),
-                    egress: instance.identity.egress.clone(),
+                    account: instance.identity().account.clone(),
+                    profile: instance.identity().profile.clone(),
+                    egress: instance.identity().egress.clone(),
+                    mode: instance.id.mode,
                     pid: instance.launched.pid,
                     child_id: instance.launched.child_id,
                     state,
@@ -949,30 +1373,46 @@ impl BrowserManager {
         self.browsers.lock().unwrap().len()
     }
 
-    /// The proxy URL a live browser for this identity is using, if any.
-    pub fn proxy_url_for(&self, identity: &BrowserIdentity) -> Option<String> {
+    /// Every live instance for an identity, mode-qualified. Never an
+    /// arbitrary single browser: a persistent and an incognito instance
+    /// share the identity label and are distinct results.
+    pub fn instances_for(&self, identity: &BrowserIdentity) -> Vec<BrowserInstanceId> {
         self.browsers
             .lock()
             .unwrap()
-            .get(&identity.key())
-            .map(|instance| instance.broker.proxy_url())
+            .keys()
+            .filter(|id| id.identity == *identity)
+            .cloned()
+            .collect()
     }
 
-    /// Page count for a live browser.
-    pub fn page_count_for(&self, identity: &BrowserIdentity) -> Option<usize> {
+    /// The proxy URL(s) a live browser (or browsers) for this identity is
+    /// using, mode-qualified and multi-valued.
+    pub fn proxy_url_for(&self, identity: &BrowserIdentity) -> Vec<(BrowserInstanceId, String)> {
         self.browsers
             .lock()
             .unwrap()
-            .get(&identity.key())
+            .iter()
+            .filter(|(id, _)| id.identity == *identity)
+            .map(|(id, instance)| (id.clone(), instance.broker.proxy_url()))
+            .collect()
+    }
+
+    /// Page count for one exact (mode-qualified) instance.
+    pub fn page_count_for(&self, id: &BrowserInstanceId) -> Option<usize> {
+        self.browsers
+            .lock()
+            .unwrap()
+            .get(id)
             .map(|instance| instance.page_count())
     }
 
-    /// True when the instance's child is still registered live.
-    pub fn is_live(&self, identity: &BrowserIdentity) -> bool {
+    /// True when the exact instance's child is still registered live.
+    pub fn is_live(&self, id: &BrowserInstanceId) -> bool {
         self.browsers
             .lock()
             .unwrap()
-            .get(&identity.key())
+            .get(id)
             .map(|instance| instance.child_is_alive(&self.supervisor))
             .unwrap_or(false)
     }
@@ -986,12 +1426,37 @@ impl BrowserManager {
     }
 
     /// The source label a live browser was launched with, if any.
-    pub fn source_for(&self, identity: &BrowserIdentity) -> Option<String> {
+    pub fn source_for(&self, id: &BrowserInstanceId) -> Option<String> {
         self.browsers
             .lock()
             .unwrap()
-            .get(&identity.key())
+            .get(id)
             .map(|instance| instance.source.clone())
+    }
+
+    /// Bounded central download records for one exact instance
+    /// (diagnostics / tests): the GUID -> context/page tracking surface.
+    pub fn download_records_for(
+        &self,
+        id: &BrowserInstanceId,
+    ) -> Option<Vec<crate::download::DownloadRecord>> {
+        self.browsers
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|instance| instance.downloads.records())
+    }
+
+    /// Download stats for one exact instance (diagnostics / tests).
+    pub fn download_stats_for(
+        &self,
+        id: &BrowserInstanceId,
+    ) -> Option<crate::download::DownloadStats> {
+        self.browsers
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|instance| instance.downloads.stats())
     }
 
     /// Profile directory (diagnostics / tests).
@@ -1010,6 +1475,76 @@ impl BrowserManager {
     }
 }
 
+/// What `prepare_profiles` produced, with an explicit cleanup for the failed
+/// launch paths (the temporary profile is removed, a persistent one is not).
+struct PreparedProfiles {
+    profile_dir: PathBuf,
+    profile_rel: PathBuf,
+    scratch_rel: PathBuf,
+    incognito: Option<IncognitoProfile>,
+}
+
+impl PreparedProfiles {
+    fn take_incognito(&mut self) -> Option<IncognitoProfile> {
+        self.incognito.take()
+    }
+
+    fn cleanup(&mut self) {
+        if let Some(incognito) = self.incognito.take() {
+            incognito.remove();
+        }
+    }
+}
+
+/// The instance-level root-session event pump: browser-domain download
+/// events (no session id) are owned centrally, and every native download is
+/// denied through `Browser.cancelDownload` with a bounded deadline. The task
+/// holds only a `Weak` instance and exits when the CDP broadcast closes.
+fn spawn_root_event_pump(instance: &Arc<BrowserInstance>) -> tokio::task::JoinHandle<()> {
+    let mut events = instance.client.subscribe();
+    let weak: Weak<BrowserInstance> = Arc::downgrade(instance);
+    tokio::spawn(async move {
+        loop {
+            let event = match events.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "browser event pump lagged; events dropped");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            let Some(instance) = weak.upgrade() else {
+                break;
+            };
+            if event.session_id.is_some() {
+                // Browser-domain events carry no session id; session-scoped
+                // events belong to the per-page pumps.
+                continue;
+            }
+            match event.method.as_str() {
+                "Browser.downloadWillBegin" | "Browser.downloadProgress" => {
+                    if let Some(denial) = instance
+                        .downloads
+                        .observe_native(&event.method, &event.params)
+                    {
+                        let _ = instance
+                            .client
+                            .send(
+                                None,
+                                "Browser.cancelDownload",
+                                serde_json::json!({ "guid": denial.guid }),
+                                deadline_in(3_000),
+                                &CancellationToken::new(),
+                            )
+                            .await;
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+}
+
 impl Drop for BrowserManager {
     /// Daemon teardown backstop: whatever the explicit shutdown paths did
     /// not cover is killed synchronously by owner through the supervisor.
@@ -1021,7 +1556,7 @@ impl Drop for BrowserManager {
         for instance in instances {
             let owner = ProcessOwner::Browser {
                 source: instance.source.clone(),
-                profile: instance.identity.profile.clone(),
+                profile: instance.identity().profile.clone(),
             };
             let _ = self.supervisor.kill_all_for(owner);
         }
@@ -1085,11 +1620,37 @@ mod tests {
     }
 
     #[test]
+    fn instance_ids_qualify_the_mode() {
+        let identity = BrowserIdentity::new("acct", "p1", "direct");
+        let persistent = BrowserInstanceId::persistent(identity.clone());
+        let incognito = BrowserInstanceId::incognito(identity);
+        assert_eq!(persistent.mode(), BrowserMode::Persistent);
+        assert_eq!(incognito.mode(), BrowserMode::Incognito);
+        assert_ne!(persistent, incognito);
+        assert_ne!(persistent.key(), incognito.key());
+        assert!(persistent.key().ends_with("persistent"));
+        assert!(incognito.key().ends_with("incognito"));
+    }
+
+    #[test]
     fn idle_expiry_is_monotonic_and_bounded() {
         let config = BrowserConfig::default();
         assert!(!idle_expired(&config, 1_000, 1_000));
         assert!(idle_expired(&config, 301_000, 1_000));
         assert!(!idle_expired(&config, 299_999, 1_000));
+    }
+
+    #[test]
+    fn invalid_download_policy_is_refused_by_config() {
+        let mut config = BrowserConfig {
+            enabled: true,
+            ..BrowserConfig::default()
+        };
+        config.downloads.enabled = true;
+        config.downloads.directory = Some("../outside".to_string());
+        assert!(config.validate().is_err());
+        config.downloads.directory = Some("downloads".to_string());
+        assert!(config.validate().is_ok());
     }
 
     #[test]

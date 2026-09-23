@@ -1,7 +1,8 @@
 //! faktor-security — the security guard crate (audit round 16:
 //! provenance/taint, secret boundaries, capability non-escalation).
 //!
-//! Three layers, all std-only plus serde:
+//! Three layers, all std-only plus serde and the `zeroize` primitive used
+//! by [`secret::SecretValue`]:
 //!
 //! 1. **Provenance** — every piece of text that reaches the agent carries a
 //!    taint list describing where it came from (`User` typed it, `Web` was
@@ -63,6 +64,7 @@ use serde::{Deserialize, Serialize};
 pub mod destination;
 pub mod payload;
 pub mod registry;
+pub mod secret;
 
 /// Hard bound for the hostile-text RED FLAG scan
 /// ([`contains_instruction_override`]): instruction-override phrasing is

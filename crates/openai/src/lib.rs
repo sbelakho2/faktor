@@ -22,16 +22,20 @@
 //! classification behavior.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use faktor_core::model::ModelCapabilities;
+use faktor_provider::config::{bearer_auth_header, ExtraHeaders, ProviderConfigError};
 #[cfg(test)]
 use faktor_provider::egress::PolicyCheckedHttpTransport;
 use faktor_provider::egress::{execute_post_json_with_extras, EgressError, HttpTransport};
+use faktor_provider::sanitize::{auth_shaped_text, ErrorScrubber};
 use faktor_provider::transport::{
     guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES, PROVIDER_CEILING_MS,
 };
+use faktor_security::secret::SecretValue;
 use futures::Stream;
 
 /// Stream hang controls: first-byte / idle bounds from the transport
@@ -81,17 +85,33 @@ pub struct OpenAiQuirks {
     pub requires_assistant_content_with_tool_calls: bool,
 }
 
-#[derive(Debug, Clone)]
+/// OpenAI adapter configuration. `api_key` is wrapped in
+/// [`SecretValue`] so no derived/custom formatting can print it; the custom
+/// [`fmt::Debug`] below keeps every other field inspectable.
+#[derive(Clone)]
 pub struct OpenAiConfig {
     pub base_url: String,
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretValue>,
     pub family: OpenAiFamily,
     /// Explicit capability overrides per model; defaults are conservative.
     pub models: HashMap<String, ModelCapabilities>,
 }
 
+impl fmt::Debug for OpenAiConfig {
+    /// Redacting `Debug`: the API key never renders (its wrapper prints
+    /// `SecretValue([redacted])`); everything else stays diagnosable.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenAiConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key)
+            .field("family", &self.family)
+            .field("models", &self.models)
+            .finish()
+    }
+}
+
 impl OpenAiConfig {
-    pub fn chat(base_url: impl Into<String>, api_key: Option<String>) -> Self {
+    pub fn chat(base_url: impl Into<String>, api_key: Option<SecretValue>) -> Self {
         Self {
             base_url: base_url.into(),
             api_key,
@@ -101,7 +121,7 @@ impl OpenAiConfig {
     }
 
     /// Selects the Responses family (native Responses codec).
-    pub fn responses(base_url: impl Into<String>, api_key: Option<String>) -> Self {
+    pub fn responses(base_url: impl Into<String>, api_key: Option<SecretValue>) -> Self {
         Self {
             base_url: base_url.into(),
             api_key,
@@ -122,21 +142,32 @@ impl OpenAiConfig {
 }
 
 /// Authorization headers for a bearer API key (empty map when keyless).
-pub fn authorization_headers(api_key: Option<&str>) -> reqwest::header::HeaderMap {
+/// The key is exposed only for the length of this construction, into a
+/// zeroized transient inside [`bearer_auth_header`]. An unencodable
+/// credential is a typed [`ProviderConfigError`] — the request MUST fail,
+/// never silently go anonymous.
+pub fn authorization_headers(
+    api_key: Option<&SecretValue>,
+) -> Result<reqwest::header::HeaderMap, ProviderConfigError> {
     let mut h = reqwest::header::HeaderMap::new();
     if let Some(key) = api_key {
-        if let Ok(v) = format!("Bearer {key}").parse() {
-            h.insert("authorization", v);
-        }
+        h.insert(reqwest::header::AUTHORIZATION, bearer_auth_header(key)?);
     }
-    h
+    Ok(h)
 }
 
 /// Shared HTTP-status classifier for BOTH wire families. Retryability comes
 /// from the provider crate's [`ProviderErrorKind::retryable`] (429 and 5xx
 /// retry with backoff; auth failures and every other 4xx are terminal), so
-/// the chat and responses paths can never drift apart.
-fn classify_http_status(status: reqwest::StatusCode, body: String) -> ProviderError {
+/// the chat and responses paths can never drift apart. The error message is
+/// the scrubbed, bounded diagnostic ([`ErrorScrubber::diagnostic`]): raw
+/// upstream bodies (which can echo request credentials) never reach the
+/// error.
+fn classify_http_status(
+    status: reqwest::StatusCode,
+    body: String,
+    scrubber: &ErrorScrubber,
+) -> ProviderError {
     let kind = match status.as_u16() {
         401 | 403 => ProviderErrorKind::Auth,
         429 => ProviderErrorKind::RateLimited,
@@ -144,7 +175,26 @@ fn classify_http_status(status: reqwest::StatusCode, body: String) -> ProviderEr
         500..=599 => ProviderErrorKind::Server,
         _ => ProviderErrorKind::BadRequest,
     };
-    ProviderError::with_code(kind, status.as_u16().to_string(), body)
+    let code = status.as_u16();
+    ProviderError::with_code(kind, code.to_string(), scrubber.diagnostic(code, &body))
+}
+
+/// Hard bound on the provider-native error `code` echoed into a
+/// [`ProviderError`] from an in-stream event. The code is scrubbed first
+/// (it is upstream-controlled text); the byte bound keeps a hostile event
+/// from inflating the error.
+const MAX_ERROR_CODE_BYTES: usize = 128;
+
+/// Typed `Malformed` error for an SSE data line that is not valid JSON. The
+/// raw line is hostile: it is scrubbed with the request's registered
+/// credentials plus the frozen patterns and bounded; an auth-shaped line
+/// (e.g. a truncated `authentication_error` payload) withholds the upstream
+/// text entirely — the in-stream equivalent of the 401/403 body rule.
+fn bad_sse_line_error(data: &str, scrubber: &ErrorScrubber) -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::Malformed,
+        scrubber.event_diagnostic("bad SSE line", data, auth_shaped_text(data)),
+    )
 }
 
 /// Hard bound on one classified error body: `Response::text()` would buffer
@@ -676,6 +726,11 @@ pub fn responses_stream(
     use futures::StreamExt as _;
     type LineStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
 
+    // Registered secret scrubber for this request: every credential the
+    // request actually carries (authorization header, credential-named
+    // query parameters) plus the frozen pattern policy.
+    let scrubber = ErrorScrubber::new().with_request_credentials(&headers, &url);
+
     enum Stage {
         Fresh,
         Streaming {
@@ -694,15 +749,17 @@ pub fn responses_stream(
         let headers = headers.clone();
         let body = body.clone();
         let cancel = cancel.clone();
+        let scrubber = scrubber.clone();
         async move {
             let (mut lines, mut pending, mut calls, mut finished) = match stage {
                 Stage::Fresh => {
+                    let no_extra_headers = ExtraHeaders::empty();
                     let resp = execute_with_head_timeout(
                         execute_post_json_with_extras(
                             transport.as_ref(),
                             &url,
                             headers,
-                            &[],
+                            &no_extra_headers,
                             &body,
                         ),
                         deadlines,
@@ -718,7 +775,10 @@ pub fn responses_stream(
                                     request_head_timeout_ms(deadlines),
                                 )
                                 .await;
-                                return Some((Err(classify_http_status(status, msg)), Stage::Done));
+                                return Some((
+                                    Err(classify_http_status(status, msg, &scrubber)),
+                                    Stage::Done,
+                                ));
                             }
                             let lines: LineStream = Box::pin(guarded_lines(
                                 utf8_line_stream(r.bytes_stream(), MAX_LINE_BYTES),
@@ -789,13 +849,7 @@ pub fn responses_stream(
                     // A data line that is not JSON is a broken stream, not
                     // forward compatibility: typed Malformed, then done.
                     Err(_) => {
-                        return Some((
-                            Err(ProviderError::new(
-                                ProviderErrorKind::Malformed,
-                                format!("bad SSE line: {data:?}"),
-                            )),
-                            Stage::Done,
-                        ));
+                        return Some((Err(bad_sse_line_error(data, &scrubber)), Stage::Done));
                     }
                 };
                 let kind = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -914,7 +968,7 @@ pub fn responses_stream(
                         finished = true;
                     }
                     "response.failed" | "error" => {
-                        return Some((Err(responses_event_error(&ev)), Stage::Done));
+                        return Some((Err(responses_event_error(&ev, &scrubber)), Stage::Done));
                     }
                     _ => {}
                 }
@@ -1022,17 +1076,20 @@ fn responses_usage(ev: &serde_json::Value) -> Result<Option<CanonicalUsage>, Pro
 /// Typed error for a Responses `error` / `response.failed` event. The
 /// structured `code` decides the retry class: auth failures are terminal,
 /// rate-limit codes stay retryable; anything else is a terminal BadRequest.
-/// Message text is never scanned for classification.
-fn responses_event_error(ev: &serde_json::Value) -> ProviderError {
+/// Message text is never scanned for classification — but both the message
+/// and the code are scrubbed (registered request credentials + frozen
+/// patterns) and bounded before they enter the error, and an auth-shaped
+/// event withholds the upstream message entirely, exactly like the
+/// 401/403 body rule of [`ErrorScrubber::diagnostic`].
+fn responses_event_error(ev: &serde_json::Value, scrubber: &ErrorScrubber) -> ProviderError {
     let err = ev
         .get("error")
         .or_else(|| ev.get("response").and_then(|r| r.get("error")));
-    let message = err
+    let raw_message = err
         .and_then(|e| e.get("message"))
         .and_then(|m| m.as_str())
         .or_else(|| ev.get("message").and_then(|m| m.as_str()))
-        .unwrap_or("responses stream error")
-        .to_string();
+        .unwrap_or_default();
     let code = err
         .and_then(|e| e.get("code"))
         .and_then(|c| c.as_str())
@@ -1055,6 +1112,12 @@ fn responses_event_error(ev: &serde_json::Value) -> ProviderError {
     } else {
         ProviderErrorKind::BadRequest
     };
+    let message = scrubber.event_diagnostic(
+        "responses stream error",
+        raw_message,
+        kind == ProviderErrorKind::Auth,
+    );
+    let code = scrubber.scrub_bounded(code, MAX_ERROR_CODE_BYTES);
     if code.is_empty() {
         ProviderError::new(kind, message)
     } else {
@@ -1199,7 +1262,18 @@ impl Provider for OpenAiProvider {
         let deadlines = stream_deadlines(&req);
         let cancel = req.meta.cancellation.clone();
         let transport = self.transport.clone();
-        let headers = authorization_headers(self.config.api_key.as_deref());
+        // An unencodable credential fails the request with a typed terminal
+        // error. It must NEVER be skipped: a dropped Authorization header
+        // would silently turn an authenticated request anonymous.
+        let headers = match authorization_headers(self.config.api_key.as_ref()) {
+            Ok(headers) => headers,
+            Err(e) => {
+                return faktor_provider::provider_error_stream(ProviderError::new(
+                    ProviderErrorKind::Auth,
+                    e.to_string(),
+                ));
+            }
+        };
         // Delivery gate BEFORE any wire decision: vision capability, image
         // mime allowlist and the provider's per-image byte bound. A refusal
         // is a typed terminal error frame (nothing was sent).
@@ -1242,7 +1316,7 @@ impl Provider for OpenAiProvider {
                     transport,
                     url,
                     headers,
-                    Vec::new(),
+                    ExtraHeaders::empty(),
                     body,
                     deadlines,
                     Some(cancel),
@@ -1270,19 +1344,23 @@ fn flush_and_pop(
     None
 }
 
-/// OpenAI SSE transport. `extra_headers` (name/value) are applied to the
-/// request before send — used by the gateway path, empty elsewhere.
+/// OpenAI SSE transport. `extra_headers` are applied to the request before
+/// send — used by the gateway path, empty elsewhere. The type is already
+/// validated, so no header can be silently dropped here.
 pub fn openai_stream(
     transport: Arc<dyn HttpTransport>,
     url: String,
     headers: reqwest::header::HeaderMap,
-    extra_headers: Vec<(String, String)>,
+    extra_headers: ExtraHeaders,
     body: serde_json::Value,
     deadlines: StreamDeadlines,
     cancel: Option<faktor_core::cancellation::CancellationToken>,
 ) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
     use futures::StreamExt as _;
     type LineStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
+
+    // Registered secret scrubber for this request (see `responses_stream`).
+    let scrubber = ErrorScrubber::new().with_request_credentials(&headers, &url);
 
     // None = request not sent yet; Some = streaming lines. Tool-call
     // fragments accumulate PER INDEX (parallel calls never collide); the
@@ -1297,7 +1375,6 @@ pub fn openai_stream(
         },
         Done,
     }
-
     futures::stream::unfold(Stage::Fresh, move |stage| {
         let transport = transport.clone();
         let url = url.clone();
@@ -1306,6 +1383,7 @@ pub fn openai_stream(
         let body = body.clone();
         let deadlines = deadlines;
         let cancel = cancel.clone();
+        let scrubber = scrubber.clone();
         async move {
             // Lazily send the request on the first poll.
             let (mut lines, mut accs, mut pending) = match stage {
@@ -1332,7 +1410,7 @@ pub fn openai_stream(
                                 )
                                 .await;
                                 return Some((
-                                    Err(classify_http_status(status, text)),
+                                    Err(classify_http_status(status, text, &scrubber)),
                                     Stage::Done,
                                 ));
                             }
@@ -1411,13 +1489,7 @@ pub fn openai_stream(
                     return Some((Ok(ProviderChunk::Done), Stage::Done));
                 }
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
-                    return Some((
-                        Err(ProviderError::new(
-                            ProviderErrorKind::Malformed,
-                            format!("bad SSE line: {data:?}"),
-                        )),
-                        Stage::Done,
-                    ));
+                    return Some((Err(bad_sse_line_error(data, &scrubber)), Stage::Done));
                 };
                 match parse_chat_chunk(&value, &mut accs, &mut pending) {
                     Ok(Some(chunk)) => {
@@ -2805,7 +2877,7 @@ mod tests {
         let mut stream = Box::pin(responses_stream(
             transport,
             format!("{base}/responses"),
-            authorization_headers(None),
+            authorization_headers(None).unwrap(),
             responses_body(&req("m")),
             StreamDeadlines {
                 first_byte_ms: 300,
@@ -2832,7 +2904,7 @@ mod tests {
         let mut stream = Box::pin(responses_stream(
             transport,
             format!("{base}/responses"),
-            authorization_headers(None),
+            authorization_headers(None).unwrap(),
             responses_body(&req("m")),
             StreamDeadlines {
                 first_byte_ms: 5000,
@@ -3300,7 +3372,7 @@ mod tests {
         );
         let base = server.base_url().await;
         let transport: Arc<dyn HttpTransport> = Arc::new(PolicyCheckedHttpTransport::permissive());
-        let headers = authorization_headers(None);
+        let headers = authorization_headers(None).unwrap();
         let deadlines = faktor_provider::transport::StreamDeadlines {
             first_byte_ms: 300,
             idle_ms: 300,
@@ -3312,7 +3384,7 @@ mod tests {
             transport,
             format!("{base}/chat/completions"),
             headers,
-            vec![],
+            ExtraHeaders::empty(),
             body,
             deadlines,
             None,
@@ -3331,15 +3403,15 @@ mod tests {
     // ------------------------------------------------------- egress (P0-36)
 
     fn allow_only(port: u16) -> Arc<dyn HttpTransport> {
-        Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
+        Arc::new(PolicyCheckedHttpTransport::with_policy_for_tests(
             DestinationPolicy::parse_lines([&format!("http://127.0.0.1:{port}")]).unwrap(),
-        )))
+        ))
     }
 
     fn https_only(port: u16) -> Arc<dyn HttpTransport> {
-        Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
+        Arc::new(PolicyCheckedHttpTransport::with_policy_for_tests(
             DestinationPolicy::parse_lines([&format!("https://127.0.0.1:{port}")]).unwrap(),
-        )))
+        ))
     }
 
     async fn first_error(mut stream: ProviderStream) -> ProviderError {
@@ -3824,5 +3896,313 @@ mod tests {
             .expect_err("no response headers is an error");
         assert_eq!(err.kind, ProviderErrorKind::Timeout, "{err:?}");
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// P0 plaintext-secret lock: a planted key must never render through
+    /// `Debug`, panic formatting, serialized diagnostics or the credential
+    /// error path, and an unencodable key fails the REQUEST with a typed
+    /// error instead of being dropped (which would send anonymously).
+    #[tokio::test]
+    async fn api_key_never_leaks_and_invalid_key_fails_the_request() {
+        const PLANTED: &str = "sk-PLANTED-openai-secret-0123456789abcdef";
+        let cfg = OpenAiConfig::chat("http://127.0.0.1:1/v1", Some(SecretValue::new(PLANTED)));
+        let mut rendered = vec![format!("{cfg:?}")];
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("provider config: {cfg:?}")
+        }))
+        .expect_err("must panic");
+        if let Some(message) = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        {
+            rendered.push(message);
+        }
+        rendered.push(serde_json::to_string(&format!("{cfg:?}")).unwrap());
+        for text in &rendered {
+            assert!(!text.contains(PLANTED), "api key leaked: {text}");
+        }
+        assert!(rendered[0].contains("[redacted]"));
+
+        // Unencodable credential: typed error whose Display/Debug carry no
+        // credential bytes.
+        let bad = SecretValue::new("sk-planted\r\nX-Injected: yes");
+        let err = authorization_headers(Some(&bad)).unwrap_err();
+        for text in [format!("{err}"), format!("{err:?}")] {
+            assert!(!text.contains("planted"), "credential leaked: {text}");
+            assert!(!text.contains("X-Injected"), "credential leaked: {text}");
+        }
+        // The provider request fails with the typed Auth error BEFORE any
+        // network byte — never an anonymous request.
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(
+            "http://127.0.0.1:1/v1",
+            Some(bad),
+        ));
+        let mut stream = provider.stream(req("m"));
+        let first = stream.next().await.expect("one item");
+        let err = first.expect_err("must fail, not send anonymously");
+        assert_eq!(err.kind, ProviderErrorKind::Auth, "{err:?}");
+        assert!(!err.message.contains("planted"), "{}", err.message);
+    }
+
+    /// Adversarial: a provider/gateway error body that echoes request
+    /// credentials must never reach the error in raw form — the bearer
+    /// credential and pattern-shaped secrets are scrubbed, bounded
+    /// diagnostics survive, and 401/403 bodies are withheld entirely.
+    /// Covers BOTH classify call sites (chat + responses families).
+    #[tokio::test]
+    async fn error_bodies_are_scrubbed_and_auth_bodies_withheld() {
+        const EXACT: &str = "exact-credential-value-9f2a";
+        const PATTERN: &str = "sk-abcdefghijklmnopqrstuvwx";
+        fn body(sentinel: &str) -> String {
+            format!(r#"{{"error":{{"message":"{sentinel} {EXACT} {PATTERN}"}}}}"#)
+        }
+        fn transport() -> Arc<dyn HttpTransport> {
+            Arc::new(PolicyCheckedHttpTransport::permissive())
+        }
+        fn headers() -> reqwest::header::HeaderMap {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert("authorization", format!("Bearer {EXACT}").parse().unwrap());
+            h
+        }
+        let assert_no_secret = |err: &ProviderError, leaked: &[&str]| {
+            let serialized = serde_json::to_string(&err.message).expect("serialize");
+            let rendered = format!("{err}|{err:?}|{serialized}");
+            for secret in leaked {
+                assert!(!rendered.contains(secret), "secret leaked: {rendered}");
+            }
+        };
+
+        // Chat family, non-auth: scrubbed bounded diagnostic, status kept.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::Respond {
+                status: 429,
+                body: body("RATE-BODY-SENTINEL"),
+            },
+        );
+        let base = server.base_url().await;
+        let mut stream = Box::pin(openai_stream(
+            transport(),
+            format!("{base}/chat/completions"),
+            headers(),
+            ExtraHeaders::empty(),
+            serde_json::json!({"model": "m"}),
+            StreamDeadlines::default(),
+            None,
+        ));
+        let err = stream
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("429 must fail");
+        assert_eq!(err.kind, ProviderErrorKind::RateLimited);
+        assert_eq!(err.code.as_deref(), Some("429"));
+        assert_no_secret(&err, &[EXACT, PATTERN]);
+        assert!(err.message.contains("HTTP 429"), "{}", err.message);
+        assert!(
+            err.message.len() <= faktor_provider::sanitize::MAX_ERROR_DIAGNOSTIC_BYTES + 128,
+            "diagnostic must stay bounded: {}",
+            err.message.len()
+        );
+
+        // Responses family, non-auth: same scrub on the second call site.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/responses",
+            MockAction::Respond {
+                status: 500,
+                body: body("RATE-BODY-SENTINEL"),
+            },
+        );
+        let base = server.base_url().await;
+        let mut stream = Box::pin(responses_stream(
+            transport(),
+            format!("{base}/responses"),
+            headers(),
+            serde_json::json!({"model": "m"}),
+            StreamDeadlines::default(),
+            None,
+        ));
+        let err = stream
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("500 must fail");
+        assert_eq!(err.kind, ProviderErrorKind::Server);
+        assert_no_secret(&err, &[EXACT, PATTERN]);
+
+        // Auth: the arbitrary upstream body is not preserved at all.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::Respond {
+                status: 401,
+                body: body("AUTH-BODY-SENTINEL"),
+            },
+        );
+        let base = server.base_url().await;
+        let mut stream = Box::pin(openai_stream(
+            transport(),
+            format!("{base}/chat/completions"),
+            headers(),
+            ExtraHeaders::empty(),
+            serde_json::json!({"model": "m"}),
+            StreamDeadlines::default(),
+            None,
+        ));
+        let err = stream
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("401 must fail");
+        assert_eq!(err.kind, ProviderErrorKind::Auth);
+        assert_no_secret(&err, &["AUTH-BODY-SENTINEL", EXACT, PATTERN]);
+        assert!(err.message.contains("withheld"), "{}", err.message);
+    }
+
+    /// Adversarial: in-stream error payloads that arrive under an HTTP 2xx
+    /// (Responses `error`/`response.failed` events and malformed SSE data
+    /// lines) are hostile text too. Planted exact credentials (registered
+    /// from the request's own Authorization header) and pattern-shaped
+    /// secrets never reach `message`, `Display`, `Debug` or the
+    /// JSON-serialized message/code; auth-shaped events withhold the
+    /// upstream message entirely; the diagnostic stays bounded.
+    #[tokio::test]
+    async fn in_stream_2xx_error_payloads_are_scrubbed_or_withheld() {
+        const EXACT: &str = "exact-credential-value-9f2a";
+        const PATTERN: &str = "sk-abcdefghijklmnopqrstuvwx";
+        fn transport() -> Arc<dyn HttpTransport> {
+            Arc::new(PolicyCheckedHttpTransport::permissive())
+        }
+        fn headers() -> reqwest::header::HeaderMap {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert("authorization", format!("Bearer {EXACT}").parse().unwrap());
+            h
+        }
+        fn assert_no_secret(err: &ProviderError, sentinels: &[&str]) {
+            let rendered = format!(
+                "{err}|{err:?}|{}|{:?}",
+                serde_json::to_string(&err.message).expect("serialize message"),
+                serde_json::to_string(&err.code).expect("serialize code"),
+            );
+            for secret in [EXACT, PATTERN].iter().chain(sentinels) {
+                assert!(!rendered.contains(secret), "secret leaked: {rendered}");
+            }
+        }
+        async fn responses_err(events: Vec<String>) -> ProviderError {
+            let server = MockServer::new();
+            server.route(
+                "POST",
+                "/responses",
+                MockAction::Sse {
+                    status: 200,
+                    events,
+                },
+            );
+            let base = server.base_url().await;
+            let mut stream = Box::pin(responses_stream(
+                transport(),
+                format!("{base}/responses"),
+                headers(),
+                serde_json::json!({"model": "m"}),
+                StreamDeadlines::default(),
+                None,
+            ));
+            stream
+                .next()
+                .await
+                .expect("one item")
+                .expect_err("2xx error event must fail the stream")
+        }
+        async fn chat_err(events: Vec<String>) -> ProviderError {
+            let server = MockServer::new();
+            server.route(
+                "POST",
+                "/chat/completions",
+                MockAction::Sse {
+                    status: 200,
+                    events,
+                },
+            );
+            let base = server.base_url().await;
+            let mut stream = Box::pin(openai_stream(
+                transport(),
+                format!("{base}/chat/completions"),
+                headers(),
+                ExtraHeaders::empty(),
+                serde_json::json!({"model": "m"}),
+                StreamDeadlines::default(),
+                None,
+            ));
+            stream
+                .next()
+                .await
+                .expect("one item")
+                .expect_err("2xx error payload must fail the stream")
+        }
+
+        // Responses error event, non-auth: scrubbed and bounded, plain
+        // non-secret text still visible.
+        let err = responses_err(vec![ev(serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_request_error",
+                "message": format!("RESP-SENTINEL {EXACT} {PATTERN}"),
+            },
+        }))])
+        .await;
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
+        assert!(err.message.contains("RESP-SENTINEL"), "{}", err.message);
+        assert!(
+            err.message.len() <= faktor_provider::sanitize::MAX_ERROR_DIAGNOSTIC_BYTES + 128,
+            "diagnostic must stay bounded: {}",
+            err.message.len()
+        );
+        assert_no_secret(&err, &[]);
+
+        // Responses error event, auth-shaped: the upstream message is
+        // withheld entirely; the secret planted in the `code` is scrubbed
+        // even though classification still reads the raw code.
+        let err = responses_err(vec![ev(serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_api_key",
+                "code": format!("invalid_api_key-{EXACT}"),
+                "message": format!("AUTH-RESP-SENTINEL {EXACT} {PATTERN}"),
+            },
+        }))])
+        .await;
+        assert_eq!(err.kind, ProviderErrorKind::Auth);
+        assert!(err.message.contains("withheld"), "{}", err.message);
+        assert_no_secret(&err, &["AUTH-RESP-SENTINEL"]);
+
+        // Chat family, malformed 2xx data line: scrubbed, bounded.
+        let err = chat_err(vec![format!(
+            "data: not-json CHAT-SENTINEL {EXACT} {PATTERN}\n\n"
+        )])
+        .await;
+        assert_eq!(err.kind, ProviderErrorKind::Malformed);
+        assert!(err.message.contains("CHAT-SENTINEL"), "{}", err.message);
+        assert!(
+            err.message.len() <= faktor_provider::sanitize::MAX_ERROR_DIAGNOSTIC_BYTES + 128,
+            "diagnostic must stay bounded: {}",
+            err.message.len()
+        );
+        assert_no_secret(&err, &[]);
+
+        // Chat family, auth-shaped malformed line: withheld.
+        let err = chat_err(vec![format!(
+            "data: authentication_error AUTH-CHAT-SENTINEL {EXACT} {PATTERN}\n\n"
+        )])
+        .await;
+        assert_eq!(err.kind, ProviderErrorKind::Malformed);
+        assert!(err.message.contains("withheld"), "{}", err.message);
+        assert_no_secret(&err, &["AUTH-CHAT-SENTINEL"]);
     }
 }

@@ -1,2 +1,7 @@
+# Authoritative Rust toolchain for this workspace (local and CI).
+# Keep in lockstep with Cargo.toml `rust-version` and the CI `rust:1.98`
+# image baseline: cargo/rustc shims resolve the exact channel below.
 [toolchain]
-channel = "stable"
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

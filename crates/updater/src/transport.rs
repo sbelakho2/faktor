@@ -145,7 +145,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_non_http_url_is_refused_before_any_connect() {
-        let fetcher = CheckedHttpFetcher::new(CheckedHttpClient::with_policy(None));
+        let fetcher = CheckedHttpFetcher::new(CheckedHttpClient::permissive());
         let mut sink = Vec::new();
         let err = fetcher
             .fetch_to("file:///etc/passwd", 1024, &mut sink)
@@ -177,7 +177,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stalled_artifact_host_is_cut_off_at_the_bounds() {
-        let fetcher = CheckedHttpFetcher::new(CheckedHttpClient::with_policy(None));
+        let fetcher = CheckedHttpFetcher::new(CheckedHttpClient::permissive());
         let head_bound = std::time::Duration::from_millis(100);
         let idle_bound = std::time::Duration::from_millis(100);
 

@@ -71,6 +71,14 @@ impl Harness {
         BrowserIdentity::new("acct", profile, "direct")
     }
 
+    fn instance(profile: &str) -> faktor_browser::BrowserInstanceId {
+        faktor_browser::BrowserInstanceId::persistent(Self::identity(profile))
+    }
+
+    fn incognito_instance(profile: &str) -> faktor_browser::BrowserInstanceId {
+        faktor_browser::BrowserInstanceId::incognito(Self::identity(profile))
+    }
+
     fn policy() -> DestinationPolicy {
         DestinationPolicy::first_party_only(vec![
             HostPattern::parse("127.0.0.1").unwrap(),
@@ -246,11 +254,14 @@ async fn proxy_only_cannot_be_overridden_by_extra_args() {
     config.extra_args = vec!["--no-proxy-server".to_string()];
     assert!(config.validate().is_err());
     // The launch argv still carries exactly one loopback proxy flag.
+    let scratch_tmp = tempfile::tempdir().unwrap();
     let argv = faktor_browser::chromium_args(&faktor_browser::LaunchOptions {
         executable: fixture_exe(),
         headless: true,
         profile_dir: PathBuf::from("/tmp/x"),
         scratch_dir: PathBuf::from("/tmp/x/scratch"),
+        scratch_root: faktor_fs::RootedDir::create(scratch_tmp.path()).unwrap(),
+        scratch_rel: PathBuf::from("scratch"),
         proxy_addr: "127.0.0.1:1".parse().unwrap(),
         owner_source: "1688".to_string(),
         owner_profile: "p1".to_string(),
@@ -294,7 +305,7 @@ async fn navigation_and_network_records_flow_through_cdp() {
         .expect("navigate");
     assert_eq!(outcome.url, "https://first.test/product");
     assert_eq!(outcome.lifecycle, faktor_browser::Lifecycle::Loaded);
-    let network = page.network();
+    let network = page.network().expect("complete history");
     assert_eq!(network.len(), 1);
     assert_eq!(network[0].request_id, "x1");
     assert_eq!(network[0].status, Some(200));
@@ -415,7 +426,7 @@ async fn navigation_cancellation_stops_loading_and_releases_the_page() {
         "the page must be released on cancellation"
     );
     assert_eq!(
-        harness.manager.page_count_for(&Harness::identity("p1")),
+        harness.manager.page_count_for(&Harness::instance("p1")),
         Some(0)
     );
     assert_eq!(harness.journal_count("recv", "Page.stopLoading"), 1);
@@ -451,7 +462,7 @@ async fn repeated_cancelled_captures_never_wedge_the_profile() {
         let result = navigation.await.unwrap();
         assert_eq!(result, Err(BrowserError::Cancelled), "round {round}");
         assert_eq!(
-            harness.manager.page_count_for(&Harness::identity("p1")),
+            harness.manager.page_count_for(&Harness::instance("p1")),
             Some(0),
             "round {round}: the slot must be released"
         );
@@ -486,7 +497,7 @@ async fn abandoned_in_flight_page_releases_its_slot_on_drop() {
     navigation.abort();
     let _ = navigation.await;
     assert_eq!(
-        harness.manager.page_count_for(&Harness::identity("p1")),
+        harness.manager.page_count_for(&Harness::instance("p1")),
         Some(0),
         "an abandoned page must release the slot on Drop"
     );
@@ -523,10 +534,10 @@ async fn idle_shutdown_reaps_browsers_whose_pages_were_abandoned() {
         )
         .await
         .expect("acquire");
-    assert_eq!(manager.page_count_for(&Harness::identity("p1")), Some(1));
+    assert_eq!(manager.page_count_for(&Harness::instance("p1")), Some(1));
     drop(page);
     assert_eq!(
-        manager.page_count_for(&Harness::identity("p1")),
+        manager.page_count_for(&Harness::instance("p1")),
         Some(0),
         "the abandoned page released its slot"
     );
@@ -597,7 +608,7 @@ async fn concurrent_acquisitions_never_exceed_the_page_bound() {
     // Exactly one target was created: the check and the open were serialized.
     assert_eq!(harness.journal_count("recv", "Target.createTarget"), 1);
     assert_eq!(
-        harness.manager.page_count_for(&Harness::identity("p1")),
+        harness.manager.page_count_for(&Harness::instance("p1")),
         Some(1)
     );
     drop(results);
@@ -1028,7 +1039,7 @@ async fn identity_egress_is_stable_and_changes_only_on_retire() {
     assert_eq!(
         harness
             .manager
-            .source_for(&Harness::identity("p1"))
+            .source_for(&Harness::instance("p1"))
             .as_deref(),
         Some("1688")
     );
@@ -1207,6 +1218,1067 @@ async fn upstream_route_selection_is_operational_config() {
         )
         .await
         .expect("acquire through a registered route");
+    let _ = page.close().await;
+    harness.manager.shutdown_all().await;
+}
+
+// ------------------------------------------------------- event loss safety
+
+#[tokio::test]
+async fn critical_event_overflow_fails_the_page_instead_of_continuing() {
+    // A burst of paused requests far beyond the critical queue capacity:
+    // the fake browser sends every event before it reads the broker's
+    // continue/fail replies, so the queue overflows deterministically.
+    let mut items = Vec::new();
+    for index in 0..64 {
+        items.push(json!({
+            "request_id": format!("r{index}"),
+            "url": format!("https://first.test/{index}.json"),
+            "resource_type": "XHR"
+        }));
+    }
+    let harness = Harness::new(
+        json!({"pause_requests": true, "network": items}),
+        |config| {
+            config.cdp_critical_event_capacity = 2;
+        },
+    )
+    .await;
+    let page = harness.acquire("p1").await.expect("acquire");
+    let result = page
+        .navigate(
+            "https://first.test/page",
+            deadline_in(10_000),
+            &CancellationToken::new(),
+        )
+        .await;
+    match result {
+        Err(BrowserError::EventStreamLagged { skipped }) => assert!(skipped >= 1),
+        other => panic!("expected EventStreamLagged, got {other:?}"),
+    }
+    // The page failed loudly and released its slot: no paused request is
+    // left waiting on a page nobody will serve.
+    assert!(page.is_closed(), "a lagged page must be failed");
+    assert_eq!(
+        harness.manager.page_count_for(&Harness::instance("p1")),
+        Some(0),
+        "the failed page's slot is released"
+    );
+    // Complete-history queries refuse typed, never answer from partial data.
+    assert!(matches!(
+        page.network(),
+        Err(BrowserError::EventStreamLagged { .. })
+    ));
+    assert_eq!(
+        wait_for_journal_count(&harness, "Target.closeTarget", 1, Duration::from_secs(2)).await,
+        1,
+        "the failed page's target must be torn down"
+    );
+    harness.manager.shutdown_all().await;
+}
+
+async fn wait_for_journal_count(
+    harness: &Harness,
+    method: &str,
+    expected: usize,
+    timeout: Duration,
+) -> usize {
+    let start = std::time::Instant::now();
+    loop {
+        let count = harness.journal_count("recv", method);
+        if count >= expected || start.elapsed() > timeout {
+            return count;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn observation_gap_latches_and_history_refuses() {
+    // Observation fan-out capacity 1: while the pump awaits the reply to the
+    // first critical `Fetch.requestPaused` (the fake browser sends every
+    // event before it reads commands), the network observation events
+    // overflow the lossy broadcast. The gap must latch and complete-history
+    // queries must refuse; unlike a critical overflow the page stays usable.
+    let mut items = Vec::new();
+    for index in 0..64 {
+        items.push(json!({
+            "request_id": format!("r{index}"),
+            "url": format!("https://first.test/{index}.json"),
+            "resource_type": "XHR"
+        }));
+    }
+    let harness = Harness::new(
+        json!({"pause_requests": true, "network": items}),
+        |config| {
+            config.cdp_event_capacity = 1;
+        },
+    )
+    .await;
+    let page = harness.acquire("p1").await.expect("acquire");
+    let _ = page
+        .navigate(
+            "https://first.test/page",
+            deadline_in(10_000),
+            &CancellationToken::new(),
+        )
+        .await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match page.network() {
+            Err(BrowserError::EventStreamLagged { skipped }) => {
+                assert!(skipped >= 1);
+                break;
+            }
+            Err(other) => panic!("unexpected network error: {other:?}"),
+            Ok(_) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the observation gap never latched"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+    assert!(
+        !page.is_closed(),
+        "an observation gap is incomplete history, not a failed page"
+    );
+    harness.manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn hostile_devtools_endpoint_is_rejected_and_the_child_is_killed() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("fake-chromium.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho 'DevTools listening on ws://attacker.example:9222/devtools/browser/evil' >&2\nsleep 60\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+    let supervisor = ProcessSupervisor::new(cas);
+    let launcher = faktor_browser::ChromiumLauncher::new(supervisor.clone());
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&profile).unwrap();
+    let error = launcher
+        .launch(
+            faktor_browser::LaunchOptions {
+                executable: script,
+                headless: true,
+                profile_dir: profile,
+                scratch_dir: dir.path().join("scratch"),
+                scratch_root: faktor_fs::RootedDir::create(dir.path()).unwrap(),
+                scratch_rel: PathBuf::from("scratch"),
+                proxy_addr: "127.0.0.1:1".parse().unwrap(),
+                owner_source: "1688".to_string(),
+                owner_profile: "p1".to_string(),
+                extra_args: Vec::new(),
+                launch_timeout_ms: 3_000,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a hostile announced endpoint must be refused");
+    assert_eq!(error.code(), "browser_unavailable", "{error:?}");
+    // The child was killed: the supervisor holds no browser child and no
+    // dial was ever made (launch never returned an endpoint).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !supervisor.alive().is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        supervisor.alive().is_empty(),
+        "the hostile child must be killed, no orphan survives"
+    );
+}
+
+// ===========================================================================
+// Lifecycle / containment wave: transactional open, launch rollback, idle
+// races, instance identity, download hard caps and rooted containment.
+// ===========================================================================
+
+use faktor_browser::{DownloadPolicy, LifecycleSeam};
+
+/// The pid the fake Chromium journaled at startup (the launch entry).
+fn launch_pid(harness: &Harness) -> u32 {
+    harness
+        .journal_entries()
+        .into_iter()
+        .find(|entry| entry["dir"] == "launch")
+        .and_then(|entry| entry["pid"].as_u64())
+        .expect("launch journal entry with pid") as u32
+}
+
+/// The broker proxy port and temp profile dir the fake was launched with.
+fn launch_proxy_and_profile(harness: &Harness) -> (u16, PathBuf) {
+    let argv: Vec<String> = harness.launch_dump()["argv"]
+        .as_array()
+        .expect("argv")
+        .iter()
+        .map(|value| value.as_str().unwrap().to_string())
+        .collect();
+    let proxy = argv
+        .iter()
+        .find(|arg| arg.starts_with("--proxy-server=http://127.0.0.1:"))
+        .expect("proxy arg");
+    let port: u16 = proxy
+        .trim_start_matches("--proxy-server=http://127.0.0.1:")
+        .parse()
+        .unwrap();
+    let user_data = argv
+        .iter()
+        .find(|arg| arg.starts_with("--user-data-dir="))
+        .expect("user-data-dir arg");
+    (
+        port,
+        PathBuf::from(user_data.trim_start_matches("--user-data-dir=")),
+    )
+}
+
+fn broker_port_refuses_connections(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &format!("127.0.0.1:{port}").parse().unwrap(),
+        Duration::from_millis(250),
+    )
+    .is_err()
+}
+
+// ---------------------------------------------------- 1. transactional open
+
+#[tokio::test]
+async fn open_page_init_failures_close_the_created_target_at_every_step() {
+    // (label, scenario, expected closeTarget count, target was handed to us)
+    let cases: Vec<(&str, Value, usize, bool)> = vec![
+        (
+            "Target.createTarget refuses",
+            json!({"fail_methods": ["Target.createTarget"]}),
+            0,
+            false,
+        ),
+        (
+            "Target.attachToTarget fails",
+            json!({"fail_methods": ["Target.attachToTarget"]}),
+            1,
+            true,
+        ),
+        (
+            "attach-without-session",
+            json!({"omit_result_fields": {"Target.attachToTarget": ["sessionId"]}}),
+            1,
+            true,
+        ),
+        (
+            "Page.enable",
+            json!({"fail_methods": ["Page.enable"]}),
+            1,
+            true,
+        ),
+        (
+            "Network.enable",
+            json!({"fail_methods": ["Network.enable"]}),
+            1,
+            true,
+        ),
+        (
+            "Runtime.enable",
+            json!({"fail_methods": ["Runtime.enable"]}),
+            1,
+            true,
+        ),
+        (
+            "Fetch.enable",
+            json!({"fail_methods": ["Fetch.enable"]}),
+            1,
+            true,
+        ),
+        (
+            "createTarget-without-id",
+            json!({"omit_result_fields": {"Target.createTarget": ["targetId"]}}),
+            0,
+            false,
+        ),
+    ];
+    for (label, scenario, expected_closes, target_owned) in cases {
+        let harness = Harness::new(scenario, |_| {}).await;
+        let result = harness.acquire("p1").await;
+        assert!(
+            result.is_err(),
+            "{label}: the injected failure must fail the open"
+        );
+        let created = harness.journal_count("recv", "Target.createTarget");
+        let closed = harness.journal_count("recv", "Target.closeTarget");
+        assert_eq!(
+            created, 1,
+            "{label}: one target was created (target count baseline is one)"
+        );
+        assert_eq!(
+            closed, expected_closes,
+            "{label}: a created-but-uninitialized target must be closed exactly once"
+        );
+        if target_owned {
+            // Target count and manager page count are back at the baseline.
+            assert_eq!(
+                created - closed,
+                0,
+                "{label}: no leaked target may survive the failed open"
+            );
+        }
+        assert_eq!(
+            harness
+                .manager
+                .page_count_for(&Harness::instance("p1"))
+                .unwrap_or(0),
+            0,
+            "{label}: no page may be recorded"
+        );
+        // The instance is not wedged: the browser is supervised and idle.
+        assert_eq!(harness.manager.browser_count(), 1, "{label}");
+        assert_eq!(harness.browser_children().len(), 1, "{label}");
+        harness.manager.shutdown_all().await;
+        assert!(
+            harness.browser_children().is_empty(),
+            "{label}: teardown leaves no orphan"
+        );
+    }
+}
+
+// ------------------------------------------------------ 2. launch rollback
+
+#[tokio::test]
+async fn failed_launch_rolls_back_child_broker_and_temp_profile() {
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "Browser.getVersion error",
+            json!({"fail_methods": ["Browser.getVersion"]}),
+        ),
+        (
+            "child dies on Browser.getVersion",
+            json!({"exit_on_method": "Browser.getVersion"}),
+        ),
+        (
+            "Browser.setDownloadBehavior error",
+            json!({"fail_methods": ["Browser.setDownloadBehavior"]}),
+        ),
+        (
+            "Target.createBrowserContext error",
+            json!({"fail_methods": ["Target.createBrowserContext"]}),
+        ),
+        (
+            "Target.createBrowserContext without id",
+            json!({"omit_result_fields": {"Target.createBrowserContext": ["browserContextId"]}}),
+        ),
+    ];
+    for (label, scenario) in cases {
+        let harness = Harness::new(scenario, |_| {}).await;
+        let result = harness
+            .manager
+            .acquire_page(
+                "1688",
+                &Harness::identity("p1"),
+                Harness::policy(),
+                &PagePurpose::incognito("probe"),
+                deadline_in(15_000),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "{label}: the injected failure must surface"
+        );
+        assert_eq!(harness.manager.browser_count(), 0, "{label}");
+        assert_eq!(
+            harness
+                .manager
+                .page_count_for(&Harness::incognito_instance("p1")),
+            None,
+            "{label}"
+        );
+        // No orphan: the supervised child exits.
+        let pid = launch_pid(&harness);
+        assert!(
+            faktor_browser::launch::wait_for_exit(&harness.supervisor, pid, Duration::from_secs(5)),
+            "{label}: the rolled-back child must die"
+        );
+        assert!(harness.browser_children().is_empty(), "{label}");
+        // The broker is stopped: its loopback port refuses connections.
+        let (port, profile_dir) = launch_proxy_and_profile(&harness);
+        assert!(
+            broker_port_refuses_connections(port),
+            "{label}: the egress broker must be shut down"
+        );
+        // The temporary incognito profile is gone.
+        assert!(
+            !profile_dir.exists(),
+            "{label}: the temporary profile must be removed"
+        );
+        assert!(
+            profile_dir.to_string_lossy().contains(".incognito"),
+            "{label}: rollback test uses an incognito profile"
+        );
+    }
+}
+
+#[tokio::test]
+async fn failed_launch_keeps_a_persistent_profile_but_removes_no_orphan() {
+    let harness = Harness::new(json!({"fail_methods": ["Browser.getVersion"]}), |_| {}).await;
+    let result = harness
+        .manager
+        .acquire_page(
+            "1688",
+            &Harness::identity("p1"),
+            Harness::policy(),
+            &PagePurpose::new("extraction"),
+            deadline_in(15_000),
+            &CancellationToken::new(),
+        )
+        .await;
+    assert!(result.is_err());
+    let pid = launch_pid(&harness);
+    assert!(faktor_browser::launch::wait_for_exit(
+        &harness.supervisor,
+        pid,
+        Duration::from_secs(5)
+    ));
+    let (port, profile_dir) = launch_proxy_and_profile(&harness);
+    assert!(broker_port_refuses_connections(port));
+    assert!(
+        profile_dir.exists(),
+        "a persistent profile is durable state and survives a failed launch"
+    );
+}
+
+// --------------------------------------------------- 3. admission vs retire
+
+async fn idle_harness() -> (
+    Arc<faktor_core::time::TestClock>,
+    std::sync::Arc<BrowserManager>,
+    tempfile::TempDir,
+) {
+    let clock = Arc::new(faktor_core::time::TestClock::new(1_000_000));
+    let dir = tempfile::tempdir().unwrap();
+    let scenario_path = dir.path().join("scenario.json");
+    std::fs::write(&scenario_path, b"{}").unwrap();
+    let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+    let supervisor = ProcessSupervisor::new(cas);
+    let config = BrowserConfig {
+        enabled: true,
+        executable: Some(fixture_exe()),
+        idle_shutdown_s: 1,
+        max_pages_per_profile: 1,
+        ..BrowserConfig::default()
+    };
+    let manager =
+        BrowserManager::with_clock(supervisor, config, dir.path(), clock.clone()).unwrap();
+    (clock, manager, dir)
+}
+
+async fn acquire_on(
+    manager: &Arc<BrowserManager>,
+    profile: &str,
+) -> Result<faktor_browser::Page, BrowserError> {
+    manager
+        .acquire_page(
+            "1688",
+            &Harness::identity(profile),
+            Harness::policy(),
+            &PagePurpose::new("extraction"),
+            deadline_in(15_000),
+            &CancellationToken::new(),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn idle_retirement_refuses_an_admission_that_raced_it() {
+    let (clock, manager, _dir) = idle_harness().await;
+    let page = acquire_on(&manager, "p1").await.expect("setup page");
+    let _ = page.close().await;
+    clock.advance(1_500);
+
+    let (seam, mut reached) = LifecycleSeam::new("p1");
+    manager.set_lifecycle_seam(Some(seam.clone()));
+    // The acquisition reaches instance_for, then pauses before admission.
+    let acquire = {
+        let manager = manager.clone();
+        tokio::spawn(async move { acquire_on(&manager, "p1").await })
+    };
+    assert_eq!(reached.recv().await, Some("admission-begin"));
+    // Retirement takes the lifecycle lock, verifies no permit is held and
+    // pauses at its decision point (still holding the lock).
+    let shutdown = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.shutdown_idle().await })
+    };
+    assert_eq!(reached.recv().await, Some("retire-decision"));
+    // Release both: retirement flips to Retiring and removes the entry; the
+    // acquisition then observes Retiring and refuses typed. It can never
+    // start a target under a browser that is being closed.
+    seam.grant(2);
+    let stopped = shutdown.await.unwrap();
+    assert_eq!(stopped, vec!["p1".to_string()]);
+    let result = acquire.await.unwrap();
+    assert_eq!(result.err().map(|e| e.code()), Some("retiring"));
+    manager.set_lifecycle_seam(None);
+    assert_eq!(manager.browser_count(), 0);
+    let page = acquire_on(&manager, "p1").await.expect("retry relaunches");
+    let _ = page.close().await;
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn idle_retirement_never_closes_a_browser_under_an_admitted_page() {
+    let (clock, manager, _dir) = idle_harness().await;
+    let page = acquire_on(&manager, "p1").await.expect("setup page");
+    let _ = page.close().await;
+    clock.advance(1_500);
+
+    let (seam, mut reached) = LifecycleSeam::new("p1");
+    manager.set_lifecycle_seam(Some(seam.clone()));
+    // The acquisition holds its permit but has not created a target yet: the
+    // exact window the old idle path closed the browser in.
+    let acquire = {
+        let manager = manager.clone();
+        tokio::spawn(async move { acquire_on(&manager, "p1").await })
+    };
+    assert_eq!(reached.recv().await, Some("admission-begin"));
+    seam.grant(1);
+    assert_eq!(reached.recv().await, Some("admission-permit"));
+    let stopped = manager.shutdown_idle().await;
+    assert!(
+        stopped.is_empty(),
+        "a browser with an admitted (in-flight) page must not be retired"
+    );
+    assert_eq!(manager.browser_count(), 1, "the instance stays live");
+    seam.grant(1);
+    let page = acquire.await.unwrap().expect("admission wins");
+    // The browser was genuinely alive underneath: the page works.
+    let outcome = page
+        .navigate(
+            "https://first.test/page",
+            deadline_in(10_000),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the page must be usable");
+    assert_eq!(outcome.lifecycle, faktor_browser::Lifecycle::Loaded);
+    manager.set_lifecycle_seam(None);
+    let _ = page.close().await;
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn page_admission_is_not_serialized_across_profiles() {
+    let harness = Harness::new(json!({}), |config| {
+        config.max_pages_per_profile = 1;
+        config.max_browsers = 2;
+    })
+    .await;
+    // Two live instances (the global admission mutex would serialize them).
+    let first = harness.acquire("p1").await.expect("p1 setup");
+    let _ = first.close().await;
+    let second = harness.acquire("p2").await.expect("p2 setup");
+    let _ = second.close().await;
+    assert_eq!(harness.manager.browser_count(), 2);
+
+    let (seam, mut reached) = LifecycleSeam::new("p1");
+    harness.manager.set_lifecycle_seam(Some(seam.clone()));
+    let p1 = {
+        let manager = harness.manager.clone();
+        tokio::spawn(async move { acquire_on(&manager, "p1").await })
+    };
+    assert_eq!(reached.recv().await, Some("admission-begin"));
+    seam.grant(1);
+    assert_eq!(reached.recv().await, Some("admission-permit"));
+    // While p1 is paused mid-admission, p2 must complete: per-instance
+    // admission, no global serialization.
+    let p2 = tokio::time::timeout(Duration::from_secs(5), harness.acquire("p2"))
+        .await
+        .expect("p2 must not block on p1")
+        .expect("p2 page");
+    seam.grant(1);
+    let p1 = p1.await.unwrap().expect("p1 page");
+    harness.manager.set_lifecycle_seam(None);
+    assert_eq!(
+        harness.manager.page_count_for(&Harness::instance("p1")),
+        Some(1)
+    );
+    assert_eq!(
+        harness.manager.page_count_for(&Harness::instance("p2")),
+        Some(1)
+    );
+    let _ = p1.close().await;
+    let _ = p2.close().await;
+    harness.manager.shutdown_all().await;
+}
+
+// ------------------------------------------------ 4. instance identity/modes
+
+#[tokio::test]
+async fn incognito_and_persistent_instances_are_distinct_and_visible() {
+    let harness = Harness::new(json!({}), |config| {
+        config.max_browsers = 2;
+        config.max_pages_per_profile = 1;
+    })
+    .await;
+    let identity = Harness::identity("p1");
+    let persistent = harness.acquire("p1").await.expect("persistent page");
+    let incognito = harness
+        .manager
+        .acquire_page(
+            "1688",
+            &identity,
+            Harness::policy(),
+            &PagePurpose::incognito("probe"),
+            deadline_in(15_000),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("incognito page");
+    let persistent_id = Harness::instance("p1");
+    let incognito_id = Harness::incognito_instance("p1");
+
+    // Both modes are visible to every lookup (the defect made incognito
+    // invisible because lookups used the persistent key).
+    assert_eq!(harness.manager.page_count_for(&persistent_id), Some(1));
+    assert_eq!(harness.manager.page_count_for(&incognito_id), Some(1));
+    assert!(harness.manager.is_live(&persistent_id));
+    assert!(harness.manager.is_live(&incognito_id));
+    assert_eq!(
+        harness.manager.source_for(&incognito_id).as_deref(),
+        Some("1688")
+    );
+    let mut ids = harness.manager.instances_for(&identity);
+    ids.sort_by_key(|id| format!("{:?}", id.mode));
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&persistent_id));
+    assert!(ids.contains(&incognito_id));
+
+    // proxy_url_for is mode-qualified and multi-valued, never one arbitrary
+    // browser.
+    let proxies = harness.manager.proxy_url_for(&identity);
+    assert_eq!(proxies.len(), 2);
+    let modes: std::collections::BTreeSet<String> = proxies
+        .iter()
+        .map(|(id, _)| format!("{:?}", id.mode))
+        .collect();
+    assert_eq!(modes.len(), 2);
+    assert_ne!(proxies[0].1, proxies[1].1, "two distinct brokers");
+
+    // retire(identity) retires BOTH modes.
+    let incognito_dir = launch_proxy_and_profile(&harness).1;
+    harness.manager.retire(&identity).await.unwrap();
+    assert_eq!(harness.manager.browser_count(), 0);
+    assert_eq!(harness.manager.page_count_for(&persistent_id), None);
+    assert_eq!(harness.manager.page_count_for(&incognito_id), None);
+    assert!(
+        !incognito_dir.exists(),
+        "the incognito profile is removed on retire"
+    );
+    assert!(harness.browser_children().is_empty());
+    let _ = persistent.close().await;
+    let _ = incognito.close().await;
+    assert_eq!(harness.manager.browser_count(), 0);
+    // retire_instance on a specific id is exact.
+    let page = harness.acquire("p1").await.expect("persistent again");
+    let _ = page.close().await;
+    harness
+        .manager
+        .retire_instance(&persistent_id)
+        .await
+        .unwrap();
+    assert_eq!(harness.manager.browser_count(), 0);
+    assert!(harness
+        .manager
+        .retire_instance(&persistent_id)
+        .await
+        .is_err());
+    harness.manager.shutdown_all().await;
+}
+
+// -------------------------------------------------------- 5. downloads
+
+fn timed_download_policy(max_bytes: u64) -> DownloadPolicy {
+    DownloadPolicy {
+        enabled: true,
+        directory: Some("downloads".to_string()),
+        max_bytes,
+    }
+}
+
+async fn wait_for<F: FnMut() -> bool>(mut ready: F, timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if ready() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    ready()
+}
+
+#[tokio::test]
+async fn native_downloads_are_denied_centrally_and_progress_fails_closed() {
+    let harness = Harness::new(
+        json!({
+            "browser_events": [
+                {"method": "Browser.downloadWillBegin", "params": {
+                    "guid": "g1",
+                    "url": "https://first.test/file.pdf",
+                    "suggestedFilename": "file.pdf",
+                    "frameId": "f1"
+                }},
+                {"method": "Browser.downloadProgress", "params": {
+                    "guid": "g1",
+                    "receivedBytes": "not-a-number"
+                }}
+            ],
+            "download_will_begin": {
+                "guid": "g2",
+                "url": "https://first.test/other.pdf",
+                "suggestedFilename": "other.pdf"
+            }
+        }),
+        |config| {
+            config.downloads = timed_download_policy(1024);
+        },
+    )
+    .await;
+    let page = harness.acquire("p1").await.expect("acquire");
+    page.navigate(
+        "https://first.test/page",
+        deadline_in(10_000),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("navigate");
+    // Native downloads are denied centrally (browser-domain events without a
+    // session id): the profile's manager records and cancels both, and the
+    // malformed progress field fails closed.
+    let instance = Harness::instance("p1");
+    assert!(
+        wait_for(
+            || harness
+                .manager
+                .download_stats_for(&instance)
+                .unwrap()
+                .blocked_total
+                >= 2,
+            Duration::from_secs(3)
+        )
+        .await,
+        "both native downloads must be blocked centrally"
+    );
+    assert!(
+        wait_for(
+            || harness
+                .manager
+                .download_stats_for(&instance)
+                .unwrap()
+                .rejected_total
+                >= 1,
+            Duration::from_secs(3)
+        )
+        .await,
+        "the malformed progress field must fail closed"
+    );
+    assert!(
+        wait_for(
+            || harness.journal_count("recv", "Browser.cancelDownload") >= 2,
+            Duration::from_secs(3)
+        )
+        .await,
+        "every native download is cancelled through CDP"
+    );
+    // Even with capture enabled, the native behavior installed is deny.
+    let behavior = harness
+        .journal_entries()
+        .into_iter()
+        .find(|entry| entry["method"] == "Browser.setDownloadBehavior")
+        .expect("behavior installed");
+    assert_eq!(behavior["params"]["behavior"], "deny");
+    let records = harness.manager.download_records_for(&instance).unwrap();
+    let malformed = records
+        .iter()
+        .find(|record| record.guid == "g1")
+        .expect("the announced GUID is tracked centrally");
+    assert_eq!(
+        malformed.state,
+        faktor_browser::DownloadState::Rejected,
+        "the malformed progress field must reject the download"
+    );
+    let error = page.last_download_error().expect("typed download error");
+    assert!(
+        matches!(error.code(), "download_blocked" | "download_rejected"),
+        "typed error: {error:?}"
+    );
+    let _ = page.close().await;
+    harness.manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn response_stage_capture_streams_under_the_cap_and_publishes_atomically() {
+    let harness = Harness::new(
+        json!({
+            "pause_response": true,
+            "stream_body_text": "captured-body",
+            "stream_chunk": 4,
+            "network": [
+                {"request_id": "dl", "url": "https://first.test/report.bin",
+                 "resource_type": "Document",
+                 "content_disposition": "attachment; filename=\"report.bin\"",
+                 "content_length": 13}
+            ]
+        }),
+        |config| {
+            config.downloads = timed_download_policy(4096);
+            config.max_pages_per_profile = 1;
+        },
+    )
+    .await;
+    let page = harness.acquire("p1").await.expect("acquire");
+    page.navigate(
+        "https://first.test/download",
+        deadline_in(10_000),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("navigate");
+    let dest = harness
+        .manager
+        .profile_dir("p1")
+        .unwrap()
+        .join("downloads")
+        .join("report.bin");
+    assert!(
+        wait_for(|| dest.exists(), Duration::from_secs(5)).await,
+        "the capture must publish the complete file"
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), b"captured-body");
+    // No partial/temp file survives a successful publish.
+    let leftovers: Vec<_> = std::fs::read_dir(dest.parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".faktor-download-")
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "no temp file may survive");
+    let stats = harness
+        .manager
+        .download_stats_for(&Harness::instance("p1"))
+        .unwrap();
+    assert_eq!(stats.captured_total, 1);
+    assert_eq!(stats.captured_bytes, 13);
+    assert!(harness.journal_count("recv", "Fetch.takeResponseBodyAsStream") == 1);
+    assert!(harness.journal_count("recv", "IO.read") >= 2);
+    assert_eq!(harness.journal_count("recv", "IO.close"), 1);
+    let _ = page.close().await;
+    harness.manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn over_bound_capture_aborts_immediately_and_publishes_nothing() {
+    let harness = Harness::new(
+        json!({
+            "pause_response": true,
+            "stream_body_bytes": 10_000,
+            "stream_chunk": 512,
+            "network": [
+                {"request_id": "big", "url": "https://first.test/big.bin",
+                 "resource_type": "Document",
+                 "content_disposition": "attachment; filename=\"big.bin\""}
+            ]
+        }),
+        |config| {
+            config.downloads = timed_download_policy(1024);
+        },
+    )
+    .await;
+    let page = harness.acquire("p1").await.expect("acquire");
+    page.navigate(
+        "https://first.test/download",
+        deadline_in(10_000),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("navigate");
+    let instance = Harness::instance("p1");
+    assert!(
+        wait_for(
+            || harness
+                .manager
+                .download_stats_for(&instance)
+                .unwrap()
+                .cancelled_over_bound
+                >= 1,
+            Duration::from_secs(5)
+        )
+        .await,
+        "the capture must abort at the cap"
+    );
+    // Abort is immediate: only the reads up to the exceeding chunk happen.
+    let reads = harness.journal_count("recv", "IO.read");
+    assert!(
+        (2..=3).contains(&reads),
+        "the stream must be abandoned immediately (reads={reads})"
+    );
+    assert_eq!(harness.journal_count("recv", "IO.close"), 1);
+    let downloads = harness.manager.profile_dir("p1").unwrap().join("downloads");
+    let entries: Vec<String> = std::fs::read_dir(&downloads)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "an over-bound capture must leave nothing behind: {entries:?}"
+    );
+    assert!(matches!(
+        page.last_download_error(),
+        Some(BrowserError::DownloadRejected { .. })
+    ));
+    let _ = page.close().await;
+    harness.manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn declared_or_malformed_length_denies_before_streaming() {
+    for (label, length_fields) in [
+        ("over-bound", json!({"content_length": 5000})),
+        ("malformed", json!({"content_length_raw": "bananas"})),
+    ] {
+        let harness = Harness::new(
+            json!({
+                "pause_response": true,
+                "stream_body_text": "payload",
+                "network": [
+                    {"request_id": "dl", "url": "https://first.test/x.bin",
+                     "resource_type": "Document",
+                     "content_disposition": "attachment; filename=\"x.bin\""
+                    }
+                ]
+            })
+            .as_object()
+            .cloned()
+            .map(|mut object| {
+                let item = object
+                    .get_mut("network")
+                    .and_then(Value::as_array_mut)
+                    .and_then(|items| items.get_mut(0))
+                    .and_then(Value::as_object_mut)
+                    .unwrap();
+                for (key, value) in length_fields.as_object().unwrap() {
+                    item.insert(key.clone(), value.clone());
+                }
+                Value::Object(object)
+            })
+            .unwrap(),
+            |config| {
+                config.downloads = timed_download_policy(1024);
+            },
+        )
+        .await;
+        let page = harness.acquire("p1").await.expect("acquire");
+        page.navigate(
+            "https://first.test/download",
+            deadline_in(10_000),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("navigate");
+        let instance = Harness::instance("p1");
+        assert!(
+            wait_for(
+                || harness
+                    .manager
+                    .download_stats_for(&instance)
+                    .unwrap()
+                    .rejected_total
+                    >= 1,
+                Duration::from_secs(5)
+            )
+            .await,
+            "{label}: the response must be denied"
+        );
+        assert_eq!(
+            harness.journal_count("recv", "Fetch.takeResponseBodyAsStream"),
+            0,
+            "{label}: no byte may be streamed"
+        );
+        assert!(
+            harness.journal_count("recv", "Fetch.failRequest") >= 1,
+            "{label}: the request must be failed"
+        );
+        let _ = page.close().await;
+        harness.manager.shutdown_all().await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlink_swapped_download_directory_cannot_publish_outside_the_profile() {
+    let harness = Harness::new(
+        json!({
+            "pause_response": true,
+            "stream_body_text": "exfil",
+            "network": [
+                {"request_id": "dl", "url": "https://first.test/x.bin",
+                 "resource_type": "Document",
+                 "content_disposition": "attachment; filename=\"x.bin\""}
+            ]
+        }),
+        |config| {
+            config.downloads = timed_download_policy(4096);
+        },
+    )
+    .await;
+    let page = harness.acquire("p1").await.expect("acquire");
+    let downloads = harness.manager.profile_dir("p1").unwrap().join("downloads");
+    assert!(
+        downloads.is_dir(),
+        "the download dir was prepared at launch"
+    );
+    // Swap the (already prepared) download directory for a symlink to a
+    // directory outside the profile.
+    let outside = harness._dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::remove_dir_all(&downloads).unwrap();
+    std::os::unix::fs::symlink(&outside, &downloads).unwrap();
+    page.navigate(
+        "https://first.test/download",
+        deadline_in(10_000),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("navigate");
+    let instance = Harness::instance("p1");
+    assert!(
+        wait_for(
+            || harness
+                .manager
+                .download_stats_for(&instance)
+                .unwrap()
+                .rejected_total
+                >= 1,
+            Duration::from_secs(5)
+        )
+        .await,
+        "the swapped download directory must fail the capture"
+    );
+    assert_eq!(
+        std::fs::read_dir(&outside).unwrap().count(),
+        0,
+        "nothing may ever be written through the symlink"
+    );
     let _ = page.close().await;
     harness.manager.shutdown_all().await;
 }

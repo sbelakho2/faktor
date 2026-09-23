@@ -123,7 +123,7 @@ impl PayloadDir {
                 return Err(PayloadError::Unreadable {
                     path: root.clone(),
                     message: e.to_string(),
-                })
+                });
             }
         };
         if metadata.file_type().is_symlink() || !metadata.is_dir() {

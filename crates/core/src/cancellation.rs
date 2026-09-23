@@ -5,47 +5,116 @@
 //! wait built on std waker registration — `cancel()` wakes every registered
 //! waker, so async waiters surface cancellation immediately without polling
 //! (audit round 14: the guarded-line transport used to poll on a timer).
+//!
+//! # Registration lifetime (no waiter leak, no recursive cancel)
+//!
+//! Every `wait()`/`attach()` registration is keyed by a process-unique id in
+//! a `slab`-style map and is removed by its owner:
+//!
+//! - a sync wait holds an RAII [`Registration`] that removes the entry when
+//!   the wait completes (woken or cancelled) or unwinds;
+//! - a cascade registration is removed when the last clone of the child
+//!   token drops ([`Inner::drop`] follows its parent back-links), so a
+//!   long-lived parent accumulates only *live* registrations, never one
+//!   entry per historical child;
+//! - async waits already unregister on future drop.
+//!
+//! Cancellation propagation is an explicit breadth-first walk
+//! (`VecDeque<Arc<Inner>>`): child refs are collected under each token's
+//! registration lock, the lock is released, and the queue is drained
+//! iteratively — a 100k-deep child tree cannot recurse the stack. All
+//! cancellation locks recover from poisoning (a panic elsewhere must never
+//! turn cancellation into a panic).
 
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::task::{Context, Poll, Waker};
 
-#[derive(Default)]
+/// Process-unique registration ids (one map per token, ids never reused).
+static NEXT_REGISTRATION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_registration_id() -> u64 {
+    NEXT_REGISTRATION_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Lock without ever panicking on an unrelated poison: cancellation
+/// infrastructure must stay available when some other thread panicked.
+fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 struct Inner {
     cancelled: AtomicBool,
-    waiters: Mutex<Vec<Arc<Waiter>>>,
+    /// Live registrations (sync waits and cascade children) by id. See the
+    /// module docs for the removal rules.
+    waiters: Mutex<BTreeMap<u64, Arc<Waiter>>>,
     /// Registrations of live [`CancellationToken::cancelled`] futures. One
     /// entry per awaiting future, removed when the future drops; `cancel()`
     /// wakes every entry.
     async_waiters: Mutex<Vec<Waker>>,
+    /// Back-links `(parent, registration id)` for every cascade `attach()`
+    /// this token is registered under. `Weak` so parent and child never
+    /// keep each other alive; [`Inner::drop`] unregisters every link.
+    parents: Mutex<Vec<(Weak<Inner>, u64)>>,
 }
 
-/// A registration on a parent token. `on_cancel` (if set) is the token that
-/// must be cancelled when the parent is — this is how `child()`/`attach()`
-/// cascade. `wait()` registers with `on_cancel = None`.
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            waiters: Mutex::new(BTreeMap::new()),
+            async_waiters: Mutex::new(Vec::new()),
+            parents: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // The last clone of this token is going away: every parent
+        // registration it holds is no longer live. Taking the links is
+        // panic-free (poison recovery); a parent already gone needs no
+        // cleanup.
+        let links = std::mem::take(&mut *lock_ignore_poison(&self.parents));
+        for (parent, id) in links {
+            if let Some(parent) = parent.upgrade() {
+                lock_ignore_poison(&parent.waiters).remove(&id);
+            }
+        }
+    }
+}
+
+/// What one registration does when its token is cancelled.
+enum WaiterKind {
+    /// A sync `wait()` registration: notified through the condvar.
+    Wait,
+    /// A cascade registration: the referenced child token is cancelled.
+    /// `Weak` — the parent never keeps a dropped child alive.
+    Cascade(Weak<Inner>),
+}
+
+/// A registration on a parent token.
 struct Waiter {
     cond: Condvar,
     notified: Mutex<bool>,
-    on_cancel: Mutex<Option<CancellationToken>>,
+    kind: WaiterKind,
 }
 
-impl Waiter {
-    fn for_wait() -> Arc<Self> {
-        Arc::new(Self {
-            cond: Condvar::new(),
-            notified: Mutex::new(false),
-            on_cancel: Mutex::new(None),
-        })
-    }
+/// RAII handle for one sync-wait registration: removes the map entry when
+/// the wait completes or unwinds.
+struct Registration {
+    inner: Arc<Inner>,
+    id: u64,
+}
 
-    fn for_cascade(other: CancellationToken) -> Arc<Self> {
-        Arc::new(Self {
-            cond: Condvar::new(),
-            notified: Mutex::new(false),
-            on_cancel: Mutex::new(Some(other)),
-        })
+impl Drop for Registration {
+    fn drop(&mut self) {
+        lock_ignore_poison(&self.inner.waiters).remove(&self.id);
     }
 }
 
@@ -80,37 +149,28 @@ impl CancellationToken {
     }
 
     /// Cancel. Returns true if this call performed the cancellation
-    /// (first caller wins; subsequent calls return false).
+    /// (first caller wins; subsequent calls return false). Propagates to
+    /// every attached child with an explicit worklist — no recursion.
     pub fn cancel(&self) -> bool {
         if self.inner.cancelled.swap(true, Ordering::AcqRel) {
             return false;
         }
-        let waiters = self.inner.waiters.lock().unwrap();
-        for w in waiters.iter() {
-            {
-                let mut n = w.notified.lock().unwrap();
-                *n = true;
-                w.cond.notify_all();
+        let mut queue: VecDeque<Arc<Inner>> = VecDeque::new();
+        self.propagate(&mut queue);
+        while let Some(inner) = queue.pop_front() {
+            // A child already cancelled independently has already
+            // propagated through its own subtree.
+            if inner.cancelled.swap(true, Ordering::AcqRel) {
+                continue;
             }
-            // Propagate to registered children. Reentrancy is bounded: a
-            // child's cancel() sees the parent's flag already set and stops.
-            let to_cancel = w.on_cancel.lock().unwrap().clone();
-            if let Some(t) = to_cancel {
-                t.cancel();
-            }
-        }
-        drop(waiters);
-        // Async waiters: drain under the lock, wake outside it — a wake may
-        // re-poll the waiting task inline, and the poll would take the same
-        // lock (std Mutex is not reentrant).
-        let to_wake = {
-            let mut async_waiters = self.inner.async_waiters.lock().unwrap();
-            std::mem::take(&mut *async_waiters)
-        };
-        for w in to_wake {
-            w.wake();
+            propagate_inner(&inner, &mut queue);
         }
         true
+    }
+
+    /// Notify this token's live registrations and enqueue cascade children.
+    fn propagate(&self, queue: &mut VecDeque<Arc<Inner>>) {
+        propagate_inner(&self.inner, queue);
     }
 
     /// A child token: cancelling the parent cancels the child. Cancelling the
@@ -123,17 +183,37 @@ impl CancellationToken {
 
     /// Register a token that must be cancelled when this one is. Used by
     /// `child()` and by structured concurrency to fan cancellation out.
+    ///
+    /// The registration lives until the last clone of `other` is dropped
+    /// (then [`Inner::drop`] removes it) or until this token is cancelled,
+    /// whichever comes first — a long-lived parent never accumulates dead
+    /// child registrations.
     pub fn attach(&self, other: CancellationToken) {
-        let waiter = Waiter::for_cascade(other.clone());
-        let mut waiters = self.inner.waiters.lock().unwrap();
+        let id = next_registration_id();
+        let waiter = Arc::new(Waiter {
+            cond: Condvar::new(),
+            notified: Mutex::new(false),
+            kind: WaiterKind::Cascade(Arc::downgrade(&other.inner)),
+        });
+        // Lock order is child back-links then parent registrations — the
+        // same order `Inner::drop` uses, and `other` is held here so its
+        // inner cannot be dropping.
+        let mut parents = lock_ignore_poison(&other.inner.parents);
+        let mut waiters = lock_ignore_poison(&self.inner.waiters);
         if self.inner.cancelled.load(Ordering::Acquire) {
+            drop(waiters);
+            drop(parents);
             other.cancel();
             return;
         }
-        waiters.push(waiter);
-        // Re-check under the same lock so cancel() cannot interleave between
-        // registration and this check: if the parent was cancelled before we
-        // registered, cancel() already iterated waiters and never saw us.
+        waiters.insert(id, waiter);
+        parents.push((Arc::downgrade(&self.inner), id));
+        drop(waiters);
+        drop(parents);
+        // Re-check under the same critical section was already done: a
+        // `cancel()` that swapped the flag before we acquired the lock is
+        // seen above; one that swaps after we release the lock sees the
+        // fully published registration (entry + back-link).
         if self.inner.cancelled.load(Ordering::Acquire) {
             other.cancel();
         }
@@ -144,21 +224,66 @@ impl CancellationToken {
         if self.inner.cancelled.load(Ordering::Acquire) {
             return;
         }
-        let waiter = Waiter::for_wait();
+        let waiter = Arc::new(Waiter {
+            cond: Condvar::new(),
+            notified: Mutex::new(false),
+            kind: WaiterKind::Wait,
+        });
+        let id = next_registration_id();
         {
-            let mut waiters = self.inner.waiters.lock().unwrap();
+            let mut waiters = lock_ignore_poison(&self.inner.waiters);
             if self.inner.cancelled.load(Ordering::Acquire) {
                 return;
             }
-            waiters.push(waiter.clone());
+            waiters.insert(id, waiter.clone());
         }
+        // The guard lives exactly as long as this wait: completion, early
+        // return, or unwind all remove the registration.
+        let _registration = Registration {
+            inner: self.inner.clone(),
+            id,
+        };
         if self.inner.cancelled.load(Ordering::Acquire) {
             return;
         }
-        let mut notified = waiter.notified.lock().unwrap();
+        let mut notified = lock_ignore_poison(&waiter.notified);
         while !*notified && !self.inner.cancelled.load(Ordering::Acquire) {
-            notified = waiter.cond.wait(notified).unwrap();
+            notified = waiter
+                .cond
+                .wait(notified)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
+    }
+}
+
+/// Notify `inner`'s sync waiters (condvar), enqueue its live cascade
+/// children, and wake its async waiters. Locks are released before any
+/// child is touched or waker woken (a wake may re-poll inline).
+fn propagate_inner(inner: &Arc<Inner>, queue: &mut VecDeque<Arc<Inner>>) {
+    {
+        let waiters = lock_ignore_poison(&inner.waiters);
+        for waiter in waiters.values() {
+            {
+                let mut notified = lock_ignore_poison(&waiter.notified);
+                *notified = true;
+                waiter.cond.notify_all();
+            }
+            if let WaiterKind::Cascade(child) = &waiter.kind {
+                if let Some(child) = child.upgrade() {
+                    queue.push_back(child);
+                }
+            }
+        }
+    }
+    // Async waiters: drain under the lock, wake outside it — a wake may
+    // re-poll the waiting task inline, and the poll would take the same
+    // lock (std Mutex is not reentrant).
+    let to_wake = {
+        let mut async_waiters = lock_ignore_poison(&inner.async_waiters);
+        std::mem::take(&mut *async_waiters)
+    };
+    for waker in to_wake {
+        waker.wake();
     }
 }
 
@@ -181,7 +306,7 @@ impl Future for CancelledAwait<'_> {
             this.registered = None;
             return Poll::Ready(());
         }
-        let mut async_waiters = this.token.inner.async_waiters.lock().unwrap();
+        let mut async_waiters = lock_ignore_poison(&this.token.inner.async_waiters);
         // Re-check under the lock: cancel() cannot interleave between this
         // check and the registration below, so no wake can be missed.
         if this.token.is_cancelled() {
@@ -214,7 +339,7 @@ impl Drop for CancelledAwait<'_> {
         let Some(registered) = self.registered.take() else {
             return;
         };
-        let mut async_waiters = self.token.inner.async_waiters.lock().unwrap();
+        let mut async_waiters = lock_ignore_poison(&self.token.inner.async_waiters);
         // Entries are per-future clones of the same waker; removing any one
         // matching entry is safe — at most one registration per live future
         // exists and wake semantics only need one survivor per task.
@@ -238,7 +363,7 @@ mod tests {
     use std::sync::mpsc;
     use std::task::RawWakerVTable;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     // ------------------------------------------------------------ async wait
 
@@ -543,5 +668,187 @@ mod tests {
             16,
             "no waiter may hang or be skipped"
         );
+    }
+
+    // ------------------------------------------- registration lifetime limits
+
+    fn waiter_count(token: &CancellationToken) -> usize {
+        lock_ignore_poison(&token.inner.waiters).len()
+    }
+
+    fn await_waiter_count(token: &CancellationToken, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while waiter_count(token) != expected {
+            assert!(
+                Instant::now() < deadline,
+                "waiter count never reached {expected} (currently {})",
+                waiter_count(token)
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn sync_wait_registrations_are_released_on_completion() {
+        // A parked wait registers exactly one live entry; waking removes it.
+        let t = Arc::new(CancellationToken::new());
+        let h = thread::spawn({
+            let t = t.clone();
+            move || t.wait()
+        });
+        await_waiter_count(&t, 1);
+        assert_eq!(waiter_count(&t), 1);
+        t.cancel();
+        h.join().unwrap();
+        assert_eq!(
+            waiter_count(&t),
+            0,
+            "a completed wait must leave no registration behind"
+        );
+        // Sequential waits against the now-cancelled token register nothing.
+        for _ in 0..1_000 {
+            t.wait();
+        }
+        assert_eq!(waiter_count(&t), 0);
+    }
+
+    #[test]
+    fn many_blocked_waiters_are_bounded_and_released() {
+        let t = Arc::new(CancellationToken::new());
+        let mut handles = vec![];
+        for _ in 0..64 {
+            let t = t.clone();
+            handles.push(thread::spawn(move || t.wait()));
+        }
+        await_waiter_count(&t, 64);
+        assert_eq!(waiter_count(&t), 64, "one entry per live waiter, no more");
+        t.cancel();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(waiter_count(&t), 0, "every waiter must unregister");
+    }
+
+    #[test]
+    fn dropped_children_unregister_from_every_parent() {
+        let parent = CancellationToken::new();
+        for _ in 0..1_000 {
+            let child = parent.child();
+            assert_eq!(waiter_count(&parent), 1);
+            drop(child);
+            assert_eq!(
+                waiter_count(&parent),
+                0,
+                "dropping the last child clone must remove its registration"
+            );
+        }
+        // A live clone keeps the one registration alive; the last drop
+        // removes it.
+        let child = parent.child();
+        let clone = child.clone();
+        drop(child);
+        assert_eq!(
+            waiter_count(&parent),
+            1,
+            "a live clone keeps the child alive"
+        );
+        drop(clone);
+        assert_eq!(waiter_count(&parent), 0);
+        // One child attached to two parents unregisters from both.
+        let other = CancellationToken::new();
+        let child = parent.child();
+        other.attach(child.clone());
+        assert_eq!(waiter_count(&parent), 1);
+        assert_eq!(waiter_count(&other), 1);
+        drop(child);
+        assert_eq!(waiter_count(&parent), 0);
+        assert_eq!(waiter_count(&other), 0);
+    }
+
+    #[test]
+    fn hundred_thousand_node_trees_cancel_iteratively() {
+        // Deep chain: a recursive cascade would overflow the stack here.
+        let root = CancellationToken::new();
+        let mut tokens = Vec::with_capacity(100_001);
+        tokens.push(root.clone());
+        for i in 0..100_000 {
+            let child = tokens[i].child();
+            tokens.push(child);
+        }
+        assert_eq!(waiter_count(&root), 1, "the chain is one live child link");
+        assert!(root.cancel());
+        for (i, token) in tokens.iter().enumerate() {
+            assert!(token.is_cancelled(), "deep node {i} must be cancelled");
+        }
+        drop(tokens);
+        assert_eq!(
+            waiter_count(&root),
+            0,
+            "no dead registration may survive the tree"
+        );
+
+        // Wide tree: 100k live siblings under one root.
+        let root = CancellationToken::new();
+        let children: Vec<CancellationToken> = (0..100_000).map(|_| root.child()).collect();
+        assert_eq!(waiter_count(&root), 100_000);
+        assert!(root.cancel());
+        assert!(children.iter().all(CancellationToken::is_cancelled));
+        drop(children);
+        assert_eq!(waiter_count(&root), 0);
+    }
+
+    #[test]
+    fn poisoned_cancellation_locks_never_panic() {
+        fn poison<T>(mutex: &Mutex<T>) {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = mutex.lock().unwrap();
+                panic!("poison injection");
+            }));
+            assert!(mutex.lock().is_err(), "the mutex must really be poisoned");
+        }
+
+        // Poisoned registration map: cancel/attach/child/drop all recover.
+        let a = CancellationToken::new();
+        poison(&a.inner.waiters);
+        let b = CancellationToken::new();
+        a.attach(b.clone());
+        let c = a.child();
+        assert!(a.cancel(), "cancel must not panic on a poisoned map");
+        assert!(b.is_cancelled());
+        assert!(c.is_cancelled());
+        drop(c);
+        drop(b);
+        a.wait();
+
+        // Poisoned `notified` of a parked waiter: cancel still wakes it and
+        // the waiter still returns (no panic, no hang).
+        let d = Arc::new(CancellationToken::new());
+        let h = thread::spawn({
+            let d = d.clone();
+            move || d.wait()
+        });
+        await_waiter_count(&d, 1);
+        let waiter = {
+            let waiters = lock_ignore_poison(&d.inner.waiters);
+            waiters.values().next().expect("registered waiter").clone()
+        };
+        poison(&waiter.notified);
+        d.cancel();
+        h.join().unwrap();
+
+        // Poisoned async waker list: poll, drop and cancel all recover.
+        let e = CancellationToken::new();
+        poison(&e.inner.async_waiters);
+        let mut fut = Box::pin(e.cancelled());
+        assert!(!poll_once(&mut fut));
+        drop(fut);
+        assert!(e.cancel());
+
+        // Poisoned back-links: dropping a child unregisters through recovery.
+        let f = CancellationToken::new();
+        let child = f.child();
+        poison(&child.inner.parents);
+        drop(child);
+        assert_eq!(waiter_count(&f), 0);
     }
 }

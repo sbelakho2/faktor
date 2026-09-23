@@ -21,6 +21,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use faktor_core::error::Error;
 use faktor_core::hash::FileHash;
 
+use crate::rooted::RootedDir;
+
 /// fsync a directory so a completed rename/link is durable. Errors are
 /// ignored on purpose: macOS refuses directory fsync with EINVAL, and on
 /// platforms where it works the error would only be reportable, not
@@ -171,6 +173,59 @@ pub fn atomic_adopt_dir(tmp: &Path, dest: &Path) -> Result<(), Error> {
     })?;
     fsync_parent(parent);
     Ok(())
+}
+
+/// Atomically publish an already-written temp entry at `dest_rel` through a
+/// [`RootedDir`] authority: the rooted analogue of [`atomic_adopt`] for
+/// callers that stage their temp through the anchored-directory authority
+/// ([`RootedDir::atomic_publish`] delegates here). Both relative paths must
+/// name the same parent directory, so the publish is a single same-directory
+/// rename; that parent is reached by the authority's no-follow /
+/// reparse-aware walk, and on unix it is fsynced afterwards so the publish
+/// survives power loss.
+///
+/// Containment: the walk refuses a symlink (unix) or unverified reparse
+/// point (Windows) on every component, so a parent swapped since the caller
+/// resolved it fails the publish instead of redirecting the rename outside
+/// the root. On failure nothing is renamed: the destination keeps its
+/// previous state (or stays absent) and the caller's temp remains for
+/// cleanup. A crash at any point leaves either the previous destination or
+/// the whole new entry, never a partial destination. Platform honest limit:
+/// see the `crate::rooted` module docs (Windows re-check-to-rename window).
+pub fn atomic_publish_at(root: &RootedDir, tmp_rel: &Path, dest_rel: &Path) -> Result<(), Error> {
+    let (tmp_parent, tmp_name) = crate::rooted::split_final(tmp_rel)?;
+    let (dest_parent, dest_name) = crate::rooted::split_final(dest_rel)?;
+    if tmp_parent != dest_parent {
+        return Err(Error::malformed(format!(
+            "atomic publish requires one directory: {tmp_rel:?} -> {dest_rel:?}"
+        )));
+    }
+    #[cfg(unix)]
+    {
+        let dir = root.walk_dirs(&tmp_parent)?;
+        crate::rooted::unix_rename_at(&dir, &tmp_name, &dir, &dest_name).map_err(|e| {
+            Error::internal(format!(
+                "cannot publish {} -> {}: {e}",
+                tmp_rel.display(),
+                dest_rel.display()
+            ))
+        })?;
+        let _ = crate::rooted::unix_fsync(&dir);
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (tmp_name, dest_name);
+        let tmp = crate::rooted::canonicalize_rooted(root.root(), tmp_rel)?;
+        let dest = crate::rooted::canonicalize_rooted(root.root(), dest_rel)?;
+        fs::rename(&tmp, &dest).map_err(|e| {
+            Error::internal(format!(
+                "cannot publish {} -> {}: {e}",
+                tmp_rel.display(),
+                dest_rel.display()
+            ))
+        })
+    }
 }
 
 /// A unique temp path in the same directory as `path`: same filesystem, so
@@ -906,5 +961,111 @@ mod tests {
             8 * per_thread,
             "a split per-path lock lost increments"
         );
+    }
+
+    /// Regression guard for the static-authority scan
+    /// (`no_hand_rolled_atomic_write_outside_fs_atomic_and_the_exact_allowlist`):
+    /// the rooted atomic publish lives in THIS sanctioned module, and
+    /// `rooted.rs` must never re-grow a hand-rolled rename / temp-write
+    /// sequence (the scan flagged `rooted.rs`'s old `std::fs::rename`).
+    #[test]
+    fn rooted_source_has_no_hand_rolled_atomic_write_sequence() {
+        const ROOTED_SRC: &str = include_str!("rooted.rs");
+        for marker in [
+            "std::fs::rename",
+            "fs::rename",
+            "tokio::fs::rename",
+            "NamedTempFile::persist",
+        ] {
+            assert!(
+                !ROOTED_SRC.contains(marker),
+                "rooted.rs re-introduced {marker:?}: route publishes through crate::atomic"
+            );
+        }
+        assert!(
+            ROOTED_SRC.contains("crate::atomic::atomic_publish_at"),
+            "RootedDir::atomic_publish must delegate to the sanctioned module"
+        );
+    }
+
+    /// The rooted publish primitive itself: a same-directory whole-file swap
+    /// through the anchored authority, a typed refusal before any syscall when
+    /// the two paths do not share one directory, no partial destination when
+    /// the rename fails, and — on unix — a parent swapped for a symlink to an
+    /// outside directory refused without touching the target.
+    #[test]
+    fn rooted_publish_at_swaps_whole_files_and_refuses_escape_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let dir = RootedDir::create(&root).unwrap();
+        dir.create_dir_all(Path::new("dl")).unwrap();
+        dir.create_dir_all(Path::new("other")).unwrap();
+
+        // Same-directory precondition: refused typed, nothing created.
+        let err =
+            atomic_publish_at(&dir, Path::new("dl/tmp-1"), Path::new("other/final")).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed, "{err:?}");
+        assert!(!dir.join(Path::new("other/final")).exists());
+
+        // A failed publish (missing temp) leaves no partial destination.
+        assert!(atomic_publish_at(&dir, Path::new("dl/ghost"), Path::new("dl/final")).is_err());
+        assert!(!dir.join(Path::new("dl/final")).exists());
+
+        // Success: whole payload at the destination, temp consumed, and the
+        // parent directory is still syncable (fsync semantics preserved).
+        let mut file = dir.open_create_new(Path::new("dl/.tmp-1")).unwrap();
+        use std::io::Write as _;
+        file.write_all(b"whole-payload").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        atomic_publish_at(&dir, Path::new("dl/.tmp-1"), Path::new("dl/final")).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join(Path::new("dl/final"))).unwrap(),
+            b"whole-payload"
+        );
+        assert!(!dir.join(Path::new("dl/.tmp-1")).exists());
+        dir.sync_dir(Path::new("dl")).unwrap();
+
+        // Repeated publishes always observe a whole destination and never
+        // leave a temp behind (atomic replace, not truncate-in-place).
+        for i in 0..25u64 {
+            let rel_tmp = PathBuf::from(format!("dl/.tmp-{i}"));
+            let payload = format!("v{i}-{}", "p".repeat((i * 7) as usize));
+            let mut f = dir.open_create_new(&rel_tmp).unwrap();
+            f.write_all(payload.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+            drop(f);
+            atomic_publish_at(&dir, &rel_tmp, Path::new("dl/final")).unwrap();
+            assert_eq!(
+                std::fs::read(dir.join(Path::new("dl/final"))).unwrap(),
+                payload.as_bytes()
+            );
+        }
+        let mut names: Vec<String> = std::fs::read_dir(dir.join(Path::new("dl")))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["final".to_string()], "temp leaked: {names:?}");
+
+        #[cfg(unix)]
+        {
+            let outside = tmp.path().join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("marker"), b"keep").unwrap();
+            dir.create_dir_all(Path::new("swap")).unwrap();
+            std::fs::remove_dir(root.join("swap")).unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("swap")).unwrap();
+            let err =
+                atomic_publish_at(&dir, Path::new("swap/a"), Path::new("swap/b")).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+            assert_eq!(
+                std::fs::read_dir(&outside).unwrap().count(),
+                1,
+                "the symlink swap redirected the publish outside the root"
+            );
+            assert!(outside.join("marker").exists());
+        }
     }
 }

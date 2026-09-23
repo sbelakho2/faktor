@@ -259,6 +259,33 @@ pub fn redact_url(url: &str) -> String {
     out
 }
 
+/// Mask **every** query value, for log lines only (never for stored or
+/// model-visible records). Path, host, parameter names and pairs without `=`
+/// are preserved byte for byte; each `name=value` pair becomes
+/// `name=[redacted]` regardless of the name, so an unrecognized credential
+/// parameter cannot leak into a log.
+pub fn redact_url_query_values(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let mut out = String::with_capacity(url.len());
+    out.push_str(base);
+    out.push('?');
+    for (index, pair) in query.split('&').enumerate() {
+        if index > 0 {
+            out.push('&');
+        }
+        match pair.split_once('=') {
+            Some((name, _)) => {
+                out.push_str(name);
+                out.push_str("=[redacted]");
+            }
+            None => out.push_str(pair),
+        }
+    }
+    out
+}
+
 /// A captured text artifact with an explicit truncation flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedText {
@@ -518,6 +545,23 @@ mod tests {
         assert!(bounded.truncated);
         assert_eq!(bounded.bytes, b"hel");
         assert_eq!(bounded.byte_len, 5);
+    }
+
+    #[test]
+    fn log_query_value_masking_hides_every_value() {
+        let url = "https://x.test/p?q=shoes&token=abc&page=2&bare&limit=10";
+        let rendered = redact_url_query_values(url);
+        assert_eq!(
+            rendered,
+            "https://x.test/p?q=[redacted]&token=[redacted]&page=[redacted]&bare&limit=[redacted]"
+        );
+        assert!(!rendered.contains("shoes"));
+        assert!(!rendered.contains("abc"));
+        // No query: byte-identical.
+        assert_eq!(
+            redact_url_query_values("https://x.test/p"),
+            "https://x.test/p"
+        );
     }
 
     #[test]

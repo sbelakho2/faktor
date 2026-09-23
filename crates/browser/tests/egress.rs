@@ -116,7 +116,9 @@ async fn spawn_upstream_full(seen: Arc<Mutex<Vec<String>>>) -> SocketAddr {
 }
 
 fn policy(first_party: Vec<HostPattern>) -> DestinationPolicy {
-    DestinationPolicy::first_party_only(first_party)
+    // The integration origins below are loopback mock servers, so the
+    // explicit loopback address-class rule is part of the test policy.
+    DestinationPolicy::first_party_only(first_party).with_allow_loopback(true)
 }
 
 #[tokio::test]
@@ -362,6 +364,7 @@ async fn destination_canonicalization_closes_spelling_tricks() {
     let origin = spawn_origin("canon-ok").await;
     let broker = EgressBroker::start(BrokerConfig {
         policy: DestinationPolicy::first_party_only(vec![HostPattern::parse("localhost").unwrap()])
+            .with_allow_loopback(true)
             .with_allowed_ports(vec![origin.port()]),
         ..BrokerConfig::default()
     })
@@ -384,7 +387,8 @@ async fn destination_canonicalization_closes_spelling_tricks() {
     )
     .await;
     assert!(numeric.starts_with("HTTP/1.1 400"), "{numeric}");
-    // A userinfo host is never the destination.
+    // A userinfo authority is rejected outright (never stripped into a
+    // valid destination).
     let userinfo = send_raw(
         broker.addr(),
         &format!(
@@ -393,7 +397,7 @@ async fn destination_canonicalization_closes_spelling_tricks() {
         ),
     )
     .await;
-    assert!(userinfo.starts_with("HTTP/1.1 200 OK"), "{userinfo}");
+    assert!(userinfo.starts_with("HTTP/1.1 400"), "{userinfo}");
     broker.shutdown().await;
 }
 
@@ -1303,5 +1307,269 @@ async fn upstream_connect_accepts_exact_200_and_relays_early_tunnel_bytes() {
         .unwrap();
     assert_eq!(&echoed, b"ping");
     assert_eq!(broker.accounting().tunnels_total, 2);
+    broker.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial: CONNECT kind policy, Host ownership, userinfo rejection.
+// ---------------------------------------------------------------------------
+
+/// Fake origin that records the request head it received. `bind` may be
+/// `127.0.0.1` or `[::1]`.
+async fn spawn_recording_origin(bind: &str, seen: Arc<Mutex<Vec<String>>>) -> SocketAddr {
+    let listener = TcpListener::bind((bind, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let head = read_one_head(&mut stream).await;
+                seen.lock().unwrap().push(head);
+                let body = "origin-ok";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn connect_tunnels_require_an_https_capable_policy() {
+    let origin = spawn_origin("http-only").await;
+    // HTTP-only policy: forward HTTP to the allowlisted host works, a
+    // CONNECT tunnel to the same host/port is a typed refusal because the
+    // request kind is part of the policy decision.
+    let broker = EgressBroker::start(BrokerConfig {
+        policy: DestinationPolicy::first_party_only(vec![HostPattern::parse("127.0.0.1").unwrap()])
+            .with_allow_loopback(true)
+            .with_allow_schemes(vec!["http".to_string()])
+            .with_allowed_ports(vec![origin.port()]),
+        ..BrokerConfig::default()
+    })
+    .await
+    .unwrap();
+    let forward = send_raw(
+        broker.addr(),
+        &format!(
+            "GET http://127.0.0.1:{}/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            origin.port()
+        ),
+    )
+    .await;
+    assert!(forward.starts_with("HTTP/1.1 200"), "{forward}");
+    let connect = send_raw(
+        broker.addr(),
+        &format!(
+            "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            origin.port(),
+            origin.port()
+        ),
+    )
+    .await;
+    assert!(connect.starts_with("HTTP/1.1 403"), "{connect}");
+    assert!(connect.contains("connect_not_allowed"), "{connect}");
+    assert_eq!(
+        broker.accounting().tunnels_total,
+        0,
+        "no tunnel may be established under an HTTP-only policy"
+    );
+    let health = broker.health();
+    assert!(health.accounting.blocked_total >= 1);
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn explicit_literal_destinations_are_admitted_but_resolved_loopback_is_not() {
+    let origin = spawn_origin("literal-ok").await;
+    // The policy EXPLICITLY names the literal 127.0.0.1 destination: a
+    // literal cannot be rebound, so it is admitted.
+    let broker = EgressBroker::start(BrokerConfig {
+        policy: DestinationPolicy::first_party_only(vec![HostPattern::parse("127.0.0.1").unwrap()])
+            .with_allowed_ports(vec![origin.port()]),
+        ..BrokerConfig::default()
+    })
+    .await
+    .unwrap();
+    let response = send_raw(
+        broker.addr(),
+        &format!(
+            "GET http://127.0.0.1:{}/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            origin.port()
+        ),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    broker.shutdown().await;
+
+    // The policy names the NAME `localhost`, which resolves onto loopback:
+    // without the explicit address rule the connect is refused after the
+    // one resolution, before any socket connects.
+    let broker = EgressBroker::start(BrokerConfig {
+        policy: DestinationPolicy::first_party_only(vec![HostPattern::parse("localhost").unwrap()])
+            .with_allowed_ports(vec![origin.port()]),
+        ..BrokerConfig::default()
+    })
+    .await
+    .unwrap();
+    let response = send_raw(
+        broker.addr(),
+        &format!(
+            "GET http://localhost:{}/x HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            origin.port()
+        ),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+    assert!(
+        response.contains("loopback"),
+        "the refusal names the address class: {response}"
+    );
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn userinfo_targets_are_rejected_for_forward_and_connect() {
+    let origin = spawn_origin("no-userinfo").await;
+    let broker = EgressBroker::start(BrokerConfig {
+        policy: DestinationPolicy::first_party_only(vec![HostPattern::parse("127.0.0.1").unwrap()])
+            .with_allow_loopback(true)
+            .with_allowed_ports(vec![origin.port()]),
+        ..BrokerConfig::default()
+    })
+    .await
+    .unwrap();
+    for request in [
+        format!(
+            "GET http://user:pass@127.0.0.1:{}/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            origin.port()
+        ),
+        // Userinfo naming the allowed host must not be sanitized into it.
+        format!(
+            "GET http://evil.test@127.0.0.1:{}/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            origin.port()
+        ),
+        format!(
+            "CONNECT user:pass@127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            origin.port()
+        ),
+        format!(
+            "CONNECT attacker.test@127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            origin.port()
+        ),
+    ] {
+        let response = send_raw(broker.addr(), &request).await;
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "{request} => {response}"
+        );
+    }
+    assert_eq!(broker.accounting().tunnels_total, 0);
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn broker_strips_and_synthesizes_exactly_one_canonical_host_header() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let origin = spawn_recording_origin("127.0.0.1", seen.clone()).await;
+    let broker = EgressBroker::start(BrokerConfig {
+        policy: DestinationPolicy::first_party_only(vec![HostPattern::parse("127.0.0.1").unwrap()])
+            .with_allow_loopback(true)
+            .with_allowed_ports(vec![origin.port()]),
+        ..BrokerConfig::default()
+    })
+    .await
+    .unwrap();
+    // Conflicting and duplicate Host headers: none may survive; exactly one
+    // canonical Host is synthesized from the policy-checked destination.
+    let response = send_raw(
+        broker.addr(),
+        &format!(
+            "GET http://127.0.0.1:{}/x HTTP/1.1\r\nHost: evil.test:80\r\nHost: 127.0.0.1\r\n\r\n",
+            origin.port()
+        ),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let heads = seen.lock().unwrap().clone();
+    assert_eq!(heads.len(), 1, "{heads:?}");
+    let head = &heads[0];
+    let lower = head.to_ascii_lowercase();
+    assert_eq!(count_occurrences(&lower, "host:"), 1, "{head}");
+    assert!(!lower.contains("evil.test"), "{head}");
+    assert!(
+        head.contains(&format!("Host: 127.0.0.1:{}", origin.port())),
+        "{head}"
+    );
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn ipv6_authorities_are_bracketed_in_the_synthesized_host() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let origin = spawn_recording_origin("::1", seen.clone()).await;
+    let broker = EgressBroker::start(BrokerConfig {
+        policy: DestinationPolicy::first_party_only(vec![HostPattern::parse("[::1]").unwrap()])
+            .with_allow_loopback(true)
+            .with_allowed_ports(vec![origin.port()]),
+        ..BrokerConfig::default()
+    })
+    .await
+    .unwrap();
+    let response = send_raw(
+        broker.addr(),
+        &format!(
+            "GET http://[::1]:{}/x HTTP/1.1\r\nHost: [::1]\r\n\r\n",
+            origin.port()
+        ),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let heads = seen.lock().unwrap().clone();
+    assert_eq!(heads.len(), 1, "{heads:?}");
+    let head = &heads[0];
+    assert_eq!(
+        count_occurrences(&head.to_ascii_lowercase(), "host:"),
+        1,
+        "{head}"
+    );
+    assert!(
+        head.contains(&format!("Host: [::1]:{}", origin.port())),
+        "{head}"
+    );
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn upstream_proxy_mode_also_owns_the_host_header() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_recording_upstream(seen.clone()).await;
+    let broker = EgressBroker::start(upstream_config(upstream))
+        .await
+        .unwrap();
+    // Absolute-form request line through an upstream proxy: the client's
+    // duplicate/conflicting Host headers are still stripped and replaced by
+    // the canonical authority of the policy-checked target.
+    let response = send_raw(
+        broker.addr(),
+        "GET http://127.0.0.1:9/x HTTP/1.1\r\nHost: attacker.example\r\nHost: 127.0.0.1:9\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let head = &seen[0].head;
+    let lower = head.to_ascii_lowercase();
+    assert_eq!(count_occurrences(&lower, "host:"), 1, "{head}");
+    assert!(!lower.contains("attacker.example"), "{head}");
+    assert!(head.contains("Host: 127.0.0.1:9"), "{head}");
+    // The absolute-form request line still names the checked destination.
+    assert!(
+        head.starts_with("GET http://127.0.0.1:9/"),
+        "absolute-form target preserved: {head}"
+    );
     broker.shutdown().await;
 }
