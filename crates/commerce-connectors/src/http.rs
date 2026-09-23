@@ -15,7 +15,13 @@
 //! * [`HttpRequest`] and [`Header`] render **redacted** under `Debug`:
 //!   credential header values and credential-named query parameters become
 //!   `<redacted>`, bodies render as a length — a credential can never leak
-//!   through a `{:?}`, a log line or a panic message;
+//!   through a `{:?}`, a log line or a panic message. Query parameter names
+//!   are classified *structurally*: each name is percent-decoded
+//!   (repeatedly, bounded) with `application/x-www-form-urlencoded`
+//!   semantics and canonicalized (case, `_`/`-`/`+`-space equivalence)
+//!   before comparison, and a name whose escape sequence cannot be decoded
+//!   is treated as sensitive (fail closed: a false positive only redacts, a
+//!   false negative would leak);
 //! * [`TransportError`] is typed and carries no free text (no URL, no
 //!   upstream message), and maps onto the domain [`SourceError`] variants.
 //!
@@ -97,14 +103,111 @@ const SENSITIVE_QUERY_PARAMS: &[&str] = &[
 ];
 
 /// True when a header name carries a credential.
+///
+/// Classification is structural and conservative: the name is decoded
+/// (`application/x-www-form-urlencoded` semantics, bounded repeated
+/// decoding) and canonicalized (ASCII lowercase, every non-alphanumeric
+/// byte treated as a separator) before comparison, so `X-Api-Key`,
+/// `x_api_key`, `api%5fkey` and `api+key` all classify as `apikey`. A name
+/// whose escape sequence cannot be decoded is treated as sensitive: a false
+/// positive only redacts, a false negative would leak.
 pub fn is_sensitive_header(name: &str) -> bool {
-    SENSITIVE_HEADERS
+    match decode_form_name(name) {
+        Some(decoded) => is_sensitive_name(&decoded, SENSITIVE_HEADERS),
+        None => true,
+    }
+}
+
+/// Decode one hex digit.
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Percent-decode one `application/x-www-form-urlencoded` component
+/// (`+` => space, `%XX` => byte). Returns `None` for a truncated or
+/// non-hex escape, or when the decoded bytes are not valid UTF-8: the
+/// caller treats that as sensitive.
+fn decode_form_component(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' => {
+                let high = hex_nibble(*bytes.get(index + 1)?)?;
+                let low = hex_nibble(*bytes.get(index + 2)?)?;
+                out.push((high << 4) | low);
+                index += 3;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Decode a name for classification only, repeatedly and bounded, so a
+/// multiply-encoded spelling (`api%254Bey`) classifies as its plain form.
+/// Every changing pass either shrinks the string or turns a `+` into a
+/// space (stable on the next pass), so `raw.len() + 1` passes suffice; not
+/// stabilizing within the bound is malformed and fails closed (`None`).
+fn decode_form_name(raw: &str) -> Option<String> {
+    let mut current = raw.to_string();
+    for _ in 0..=raw.len() {
+        let decoded = decode_form_component(&current)?;
+        if decoded == current {
+            return Some(decoded);
+        }
+        current = decoded;
+    }
+    None
+}
+
+/// Canonical form of a decoded name for sensitive-name classification:
+/// ASCII-lowercased alphanumerics only, so `api_key`, `api-key`, `api key`
+/// (from `+`), `apiKey` and `apikey` are one identity while any other name
+/// keeps its full distinguishing content.
+fn canonical_sensitive_name(name: &str) -> Vec<u8> {
+    name.bytes()
+        .filter(u8::is_ascii_alphanumeric)
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect()
+}
+
+/// True when a decoded name matches one entry of the sensitive table under
+/// the canonical form.
+fn is_sensitive_name(name: &str, table: &[&str]) -> bool {
+    let canonical = canonical_sensitive_name(name);
+    table
         .iter()
-        .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
+        .any(|sensitive| canonical_sensitive_name(sensitive) == canonical)
+}
+
+/// True when a raw query parameter name carries a credential. The stored
+/// value must be masked whenever this returns true.
+fn is_sensitive_query_name(raw_name: &str) -> bool {
+    match decode_form_name(raw_name) {
+        Some(decoded) => is_sensitive_name(&decoded, SENSITIVE_QUERY_PARAMS),
+        None => true,
+    }
 }
 
 /// Render a URL with credential-named query parameters redacted. Never
-/// panics, never returns the credential.
+/// panics, never returns the credential. The query is parsed into `&`
+/// separated pairs and only the *value* of a sensitive pair is replaced;
+/// the original percent-encoding of both sensitive names and all
+/// non-sensitive pairs is preserved byte for byte.
 pub fn redact_url(url: &str) -> String {
     let Some((head, query)) = url.split_once('?') else {
         return url.to_string();
@@ -117,11 +220,7 @@ pub fn redact_url(url: &str) -> String {
             out.push('&');
         }
         match pair.split_once('=') {
-            Some((name, _value))
-                if SENSITIVE_QUERY_PARAMS
-                    .iter()
-                    .any(|sensitive| name.eq_ignore_ascii_case(sensitive)) =>
-            {
+            Some((name, _value)) if is_sensitive_query_name(name) => {
                 out.push_str(name);
                 out.push_str("=<redacted>");
             }
@@ -732,5 +831,147 @@ mod tests {
             !rig.diagnostics.joined().contains(planted.expose()),
             "the refusal must not record the value"
         );
+    }
+
+    /// Encoded spellings of sensitive names that the old raw-name
+    /// classification missed. All must mask the value while preserving the
+    /// original name spelling and every non-sensitive pair byte for byte.
+    const ENCODED_SENSITIVE_NAMES: &[&str] = &[
+        "api%4Bey",
+        "api%4bey",
+        "API%4bEY",
+        "api%5Fkey",
+        "api%5fkey",
+        "api+key",
+        "api%2Bkey",
+        "api.key",
+        "api-key",
+        "apikey",
+        "access%5ftoken",
+        "access%5Ftoken",
+        "access-token",
+        "ACCESS%5FTOKEN",
+        "client%5Fsecret",
+        "client%5fsecret",
+        "client-secret",
+        "CLIENT%5FSECRET",
+        "sec%72et",
+        "si%67",
+        "to%6ben",
+        // Multiply-encoded spellings must classify as their plain form.
+        "api%254Bey",
+        "access%25255ftoken",
+        "client%2525255Fsecret",
+    ];
+
+    #[test]
+    fn redact_url_masks_encoded_sensitive_names_and_preserves_everything_else() {
+        const SECRET: &str = "SECRET-CREDENTIAL-0123456789";
+        for spelling in ENCODED_SENSITIVE_NAMES {
+            let url =
+                format!("https://api.test/v1/p?{spelling}={SECRET}&plain=keep%20this&limit=10");
+            let redacted = redact_url(&url);
+            assert!(
+                !redacted.contains(SECRET),
+                "{spelling} leaked the credential: {redacted}"
+            );
+            assert!(
+                redacted.contains(&format!("{spelling}=<redacted>")),
+                "{spelling} must keep its original name spelling and mask the value: {redacted}"
+            );
+            assert!(
+                redacted.ends_with("&plain=keep%20this&limit=10"),
+                "{spelling} changed a non-sensitive pair: {redacted}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_request_debug_never_renders_encoded_sensitive_names() {
+        const SECRET: &str = "SECRET-CREDENTIAL-0123456789";
+        for spelling in ENCODED_SENSITIVE_NAMES {
+            let request = HttpRequest::get(&format!(
+                "https://api.test/v1/p?{spelling}={SECRET}&plain=keep"
+            ))
+            .expect("request");
+            let rendered = format!("{request:?}");
+            assert!(
+                !rendered.contains(SECRET),
+                "{spelling} leaked through Debug: {rendered}"
+            );
+            assert!(
+                rendered.contains("plain=keep"),
+                "the non-sensitive pair stays visible: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_url_fails_closed_on_malformed_or_undecodable_names() {
+        // Truncated/non-hex escapes, non-UTF-8 decoded names and names that
+        // never stabilize can carry the credential too: masking is the only
+        // safe verdict. A false positive only redacts; a false negative would
+        // leak.
+        for hostile in [
+            "api%Key",
+            "api%4",
+            "api%",
+            "api%zzkey",
+            "%4Bey",
+            "api%FFkey",
+            "%c3%28token",
+        ] {
+            let url = format!("https://api.test/p?{hostile}=SECRET&plain=keep");
+            let redacted = redact_url(&url);
+            assert!(
+                !redacted.contains("SECRET"),
+                "{hostile} leaked through fail-closed classification: {redacted}"
+            );
+            assert!(
+                redacted.contains(&format!("{hostile}=<redacted>")),
+                "{hostile} must mask the value, keeping the raw name: {redacted}"
+            );
+            assert!(
+                redacted.ends_with("&plain=keep"),
+                "non-sensitive pairs are untouched: {redacted}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_url_leaves_clean_and_non_sensitive_urls_unchanged() {
+        for clean in [
+            "https://api.test/v1/p",
+            "https://api.test/v1/p?a=1&b%20c=2&limit=10",
+            "https://api.test/v1/p?apricot=1&keychain=2&signed=3",
+            "https://api.test/v1/p?monkey=1",
+            // The name is not a value: a pair without `=` carries no secret.
+            "https://api.test/v1/p?token",
+        ] {
+            assert_eq!(redact_url(clean), clean, "{clean} must be unchanged");
+        }
+    }
+
+    #[test]
+    fn sensitive_header_names_are_canonicalized() {
+        for sensitive in [
+            "authorization",
+            "AUTHORIZATION",
+            "x-api-key",
+            "X-API-KEY",
+            "x_api_key",
+            "xapi%5Fkey",
+            "client-secret",
+            "client_secret",
+            "CLIENT%5FSECRET",
+            "cookie",
+        ] {
+            assert!(is_sensitive_header(sensitive), "{sensitive}");
+        }
+        for plain in ["accept", "content-type", "x-trace-id", "x-apricot-key"] {
+            assert!(!is_sensitive_header(plain), "{plain}");
+        }
+        // A malformed escape fails closed.
+        assert!(is_sensitive_header("x-api%key"));
     }
 }

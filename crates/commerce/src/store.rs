@@ -2431,3 +2431,41 @@ fn verified_pre_migration_backup(
     }
     Ok(dest)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::text::CanonicalUrl;
+
+    fn identity(url: &str) -> ProductIdentity {
+        ProductIdentity {
+            manufacturer: None,
+            manufacturer_part_number: Some(Text::new("STM32F407VGT6").expect("mpn")),
+            source_part_number: None,
+            offer_id: None,
+            canonical_url: Some(CanonicalUrl::parse(url).expect("url")),
+            category: None,
+        }
+    }
+
+    /// The persisted identity digest must see the fragment-free canonical
+    /// form: fragments are never sent and never identify a product.
+    #[test]
+    fn identity_digest_key_ignores_fragments() {
+        let one = CommerceStore::identity_key(&identity("https://x.test/product#one"));
+        let two = CommerceStore::identity_key(&identity("https://x.test/product#two"));
+        let plain = CommerceStore::identity_key(&identity("https://x.test/product"));
+        assert_eq!(one, two);
+        assert_eq!(one, plain);
+        assert_ne!(
+            plain,
+            CommerceStore::identity_key(&identity("https://x.test/product?v=1")),
+            "query differences are real identity differences"
+        );
+        assert_ne!(
+            plain,
+            CommerceStore::identity_key(&identity("https://x.test/other")),
+            "path differences are real identity differences"
+        );
+    }
+}

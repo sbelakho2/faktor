@@ -11,7 +11,9 @@
 //!   part numbers via RTL overrides),
 //! - [`CanonicalUrl`] accepts only absolute `http`/`https` URLs with a
 //!   plain host, no userinfo (credentials can never hide in a canonical
-//!   URL), no fragment-free surprises, and a bounded length.
+//!   URL), no fragment (the fragment is stripped during canonicalization: it
+//!   is never sent in a request and never participates in identity), and a
+//!   bounded length.
 
 use serde::de::{self, Deserializer};
 use serde::{Serialize, Serializer};
@@ -356,7 +358,15 @@ pub enum UrlError {
 /// This is a strict parser for hostile input, not a general URL library: it
 /// accepts exactly what a marketplace product reference can be. The scheme
 /// and host are normalized to lowercase; path/query keep their original
-/// case. Fragments are preserved but never used for identity.
+/// case.
+///
+/// The fragment is stripped during canonicalization — RFC 3986 fragments are
+/// never sent in HTTP requests, so they must not participate in identity.
+/// `Eq`/`Hash`/`Ord`, every identity key and every digest therefore see the
+/// fragment-free canonical form `scheme://host[:port]/path?query` only:
+/// `https://x.test/product#one` and `https://x.test/product#two` are the
+/// same value. The raw input fragment is deliberately not retained; no
+/// caller in the workspace needs it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CanonicalUrl(String);
 
@@ -406,14 +416,20 @@ impl CanonicalUrl {
             validate_port(port)?;
         }
         let host = host.to_ascii_lowercase();
+        // The fragment starts at the first `#` and ends the URL; it is never
+        // sent and never part of identity, so it is dropped here. A `?` or
+        // `/` inside the fragment is fragment data, not path or query.
+        let path_query = tail.split_once('#').map_or(tail, |(before, _)| before);
         let normalized = match port {
-            Some(port) => format!("{scheme}://{host}:{port}{tail}"),
-            None => format!("{scheme}://{host}{tail}"),
+            Some(port) => format!("{scheme}://{host}:{port}{path_query}"),
+            None => format!("{scheme}://{host}{path_query}"),
         };
         Ok(Self(normalized))
     }
 
-    /// The normalized URL.
+    /// The normalized canonical URL:
+    /// `scheme://host[:port]/path?query`. The fragment is not part of the
+    /// canonical form (it is stripped at parse time).
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -574,10 +590,8 @@ mod tests {
     fn url_accepts_and_normalizes_real_marketplace_urls() {
         let url =
             CanonicalUrl::parse("HTTPS://Detail.1688.COM/offer/123.html?x=1#frag").expect("valid");
-        assert_eq!(
-            url.as_str(),
-            "https://detail.1688.com/offer/123.html?x=1#frag"
-        );
+        assert_eq!(url.as_str(), "https://detail.1688.com/offer/123.html?x=1");
+        assert!(!url.as_str().contains('#'));
         assert_eq!(url.scheme(), "https");
         assert_eq!(url.host(), "detail.1688.com");
         assert_eq!(url.origin(), "https://detail.1688.com");
@@ -592,6 +606,74 @@ mod tests {
                 .expect("valid")
                 .origin(),
             "https://good.com:0443"
+        );
+    }
+
+    #[test]
+    fn url_fragments_are_stripped_and_do_not_participate_in_identity() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let one = CanonicalUrl::parse("https://x.test/product#one").expect("valid");
+        let two = CanonicalUrl::parse("https://x.test/product#two").expect("valid");
+        assert_eq!(one, two, "fragments are not identity");
+        assert_eq!(one.cmp(&two), std::cmp::Ordering::Equal);
+        let hash = |url: &CanonicalUrl| {
+            let mut hasher = DefaultHasher::new();
+            url.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(hash(&one), hash(&two), "fragments are not a hash identity");
+        assert_eq!(one.as_str(), "https://x.test/product");
+        assert_eq!(two.as_str(), "https://x.test/product");
+        assert_eq!(
+            one.as_str(),
+            CanonicalUrl::parse("https://x.test/product")
+                .expect("valid")
+                .as_str(),
+            "a fragmentless URL has the same canonical form"
+        );
+
+        // Fragment stripping is positional (RFC 3986): everything from the
+        // first `#` is dropped, even when it precedes or contains `?`/`/`.
+        assert_eq!(
+            CanonicalUrl::parse("https://x.test/a?b=1#frag?c=2")
+                .expect("valid")
+                .as_str(),
+            "https://x.test/a?b=1"
+        );
+        assert_eq!(
+            CanonicalUrl::parse("https://x.test/a#frag?b=1")
+                .expect("valid")
+                .as_str(),
+            "https://x.test/a"
+        );
+        assert_eq!(
+            CanonicalUrl::parse("https://x.test#frag")
+                .expect("valid")
+                .as_str(),
+            "https://x.test"
+        );
+
+        // Path/query canonicalization rules are untouched, and an encoded
+        // `#` inside the query stays data.
+        assert_eq!(
+            CanonicalUrl::parse("https://x.test/p?q=a%23b")
+                .expect("valid")
+                .as_str(),
+            "https://x.test/p?q=a%23b"
+        );
+        assert_eq!(
+            CanonicalUrl::parse("HTTPS://X.test/A?B=1")
+                .expect("valid")
+                .as_str(),
+            "https://x.test/A?B=1"
+        );
+
+        // The canonical (fragment-free) form is what serializes.
+        assert_eq!(
+            serde_json::to_string(&one).expect("serialize"),
+            "\"https://x.test/product\""
         );
     }
 
