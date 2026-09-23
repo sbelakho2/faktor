@@ -254,7 +254,7 @@ async fn proxy_only_cannot_be_overridden_by_extra_args() {
         proxy_addr: "127.0.0.1:1".parse().unwrap(),
         owner_source: "1688".to_string(),
         owner_profile: "p1".to_string(),
-        extra_args: vec!["--no-sandbox".to_string()],
+        extra_args: vec!["--disable-gpu".to_string()],
         launch_timeout_ms: 1000,
     });
     assert_eq!(
@@ -423,6 +423,254 @@ async fn navigation_cancellation_stops_loading_and_releases_the_page() {
     // The profile itself stays healthy: a new page can be acquired.
     let replacement = harness.acquire("p1").await.expect("profile stays healthy");
     let _ = replacement.close().await;
+    harness.manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn repeated_cancelled_captures_never_wedge_the_profile() {
+    let harness = Harness::new(json!({"suppress_lifecycle": true}), |config| {
+        config.max_pages_per_profile = 1;
+    })
+    .await;
+    for round in 0..5 {
+        let page = harness.acquire("p1").await.expect("acquire");
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let page_clone = page.clone();
+        let navigation = tokio::spawn(async move {
+            page_clone
+                .navigate(
+                    "https://first.test/slow",
+                    deadline_in(30_000),
+                    &cancel_clone,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        cancel.cancel();
+        let result = navigation.await.unwrap();
+        assert_eq!(result, Err(BrowserError::Cancelled), "round {round}");
+        assert_eq!(
+            harness.manager.page_count_for(&Harness::identity("p1")),
+            Some(0),
+            "round {round}: the slot must be released"
+        );
+    }
+    // The bound was never the thing that failed: a final acquisition works.
+    let page = harness.acquire("p1").await.expect("profile never wedged");
+    let _ = page.close().await;
+    harness.manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn abandoned_in_flight_page_releases_its_slot_on_drop() {
+    let harness = Harness::new(json!({"suppress_lifecycle": true}), |config| {
+        config.max_pages_per_profile = 1;
+    })
+    .await;
+    let page = harness.acquire("p1").await.expect("acquire");
+    let page_clone = page.clone();
+    let navigation = tokio::spawn(async move {
+        page_clone
+            .navigate(
+                "https://first.test/slow",
+                deadline_in(30_000),
+                &CancellationToken::new(),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    // The caller abandons the whole capture: the future is dropped mid-await
+    // without a chance to call `close`.
+    drop(page);
+    navigation.abort();
+    let _ = navigation.await;
+    assert_eq!(
+        harness.manager.page_count_for(&Harness::identity("p1")),
+        Some(0),
+        "an abandoned page must release the slot on Drop"
+    );
+    // The profile is immediately usable again.
+    let replacement = harness.acquire("p1").await.expect("slot freed");
+    let _ = replacement.close().await;
+    harness.manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn idle_shutdown_reaps_browsers_whose_pages_were_abandoned() {
+    let clock = Arc::new(faktor_core::time::TestClock::new(1_000_000));
+    let dir = tempfile::tempdir().unwrap();
+    let scenario_path = dir.path().join("scenario.json");
+    std::fs::write(&scenario_path, b"{}").unwrap();
+    let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+    let supervisor = ProcessSupervisor::new(cas);
+    let config = BrowserConfig {
+        enabled: true,
+        executable: Some(fixture_exe()),
+        idle_shutdown_s: 1,
+        ..BrowserConfig::default()
+    };
+    let manager =
+        BrowserManager::with_clock(supervisor.clone(), config, dir.path(), clock.clone()).unwrap();
+    let page = manager
+        .acquire_page(
+            "1688",
+            &Harness::identity("p1"),
+            Harness::policy(),
+            &PagePurpose::new("extraction"),
+            deadline_in(15_000),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("acquire");
+    assert_eq!(manager.page_count_for(&Harness::identity("p1")), Some(1));
+    drop(page);
+    assert_eq!(
+        manager.page_count_for(&Harness::identity("p1")),
+        Some(0),
+        "the abandoned page released its slot"
+    );
+    clock.advance(1_500);
+    assert!(
+        !manager.shutdown_idle().await.is_empty(),
+        "a browser with only abandoned pages must be reaped"
+    );
+    assert!(
+        supervisor.alive().is_empty(),
+        "no orphan after idle shutdown"
+    );
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn concurrent_acquisitions_never_exceed_the_page_bound() {
+    let harness = Harness::new(json!({}), |config| {
+        config.max_pages_per_profile = 1;
+        config.max_browsers = 1;
+    })
+    .await;
+    // All eight acquisitions race; every page that is admitted stays OPEN in
+    // the result vector until the assertions run, so the refusal is about
+    // the bound and not about a dropped handle.
+    let barrier = Arc::new(tokio::sync::Barrier::new(9));
+    let results: Arc<std::sync::Mutex<Vec<Result<faktor_browser::Page, BrowserError>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    for _ in 0..8 {
+        let manager = harness.manager.clone();
+        let barrier = barrier.clone();
+        let results = results.clone();
+        tokio::spawn(async move {
+            let result = manager
+                .acquire_page(
+                    "1688",
+                    &Harness::identity("p1"),
+                    Harness::policy(),
+                    &PagePurpose::new("extraction"),
+                    deadline_in(15_000),
+                    &CancellationToken::new(),
+                )
+                .await;
+            results.lock().unwrap().push(result);
+            barrier.wait().await;
+        });
+    }
+    tokio::time::timeout(Duration::from_secs(15), barrier.wait())
+        .await
+        .expect("all acquisitions settled");
+    let (opened, refused) = {
+        let guard = results.lock().unwrap();
+        let mut opened = 0usize;
+        let mut refused = 0usize;
+        for result in guard.iter() {
+            match result {
+                Ok(_) => opened += 1,
+                Err(error) => {
+                    assert_eq!(error.code(), "bound", "{error:?}");
+                    refused += 1;
+                }
+            }
+        }
+        (opened, refused)
+    };
+    assert_eq!(opened, 1, "exactly one admission wins");
+    assert_eq!(refused, 7, "every other acquisition is a typed refusal");
+    // Exactly one target was created: the check and the open were serialized.
+    assert_eq!(harness.journal_count("recv", "Target.createTarget"), 1);
+    assert_eq!(
+        harness.manager.page_count_for(&Harness::identity("p1")),
+        Some(1)
+    );
+    drop(results);
+    harness.manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn incognito_never_reuses_a_persistent_page() {
+    let harness = Harness::new(json!({}), |config| {
+        config.max_browsers = 2;
+    })
+    .await;
+    let persistent = harness.acquire("p1").await.expect("persistent page");
+    let incognito = harness
+        .manager
+        .acquire_page(
+            "1688",
+            &Harness::identity("p1"),
+            Harness::policy(),
+            &PagePurpose::incognito("probe"),
+            deadline_in(15_000),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("incognito page");
+    // Two distinct browsers: a temporary context was created instead of
+    // reusing the persistent profile.
+    let health = harness.manager.health();
+    assert_eq!(harness.manager.browser_count(), 2);
+    assert_eq!(health.len(), 2);
+    assert_eq!(health.iter().filter(|entry| entry.pages == 1).count(), 2);
+    let pids: std::collections::BTreeSet<u32> = health.iter().map(|entry| entry.pid).collect();
+    assert_eq!(pids.len(), 2, "two distinct browser processes: {health:?}");
+    // The latest launch (the incognito one) used a temporary context and a
+    // temporary profile directory.
+    assert_eq!(
+        harness.journal_count("recv", "Target.createBrowserContext"),
+        1
+    );
+    let created: Vec<Value> = harness
+        .journal_entries()
+        .into_iter()
+        .filter(|entry| entry["method"] == "Target.createTarget")
+        .collect();
+    assert!(!created.is_empty());
+    assert_eq!(
+        created
+            .iter()
+            .filter(|entry| entry["params"].get("browserContextId").is_some())
+            .count(),
+        1,
+        "the incognito target carries a browser context: {created:?}"
+    );
+    let argv: Vec<String> = harness.launch_dump()["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        argv.iter()
+            .any(|arg| arg.starts_with("--user-data-dir=") && arg.contains(".incognito")),
+        "the incognito launch must not reuse the persistent profile dir: {argv:?}"
+    );
+    // The persistent profile directory was not turned into a context.
+    assert!(!harness
+        .manager
+        .profile_dir("probe")
+        .unwrap()
+        .join("Default")
+        .exists());
+    let _ = persistent.close().await;
+    let _ = incognito.close().await;
     harness.manager.shutdown_all().await;
 }
 

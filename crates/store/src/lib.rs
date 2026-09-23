@@ -10486,9 +10486,12 @@ fn u32_field(ctx: &str, raw: i64) -> StoreResult<u32> {
 /// SQLite has no unsigned integers: every `u64` id is persisted through the
 /// lossless two's-complement `raw as i64` bit cast, so the read side is the
 /// inverse cast (`raw as u64`) and the upper half of the id space round-trips
-/// exactly. The id type's `TryFrom` then rejects structurally invalid values
-/// (zero) as typed [`StoreError::Corrupt`] naming the row and column — never
-/// the `OpId::new(0)` panic or a silently minted `1` under `.max(1)`.
+/// exactly. A NEGATIVE `raw` therefore decodes to the high-half `u64`
+/// (`-1` -> `u64::MAX`, `i64::MIN` -> `2^63`) BY DESIGN — it is the
+/// intentional legacy encoding, never treated as corruption. Only a value
+/// the typed id rejects (zero) is corruption: the id type's `TryFrom` maps
+/// it to typed [`StoreError::Corrupt`] naming the row and column — never the
+/// `OpId::new(0)` panic or a silently minted `1` under `.max(1)`.
 fn id_field<T>(ctx: &str, raw: i64) -> StoreResult<T>
 where
     T: TryFrom<u64>,
@@ -16403,6 +16406,41 @@ mod typed_ledger_tests {
             round_trip!(EventSeq, raw, wanted);
             round_trip!(VerificationRecordId, raw, wanted);
         }
+    }
+
+    /// PIN (P2): a negative `i64` observed in a real id COLUMN is the
+    /// intentional SQLite two's-complement legacy of a high-half `u64` id —
+    /// not corruption — while zero stays typed `Corrupt`. Reads the column
+    /// back through a real row mapper (`all_active_turns`), not just the
+    /// decode helper.
+    #[test]
+    fn negative_legacy_id_column_decodes_to_the_high_half_not_corruption() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let turn_id = store
+            .start_turn_record(s.id, OpId::new(5), None, None, "p", "m", None)
+            .unwrap();
+        for wanted in [u64::MAX, 2u64.pow(63), u64::MAX - 1] {
+            let raw = wanted as i64;
+            assert!(raw < 0, "the fixture must exercise a negative legacy raw");
+            corrupt_ignoring_fks(
+                &store,
+                "UPDATE turn_record SET session_id = ?2 WHERE id = ?1",
+                &[&turn_id, &raw],
+            );
+            assert_eq!(
+                store.all_active_turns().unwrap()[0].session_id.raw(),
+                wanted,
+                "{raw} is the bit-cast of the high-half id {wanted}: intentional, not corruption"
+            );
+        }
+        corrupt_ignoring_fks(
+            &store,
+            "UPDATE turn_record SET session_id = 0 WHERE id = ?1",
+            &[&turn_id],
+        );
+        assert_corrupt_id(store.all_active_turns(), "all_active_turns", "session_id");
     }
 
     /// Child-table id columns read by UNSCOPED doctor scans (no WHERE on the

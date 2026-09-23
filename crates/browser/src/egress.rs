@@ -31,6 +31,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use faktor_core::cancellation::CancellationToken;
+use faktor_security::destination::RequestTarget;
 
 use crate::error::BrowserError;
 use crate::interception::ResourceType;
@@ -49,6 +50,10 @@ pub enum HostPattern {
 
 impl HostPattern {
     /// Parse a pattern: `*`, `example.com`, `.example.com`, `*.example.com`.
+    /// The host part is canonicalized through the shared `faktor-security`
+    /// destination authority (lowercase, trailing-dot stripped, UTS-46
+    /// punycode for IDNs, numeric IPv4 canonicalized), so a pattern and a
+    /// request spelling of the same destination always compare equal.
     pub fn parse(raw: &str) -> Result<Self, BrowserError> {
         let raw = raw.trim().to_ascii_lowercase();
         if raw.is_empty() {
@@ -57,25 +62,42 @@ impl HostPattern {
         if raw == "*" {
             return Ok(HostPattern::Suffix(String::new()));
         }
-        let normalized = raw.trim_start_matches("*.").trim_start_matches('.');
-        if normalized.is_empty()
-            || !normalized
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
-        {
+        let (suffix, host) = if let Some(rest) = raw.strip_prefix("*.") {
+            (true, rest)
+        } else if let Some(rest) = raw.strip_prefix('.') {
+            (true, rest)
+        } else {
+            (false, raw.as_str())
+        };
+        if host.is_empty() || host.contains('*') || host.contains('/') {
             return Err(BrowserError::invalid_config(format!(
                 "invalid host pattern {raw:?}"
             )));
         }
-        if raw.starts_with("*.") || raw.starts_with('.') {
-            Ok(HostPattern::Suffix(format!(".{normalized}")))
+        let target = RequestTarget::parse(host).map_err(|error| {
+            BrowserError::invalid_config(format!("invalid host pattern {raw:?}: {error}"))
+        })?;
+        if target.port.is_some() {
+            return Err(BrowserError::invalid_config(format!(
+                "host pattern {raw:?} must not carry a port; permitted ports are listed in \
+                 allowed_ports"
+            )));
+        }
+        if suffix {
+            Ok(HostPattern::Suffix(format!(".{}", target.host)))
         } else {
-            Ok(HostPattern::Exact(normalized.to_string()))
+            Ok(HostPattern::Exact(target.host))
         }
     }
 
+    /// Match a canonical host spelling against this pattern. The argument is
+    /// canonicalized through the shared authority first, so punycode,
+    /// trailing dots, case and numeric IPv4 spellings cannot evade a rule;
+    /// an unparseable host never matches (fail closed).
     pub fn matches(&self, host: &str) -> bool {
-        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        let Some(host) = canonical_host(host) else {
+            return false;
+        };
         match self {
             HostPattern::Exact(exact) => host == *exact,
             HostPattern::Suffix(suffix) => {
@@ -102,6 +124,8 @@ pub enum BlockReason {
     Malformed,
     /// Blocked by resource type (interception), carried through accounting.
     ResourceTypeBlocked,
+    /// The destination port is not in the policy's explicit port allowlist.
+    PortNotAllowed,
 }
 
 impl BlockReason {
@@ -112,6 +136,7 @@ impl BlockReason {
             BlockReason::SchemeNotAllowed => "scheme_not_allowed",
             BlockReason::Malformed => "malformed",
             BlockReason::ResourceTypeBlocked => "resource_type_blocked",
+            BlockReason::PortNotAllowed => "port_not_allowed",
         }
     }
 }
@@ -135,8 +160,17 @@ impl DestinationDecision {
     }
 }
 
+/// The documented default port allowlist: the two web ports. Every other
+/// port must be listed explicitly by the connector's policy.
+pub const DEFAULT_ALLOWED_PORTS: [u16; 2] = [80, 443];
+
+fn default_allowed_ports() -> Vec<u16> {
+    DEFAULT_ALLOWED_PORTS.to_vec()
+}
+
 /// The per-connector destination policy (spec §9). Default posture: deny
-/// everything that is not explicitly first-party; block video/audio/images/
+/// everything that is not explicitly first-party; deny every port outside
+/// the explicit allowlist (80/443 unless widened); block video/audio/images/
 /// fonts/tracking resource types unless the connector says otherwise.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -150,23 +184,36 @@ pub struct DestinationPolicy {
     pub blocked_resource_types: Vec<ResourceType>,
     /// Permitted URL schemes (lowercase). Defaults to http/https.
     pub allow_schemes: Vec<String>,
+    /// The explicit port allowlist. A destination whose real connection port
+    /// is not listed is refused with [`BlockReason::PortNotAllowed`] even
+    /// when its host is first-party. Defaults to 80/443.
+    #[serde(default = "default_allowed_ports")]
+    pub allowed_ports: Vec<u16>,
 }
 
 impl DestinationPolicy {
     /// The strict default: only the listed first-party hosts, http/https,
-    /// with the aggressive default resource-type drop set.
+    /// the 80/443 port allowlist, with the aggressive default resource-type
+    /// drop set.
     pub fn first_party_only(hosts: Vec<HostPattern>) -> Self {
         Self {
             first_party: hosts,
             blocked_hosts: Vec::new(),
             blocked_resource_types: ResourceType::default_blocked(),
             allow_schemes: vec!["http".to_string(), "https".to_string()],
+            allowed_ports: default_allowed_ports(),
         }
     }
 
     /// Add explicit deny patterns (deny always wins).
     pub fn with_blocked_hosts(mut self, hosts: Vec<HostPattern>) -> Self {
         self.blocked_hosts = hosts;
+        self
+    }
+
+    /// Set the explicit port allowlist (replaces the 80/443 default).
+    pub fn with_allowed_ports(mut self, ports: Vec<u16>) -> Self {
+        self.allowed_ports = ports;
         self
     }
 
@@ -192,27 +239,76 @@ impl DestinationPolicy {
                 )));
             }
         }
+        if self.allowed_ports.is_empty() {
+            return Err(BrowserError::invalid_config(
+                "destination policy must allow at least one port (default: 80, 443)",
+            ));
+        }
+        if self.allowed_ports.contains(&0) {
+            return Err(BrowserError::invalid_config(
+                "port 0 is not a valid destination port",
+            ));
+        }
         Ok(())
     }
 
-    /// Decide a bare host (no port). Deny wins; unknown hosts are blocked.
+    /// Decide a bare host (no port), for host-level diagnostics. The wire
+    /// path always uses [`DestinationPolicy::decide_destination`] with the
+    /// real port.
     pub fn decide_host(&self, host: &str) -> DestinationDecision {
+        let Some(canonical) = canonical_host(host) else {
+            return DestinationDecision::Blocked {
+                reason: BlockReason::Malformed,
+            };
+        };
+        self.decide_canonical(&canonical, None)
+    }
+
+    fn decide_canonical(&self, host: &str, port: Option<u16>) -> DestinationDecision {
         if self.blocked_hosts.iter().any(|p| p.matches(host)) {
             return DestinationDecision::Blocked {
                 reason: BlockReason::ExplicitlyBlocked,
             };
         }
-        if self.first_party.iter().any(|p| p.matches(host)) {
-            return DestinationDecision::Allowed;
+        if !self.first_party.iter().any(|p| p.matches(host)) {
+            return DestinationDecision::Blocked {
+                reason: BlockReason::NotFirstParty,
+            };
         }
-        DestinationDecision::Blocked {
-            reason: BlockReason::NotFirstParty,
+        if let Some(port) = port {
+            if !self.allowed_ports.contains(&port) {
+                return DestinationDecision::Blocked {
+                    reason: BlockReason::PortNotAllowed,
+                };
+            }
         }
+        DestinationDecision::Allowed
     }
 
-    /// Decide a full URL (scheme + host + optional port).
+    /// Decide one destination: host and real connection port. The host is
+    /// canonicalized through the shared `faktor-security` authority
+    /// (lowercase, trailing dot, UTS-46 punycode, canonical numeric IPv4/
+    /// IPv6) so alternate spellings cannot bypass a rule. Deny wins; an
+    /// unknown host or an unlisted port is refused.
+    ///
+    /// Residual (honest): DNS-rebinding IP pinning is **not** implemented.
+    /// The policy decides the canonical *name*; name resolution and connect
+    /// happen afterwards, so a name that resolves to an unlisted address is
+    /// not re-checked against an IP allowlist.
+    pub fn decide_destination(&self, host: &str, port: u16) -> DestinationDecision {
+        let Some(canonical) = canonical_host(host) else {
+            return DestinationDecision::Blocked {
+                reason: BlockReason::Malformed,
+            };
+        };
+        self.decide_canonical(&canonical, Some(port))
+    }
+
+    /// Decide a full URL (scheme + host + port). The port is the URL's real
+    /// connection port (explicit, else the scheme default), so an allowed
+    /// host on a non-allowlisted port is refused.
     pub fn decide_url(&self, url: &str) -> DestinationDecision {
-        let Some((scheme, host)) = split_scheme_host(url) else {
+        let Some((scheme, authority)) = split_absolute_target(url) else {
             return DestinationDecision::Blocked {
                 reason: BlockReason::Malformed,
             };
@@ -226,7 +322,18 @@ impl DestinationPolicy {
                 reason: BlockReason::SchemeNotAllowed,
             };
         }
-        self.decide_host(&host)
+        let destination = format!("{scheme}://{authority}");
+        let Ok(target) = RequestTarget::parse(&destination) else {
+            return DestinationDecision::Blocked {
+                reason: BlockReason::Malformed,
+            };
+        };
+        let Some(port) = target.port else {
+            return DestinationDecision::Blocked {
+                reason: BlockReason::Malformed,
+            };
+        };
+        self.decide_canonical(&target.host, Some(port))
     }
 
     /// Is this resource type dropped by default interception?
@@ -235,9 +342,10 @@ impl DestinationPolicy {
     }
 }
 
-/// Split `scheme://host[:port]/...` into (scheme, host) — no URL library
-/// needed for the two forms this proxy accepts.
-pub(crate) fn split_scheme_host(url: &str) -> Option<(&str, String)> {
+/// Split `scheme://authority/...` into (scheme, authority): path, query and
+/// fragment are dropped, userinfo (hostile input) is stripped. The authority
+/// is returned verbatim; canonicalization is the shared authority's job.
+pub(crate) fn split_absolute_target(url: &str) -> Option<(&str, &str)> {
     let (scheme, rest) = url.split_once("://")?;
     if scheme.is_empty() {
         return None;
@@ -247,17 +355,41 @@ pub(crate) fn split_scheme_host(url: &str) -> Option<(&str, String)> {
     if authority.is_empty() {
         return None;
     }
-    let host = if authority.starts_with('[') {
-        // IPv6 literal: [::1]:8080
-        let end = authority.find(']')?;
-        authority[1..end].to_string()
-    } else {
-        authority.split(':').next()?.to_string()
-    };
+    Some((scheme, authority))
+}
+
+/// Parse a CONNECT authority (`host:port`, `[v6]:port`) into a canonical
+/// destination. The port defaults to 443. A URL-shaped or unparseable target
+/// is refused (fail closed).
+pub(crate) fn parse_connect_target(target: &str) -> Option<(String, u16)> {
+    let target = target.rsplit('@').next()?;
+    let parsed = RequestTarget::parse(target).ok()?;
+    if !parsed.scheme.is_empty() {
+        return None;
+    }
+    Some((parsed.host, parsed.port.unwrap_or(443)))
+}
+
+/// Canonicalize one bare destination host through the shared
+/// `faktor-security` authority. A canonical unbracketed IPv6 literal
+/// (what URL parsers produce) is canonicalized directly; a bracketed
+/// literal, name, IDN or numeric IPv4 goes through the shared parser.
+fn canonical_host(host: &str) -> Option<String> {
+    let host = host.trim();
     if host.is_empty() {
         return None;
     }
-    Some((scheme, host))
+    if host.contains(':') && !host.starts_with('[') {
+        return host
+            .parse::<std::net::Ipv6Addr>()
+            .ok()
+            .map(|address| address.to_string());
+    }
+    let target = RequestTarget::parse(host).ok()?;
+    if target.port.is_some() {
+        return None;
+    }
+    Some(target.host)
 }
 
 /// Upstream proxy credentials. Debug is redacted; there is no Display, no
@@ -386,6 +518,12 @@ pub struct BrokerConfig {
     pub max_connections: usize,
     /// TCP connect timeout to destinations/upstreams.
     pub connect_timeout_ms: u64,
+    /// Idle timeout for one direction of a tunneled/forwarded copy: a peer
+    /// that stalls for this long loses its connection (and its
+    /// `max_connections` permit).
+    pub copy_idle_timeout_ms: u64,
+    /// Total lifetime of one tunneled/forwarded copy.
+    pub copy_max_ms: u64,
 }
 
 impl Default for BrokerConfig {
@@ -397,6 +535,8 @@ impl Default for BrokerConfig {
             max_request_bytes: 32 * 1024,
             max_connections: 64,
             connect_timeout_ms: 10_000,
+            copy_idle_timeout_ms: 30_000,
+            copy_max_ms: 600_000,
         }
     }
 }
@@ -412,6 +552,14 @@ impl BrokerConfig {
         if self.max_request_bytes == 0 || self.max_connections == 0 {
             return Err(BrowserError::invalid_config(
                 "broker request/connection bounds must be > 0",
+            ));
+        }
+        if self.connect_timeout_ms == 0 || self.copy_idle_timeout_ms == 0 || self.copy_max_ms == 0 {
+            return Err(BrowserError::invalid_config("broker timeouts must be > 0"));
+        }
+        if self.copy_max_ms < self.copy_idle_timeout_ms {
+            return Err(BrowserError::invalid_config(
+                "broker copy_max_ms must be >= copy_idle_timeout_ms",
             ));
         }
         self.policy.validate()?;
@@ -455,6 +603,8 @@ struct BrokerInner {
     upstream: UpstreamSelector,
     max_request_bytes: usize,
     connect_timeout: Duration,
+    copy_idle_timeout: Duration,
+    copy_max: Duration,
     accounting: Mutex<AccountingCounters>,
     active: AtomicUsize,
     started_ms: i64,
@@ -622,6 +772,8 @@ impl EgressBroker {
             upstream: config.upstream.clone(),
             max_request_bytes: config.max_request_bytes,
             connect_timeout: Duration::from_millis(config.connect_timeout_ms),
+            copy_idle_timeout: Duration::from_millis(config.copy_idle_timeout_ms),
+            copy_max: Duration::from_millis(config.copy_max_ms),
             accounting: Mutex::new(AccountingCounters::default()),
             active: AtomicUsize::new(0),
             started_ms: now_ms(),
@@ -676,6 +828,9 @@ enum HeadError {
     Closed,
     TooLarge(usize),
     Io(String),
+    /// The head is malformed (strict grammar violation). Refused with a
+    /// typed 400, never forwarded or re-emitted.
+    Malformed(String),
 }
 
 /// Read an HTTP request/response head (through `\r\n\r\n`), returning the
@@ -719,38 +874,151 @@ struct ParsedRequest {
     headers: Vec<(String, String)>,
 }
 
-fn parse_head(head: &str) -> Result<ParsedRequest, String> {
-    let mut lines = head.split("\r\n");
-    let request_line = lines.next().ok_or("empty request")?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().ok_or("missing method")?.to_string();
-    let target = parts.next().ok_or("missing target")?.to_string();
-    let version = parts.next().unwrap_or("HTTP/1.1");
-    if !version.starts_with("HTTP/1.") {
-        return Err(format!("unsupported http version {version:?}"));
+/// RFC 7230 token characters.
+fn is_token_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn is_token(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(is_token_char)
+}
+
+/// Strict header value grammar: visible ASCII plus SP/HTAB only. Every CTL
+/// (CR, LF, NUL, DEL) is refused, so no line can be smuggled through a
+/// header value.
+fn is_header_value(text: &str) -> bool {
+    text.bytes()
+        .all(|b| b == b'\t' || (0x20..=0x7e).contains(&b))
+}
+
+/// The standard hop-by-hop set (RFC 7230 §6.1 plus the proxy header). A
+/// header listed here is never forwarded, whatever its case.
+const HOP_BY_HOP: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+fn is_hop_by_hop(name: &str, connection_tokens: &[String]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    HOP_BY_HOP.contains(&lower.as_str()) || connection_tokens.iter().any(|token| token == &lower)
+}
+
+/// Collect the tokens listed by every `Connection` header, so
+/// `Connection: x-forwarded-for`-style lists strip the named headers too.
+/// A malformed token list is refused (never silently ignored).
+fn connection_tokens(headers: &[(String, String)]) -> Result<Vec<String>, HeadError> {
+    let mut tokens = Vec::new();
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        for token in value.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if !is_token(token) {
+                return Err(HeadError::Malformed(format!(
+                    "malformed Connection token {token:?}"
+                )));
+            }
+            tokens.push(token.to_ascii_lowercase());
+        }
     }
-    let mut headers = Vec::new();
+    Ok(tokens)
+}
+
+/// Strict request-head grammar:
+///
+/// * request line: `METHOD SP target SP HTTP/1.x` with token method and a
+///   control-free target;
+/// * header lines: `token ":" value`, no obs-fold, no bare `\n` or any other
+///   CTL inside a line, no empty names;
+/// * anything else is a typed [`HeadError::Malformed`] (refused with 400).
+fn parse_head(head: &str) -> Result<ParsedRequest, HeadError> {
+    let mut lines = head.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| HeadError::Malformed("empty request".to_string()))?;
+    if !is_header_value(request_line) || request_line.contains('\t') {
+        return Err(HeadError::Malformed(
+            "request line carries control characters".to_string(),
+        ));
+    }
+    let mut parts = request_line.split(' ');
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+    let version = parts.next().unwrap_or_default();
+    if parts.next().is_some() {
+        return Err(HeadError::Malformed(
+            "request line has too many fields".to_string(),
+        ));
+    }
+    if !is_token(method) {
+        return Err(HeadError::Malformed(format!("invalid method {method:?}")));
+    }
+    if target.is_empty() || target.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err(HeadError::Malformed(format!(
+            "invalid request target {target:?}"
+        )));
+    }
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return Err(HeadError::Malformed(format!(
+            "unsupported http version {version:?}"
+        )));
+    }
+    let mut headers: Vec<(String, String)> = Vec::new();
     for line in lines {
         if line.is_empty() {
             continue;
         }
         let Some((name, value)) = line.split_once(':') else {
-            return Err(format!("malformed header line {line:?}"));
+            return Err(HeadError::Malformed(format!(
+                "malformed header line {line:?}"
+            )));
         };
-        headers.push((name.trim().to_string(), value.trim().to_string()));
+        if !is_token(name) {
+            return Err(HeadError::Malformed(format!(
+                "invalid header name {name:?}"
+            )));
+        }
+        let value = value.trim_matches(|c| c == ' ' || c == '\t');
+        if !is_header_value(value) {
+            return Err(HeadError::Malformed(format!(
+                "header {name:?} carries control characters"
+            )));
+        }
+        headers.push((name.to_string(), value.to_string()));
     }
     Ok(ParsedRequest {
-        method,
-        target,
+        method: method.to_string(),
+        target: target.to_string(),
         headers,
     })
-}
-
-fn is_hop_by_hop(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "proxy-authorization" | "proxy-connection" | "connection" | "keep-alive"
-    )
 }
 
 async fn write_denial(stream: &mut TcpStream, status: &str, reason: BlockReason) {
@@ -787,8 +1055,20 @@ async fn serve_connection(mut client: TcpStream, inner: Arc<BrokerInner>) -> Res
             return Err(format!("request head of {size} bytes exceeds the bound"));
         }
         Err(HeadError::Io(e)) => return Err(format!("head read failed: {e}")),
+        Err(HeadError::Malformed(detail)) => {
+            return Err(format!("head read reported malformed input: {detail}"))
+        }
     };
-    let request = parse_head(&head).map_err(|e| format!("malformed request head: {e}"))?;
+    let request = match parse_head(&head) {
+        Ok(request) => request,
+        Err(HeadError::Malformed(detail)) => {
+            inner.account_blocked();
+            tracing::info!(detail = %detail, "egress: malformed request head refused");
+            write_denial(&mut client, "400 Bad Request", BlockReason::Malformed).await;
+            return Ok(());
+        }
+        Err(other) => return Err(format!("head parse failed: {other:?}")),
+    };
 
     if request.method.eq_ignore_ascii_case("CONNECT") {
         return serve_connect(client, request, leftover, inner).await;
@@ -802,13 +1082,16 @@ async fn serve_connect(
     leftover: Vec<u8>,
     inner: Arc<BrokerInner>,
 ) -> Result<(), String> {
-    let (host, port) = split_authority(&request.target)
-        .ok_or_else(|| format!("malformed CONNECT target {:?}", request.target))?;
+    let Some((host, port)) = parse_connect_target(&request.target) else {
+        inner.account_blocked();
+        write_denial(&mut client, "400 Bad Request", BlockReason::Malformed).await;
+        return Ok(());
+    };
     inner.account_request(&host);
-    let decision = inner.policy.decide_host(&host);
+    let decision = inner.policy.decide_destination(&host, port);
     if let DestinationDecision::Blocked { reason } = &decision {
         inner.account_blocked();
-        tracing::info!(host = %host, reason = %reason, "egress: CONNECT blocked by policy");
+        tracing::info!(host = %host, port, reason = %reason, "egress: CONNECT blocked by policy");
         write_denial(&mut client, "403 Forbidden", *reason).await;
         return Ok(());
     }
@@ -839,9 +1122,14 @@ async fn serve_connect(
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await
         .map_err(|e| format!("client write failed: {e}"))?;
-    let (up, down) = tokio::io::copy_bidirectional(&mut client, &mut target)
-        .await
-        .map_err(|e| format!("tunnel copy failed: {e}"))?;
+    let (up, down) = copy_bidirectional_bounded(
+        &mut client,
+        &mut target,
+        inner.copy_idle_timeout,
+        inner.copy_max,
+    )
+    .await
+    .map_err(|detail| format!("tunnel copy failed: {detail}"))?;
     inner.account_bytes(up, down);
     Ok(())
 }
@@ -883,13 +1171,12 @@ async fn serve_forward(
     leftover: Vec<u8>,
     inner: Arc<BrokerInner>,
 ) -> Result<(), String> {
-    let Some((scheme, host)) = split_scheme_host(&request.target) else {
+    let Some((scheme, authority)) = split_absolute_target(&request.target) else {
         inner.account_blocked();
         write_denial(&mut client, "400 Bad Request", BlockReason::Malformed).await;
         return Ok(());
     };
     let scheme = scheme.to_ascii_lowercase();
-    inner.account_request(&host);
     if !inner
         .policy
         .allow_schemes
@@ -909,17 +1196,41 @@ async fn serve_forward(
         .await;
         return Ok(());
     }
-    let decision = inner.policy.decide_host(&host);
+    let destination = format!("{scheme}://{authority}");
+    let Ok(parsed) = RequestTarget::parse(&destination) else {
+        inner.account_blocked();
+        write_denial(&mut client, "400 Bad Request", BlockReason::Malformed).await;
+        return Ok(());
+    };
+    let Some(port) = parsed.port else {
+        inner.account_blocked();
+        write_denial(&mut client, "400 Bad Request", BlockReason::Malformed).await;
+        return Ok(());
+    };
+    let host = parsed.host;
+    inner.account_request(&host);
+    let decision = inner.policy.decide_destination(&host, port);
     if let DestinationDecision::Blocked { reason } = &decision {
         inner.account_blocked();
-        tracing::info!(host = %host, reason = %reason, "egress: request blocked by policy");
+        tracing::info!(host = %host, port, reason = %reason, "egress: request blocked by policy");
         write_denial(&mut client, "403 Forbidden", *reason).await;
         return Ok(());
     }
-    let port = url_host_port(&request.target)
-        .map(|(_, port)| port)
-        .unwrap_or(80);
     let origin_form = origin_form_of(&request.target).unwrap_or_else(|| "/".to_string());
+    // Rebuild the head: hop-by-hop headers — the fixed set AND every token
+    // listed by `Connection` — plus any client-supplied proxy credentials
+    // are stripped; the upstream credential (if any) is added on this leg
+    // only. A malformed Connection list is refused before any destination
+    // socket is opened.
+    let connection_listed = match connection_tokens(&request.headers) {
+        Ok(tokens) => tokens,
+        Err(_) => {
+            inner.account_blocked();
+            tracing::info!("egress: malformed Connection header refused");
+            write_denial(&mut client, "400 Bad Request", BlockReason::Malformed).await;
+            return Ok(());
+        }
+    };
     let upstream = inner.upstream.select(&host);
     let mut target = match connect_destination(upstream, &host, port, &inner).await {
         Ok(stream) => stream,
@@ -929,9 +1240,6 @@ async fn serve_forward(
             return Ok(());
         }
     };
-    // Rebuild the head: hop-by-hop and any client-supplied proxy
-    // credentials are stripped; the upstream credential (if any) is added
-    // on this leg only.
     let mut out = String::new();
     if upstream.is_some() {
         out.push_str(&format!(
@@ -942,7 +1250,7 @@ async fn serve_forward(
         out.push_str(&format!("{} {} HTTP/1.1\r\n", request.method, origin_form));
     }
     for (name, value) in &request.headers {
-        if is_hop_by_hop(name) {
+        if is_hop_by_hop(name, &connection_listed) {
             continue;
         }
         out.push_str(&format!("{name}: {value}\r\n"));
@@ -972,9 +1280,14 @@ async fn serve_forward(
             .await
             .map_err(|e| format!("upstream body write failed: {e}"))?;
     }
-    let (up, down) = tokio::io::copy_bidirectional(&mut client, &mut target)
-        .await
-        .map_err(|e| format!("forward copy failed: {e}"))?;
+    let (up, down) = copy_bidirectional_bounded(
+        &mut client,
+        &mut target,
+        inner.copy_idle_timeout,
+        inner.copy_max,
+    )
+    .await
+    .map_err(|detail| format!("forward copy failed: {detail}"))?;
     inner.account_bytes(up, down);
     Ok(())
 }
@@ -999,42 +1312,68 @@ async fn connect_destination(
     }
 }
 
-/// Split `host:port` (also `[v6]:port`) with a default port per scheme.
-fn split_authority(authority: &str) -> Option<(String, u16)> {
-    split_authority_default(authority, 443)
-}
-
-/// Host+port of an absolute URL (`scheme://host[:port]/...`).
-fn url_host_port(url: &str) -> Option<(String, u16)> {
-    let (scheme, rest) = url.split_once("://")?;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let default_port = if scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("wss")
-    {
-        443
-    } else {
-        80
-    };
-    split_authority_default(authority, default_port)
-}
-
-fn split_authority_default(authority: &str, default_port: u16) -> Option<(String, u16)> {
-    let authority = authority.rsplit('@').next()?;
-    if let Some(rest) = authority.strip_prefix('[') {
-        let end = rest.find(']')?;
-        let host = rest[..end].to_string();
-        let port = rest[end + 1..]
-            .strip_prefix(':')
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(default_port);
-        return Some((host, port));
+/// Bounded bidirectional copy: one idle timeout per read/write and a total
+/// copy deadline. Both directions half-close on EOF. On timeout or error the
+/// sockets are left for the caller to drop (the typed reason is returned),
+/// so a stalled peer can never pin a `max_connections` permit indefinitely.
+async fn copy_bidirectional_bounded(
+    client: &mut TcpStream,
+    target: &mut TcpStream,
+    idle: Duration,
+    total: Duration,
+) -> Result<(u64, u64), String> {
+    let deadline = tokio::time::Instant::now() + total;
+    let mut client_open = true;
+    let mut target_open = true;
+    let mut up = 0u64;
+    let mut down = 0u64;
+    let mut client_buf = vec![0u8; 16 * 1024];
+    let mut target_buf = vec![0u8; 16 * 1024];
+    while client_open || target_open {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(format!("copy deadline of {}ms exceeded", total.as_millis()));
+        }
+        let wait = idle.min(deadline - now);
+        tokio::select! {
+            biased;
+            read = tokio::time::timeout(wait, client.read(&mut client_buf)), if client_open => {
+                match read {
+                    Err(_) => return Err("idle timeout on the client leg".to_string()),
+                    Ok(Err(e)) => return Err(format!("client read failed: {e}")),
+                    Ok(Ok(0)) => {
+                        client_open = false;
+                        let _ = target.shutdown().await;
+                    }
+                    Ok(Ok(n)) => {
+                        match tokio::time::timeout(wait, target.write_all(&client_buf[..n])).await {
+                            Err(_) => return Err("idle timeout writing to the target leg".to_string()),
+                            Ok(Err(e)) => return Err(format!("target write failed: {e}")),
+                            Ok(Ok(())) => up = up.saturating_add(n as u64),
+                        }
+                    }
+                }
+            }
+            read = tokio::time::timeout(wait, target.read(&mut target_buf)), if target_open => {
+                match read {
+                    Err(_) => return Err("idle timeout on the target leg".to_string()),
+                    Ok(Err(e)) => return Err(format!("target read failed: {e}")),
+                    Ok(Ok(0)) => {
+                        target_open = false;
+                        let _ = client.shutdown().await;
+                    }
+                    Ok(Ok(n)) => {
+                        match tokio::time::timeout(wait, client.write_all(&target_buf[..n])).await {
+                            Err(_) => return Err("idle timeout writing to the client leg".to_string()),
+                            Ok(Err(e)) => return Err(format!("client write failed: {e}")),
+                            Ok(Ok(())) => down = down.saturating_add(n as u64),
+                        }
+                    }
+                }
+            }
+        }
     }
-    match authority.rsplit_once(':') {
-        Some((host, port)) => match port.parse::<u16>() {
-            Ok(port) => Some((host.to_string(), port)),
-            Err(_) => None,
-        },
-        None => Some((authority.to_string(), default_port)),
-    }
+    Ok((up, down))
 }
 
 /// The origin-form path+query of an absolute URI.
@@ -1074,6 +1413,7 @@ pub fn policy_snapshot(policy: &DestinationPolicy) -> serde_json::Value {
         "blocked_hosts": policy.blocked_hosts,
         "blocked_resource_types": policy.blocked_resource_types,
         "allow_schemes": policy.allow_schemes,
+        "allowed_ports": policy.allowed_ports,
     })
 }
 
@@ -1186,5 +1526,162 @@ mod tests {
         };
         assert!(config.validate().is_err());
         assert!(BrokerConfig::default().validate().is_ok());
+        // Copy bounds are validated too.
+        let bad = BrokerConfig {
+            copy_idle_timeout_ms: 0,
+            ..BrokerConfig::default()
+        };
+        assert!(bad.validate().is_err());
+        let bad = BrokerConfig {
+            copy_max_ms: BrokerConfig::default().copy_idle_timeout_ms - 1,
+            ..BrokerConfig::default()
+        };
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn destination_ports_are_policy_checked() {
+        let policy = policy();
+        assert!(policy.decide_destination("example.com", 443).is_allowed());
+        assert!(policy.decide_destination("example.com", 80).is_allowed());
+        assert!(policy.decide_url("https://example.com/x").is_allowed());
+        assert!(policy.decide_url("http://example.com/x").is_allowed());
+        // An allowlisted host on a non-policy port is refused.
+        assert_eq!(
+            policy.decide_destination("example.com", 8443),
+            DestinationDecision::Blocked {
+                reason: BlockReason::PortNotAllowed
+            }
+        );
+        assert_eq!(
+            policy.decide_url("https://example.com:8443/x"),
+            DestinationDecision::Blocked {
+                reason: BlockReason::PortNotAllowed
+            }
+        );
+        // An explicit port allowlist is honored.
+        let widened = policy.clone().with_allowed_ports(vec![80, 443, 8443]);
+        assert!(widened.decide_destination("example.com", 8443).is_allowed());
+        assert_eq!(
+            widened.decide_destination("example.com", 8080),
+            DestinationDecision::Blocked {
+                reason: BlockReason::PortNotAllowed
+            }
+        );
+        // A widened port never widens the host set.
+        assert_eq!(
+            widened.decide_destination("tracker.test", 8443),
+            DestinationDecision::Blocked {
+                reason: BlockReason::NotFirstParty
+            }
+        );
+        // An empty port allowlist is a config error, not a silent deny-all.
+        let mut empty = policy.clone();
+        empty.allowed_ports = Vec::new();
+        assert!(empty.validate().is_err());
+    }
+
+    #[test]
+    fn canonicalization_blocks_spelling_tricks() {
+        let policy = DestinationPolicy::first_party_only(vec![
+            HostPattern::parse("example.com").unwrap(),
+            HostPattern::parse("127.0.0.1").unwrap(),
+            HostPattern::parse("bücher.example").unwrap(),
+            HostPattern::parse("[::1]").unwrap(),
+        ]);
+        // Trailing dot and case.
+        assert!(policy.decide_url("https://example.com./x").is_allowed());
+        assert!(policy.decide_destination("EXAMPLE.COM.", 443).is_allowed());
+        // UTS-46 punycode both directions.
+        let puny = HostPattern::parse("xn--bcher-kva.example").unwrap();
+        assert!(puny.matches("bücher.example"));
+        assert!(HostPattern::parse("bücher.example")
+            .unwrap()
+            .matches("xn--bcher-kva.example"));
+        assert!(policy
+            .decide_destination("xn--bcher-kva.example", 443)
+            .is_allowed());
+        assert!(policy.decide_url("https://BÜCHER.example/").is_allowed());
+        // Numeric IPv4 alternates canonicalize to the allowlisted literal.
+        assert!(policy
+            .decide_destination("127.000.000.001", 80)
+            .is_allowed());
+        assert!(policy.decide_url("http://127.000.000.001/").is_allowed());
+        // Decimal IP shorthand and unbracketed IPv6 are ambiguous: refused.
+        assert_eq!(
+            policy.decide_destination("2130706433", 80),
+            DestinationDecision::Blocked {
+                reason: BlockReason::Malformed
+            }
+        );
+        assert_eq!(
+            policy.decide_url("http://2130706433/"),
+            DestinationDecision::Blocked {
+                reason: BlockReason::Malformed
+            }
+        );
+        assert_eq!(
+            policy.decide_url("http://::1/"),
+            DestinationDecision::Blocked {
+                reason: BlockReason::Malformed
+            }
+        );
+        // A zero-padded IPv6 literal canonicalizes and matches.
+        assert!(policy
+            .decide_url("http://[0:0:0:0:0:0:0:1]:80/")
+            .is_allowed());
+        // Patterns carry no ports: ports live in `allowed_ports`.
+        assert!(HostPattern::parse("example.com:8443").is_err());
+        // A hostile userinfo never becomes the host.
+        assert!(policy
+            .decide_url("https://evil.test@example.com/x")
+            .is_allowed());
+        assert_eq!(
+            policy.decide_url("https://example.com@evil.test/x"),
+            DestinationDecision::Blocked {
+                reason: BlockReason::NotFirstParty
+            }
+        );
+    }
+
+    #[test]
+    fn request_head_grammar_refuses_smuggling() {
+        assert!(parse_head("GET http://x.test/ HTTP/1.1\r\nHost: x.test\r\n\r\n").is_ok());
+        assert!(parse_head("CONNECT x.test:443 HTTP/1.0\r\nHost: x.test\r\n\r\n").is_ok());
+        // A bare \n inside a value must not survive as a new header line.
+        let smuggled = "GET http://x.test/ HTTP/1.1\r\nHost: x.test\r\n\
+                        X-Ignored: a\nProxy-Authorization: Basic ZQ==\r\n\r\n";
+        assert!(matches!(parse_head(smuggled), Err(HeadError::Malformed(_))));
+        // Empty header name.
+        assert!(parse_head("GET http://x.test/ HTTP/1.1\r\n: v\r\n\r\n").is_err());
+        // Obsolete line folding.
+        assert!(
+            parse_head("GET http://x.test/ HTTP/1.1\r\nX: v\r\n  folded\r\n\r\n").is_err(),
+            "obs-fold must be refused"
+        );
+        // Control characters in the request line.
+        assert!(parse_head("GET http://x.test/\nHTTP/1.1\r\n\r\n").is_err());
+        // Non-token method/target/version.
+        assert!(parse_head("G ET http://x.test/ HTTP/1.1\r\n\r\n").is_err());
+        assert!(parse_head("GET http://x.test/ HTTP/2\r\n\r\n").is_err());
+        assert!(parse_head("GET  HTTP/1.1\r\n\r\n").is_err());
+        // DEL in a value.
+        assert!(parse_head("GET http://x.test/ HTTP/1.1\r\nX: a\u{7f}b\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn connection_listed_tokens_are_hop_by_hop() {
+        let headers = vec![(
+            "connection".to_string(),
+            "Keep-Alive, X-Custom-Hop".to_string(),
+        )];
+        let tokens = connection_tokens(&headers).unwrap();
+        assert!(is_hop_by_hop("Connection", &tokens));
+        assert!(is_hop_by_hop("x-custom-hop", &tokens));
+        assert!(is_hop_by_hop("Proxy-Authorization", &tokens));
+        assert!(is_hop_by_hop("Transfer-Encoding", &tokens));
+        assert!(!is_hop_by_hop("Content-Type", &tokens));
+        // A malformed token list is refused, never guessed at.
+        assert!(connection_tokens(&[("connection".to_string(), "bad token".to_string())]).is_err());
     }
 }

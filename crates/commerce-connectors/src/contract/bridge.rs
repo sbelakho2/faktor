@@ -38,7 +38,7 @@ use faktor_commerce::text::{CanonicalUrl, Text};
 use faktor_commerce::{SourceError, SourceId};
 
 use crate::browser::FallbackPolicy;
-use crate::context::{AcquireCtx, Clock, Diagnostics};
+use crate::context::{AcquireCtx, Cancellation, Clock, Diagnostics};
 use crate::contract::capture::SharedBrowserExtraction;
 use crate::contract::{
     CapabilityLevel, ConnectorCapabilities, Discovery, Mechanism, ProductReference, ProductRequest,
@@ -145,9 +145,11 @@ impl<C: SiteConnector + 'static> Registered<C> {
     }
 
     /// Build the site context for one call: the runtime's injected seams plus
-    /// the commerce context's deadline, account scope and freshness.
+    /// the commerce context's deadline, cancellation, account scope and
+    /// freshness.
     fn rich_ctx(&self, ctx: &CommerceCtx) -> AcquireCtx {
         let now = self.runtime.clock.now_ms();
+        let commerce_cancel = ctx.cancel.clone();
         let mut builder = AcquireCtx::builder(
             self.runtime.transport.clone(),
             self.runtime.quota.clone(),
@@ -155,6 +157,12 @@ impl<C: SiteConnector + 'static> Registered<C> {
         )
         .clock(self.runtime.clock.clone())
         .diagnostics(self.runtime.diagnostics.clone())
+        // The caller's cancellation must be observable inside every
+        // connector `check_alive()`; the observed token mirrors the
+        // commerce token lazily.
+        .cancellation(Cancellation::observed(move || {
+            commerce_cancel.is_cancelled()
+        }))
         .fallback_policy(self.runtime.fallback_policy);
         if let Some(remaining) = ctx.remaining() {
             builder = builder.deadline_ms(now.saturating_add(duration_ms(remaining)));
@@ -519,6 +527,32 @@ mod tests {
                 .to_decimal_string(),
             "36.000000"
         );
+    }
+
+    #[tokio::test]
+    async fn rich_ctx_mirrors_the_caller_cancellation() {
+        let registered = Registered::new(
+            FakeSite {
+                calls: std::sync::Mutex::new(0),
+            },
+            runtime(),
+        );
+        // A fresh caller is not cancelled; after cancellation the connector
+        // context observes it on its very next liveness check.
+        let commerce = CommerceCtx::new();
+        let site = registered.rich_ctx(&commerce);
+        assert!(!site.is_cancelled(), "a fresh caller is not cancelled");
+        commerce.cancel.cancel();
+        assert!(
+            site.is_cancelled(),
+            "the observed token must mirror the caller's cancellation"
+        );
+        // A caller already cancelled before the bridge is built starts
+        // cancelled too.
+        let cancelled = CommerceCtx::new();
+        cancelled.cancel.cancel();
+        let site = registered.rich_ctx(&cancelled);
+        assert!(site.is_cancelled());
     }
 
     #[tokio::test]

@@ -499,6 +499,12 @@ fn account_pricing_requires_the_matching_scope_and_wins_at_equal_tiers() {
     account_tier.account_scope = Some(AccountScope::new("acct-1").expect("scope"));
     offer.price_breaks.push(account_tier);
 
+    // The scoped double minimum is a FIRST-CLASS model state: it survives
+    // the real deserialization path (offer -> JSON -> CommercialOffer).
+    let json = serde_json::to_value(&offer).expect("serialize");
+    let offer: CommercialOffer =
+        serde_json::from_value(json).expect("public + account tier at the same minimum");
+
     let public = price_at_quantity(&offer, VariantRequest::None, qty(100));
     let public_quote = resolved(&public);
     assert_eq!(public_quote.merchandise, money("2000.00"));
@@ -521,6 +527,27 @@ fn account_pricing_requires_the_matching_scope_and_wins_at_equal_tiers() {
     };
     let other = resolve_quote(&offer, &other_ctx, qty(100));
     assert_eq!(resolved(&other).merchandise, money("2000.00"));
+}
+
+#[test]
+fn duplicate_minima_remain_refused_within_one_visibility_scope() {
+    // Two PUBLIC tiers at the same minimum stay a duplicate...
+    let duplicate = with_tiers(base_offer(), vec![tier(100, "20.00"), tier(100, "19.00")]);
+    let json = serde_json::to_value(&duplicate).expect("serialize");
+    assert!(serde_json::from_value::<CommercialOffer>(json).is_err());
+
+    // ...and two ACCOUNT tiers of the SAME scope at the same minimum would
+    // be ambiguous for that account: also refused.
+    let scope = AccountScope::new("acct-1").expect("scope");
+    let mut first = tier(100, "17.00");
+    first.visibility = PriceVisibility::AccountSpecific;
+    first.account_scope = Some(scope.clone());
+    let mut second = tier(100, "16.00");
+    second.visibility = PriceVisibility::AccountSpecific;
+    second.account_scope = Some(scope);
+    let ambiguous = with_tiers(base_offer(), vec![first, second]);
+    let json = serde_json::to_value(&ambiguous).expect("serialize");
+    assert!(serde_json::from_value::<CommercialOffer>(json).is_err());
 }
 
 #[test]

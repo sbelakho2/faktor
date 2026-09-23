@@ -37,8 +37,8 @@ use crate::connector::{
 };
 use crate::error::{ConnectorHealth, SourceError};
 use crate::jobs::{
-    advance_job, bom_request, job_digest, running_outcome, CommerceJobRequest, ItemOutcome,
-    JobItemExecutor, JobItemState, JobLine, JobOutcome, JobState,
+    advance_job, bom_request, job_digest, running_outcome, terminal_outcome, CommerceJobRequest,
+    ItemOutcome, JobItemExecutor, JobItemState, JobLine, JobOutcome, JobState,
 };
 use crate::offer::{CommercialOffer, Freshness};
 use crate::query::{
@@ -563,6 +563,10 @@ impl CommerceSourceService {
                     if let Ok(registry) = self.registry.lock() {
                         registry.note_success(&source, crate::connector::AcquisitionPath::Api);
                     }
+                    // Extracted text is scrubbed before it can reach a cache
+                    // payload or a tool outcome.
+                    let mut rows = rows;
+                    crate::result::scrub_discoveries(&mut rows);
                     let payload = NormalizedPayload::from_serializable(&rows)?;
                     self.write_cache(&identity, &payload, now)?;
                     marks.push(Freshness::Live);
@@ -687,7 +691,8 @@ impl CommerceSourceService {
                     if let Ok(registry) = self.registry.lock() {
                         registry.note_success(source, crate::connector::AcquisitionPath::Api);
                     }
-                    let offer = *offer;
+                    let mut offer = *offer;
+                    crate::result::scrub_offer(&mut offer);
                     let payload = NormalizedPayload::from_serializable(&offer)?;
                     self.write_cache(&identity, &payload, now)?;
                     self.persist_offer_snapshot(&offer, now);
@@ -828,6 +833,8 @@ impl CommerceSourceService {
                     if let Ok(registry) = self.registry.lock() {
                         registry.note_success(source, crate::connector::AcquisitionPath::Api);
                     }
+                    let mut candidates = candidates;
+                    crate::result::scrub_quote_candidates(&mut candidates);
                     let payload = NormalizedPayload::from_serializable(&candidates)?;
                     self.write_cache(&identity, &payload, now)?;
                     for candidate in candidates.iter().take(MAX_QUOTE_SNAPSHOTS) {
@@ -925,6 +932,19 @@ impl CommerceSourceService {
         let compact = match row.compact_json {
             Some(json) => {
                 serde_json::from_str(&json).map_err(|_| ServiceError::Source(SourceError::Store))?
+            }
+            // A terminal job without a persisted compact result reports its
+            // TRUE terminal state with typed diagnostics; only a
+            // non-terminal job is "running".
+            None if row.state.is_terminal() => {
+                let counts = ResultCounts {
+                    matched: row.matched,
+                    ambiguous: row.ambiguous,
+                    unmatched: row.unmatched,
+                };
+                terminal_outcome(&job, counts, row.last_error.as_deref())
+                    .map_err(ServiceError::Source)?
+                    .compact
             }
             None => running_outcome(&job, now_ms()).compact,
         };
@@ -1032,11 +1052,22 @@ impl JobItemExecutor for ServiceJobExecutor<'_> {
             Some(quantity) => quantity,
             None => crate::quantity::NonZeroQuantity::new(1).map_err(|_| SourceError::Store)?,
         };
+        // A `Quote` job carries the requested packaging/variant in its work
+        // (both are bound into the job digest); they must reach the quote
+        // request, or a variant/packaging-scoped job would resolve at the
+        // offer level or report VariantAmbiguous instead of the requested
+        // price.
+        let (packaging, variant) = match &job.request.work {
+            crate::jobs::JobWork::Quote {
+                packaging, variant, ..
+            } => (*packaging, variant.clone()),
+            _ => (None, None),
+        };
         let quote_request = QuoteRequest::new(
             reference.clone(),
             quantity.get(),
-            None,
-            None,
+            packaging,
+            variant,
             ctx.account_scope.clone(),
             job.request.freshness,
         )

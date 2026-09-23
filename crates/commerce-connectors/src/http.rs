@@ -241,6 +241,11 @@ pub struct HttpRequest {
     body: Option<Vec<u8>>,
     timeout_ms: u64,
     max_response_bytes: usize,
+    /// A credential the connector intentionally placed in the URL query
+    /// (the documented Mouser `apiKey` parameter). The transport boundary
+    /// requires it registered with the outbound scanner and refuses any
+    /// *other* registered secret found in the URL.
+    url_secret: Option<SecretString>,
 }
 
 impl HttpRequest {
@@ -253,6 +258,7 @@ impl HttpRequest {
             body: None,
             timeout_ms: DEFAULT_TIMEOUT_MS,
             max_response_bytes: MAX_RESPONSE_BYTES,
+            url_secret: None,
         })
     }
 
@@ -268,6 +274,7 @@ impl HttpRequest {
             body: Some(body.to_vec()),
             timeout_ms: DEFAULT_TIMEOUT_MS,
             max_response_bytes: MAX_RESPONSE_BYTES,
+            url_secret: None,
         };
         request.push_header(Header::new("content-type", "application/json")?)?;
         request.push_header(Header::new("accept", "application/json")?)?;
@@ -286,6 +293,7 @@ impl HttpRequest {
             body: Some(body.to_vec()),
             timeout_ms: DEFAULT_TIMEOUT_MS,
             max_response_bytes: MAX_RESPONSE_BYTES,
+            url_secret: None,
         };
         request.push_header(Header::new(
             "content-type",
@@ -312,6 +320,20 @@ impl HttpRequest {
     /// Add a credential-bearing header.
     pub fn with_secret_header(self, name: &str, value: &SecretString) -> Result<Self, HttpError> {
         self.with_header(Header::secret(name, value)?)
+    }
+
+    /// Declare that the URL query intentionally carries `secret` (the
+    /// documented API-key query parameter). The transport boundary scans the
+    /// URL with the outbound secret scanner: the declared credential is
+    /// permitted, any *other* registered secret refuses before dispatch.
+    pub fn with_url_credential(mut self, secret: &SecretString) -> Self {
+        self.url_secret = Some(secret.clone());
+        self
+    }
+
+    /// The declared URL credential, when one was set.
+    pub(crate) fn url_credential(&self) -> Option<&SecretString> {
+        self.url_secret.as_ref()
     }
 
     /// Override the timeout (bounded by the transport's own policy).
@@ -531,9 +553,74 @@ pub(crate) fn map_status(response: &HttpResponse) -> Result<(), SourceError> {
     }
 }
 
+/// Enforce that the URL query is covered by the outbound secret scanner: a
+/// URL may carry a registered secret only when the request declares exactly
+/// that credential (e.g. the documented Mouser `apiKey` query parameter).
+/// Any other registered secret refuses typed before the request leaves, so
+/// a query-borne credential can never become an unscanned egress surface.
+fn verify_url_secrets(
+    ctx: &AcquireCtx,
+    source: &faktor_commerce::SourceId,
+    operation: &'static str,
+    request: &HttpRequest,
+) -> Result<(), SourceError> {
+    let raw = request.url().as_str();
+    let scrubbed = ctx.secrets().scrub(raw);
+    if scrubbed == raw {
+        // No registered secret in the URL: nothing to cover.
+        return Ok(());
+    }
+    let declared_ok = request.url_credential().is_some_and(|secret| {
+        let plain = secret.expose();
+        if plain.is_empty() {
+            return false;
+        }
+        // The declared credential itself must be scanner-covered...
+        if ctx.secrets().scrub(plain) == plain {
+            return false;
+        }
+        // ...and after removing exactly it, no other registered secret may
+        // remain anywhere in the URL.
+        let remainder = raw.replace(plain, "");
+        ctx.secrets().scrub(&remainder) == remainder
+    });
+    if declared_ok {
+        return Ok(());
+    }
+    ctx.record(
+        source,
+        operation,
+        crate::context::ConnectorEventKind::Request,
+        None,
+        Some("secret_scan_refused_url"),
+    );
+    Err(SourceError::InvalidRequest)
+}
+
+/// Apply the outbound secret scanner to one response at the connector
+/// boundary: a credential echoed by an upstream API (or present in scraped
+/// text) can never enter a model-visible result, diagnostic or artifact.
+/// Invalid UTF-8 bodies are left untouched — the typed parsers reject them
+/// before any text can surface.
+fn scrub_response(ctx: &AcquireCtx, mut response: HttpResponse) -> HttpResponse {
+    if let Ok(text) = std::str::from_utf8(response.body()) {
+        let scrubbed = ctx.secrets().scrub(text);
+        if scrubbed != text {
+            response.body = scrubbed.into_bytes();
+        }
+    }
+    for header in &mut response.headers {
+        let scrubbed = ctx.secrets().scrub(&header.value);
+        if scrubbed != header.value {
+            header.value = scrubbed;
+        }
+    }
+    response
+}
+
 /// Send one request through the injected transport with the connector-side
-/// guarantees: liveness check, quota admission, typed error mapping, and
-/// rate-limit header accounting.
+/// guarantees: liveness check, URL secret scan, quota admission, typed error
+/// mapping, response secret scrubbing, and rate-limit header accounting.
 pub(crate) async fn send(
     ctx: &AcquireCtx,
     source: &faktor_commerce::SourceId,
@@ -541,6 +628,7 @@ pub(crate) async fn send(
     request: HttpRequest,
 ) -> Result<HttpResponse, SourceError> {
     ctx.check_alive()?;
+    verify_url_secrets(ctx, source, operation, &request)?;
     let host = request.url().host().to_string();
     let permit = ctx.quota().try_acquire(source, ctx.now_ms())?;
     ctx.record(
@@ -555,6 +643,7 @@ pub(crate) async fn send(
     let elapsed = ctx.now_ms().saturating_sub(started);
     match outcome {
         Ok(response) => {
+            let response = scrub_response(ctx, response);
             ctx.observe_rate_limit_headers(source, &response, ctx.now_ms());
             ctx.record_timed(
                 source,
@@ -585,5 +674,63 @@ pub(crate) async fn send(
             }
             Err(error.into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::CannedResponse;
+
+    fn source() -> faktor_commerce::SourceId {
+        faktor_commerce::SourceId::new("mouser").expect("source")
+    }
+
+    #[tokio::test]
+    async fn declared_url_credentials_pass_and_undeclared_ones_refuse() {
+        let rig = crate::testsupport::Rig::new();
+        let ctx = rig.ctx();
+        let source = source();
+
+        // A URL with no registered secret scans clean.
+        rig.transport.push(CannedResponse::json("{}"));
+        let clean =
+            HttpRequest::get("https://api.mouser.com/api/v1/search/partnumber?limit=1").unwrap();
+        assert!(send(&ctx, &source, "probe", clean).await.is_ok());
+
+        // A credential that is registered and declared is permitted.
+        let declared = SecretString::new("declared-url-key-0123456789".to_string());
+        ctx.secrets().register(declared.expose());
+        let request = HttpRequest::get(&format!(
+            "https://api.mouser.com/api/v1/search/partnumber?apiKey={}",
+            declared.expose()
+        ))
+        .unwrap()
+        .with_url_credential(&declared);
+        rig.transport.push(CannedResponse::json("{}"));
+        assert!(send(&ctx, &source, "declared", request).await.is_ok());
+
+        // An *undeclared* registered secret in the URL refuses before dispatch.
+        let planted = SecretString::new("planted-url-key-abcdef0123".to_string());
+        ctx.secrets().register(planted.expose());
+        let before = rig.transport.request_count();
+        let hostile = HttpRequest::get(&format!(
+            "https://api.mouser.com/api/v1/search/partnumber?token={}",
+            planted.expose()
+        ))
+        .unwrap();
+        let error = send(&ctx, &source, "hostile", hostile)
+            .await
+            .expect_err("an undeclared URL secret must refuse");
+        assert_eq!(error, SourceError::InvalidRequest);
+        assert_eq!(
+            rig.transport.request_count(),
+            before,
+            "the request must never be dispatched"
+        );
+        assert!(
+            !rig.diagnostics.joined().contains(planted.expose()),
+            "the refusal must not record the value"
+        );
     }
 }

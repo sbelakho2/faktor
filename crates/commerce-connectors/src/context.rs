@@ -81,9 +81,16 @@ impl Clock for ManualClock {
 }
 
 /// A cooperative cancellation token.
+///
+/// Besides its own flag it can mirror an external cancellation source
+/// through an observed probe (used by the registry bridge to propagate the
+/// commerce context's cancellation without adding a runtime dependency
+/// here), so `is_cancelled()`/`check_alive()` reflect the caller's real
+/// token at every check.
 #[derive(Clone, Default)]
 pub struct Cancellation {
     cancelled: Arc<AtomicBool>,
+    observed: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl Cancellation {
@@ -92,14 +99,25 @@ impl Cancellation {
         Self::default()
     }
 
+    /// A token that is cancelled whenever `probe` reports cancellation.
+    /// `probe` must be cheap and non-blocking (it is consulted on every
+    /// liveness check).
+    pub fn observed(probe: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            observed: Some(Arc::new(probe)),
+        }
+    }
+
     /// Request cancellation.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
     }
 
-    /// Whether cancellation was requested.
+    /// Whether cancellation was requested (locally or by the observed
+    /// source).
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.cancelled.load(Ordering::SeqCst) || self.observed.as_ref().is_some_and(|probe| probe())
     }
 }
 

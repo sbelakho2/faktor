@@ -12,8 +12,8 @@
 //! | equal base, only packaging suffixes differ | `Strong` |
 //! | equal base, a non-packaging suffix differs | `Possible` |
 //! | source part number matches but no MPN | `Possible` |
-//! | no identifier match, title token overlap ≥ 90% | `Possible` |
-//! | a known identifier or manufacturer contradicts | `Mismatch` |
+//! | no identifier match, no manufacturer conflict, title token overlap ≥ 90% | `Possible` |
+//! | a known identifier or manufacturer contradicts | `Mismatch` (never softened by title overlap) |
 //!
 //! At the set level, two or more candidates at the same best certainty are
 //! reported as [`MatchCertainty::Ambiguous`] — a caller must never
@@ -480,7 +480,7 @@ pub fn match_offer(query: &PartQuery, offer: &CommercialOffer, offer_index: usiz
                     };
                 }
             }
-            if certainty == MatchCertainty::Mismatch {
+            if certainty == MatchCertainty::Mismatch && !manufacturer_conflict {
                 let overlap = signals.title_token_overlap_bp.unwrap_or(0);
                 if overlap >= TITLE_OVERLAP_POSSIBLE_BP {
                     certainty = MatchCertainty::Possible;
@@ -488,9 +488,13 @@ pub fn match_offer(query: &PartQuery, offer: &CommercialOffer, offer_index: usiz
             }
         }
         (Err(_), _) => {
-            let overlap = signals.title_token_overlap_bp.unwrap_or(0);
-            if overlap >= TITLE_OVERLAP_POSSIBLE_BP {
-                certainty = MatchCertainty::Possible;
+            // A known manufacturer contradiction is never softened by title
+            // overlap: the signals would still say `manufacturer_conflict`.
+            if !manufacturer_conflict {
+                let overlap = signals.title_token_overlap_bp.unwrap_or(0);
+                if overlap >= TITLE_OVERLAP_POSSIBLE_BP {
+                    certainty = MatchCertainty::Possible;
+                }
             }
         }
     }

@@ -76,8 +76,10 @@ impl LcscConnector {
         ctx.quota().register_limits(&self.source, DOCUMENTED_LIMITS);
     }
 
-    /// The API key travels in the documented `key` query parameter, which
-    /// [`crate::http::redact_url`] removes from every rendered form.
+    /// The API key travels in the documented `key` query parameter; it is
+    /// registered with the outbound scanner and declared on the request, so
+    /// the transport boundary permits exactly this credential and
+    /// [`crate::http::redact_url`] removes it from every rendered form.
     fn with_key(&self, url: &str) -> String {
         format!(
             "{url}{}key={}",
@@ -106,7 +108,13 @@ impl LcscConnector {
         operation: &'static str,
         url: &str,
     ) -> Result<normalize::Response, SourceError> {
-        let response = http::send(ctx, &self.source, operation, HttpRequest::get(url)?).await?;
+        let response = http::send(
+            ctx,
+            &self.source,
+            operation,
+            HttpRequest::get(url)?.with_url_credential(&self.api_key),
+        )
+        .await?;
         http::map_status(&response)?;
         normalize::parse_response(response.body())
     }

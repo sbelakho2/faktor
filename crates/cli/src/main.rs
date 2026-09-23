@@ -914,11 +914,12 @@ fn daemon_instructions_resolver(
     ))
 }
 
-/// The outbound secret-scan config of the daemon's provider transports:
-/// every request body is whole-payload scanned with a [`SecretRegistry`]
-/// fed from the CONFIGURED provider keys (the same env values the adapter
-/// constructions read). Keys are registered without any logging — the
-/// registry's Debug stays redacted (counts only).
+/// The outbound secret-scan config of the daemon's transports: every
+/// request body is whole-payload scanned with a [`SecretRegistry`] fed from
+/// the CONFIGURED provider keys AND every configured commerce connector
+/// credential (resolved from its configured env-var NAME; the name itself
+/// is never a secret and nothing is logged). The registry fingerprints
+/// values only — its Debug stays redacted (counts only).
 fn daemon_outbound_scan(config: &config::Config) -> OutboundScanConfig {
     let mut registry = SecretRegistry::new();
     for p in &config.providers {
@@ -926,9 +927,40 @@ fn daemon_outbound_scan(config: &config::Config) -> OutboundScanConfig {
             registry.register(key.as_bytes());
         }
     }
+    if config.commerce.enabled {
+        for (_, credential) in config.commerce.connectors.enabled() {
+            register_commerce_credential(&mut registry, credential);
+        }
+    }
     OutboundScanConfig {
         registry: Some(Arc::new(registry)),
         ..Default::default()
+    }
+}
+
+/// Register one configured commerce credential VALUE with the outbound
+/// scan registry. The config carries env-var names only; an unset/empty/
+/// non-unicode variable is left unregistered exactly like a provider key
+/// whose env var is unset (the connector itself registers Disabled). The
+/// value is never logged, named or rendered.
+fn register_commerce_credential(
+    registry: &mut SecretRegistry,
+    credential: config::ConnectorCredential<'_>,
+) {
+    let mut register_env = |name: &str| {
+        if let Ok(value) = std::env::var(name) {
+            if !value.trim().is_empty() {
+                registry.register(value.as_bytes());
+            }
+        }
+    };
+    match credential {
+        config::ConnectorCredential::ApiKey(Some(name)) => register_env(name),
+        config::ConnectorCredential::OAuthPair(Some(client_id), Some(client_secret)) => {
+            register_env(client_id);
+            register_env(client_secret);
+        }
+        _ => {}
     }
 }
 
@@ -1184,7 +1216,10 @@ fn build_daemon_core(
         .sandbox_policy()
         .map_err(|e| format!("sandbox config: {e}"))?;
     let egress = daemon_outbound_scan(&config);
-    let transport = daemon_egress_transport(&sandbox_policy, egress);
+    // The scan config is shared: the provider transport and the commerce
+    // checked transport each install their own destination policy over the
+    // SAME configured-secret registry (provider keys + commerce credentials).
+    let transport = daemon_egress_transport(&sandbox_policy, egress.clone());
     // Steps 5-6 — provider registry + catalog/pricing: every configured
     // adapter is built through the checked transport; Ollama providers are
     // kept CONCRETE for live probing (spec §10: warm-up must reach the
@@ -1305,17 +1340,27 @@ fn build_daemon_core(
     // source service, constructed AFTER memory/tokenizers and BEFORE the
     // agent, because the `source_market` tool needs its Arc before the final
     // ToolRegistry is injected. The enabled site adapters are registered
-    // through the bridge at construction time (transport from the checked
-    // egress authority, browser authority only while `[commerce.browser]` is
-    // enabled, credentials by env-var NAME) — exactly once, before the tool
-    // registry is finalized. Disabled (the default) constructs `None`:
-    // no commerce directory, database, connector runtime, browser state or
-    // network.
+    // through the bridge at construction time (transport = the COMMERCE
+    // checked egress over the parsed per-source destination policy, browser
+    // authority only while `[commerce.browser]` is enabled, credentials by
+    // env-var NAME, outbound whole-payload scan over the SAME configured
+    // credential values) — exactly once, before the tool registry is
+    // finalized. Disabled (the default) constructs `None`: no commerce
+    // directory, database, connector runtime, browser state or network.
+    let commerce_seams =
+        tools_market::commerce_seams(&config.commerce, data_dir, egress.clone(), &supervisor)?;
+    // The shared registered-value guard of the commerce surface: the
+    // connectors fill it at registration and the tool gateway + CAS artifact
+    // store scrub through the SAME Arc.
+    let commerce_secrets = commerce_seams.secrets.clone();
     let commerce = tools_market::open_commerce_service_with(
         data_dir,
         &config.commerce,
-        Arc::new(tools_market::CasArtifacts::new(cas.clone())),
-        tools_market::commerce_seams(&config.commerce, data_dir, transport.clone(), &supervisor)?,
+        Arc::new(tools_market::CasArtifacts::with_secrets(
+            cas.clone(),
+            commerce_secrets.clone(),
+        )),
+        commerce_seams,
     )?;
     // The builtin tool registry + the MCP tools (a collision never replaces
     // a builtin) and the engine layer the runtime hands its tools: edit
@@ -1339,7 +1384,10 @@ fn build_daemon_core(
     // it contributes zero schema bytes and zero schema tokens.
     if let Some(commerce) = &commerce {
         tools.register_lazy(
-            tools_market::source_market_tool(commerce.clone()),
+            tools_market::source_market_tool_with_secrets(
+                commerce.clone(),
+                Some(commerce_secrets.clone()),
+            ),
             tools_market::source_market_exposure(),
         );
     }
@@ -12243,5 +12291,49 @@ mod tests {
         let cheap = build_report_json(false);
         assert!(cheap["self_sha256"].is_null());
         assert_eq!(cheap["version"], faktor_core::VERSION);
+    }
+
+    #[test]
+    fn daemon_outbound_scan_registers_every_configured_commerce_credential_value() {
+        const KEY_ENV: &str = "KP_CLI_COMMERCE_SCAN_KEY";
+        const ID_ENV: &str = "KP_CLI_COMMERCE_SCAN_ID";
+        const SECRET_ENV: &str = "KP_CLI_COMMERCE_SCAN_SECRET";
+        // Values must not trip the frozen GENERIC patterns (sk-*, AKIA, …):
+        // only the configured-secret registry can catch them, so a hit proves
+        // the commerce credential VALUE was registered by name resolution.
+        const KEY: &str = "kp-commerce-key-51ab";
+        const ID: &str = "kp-commerce-id-77c1";
+        const PAIR: &str = "kp-commerce-secret-0d42";
+        std::env::set_var(KEY_ENV, KEY);
+        std::env::set_var(ID_ENV, ID);
+        std::env::set_var(SECRET_ENV, PAIR);
+        let mut cfg = config::Config::default();
+        cfg.commerce.enabled = true;
+        cfg.commerce.connectors.mouser = Some(config::CommerceApiConnectorCfg {
+            enabled: true,
+            api_key_env: Some(KEY_ENV.to_string()),
+        });
+        cfg.commerce.connectors.digikey = Some(config::CommerceDigikeyConnectorCfg {
+            enabled: true,
+            client_id_env: Some(ID_ENV.to_string()),
+            client_secret_env: Some(SECRET_ENV.to_string()),
+        });
+        let scan = daemon_outbound_scan(&cfg);
+        let registry = scan.registry.expect("registry installed");
+        for value in [KEY, ID, PAIR] {
+            assert!(
+                !registry.scan_exact(value.as_bytes()).is_empty(),
+                "configured commerce credential {value} must be registered"
+            );
+        }
+        // Disabled commerce resolves the connectors away: nothing registers.
+        cfg.commerce.enabled = false;
+        let scan = daemon_outbound_scan(&cfg);
+        let registry = scan.registry.expect("registry installed");
+        assert!(registry.scan_exact(KEY.as_bytes()).is_empty());
+        assert!(registry.scan_exact(PAIR.as_bytes()).is_empty());
+        std::env::remove_var(KEY_ENV);
+        std::env::remove_var(ID_ENV);
+        std::env::remove_var(SECRET_ENV);
     }
 }

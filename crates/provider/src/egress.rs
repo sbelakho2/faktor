@@ -318,12 +318,93 @@ pub const MAX_RAW_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// helpers. Building and the raw execution happen ONLY here, so a
 /// non-provider adapter never names a `reqwest` type and every send still
 /// passes the request-time destination gate of the transport it is handed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is REDACTING (audit: the derived form leaked API keys and
+/// bearers from the URL query, the fragment and auth-ish headers into logs):
+/// URL userinfo, every query value and the fragment are masked, headers
+/// whose name looks auth-bearing are `<redacted>`, and the body is reported
+/// by length only. `Clone`/`PartialEq` carry the real values unchanged.
+#[derive(Clone, PartialEq, Eq)]
 pub struct RawRequest {
     pub method: String,
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
+}
+
+/// True for header names that conventionally carry credentials/tokens; such
+/// values are never rendered by [`RawRequest`]'s `Debug`.
+fn header_name_is_sensitive(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        "authorization",
+        "auth",
+        "cookie",
+        "proxy-",
+        "api-key",
+        "apikey",
+        "token",
+        "secret",
+        "password",
+        "credential",
+        "key",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// The display form of one URL with credential-bearing parts masked: userinfo,
+/// every query value and the fragment. An unparseable URL is never echoed
+/// (it may itself contain a planted secret) — a fixed marker is used instead.
+fn redacted_url(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(mut parsed) => {
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                let _ = parsed.set_username("***");
+                let _ = parsed.set_password(Some("***"));
+            }
+            if parsed.query().is_some() {
+                let masked: Vec<String> = parsed
+                    .query_pairs()
+                    .map(|(name, _)| format!("{name}=***"))
+                    .collect();
+                parsed.set_query(Some(&masked.join("&")));
+            }
+            if parsed.fragment().is_some() {
+                parsed.set_fragment(Some("***"));
+            }
+            parsed.to_string()
+        }
+        Err(_) => "<unparseable url>".to_string(),
+    }
+}
+
+impl std::fmt::Debug for RawRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headers: Vec<String> = self
+            .headers
+            .iter()
+            .map(|(name, value)| {
+                if header_name_is_sensitive(name) {
+                    format!("{name}: <redacted>")
+                } else {
+                    format!("{name}: {value}")
+                }
+            })
+            .collect();
+        f.debug_struct("RawRequest")
+            .field("method", &self.method)
+            .field("url", &redacted_url(&self.url))
+            .field("headers", &headers)
+            .field(
+                "body",
+                &self
+                    .body
+                    .as_ref()
+                    .map(|body| format!("<{} bytes>", body.len())),
+            )
+            .finish()
+    }
 }
 
 impl RawRequest {
@@ -684,7 +765,14 @@ pub struct CheckedHttpClient {
 /// (the refusal arrives before the hop that would exceed the bound is
 /// sent); a redirect is only ever followed because the gate allowed the
 /// next URL.
-pub const MAX_REDIRECT_HOPS: usize = 5;
+///
+/// Restored to 10: this checker replaced `reqwest`'s internal follower
+/// (whose effective default was `Policy::limited(10)`), and a value of 5
+/// silently tightened every adapter's behavior instead of preserving the
+/// documented compatibility surface. There is no bypass either way — every
+/// hop still re-runs the parsed destination gate and the secret scan — but
+/// 10 is the documented, adapter-compatible bound.
+pub const MAX_REDIRECT_HOPS: usize = 10;
 
 /// The method (and whether the payload must be dropped) of the next hop for
 /// one redirect status, `None` when the status is not followed. Exactly the
@@ -1277,6 +1365,48 @@ mod tests {
         let err = client.execute(request).await.unwrap_err();
         assert!(matches!(err, EgressError::Denied { .. }), "{err:?}");
         assert_eq!(server.request_count(), 1);
+    }
+
+    #[test]
+    fn raw_request_debug_redacts_url_queries_fragments_and_auth_headers() {
+        let request = RawRequest::new(
+            "POST",
+            "https://api.example.com/v1/token?api_key=SECRET_QUERY&plain=SECRET_TOO#SECRET_FRAGMENT",
+        )
+        .header("authorization", "Bearer SECRET_HEADER")
+        .header("x-api-key", "SECRET_KEY")
+        .header("cookie", "session=SECRET_COOKIE")
+        .header("accept", "application/json")
+        .json_body(&serde_json::json!({ "password": "SECRET_BODY" }));
+        let debug = format!("{request:?}");
+        for secret in [
+            "SECRET_QUERY",
+            "SECRET_TOO",
+            "SECRET_FRAGMENT",
+            "SECRET_HEADER",
+            "SECRET_KEY",
+            "SECRET_COOKIE",
+            "SECRET_BODY",
+            "Bearer",
+        ] {
+            assert!(
+                !debug.contains(secret),
+                "planted secret {secret:?} leaked through Debug: {debug}"
+            );
+        }
+        assert!(debug.contains("api_key=***"), "{debug}");
+        assert!(debug.contains("authorization: <redacted>"), "{debug}");
+        assert!(
+            debug.contains("accept: application/json"),
+            "non-sensitive headers stay visible: {debug}"
+        );
+        assert!(debug.contains("bytes>"), "body is length-only: {debug}");
+        // An unparseable URL must not be echoed raw (it could itself carry a
+        // planted secret).
+        let hostile = RawRequest::new("GET", "not a url ?secret=RAW_SECRET");
+        assert!(!format!("{hostile:?}").contains("RAW_SECRET"));
+        // Clone/PartialEq are untouched by the manual Debug.
+        assert_eq!(request.clone(), request);
     }
 
     #[tokio::test]

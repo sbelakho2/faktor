@@ -157,8 +157,9 @@ impl From<std::io::Error> for CommerceStoreError {
 pub struct NormalizedPayload(String);
 
 impl NormalizedPayload {
-    /// Validate a JSON string for persistence. Raw HTML/bodies, cookies,
-    /// auth headers and API secrets are refused.
+    /// Validate a JSON string for persistence. Raw HTML/bodies, cookies and
+    /// auth headers are refused; credential values echoed into extracted
+    /// text are scrubbed with the shared `faktor-security` utility.
     pub fn from_json(json: impl Into<String>) -> Result<Self, CommerceStoreError> {
         let json = json.into();
         if json.len() > MAX_PAYLOAD_BYTES {
@@ -170,7 +171,21 @@ impl NormalizedPayload {
         if let Err(forbidden) = scan_forbidden(&json) {
             return Err(CommerceStoreError::Forbidden(forbidden));
         }
-        Ok(Self(json))
+        // Extracted text can echo a credential value; scrub it before the
+        // payload can reach a cache row, snapshot or CAS artifact. The
+        // marker scan above still refuses the marker strings it owns, while
+        // the scrub replaces credential values matched by the shared
+        // `faktor-security` patterns.
+        let scrubbed = crate::result::scrub_secrets(&json);
+        if scrubbed.len() > MAX_PAYLOAD_BYTES {
+            // A replacement can be marginally longer than its match; the
+            // bound still holds.
+            return Err(CommerceStoreError::TooLarge {
+                limit: MAX_PAYLOAD_BYTES,
+                actual: scrubbed.len(),
+            });
+        }
+        Ok(Self(scrubbed))
     }
 
     /// Serialize a normalized domain value and validate it. The domain
@@ -187,9 +202,12 @@ impl NormalizedPayload {
         &self.0
     }
 
-    /// Parse back into a domain value.
+    /// Parse back into a domain value. The stored JSON is scrubbed again on
+    /// read (idempotent for payloads written since the scrub boundary): a
+    /// legacy or hostile row can never hand a credential back to a caller.
     pub fn parse<T: DeserializeOwned>(&self) -> Result<T, CommerceStoreError> {
-        serde_json::from_str(&self.0)
+        let scrubbed = crate::result::scrub_secrets(&self.0);
+        serde_json::from_str(&scrubbed)
             .map_err(|e| CommerceStoreError::Malformed(format!("parse payload: {e}")))
     }
 
@@ -1792,7 +1810,10 @@ impl CommerceStore {
         Ok(())
     }
 
-    /// Insert or update one job item, bumping its attempt count.
+    /// Insert or update one job item with the CALLER's attempt count: the
+    /// durable `attempts` column is exactly `item.attempts` (the caller owns
+    /// the per-line retry budget; the store never force-increments it), so a
+    /// recovered item resumes with the count it earned.
     pub fn upsert_job_item(&self, item: &JobItemRow) -> Result<(), CommerceStoreError> {
         let result_json = item
             .result
@@ -1803,11 +1824,11 @@ impl CommerceStore {
         tx.execute(
             "INSERT INTO job_item(job_id, item_key, ordinal, state, attempts, result_json,
                 error_label, updated_ms)
-             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(job_id, item_key) DO UPDATE SET
                 ordinal = excluded.ordinal,
                 state = excluded.state,
-                attempts = job_item.attempts + 1,
+                attempts = excluded.attempts,
                 result_json = excluded.result_json,
                 error_label = excluded.error_label,
                 updated_ms = excluded.updated_ms",
@@ -1816,6 +1837,7 @@ impl CommerceStore {
                 item.item_key,
                 item.ordinal as i64,
                 item.state.as_str(),
+                item.attempts as i64,
                 result_json,
                 item.error_label,
                 item.updated_ms as i64,

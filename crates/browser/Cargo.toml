@@ -8,6 +8,7 @@ description = "Faktor Browser authority: supervised Chromium/CDP, profiles, inte
 
 [dependencies]
 faktor-core.workspace = true
+faktor-security.workspace = true
 faktor-terminal.workspace = true
 tokio.workspace = true
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }

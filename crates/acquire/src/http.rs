@@ -323,6 +323,16 @@ fn merged_headers(
 }
 
 /// Validate one absolute http(s) URL under the length bound.
+///
+/// The scheme/host/port/userinfo semantics are DELEGATED to the shared
+/// parser the provider transport's destination gate uses
+/// (`faktor_provider::egress::validate_provider_base_url`): acquire never
+/// re-derives URL semantics from strings, so an accepted URL can never
+/// parse to a different origin at the hand-built
+/// [`faktor_provider::egress::RawRequest`] than the one validated here
+/// (backslash/authority normalization, IDN and port canonicalization all
+/// happen inside that single parser). A rejected URL surfaces a typed
+/// refusal WITHOUT echoing the raw text (it may carry a planted secret).
 pub fn validate_fetch_url(url: &str, max_url_bytes: usize) -> Result<(), AcquisitionError> {
     if url.is_empty() {
         return Err(invalid("url is empty"));
@@ -333,38 +343,25 @@ pub fn validate_fetch_url(url: &str, max_url_bytes: usize) -> Result<(), Acquisi
     if url.chars().any(char::is_control) {
         return Err(invalid("url contains control characters"));
     }
-    let lower = url.to_ascii_lowercase();
-    let rest = if let Some(rest) = lower.strip_prefix("https://") {
-        rest
-    } else if let Some(rest) = lower.strip_prefix("http://") {
-        rest
-    } else {
-        return Err(invalid("only http(s) URLs are fetchable"));
-    };
-    let authority = rest.split('/').next().unwrap_or(rest);
-    if authority.is_empty() {
-        return Err(invalid("url has no host"));
-    }
-    if authority.contains('@') {
-        return Err(invalid("url must not carry credentials"));
-    }
-    if !authority.starts_with('[') {
-        if let Some((host, port)) = authority.rsplit_once(':') {
-            if !host.is_empty() && port.parse::<u16>().is_err() {
-                return Err(invalid("url port is not numeric"));
-            }
-        }
-    }
+    faktor_provider::egress::validate_provider_base_url(url).map_err(|_| {
+        invalid(
+            "url is not a fetchable absolute http(s) URL (shared parser refused: scheme/host/\
+             userinfo/port must be valid)",
+        )
+    })?;
     Ok(())
 }
 
 /// Resolve a redirect target against the current URL.
 ///
-/// Supports absolute targets, scheme-relative (`//host/path`), root-relative
-/// (`/path`), path-relative and dot segments (`./`, `../`). Anything that
-/// does not resolve to an absolute http(s) URL inside the length bound is a
-/// typed refusal — a redirect can never smuggle a non-HTTP scheme or a
-/// credential-bearing URL past the transport gate.
+/// The resolution itself is DELEGATED to the shared URL parser
+/// (`Url::join`, via the provider's strict http(s) validator), so the
+/// returned string is the parser's own canonical form: whatever the policy
+/// gate later parses from the hand-built
+/// [`faktor_provider::egress::RawRequest`] is byte-identical to what was
+/// validated here. A target that does not resolve to an absolute http(s)
+/// URL inside the length bound (non-HTTP scheme, embedded credentials,
+/// control characters) is a typed refusal.
 pub fn resolve_redirect(
     base: &str,
     location: &str,
@@ -382,97 +379,19 @@ pub fn resolve_redirect(
     if location.chars().any(char::is_control) {
         return Err(invalid("redirect target contains control characters"));
     }
-    let lower = location.to_ascii_lowercase();
-    let resolved = if lower.starts_with("http://") || lower.starts_with("https://") {
-        location.to_string()
-    } else if let Some(rest) = location.strip_prefix("//") {
-        format!("{}://{rest}", scheme_of(base)?)
-    } else if location.starts_with('/') {
-        format!("{}://{}{location}", scheme_of(base)?, authority_of(base)?)
-    } else {
-        // A path-relative reference never carries a scheme: a colon in the
-        // first segment (`file:`, `javascript:`, `data:`) is a smuggling
-        // attempt, not a path.
-        let first_segment = location.split(['/', '?', '#']).next().unwrap_or(location);
-        if first_segment.contains(':') {
-            return Err(invalid("redirect target carries a scheme-like segment"));
-        }
-        let (origin, base_path) = split_origin_path(base)?;
-        let path = base_path.split('?').next().unwrap_or(&base_path);
-        let directory = match path.rfind('/') {
-            Some(index) => &path[..=index],
-            None => "/",
-        };
-        format!("{origin}{directory}{location}")
-    };
-    let resolved = normalize_dot_segments(&resolved);
+    let base = faktor_provider::egress::validate_provider_base_url(base)
+        .map_err(|_| invalid("base url is not a fetchable absolute http(s) URL"))?;
+    let resolved = base
+        .join(location)
+        .map_err(|_| invalid("redirect Location does not resolve against the base URL"))?;
+    let resolved = resolved.to_string();
+    if resolved.len() > max_url_bytes {
+        return Err(invalid(format!(
+            "redirect target exceeds {max_url_bytes} bytes"
+        )));
+    }
     validate_fetch_url(&resolved, max_url_bytes)?;
     Ok(resolved)
-}
-
-fn scheme_of(url: &str) -> Result<&str, AcquisitionError> {
-    match url.split_once("://") {
-        Some((scheme, _)) if !scheme.is_empty() => Ok(scheme),
-        _ => Err(invalid("base url has no scheme")),
-    }
-}
-
-fn authority_of(url: &str) -> Result<&str, AcquisitionError> {
-    let (_, rest) = url
-        .split_once("://")
-        .ok_or_else(|| invalid("base url has no scheme"))?;
-    let authority = rest.split('/').next().unwrap_or(rest);
-    if authority.is_empty() {
-        return Err(invalid("base url has no host"));
-    }
-    Ok(authority)
-}
-
-fn split_origin_path(url: &str) -> Result<(String, String), AcquisitionError> {
-    let (scheme, rest) = url
-        .split_once("://")
-        .ok_or_else(|| invalid("base url has no scheme"))?;
-    let (authority, path) = match rest.find('/') {
-        Some(index) => (&rest[..index], &rest[index..]),
-        None => (rest, ""),
-    };
-    if authority.is_empty() {
-        return Err(invalid("base url has no host"));
-    }
-    Ok((format!("{scheme}://{authority}"), path.to_string()))
-}
-
-fn normalize_dot_segments(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_string();
-    };
-    let (authority, path_and_more) = match rest.find('/') {
-        Some(index) => (&rest[..index], &rest[index..]),
-        None => (rest, ""),
-    };
-    if path_and_more.is_empty() {
-        return format!("{scheme}://{authority}/");
-    }
-    let (path, suffix) = match path_and_more.find('?') {
-        Some(index) => (&path_and_more[..index], &path_and_more[index..]),
-        None => (path_and_more, ""),
-    };
-    let mut segments: Vec<&str> = Vec::new();
-    for segment in path.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                segments.pop();
-            }
-            other => segments.push(other),
-        }
-    }
-    let mut rebuilt = format!("{scheme}://{authority}/{}", segments.join("/"));
-    if path.ends_with('/') && !segments.is_empty() {
-        rebuilt.push('/');
-    }
-    rebuilt.push_str(suffix);
-    rebuilt
 }
 
 /// Scan a JSON document for nesting depth *before* parsing. The scan is

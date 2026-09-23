@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::quantity::{NonZeroQuantity, MAX_ORDER_QUANTITY};
-use crate::query::{normalize_query, RequestError, MAX_QUERY_BYTES};
+use crate::query::{canonical_query, RequestError, MAX_QUERY_BYTES};
 use crate::text::Text;
 
 pub use crate::query::MAX_BOM_LINES;
@@ -49,9 +49,12 @@ impl BomItem {
     }
 }
 
-/// The stable key of one BOM line.
+/// The stable key of one BOM line. The query uses the NON-LOSSY
+/// [`canonical_query`] form: punctuation is identity-bearing, so `AB#123`
+/// and `AB123` are different lines (case/whitespace-equivalent spellings
+/// still share one key).
 pub fn item_key(query: &str, quantity: u64) -> String {
-    let normalized = normalize_query(query);
+    let normalized = canonical_query(query);
     let mut hasher = blake3::Hasher::new();
     hasher.update(BOM_ITEM_DOMAIN);
     hasher.update(&(normalized.len() as u64).to_le_bytes());
@@ -167,6 +170,42 @@ mod tests {
         let c = BomItem::new("TPS5430DDAR", 101).expect("line");
         assert_ne!(a.key(), c.key());
         assert_eq!(a.key().len(), 64);
+    }
+
+    #[test]
+    fn item_keys_never_erase_identity_punctuation() {
+        let hashed = BomItem::new("AB#123", 10).expect("line");
+        let plain = BomItem::new("AB123", 10).expect("line");
+        assert_ne!(
+            hashed.key(),
+            plain.key(),
+            "punctuation is identity-bearing: AB#123 and AB123 are different lines"
+        );
+        // The lossy free-text search normalization stays a separate function.
+        assert_eq!(crate::query::normalize_query("AB#123"), "ab123");
+        assert_eq!(crate::query::canonical_query("AB#123"), "ab#123");
+        assert_eq!(crate::query::canonical_query(" AB#123 "), "ab#123");
+    }
+
+    #[test]
+    fn bom_line_keys_are_stable_unique_and_keep_the_digest() {
+        let first = BomItem::new(" DUP ", 10).expect("line");
+        let second = BomItem::new("dup", 10).expect("line");
+        assert_eq!(first.key(), second.key(), "content keys still normalize");
+        assert_eq!(
+            crate::jobs::bom_line_key(0, &first),
+            crate::jobs::bom_line_key(0, &second),
+            "the same content at the same ordinal is the same line"
+        );
+        assert_ne!(
+            crate::jobs::bom_line_key(0, &first),
+            crate::jobs::bom_line_key(1, &first),
+            "two duplicates are two distinct durable lines"
+        );
+        // The BOM digest stays the content digest of the request.
+        let forward = Bom::from_pairs(&[("dup", 10), ("DUP", 10)]).expect("bom");
+        let again = Bom::from_pairs(&[("dup", 10), ("dup", 10)]).expect("bom");
+        assert_eq!(forward.digest(), again.digest());
     }
 
     #[test]

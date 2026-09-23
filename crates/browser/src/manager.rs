@@ -30,7 +30,7 @@ use crate::interception::Interceptor;
 use crate::launch::{
     resolve_executable, ChromiumLauncher, LaunchOptions, LaunchedBrowser, KILL_GRACE_MS,
 };
-use crate::page::{Page, PageHost, PageState, VerificationSignal};
+use crate::page::{Page, PageHost, PageInner, PageState, VerificationSignal};
 use crate::profile::{validate_profile_name, IncognitoProfile, ProfileStore, MAX_ACCOUNT_BYTES};
 
 /// Runtime configuration (mirrors spec §13 `commerce.browser`).
@@ -243,6 +243,8 @@ pub enum BrowserState {
 pub struct BrowserInstance {
     source: String,
     identity: BrowserIdentity,
+    /// The manager map key (includes the incognito discriminator).
+    key: String,
     launched: LaunchedBrowser,
     client: CdpClient,
     broker: BrokerHandle,
@@ -252,11 +254,26 @@ pub struct BrowserInstance {
     incognito: Option<IncognitoProfile>,
     context_id: Option<String>,
     policy: DestinationPolicy,
-    pages: Mutex<HashMap<String, Page>>,
+    /// Live pages as weak handles: an abandoned/cancelled capture whose last
+    /// `Page` handle drops releases its profile slot automatically (see
+    /// `PageInner`'s `Drop`). A dead entry can never occupy a slot.
+    pages: Mutex<HashMap<String, Weak<PageInner>>>,
     stop: Mutex<Option<VerificationSignal>>,
     crashed: AtomicBool,
     last_used_ms: AtomicI64,
     clock: Arc<dyn Clock>,
+}
+
+/// The manager map key for an identity: the incognito flag is part of the
+/// key, so an incognito request can never reuse (or be reused by) a
+/// persistent profile. `PagePurpose::name` is a diagnostic label, not an
+/// isolation boundary.
+fn instance_key(identity: &BrowserIdentity, incognito: bool) -> String {
+    if incognito {
+        format!("{}\u{1}incognito", identity.key())
+    } else {
+        identity.key()
+    }
 }
 
 impl BrowserInstance {
@@ -270,11 +287,21 @@ impl BrowserInstance {
     }
 
     fn pages_snapshot(&self) -> Vec<Page> {
-        self.pages.lock().unwrap().values().cloned().collect()
+        self.pages
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(Page::upgrade)
+            .collect()
     }
 
     fn page_count(&self) -> usize {
-        self.pages.lock().unwrap().len()
+        self.pages
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|weak| weak.strong_count() > 0)
+            .count()
     }
 
     /// Is the supervised child still in the live registry?
@@ -338,7 +365,9 @@ impl PageHost for BrowserInstance {
         // close the targets in the background.
         let pages: Vec<Page> = {
             let mut map = self.pages.lock().unwrap();
-            map.drain().map(|(_, page)| page).collect()
+            map.drain()
+                .filter_map(|(_, weak)| Page::upgrade(&weak))
+                .collect()
         };
         for page in pages {
             tokio::spawn(async move {
@@ -357,6 +386,10 @@ pub struct BrowserManager {
     browsers: Mutex<HashMap<String, Arc<BrowserInstance>>>,
     egress_routes: Mutex<HashMap<String, UpstreamSelector>>,
     create_serial: tokio::sync::Mutex<()>,
+    /// Serializes the page admission check and the target open, so
+    /// concurrent acquisitions for one profile can never overshoot
+    /// `max_pages_per_profile`.
+    page_admission: tokio::sync::Mutex<()>,
     clock: Arc<dyn Clock>,
 }
 
@@ -395,6 +428,7 @@ impl BrowserManager {
             browsers: Mutex::new(HashMap::new()),
             egress_routes: Mutex::new(HashMap::new()),
             create_serial: tokio::sync::Mutex::new(()),
+            page_admission: tokio::sync::Mutex::new(()),
             clock,
         }))
     }
@@ -443,6 +477,10 @@ impl BrowserManager {
         let instance = self
             .instance_for(source, identity, &policy, purpose, deadline, cancel)
             .await?;
+        // Admission and target open are ONE critical section: the check and
+        // the insert must not interleave, or N concurrent acquisitions all
+        // pass the check before any page exists and the bound is exceeded.
+        let _admission = self.page_admission.lock().await;
         if let Err(error) = instance.check_alive(&self.supervisor) {
             self.drop_instance(&instance);
             return Err(error);
@@ -567,7 +605,7 @@ impl BrowserManager {
             .pages
             .lock()
             .unwrap()
-            .insert(target_id, page.clone());
+            .insert(target_id, page.downgrade());
         Ok(page)
     }
 
@@ -584,7 +622,7 @@ impl BrowserManager {
         cancel: &CancellationToken,
     ) -> Result<Arc<BrowserInstance>, BrowserError> {
         let _serial = self.create_serial.lock().await;
-        let key = identity.key();
+        let key = instance_key(identity, purpose.incognito);
         if let Some(instance) = self.browsers.lock().unwrap().get(&key).cloned() {
             if instance.policy != *policy {
                 return Err(BrowserError::invalid_config(
@@ -595,6 +633,15 @@ impl BrowserManager {
             if instance.source != source {
                 return Err(BrowserError::invalid_config(
                     "browser source changed for a live browser identity; retire the browser first",
+                ));
+            }
+            // Belt-and-braces: the key already carries the incognito flag,
+            // so a persistent page can never be handed to an incognito
+            // request (or vice versa).
+            if instance.context_id.is_some() != purpose.incognito {
+                return Err(BrowserError::invalid_config(
+                    "page purpose isolation changed for a live browser identity; retire the \
+                     browser first",
                 ));
             }
             return Ok(instance);
@@ -750,6 +797,7 @@ impl BrowserManager {
         Ok(Arc::new(BrowserInstance {
             source: source.to_string(),
             identity: identity.clone(),
+            key: instance_key(identity, purpose.incognito),
             launched,
             client,
             broker,
@@ -801,10 +849,7 @@ impl BrowserManager {
     }
 
     async fn shutdown_instance(&self, instance: &Arc<BrowserInstance>) {
-        self.browsers
-            .lock()
-            .unwrap()
-            .remove(&instance.identity.key());
+        self.browsers.lock().unwrap().remove(&instance.key);
         let pages = instance.pages_snapshot();
         for page in pages {
             let _ = page.close().await;
@@ -825,10 +870,7 @@ impl BrowserManager {
     }
 
     fn drop_instance(&self, instance: &Arc<BrowserInstance>) {
-        self.browsers
-            .lock()
-            .unwrap()
-            .remove(&instance.identity.key());
+        self.browsers.lock().unwrap().remove(&instance.key);
         let _ = instance.launched.kill(&self.supervisor, KILL_GRACE_MS);
     }
 

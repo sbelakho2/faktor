@@ -540,15 +540,44 @@ pub enum QuoteResolutionError {
 }
 
 /// The terms that price a request, after variant/packaging precedence.
-struct EffectiveTerms<'a> {
-    price_breaks: &'a [PriceBreak],
-    moq: Option<NonZeroQuantity>,
-    order_multiple: Option<NonZeroQuantity>,
-    standard_pack: Option<NonZeroQuantity>,
-    stock: StockState,
+pub(crate) struct EffectiveTerms<'a> {
+    pub(crate) price_breaks: &'a [PriceBreak],
+    pub(crate) moq: Option<NonZeroQuantity>,
+    pub(crate) order_multiple: Option<NonZeroQuantity>,
+    pub(crate) standard_pack: Option<NonZeroQuantity>,
+    pub(crate) stock: StockState,
 }
 
-fn effective_terms<'a>(
+/// The variant/packaging scope a pricing context selects, when the selection
+/// is unambiguous. The same precedence as [`resolve_quote`]: attributes with
+/// exactly one match select that variant, an id selects its variant, and a
+/// requested packaging selects the option when exactly one matches.
+pub(crate) fn selected_scope<'a>(
+    offer: &'a CommercialOffer,
+    ctx: &PricingContext<'_>,
+) -> (Option<&'a VariantOffer>, Option<&'a PackagingOption>) {
+    let variant = match ctx.variant {
+        VariantRequest::None => None,
+        VariantRequest::Id(variant_id) => offer.variant_by_id(variant_id),
+        VariantRequest::Attributes(attributes) => {
+            let matching = offer.variants_matching(attributes);
+            match matching.as_slice() {
+                [only] => Some(*only),
+                _ => None,
+            }
+        }
+    };
+    let packaging = ctx.packaging.and_then(|wanted| {
+        let matching = offer.packaging_options(wanted);
+        match matching.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        }
+    });
+    (variant, packaging)
+}
+
+pub(crate) fn effective_terms<'a>(
     offer: &'a CommercialOffer,
     variant: Option<&'a VariantOffer>,
     packaging: Option<&'a PackagingOption>,

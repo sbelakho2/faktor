@@ -37,9 +37,10 @@ use crate::billing::{
     Subscription, UsageEvent, UsageFold, UsageUnit, CAUSE_CREDITS, CAUSE_FEATURE_MANAGED,
     CAUSE_LEDGER_OVERFLOW, CAUSE_PLAN, CAUSE_SUBSCRIPTION_ACTIVE, FEATURE_MANAGED_PROVIDERS,
     LIMIT_MAX_ACTIVE_TASKS, LIMIT_MAX_CHILDREN_PER_TASK, LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD,
-    LIMIT_MAX_PROVIDER_ATTEMPTS_PER_TASK, LIMIT_MAX_TOKENS_PER_PERIOD, MAX_FOLD_EVENTS,
-    MAX_SOURCE_KEY_BYTES, MAX_USAGE_TEXT, UNIT_CACHE_READ_TOKENS, UNIT_CACHE_WRITE_TOKENS,
-    UNIT_INPUT_TOKENS, UNIT_OUTPUT_TOKENS, UNIT_PROVIDER_COST, UNIT_REASONING_TOKENS,
+    LIMIT_MAX_PROVIDER_ATTEMPTS_PER_TASK, LIMIT_MAX_TOKENS_PER_PERIOD,
+    LIMIT_MIN_CREDIT_BALANCE_MICRO, MAX_FOLD_EVENTS, MAX_SOURCE_KEY_BYTES, MAX_USAGE_TEXT,
+    UNIT_CACHE_READ_TOKENS, UNIT_CACHE_WRITE_TOKENS, UNIT_INPUT_TOKENS, UNIT_OUTPUT_TOKENS,
+    UNIT_PROVIDER_COST, UNIT_REASONING_TOKENS,
 };
 use crate::billing_store::{
     BillingStore, CreditAppend, StoredCreditEntry, StoredUsageEvent, UsageAppend,
@@ -274,7 +275,23 @@ impl EntitlementService {
             return Err(EntitlementExceeded::of(boundary, CAUSE_SUBSCRIPTION_ACTIVE));
         }
         let observed = request.observed;
-        // 3. Per-boundary observed counters against the configured limits.
+        // 3. The configured free-credit floor gates every NEW admission:
+        //    `min_credit_balance_micro` is the operator's required free
+        //    balance. The free balance comes from the checked ledger fold
+        //    (never trusted from the caller); a corrupt ledger fails closed.
+        if let Some(floor) = snapshot.limit(LIMIT_MIN_CREDIT_BALANCE_MICRO) {
+            let free = snapshot
+                .credits
+                .balance_micro()
+                .map_err(|_| EntitlementExceeded::of(boundary, CAUSE_CREDITS))?;
+            if free < floor {
+                return Err(
+                    EntitlementExceeded::of(boundary, LIMIT_MIN_CREDIT_BALANCE_MICRO)
+                        .with_value(floor, free),
+                );
+            }
+        }
+        // 4. Per-boundary observed counters against the configured limits.
         match boundary {
             AdmissionBoundary::NewTask => {
                 if let Some(limit) = snapshot.limit(LIMIT_MAX_ACTIVE_TASKS) {
@@ -359,7 +376,7 @@ impl EntitlementService {
             }
             _ => {}
         }
-        // 4. Token quota (all gated boundaries consume the same period
+        // 5. Token quota (all gated boundaries consume the same period
         //    aggregate).
         if let Some(limit) = snapshot.limit(LIMIT_MAX_TOKENS_PER_PERIOD) {
             if snapshot.total_tokens >= limit {

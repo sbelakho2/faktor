@@ -314,7 +314,10 @@ impl AlibabaConnector {
         url: &str,
         operation: &'static str,
     ) -> Result<Vec<extract::Draft>, SourceError> {
-        let request = HttpRequest::get(url)?;
+        let Some(api) = self.api.as_ref() else {
+            return Err(SourceError::InvalidRequest);
+        };
+        let request = HttpRequest::get(url)?.with_url_credential(&api.app_key);
         let response = http::send(ctx, &self.source, operation, request).await?;
         http::map_status(&response)?;
         let body = response.body();
