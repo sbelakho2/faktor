@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use faktor_core::{CancellationToken, CommandSpec, EnvSpec};
 use faktor_provider::egress::{
-    execute_post_json, BudgetComponent, BudgetedBody, EgressError, HttpTransport, ResponseBudget,
+    execute_post_json, BudgetComponent, EgressError, HttpTransport, ResponseBudget,
 };
 use faktor_terminal::{ProcessOwner, ProcessSupervisor, SpawnConfig};
 use serde::de::DeserializeOwned;
@@ -1036,7 +1036,7 @@ async fn http_post_and_read(
         // Reads go through the shared budget-aware reader — never a direct
         // body read.
         let budget = ResponseBudget::for_timeout(timeout, max_body as u64);
-        let mut body = BudgetedBody::new(response, budget);
+        let mut body = response.into_budgeted(budget);
         let mut bytes: Vec<u8> = Vec::new();
         loop {
             match body.next_chunk().await {

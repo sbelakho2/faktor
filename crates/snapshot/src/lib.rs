@@ -440,9 +440,13 @@ impl CheckpointStore {
                     hash: Some(new_hash),
                 }
             }
-            // The file did not exist before the write: rollback DELETES it.
+            // The file did not exist before the write: rollback DELETES it
+            // through the workspace handle's anchored rooted authority —
+            // never resolve-then-`std::fs::remove_file`, which loses the
+            // authority and follows a parent directory swapped for an
+            // outside symlink.
             FileState { exists: false, .. } => {
-                self.delete_through_workspace(workspace, rel)?;
+                workspace.remove_file(rel)?;
                 RollbackOutcome::Restored {
                     path: row.path.clone(),
                     hash: None,
@@ -455,27 +459,6 @@ impl CheckpointStore {
             .mark_checkpoint_restored(checkpoint_id)
             .map_err(map_store)?;
         Ok(outcome)
-    }
-
-    /// Delete `rel` via the workspace handle's canonical resolution. The
-    /// resolved path is guaranteed inside the workspace root, so a stored
-    /// row path like `../escape` fails here with Permission before any file
-    /// is touched. Deleting an already-missing file is success (the goal
-    /// state is deletion).
-    fn delete_through_workspace(
-        &self,
-        workspace: &WorkspaceHandle,
-        rel: &Path,
-    ) -> Result<(), Error> {
-        let resolved = workspace.resolve(rel)?;
-        match std::fs::remove_file(&resolved) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::new(
-                ErrorKind::Store,
-                format!("delete {}: {e}", resolved.display()),
-            )),
-        }
     }
 
     /// Redo (unrevert): verify the current file state equals the before-state
@@ -506,10 +489,10 @@ impl CheckpointStore {
         }
         let outcome = match after {
             // The edit's after-state is MISSING: unrevert deletes the file
-            // the rollback recreated. No after blob exists — that is the
-            // state, not a pre-v3 row.
+            // the rollback recreated — through the handle's anchored rooted
+            // authority (P1-C), never resolve-then-unlink.
             FileState { exists: false, .. } => {
-                self.delete_through_workspace(workspace, rel)?;
+                workspace.remove_file(rel)?;
                 RollbackOutcome::Restored {
                     path: row.path.clone(),
                     hash: None,
@@ -1031,6 +1014,142 @@ mod tests {
             other => panic!("expected Conflict, got {other:?}"),
         }
         assert_eq!(fs::read(h.root().join("f.txt")).unwrap(), b"user took over");
+    }
+
+    /// P1-C: rollback's delete branch goes through the handle's anchored
+    /// rooted authority. A parent directory swapped for an outside symlink
+    /// holding a same-named file must never be unlinked outside (the old
+    /// `workspace.resolve(rel)?` + `std::fs::remove_file(resolved)` flow
+    /// deleted exactly that outside file).
+    #[cfg(unix)]
+    #[test]
+    fn rollback_delete_refuses_a_parent_swapped_to_an_outside_symlink() {
+        let (_d, cps, h, id, session) = fixture();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("f"), b"outside-marker").unwrap();
+        fs::create_dir_all(h.root().join("d")).unwrap();
+        fs::write(h.root().join("d/f"), b"edited").unwrap();
+        // before missing -> after existing: rollback's job is the DELETE.
+        let after = CheckpointStore::hash_of(b"edited");
+        let cid = cps
+            .record_change(
+                session,
+                "d/f",
+                FileState::missing(),
+                None,
+                FileState::existing(after),
+                Some(b"edited"),
+            )
+            .unwrap();
+        // The attack: the parent is swapped for an escape symlink whose
+        // target holds a same-named file.
+        fs::remove_dir_all(h.root().join("d")).unwrap();
+        symlink(outside.path(), h.root().join("d")).unwrap();
+        let err = cps.rollback(&h, &id, session, cid).unwrap_err();
+        assert_eq!(
+            err.kind,
+            ErrorKind::Permission,
+            "a swapped parent must be refused: {err:?}"
+        );
+        assert_eq!(
+            fs::read(outside.path().join("f")).unwrap(),
+            b"outside-marker",
+            "the outside file must never be deleted"
+        );
+
+        // The same attack against redo's delete branch (before existing ->
+        // after missing): redo must delete through the handle, never the
+        // outside file.
+        fs::create_dir_all(h.root().join("e")).unwrap();
+        fs::write(h.root().join("e/f"), b"original").unwrap();
+        let before = cps.before_write(session, "e/f", b"original").unwrap();
+        let cid2 = cps
+            .record_change(
+                session,
+                "e/f",
+                FileState::existing(before),
+                None,
+                FileState::missing(),
+                None,
+            )
+            .unwrap();
+        fs::remove_dir_all(h.root().join("e")).unwrap();
+        symlink(outside.path(), h.root().join("e")).unwrap();
+        let err = cps.redo(&h, &id, session, cid2).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert_eq!(
+            fs::read(outside.path().join("f")).unwrap(),
+            b"outside-marker",
+            "redo must never delete outside the workspace"
+        );
+    }
+
+    /// P1-C: the in-workspace delete branches of rollback (before missing)
+    /// and redo (after missing) still delete exactly the workspace file —
+    /// and a repeated delete is idempotent.
+    #[test]
+    fn rollback_and_redo_delete_in_workspace_files() {
+        let (_d, cps, h, id, session) = fixture();
+        fs::create_dir_all(h.root().join("d")).unwrap();
+
+        // rollback: before missing -> after existing deletes the file.
+        fs::write(h.root().join("d/gone.txt"), b"edited").unwrap();
+        let after = CheckpointStore::hash_of(b"edited");
+        let cid = cps
+            .record_change(
+                session,
+                "d/gone.txt",
+                FileState::missing(),
+                None,
+                FileState::existing(after),
+                Some(b"edited"),
+            )
+            .unwrap();
+        let outcome = cps.rollback(&h, &id, session, cid).unwrap();
+        match outcome {
+            RollbackOutcome::Restored { path, hash } => {
+                assert_eq!(path, "d/gone.txt");
+                assert_eq!(hash, None, "a deleted file restores to no content");
+            }
+            other => panic!("expected Restored, got {other:?}"),
+        }
+        assert!(!h.root().join("d/gone.txt").exists());
+
+        // redo: before existing -> after missing deletes the file.
+        fs::write(h.root().join("d/undo.txt"), b"original").unwrap();
+        let before = cps
+            .before_write(session, "d/undo.txt", b"original")
+            .unwrap();
+        let cid2 = cps
+            .record_change(
+                session,
+                "d/undo.txt",
+                FileState::existing(before),
+                None,
+                FileState::missing(),
+                None,
+            )
+            .unwrap();
+        let outcome = cps.redo(&h, &id, session, cid2).unwrap();
+        match outcome {
+            RollbackOutcome::Restored { path, hash } => {
+                assert_eq!(path, "d/undo.txt");
+                assert_eq!(hash, None);
+            }
+            other => panic!("expected Restored, got {other:?}"),
+        }
+        assert!(!h.root().join("d/undo.txt").exists());
+        // Redo cleared the restored marker (the row must not read restored).
+        let row = cps
+            .checkpoints(session)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == cid2)
+            .unwrap();
+        assert!(
+            row.restored_ms.is_none(),
+            "redo must clear the restored marker"
+        );
     }
 
     #[test]

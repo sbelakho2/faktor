@@ -32,8 +32,11 @@ pub(crate) use unix::{clear_walk_seam, install_walk_seam};
 mod windows;
 #[cfg(windows)]
 pub(crate) use windows::{
-    canonicalize_within, lexical_check, open_no_follow_walk, opened_is_path, read_reparse_link,
-    windows_list_dir_raw, windows_open_child_dir, windows_reparse_class, RawDirEntry, ReparseClass,
+    anchored_create_dir, anchored_create_file, anchored_delete_entry, anchored_open_entry,
+    anchored_rename, canonicalize_within, entry_meta, lexical_check, open_no_follow_walk,
+    open_root_anchor, opened_is_path, read_reparse_link, validated_relative_units,
+    windows_list_dir_raw, windows_open_child_dir, windows_open_child_dir_anchored,
+    windows_reparse_class, AnchoredCreateOutcome, AnchoredEntry, RawDirEntry, ReparseClass,
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
 };
 

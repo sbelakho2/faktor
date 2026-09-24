@@ -1,6 +1,6 @@
 //! Static source-authority certification (audit 31/107-109).
 //!
-//! Ten structural invariants are locked by scanning the repository's
+//! Twelve structural invariants are locked by scanning the repository's
 //! *production* Rust sources (`crates/*/src`, test modules and out-of-line
 //! `#[cfg(test)] mod` bodies excluded):
 //!
@@ -79,10 +79,21 @@
 //! 11. **Budgeted response-body reads** — every production egress consumer
 //!     (`crates/provider` streaming, the wire adapters, SCM, cloud OIDC,
 //!     updater, semantic, commerce connectors) must read response bodies
-//!     through the budget-aware helpers (`ResponseBudget` / `BudgetedBody`).
-//!     A direct `.bytes()`/`.text()`/`.chunk()`/`bytes_stream()` read is a
-//!     red test: unbounded reads are exactly the hang/RAM surface the
-//!     response budget exists to close.
+//!     through the budget-aware helpers (`CheckedResponse` /
+//!     `ResponseBudget` / `BudgetedBody`), never through a raw
+//!     `reqwest::Response`. A direct `.json()` read, `.bytes()`/`.text()`/
+//!     `.chunk(`/`bytes_stream()` read, a `.body_mut()` grab,
+//!     `.copy_to(`/`.copy_to_bytes(`/`read_to_end(` stream copy, or the
+//!     un-budgeted `resp.json().await` shape is a red test: unbounded reads
+//!     are exactly the hang/RAM surface the response budget exists to
+//!     close.
+//! 12. **No resolve-then-std::fs workspace mutation** — a production
+//!     `.resolve(…)` binding that is then passed to a `std::fs`/`fs`
+//!     mutation call is refused: resolution is a point-in-time check, so a
+//!     parent directory swapped for an outside symlink afterwards redirects
+//!     the mutation outside the workspace. Deletions go through
+//!     `WorkspaceHandle::remove_file` (anchored, no-follow), content writes
+//!     through `write_atomic`/`crate::atomic`.
 //!
 //! Scanning methodology: per file, comments and string literals are masked
 //! out and every `#[cfg(...)]`-gated item that can never compile in a
@@ -1444,6 +1455,234 @@ mod scans {
     }
 
     // ------------------------------------------------------------------
+    // scan 3b: no resolve-then-std::fs mutation of workspace paths (P1-C)
+    // ------------------------------------------------------------------
+
+    /// P1-C: production code must NEVER resolve a workspace-relative path
+    /// with `WorkspaceHandle::resolve` (or any `.resolve(`) and then mutate
+    /// that resolved PATH STRING with `std::fs`/`fs`. Resolution is a
+    /// point-in-time check: between it and the mutation syscall a parent
+    /// directory can be swapped for an outside symlink, so the mutation
+    /// follows the swap and touches an external file. Workspace mutations
+    /// go through the anchored handle (`WorkspaceHandle::remove_file`,
+    /// `write_atomic`, `RootedDir::*`), which walks from the fd opened at
+    /// open time and refuses links.
+    ///
+    /// Detection shape: either (a) a mutation call whose own argument
+    /// expression contains `.resolve(` (`std::fs::remove_file(ws.resolve(rel)?)`),
+    /// or (b) a `let <name> = … .resolve(…)` binding whose `<name>` appears
+    /// as an argument of a mutation call within the next 700 bytes
+    /// (`let resolved = ws.resolve(rel)?; std::fs::remove_file(&resolved)`).
+    /// A resolve used only for a capability gate/read (`sandbox_gate`,
+    /// `metadata`) is not a mutation and does not fire.
+    const FS_MUTATION_MARKERS: &[&str] = &[
+        "std::fs::remove_file",
+        "std::fs::remove_dir_all",
+        "std::fs::remove_dir",
+        "std::fs::write",
+        "std::fs::rename",
+        "std::fs::copy",
+        "std::fs::create_dir_all",
+        "std::fs::create_dir",
+        "std::fs::hard_link",
+        "std::fs::symlink",
+        "std::fs::set_permissions",
+        "std::fs::File::create",
+        "fs::remove_file",
+        "fs::remove_dir_all",
+        "fs::remove_dir",
+        "fs::write",
+        "fs::rename",
+        "fs::copy",
+        "fs::create_dir_all",
+        "fs::create_dir",
+        "fs::hard_link",
+        "fs::symlink",
+        "fs::set_permissions",
+    ];
+
+    /// The identifier bound by the nearest preceding `let <name> = …`
+    /// statement (bounded window; `None` when the resolve is not bound).
+    fn let_binding_before(src: &str, at: usize) -> Option<String> {
+        let start = at.saturating_sub(240);
+        let window = &src[start..at];
+        let boundary = window.rfind([';', '{', '}']).map(|i| i + 1).unwrap_or(0);
+        let stmt = &window[boundary..];
+        let let_at = stmt.find("let ")?;
+        let name: String = stmt[let_at + 4..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// The argument text of the call whose marker ends at `from` (first `(`
+    /// to its matching `)`), bounded; empty when no call parens follow.
+    fn call_args_after(src: &str, from: usize) -> String {
+        let b = src.as_bytes();
+        let end = (from + 512).min(src.len());
+        let mut i = from;
+        while i < end && b[i] != b'(' {
+            if b[i] == b';' || b[i] == b'}' {
+                return String::new();
+            }
+            i += 1;
+        }
+        if i >= end {
+            return String::new();
+        }
+        let start = i + 1;
+        let mut depth = 1i32;
+        let mut j = start;
+        while j < src.len() {
+            match b[j] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return src[start..j].to_string();
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        String::new()
+    }
+
+    fn resolve_then_fs_mutation_offenders(f: &File<'_>) -> Vec<String> {
+        let mut hits: Vec<(usize, String)> = Vec::new();
+        // (a) nested: the mutation call's own argument resolves the path.
+        for marker in FS_MUTATION_MARKERS {
+            for at in find_marker_offsets(f, marker) {
+                let args = call_args_after(f.src, at + marker.len());
+                if args.contains(".resolve(") {
+                    hits.push((line_of(f.src, at), trim_line(f.src, at)));
+                }
+            }
+        }
+        // (b) bound: `let resolved = ….resolve(rel)?; … fs::<mutation>(&resolved)`.
+        for at in find_marker_offsets(f, ".resolve(") {
+            let Some(binding) = let_binding_before(f.src, at) else {
+                continue;
+            };
+            let window_end = (at + 700).min(f.src.len());
+            for marker in FS_MUTATION_MARKERS {
+                let mut pos = at;
+                while let Some(rel) = f.src[pos..window_end].find(marker) {
+                    let mat = pos + rel;
+                    if f.code[mat..mat + marker.len()].iter().all(|c| *c) {
+                        let args = call_args_after(f.src, mat + marker.len());
+                        let uses_binding = args
+                            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                            .any(|w| w == binding);
+                        if uses_binding {
+                            hits.push((line_of(f.src, mat), trim_line(f.src, mat)));
+                        }
+                    }
+                    pos = mat + marker.len();
+                }
+            }
+        }
+        hits.sort_unstable();
+        hits.dedup();
+        hits.into_iter()
+            .map(|(line, text)| format!("{}:{line}: {text}", f.rel))
+            .collect()
+    }
+
+    /// P1-C static rule: production code must not resolve a workspace path
+    /// and then mutate it by path. The only sanctioned route for a workspace
+    /// file deletion is `WorkspaceHandle::remove_file` (anchored, no-follow);
+    /// content writes stay on `write_atomic`/`crate::atomic`.
+    #[test]
+    fn no_resolve_then_std_fs_mutation_of_workspace_paths() {
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for rel in walk_crate_sources() {
+            if is_test_file(&rel) {
+                continue;
+            }
+            let Some(f) = load(&rel) else {
+                continue;
+            };
+            offenders.extend(resolve_then_fs_mutation_offenders(&f));
+            scanned += 1;
+        }
+        assert_no_offenders(
+            "resolve-then-mutate scan: production code resolves a workspace path and \
+             then mutates it with std::fs (use WorkspaceHandle::remove_file / write_atomic; \
+             the resolved path loses authority and can be raced by a symlink swap)",
+            &offenders,
+            scanned,
+            100,
+        );
+    }
+
+    /// Negative proofs: the planted two-step and the nested direct form
+    /// MUST fire; a gate-only resolve, a read after resolve, and a
+    /// test-gated pattern must not.
+    #[test]
+    fn resolve_then_mutation_scan_fires_on_the_planted_two_step() {
+        let planted = "fn del(ws: &WorkspaceHandle, rel: &Path) -> Result<(), Error> {\n    \
+                       let resolved = ws.resolve(rel)?;\n    \
+                       std::fs::remove_file(&resolved).map_err(|e| Error::internal(format!(\"{e}\")))?;\n    \
+                       Ok(())\n}\n";
+        let f = synthetic_file("crates/snapshot/src/lib.rs", planted);
+        let offenders = resolve_then_fs_mutation_offenders(&f);
+        assert_eq!(
+            offenders.len(),
+            1,
+            "exactly the planted line fires: {offenders:?}"
+        );
+        assert!(
+            offenders[0].contains("std::fs::remove_file") && offenders[0].contains("resolved"),
+            "{offenders:?}"
+        );
+
+        let nested = "fn del(ws: &WorkspaceHandle, rel: &Path) -> std::io::Result<()> {\n    \
+                      std::fs::remove_file(ws.resolve(rel)?)\n}\n";
+        let f = synthetic_file("crates/agent/src/runtime.rs", nested);
+        assert!(
+            !resolve_then_fs_mutation_offenders(&f).is_empty(),
+            "the nested direct form must fire"
+        );
+
+        // A resolve used only for a capability gate (and a handle write) is
+        // the sanctioned shape.
+        let gate_only = "fn gate(ws: &WorkspaceHandle, rel: &Path) -> Result<(), Error> {\n    \
+                         let resolved = ws.resolve(rel)?;\n    \
+                         sandbox_gate(&resolved.clone(), \"write_file\")?;\n    \
+                         ws.write_atomic(rel, b\"x\")?;\n    Ok(())\n}\n";
+        let f = synthetic_file("crates/cli/src/tools.rs", gate_only);
+        assert!(
+            resolve_then_fs_mutation_offenders(&f).is_empty(),
+            "a gate-only resolve is not a mutation"
+        );
+
+        // A read after resolve (`metadata`) is not a mutation.
+        let read_only = "fn stat(ws: &WorkspaceHandle, rel: &Path) -> std::io::Result<()> {\n    \
+                         let resolved = ws.resolve(rel)?;\n    \
+                         let _ = std::fs::metadata(&resolved)?;\n    Ok(())\n}\n";
+        let f = synthetic_file("crates/fs/src/lib.rs", read_only);
+        assert!(
+            resolve_then_fs_mutation_offenders(&f).is_empty(),
+            "metadata is a read, not a mutation"
+        );
+
+        // A test-gated pattern is not production text.
+        let test_gated = "fn ok() {}\n#[cfg(test)]\nmod tests {\n    \
+                          fn t(ws: &WorkspaceHandle, rel: &Path) {\n        \
+                          let resolved = ws.resolve(rel).unwrap();\n        \
+                          std::fs::remove_file(&resolved).unwrap();\n    }\n}\n";
+        let f = synthetic_file("crates/snapshot/src/lib.rs", test_gated);
+        assert!(
+            resolve_then_fs_mutation_offenders(&f).is_empty(),
+            "#[cfg(test)] bodies are excluded like every production scan"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // scan 4: daemon-authority constructor sites (documented, exact counts)
     // ------------------------------------------------------------------
 
@@ -1750,6 +1989,15 @@ mod scans {
                     }
                     stack.push(entry.path());
                 } else if file_type.is_file() {
+                    // OS core dumps are crash artifacts, never source: a
+                    // crashed process can leave retired tokens in heap bytes
+                    // (e.g. environment/paths), so they must not fail the
+                    // branding scan. They are git-ignored and deleted by
+                    // hygiene tooling; skipping here keeps the scan about
+                    // delivered source only.
+                    if name == "core" || name.starts_with("core.") {
+                        continue;
+                    }
                     let rel = entry
                         .path()
                         .strip_prefix(&root)
@@ -4779,9 +5027,11 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
 
     /// Every production crate whose code consumes a response body from the
     /// `HttpTransport` seam / the checked client. A body read here MUST go
-    /// through the budget-aware helpers (`ResponseBudget` +
-    /// `BudgetedBody::next_chunk`/`read_all`/`into_stream`, or `execute_raw`
-    /// with a budget), never a direct read method.
+    /// through the budget-aware helpers (`CheckedResponse` +
+    /// `ResponseBudget` + `BudgetedBody::next_chunk`/`read_all`/
+    /// `stream_frames`, the `read_json_bounded` helper, or `execute_raw`
+    /// with a budget), never a direct read method and never a raw
+    /// `reqwest::Response`.
     const EGRESS_CONSUMER_ROOTS: &[&str] = &[
         "crates/provider/src/",
         "crates/openai/src/",
@@ -4809,24 +5059,43 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
     }
 
     /// Offenders of one production consumer file: a direct response-body
-    /// read. `.bytes_stream(` and `.chunk()` are unambiguous. `.bytes()` and
-    /// `.text()` are flagged only when AWAITED: a response body read always
-    /// awaits, while synchronous accessors (`payload.text()` on a browser
-    /// capture, `str::bytes()` iteration) never do. The `.await` window
-    /// tolerates rustfmt splitting the call and the await across lines.
+    /// read or raw body consumption. `.bytes_stream(`, `.copy_to(`,
+    /// `.copy_to_bytes(`, `.body_mut(` and `read_to_end(` are unambiguous
+    /// (they can only act on a body stream/reader). `.chunk(`, `.json()`
+    /// and `.json::<` are the raw reqwest body-read shapes the audit
+    /// caught (`resp.json().await` bypassed every budget); the
+    /// request-builder spelling `.json(&value)` deliberately does NOT match
+    /// (`.json()`/`.json::<` require the body-read call parens). `.bytes()`
+    /// and `.text()` are flagged only when AWAITED: a response body read
+    /// always awaits, while synchronous accessors (`payload.text()` on a
+    /// browser capture, `str::bytes()` iteration) never do. The `.await`
+    /// window tolerates rustfmt splitting the call and the await across
+    /// lines.
     fn direct_body_read_offenders(f: &File<'_>) -> Vec<String> {
         let mut offenders = Vec::new();
-        for (line, text) in find_markers(f, &[".bytes_stream("]) {
-            offenders.push(format!(
-                "{}:{line}: {text}  [unbounded stream collection; use BudgetedBody]",
-                f.rel
-            ));
+        for marker in [
+            ".bytes_stream(",
+            ".copy_to(",
+            ".copy_to_bytes(",
+            ".body_mut(",
+            "read_to_end(",
+        ] {
+            for (line, text) in find_markers(f, &[marker]) {
+                offenders.push(format!(
+                    "{}:{line}: {text}  [raw body consumption; use \
+                     CheckedResponse/BudgetedBody under a ResponseBudget]",
+                    f.rel
+                ));
+            }
         }
-        for (line, text) in find_markers(f, &[".chunk()"]) {
-            offenders.push(format!(
-                "{}:{line}: {text}  [direct body read; use BudgetedBody::next_chunk]",
-                f.rel
-            ));
+        for marker in [".chunk(", ".json()", ".json::<"] {
+            for (line, text) in find_markers(f, &[marker]) {
+                offenders.push(format!(
+                    "{}:{line}: {text}  [direct body read; use \
+                     BudgetedBody::read_all / read_json_bounded]",
+                    f.rel
+                ));
+            }
         }
         for marker in [".bytes()", ".text()"] {
             for at in find_marker_offsets(f, marker) {
@@ -4855,6 +5124,9 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             "pub struct ResponseBudget",
             "pub struct BudgetedBody",
             "pub enum BudgetComponent",
+            "pub struct CheckedResponse",
+            "pub struct ResponseHead",
+            "pub async fn read_json_bounded",
         ] {
             assert!(
                 authority.contains(marker),
@@ -4876,8 +5148,10 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         }
         assert_no_offenders(
             "egress body-read scan: production consumers must read response bodies \
-             through the budget-aware helpers (ResponseBudget/BudgetedBody); direct \
-             .bytes()/.text()/.chunk()/bytes_stream() reads are unbounded",
+             through the budget-aware helpers (CheckedResponse/ResponseBudget/\
+             BudgetedBody/read_json_bounded); direct .json()/.bytes()/.text()/\
+             .chunk(/.bytes_stream()/.body_mut()/.copy_to(/.copy_to_bytes(/\
+             read_to_end( body consumption is unbounded",
             &offenders,
             scanned,
             30,
@@ -4886,7 +5160,9 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
 
     /// Planted-fixture proof: a direct unbounded read FAILS the scan (the
     /// regression it exists for), while the budget-aware shapes — and a
-    /// non-await `.bytes()` iterator over a `&str` — pass.
+    /// non-await `.bytes()` iterator over a `&str` — pass. Every marker
+    /// family has its own planted violation, including the audit's
+    /// `resp.json().await` bypass and the `.json::<T>()` typed spelling.
     #[test]
     fn budgeted_body_read_scan_fires_on_planted_unbounded_reads() {
         for src in [
@@ -4894,6 +5170,12 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             "async fn f(r: reqwest::Response) -> String { r.text().await.unwrap() }\n",
             "fn f(r: reqwest::Response) { let _ = r.bytes_stream(); }\n",
             "async fn f(r: reqwest::Response) { let _ = r.chunk().await; }\n",
+            "async fn f(r: reqwest::Response) -> serde_json::Value { r.json().await.unwrap() }\n",
+            "async fn f(r: reqwest::Response) -> serde_json::Value { r.json::<serde_json::Value>().await.unwrap() }\n",
+            "async fn f(mut r: reqwest::Response, w: &mut Vec<u8>) { let _ = r.copy_to(w).await; }\n",
+            "fn f(r: reqwest::Response) { let _ = r.copy_to_bytes(16); }\n",
+            "fn f(r: &mut reqwest::Response) { let _ = r.body_mut(); }\n",
+            "async fn f(mut r: reqwest::Response) { let mut b = Vec::new(); let _ = r.read_to_end(&mut b).await; }\n",
             // rustfmt may split the call and the await across lines: the
             // window must still catch both.
             "async fn f(r: reqwest::Response) -> Vec<u8> {\n    r.bytes()\n        .await\n        .unwrap()\n}\n",
@@ -4910,6 +5192,14 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             "async fn f(r: reqwest::Response, b: ResponseBudget) -> Vec<u8> { BudgetedBody::new(r, b).read_all().await.unwrap() }\n",
             "fn f(r: reqwest::Response, b: ResponseBudget) { let _ = BudgetedBody::new(r, b).into_stream(); }\n",
             "fn f(v: &str) -> bool { v.bytes().all(|b| b.is_ascii_graphic()) }\n",
+            // The checked-response APIs are the compliant shapes.
+            "async fn f(r: CheckedResponse, b: ResponseBudget) -> Vec<u8> { r.read_bytes(&b).await.unwrap() }\n",
+            "async fn f(r: CheckedResponse, b: ResponseBudget) -> serde_json::Value { r.read_json(&b).await.unwrap() }\n",
+            "async fn f(r: CheckedResponse, b: ResponseBudget) -> serde_json::Value { read_json_bounded(r, &b).await.unwrap() }\n",
+            "fn f(r: CheckedResponse, b: ResponseBudget) { let _ = r.stream_frames(&b); }\n",
+            "fn f(r: CheckedResponse, b: ResponseBudget) { let _ = r.into_budgeted(b); }\n",
+            // A REQUEST-BUILDER `.json(&value)` is not a body read.
+            "fn f(rb: RequestBuilder, v: &serde_json::Value) -> RequestBuilder { rb.json(v) }\n",
         ] {
             let f = synthetic_file("crates/scm/src/good.rs", src);
             assert!(

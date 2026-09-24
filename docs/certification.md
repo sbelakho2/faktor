@@ -26,7 +26,7 @@ an LLM: everything below is deterministic and offline.
 | `bash scripts/package-artifacts.sh` | packaging (part of `full`) | Builds the release daemon bundle (`tar.gz`), the VS Code VSIX (via the lockfile-pinned `npx --no-install vsce`) and copies the JetBrains plugin zip when present; writes `target/certification/artifacts.json` with `{name, path, sha256, size, commit, status, detail}` per artifact, recording exact errors and retry commands for anything not produced. |
 | `node scripts/install-matrix.mjs` | matrix (part of `full`) | Installs/verifies every built artifact on this host into clean temp prefixes: daemon extraction + `faktor-cli doctor --data-dir <tmp>`, VSIX zip/manifest structure, JetBrains `plugin.xml` id/version; writes `target/certification/install-matrix.json`. Non-zero on any verification failure. |
 | `TAMPER=1 node scripts/install-matrix.mjs` | matrix self-test | Copies a built artifact, flips one byte, and requires the verifier to reject the copy (sha256 mismatch); exits 0 only on rejection. Evidence: `target/certification/install-matrix-tamper.json`. |
-| `bash scripts/certify.sh` | legacy wrapper | The older 8-gate release wrapper; `certify-local.sh full` supersedes it with the manifest. Kept for compatibility. |
+| `bash scripts/certify.sh` | legacy wrapper | The 8-gate release wrapper plus the exact-SHA Woodpecker gate: immutable context registry, observed-fact verification, fetched signed trusted-build attestation, `faktor-release-certification/v2` manifest (§2.12). `certify-local.sh full` supersedes it for the local/offline manifest; kept for the release run. |
 
 ### Certification levels
 
@@ -519,52 +519,120 @@ server-side settings and UI steps, and what a PR diff cannot change.
 ### 2.12 Exact-SHA CI certification (`scripts/certify.sh`)
 
 Local green gates are necessary but never sufficient. The release gate for
-an exact commit is the required Woodpecker context `ci/woodpecker/pr/pr`
-(the untrusted PR workflow's status; the context string is fixed by
-`WOODPECKER_STATUS_CONTEXT_FORMAT`, see `docs/ci-enforcement.md` §2 and
-`scripts/woodpecker/setup.md` §7).
+an exact commit is a Woodpecker context from the **immutable context
+registry** baked into `scripts/certify.sh`; `--context` /
+`CERTIFY_CI_CONTEXT` can only SELECT an entry and anything else exits 2 with
+the registry listed:
 
-`bash scripts/certify.sh [--commit <40-hex-sha>]` runs the local cargo gates
-and then verifies CI over the Woodpecker API for the exact shipped commit:
+| Context | Event | Workflow | Class | Project config file |
+| --- | --- | --- | --- | --- |
+| `ci/woodpecker/pr/pr` (default) | `pull_request` | `pr` | untrusted | `.woodpecker/untrusted/` |
+| `ci/woodpecker/push/trusted` | `push` | `trusted` | trusted | `.woodpecker/trusted/` |
+| `ci/woodpecker/tag/trusted` | `tag` | `trusted` | trusted | `.woodpecker/trusted/` |
 
-1. `GET /api/repos/lookup/{owner}/{repo}` resolves the repository id
-   (`--repo owner/name` / `WOODPECKER_REPO`, or `WOODPECKER_REPO_ID`).
-2. `GET /api/repos/{id}/pipelines?event=pull_request&per_page=50` is filtered
-   to the exact commit SHA; `--pipeline <number>` may select one explicitly
-   (it must still belong to the same SHA).
-3. `GET /api/repos/{id}/pipelines/{number}` must contain the `pr` workflow
-   with state `success` (pipeline status must agree).
+`bash scripts/certify.sh [--commit <40-hex-sha>] [--context <registry>]`
+runs the local cargo gates and then verifies CI over the Woodpecker API for
+the exact shipped commit. The verifier does not trust the requested context
+or any caller-supplied literal; it **observes** and then checks:
 
-It fails on `context-absent` (no pipeline for the SHA, or pipelines that
-belong to another SHA), `context-pending` (`pending/running/blocked/...`),
-`context-failure` (`failure/killed/canceled/declined/skipped`),
-`context-error` (`error`) and `context-unknown`. Without
+1. the repository: `GET /api/repos/lookup/{owner}/{repo}` (with
+   `?project=trusted` for a trusted context; `--repo` / `WOODPECKER_REPO`,
+   or `WOODPECKER_UNTRUSTED_REPO_ID` / `WOODPECKER_TRUSTED_REPO_ID` /
+   `WOODPECKER_REPO_ID`) and `GET /api/repos/{id}` — observed full name,
+   `config_file` (must equal the registry path) and `trusted.volumes` (must
+   equal the registry class: `false` untrusted, `true` trusted);
+2. the exact 40-hex SHA: `GET /api/repos/{id}/pipelines?event=<registry
+   event>&per_page=50` filtered to the exact commit, then the pipeline
+   detail's own `commit` must equal it; `--pipeline <number>` selects one
+   explicitly and is checked the same way;
+3. the actual event: the detail's `event` must equal the registry event
+   (a pipeline of another event never satisfies the context);
+4. the actual workflow: `GET /api/repos/{id}/pipelines/{number}` must carry
+   the registry workflow name with state `success`, and the pipeline status
+   must agree;
+5. the pipeline id/number: detail `number` must equal the selected pipeline,
+   detail `id` must match the listed id, and the observed values are what
+   the certificate records;
+6. the trusted class: the observed `trusted.volumes`/`config_file` facts
+   above (a `pr/pr` pipeline can never certify as a trusted run and vice
+   versa).
+
+It fails on `context-absent` (no pipeline for the SHA, no workflow of that
+name, or pipelines that belong to another SHA/event), `context-pending`
+(`pending/running/blocked/...`), `context-failure`
+(`failure/killed/canceled/declined/skipped`), `context-error` (`error`),
+`context-unknown`, and on any observed-value mismatch
+(`repository-mismatch`, `config-file-mismatch`, `trusted-class-mismatch`,
+`trusted-class-unknown`, `sha-mismatch`, `observed-event-mismatch`,
+`pipeline-id-mismatch`, `pipeline-number-mismatch`). Without
 `WOODPECKER_HOST`/`WOODPECKER_TOKEN` it exits 2 with explicit operator
-instructions — never a silent pass. `--local-only` runs the cargo gates and
-prints that the result is **not** a release certificate.
+instructions — never a silent pass.
+
+**Trusted-build attestation (P1-J).** The trusted workflow's `attestation`
+step (after `certificate`) publishes a signed
+`faktor-build-attestation/v1` object into its step log as a base64 marker
+block: `{source_sha, tree_sha, workflow, event, pipeline_id,
+pipeline_number, build_environment_digest (the CI image digest),
+rust_toolchain, repository_tree_verified, artifacts{name: sha256}}`, signed
+with an ed25519 key from the trusted project's allowlist (Sigstore bundles
+are the documented upgrade path; without a key the object is emitted
+UNSIGNED and loudly marked). `scripts/certify.sh` fetches the block
+belonging to the exact trusted pipeline, verifies the signature against
+`FAKTOR_ATTEST_KEYS` / `--attestation-keys`, verifies source SHA, tree,
+workflow, event and pipeline number/id, and re-hashes **every
+local/shipped artifact** against the attested digests. Any mismatch
+(`attestation-invalid`), a missing attestation on a trusted context
+(`attestation-absent`), or a missing allowlist when a signed attestation
+exists (`attestation-keys-missing`) fails the run. Distributing the
+CI-built artifacts covered by the attestation, rather than locally rebuilt
+ones, is the preferred release model: the attestation is the binding
+between the certified run and the shipped bytes.
 
 Pass and fail both write `target/certification/release-manifest.json`
-(`faktor-release-certification/v1`): repository, exact commit, exact tree
-(`git rev-parse '<sha>^{tree}'`), context, pipeline number/status, `pr`
-workflow state, run URL (`<host>/repos/<id>/pipeline/<number>`), the sha256
-of every packaged artifact (`--artifact PATH`, or auto-discovered
+(`faktor-release-certification/v2`, written for pass and fail alike):
+repository identity/id, exact commit and tree (`git rev-parse
+'<sha>^{tree}'`), the context registry entry, every OBSERVED fact
+(event/workflow/state/pipeline id+number/repository/config file/trusted
+class), the run URL (`<host>/repos/<id>/pipeline/<number>`), the sha256 of
+every packaged artifact (`--artifact PATH`, or auto-discovered
 `.vsix`/plugin-zip/`target/release/faktor-cli`) with an `artifact_digest`,
-and an `evidence_digest` = sha256 of the canonical JSON of the verification
-core (context, commit, tree, run, statuses, artifacts). Rejection codes are
-recorded in `problems[]`.
+the attestation evidence block (status, origin context, pipeline, step pid,
+signature identity, fetched-bytes digest, matched/attested artifact counts),
+`release_certificate`, and an `evidence_digest` = sha256 of the canonical
+JSON of the verification core (context, observed facts, commit, tree, run,
+statuses, artifacts, attestation). Rejection codes are recorded in
+`problems[]`, non-fatal observations in `notes[]`.
+
+**Certificate class (P1-K).** `--verify-ci-evidence` (the renamed
+`--ci-only`; the old flag is rejected) verifies the embedded CI run but
+always terminates with `CI EVIDENCE: PASS — NOT A RELEASE CERTIFICATE`
+(or `CI EVIDENCE: FAIL` / `INCOMPLETE`). `--local-only` likewise prints
+`LOCAL PRE-FLIGHT: ... — NOT A RELEASE CERTIFICATE`. A release certificate
+(`RELEASE CERTIFICATE: PASS`) is emitted ONLY when the full local gates
+pass AND a trusted context verified OR a signed attestation verified at the
+same exact commit/tree; otherwise a passing run prints `CERTIFICATION:
+PASS — NOT A RELEASE CERTIFICATE` and the manifest records
+`release_certificate: false`. No flag weakens checks while preserving the
+certificate class.
 
 `bash scripts/certify.sh --selftest` proves the whole matrix hermetically
 against the mock API in
 `scripts/certification/fixtures/woodpecker-api/mock_server.py`: success,
-absent, other-SHA, pending, failure, error, wrong-workflow, missing
-credentials (operator error), manifest field binding and deterministic
-evidence digest.
+absent, other-SHA, pending, failure, error, wrong-workflow, unregistered
+context (operator error), the observed-fact rejection matrix
+(repository/config-file/trusted-class/event/pipeline-id), trusted-context
+attestation success plus tampered/foreign-signature/unsigned/absent
+attestation failures, pr-context upgrade by a trusted attestation, the
+`--verify-ci-evidence` wording, the `--ci-only` rejection, certificate-class
+truth-table checks, manifest field binding/determinism and the temp-name
+migration. The same suites run from
+`bash scripts/certification/tests/selftests.sh`.
 
 **Commit-message claims are not evidence.** A commit message, PR
 description, local test run, or any boolean environment flag never
-certifies: only the required context succeeding at the exact commit SHA
-does. The manifest's `evidence_policy` field states this, and the digest
-binds the record to the exact SHA/tree it was observed for.
+certifies: only the observed context and the signed attestation at the
+exact commit SHA do. The manifest's `evidence_policy` field states this, and
+the digest binds the record to the exact SHA/tree it was observed for.
 
 ### 2.13 Ignored-test inventory and nightly lanes
 
@@ -604,7 +672,22 @@ fails with `unassigned`; an unconventional tag fails with
   digest; `sh scripts/check-ci-image-pins.sh` (the `image-pins` step in the
   PR and trusted workflows) fails on any `image:` line without `@sha256:`.
   The Windows self-hosted `powershell` shell image is the only line allowed
-  to carry an explicit `digest-exempt: <reason>` annotation.
+  to carry an explicit `digest-exempt: <reason>` annotation. The trusted
+  workflow's `attestation` step records its own image digest as the
+  attestation's `build_environment_digest`, so certified bytes name the
+  build environment they came from.
+- **CI-image residual (P2-D; loud, never silent):** the CI jobs still run
+  `apt-get update && apt-get install` against live Debian repositories — no
+  single Faktor CI image has been built, and no Debian snapshot + exact
+  package-version pin exists yet. Every apt command item therefore carries
+  an explicit `# apt-residual: <reason>` annotation; the `image-pins` check
+  audits this, prints every residual line on every run and fails an apt
+  usage with no annotation (or a bare `apt-residual:`). The pinned-CI-image
+  requirement is the target state: build one Faktor CI image (or pin the
+  Debian snapshot + exact versions), replace the residual annotations with
+  `# apt-pinned: <image@sha256:...>`, and the image digest then flows into
+  the attestation's `build_environment_digest`. Until then the residual is
+  documented here and surfaced by every certification run.
 - `apps/jetbrains/gradle/wrapper/gradle-wrapper.properties` pins
   `distributionSha256Sum` for `gradle-9.7.1-bin.zip`
   (`acd53f1e…f804d20a`, cross-checked against
@@ -975,13 +1058,19 @@ Concretely, to ship:
    `ui_parity` requires every executable axis of the Faktor-owned UI.
    `BLOCKED_EXTERNAL`/`PARTIAL` surfaces are carried into the release
    notes; no claim is made for unproven assets.
-8. `bash scripts/certify.sh --commit <sha>` (see §2.12) verifies the
-   required Woodpecker context `ci/woodpecker/pr/pr` at that exact SHA and
-   writes `target/certification/release-manifest.json` with
-   `"status": "passed"` and an empty `problems[]`, binding commit, tree,
-   context, run URL, artifact digests and the certification evidence
-   digest. Missing API credentials are an operator error (exit 2), never a
-   pass; commit-message claims and local flags are not evidence.
+8. `bash scripts/certify.sh --commit <sha>` (see §2.12) verifies a context
+   from the immutable registry at that exact SHA and writes
+   `target/certification/release-manifest.json`
+   (`faktor-release-certification/v2`) with `"status": "passed"`, an empty
+   `problems[]` and `"release_certificate": true`, binding the OBSERVED
+   event/workflow/pipeline/repository/trusted-class facts, commit, tree,
+   run URL, artifact digests, the fetched signed attestation digest and the
+   certification evidence digest. `RELEASE CERTIFICATE: PASS` requires the
+   full local gates plus a trusted context (`ci/woodpecker/push/trusted` or
+   `ci/woodpecker/tag/trusted`) or a verified signed build attestation;
+   `--verify-ci-evidence` and `--local-only` never print a release
+   certificate. Missing API credentials are an operator error (exit 2),
+   never a pass; commit-message claims and local flags are not evidence.
 
 Any new commit — including a docs-only change — invalidates the previous
 certificate and requires a fresh run.

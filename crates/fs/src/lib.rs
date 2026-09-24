@@ -189,9 +189,11 @@ impl WorkspaceFileService {
         watcher
             .watch(&root, RecursiveMode::Recursive)
             .map_err(|e| Error::internal(format!("watch {}: {e}", root.display())))?;
+        let rooted = Arc::new(RootedDir::open(&root)?);
         let handle = WorkspaceHandle {
             workspace_id,
             root,
+            rooted,
             _watcher: Arc::new(Mutex::new(watcher)),
             events: Arc::new(Mutex::new(rx)),
         };
@@ -222,6 +224,13 @@ impl WorkspaceFileService {
 pub struct WorkspaceHandle {
     workspace_id: WorkspaceId,
     root: PathBuf,
+    /// The workspace's anchored directory authority, opened ONCE at
+    /// [`WorkspaceFileService::open`] and retained for the handle's whole
+    /// lifetime. Every handle-relative traversal (enumeration, budgeted
+    /// walks, deletes) runs through this handle instead of re-opening the
+    /// root path per operation: a root directory entry swapped after the
+    /// open cannot redirect those operations.
+    rooted: Arc<RootedDir>,
     _watcher: Arc<Mutex<RecommendedWatcher>>,
     events: Arc<Mutex<mpsc::Receiver<FsEvent>>>,
 }
@@ -571,19 +580,20 @@ impl WorkspaceHandle {
             .collect())
     }
 
-    /// Handle-relative enumeration through the rooted-directory authority
-    /// (P0-52): the directory is reached by an `openat`/handle walk and its
-    /// children are inspected relative to the open handle — never a
-    /// resolve-then-`read_dir` by pathname. `truncated` reports that the
-    /// directory held more than `max` entries.
+    /// Handle-relative enumeration through the workspace's RETAINED rooted
+    /// authority (P0-52): the directory is reached by an `openat`/handle
+    /// walk from the fd anchored at open time and its children are inspected
+    /// relative to the open handle — never a resolve-then-`read_dir` by
+    /// pathname. `truncated` reports that the directory held more than
+    /// `max` entries.
     pub fn list_entries(&self, rel: &Path, max: usize) -> Result<crate::rooted::DirListing, Error> {
-        let rooted = RootedDir::open(&self.root)?;
-        rooted.list_entries(rel, max)
+        self.rooted.list_entries(rel, max)
     }
 
     /// Budgeted handle-relative recursive walk (the shared traversal
-    /// primitive for upper-layer walkers). Every entry is charged to
-    /// `budget`; the visitor may charge reads and stop early.
+    /// primitive for upper-layer walkers), anchored on the RETAINED rooted
+    /// authority: every entry is charged to `budget`; the visitor may charge
+    /// reads and stop early.
     pub fn walk_bounded<F>(
         &self,
         rel: &Path,
@@ -598,8 +608,19 @@ impl WorkspaceHandle {
             &mut crate::rooted::WalkBudget,
         ) -> Result<crate::rooted::WalkStep, Error>,
     {
-        let rooted = RootedDir::open(&self.root)?;
-        rooted.walk_bounded(rel, budget, skip_dirs, visit)
+        self.rooted.walk_bounded(rel, budget, skip_dirs, visit)
+    }
+
+    /// Remove one workspace-relative file entry through the RETAINED rooted
+    /// authority: the parent chain and the final entry are `openat`/
+    /// unlinkat-walked from the fd anchored at open time, with strict
+    /// no-follow semantics, so a directory swapped for a symlink/reparse
+    /// point after any earlier resolution can never redirect the unlink
+    /// outside the workspace. A missing entry is `Ok(())` (the goal state
+    /// of a delete); a directory, link or out-of-root entry is a typed
+    /// refusal.
+    pub fn remove_file(&self, rel: &Path) -> Result<(), Error> {
+        self.rooted.remove_file(rel)
     }
 
     pub fn events(&self) -> &Mutex<mpsc::Receiver<FsEvent>> {
@@ -1831,6 +1852,83 @@ mod tests {
             resolved.starts_with(h.root()),
             "resolution must stay inside the workspace root"
         );
+    }
+
+    /// P1-C: the delete is rooted, not resolve-then-`std::fs::remove_file`.
+    /// The old two-step (`resolve` to an absolute path, then unlink that
+    /// path string) followed a parent directory swapped for an outside
+    /// symlink AFTER the resolve and deleted the outside file. The rooted
+    /// authority walks the parent from the fd anchored at open time, so the
+    /// swap is refused and the outside marker survives.
+    #[cfg(unix)]
+    #[test]
+    fn remove_file_is_rooted_and_refuses_a_parent_swapped_after_resolve() {
+        let (_d, _s, h) = fixture();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("precious"), b"outside-marker").unwrap();
+        fs::create_dir_all(h.root().join("d")).unwrap();
+        fs::write(h.root().join("d/f"), b"inside").unwrap();
+        // The old dangerous sequence: resolve FIRST (the path string is now
+        // the only authority), THEN swap the parent for an outside symlink.
+        let _resolved = h.resolve(Path::new("d/f")).unwrap();
+        fs::remove_dir_all(h.root().join("d")).unwrap();
+        symlink(outside.path(), h.root().join("d")).unwrap();
+        let err = h.remove_file(Path::new("d/f")).unwrap_err();
+        assert_eq!(
+            err.kind,
+            ErrorKind::Permission,
+            "the anchored walk must refuse the swapped parent: {err:?}"
+        );
+        assert_eq!(
+            fs::read(outside.path().join("precious")).unwrap(),
+            b"outside-marker",
+            "the outside file must never be deleted"
+        );
+        // In-workspace delete works, and a missing entry is idempotent.
+        fs::write(h.root().join("ok.txt"), b"x").unwrap();
+        h.remove_file(Path::new("ok.txt")).unwrap();
+        assert!(!h.root().join("ok.txt").exists());
+        h.remove_file(Path::new("ok.txt")).unwrap();
+        // Traversal is refused before any syscall; the outside tree is
+        // still untouched.
+        assert!(h.remove_file(Path::new("../precious")).is_err());
+        assert_eq!(
+            fs::read(outside.path().join("precious")).unwrap(),
+            b"outside-marker"
+        );
+    }
+
+    /// P1-C: the handle anchors its rooted authority ONCE at open. Renaming
+    /// the root path away and replacing it with an outside symlink does not
+    /// redirect the retained authority's operations — they keep addressing
+    /// the original directory.
+    #[cfg(unix)]
+    #[test]
+    fn retained_root_authority_is_immune_to_a_root_path_swap() {
+        let (dir, _s, h) = fixture();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("marker"), b"keep").unwrap();
+        fs::write(h.root().join("f.txt"), b"one").unwrap();
+        let moved = dir.path().join("ws-moved");
+        fs::rename(h.root(), &moved).unwrap();
+        symlink(outside.path(), h.root()).unwrap();
+        // Deletes and walks still address the original directory through the
+        // retained fd; the symlinked root path is irrelevant.
+        h.remove_file(Path::new("f.txt")).unwrap();
+        assert!(
+            !moved.join("f.txt").exists(),
+            "the anchored root was addressed"
+        );
+        assert!(outside.path().join("marker").exists(), "outside untouched");
+        fs::write(moved.join("g.txt"), b"two").unwrap();
+        let mut budget = crate::rooted::WalkBudget::new(16, 16, 8, 1 << 20, 1 << 20);
+        let mut seen = Vec::new();
+        h.walk_bounded(Path::new(""), &mut budget, &[], &mut |entry, _depth, _b| {
+            seen.push(entry.rel.display().to_string());
+            Ok(crate::rooted::WalkStep::Continue)
+        })
+        .unwrap();
+        assert_eq!(seen, vec!["g.txt".to_string()], "retained walk: {seen:?}");
     }
 
     #[test]

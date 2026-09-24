@@ -1,0 +1,8 @@
+# Planted violation: the apt-residual annotation carries no reason.
+# `scripts/check-ci-image-pins.sh --dir` must reject this file.
+steps:
+  - name: linux
+    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24
+    commands:
+      # apt-residual:
+      - apt-get update && apt-get install -y --no-install-recommends ca-certificates

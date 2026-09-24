@@ -1732,6 +1732,9 @@ pub(crate) mod tests {
                 assert!(reason.contains("unanchored"), "{reason}");
             }
             Ok(_) => panic!("a degenerate store root must refuse typed, never fall back"),
+            Err(other) => {
+                panic!("a degenerate store root must refuse typed, never fall back; got {other:?}")
+            }
         }
         drop(cleanup);
     }

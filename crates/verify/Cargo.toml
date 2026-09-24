@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 faktor-core = { path = "../core" }
+faktor-fs = { path = "../fs" }
 faktor-terminal = { path = "../terminal" }
 tokio = { version = "1.53", features = ["full"] }
 libc = "0.2"

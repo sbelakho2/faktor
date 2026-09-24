@@ -11,3 +11,7 @@ fuzz/corpus/
 fuzz/artifacts/
 fuzz/coverage/
 fuzz/Cargo.lock
+
+# OS core dumps (crash artifacts; never source)
+core
+core.*

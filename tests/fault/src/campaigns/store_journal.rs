@@ -348,6 +348,7 @@ fn kind_tag(k: EventKind) -> &'static str {
         EventKind::TurnCompleted => "TurnCompleted",
         EventKind::PermissionGranted => "PermissionGranted",
         EventKind::PermissionDenied => "PermissionDenied",
+        EventKind::PermissionExpired => "PermissionExpired",
         EventKind::PromptAdmitted => "PromptAdmitted",
         EventKind::PhaseChanged => "PhaseChanged",
         EventKind::ReplayStarted => "ReplayStarted",

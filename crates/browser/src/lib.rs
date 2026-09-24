@@ -37,17 +37,24 @@
 //!
 //! # Honest isolation semantics
 //!
-//! Today's isolation is **process-level and application-level**, not an OS
-//! sandbox: Chromium is a normal supervised child process; its network
-//! confinement comes from the broker + interception (fail-closed policy
-//! decisions), and its filesystem confinement from a per-profile directory
-//! with restrictive permissions. A permitted Chromium could still open raw
-//! sockets that bypass the proxy — we do not claim otherwise. The crate
-//! never silently downgrades a stricter guarantee: an operator who needs
-//! OS-level isolation must add it at the spawn layer
-//! (`NetworkIsolation::DenyAll`, which fails closed where no backend
-//! exists) knowing that a deny-all child cannot reach the loopback broker
-//! either.
+//! Isolation strength is reported, never assumed. On platforms with a
+//! per-process network-isolation backend (Linux), every launch REQUESTS
+//! [`NetworkIsolation::BrokerOnly`](faktor_terminal::NetworkIsolation) at the
+//! live egress broker endpoint: the child runs in a dedicated network
+//! namespace whose only reachable destination is the relayed broker endpoint
+//! (no external route exists), and the launch fails closed typed when the
+//! sandbox cannot be created — it is never downgraded to proxy-only. On
+//! platforms without that backend (macOS/Windows), the spawn layer refuses a
+//! BrokerOnly request typed, so launches stay application-level: Chromium
+//! runs behind the broker proxy and interception (fail-closed policy
+//! decisions), and its filesystem confinement comes from a per-profile
+//! directory with restrictive permissions. A permitted Chromium could still
+//! open raw sockets that bypass the proxy under that app-level mode — the
+//! crate does not claim otherwise, and [`BrowserIsolationState`] /
+//! [`BrowserHealth::isolation`] carry the honest per-child state
+//! ([`BrowserIsolationState::is_os_confined`] is false there; the
+//! [`BrowserIsolationState::strength_label`] spelling says so explicitly).
+//! The crate never silently downgrades a stricter guarantee.
 //!
 //! # Test fixture
 //!
@@ -83,7 +90,10 @@ pub use error::{BrowserError, VerificationKind};
 pub use interception::{
     InterceptionDecision, InterceptionPolicy, InterceptionStats, Interceptor, ResourceType,
 };
-pub use launch::{chromium_args, ChromiumLauncher, LaunchOptions, LaunchedBrowser};
+pub use launch::{
+    chromium_args, platform_isolation_label, select_network_isolation, BrowserIsolationState,
+    ChromiumLauncher, LaunchOptions, LaunchedBrowser,
+};
 pub use manager::{
     BrowserConfig, BrowserHealth, BrowserIdentity, BrowserInstanceId, BrowserManager, BrowserMode,
     BrowserState, LifecycleSeam, PagePurpose,

@@ -203,6 +203,20 @@ environment (self-hosted) or register project secrets with
 `environment: {FAKTOR_BENCH_API_KEY: {from_secret: ...}}` entries to the lane
 in `.woodpecker/trusted/nightly.yaml`.
 
+The release attestation (`trusted.yaml`, step `attestation`) follows the
+same rule: without a key it is emitted UNSIGNED (loudly) and
+`scripts/certify.sh` refuses it as release-grade evidence. To sign it:
+generate an ed25519 pair with `node scripts/certification/attestation.mjs
+keygen --out-key release.pem --out-keys release-keys.json --key-id
+faktor-ci-release`, store the private key as the trusted-project secret
+`faktor_attest_signing_key` (`activate.sh --secret
+faktor_attest_signing_key="$(cat release.pem)"`), add
+`environment: {FAKTOR_ATTEST_SIGN_KEY_PEM: {from_secret:
+faktor_attest_signing_key}, FAKTOR_ATTEST_SIGN_KEY_ID: faktor-ci-release}`
+to the step, and hand operators `release-keys.json` as `FAKTOR_ATTEST_KEYS`
+— never the private key. Sigstore/keyless is the documented upgrade path
+when the instance can mint OIDC tokens.
+
 Secrets are registered on the **trusted project only** (`activate.sh` targets
 it): a secret that exists for the untrusted PR project would be readable by
 unreviewed PR code. The untrusted project needs no secrets.
@@ -423,6 +437,14 @@ are not possible; the aggregate gate therefore lives **inside** each workflow:
 - The only accepted non-`passed` marker is `skipped` on
   `coding-benchmark-real-model` in the nightly certificate, and only with a
   non-empty `reason` — a silent skip is a failure.
+- The trusted workflow's `attestation` step (after `certificate`, only on
+  success) publishes a signed `faktor-build-attestation/v1` object into its
+  step log, binding source/tree, workflow/event, pipeline id/number, the CI
+  image digest and the hashes of the artifacts produced by the lanes.
+  `scripts/certify.sh` fetches that block from the exact trusted pipeline
+  and verifies it before a release certificate is possible
+  (`docs/certification.md` §2.12); the preferred release model is
+  distributing those CI-built artifacts rather than local rebuilds.
 
 The darwin and windows combos carry their own `certificate-darwin` /
 `certificate-windows` steps with the same marker/status rule. Woodpecker has

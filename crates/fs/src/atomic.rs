@@ -181,17 +181,20 @@ pub fn atomic_adopt_dir(tmp: &Path, dest: &Path) -> Result<(), Error> {
 /// ([`RootedDir::atomic_publish`] delegates here). Both relative paths must
 /// name the same parent directory, so the publish is a single same-directory
 /// rename; that parent is reached by the authority's no-follow /
-/// reparse-aware walk, and on unix it is fsynced afterwards so the publish
-/// survives power loss.
+/// reparse-aware walk (or, on Windows, as a HANDLE chain from the root handle
+/// opened once at construction), and on unix it is fsynced afterwards so the
+/// publish survives power loss.
 ///
-/// Containment: the walk refuses a symlink (unix) or unverified reparse
-/// point (Windows) on every component, so a parent swapped since the caller
-/// resolved it fails the publish instead of redirecting the rename outside
-/// the root. On failure nothing is renamed: the destination keeps its
-/// previous state (or stays absent) and the caller's temp remains for
-/// cleanup. A crash at any point leaves either the previous destination or
-/// the whole new entry, never a partial destination. Platform honest limit:
-/// see the `crate::rooted` module docs (Windows re-check-to-rename window).
+/// Containment: the walk refuses a symlink (unix) or reparse point (Windows)
+/// on every component, and the Windows rename names the verified parent
+/// HANDLE as its destination root, so a parent swapped since the caller
+/// resolved it cannot redirect the rename outside the root. On failure
+/// nothing is renamed: the destination keeps its previous state (or stays
+/// absent) and the caller's temp remains for cleanup. A crash at any point
+/// leaves either the previous destination or the whole new entry, never a
+/// partial destination. The remaining honest limit is the same on both
+/// platforms: POSIX and Windows both lack a compare-and-swap rename, so the
+/// final syscall is the irreducible window.
 pub fn atomic_publish_at(root: &RootedDir, tmp_rel: &Path, dest_rel: &Path) -> Result<(), Error> {
     let (tmp_parent, tmp_name) = crate::rooted::split_final(tmp_rel)?;
     let (dest_parent, dest_name) = crate::rooted::split_final(dest_rel)?;
@@ -213,7 +216,17 @@ pub fn atomic_publish_at(root: &RootedDir, tmp_rel: &Path, dest_rel: &Path) -> R
         let _ = crate::rooted::unix_fsync(&dir);
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Audit 1/P1-B: the Windows publish is handle-anchored — the parent
+        // is re-opened as a HANDLE chain from the root handle opened at
+        // `RootedDir` construction, the source is opened relative to that
+        // parent and the rename names the same parent handle; no absolute
+        // pathname selects either object after the call begins.
+        let _ = (tmp_name, dest_name);
+        root.windows_publish(tmp_rel, dest_rel)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (tmp_name, dest_name);
         let tmp = crate::rooted::canonicalize_rooted(root.root(), tmp_rel)?;

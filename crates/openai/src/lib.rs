@@ -31,7 +31,7 @@ use faktor_provider::config::{bearer_auth_header, ExtraHeaders, ProviderConfigEr
 #[cfg(test)]
 use faktor_provider::egress::PolicyCheckedHttpTransport;
 use faktor_provider::egress::{execute_post_json_with_extras, EgressError, HttpTransport};
-use faktor_provider::egress::{BudgetComponent, BudgetedBody, ResponseBudget};
+use faktor_provider::egress::{BudgetComponent, CheckedResponse, ResponseBudget};
 use faktor_provider::sanitize::{auth_shaped_text, ErrorScrubber};
 use faktor_provider::transport::{
     guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES, PROVIDER_CEILING_MS,
@@ -222,9 +222,9 @@ fn request_head_timeout_ms(deadlines: StreamDeadlines) -> u64 {
 /// Execute one stream request, bounding the wait for response headers by
 /// [`request_head_timeout_ms`] (a typed `Timeout` on breach).
 async fn execute_with_head_timeout(
-    fut: impl std::future::Future<Output = Result<reqwest::Response, EgressError>>,
+    fut: impl std::future::Future<Output = Result<CheckedResponse, EgressError>>,
     deadlines: StreamDeadlines,
-) -> Result<reqwest::Response, ProviderError> {
+) -> Result<CheckedResponse, ProviderError> {
     let bound_ms = request_head_timeout_ms(deadlines);
     if bound_ms == 0 {
         return fut.await.map_err(ProviderError::from);
@@ -254,7 +254,7 @@ enum ErrorBodyRead {
 /// truncated or the read stalled. The HTTP status still classifies the
 /// error. The budget is REQUIRED — an adapter never reads a response body
 /// directly.
-async fn read_error_body_bounded(resp: reqwest::Response, cap: usize, bound_ms: u64) -> String {
+async fn read_error_body_bounded(resp: CheckedResponse, cap: usize, bound_ms: u64) -> String {
     let budget_ms = if bound_ms == 0 {
         PROVIDER_CEILING_MS
     } else {
@@ -262,7 +262,7 @@ async fn read_error_body_bounded(resp: reqwest::Response, cap: usize, bound_ms: 
     };
     let budget = ResponseBudget::from_millis(budget_ms, budget_ms, budget_ms, cap as u64, None);
     let read = async {
-        let mut body = BudgetedBody::new(resp, budget);
+        let mut body = resp.into_budgeted(budget);
         let mut out: Vec<u8> = Vec::new();
         loop {
             match body.next_chunk().await {
@@ -802,7 +802,7 @@ pub fn responses_stream(
                             }
                             let lines: LineStream = Box::pin(guarded_lines(
                                 utf8_line_stream(
-                                    BudgetedBody::new(r, deadlines.response_budget()).into_stream(),
+                                    r.stream_frames(&deadlines.response_budget()),
                                     MAX_LINE_BYTES,
                                 ),
                                 deadlines,
@@ -1439,7 +1439,7 @@ pub fn openai_stream(
                             }
                             let lines: LineStream = Box::pin(guarded_lines(
                                 utf8_line_stream(
-                                    BudgetedBody::new(r, deadlines.response_budget()).into_stream(),
+                                    r.stream_frames(&deadlines.response_budget()),
                                     MAX_LINE_BYTES,
                                 ),
                                 deadlines,

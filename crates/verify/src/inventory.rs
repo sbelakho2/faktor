@@ -46,16 +46,24 @@
 //! inventory non-Complete ([`InventoryCompleteness::Unreadable`] — the tree
 //! could not be vouched for at that path).
 //!
+//! Manifest existence probes and manifest content reads resolve through ONE
+//! anchored [`faktor_fs::RootedDir`] capability (`openat`/handle-relative,
+//! no-follow), never through pathname I/O: a parent directory entry swapped
+//! for a symlink/reparse point after enumeration — even one pointing outside
+//! the root — is a typed refusal, never a stat/read of the link target.
+//!
 //! ANY value other than [`InventoryCompleteness::Complete`] prohibits a
 //! `Passed` verification verdict: the caller must classify the attempt
 //! `Unavailable` with the typed reason.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsString;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use faktor_core::error::ErrorKind;
+use faktor_fs::rooted::RootedEntryKind;
+use faktor_fs::{FileData, RootedDir};
 use faktor_terminal::{EnvSpec, ProcessOwner, ProcessSupervisor, SpawnConfig};
 
 /// Default hard cap on the scanned depth (the root is depth 0), generous for
@@ -199,53 +207,35 @@ impl<T> ManifestProbe<T> {
     }
 }
 
-/// The secure identity of one file (dev + inode on unix; unavailable
-/// elsewhere). Compared around reads so a swapped file can never certify
-/// content it does not own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    dev: u64,
-    ino: u64,
-}
-
-fn file_identity(path: &Path) -> Option<FileIdentity> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::symlink_metadata(path)
-            .ok()
-            .map(|meta| FileIdentity {
-                dev: meta.dev(),
-                ino: meta.ino(),
-            })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        None
-    }
-}
-
-/// The secure identity of the candidate generation one manifest probe is
-/// admitted under: the canonical root plus its directory identity. Every
-/// read is tied to it, so a probe can never certify content from a
-/// different (replaced/renamed) candidate generation.
+/// The candidate generation one manifest probe is admitted under: an OPEN
+/// anchored-directory capability (never a pathname identity). Every
+/// existence probe and content read resolves component-by-component through
+/// that capability with no-follow semantics, so a directory entry swapped
+/// for a symlink (unix) or a reparse point/junction (Windows) after
+/// enumeration can never redirect a read — neither inside nor outside the
+/// root. On Windows the walk opens every component with `NtCreateFile`
+/// relative to the already-open parent handle and refuses out-of-root
+/// reparse targets, so the opened handle is a validated descendant of the
+/// anchored root by construction, not by comparing a pathname afterwards.
 #[derive(Debug, Clone)]
 pub struct CandidateGeneration {
     root: PathBuf,
-    identity: Option<FileIdentity>,
+    anchored: Option<RootedDir>,
 }
 
 impl CandidateGeneration {
-    /// Admit a generation over `root`: canonicalized once, identity captured
-    /// now. A root that does not resolve is admitted with no identity — its
-    /// probes then refuse (a missing root can never certify content).
+    /// Admit a generation over `root`: the path is canonicalized once (a
+    /// symlinked root is accepted deliberately at admission, like the old
+    /// generation identity), then opened as an anchored directory
+    /// capability. A root that cannot be opened is admitted WITHOUT an
+    /// anchor — its probes then refuse typed, because a missing or
+    /// link-swapped root can never certify content.
     pub fn admit(root: &Path) -> Self {
         let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        let identity = file_identity(&canonical);
+        let anchored = RootedDir::open(&canonical).ok();
         Self {
             root: canonical,
-            identity,
+            anchored,
         }
     }
 
@@ -254,48 +244,51 @@ impl CandidateGeneration {
         &self.root
     }
 
-    /// Whether `root` is still the admitted generation: same canonical root
-    /// AND the same directory identity (a replaced root is a new
-    /// generation, never the old one).
+    /// Whether `root` still names the admitted generation: the same
+    /// canonical path AND a live anchored capability. The capability — not
+    /// the pathname — is what every read resolves through, so a root entry
+    /// replaced underneath the pathname can never redirect a read.
     pub fn matches(&self, root: &Path) -> bool {
-        let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        if canonical != self.root {
+        if self.anchored.is_none() {
             return false;
         }
-        match (file_identity(&canonical), self.identity) {
-            (Some(now), Some(admitted)) => now == admitted,
-            (None, None) => true,
-            _ => false,
-        }
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        canonical == self.root
+    }
+
+    /// The anchored capability every probe resolves through, when admitted.
+    fn anchored(&self) -> Option<&RootedDir> {
+        self.anchored.as_ref()
     }
 }
 
-/// The injectable content reader of [`probe_manifest_text_with`]: production
-/// reads with `std::fs::read`; adversarial tests swap a reader that changes
-/// content between reads. Identity checks always run against the real
-/// filesystem.
-type ManifestReader<'a> = &'a mut dyn FnMut(&Path) -> std::io::Result<Vec<u8>>;
+/// The injectable seam between the two rooted content reads of one manifest
+/// probe: production passes a no-op. Both reads ALWAYS go through
+/// [`RootedDir::read`] — the seam can schedule a tree mutation in the
+/// window a pathname-based probe could be swapped, but it can never
+/// substitute bytes for a read.
+type BetweenReads<'a> = &'a mut dyn FnMut();
 
 /// Probe one manifest's bounded content under an admitted candidate
-/// generation. A read is accepted only when the root still matches the
-/// generation, the path is a plain regular file (never a symlink/special
-/// file), the file identity is stable from metadata to open, and two
-/// independent reads agree byte-for-byte. Everything else is a typed
-/// [`ManifestProbe`] refusal — never a silent `Absent`.
+/// generation. The entry is classified and read ONLY through the anchored
+/// capability: a symlink/special entry is refused without being followed or
+/// opened, an over-cap entry is refused from its literal no-follow size, and
+/// a content read is accepted only when two independent ROOTED reads agree
+/// byte-for-byte. Everything else is a typed [`ManifestProbe`] refusal —
+/// never a silent `Absent`.
 pub fn probe_manifest_text(
     root: &Path,
     generation: &CandidateGeneration,
     rel: &str,
 ) -> ManifestProbe<String> {
-    let mut read = |path: &Path| std::fs::read(path);
-    probe_manifest_text_with(root, generation, rel, &mut read)
+    probe_manifest_text_with(root, generation, rel, &mut || {})
 }
 
 fn probe_manifest_text_with(
     root: &Path,
     generation: &CandidateGeneration,
     rel: &str,
-    read: ManifestReader<'_>,
+    between_reads: BetweenReads<'_>,
 ) -> ManifestProbe<String> {
     let cap = crate::derive::MAX_PROBE_BYTES;
     if !generation.matches(root) {
@@ -308,132 +301,109 @@ fn probe_manifest_text_with(
             ),
         };
     }
-    let path = generation.root().join(rel);
-    let meta = match std::fs::symlink_metadata(&path) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ManifestProbe::Absent,
-        Err(e) => {
-            return ManifestProbe::Unreadable {
-                path: rel.to_string(),
-                reason: format!("metadata failed: {e}"),
-            }
-        }
-    };
-    if meta.file_type().is_symlink() {
-        return ManifestProbe::Unreadable {
-            path: rel.to_string(),
-            reason: "the manifest is a symlink the probe refuses to follow".into(),
-        };
-    }
-    if !meta.file_type().is_file() {
-        return ManifestProbe::Unreadable {
-            path: rel.to_string(),
-            reason: "the manifest is not a plain regular file".into(),
-        };
-    }
-    if meta.len() > cap {
-        return ManifestProbe::Oversized {
-            path: rel.to_string(),
-            bytes: meta.len(),
-        };
-    }
-    // Identity is captured from the PATH and compared against the OPENED
-    // handle (the same TOCTOU guard the canonical fs state uses): a path
-    // swapped under the read can never certify content.
-    let opened = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(e) => {
-            return ManifestProbe::Unreadable {
-                path: rel.to_string(),
-                reason: format!("open failed: {e}"),
-            }
-        }
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let opened_meta = match opened.metadata() {
-            Ok(meta) => meta,
-            Err(e) => {
-                return ManifestProbe::Unreadable {
-                    path: rel.to_string(),
-                    reason: format!("opened metadata failed: {e}"),
-                }
-            }
-        };
-        if opened_meta.dev() != meta.dev() || opened_meta.ino() != meta.ino() {
-            return ManifestProbe::Unstable {
-                path: rel.to_string(),
-                reason: "the path changed identity between metadata and open (TOCTOU)".into(),
-            };
-        }
-    }
-    // Read #1 from the opened handle (bounded), read #2 independently: the
-    // two views must be byte-identical, else the probe cannot say which
-    // revision it saw.
-    let mut first = Vec::new();
-    if let Err(e) = opened.take(cap + 1).read_to_end(&mut first) {
-        return ManifestProbe::Unreadable {
-            path: rel.to_string(),
-            reason: format!("read failed: {e}"),
-        };
-    }
-    if first.len() as u64 > cap {
-        return ManifestProbe::Oversized {
-            path: rel.to_string(),
-            bytes: first.len() as u64,
-        };
-    }
-    let second = match read(&path) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return ManifestProbe::Unreadable {
-                path: rel.to_string(),
-                reason: format!("re-read failed: {e}"),
-            }
-        }
-    };
-    if second.len() as u64 > cap {
-        return ManifestProbe::Oversized {
-            path: rel.to_string(),
-            bytes: second.len() as u64,
-        };
-    }
-    if second != first {
+    let Some(rooted) = generation.anchored() else {
         return ManifestProbe::Unstable {
             path: rel.to_string(),
-            reason: "the content changed between two reads".into(),
+            reason: "the candidate generation is not anchored on an open root".to_string(),
         };
-    }
-    // The path must still resolve to the SAME identity and size after both
-    // reads: a swap after the reads can never certify the bytes read.
-    match std::fs::symlink_metadata(&path) {
-        Ok(after) => {
-            if after.len() != meta.len() {
-                return ManifestProbe::Unstable {
-                    path: rel.to_string(),
-                    reason: "the manifest size changed across the read".into(),
-                };
+    };
+    let rel_path = Path::new(rel);
+    // No-follow classification first: a symlink/special entry is refused
+    // through the anchored walk WITHOUT being opened (a hostile FIFO must
+    // never block the probe), and an over-cap manifest is refused from its
+    // literal size without reading its content.
+    match rooted.entry_meta(rel_path) {
+        Ok(None) => return ManifestProbe::Absent,
+        Ok(Some(meta)) if meta.kind == RootedEntryKind::Symlink => {
+            return ManifestProbe::Unreadable {
+                path: rel.to_string(),
+                reason: "the manifest is a symlink the probe refuses to follow".into(),
             }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if after.dev() != meta.dev() || after.ino() != meta.ino() {
-                    return ManifestProbe::Unstable {
-                        path: rel.to_string(),
-                        reason: "the path identity changed across the read".into(),
-                    };
-                }
+        }
+        Ok(Some(meta)) if meta.kind != RootedEntryKind::File => {
+            return ManifestProbe::Unreadable {
+                path: rel.to_string(),
+                reason: "the manifest is not a plain regular file".into(),
+            }
+        }
+        Ok(Some(meta)) if meta.size > cap => {
+            return ManifestProbe::Oversized {
+                path: rel.to_string(),
+                bytes: meta.size,
+            }
+        }
+        Ok(Some(_)) => {}
+        Err(e) => {
+            return ManifestProbe::Unreadable {
+                path: rel.to_string(),
+                reason: format!("rooted metadata failed: {}", e.message),
+            }
+        }
+    }
+    let first = match rooted.read(rel_path, cap as usize) {
+        Ok(data) => data,
+        Err(e) if e.kind == ErrorKind::NotFound => return ManifestProbe::Absent,
+        Err(e) => {
+            return ManifestProbe::Unreadable {
+                path: rel.to_string(),
+                reason: format!("rooted read failed: {}", e.message),
+            }
+        }
+    };
+    if !first.digest.is_full() {
+        return oversized_probe(rooted, rel, rel_path, &first);
+    }
+    between_reads();
+    // The stability check is a SECOND rooted read: it can only ever return
+    // bytes resolved through the same anchored capability. A manifest that
+    // vanishes after the first read is a stability failure, never a silent
+    // `Absent`: its content was certified once and could not be re-read.
+    let second = match rooted.read(rel_path, cap as usize) {
+        Ok(data) => data,
+        Err(e) if e.kind == ErrorKind::NotFound => {
+            return ManifestProbe::Unstable {
+                path: rel.to_string(),
+                reason: "the manifest vanished between two rooted reads".into(),
             }
         }
         Err(e) => {
-            return ManifestProbe::Unstable {
+            return ManifestProbe::Unreadable {
                 path: rel.to_string(),
-                reason: format!("the path vanished across the read: {e}"),
+                reason: format!("rooted re-read failed: {}", e.message),
             }
         }
+    };
+    if !second.digest.is_full() {
+        return oversized_probe(rooted, rel, rel_path, &second);
     }
-    ManifestProbe::Present(String::from_utf8_lossy(&first).into_owned())
+    if second.bytes != first.bytes {
+        return ManifestProbe::Unstable {
+            path: rel.to_string(),
+            reason: "the content changed between two rooted reads".into(),
+        };
+    }
+    ManifestProbe::Present(String::from_utf8_lossy(&first.bytes).into_owned())
+}
+
+/// The typed `Oversized` refusal for a bounded rooted read that hit the cap:
+/// the exact size is re-read through the SAME anchored capability (a no-follow
+/// metadata query, never a pathname stat); when the entry changed under the
+/// read, the observed lower bound (one byte over the cap) is reported.
+fn oversized_probe(
+    rooted: &RootedDir,
+    rel: &str,
+    rel_path: &Path,
+    bounded: &FileData,
+) -> ManifestProbe<String> {
+    let cap = crate::derive::MAX_PROBE_BYTES;
+    let bytes = match rooted.entry_meta(rel_path) {
+        Ok(Some(meta)) if meta.kind == RootedEntryKind::File && meta.size > cap => meta.size,
+        _ => (bounded.size as u64).saturating_add(1),
+    };
+    ManifestProbe::Oversized {
+        path: rel.to_string(),
+        bytes,
+    }
 }
 
 /// The resource budgets of one discovery, configurable per call. Exceeding
@@ -1085,13 +1055,26 @@ fn native_inventory(root: &Path, budget: &InventoryBudget, deadline: Instant) ->
 /// Targeted manifest discovery: probe every directory prefix observed in
 /// the inventory for the recognized manifest names, and surface the first
 /// completeness violation in deterministic order (root first, sorted dirs,
-/// fixed name order). The rule is documented at the module level.
+/// fixed name order). Every probe resolves through ONE anchored
+/// [`RootedDir`] opened for the discovery — a parent entry swapped for a
+/// symlink/reparse point after enumeration is a typed `Unreadable` refusal,
+/// never a stat of the link target. The rule is documented at the module
+/// level.
 fn probe_manifests(
     root: &Path,
     files: &[String],
     budget: &InventoryBudget,
     deadline: Instant,
 ) -> Option<InventoryCompleteness> {
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let rooted = match RootedDir::open(&canonical) {
+        Ok(rooted) => rooted,
+        Err(_) => {
+            return Some(InventoryCompleteness::Unreadable {
+                path: String::new(),
+            });
+        }
+    };
     let mut dirs: BTreeSet<String> = BTreeSet::new();
     dirs.insert(String::new());
     for file in files {
@@ -1124,12 +1107,13 @@ fn probe_manifests(
             });
             if files.binary_search(&rel).is_ok() {
                 if content_decides_checks(name) {
-                    if let Ok(meta) = std::fs::symlink_metadata(root.join(&rel)) {
-                        if meta.file_type().is_file() && meta.len() > crate::derive::MAX_PROBE_BYTES
+                    if let Ok(Some(meta)) = rooted.entry_meta(Path::new(&rel)) {
+                        if meta.kind == RootedEntryKind::File
+                            && meta.size > crate::derive::MAX_PROBE_BYTES
                         {
                             return Some(InventoryCompleteness::ManifestOversized {
                                 path: rel,
-                                bytes: meta.len(),
+                                bytes: meta.size,
                             });
                         }
                     }
@@ -1139,15 +1123,14 @@ fn probe_manifests(
             if case_variant_present {
                 continue;
             }
-            match std::fs::symlink_metadata(root.join(&rel)) {
-                Ok(meta) if meta.file_type().is_symlink() => {
+            match rooted.entry_meta(Path::new(&rel)) {
+                Ok(Some(meta)) if meta.kind == RootedEntryKind::Symlink => {
                     return Some(InventoryCompleteness::Unreadable { path: rel });
                 }
-                Ok(meta) if meta.file_type().is_file() => {
+                Ok(Some(meta)) if meta.kind == RootedEntryKind::File => {
                     return Some(InventoryCompleteness::ManifestExcluded { path: rel });
                 }
                 Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => return Some(InventoryCompleteness::Unreadable { path: rel }),
             }
         }
@@ -1730,29 +1713,106 @@ mod tests {
     }
 
     #[test]
-    fn manifest_probe_unstable_when_content_changes_between_reads() {
+    fn manifest_probe_unstable_when_content_changes_between_rooted_reads() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("package.json"), br#"{"jest":true}"#).unwrap();
+        let path = dir.path().join("package.json");
+        fs::write(&path, br#"{"jest":true}"#).unwrap();
         let generation = CandidateGeneration::admit(dir.path());
-        let mut calls = 0usize;
-        let mut reader = |_path: &Path| {
-            calls += 1;
-            Ok(br#"{"vitest":true}"#.to_vec())
+        let mut seam_ran = false;
+        let mut between = || {
+            // The second read must observe the new revision: a probe that
+            // read through a stale descriptor or a replaced pathname could
+            // not detect the swap.
+            fs::write(&path, br#"{"vitest":true}"#).unwrap();
+            seam_ran = true;
         };
-        let probe = probe_manifest_text_with(dir.path(), &generation, "package.json", &mut reader);
-        assert_eq!(calls, 1, "the probe re-reads the content exactly once");
+        let probe = probe_manifest_text_with(dir.path(), &generation, "package.json", &mut between);
+        assert!(seam_ran, "the seam fires between the two rooted reads");
         match &probe {
             ManifestProbe::Unstable { reason, .. } => {
-                assert!(reason.contains("changed between two reads"), "{reason}");
+                assert!(reason.contains("between two rooted reads"), "{reason}");
             }
             other => panic!("changing content must be a typed refusal: {other:?}"),
         }
         assert_eq!(probe.refusal().map(|r| r.kind), Some("unstable"));
     }
 
+    #[test]
+    fn manifest_probe_vanish_between_rooted_reads_is_unstable_never_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package.json");
+        fs::write(&path, br#"{"jest":true}"#).unwrap();
+        let generation = CandidateGeneration::admit(dir.path());
+        let mut between = || {
+            // The content was read once; a second read that cannot find the
+            // revision must never downgrade to `Absent` (which would silently
+            // drop the checks the read content derives).
+            fs::remove_file(&path).unwrap();
+        };
+        let probe = probe_manifest_text_with(dir.path(), &generation, "package.json", &mut between);
+        match &probe {
+            ManifestProbe::Unstable { reason, .. } => {
+                assert!(reason.contains("vanished"), "{reason}");
+            }
+            other => panic!("a vanished re-read must be a typed refusal: {other:?}"),
+        }
+        assert_eq!(probe.refusal().map(|r| r.kind), Some("unstable"));
+    }
+
+    #[test]
+    fn manifest_probe_growth_across_rooted_reads_is_typed_oversized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package.json");
+        fs::write(&path, br#"{"jest":true}"#).unwrap();
+        let generation = CandidateGeneration::admit(dir.path());
+        let grown = vec![b'x'; (crate::derive::MAX_PROBE_BYTES + 1) as usize];
+        let mut between = || {
+            // The first read certified a small file; the second bounded read
+            // must refuse the grown revision as oversized, never present the
+            // first revision's bytes as the current content.
+            fs::write(&path, &grown).unwrap();
+        };
+        let probe = probe_manifest_text_with(dir.path(), &generation, "package.json", &mut between);
+        match &probe {
+            ManifestProbe::Oversized { bytes, .. } => {
+                assert_eq!(*bytes, crate::derive::MAX_PROBE_BYTES + 1);
+            }
+            other => panic!("a grown manifest must be a typed oversized refusal: {other:?}"),
+        }
+        assert_eq!(probe.refusal().map(|r| r.kind), Some("oversized"));
+    }
+
     #[cfg(unix)]
     #[test]
-    fn manifest_probe_generation_mismatch_refuses() {
+    fn manifest_probe_second_rooted_read_refuses_a_link_swap_to_outside_content() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        let outside = base.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let manifest = root.join("package.json");
+        fs::write(&manifest, br#"{"name":"honest"}"#).unwrap();
+        fs::write(outside.join("package.json"), b"EXTERNAL-MARKER-2f71").unwrap();
+        let generation = CandidateGeneration::admit(&root);
+        let outside_manifest = outside.join("package.json");
+        let mut between = || {
+            fs::remove_file(&manifest).unwrap();
+            std::os::unix::fs::symlink(&outside_manifest, &manifest).unwrap();
+        };
+        let probe = probe_manifest_text_with(&root, &generation, "package.json", &mut between);
+        assert!(
+            !format!("{probe:?}").contains("EXTERNAL-MARKER-2f71"),
+            "the link target's content must never be read: {probe:?}"
+        );
+        assert!(
+            matches!(probe, ManifestProbe::Unreadable { .. }),
+            "{probe:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_probe_generation_mismatch_and_replaced_root_refuse() {
         let base = tempfile::tempdir().unwrap();
         let a = base.path().join("gen-a");
         let b = base.path().join("gen-b");
@@ -1764,18 +1824,145 @@ mod tests {
         // A generation admitted on A never certifies content under B.
         let probe = probe_manifest_text(&b, &generation, "package.json");
         assert!(matches!(probe, ManifestProbe::Unstable { .. }), "{probe:?}");
-        // Replacing the admitted root at the SAME path (new identity) is a
-        // new generation: the old admission refuses.
+        // Replacing the admitted root at the SAME path is a different
+        // directory: the anchored capability still resolves the OLD (now
+        // unlinked) generation, so the replacement's content is never
+        // certified through the old admission.
         fs::remove_dir_all(&a).unwrap();
         fs::create_dir_all(&a).unwrap();
-        fs::write(a.join("package.json"), br#"{"jest":true}"#).unwrap();
+        fs::write(a.join("package.json"), b"REPLACEMENT-MARKER-88c0").unwrap();
         let probe = probe_manifest_text(&a, &generation, "package.json");
-        match &probe {
-            ManifestProbe::Unstable { reason, .. } => {
-                assert!(reason.contains("does not match"), "{reason}");
+        assert!(
+            !format!("{probe:?}").contains("REPLACEMENT-MARKER-88c0"),
+            "the replacement root's content must never be certified: {probe:?}"
+        );
+        assert!(
+            matches!(
+                &probe,
+                ManifestProbe::Absent | ManifestProbe::Unreadable { .. }
+            ),
+            "{probe:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_probe_never_reads_outside_a_swapped_parent_link() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        let outside = base.path().join("outside");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join("sub/package.json"), br#"{"jest":true}"#).unwrap();
+        fs::write(outside.join("package.json"), b"EXTERNAL-MARKER-9f3a").unwrap();
+        let generation = CandidateGeneration::admit(&root);
+        // Enumeration listed `sub/package.json`; the parent entry is swapped
+        // for an outside link before the read.
+        fs::rename(root.join("sub"), root.join("sub-real")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("sub")).unwrap();
+        let probe = probe_manifest_text(&root, &generation, "sub/package.json");
+        assert!(
+            !format!("{probe:?}").contains("EXTERNAL-MARKER-9f3a"),
+            "external marker must never be read or accepted: {probe:?}"
+        );
+        assert!(
+            matches!(probe, ManifestProbe::Unreadable { .. }),
+            "{probe:?}"
+        );
+        assert_eq!(probe.refusal().map(|r| r.kind), Some("unreadable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_probe_refuses_a_parent_swapped_to_an_outside_link() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        let outside = base.path().join("outside");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"x").unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("Cargo.toml"), b"x").unwrap();
+        // The inventory was listed first; the parent is swapped before the
+        // existence probe runs. The outside manifest must never surface as
+        // `ManifestExcluded`.
+        let files = vec!["src/lib.rs".to_string()];
+        fs::rename(root.join("src"), root.join("src-real")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("src")).unwrap();
+        let violation = probe_manifests(
+            &root,
+            &files,
+            &InventoryBudget::default(),
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert_eq!(
+            violation,
+            Some(InventoryCompleteness::Unreadable {
+                path: "src/Cargo.toml".to_string()
+            }),
+            "the swapped parent must be a typed refusal, never an outside finding"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swapped_parent_between_enumeration_and_profile_read_never_imports_outside_markers() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        let outside = base.path().join("outside");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/package.json"), br#"{"name":"honest"}"#).unwrap();
+        write(&root, "src/lib.rs");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            outside.join("package.json"),
+            br#"{"devDependencies":{"jest":"30"}}"#,
+        )
+        .unwrap();
+        let inventory = discover_repo_inventory(&root);
+        assert_eq!(
+            inventory.completeness,
+            InventoryCompleteness::Complete,
+            "{inventory:?}"
+        );
+        // Enumeration finished; the parent is swapped to an outside
+        // directory before profile detection reads any manifest.
+        fs::rename(root.join("sub"), root.join("sub-real")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("sub")).unwrap();
+        let profile = crate::derive::detect_project_profile(&root, &inventory.files);
+        let jest = profile.components.iter().any(|component| {
+            component
+                .test_frameworks
+                .contains(&crate::derive::TestFramework::Jest)
+        });
+        assert!(!jest, "the outside marker must never be read: {profile:?}");
+        assert!(
+            profile
+                .manifest_refusals
+                .iter()
+                .any(|refusal| refusal.path == "sub/package.json" && refusal.kind == "unreadable"),
+            "the swapped parent must surface as an unreadable refusal: {profile:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_probe_classifies_a_fifo_without_blocking_or_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("package.json");
+        match std::process::Command::new("mkfifo").arg(&fifo).status() {
+            Ok(status) if status.success() => {}
+            _ => {
+                eprintln!("skipping FIFO probe test: mkfifo is not available");
+                return;
             }
-            other => panic!("a replaced generation must refuse: {other:?}"),
         }
+        let generation = CandidateGeneration::admit(dir.path());
+        let probe = probe_manifest_text(dir.path(), &generation, "package.json");
+        assert!(
+            matches!(probe, ManifestProbe::Unreadable { .. }),
+            "{probe:?}"
+        );
+        assert_eq!(probe.refusal().map(|r| r.kind), Some("unreadable"));
     }
 
     #[test]

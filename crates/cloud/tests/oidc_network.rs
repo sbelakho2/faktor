@@ -24,7 +24,7 @@ use faktor_cloud::{
     NetworkOidcAdapter, NetworkOidcConfig, OidcClaims, OidcError, Role, SsoConfigRef, SsoLogin,
     OIDC_NETWORK_TIMEOUT_MS,
 };
-use faktor_provider::egress::{EgressError, HttpTransport};
+use faktor_provider::egress::{CheckedResponse, EgressError, HttpTransport};
 
 const ISSUER: &str = "https://idp.example";
 const CLIENT: &str = "faktor-test";
@@ -528,7 +528,7 @@ fn form_field(body: &[u8], name: &str) -> Option<String> {
 }
 
 impl HttpTransport for MockProvider {
-    fn execute(&self, req: Request) -> BoxFuture<'_, Result<Response, EgressError>> {
+    fn execute(&self, req: Request) -> BoxFuture<'_, Result<CheckedResponse, EgressError>> {
         let method = req.method().to_string();
         let url = req.url().to_string();
         let headers: Vec<(String, String)> = req
@@ -555,7 +555,7 @@ impl HttpTransport for MockProvider {
             let response = builder
                 .body(Body::from(body))
                 .map_err(|e| EgressError::Build(e.to_string()))?;
-            Ok(Response::from(response))
+            Ok(CheckedResponse::from_response(Response::from(response)))
         })
     }
 }
@@ -657,6 +657,18 @@ fn query_param(url: &str, name: &str) -> Option<String> {
     None
 }
 
+/// The wire projection of a started login (P2-B): the authorization URL plus
+/// the plaintext state for the frontend — the domain type exposes neither.
+fn wire_of(start: faktor_cloud::sso::SsoStart) -> faktor_cloud::sso::SsoStartWireResponse {
+    start.into_wire_response()
+}
+
+/// The nonce of a started login, read from its authorization URL (the domain
+/// type never exposes the wrapped nonce).
+fn nonce_of(wire: &faktor_cloud::sso::SsoStartWireResponse) -> String {
+    query_param(wire.authorization_url(), "nonce").expect("the URL carries the nonce")
+}
+
 // -------------------------------------------------------------------- tests
 
 /// The full network flow: discovery (cached by max-age), code exchange,
@@ -678,16 +690,22 @@ async fn network_happy_path_caches_discovery_and_mints_a_session() {
         .start(&org.id, &sso_ref(), "https://app.example/callback")
         .await
         .unwrap();
-    assert!(started.authorization_url.starts_with(ISSUER));
+    let started = wire_of(started);
+    assert!(started.authorization_url().starts_with(ISSUER));
     assert_eq!(
-        query_param(&started.authorization_url, "code_challenge_method").as_deref(),
+        query_param(started.authorization_url(), "code_challenge_method").as_deref(),
         Some("S256")
     );
-    assert!(query_param(&started.authorization_url, "code_challenge").is_some());
-    let nonce = query_param(&started.authorization_url, "nonce").unwrap();
-    assert_eq!(nonce, started.nonce, "the URL nonce is the login nonce");
+    assert!(query_param(started.authorization_url(), "code_challenge").is_some());
+    let nonce = nonce_of(&started);
+    assert!(
+        started
+            .authorization_url()
+            .contains(&format!("nonce={nonce}")),
+        "the URL nonce is the login nonce"
+    );
 
-    provider.issue_code("code-1", token_spec(Some(&started.nonce), NOW_MS + 60_000));
+    provider.issue_code("code-1", token_spec(Some(&nonce), NOW_MS + 60_000));
     let outcome = login
         .callback(
             &cp,
@@ -695,7 +713,7 @@ async fn network_happy_path_caches_discovery_and_mints_a_session() {
             &sso_ref(),
             "https://app.example/callback",
             "code-1",
-            &started.state,
+            started.state(),
         )
         .await
         .unwrap();
@@ -721,7 +739,7 @@ async fn network_happy_path_caches_discovery_and_mints_a_session() {
                 &sso_ref(),
                 "https://app.example/callback",
                 "code-1",
-                &started.state
+                started.state()
             )
             .await,
         Err(OidcError::StateInvalid)
@@ -747,7 +765,11 @@ async fn sso_email_rename_follows_the_linked_subject() {
         .start(&org.id, &sso_ref(), "https://app.example/callback")
         .await
         .unwrap();
-    provider.issue_code("code-r1", token_spec(Some(&started.nonce), NOW_MS + 60_000));
+    let started = wire_of(started);
+    provider.issue_code(
+        "code-r1",
+        token_spec(Some(&nonce_of(&started)), NOW_MS + 60_000),
+    );
     let first = login
         .callback(
             &cp,
@@ -755,7 +777,7 @@ async fn sso_email_rename_follows_the_linked_subject() {
             &sso_ref(),
             "https://app.example/callback",
             "code-r1",
-            &started.state,
+            started.state(),
         )
         .await
         .unwrap();
@@ -766,7 +788,8 @@ async fn sso_email_rename_follows_the_linked_subject() {
         .start(&org.id, &sso_ref(), "https://app.example/callback")
         .await
         .unwrap();
-    let mut renamed = token_spec(Some(&started.nonce), NOW_MS + 60_000);
+    let started = wire_of(started);
+    let mut renamed = token_spec(Some(&nonce_of(&started)), NOW_MS + 60_000);
     renamed.email = "renamed@example.test".into();
     provider.issue_code("code-r2", renamed);
     let second = login
@@ -776,7 +799,7 @@ async fn sso_email_rename_follows_the_linked_subject() {
             &sso_ref(),
             "https://app.example/callback",
             "code-r2",
-            &started.state,
+            started.state(),
         )
         .await
         .unwrap();
@@ -822,6 +845,7 @@ async fn wrong_state_nonce_and_redirect_are_refused() {
         .start(&org.id, &sso_ref(), "https://app.example/callback")
         .await
         .unwrap();
+    let started = wire_of(started);
     provider.issue_code("code-2", token_spec(Some("nonce-other"), NOW_MS + 60_000));
     assert!(matches!(
         login
@@ -831,7 +855,7 @@ async fn wrong_state_nonce_and_redirect_are_refused() {
                 &sso_ref(),
                 "https://app.example/callback",
                 "code-2",
-                &started.state
+                started.state()
             )
             .await,
         Err(OidcError::NonceMismatch)
@@ -842,7 +866,11 @@ async fn wrong_state_nonce_and_redirect_are_refused() {
         .start(&org.id, &sso_ref(), "https://app.example/callback")
         .await
         .unwrap();
-    provider.issue_code("code-3", token_spec(Some(&started.nonce), NOW_MS + 60_000));
+    let started = wire_of(started);
+    provider.issue_code(
+        "code-3",
+        token_spec(Some(&nonce_of(&started)), NOW_MS + 60_000),
+    );
     assert!(matches!(
         login
             .callback(
@@ -851,7 +879,7 @@ async fn wrong_state_nonce_and_redirect_are_refused() {
                 &sso_ref(),
                 "https://evil.example/callback",
                 "code-3",
-                &started.state
+                started.state()
             )
             .await,
         Err(OidcError::RedirectMismatch)
@@ -865,7 +893,7 @@ async fn wrong_state_nonce_and_redirect_are_refused() {
                 &sso_ref(),
                 "https://app.example/callback",
                 "code-3",
-                &started.state
+                started.state()
             )
             .await,
         Err(OidcError::StateInvalid)
@@ -888,7 +916,11 @@ async fn expired_id_token_is_refused() {
         .start(&org.id, &sso_ref(), "https://app.example/callback")
         .await
         .unwrap();
-    provider.issue_code("code-4", token_spec(Some(&started.nonce), NOW_MS - 1_000));
+    let started = wire_of(started);
+    provider.issue_code(
+        "code-4",
+        token_spec(Some(&nonce_of(&started)), NOW_MS - 1_000),
+    );
     assert!(matches!(
         login
             .callback(
@@ -897,7 +929,7 @@ async fn expired_id_token_is_refused() {
                 &sso_ref(),
                 "https://app.example/callback",
                 "code-4",
-                &started.state
+                started.state()
             )
             .await,
         Err(OidcError::Expired)
@@ -1240,7 +1272,11 @@ async fn callback_is_bound_to_the_starting_organization() {
         .start(&org_a.id, &sso_ref(), "https://app.example/callback")
         .await
         .unwrap();
-    provider.issue_code("code-5", token_spec(Some(&started.nonce), NOW_MS + 60_000));
+    let started = wire_of(started);
+    provider.issue_code(
+        "code-5",
+        token_spec(Some(&nonce_of(&started)), NOW_MS + 60_000),
+    );
     assert!(matches!(
         login
             .callback(
@@ -1249,7 +1285,7 @@ async fn callback_is_bound_to_the_starting_organization() {
                 &sso_ref(),
                 "https://app.example/callback",
                 "code-5",
-                &started.state
+                started.state()
             )
             .await,
         Err(OidcError::StateInvalid)
@@ -1686,7 +1722,7 @@ async fn extreme_time_claims_are_typed_outcomes_never_overflow() {
 struct StallingTransport;
 
 impl HttpTransport for StallingTransport {
-    fn execute(&self, _req: Request) -> BoxFuture<'_, Result<Response, EgressError>> {
+    fn execute(&self, _req: Request) -> BoxFuture<'_, Result<CheckedResponse, EgressError>> {
         Box::pin(std::future::pending())
     }
 }

@@ -74,15 +74,47 @@
 //! Windows equivalent of the unix `(dev, ino)` check. Filesystems without
 //! stable file ids fail loudly instead of silently skipping the net.
 //!
+//! Anchored mutations (audit 1 / P1-B)
+//! -----------------------------------
+//! [`open_root_anchor`] opens the workspace root ONCE as a HANDLE with
+//! `MAXIMUM_ALLOWED` (the caller's full granted rights), `NtCreateFile` over
+//! the absolute path converted to the NT object namespace
+//! ([`dos_path_to_nt_units`]), and a reparse/directory check. Every rooted
+//! content mutation (`create_dir_all`, `open_create_new`, `remove_tree`,
+//! `remove_file`, `atomic_publish`) then acts strictly relative to that
+//! handle:
+//!
+//! * [`anchored_create_dir`] / [`anchored_create_file`]: relative
+//!   `NtCreateFile` with `FILE_CREATE` (exclusive, `EEXIST` on collision);
+//! * [`windows_open_child_dir_anchored`]: ancestor chain opens relative to
+//!   the verified parent, strict no-follow;
+//! * [`anchored_open_entry`] + [`anchored_delete_entry`]: the target is
+//!   opened reparse-aware relative to its parent and THAT handle is marked
+//!   for disposition (`FileDispositionInfoEx`, POSIX semantics);
+//! * [`anchored_rename`]: `FileRenameInfoEx` with the anchored destination
+//!   parent handle as `RootDirectory`.
+//!
+//! After an operation begins, no absolute pathname selects the mutated
+//! object. The `cfg(windows)` seam suite
+//! (`anchored_*_survives_parent_swap_to_outside_junction`) pins this on a
+//! Windows runner: a parent swapped for an outside junction after anchoring
+//! cannot redirect create/delete/recursive-delete/publish.
+//!
 //! Honest limits
 //! -------------
 //! `fs::rename`/`fs::hard_link` have no compare-and-swap form on Windows
 //! either, so the guarded writers keep the same recheck-to-rename window
-//! unix documents; the parent-directory handle walk immediately before the
-//! rename removes the swap-the-parent window. This module is compiled under
+//! unix documents; the anchored mutation surface removes the
+//! swap-the-parent window (handles, not pathnames, select the objects).
+//! `RootedDir::create_symlink` still validates its parent through the
+//! reparse-aware walk and then creates the link with the Win32 API
+//! (reparse creation strictly relative to a parent handle needs
+//! `FSCTL_SET_REPARSE_POINT` with a hand-built reparse record and is the
+//! one documented mutation residual). This module is compiled under
 //! `cfg(test)` on unix hosts too, but only its platform-independent
-//! validators/parser run there; the Win32 walk itself requires a Windows
-//! runner.
+//! validators/parser run there; the Win32 walk and the anchored mutation
+//! seam suite require a Windows runner (the code is additionally
+//! type-checked for the MSVC target in a hermetic harness).
 
 #![allow(unsafe_code)] // platform authority module: every unsafe
                        // block/function in this module carries a `// SAFETY:` justification and is
@@ -347,6 +379,81 @@ pub(crate) fn lexical_components(root: &[u16], rel: &[u16]) -> Result<Vec<Vec<u1
         return Err(PathHazard::TooManyComponents);
     }
     Ok(comps)
+}
+
+fn units_of(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+/// Convert an absolute Win32/DOS-namespace path (the spelling
+/// `std::path::absolute` returns) to the NT object-namespace form
+/// `NtCreateFile` accepts with a null root:
+///
+/// * `C:\ws`                    -> `\??\C:\ws`
+/// * `\\server\share\x`         -> `\??\UNC\server\share\x`
+/// * `\\?\C:\ws`                -> `\??\C:\ws`
+/// * `\\?\UNC\server\share\x`   -> `\??\UNC\server\share\x`
+///
+/// Device-namespace (`\\.\`) and object-manager-rooted (`\foo`) forms are
+/// denied: an anchored open must never address a device or the object-manager
+/// root. A relative path is denied too (the caller makes it absolute first).
+/// Forward slashes are normalized to `\` (Win32 treats both as separators,
+/// the NT parse path does not).
+pub(crate) fn dos_path_to_nt_units(units: &[u16]) -> Result<Vec<u16>, PathHazard> {
+    if units.contains(&0) {
+        return Err(PathHazard::Nul);
+    }
+    // Win32 accepts `/` as a separator; the NT parse path expects `\`.
+    let units: Vec<u16> = units
+        .iter()
+        .map(|u| if is_sep(*u) { u16::from(b'\\') } else { *u })
+        .collect();
+    let units = units.as_slice();
+    if starts_with_ci(units, r"\\?\") || starts_with_ci(units, r"\??\") {
+        let rest = &units[4..];
+        if rest.is_empty() {
+            return Err(PathHazard::Rooted);
+        }
+        if starts_with_ci(rest, r"UNC\") {
+            let server_share = &rest[4..];
+            if split_raw(server_share).len() < 2 {
+                return Err(PathHazard::UncRoot);
+            }
+            let mut out = units_of(r"\??\UNC\");
+            out.extend_from_slice(server_share);
+            return Ok(out);
+        }
+        let mut out = units_of(r"\??\");
+        out.extend_from_slice(rest);
+        return Ok(out);
+    }
+    if starts_with_ci(units, r"\\.\") {
+        return Err(PathHazard::DeviceNamespace);
+    }
+    if units.len() >= 2 && is_sep(units[0]) && is_sep(units[1]) {
+        let rest = &units[2..];
+        if split_raw(rest).len() < 2 {
+            return Err(PathHazard::UncRoot);
+        }
+        let mut out = units_of(r"\??\UNC\");
+        out.extend_from_slice(rest);
+        return Ok(out);
+    }
+    if looks_rooted(units) {
+        if is_drive_spec(units) {
+            if units.len() == 2 || !is_sep(units[2]) {
+                return Err(PathHazard::DriveRelative);
+            }
+            let mut out = units_of(r"\??\");
+            out.extend_from_slice(units);
+            return Ok(out);
+        }
+        // A single leading separator (`\foo`) is the object-manager root,
+        // not the DOS namespace: not addressable as a Win32 root.
+        return Err(PathHazard::Rooted);
+    }
+    // Relative paths must be absolutized by the caller before conversion.
+    Err(PathHazard::Rooted)
 }
 
 /// A parsed Windows root marker, comparable across spelling variants
@@ -619,36 +726,41 @@ mod nt {
     use std::path::{Path, PathBuf};
     use std::ptr;
 
-    use faktor_core::error::Error;
+    use faktor_core::error::{Error, ErrorKind};
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        NtCreateFile, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT,
-        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+        FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
     };
     use windows_sys::Win32::Foundation::{
         GetLastError, RtlNtStatusToDosError, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
         ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND,
         HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE, STATUS_ACCESS_DENIED,
-        STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
-        UNICODE_STRING,
+        STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
+        STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FileAttributeTagInfo, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
-        FileIdInfo, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY,
-        FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, OPEN_EXISTING, SYNCHRONIZE, VOLUME_NAME_DOS,
+        CreateFileW, FileAttributeTagInfo, FileDispositionInfoEx, FileIdBothDirectoryInfo,
+        FileIdBothDirectoryRestartInfo, FileIdInfo, FileRenameInfoEx, GetFileInformationByHandleEx,
+        GetFileSizeEx, GetFinalPathNameByHandleW, SetFileInformationByHandle, DELETE,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
+        FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+        FILE_READ_DATA, FILE_READ_EA, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_WRITE_DATA, OPEN_EXISTING, SYNCHRONIZE, VOLUME_NAME_DOS,
     };
     use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+    use windows_sys::Win32::System::SystemServices::MAXIMUM_ALLOWED;
     use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 
     use super::{
-        lexical_components, parse_reparse_data, rebase_target, strip_root_prefix, ParsedReparse,
-        Rebase, IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_SYMLINK, MAX_COMPONENTS,
-        MAX_SYMLINK_HOPS, SYMLINK_FLAG_RELATIVE,
+        dos_path_to_nt_units, lexical_components, parse_reparse_data, rebase_target,
+        split_relative, strip_root_prefix, ParsedReparse, Rebase, IO_REPARSE_TAG_MOUNT_POINT,
+        IO_REPARSE_TAG_SYMLINK, MAX_COMPONENTS, MAX_SYMLINK_HOPS, SYMLINK_FLAG_RELATIVE,
     };
     use crate::platform::OpenKind;
+    use crate::rooted::{RootedEntryKind, RootedEntryMeta};
 
     const INITIAL_REPARSE_BUF: usize = 16 * 1024;
     const MAX_REPARSE_BUF: usize = 128 * 1024;
@@ -899,23 +1011,23 @@ mod nt {
         status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND
     }
 
-    /// Open `name` relative to the parent directory handle, never following
-    /// the final reparse point. `directory` requests a directory handle
-    /// (`FILE_DIRECTORY_FILE`); intermediates are always directories.
+    /// One anchored `NtCreateFile`: `name` is resolved relative to the
+    /// directory `parent` (a null parent means `name` is a full `\??\`
+    /// object-namespace path). `access` is the NT desired-access mask,
+    /// `disposition` the create disposition and `options` the create
+    /// options; share access is always read|write|delete so the anchored
+    /// rename/delete steps can act on an entry another handle still holds.
     ///
     /// Canonical NT recipe (MSDN `NtCreateFile` / `OBJECT_ATTRIBUTES`):
     /// length-delimited `UNICODE_STRING` (no NUL; a Windows file name may
-    /// legally contain none, and the string is not NUL-terminated),
-    /// `OBJ_CASE_INSENSITIVE`, RWD share access, `FILE_OPEN` disposition,
-    /// `FILE_SYNCHRONOUS_IO_NONALERT`, and `FILE_OPEN_REPARSE_POINT` so the
-    /// walker — not the kernel — decides whether a reparse point is
-    /// followed. `FILE_OPEN_FOR_BACKUP_INTENT` keeps traversal working
-    /// through entries whose ACL denies ordinary access (the walk still
-    /// re-validates every target itself).
-    fn nt_open_relative(
+    /// legally contain none, and the string is not NUL-terminated) and
+    /// `OBJ_CASE_INSENSITIVE`.
+    fn nt_open(
         parent: HANDLE,
         name: &[u16],
-        directory: bool,
+        access: u32,
+        disposition: u32,
+        options: u32,
     ) -> Result<OwnedHandle, NtOpenError> {
         if name.is_empty() {
             return Err(NtOpenError::EmptyName);
@@ -936,19 +1048,6 @@ mod nt {
             SecurityDescriptor: ptr::null(),
             SecurityQualityOfService: ptr::null(),
         };
-        // Intermediates need only list the directory plus the attribute
-        // query the reparse check performs; a final file needs read data
-        // (`FILE_LIST_DIRECTORY` is the directory form of `FILE_READ_DATA`).
-        let access = if directory {
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE
-        } else {
-            FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE
-        };
-        let mut options =
-            FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT;
-        if directory {
-            options |= FILE_DIRECTORY_FILE;
-        }
         let mut handle: HANDLE = ptr::null_mut();
         let mut iosb = IO_STATUS_BLOCK::default();
         // SAFETY: the OBJECT_ATTRIBUTES point at a live UNICODE_STRING whose
@@ -963,7 +1062,7 @@ mod nt {
                 ptr::null(),
                 0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                FILE_OPEN,
+                disposition,
                 options,
                 ptr::null(),
                 0,
@@ -974,6 +1073,36 @@ mod nt {
         }
         // SAFETY: NtCreateFile succeeded and the handle is owned by us.
         Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+    }
+
+    /// Open `name` relative to the parent directory handle, never following
+    /// the final reparse point. `directory` requests a directory handle
+    /// (`FILE_DIRECTORY_FILE`); intermediates are always directories.
+    ///
+    /// `FILE_OPEN` disposition, `FILE_SYNCHRONOUS_IO_NONALERT`, and
+    /// `FILE_OPEN_REPARSE_POINT` so the walker — not the kernel — decides
+    /// whether a reparse point is followed. `FILE_OPEN_FOR_BACKUP_INTENT`
+    /// keeps traversal working through entries whose ACL denies ordinary
+    /// access (the walk still re-validates every target itself).
+    fn nt_open_relative(
+        parent: HANDLE,
+        name: &[u16],
+        directory: bool,
+    ) -> Result<OwnedHandle, NtOpenError> {
+        // Intermediates need only list the directory plus the attribute
+        // query the reparse check performs; a final file needs read data
+        // (`FILE_LIST_DIRECTORY` is the directory form of `FILE_READ_DATA`).
+        let access = if directory {
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+        } else {
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE
+        };
+        let mut options =
+            FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT;
+        if directory {
+            options |= FILE_DIRECTORY_FILE;
+        }
+        nt_open(parent, name, access, FILE_OPEN, options)
     }
 
     fn read_reparse(handle: HANDLE) -> Result<ParsedReparse, Error> {
@@ -1141,6 +1270,372 @@ mod nt {
         Ok(handle)
     }
 
+    // -------------------------------------------------------------------
+    // Anchored mutation surface (audit 1 / P1-B)
+    // -------------------------------------------------------------------
+    //
+    // Every rooted mutation is performed RELATIVE to a directory HANDLE that
+    // was itself reached relative to the root handle opened once by
+    // [`open_root_anchor`]. No absolute pathname selects the mutated object
+    // after the operation begins: creates use `NtCreateFile` with
+    // `FILE_CREATE`, deletes open the target reparse-aware relative to its
+    // parent and mark that handle for disposition, and publishes rename
+    // through `FileRenameInfoEx` naming an anchored destination parent.
+    // The ancestor handles are opened with `MAXIMUM_ALLOWED`, so a caller
+    // that may not write a component gets an `ACCESS_DENIED` at the mutation
+    // itself instead of a silently degraded open.
+
+    /// How an anchored exclusive create ended: the created entry's handle, or
+    /// the name was already taken (the `EEXIST` analogue).
+    pub(crate) enum AnchoredCreateOutcome {
+        Created(OwnedHandle),
+        AlreadyExists,
+    }
+
+    /// One entry opened for an anchored mutation: the reparse-aware handle
+    /// (never following a reparse point) plus its attribute word.
+    pub(crate) struct AnchoredEntry {
+        pub(crate) handle: OwnedHandle,
+        pub(crate) attributes: u32,
+    }
+
+    /// Map an anchored open failure to a typed error; `what` is the
+    /// caller-facing relative path and `name` the failing component.
+    fn anchored_nt_error(what: &Path, name: &[u16], err: NtOpenError) -> Error {
+        let comp = String::from_utf16_lossy(name);
+        match err {
+            NtOpenError::EmptyName => Error::malformed(format!("{what:?}: empty path component")),
+            NtOpenError::NameTooLong => Error::oversized(format!(
+                "{what:?}: path component {comp:?} exceeds the NT name bound"
+            )),
+            NtOpenError::Status(status) => match status {
+                STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => {
+                    Error::not_found(format!("{}", what.display()))
+                }
+                STATUS_NOT_A_DIRECTORY => Error::permission(format!(
+                    "{}: component {comp:?} is not a directory",
+                    what.display()
+                )),
+                STATUS_ACCESS_DENIED => Error::permission(format!(
+                    "{}: access denied (NTSTATUS {:#010X})",
+                    what.display(),
+                    status as u32
+                )),
+                // SAFETY: RtlNtStatusToDosError only maps an NTSTATUS value
+                // the kernel already returned above; it takes no pointers.
+                _ => Error::internal(format!(
+                    "{}: NTSTATUS {:#010X} (win32 {})",
+                    what.display(),
+                    status as u32,
+                    unsafe { RtlNtStatusToDosError(status) }
+                )),
+            },
+        }
+    }
+
+    /// Exclusively create directory `name` under the verified parent handle
+    /// (`NtCreateFile` with `FILE_CREATE`). An existing entry — including
+    /// any reparse point — is reported as
+    /// [`AnchoredCreateOutcome::AlreadyExists`]; nothing is followed,
+    /// overwritten or created through it. The handle is opened with
+    /// `MAXIMUM_ALLOWED` so it can anchor deeper mutations.
+    pub(crate) fn anchored_create_dir(
+        parent: &OwnedHandle,
+        name: &[u16],
+        rel: &Path,
+    ) -> Result<AnchoredCreateOutcome, Error> {
+        match nt_open(
+            raw(parent),
+            name,
+            MAXIMUM_ALLOWED,
+            FILE_CREATE,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        ) {
+            Ok(handle) => Ok(AnchoredCreateOutcome::Created(handle)),
+            Err(NtOpenError::Status(STATUS_OBJECT_NAME_COLLISION)) => {
+                Ok(AnchoredCreateOutcome::AlreadyExists)
+            }
+            Err(e) => Err(anchored_nt_error(rel, name, e)),
+        }
+    }
+
+    /// Exclusively create file `name` under the verified parent handle
+    /// (`NtCreateFile` with `FILE_CREATE` + `FILE_NON_DIRECTORY_FILE`). An
+    /// existing entry — a file, a directory or a link — is refused with
+    /// `EEXIST` semantics; `FILE_OPEN_REPARSE_POINT` keeps an existing link
+    /// from being followed by the create protocol.
+    pub(crate) fn anchored_create_file(
+        parent: &OwnedHandle,
+        name: &[u16],
+        rel: &Path,
+    ) -> Result<OwnedHandle, Error> {
+        nt_open(
+            raw(parent),
+            name,
+            FILE_WRITE_DATA | FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+        .map_err(|e| match e {
+            NtOpenError::Status(STATUS_OBJECT_NAME_COLLISION) => Error::internal(format!(
+                "cannot create {}: the entry already exists",
+                rel.display()
+            )),
+            other => anchored_nt_error(rel, name, other),
+        })
+    }
+
+    /// Open a child directory relative to an already-open parent with the
+    /// caller's `MAXIMUM_ALLOWED` rights and strict no-follow semantics: a
+    /// reparse child is refused, and the returned handle carries whatever
+    /// rights the caller really has on that component, so the anchored
+    /// mutation chain can continue through it exactly like a path walk
+    /// (traverse rights on a component never require write rights on it).
+    pub(crate) fn windows_open_child_dir_anchored(
+        parent: &OwnedHandle,
+        name: &[u16],
+        rel: &Path,
+    ) -> Result<OwnedHandle, Error> {
+        let handle = nt_open(
+            raw(parent),
+            name,
+            MAXIMUM_ALLOWED,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+        .map_err(|e| anchored_nt_error(rel, name, e))?;
+        let info = attribute_tag(raw(&handle))
+            .ok_or_else(|| Error::internal(format!("{}: attribute query failed", rel.display())))?;
+        if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(Error::permission(format!(
+                "{}: component is a reparse point; the anchored walk never follows a link",
+                rel.display()
+            )));
+        }
+        if info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(Error::permission(format!(
+                "{}: component is not a directory",
+                rel.display()
+            )));
+        }
+        Ok(handle)
+    }
+
+    /// Open `name` relative to the verified parent handle with
+    /// `FILE_OPEN_REPARSE_POINT` and DELETE access, so the caller can decide
+    /// what the entry IS and then unlink exactly that object. The final
+    /// component is never followed; the attribute word is returned so the
+    /// caller can distinguish a link, a directory and a file WITHOUT a
+    /// second pathname query.
+    ///
+    /// The read-data right (directory list for a directory) is requested
+    /// first because a recursive delete must enumerate real directories; an
+    /// ACL that grants DELETE but denies read is retried without it, so
+    /// unlinking never requires more than `unlink(2)` does (and a reparse
+    /// entry, whose data right may be refused, is still openable for
+    /// deletion).
+    pub(crate) fn anchored_open_entry(
+        parent: &OwnedHandle,
+        name: &[u16],
+        rel: &Path,
+    ) -> Result<AnchoredEntry, Error> {
+        let options = FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT;
+        let full = FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE | DELETE;
+        let handle = match nt_open(raw(parent), name, full, FILE_OPEN, options) {
+            Ok(handle) => handle,
+            Err(NtOpenError::Status(STATUS_ACCESS_DENIED)) => {
+                let minimal = FILE_READ_ATTRIBUTES | SYNCHRONIZE | DELETE;
+                nt_open(raw(parent), name, minimal, FILE_OPEN, options)
+                    .map_err(|e| anchored_nt_error(rel, name, e))?
+            }
+            Err(e) => return Err(anchored_nt_error(rel, name, e)),
+        };
+        let info = attribute_tag(raw(&handle))
+            .ok_or_else(|| Error::internal(format!("{}: attribute query failed", rel.display())))?;
+        Ok(AnchoredEntry {
+            handle,
+            attributes: info.FileAttributes,
+        })
+    }
+
+    /// Mark an open handle's entry for deletion (`FileDispositionInfoEx`
+    /// with DELETE + POSIX_SEMANTICS + IGNORE_READONLY_ATTRIBUTE): the unlink
+    /// is immediate even while this handle is open and never blocked by the
+    /// read-only attribute. The handle must have been opened with DELETE
+    /// access; a directory must already be empty (the caller removes the
+    /// children first).
+    pub(crate) fn anchored_delete_entry(handle: &OwnedHandle, rel: &Path) -> Result<(), Error> {
+        let info = FILE_DISPOSITION_INFO_EX {
+            Flags: FILE_DISPOSITION_FLAG_DELETE
+                | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+                | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        };
+        // SAFETY: `handle` is a live handle opened with DELETE access; `info`
+        // is a live, correctly sized FILE_DISPOSITION_INFO_EX and its exact
+        // size is passed, so the kernel reads stay inside the struct.
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                raw(handle),
+                FileDispositionInfoEx,
+                (&info as *const FILE_DISPOSITION_INFO_EX).cast::<c_void>(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+            )
+        };
+        if ok == 0 {
+            // SAFETY: GetLastError reads the calling thread's last-error slot
+            // after the failed call above and takes no arguments.
+            let code = unsafe { GetLastError() };
+            return Err(match code {
+                ERROR_ACCESS_DENIED => {
+                    Error::permission(format!("cannot remove {}: access denied", rel.display()))
+                }
+                ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => {
+                    Error::not_found(format!("{}", rel.display()))
+                }
+                _ => Error::internal(format!(
+                    "cannot remove {}: win32 error {code}",
+                    rel.display()
+                )),
+            });
+        }
+        Ok(())
+    }
+
+    /// Rename the entry an open `source` handle names to `dest_name` under
+    /// the verified destination parent handle, via `FileRenameInfoEx` with
+    /// `REPLACE_IF_EXISTS | POSIX_SEMANTICS` (the destination is replaced
+    /// atomically even when open handles exist on either side). Both
+    /// handles are the authority: no pathname is re-resolved anywhere in
+    /// this call.
+    pub(crate) fn anchored_rename(
+        source: &OwnedHandle,
+        dest_parent: &OwnedHandle,
+        dest_name: &[u16],
+        rel: &Path,
+    ) -> Result<(), Error> {
+        if dest_name.is_empty() {
+            return Err(Error::malformed(format!("{rel:?}: empty destination name")));
+        }
+        if dest_name.len() > (u16::MAX as usize) / 2 {
+            return Err(Error::oversized(format!(
+                "{rel:?}: destination name exceeds the NT name bound"
+            )));
+        }
+        // FILE_RENAME_INFO's fixed layout carries a 1-unit FileName; the
+        // kernel reads FileNameLength bytes from the record, so the whole
+        // record is laid out in one `usize`-aligned allocation sized for the
+        // real name.
+        const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x0000_0001;
+        const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
+        let header = std::mem::size_of::<FILE_RENAME_INFO>() - std::mem::size_of::<u16>();
+        let name_bytes = dest_name.len() * 2;
+        let total = header + name_bytes;
+        let mut buffer: Vec<usize> = vec![0; total.div_ceil(std::mem::size_of::<usize>())];
+        let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        // SAFETY: `buffer` is a live allocation aligned to `usize` (at least
+        // the alignment of FILE_RENAME_INFO) with at least `total` bytes
+        // (rounding only grows it); every field and the full
+        // FileNameLength-delimited name are written before the call.
+        unsafe {
+            (*info).Anonymous = windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO_0 {
+                Flags: FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS,
+            };
+            (*info).RootDirectory = raw(dest_parent);
+            (*info).FileNameLength = name_bytes as u32;
+            std::ptr::copy_nonoverlapping(
+                dest_name.as_ptr(),
+                (*info).FileName.as_mut_ptr(),
+                dest_name.len(),
+            );
+        }
+        // SAFETY: `info` points at the live, fully initialized record of
+        // `total` bytes the kernel reads; `source` is a live handle opened
+        // with DELETE access and `dest_parent` a live directory handle.
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                raw(source),
+                FileRenameInfoEx,
+                info.cast::<c_void>(),
+                total as u32,
+            )
+        };
+        if ok == 0 {
+            // SAFETY: GetLastError reads the calling thread's last-error slot
+            // after the failed call above and takes no arguments.
+            let code = unsafe { GetLastError() };
+            return Err(match code {
+                ERROR_ACCESS_DENIED => {
+                    Error::permission(format!("cannot publish {}: access denied", rel.display()))
+                }
+                ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => {
+                    Error::not_found(format!("{}", rel.display()))
+                }
+                _ => Error::internal(format!(
+                    "cannot publish {}: win32 error {code}",
+                    rel.display()
+                )),
+            });
+        }
+        Ok(())
+    }
+
+    /// Open the workspace root ONCE as the anchored-mutation authority:
+    /// `NtCreateFile` over the caller's absolute path converted to the NT
+    /// object namespace (`\??\...`) with `MAXIMUM_ALLOWED`, so the handle
+    /// carries exactly the rights the caller has (a root the caller may only
+    /// read opens fine but cannot be mutated), then a post-open check that
+    /// the entry is a real directory and not a reparse point. Every later
+    /// mutation opens its components relative to this handle.
+    pub(crate) fn open_root_anchor(root: &Path) -> Result<OwnedHandle, Error> {
+        let absolute = std::path::absolute(root)
+            .map_err(|e| Error::internal(format!("cannot resolve root {}: {e}", root.display())))?;
+        let units: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+        let nt_path = dos_path_to_nt_units(&units).map_err(|h| h.into_error(root))?;
+        let handle = nt_open(
+            ptr::null_mut(),
+            &nt_path,
+            MAXIMUM_ALLOWED,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+        .map_err(|e| match e {
+            NtOpenError::Status(STATUS_NOT_A_DIRECTORY) => Error::not_found(format!(
+                "workspace root {} is not a directory",
+                root.display()
+            )),
+            other => anchored_nt_error(root, &nt_path, other),
+        })?;
+        let info = attribute_tag(raw(&handle)).ok_or_else(|| {
+            Error::internal(format!(
+                "workspace root {}: attribute query failed",
+                root.display()
+            ))
+        })?;
+        if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(Error::permission(format!(
+                "workspace root {} was swapped for a reparse point",
+                root.display()
+            )));
+        }
+        if info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(Error::not_found(format!(
+                "workspace root {} is not a directory",
+                root.display()
+            )));
+        }
+        Ok(handle)
+    }
+
+    /// Validate a caller-supplied relative path for an anchored mutation:
+    /// encode to UTF-16 and run the SAME hazard validation the platform walk
+    /// uses (`..`, extended/device prefixes, UNC roots, drive-relative
+    /// forms, alternate-data-stream colons, NULs, separators), then return
+    /// the components. No filesystem access happens here.
+    pub(crate) fn validated_relative_units(rel: &Path) -> Result<Vec<Vec<u16>>, Error> {
+        let units: Vec<u16> = rel.as_os_str().encode_wide().collect();
+        split_relative(&units).map_err(|h| h.into_error(rel))
+    }
+
     /// Classify `rel` as a reparse point (symlink vs junction) or `None` when
     /// it is not reparse-tagged at all. The entry is opened handle-relative
     /// with `FILE_OPEN_REPARSE_POINT` and the tag read from the handle; a
@@ -1164,6 +1659,62 @@ mod nt {
                     "{rel:?}: reparse tag {other:#010X} is not permitted in a workspace path"
                 )))
             }
+        }))
+    }
+
+    /// No-follow metadata of one entry under the canonical `root`, resolved
+    /// by the SAME handle-relative walk as every other operation: the entry
+    /// is opened with `FILE_OPEN_REPARSE_POINT` relative to its verified
+    /// parent handle and inspected through its own handle (attributes +
+    /// size) — never through a re-resolved pathname. A reparse point is
+    /// classified as a link and never followed; intermediate components are
+    /// validated by the walk itself. Missing entries are `None`.
+    pub(crate) fn entry_meta(root: &Path, rel: &Path) -> Result<Option<RootedEntryMeta>, Error> {
+        let outcome = match walk(root, rel, OpenKind::ReparsePoint, false, false) {
+            Ok(outcome) => outcome,
+            Err(e) if matches!(e.kind, ErrorKind::NotFound) => return Ok(None),
+            Err(e) => {
+                // Some volumes refuse a read-data open of a directory made
+                // without FILE_DIRECTORY_FILE; classify it through the
+                // directory walk instead of failing the metadata query.
+                return match walk(root, rel, OpenKind::Directory, false, false) {
+                    Ok(_) => Ok(Some(RootedEntryMeta {
+                        kind: RootedEntryKind::Directory,
+                        size: 0,
+                    })),
+                    Err(_) => Err(e),
+                };
+            }
+        };
+        let info = attribute_tag(raw(&outcome.handle))
+            .ok_or_else(|| Error::internal(format!("{}: attribute query failed", rel.display())))?;
+        if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Ok(Some(RootedEntryMeta {
+                kind: RootedEntryKind::Symlink,
+                size: 0,
+            }));
+        }
+        if info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            return Ok(Some(RootedEntryMeta {
+                kind: RootedEntryKind::Directory,
+                size: 0,
+            }));
+        }
+        let mut size: i64 = 0;
+        // SAFETY: `outcome.handle` is a live file handle opened with
+        // FILE_READ_ATTRIBUTES and `size` is a valid i64 out-parameter;
+        // GetFileSizeEx writes exactly one LARGE_INTEGER and its BOOL result
+        // is checked below.
+        let ok = unsafe { GetFileSizeEx(raw(&outcome.handle), &mut size) };
+        if ok == 0 {
+            return Err(Error::internal(format!(
+                "{}: file size query failed",
+                rel.display()
+            )));
+        }
+        Ok(Some(RootedEntryMeta {
+            kind: RootedEntryKind::File,
+            size: size.max(0) as u64,
         }))
     }
 
@@ -1542,8 +2093,11 @@ mod nt {
 
 #[cfg(windows)]
 pub(crate) use nt::{
-    canonicalize_within, lexical_check, open_no_follow_walk, opened_is_path, read_reparse_link,
-    windows_list_dir_raw, windows_open_child_dir, windows_reparse_class, RawDirEntry, ReparseClass,
+    anchored_create_dir, anchored_create_file, anchored_delete_entry, anchored_open_entry,
+    anchored_rename, canonicalize_within, entry_meta, lexical_check, open_no_follow_walk,
+    open_root_anchor, opened_is_path, read_reparse_link, validated_relative_units,
+    windows_list_dir_raw, windows_open_child_dir, windows_open_child_dir_anchored,
+    windows_reparse_class, AnchoredCreateOutcome, AnchoredEntry, RawDirEntry, ReparseClass,
 };
 
 #[cfg(test)]
@@ -1758,6 +2312,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn rooted_walk_refuses_a_junction_before_descent() {
+        use super::win_tests::make_junction;
         use crate::rooted::{RootedDir, RootedEntryKind, WalkBudget, WalkStep};
         let dir = tempfile::tempdir().unwrap();
         let outside = dir.path().join("outside");
@@ -1791,6 +2346,48 @@ mod tests {
         // The junction target was never entered.
         assert!(outside.join("marker.txt").exists());
         assert!(!outside.join("marker.txt").is_dir());
+    }
+
+    // -------------------------------------- anchored NT path conversion
+
+    /// The anchored root open converts the absolute Win32 spelling to the NT
+    /// object namespace component-for-component; device and object-root
+    /// forms never convert. Pure logic, exercised on every host.
+    #[test]
+    fn dos_path_converts_to_nt_namespace_and_rejects_hazards() {
+        let d = |s: &str| dos_path_to_nt_units(&u(s));
+        assert_eq!(text(&d(r"C:\ws").unwrap()), r"\??\C:\ws");
+        assert_eq!(
+            text(&d(r"\\server\share\ws\x").unwrap()),
+            r"\??\UNC\server\share\ws\x"
+        );
+        assert_eq!(text(&d(r"\\?\C:\ws").unwrap()), r"\??\C:\ws");
+        assert_eq!(
+            text(&d(r"\\?\UNC\Server\Share\ws").unwrap()),
+            r"\??\UNC\Server\Share\ws"
+        );
+        assert_eq!(
+            text(&d(r"\??\Volume{01234567-89ab-cdef-0123-456789abcdef}\ws").unwrap()),
+            r"\??\Volume{01234567-89ab-cdef-0123-456789abcdef}\ws"
+        );
+        // Forward slashes are normalized to the NT separator.
+        assert_eq!(text(&d("C:/ws/sub").unwrap()), r"\??\C:\ws\sub");
+        assert_eq!(
+            text(&d("//server/share/ws").unwrap()),
+            r"\??\UNC\server\share\ws"
+        );
+        // Device namespace, object-manager root, relative forms and an
+        // incomplete UNC root are all hazards.
+        assert_eq!(d(r"\\.\C:"), Err(PathHazard::DeviceNamespace));
+        assert_eq!(d(r"\Windows"), Err(PathHazard::Rooted));
+        assert_eq!(d(r"C:relative"), Err(PathHazard::DriveRelative));
+        assert_eq!(d(r"relative\x"), Err(PathHazard::Rooted));
+        assert_eq!(d(r"\\server"), Err(PathHazard::UncRoot));
+        assert_eq!(d(r"\\?\UNC\server"), Err(PathHazard::UncRoot));
+        assert_eq!(d(r"\\?\"), Err(PathHazard::Rooted));
+        let mut nul = u(r"C:\ws");
+        nul.push(0);
+        assert_eq!(dos_path_to_nt_units(&nul), Err(PathHazard::Nul));
     }
 
     // ------------------------------------------------- reparse parser
@@ -1976,6 +2573,7 @@ mod tests {
 #[cfg(all(test, windows))]
 mod win_tests {
     use super::nt::{clear_walk_seam, install_walk_seam};
+    use crate::rooted::{clear_mutation_seam, install_mutation_seam, RootedDir};
     use crate::{WorkspaceFileService, WorkspaceHandle};
     use faktor_core::error::ErrorKind;
     use faktor_core::id::WorkspaceId;
@@ -2017,6 +2615,7 @@ mod win_tests {
     impl Drop for SeamTest {
         fn drop(&mut self) {
             clear_walk_seam();
+            clear_mutation_seam();
         }
     }
 
@@ -2037,9 +2636,36 @@ mod win_tests {
         }));
     }
 
+    /// Install an anchored-mutation seam firing at most once, on the
+    /// installing thread, only for the given operation-relative path. It
+    /// fires AFTER the parent handle chain is anchored and BEFORE the
+    /// mutation syscall, so the hook can swap the pathname in exactly the
+    /// window the anchored implementation must ignore.
+    fn mutation_swap_seam(target: &str, hook: impl Fn(&Path) + Send + 'static) {
+        let me = std::thread::current().id();
+        let fired = Arc::new(AtomicBool::new(false));
+        let target = target.to_string();
+        install_mutation_seam(Box::new(move |rel: &Path| {
+            if std::thread::current().id() == me
+                && rel == Path::new(&target)
+                && !fired.swap(true, Ordering::SeqCst)
+            {
+                hook(rel);
+            }
+        }));
+    }
+
+    /// Swap `root/<name>` for a junction to `outside` (the parent/hostile
+    /// replacement used by the anchored seam tests). Returns after the
+    /// original directory sits at `<name>-moved`.
+    fn swap_to_outside_junction(root: &Path, name: &str, outside: &Path) {
+        std::fs::rename(root.join(name), root.join(format!("{name}-moved"))).unwrap();
+        make_junction(&root.join(name), outside);
+    }
+
     /// Create a directory junction (IO_REPARSE_TAG_MOUNT_POINT). Junctions
     /// need no SeCreateSymbolicLinkPrivilege, so these tests always run.
-    fn make_junction(link: &Path, target: &Path) {
+    pub(super) fn make_junction(link: &Path, target: &Path) {
         let out = std::process::Command::new("cmd")
             .arg("/C")
             .arg("mklink")
@@ -2466,5 +3092,172 @@ mod win_tests {
         let data = h.read(Path::new("casefile.txt"), 100).unwrap();
         assert_eq!(data.bytes, b"CASE");
         assert_eq!(h.stat(Path::new("CASEFILE.txt")).unwrap().size, 4);
+    }
+
+    // ==================================================================
+    // Audit 1 / P1-B: anchored-mutation seam suite. Each test anchors the
+    // parent HANDLE chain, swaps the parent pathname for an outside junction
+    // in the mutation seam (validate-parent -> swap -> mutate), and proves:
+    // the mutation acts on the PINNED original directory, the outside marker
+    // is byte-identical, and nothing new appears outside.
+    // ==================================================================
+
+    /// (create) `open_create_new` after the parent was swapped: the file is
+    /// created in the pinned original directory, never through the junction.
+    #[test]
+    fn anchored_create_survives_parent_swap_to_outside_junction() {
+        let _seam = SeamTest::new();
+        let (_d, _s, h) = fixture();
+        let root: PathBuf = h.root().to_path_buf();
+        std::fs::create_dir_all(root.join("p")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("marker"), b"OUTSIDE-MARKER").unwrap();
+        let out = outside.path().to_path_buf();
+        let hook_root = root.clone();
+        mutation_swap_seam("p/new.txt", move |_rel| {
+            swap_to_outside_junction(&hook_root, "p", &out);
+        });
+        let dir = RootedDir::open(&root).unwrap();
+        let mut file = dir.open_create_new(Path::new("p/new.txt")).unwrap();
+        use std::io::Write as _;
+        file.write_all(b"ANCHORED-CREATE").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        // The create acted on the pinned directory (now `p-moved`).
+        assert_eq!(
+            std::fs::read(root.join("p-moved/new.txt")).unwrap(),
+            b"ANCHORED-CREATE"
+        );
+        assert!(!outside.path().join("new.txt").exists());
+        assert_eq!(
+            std::fs::read(outside.path().join("marker")).unwrap(),
+            b"OUTSIDE-MARKER"
+        );
+    }
+
+    /// (create_dir_all) the same swap before a nested component is created:
+    /// the directory lands in the pinned original, not through the junction.
+    #[test]
+    fn anchored_create_dir_all_survives_parent_swap_to_outside_junction() {
+        let _seam = SeamTest::new();
+        let (_d, _s, h) = fixture();
+        let root: PathBuf = h.root().to_path_buf();
+        std::fs::create_dir_all(root.join("p")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("marker"), b"OUTSIDE-MARKER").unwrap();
+        let out = outside.path().to_path_buf();
+        let hook_root = root.clone();
+        mutation_swap_seam("p/sub", move |_rel| {
+            swap_to_outside_junction(&hook_root, "p", &out);
+        });
+        let dir = RootedDir::open(&root).unwrap();
+        dir.create_dir_all(Path::new("p/sub")).unwrap();
+        assert!(root.join("p-moved/sub").is_dir());
+        assert!(!outside.path().join("sub").exists());
+        assert_eq!(
+            std::fs::read(outside.path().join("marker")).unwrap(),
+            b"OUTSIDE-MARKER"
+        );
+    }
+
+    /// (delete) `remove_file` after the parent was swapped: the pinned
+    /// original file is unlinked; the outside directory is untouched.
+    #[test]
+    fn anchored_delete_survives_parent_swap_to_outside_junction() {
+        let _seam = SeamTest::new();
+        let (_d, _s, h) = fixture();
+        let root: PathBuf = h.root().to_path_buf();
+        std::fs::create_dir_all(root.join("q")).unwrap();
+        std::fs::write(root.join("q/doomed.txt"), b"INSIDE-DOOMED").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("doomed.txt"), b"OUTSIDE-DOOMED").unwrap();
+        std::fs::write(outside.path().join("marker"), b"OUTSIDE-MARKER").unwrap();
+        let out = outside.path().to_path_buf();
+        let hook_root = root.clone();
+        mutation_swap_seam("q/doomed.txt", move |_rel| {
+            swap_to_outside_junction(&hook_root, "q", &out);
+        });
+        let dir = RootedDir::open(&root).unwrap();
+        dir.remove_file(Path::new("q/doomed.txt")).unwrap();
+        assert!(!root.join("q-moved/doomed.txt").exists());
+        assert_eq!(
+            std::fs::read(outside.path().join("doomed.txt")).unwrap(),
+            b"OUTSIDE-DOOMED"
+        );
+        assert_eq!(
+            std::fs::read(outside.path().join("marker")).unwrap(),
+            b"OUTSIDE-MARKER"
+        );
+    }
+
+    /// (recursive delete) `remove_tree` of a subdirectory after its parent
+    /// was swapped: the pinned original subtree is removed; the outside tree
+    /// survives byte-identically.
+    #[test]
+    fn anchored_recursive_delete_survives_parent_swap_to_outside_junction() {
+        let _seam = SeamTest::new();
+        let (_d, _s, h) = fixture();
+        let root: PathBuf = h.root().to_path_buf();
+        std::fs::create_dir_all(root.join("r/sub/deep")).unwrap();
+        std::fs::write(root.join("r/sub/deep/f.txt"), b"INSIDE").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("sub/deep")).unwrap();
+        std::fs::write(outside.path().join("sub/deep/f.txt"), b"OUTSIDE-KEEP").unwrap();
+        std::fs::write(outside.path().join("marker"), b"OUTSIDE-MARKER").unwrap();
+        let out = outside.path().to_path_buf();
+        let hook_root = root.clone();
+        mutation_swap_seam("r/sub", move |_rel| {
+            swap_to_outside_junction(&hook_root, "r", &out);
+        });
+        let dir = RootedDir::open(&root).unwrap();
+        dir.remove_tree(Path::new("r/sub")).unwrap();
+        assert!(!root.join("r-moved/sub").exists());
+        assert!(root.join("r-moved").is_dir());
+        assert_eq!(
+            std::fs::read(outside.path().join("sub/deep/f.txt")).unwrap(),
+            b"OUTSIDE-KEEP"
+        );
+        assert_eq!(
+            std::fs::read(outside.path().join("marker")).unwrap(),
+            b"OUTSIDE-MARKER"
+        );
+    }
+
+    /// (atomic publish) `atomic_publish` after the shared parent was swapped:
+    /// the rename acts on the pinned directory handle; the outside directory
+    /// is byte-identical and receives no temp or destination entry.
+    #[test]
+    fn anchored_atomic_publish_survives_parent_swap_to_outside_junction() {
+        let _seam = SeamTest::new();
+        let (_d, _s, h) = fixture();
+        let root: PathBuf = h.root().to_path_buf();
+        std::fs::create_dir_all(root.join("s")).unwrap();
+        std::fs::write(root.join("s/.tmp-1"), b"WHOLE-PAYLOAD").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("marker"), b"OUTSIDE-MARKER").unwrap();
+        let out = outside.path().to_path_buf();
+        let hook_root = root.clone();
+        mutation_swap_seam("s/.tmp-1", move |_rel| {
+            swap_to_outside_junction(&hook_root, "s", &out);
+        });
+        let dir = RootedDir::open(&root).unwrap();
+        dir.atomic_publish(Path::new("s/.tmp-1"), Path::new("s/final"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.join("s-moved/final")).unwrap(),
+            b"WHOLE-PAYLOAD"
+        );
+        assert!(!root.join("s-moved/.tmp-1").exists());
+        assert!(!outside.path().join("final").exists());
+        let names: Vec<String> = std::fs::read_dir(outside.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["marker".to_string()]);
+        assert_eq!(
+            std::fs::read(outside.path().join("marker")).unwrap(),
+            b"OUTSIDE-MARKER"
+        );
     }
 }

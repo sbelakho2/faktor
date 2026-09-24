@@ -1,7 +1,40 @@
 {
+  "lookup": {
+    "id": 7,
+    "full_name": "acme/widgets",
+    "config_file": ".woodpecker/untrusted/",
+    "trusted": {
+      "volumes": false
+    }
+  },
+  "lookup_trusted": {
+    "id": 8,
+    "full_name": "acme/widgets",
+    "config_file": ".woodpecker/trusted/",
+    "trusted": {
+      "volumes": true
+    }
+  },
+  "repo7": {
+    "id": 7,
+    "full_name": "acme/widgets",
+    "config_file": ".woodpecker/untrusted/",
+    "trusted": {
+      "volumes": false
+    }
+  },
+  "repo8": {
+    "id": 8,
+    "full_name": "acme/widgets",
+    "config_file": ".woodpecker/trusted/",
+    "trusted": {
+      "volumes": true
+    }
+  },
   "pipelines": [
     {
       "number": 11,
+      "id": 111,
       "status": "success",
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "event": "pull_request",
@@ -10,12 +43,14 @@
   ],
   "detail": {
     "number": 11,
+    "id": 111,
     "status": "success",
     "commit": "0123456789abcdef0123456789abcdef01234567",
     "event": "pull_request",
     "workflows": [
-      {"name": "pr", "state": "success"},
-      {"name": "linux", "state": "success"}
+      {"name": "pr", "state": "success", "children": []},
+      {"name": "linux", "state": "success", "children": []}
     ]
-  }
+  },
+  "logs": {}
 }

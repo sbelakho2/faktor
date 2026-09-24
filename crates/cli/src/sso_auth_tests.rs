@@ -127,22 +127,30 @@ async fn public_client_happy_path_mints_an_authorization_url() {
     let start = authority
         .start(&organization, &sso_ref, "https://app.example/sso/callback")
         .await
-        .unwrap();
+        .unwrap()
+        .into_wire_response();
     assert!(
         start
-            .authorization_url
+            .authorization_url()
             .starts_with(&format!("{base}/authorize?")),
         "{}",
-        start.authorization_url
+        start.authorization_url()
     );
     assert!(start
-        .authorization_url
+        .authorization_url()
         .contains("code_challenge_method=S256"));
     assert!(start
-        .authorization_url
-        .contains(&format!("state={}", start.state)));
-    assert_eq!(start.state.len(), 64, "32 random bytes hex-encoded");
-    assert_eq!(start.nonce.len(), 64);
+        .authorization_url()
+        .contains(&format!("state={}", start.state())));
+    assert_eq!(start.state().len(), 64, "32 random bytes hex-encoded");
+    // The nonce is a wrapped secret: it rides ONLY the authorization URL
+    // (read back here to assert the 32 random bytes are present).
+    let nonce = start
+        .authorization_url()
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("nonce="))
+        .expect("the URL carries the nonce");
+    assert_eq!(nonce.len(), 64);
     assert_eq!(
         mock.requests("GET", "/.well-known/openid-configuration")
             .len(),
@@ -184,9 +192,10 @@ async fn confidential_section_builds_from_the_staged_secret_and_refuses_bad_meth
     let start = authority
         .start(&organization, &sso_ref, "https://app.example/sso/callback")
         .await
-        .unwrap();
+        .unwrap()
+        .into_wire_response();
     assert!(start
-        .authorization_url
+        .authorization_url()
         .starts_with(&format!("{base}/authorize?")));
     assert_eq!(
         cfg.client_auth_method().unwrap(),

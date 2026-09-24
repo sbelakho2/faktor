@@ -1125,6 +1125,11 @@ fn map_egress_error(error: EgressError) -> connectors::TransportError {
         | EgressError::TooManyRedirects { .. }
         | EgressError::RedirectBodyNotReplayable { .. }
         | EgressError::UncheckedRedirectFollowed { .. }
+        // A checked-transport response that is malformed, or a body read
+        // outside the checked response binding, is a protocol failure —
+        // never retried as a network fault.
+        | EgressError::MalformedResponse { .. }
+        | EgressError::UnboundResponseBody
         | EgressError::Transport(_) => ConnectorError::Protocol,
     }
 }
@@ -1410,6 +1415,10 @@ fn browser_source_error(error: faktor_browser::BrowserError) -> SourceError {
         // download/retire work lands; the owning sibling may adjust.
         Browser::DownloadRejected { .. } => SourceError::InvalidRequest,
         Browser::Retiring { .. } => SourceError::BrowserUnavailable,
+        // A requested OS-level isolation that the spawn layer refused: the
+        // browser is not available under the required confinement, never
+        // silently downgraded to proxy-only.
+        Browser::IsolationUnavailable { .. } => SourceError::EgressUnavailable,
     }
 }
 

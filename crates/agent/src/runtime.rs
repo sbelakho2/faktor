@@ -397,27 +397,6 @@ the transcript; if the transcript is incomplete, say exactly what is missing. Pr
 structured output (short labeled sections). Do not answer the latest user message: do not \
 add advice, do not continue the task, do not write code.";
 
-/// BLAKE3 of a file via bounded 64KiB chunks (never read-whole-file).
-/// Unreadable/missing files hash to the zero marker.
-fn stream_hash_file(path: &str) -> faktor_core::hash::FileHash {
-    use std::io::Read;
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return faktor_core::hash::FileHash::from([0u8; 32]);
-    };
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        match f.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                hasher.update(&buf[..n]);
-            }
-            Err(_) => break,
-        }
-    }
-    faktor_core::hash::FileHash::from(hasher.finalize().into())
-}
-
 /// How the runtime asks for permission. The server implementation waits on a
 /// durable permission row + a UI response channel (async so blocking on the
 /// user never stalls a tokio worker).
@@ -2008,6 +1987,74 @@ fn workspace_relative_path_rejection(rel: &str) -> Option<&'static str> {
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         return Some("path traversal (..)");
+    }
+    None
+}
+
+/// One-time legacy migration proof (audit P1-F): derive the normalized
+/// workspace-relative path of a legacy `VerifyHash` path, or `None` when the
+/// path cannot be PROVEN to be inside the canonical workspace `root`.
+/// Canonicalization is the proof: `..` climbs, symlinks pointing out of the
+/// root, and different roots all fail the `strip_prefix` step. A
+/// not-yet-existing tail is appended lexically to its canonicalized deepest
+/// existing ancestor (a missing component cannot be a symlink; the handle
+/// re-walks the relative path under its own anchored resolution at
+/// verification time, so a swap after this proof can never redirect the
+/// read outside). The caller must classify `None` as Unknown/NeedsUserInput
+/// — never Verified.
+fn legacy_relative_path_within(root: &std::path::Path, legacy: &str) -> Option<String> {
+    if legacy.is_empty() || legacy.contains('\0') {
+        return None;
+    }
+    let raw = std::path::Path::new(legacy);
+    let joined = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        root.join(raw)
+    };
+    let canonical = canonicalize_lenient(&joined)?;
+    let relative = canonical.strip_prefix(root).ok()?;
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    // Canonicalization removes `.`/`..`/root components; anything else
+    // surviving (a hostile dialect, a device name) is refused.
+    if relative
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(relative.to_str()?.to_string())
+}
+
+/// Canonicalize `path`; when part of the tail does not exist yet,
+/// canonicalize the deepest existing ancestor and append the missing
+/// components lexically (a missing component cannot be a symlink). `None`
+/// when no ancestor resolves or a missing component is `..`.
+fn canonicalize_lenient(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Ok(canonical) = path.canonicalize() {
+        return Some(canonical);
+    }
+    // A path ending in `..` (or at the filesystem root itself) has no
+    // provable lexical continuation.
+    let mut tail: Vec<std::ffi::OsString> = vec![path.file_name()?.to_os_string()];
+    let mut current = path.parent();
+    while let Some(dir) = current {
+        if let Ok(canonical) = dir.canonicalize() {
+            let mut out = canonical;
+            for name in tail.iter().rev() {
+                if name == ".." {
+                    return None;
+                }
+                out.push(name);
+            }
+            return Some(out);
+        }
+        // Same refusal for a `..` ancestor: canonicalization could not
+        // resolve it, and lexical guessing is not a proof.
+        tail.push(dir.file_name()?.to_os_string());
+        current = dir.parent();
     }
     None
 }
@@ -3804,7 +3851,9 @@ impl AgentRuntime {
     /// Crash-recovery sweep over every session (daemon startup, spec §7).
     /// Runtime-level: rows are resolved with runtime knowledge —
     /// workspace-scoped postcondition verification for workspace writes,
-    /// legacy absolute-path hash verification, unknown-effect marking.
+    /// one-time migration of legacy absolute-path `VerifyHash` rows to
+    /// proven-inside workspace-relative identities (unprovable containment
+    /// becomes Unknown/NeedsUserInput), unknown-effect marking.
     /// Interrupted turns whose rows need ASYNC replay (idempotent tools with
     /// a stored ReplayDescriptor) keep their rows running and their machine
     /// continuable; the per-session queue runner (or `continue_turn`)
@@ -3960,8 +4009,12 @@ impl AgentRuntime {
     /// running on the SAME row — the replay is a new physical attempt of the
     /// same logical operation. Everything else is finished durably here:
     /// workspace writes verify their recorded FilePostcondition through the
-    /// workspace service (never a hash of JSON-encoded args); legacy
-    /// VerifyHash rows hash the absolute path; MarkUnknown/Manual/None and
+    /// workspace service (never a hash of JSON-encoded args, never a hash of
+    /// a raw pathname); legacy VerifyHash rows are migrated ONCE — the old
+    /// path is only a containment claim, canonicalized against the session's
+    /// durable root, converted to a workspace-relative postcondition and
+    /// verified through the handle, or classified Unknown/NeedsUserInput
+    /// when containment cannot be proven; MarkUnknown/Manual/None and
     /// legacy descriptor-less Idempotent rows are marked failed/unknown
     /// (never blindly re-run).
     fn recover_session(
@@ -4098,13 +4151,41 @@ impl AgentRuntime {
         for (row, verdict) in &verdicts {
             match verdict {
                 Verdict::Verify { .. } | Verdict::LegacyVerify { .. } => {
-                    let (expected, actual) = match verdict {
+                    let (expected, actual, legacy_migrated) = match verdict {
                         Verdict::Verify { postcondition } => (
                             postcondition.expected_hash,
                             self.verify_workspace_file(handle.id(), postcondition)?,
+                            None,
                         ),
                         Verdict::LegacyVerify { path, expected } => {
-                            (*expected, Some(stream_hash_file(path)))
+                            // One-time migration (audit P1-F): a legacy
+                            // absolute pathname is NEVER an execution
+                            // capability. Containment must be PROVEN against
+                            // the session's durable workspace root; only then
+                            // is the old path converted to a normalized
+                            // relative path and recorded durably on the
+                            // running row as the modern postcondition BEFORE
+                            // any read. A row whose containment cannot be
+                            // proven is classified Unknown/NeedsUserInput —
+                            // never Verified, and no raw path is ever read.
+                            let Some(postcondition) =
+                                self.migrate_legacy_verify_row(handle, row, path, *expected)?
+                            else {
+                                self.fail_unknown_effect(
+                                    handle,
+                                    row,
+                                    "legacy_unverifiable",
+                                    RecoveryAction::NeedsHuman,
+                                    &mut report,
+                                )?;
+                                continue;
+                            };
+                            let relative = postcondition.relative_path.clone();
+                            (
+                                *expected,
+                                self.verify_workspace_file(handle.id(), &postcondition)?,
+                                Some(relative),
+                            )
                         }
                         _ => unreachable!(),
                     };
@@ -4116,6 +4197,7 @@ impl AgentRuntime {
                             "completed",
                             EffectStatus::Verified,
                             "verified",
+                            legacy_migrated.as_deref(),
                         )?;
                         report.crashed_ops.push(RecoveredOp {
                             op_id: row.op_id,
@@ -4138,6 +4220,7 @@ impl AgentRuntime {
                             "failed",
                             EffectStatus::Failed,
                             "not_applied",
+                            legacy_migrated.as_deref(),
                         )?;
                         report.crashed_ops.push(RecoveredOp {
                             op_id: row.op_id,
@@ -4149,21 +4232,13 @@ impl AgentRuntime {
                     }
                 }
                 Verdict::FailUnknown => {
-                    handle.finish_tool_run(row.op_id, "failed", EffectStatus::Unknown)?;
-                    self.journal_recovery_applied(
+                    self.fail_unknown_effect(
                         handle,
                         row,
-                        "failed",
-                        EffectStatus::Unknown,
                         "unknown_effect",
+                        RecoveryAction::UnknownEffect,
+                        &mut report,
                     )?;
-                    report.crashed_ops.push(RecoveredOp {
-                        op_id: row.op_id,
-                        tool: row.tool.clone(),
-                        status: "failed".into(),
-                        effect: EffectStatus::Unknown,
-                        action: RecoveryAction::UnknownEffect,
-                    });
                 }
                 Verdict::DeferReplay => {
                     if all_deferrable {
@@ -4183,6 +4258,7 @@ impl AgentRuntime {
                             "failed",
                             EffectStatus::Unknown,
                             "unknown_effect",
+                            None,
                         )?;
                         report.crashed_ops.push(RecoveredOp {
                             op_id: row.op_id,
@@ -4220,21 +4296,100 @@ impl AgentRuntime {
         status: &str,
         effect: EffectStatus,
         action: &str,
+        legacy_migrated_to: Option<&str>,
     ) -> faktor_core::Result<()> {
         let state = handle.state()?;
+        let mut payload = serde_json::json!({
+            "op_id": row.op_id.raw(),
+            "tool": row.tool,
+            "status": status,
+            "effect": effect_tag(effect),
+            "action": action,
+        });
+        if let Some(relative) = legacy_migrated_to {
+            // Durable evidence of the one-time legacy migration (audit
+            // P1-F): the run was verified through this normalized
+            // workspace-relative identity, never through the recorded raw
+            // pathname.
+            payload["legacy_migrated_to"] = serde_json::json!(relative);
+        }
         handle.append_event(
             faktor_core::event::EventKind::RecoveryApplied,
             state,
             Some(row.op_id),
-            Some(serde_json::json!({
-                "op_id": row.op_id.raw(),
-                "tool": row.tool,
-                "status": status,
-                "effect": effect_tag(effect),
-                "action": action,
-            })),
+            Some(payload),
         )?;
         Ok(())
+    }
+
+    /// Terminal classification of one crashed run whose effect cannot be
+    /// established (unknown external effect, or a legacy `VerifyHash` path
+    /// whose containment cannot be proven): the row is finished
+    /// failed/Unknown — terminal, never re-scanned, never re-verified — and
+    /// the report names the required human decision.
+    fn fail_unknown_effect(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        row: &ToolRunRow,
+        action: &str,
+        report_action: RecoveryAction,
+        report: &mut RecoveryReport,
+    ) -> faktor_core::Result<()> {
+        handle.finish_tool_run(row.op_id, "failed", EffectStatus::Unknown)?;
+        self.journal_recovery_applied(handle, row, "failed", EffectStatus::Unknown, action, None)?;
+        report.crashed_ops.push(RecoveredOp {
+            op_id: row.op_id,
+            tool: row.tool.clone(),
+            status: "failed".into(),
+            effect: EffectStatus::Unknown,
+            action: report_action,
+        });
+        Ok(())
+    }
+
+    /// One-time migration of a legacy `VerifyHash` recovery row (audit
+    /// P1-F). The recorded path is only ever a claim to be PROVEN: the
+    /// session's durable workspace root is resolved, the old path is
+    /// canonicalized to prove it is inside that root, and the proof is
+    /// converted to a normalized workspace-relative path. Only then is the
+    /// still-running row annotated with the modern [`FilePostcondition`]
+    /// (durable, BEFORE any read), so a crash after this write resumes
+    /// through the handle-relative path exactly once and never re-derives
+    /// capability from the legacy string. `None` = containment cannot be
+    /// proven (`..` climbs, symlinks pointing out, different roots,
+    /// unreadable roots, foreign path grammars): the caller classifies the
+    /// effect Unknown/NeedsUserInput, NEVER Verified.
+    fn migrate_legacy_verify_row(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        row: &ToolRunRow,
+        legacy_path: &str,
+        expected: FileHash,
+    ) -> faktor_core::Result<Option<FilePostcondition>> {
+        let Some(root) = self.deps.session.resolve_workspace_root(handle.id())? else {
+            return Ok(None);
+        };
+        let identity = handle.identity()?;
+        let ws = match self.deps.workspaces.open(identity.workspace_id, root) {
+            Ok(ws) => ws,
+            Err(_) => return Ok(None),
+        };
+        let Some(relative) = legacy_relative_path_within(ws.root(), legacy_path) else {
+            return Ok(None);
+        };
+        if workspace_relative_path_rejection(&relative).is_some() {
+            return Ok(None);
+        }
+        let postcondition = FilePostcondition {
+            workspace_id: identity.workspace_id,
+            worktree_id: identity.worktree_id,
+            relative_path: relative,
+            expected_hash: expected,
+        };
+        let raw = serde_json::to_value(&postcondition)
+            .map_err(|e| Error::malformed(format!("legacy postcondition serialization: {e}")))?;
+        handle.record_tool_postcondition(row.op_id, &raw)?;
+        Ok(Some(postcondition))
     }
 
     fn last_event_kind(
@@ -4256,9 +4411,12 @@ impl AgentRuntime {
     /// workspace root (P0-48 root re-pointing: a live shadow of `session`
     /// verifies against the shadow root — a crash mid-drive re-verifies the
     /// file exactly where the write landed; no `..`, no symlink escapes,
-    /// never the daemon cwd), then a streamed BLAKE3 of the CURRENT file
-    /// bytes. `None` when the file is missing or unreadable (the
-    /// zero-marker — "write never landed").
+    /// never the daemon cwd), then a BLAKE3 read through the handle's OWN
+    /// anchored relative open — never a hash of a pathname re-resolved after
+    /// the gate (audit P1-F removed the last raw-path hash from recovery;
+    /// the post-open identity net catches an entry swapped after
+    /// resolution). `None` when the file is missing or unreadable: the
+    /// honest "write never landed" — never Verified.
     fn verify_workspace_file(
         &self,
         session_id: SessionId,
@@ -4287,15 +4445,17 @@ impl AgentRuntime {
                 pc.relative_path
             )));
         }
-        let resolved = ws
-            .resolve(std::path::Path::new(&pc.relative_path))
+        ws.resolve(std::path::Path::new(&pc.relative_path))
             .map_err(|e| {
                 Error::permission(format!(
                     "tool recovery path {:?} rejected: {e}",
                     pc.relative_path
                 ))
             })?;
-        Ok(Some(stream_hash_file(&resolved.to_string_lossy())))
+        match ws.hash_file_streaming(std::path::Path::new(&pc.relative_path), None) {
+            Ok((_bytes, actual)) => Ok(Some(actual)),
+            Err(_) => Ok(None),
+        }
     }
 
     /// Validate a stored replay invocation. A hostile descriptor (missing
@@ -20470,86 +20630,361 @@ mod tests {
         assert!(card.status == "waiting" || card.status == "completed" || card.status == "running");
     }
 
+    // ---- legacy VerifyHash containment migration (audit P1-F) ----
+
+    /// A legacy absolute path that is PROVABLY inside the session's durable
+    /// workspace migrates ONCE to a normalized relative postcondition and
+    /// verifies through the workspace handle — never through the raw path.
     #[tokio::test]
-    async fn crash_recovery_verify_hash_completes_without_rerun() {
-        // Simulate a crash: ToolStarted recorded (VerifyHash) with a file on
-        // disk matching the expected hash; recovery must complete the run
-        // without executing the tool again.
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        let file_path = root.join("target.txt");
-        std::fs::write(&file_path, b"new content").unwrap();
-        let expected = faktor_core::hash::FileHash::from(blake3::hash(b"new content").into());
-
-        let (_base_deps, _base_dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
-        let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
-        let mut deps = AgentDeps {
-            session: session.clone(),
-            providers: Arc::new(ProviderRegistry::new()),
-            chunk_sink: None,
-            permission_requester: Arc::new(AlwaysAllow),
-            evidence: Arc::new(NoEvidence),
-            tools: Arc::new(ToolRegistry::new()),
-            cas: Some(Arc::new(faktor_cas::Cas::open(root.join("cas")).unwrap())),
-            workspaces: faktor_fs::WorkspaceFileService::new(),
-            edit: None,
-            snapshots: None,
-            sandbox: None,
-            supervisor: None,
-            verification: crate::VerificationService::disabled(),
-            hooks: None,
-            instructions_resolver: test_resolver(&session),
-            routing: crate::FixedRoutingPolicy::passthrough(),
-            budgets: Arc::new(faktor_session::NoopBudget),
-            model: "m".into(),
-            compaction_model: None,
-            compact_at_usage: 0.65,
-            instructions: "You are a test agent.".into(),
-            clock: Arc::new(SystemClock),
-            tool_call_mode: ToolCallMode::Native,
-            tool_deadline_ms: 2000,
-            retry_policy: faktor_core::retry::RetryPolicy::default(),
-            semantic: crate::fallback_semantic_registry(),
-            context_prior: None,
-            efficiency: Default::default(),
-        };
-        let mut registry = ProviderRegistry::new();
-        registry
-            .try_register(Arc::new(scripted_provider(vec![ScriptedResponse::End])))
+    async fn legacy_verify_inside_workspace_migrates_and_verifies_through_handle() {
+        let dir = fresh_store_dir();
+        let session: SessionId;
+        let tool_op: OpId;
+        let root: std::path::PathBuf;
+        let expected = FileHash::from(blake3::hash(b"landed").into());
+        {
+            let (manager, _wid, sid, root_path) = workspace_env(&dir);
+            session = sid;
+            root = root_path;
+            std::fs::write(root.join("target.txt"), b"landed").unwrap();
+            let handle = manager.get_session(session).unwrap().unwrap();
+            let receipt = handle.submit_prompt("crash verify", &[]).unwrap();
+            chain_to_streaming(&handle, receipt.op_id);
+            let meta = op_meta(
+                &manager,
+                session,
+                RecoveryStrategy::VerifyHash {
+                    path: root.join("target.txt").to_string_lossy().to_string(),
+                    expected,
+                },
+            );
+            tool_op = meta.operation_id;
+            crash_tool_start(
+                &handle,
+                receipt.op_id,
+                "write_file",
+                serde_json::json!({}),
+                "call_1",
+                meta,
+            );
+        }
+        let (deps2, _keep2) = reopen_runtime(&dir, Arc::new(scripted_provider(vec![])), vec![]);
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let reports = runtime2.recover().unwrap();
+        let report = reports.iter().find(|r| r.session_id == session).unwrap();
+        assert_eq!(report.crashed_ops.len(), 1);
+        assert_eq!(report.crashed_ops[0].status, "completed");
+        assert_eq!(report.crashed_ops[0].effect, EffectStatus::Verified);
+        let handle2 = runtime2
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
             .unwrap();
-        deps.providers = Arc::new(registry);
-        let runtime = AgentRuntime::new(deps).unwrap();
-        let session = new_session(runtime.deps());
-        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        assert!(handle2.pending_tool_runs().unwrap().is_empty());
+        // The migration is durable audit evidence: the RecoveryApplied
+        // journal names the RELATIVE identity the run was verified through.
+        let events = handle2.events_range(1, None).unwrap();
+        let migrated = events.iter().any(|e| {
+            e.kind == faktor_core::event::EventKind::RecoveryApplied
+                && e.op_id == Some(tool_op)
+                && e.payload.as_ref().is_some_and(|p| {
+                    p.get("legacy_migrated_to").and_then(|v| v.as_str()) == Some("target.txt")
+                        && p.get("status").and_then(|v| v.as_str()) == Some("completed")
+                })
+        });
+        assert!(migrated, "the one-time migration must be journaled");
+        // The verified file is untouched: verification is a read, nothing
+        // re-ran.
+        assert_eq!(std::fs::read(root.join("target.txt")).unwrap(), b"landed");
+        // Second sweep: the row is terminal — nothing re-derived, nothing
+        // re-verified.
+        let reports = runtime2.recover().unwrap();
+        assert!(reports.iter().all(|r| r.crashed_ops.is_empty()));
+    }
 
-        // Durable ToolStarted row with VerifyHash recovery, never finished
-        // (the "crash").
-        let op_meta = OpMeta::new(
-            runtime.deps.session.try_next_op_id().unwrap(),
-            session,
-            faktor_core::time::Deadline::at(runtime.deps.clock.now_ms().saturating_add(1000)),
-            faktor_core::retry::RetryPolicy::default(),
-            CancellationToken::new(),
-            RecoveryStrategy::VerifyHash {
-                path: file_path.to_string_lossy().to_string(),
-                expected,
-            },
-            runtime.deps.clock.now_ms(),
+    /// Legacy paths that cannot be PROVEN inside the workspace — a `..`
+    /// climb, a symlink pointing out, a different root — classify the effect
+    /// failed/Unknown and demand a human decision: NEVER Verified. The
+    /// outside files deliberately hold bytes matching `expected`, so the old
+    /// raw-path hash would have "verified" them; containment proof is the
+    /// only thing standing between the row and a false completion.
+    #[tokio::test]
+    async fn legacy_verify_paths_outside_workspace_are_unknown_never_verified() {
+        let dir = fresh_store_dir();
+        let session: SessionId;
+        let outside: Vec<std::path::PathBuf>;
+        let expected = FileHash::from(blake3::hash(b"outside-marker").into());
+        let other_root = tempdir().unwrap();
+        {
+            let (manager, _wid, sid, root) = workspace_env(&dir);
+            session = sid;
+            let handle = manager.get_session(session).unwrap().unwrap();
+            let receipt = handle.submit_prompt("crash verify", &[]).unwrap();
+            chain_to_streaming(&handle, receipt.op_id);
+            // (1) A `..` climb out of the workspace.
+            let climb = root.join("..").join("outside.txt");
+            std::fs::write(&climb, b"outside-marker").unwrap();
+            // (2) A different root entirely.
+            let different = other_root.path().join("other.txt");
+            std::fs::write(&different, b"outside-marker").unwrap();
+            let mut outside_paths = vec![climb.clone(), different.clone()];
+            let mut paths = vec![
+                climb.to_string_lossy().to_string(),
+                different.to_string_lossy().to_string(),
+            ];
+            // (3) A symlink inside the root pointing OUT of it.
+            #[cfg(unix)]
+            {
+                let out_dir = dir.path().join("outside-dir");
+                std::fs::create_dir_all(&out_dir).unwrap();
+                let target = out_dir.join("secret.txt");
+                std::fs::write(&target, b"outside-marker").unwrap();
+                std::os::unix::fs::symlink(&out_dir, root.join("link")).unwrap();
+                outside_paths.push(target.clone());
+                paths.push(
+                    root.join("link")
+                        .join("secret.txt")
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            }
+            outside = outside_paths;
+            for (i, path) in paths.iter().enumerate() {
+                let meta = op_meta(
+                    &manager,
+                    session,
+                    RecoveryStrategy::VerifyHash {
+                        path: path.clone(),
+                        expected,
+                    },
+                );
+                crash_tool_start(
+                    &handle,
+                    receipt.op_id,
+                    "write_file",
+                    serde_json::json!({}),
+                    &format!("call_{i}"),
+                    meta,
+                );
+            }
+        }
+        let (deps2, _keep2) = reopen_runtime(&dir, Arc::new(scripted_provider(vec![])), vec![]);
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let reports = runtime2.recover().unwrap();
+        let report = reports.iter().find(|r| r.session_id == session).unwrap();
+        assert_eq!(report.crashed_ops.len(), outside.len());
+        for op in &report.crashed_ops {
+            assert_eq!(op.status, "failed", "{op:?}");
+            assert_eq!(op.effect, EffectStatus::Unknown, "{op:?}");
+            assert_eq!(op.action, RecoveryAction::NeedsHuman, "{op:?}");
+        }
+        let handle2 = runtime2
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+        assert!(
+            handle2.pending_tool_runs().unwrap().is_empty(),
+            "unverifiable legacy rows are terminally failed, never re-scanned"
         );
-        let _ = handle.request_permission(
-            op_meta.operation_id,
-            &Capability::WriteWorkspace {
-                path: file_path.clone(),
-            },
-        );
-        let _ = handle.start_tool_run(op_meta.clone(), "write_file", serde_json::json!({}));
+        // No completion was ever journaled for these rows.
+        assert!(!handle2.events_range(1, None).unwrap().iter().any(|e| {
+            e.kind == faktor_core::event::EventKind::RecoveryApplied
+                && e.payload
+                    .as_ref()
+                    .is_some_and(|p| p.get("effect").and_then(|v| v.as_str()) == Some("verified"))
+        }));
+        // The outside markers are untouched: no outside file was hashed into
+        // a completion and none was written.
+        for path in &outside {
+            assert_eq!(std::fs::read(path).unwrap(), b"outside-marker");
+        }
+        // A second sweep must not re-litigate the terminal rows.
+        let reports = runtime2.recover().unwrap();
+        assert!(reports.iter().all(|r| r.crashed_ops.is_empty()));
+    }
 
-        // Recovery: pending run resolved as verified without executing.
-        runtime.recover().unwrap();
-        assert!(handle.pending_tool_runs().unwrap().is_empty());
-        // The file is untouched (no re-run happened — a re-run would have
-        // written different content).
-        assert_eq!(std::fs::read(&file_path).unwrap(), b"new content");
+    /// A swap AFTER the one-time migration (the migration write landed, the
+    /// verification did not) cannot redirect the read: verification goes
+    /// through the handle's relative, symlink-bounded open, so a parent
+    /// directory swapped for a symlink out of the workspace is refused
+    /// loudly — the outside file whose bytes match `expected` is never
+    /// hashed into a completion.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_verify_swap_after_migration_uses_handle_relative_read() {
+        let dir = fresh_store_dir();
+        let session: SessionId;
+        let tool_op: OpId;
+        let root: std::path::PathBuf;
+        let outside_dir: std::path::PathBuf;
+        let expected = FileHash::from(blake3::hash(b"payload").into());
+        {
+            let (manager, _wid, sid, root_path) = workspace_env(&dir);
+            session = sid;
+            root = root_path;
+            std::fs::create_dir_all(root.join("sub")).unwrap();
+            std::fs::write(root.join("sub").join("a.txt"), b"payload").unwrap();
+            outside_dir = dir.path().join("outside");
+            std::fs::create_dir_all(&outside_dir).unwrap();
+            // Equal bytes outside: a raw absolute-path read would "verify".
+            std::fs::write(outside_dir.join("a.txt"), b"payload").unwrap();
+            let handle = manager.get_session(session).unwrap().unwrap();
+            let receipt = handle.submit_prompt("crash verify", &[]).unwrap();
+            chain_to_streaming(&handle, receipt.op_id);
+            let legacy_path = root.join("sub").join("a.txt");
+            let meta = op_meta(
+                &manager,
+                session,
+                RecoveryStrategy::VerifyHash {
+                    path: legacy_path.to_string_lossy().to_string(),
+                    expected,
+                },
+            );
+            tool_op = meta.operation_id;
+            crash_tool_start(
+                &handle,
+                receipt.op_id,
+                "write_file",
+                serde_json::json!({}),
+                "call_1",
+                meta,
+            );
+            // Deterministic crash MID-migration: run the migration helper
+            // (the durable midpoint of recover()'s legacy arm) and drop the
+            // runtime before the verification/finish.
+            let (deps_x, keep_x) =
+                deps_sharing_session(manager.clone(), Arc::new(scripted_provider(vec![])), vec![]);
+            let runtime_x = AgentRuntime::new(deps_x).unwrap();
+            let pending = handle.pending_tool_runs().unwrap();
+            let row = pending.iter().find(|r| r.op_id == tool_op).unwrap();
+            let migrated = runtime_x
+                .migrate_legacy_verify_row(&handle, row, &legacy_path.to_string_lossy(), expected)
+                .unwrap()
+                .expect("a provably-inside path must migrate");
+            assert_eq!(migrated.relative_path, "sub/a.txt");
+            drop(runtime_x);
+            drop(keep_x);
+            // The race: the verified path's parent becomes a symlink to the
+            // outside directory AFTER the migration proof.
+            std::fs::remove_dir_all(root.join("sub")).unwrap();
+            std::os::unix::fs::symlink(&outside_dir, root.join("sub")).unwrap();
+        }
+        let (deps2, _keep2) = reopen_runtime(&dir, Arc::new(scripted_provider(vec![])), vec![]);
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let err = runtime2.recover().unwrap_err();
+        assert_eq!(
+            err.kind,
+            ErrorKind::Permission,
+            "the swapped parent must be refused by handle-relative resolution: {err}"
+        );
+        // The row stays running (visible, never silently completed) and the
+        // outside file was never hashed into a completion.
+        let handle2 = runtime2
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle2.pending_tool_runs().unwrap().len(), 1);
+        assert!(!handle2
+            .events_range(1, None)
+            .unwrap()
+            .iter()
+            .any(|e| { e.kind == faktor_core::event::EventKind::RecoveryApplied }));
+        assert_eq!(
+            std::fs::read(outside_dir.join("a.txt")).unwrap(),
+            b"payload"
+        );
+    }
+
+    /// The one-time migration is durable BEFORE any verification: a crash
+    /// after the migration write but before the finish resumes through the
+    /// modern relative postcondition exactly once (idempotent on re-sweep);
+    /// the legacy string is never consulted again.
+    #[tokio::test]
+    async fn legacy_verify_migration_midpoint_resumes_once_and_is_idempotent() {
+        let dir = fresh_store_dir();
+        let session: SessionId;
+        let tool_op: OpId;
+        let root: std::path::PathBuf;
+        let expected = FileHash::from(blake3::hash(b"landed").into());
+        {
+            let (manager, wid, sid, root_path) = workspace_env(&dir);
+            session = sid;
+            root = root_path;
+            std::fs::write(root.join("target.txt"), b"landed").unwrap();
+            let handle = manager.get_session(session).unwrap().unwrap();
+            let receipt = handle.submit_prompt("crash verify", &[]).unwrap();
+            chain_to_streaming(&handle, receipt.op_id);
+            let legacy_path = root.join("target.txt");
+            let meta = op_meta(
+                &manager,
+                session,
+                RecoveryStrategy::VerifyHash {
+                    path: legacy_path.to_string_lossy().to_string(),
+                    expected,
+                },
+            );
+            tool_op = meta.operation_id;
+            crash_tool_start(
+                &handle,
+                receipt.op_id,
+                "write_file",
+                serde_json::json!({}),
+                "call_1",
+                meta,
+            );
+            // Crash mid-migration: the durable postcondition write landed,
+            // the finish did not.
+            let (deps_x, keep_x) =
+                deps_sharing_session(manager.clone(), Arc::new(scripted_provider(vec![])), vec![]);
+            let runtime_x = AgentRuntime::new(deps_x).unwrap();
+            let pending = handle.pending_tool_runs().unwrap();
+            let row = pending.iter().find(|r| r.op_id == tool_op).unwrap();
+            let migrated = runtime_x
+                .migrate_legacy_verify_row(&handle, row, &legacy_path.to_string_lossy(), expected)
+                .unwrap()
+                .expect("a provably-inside path must migrate");
+            assert_eq!(migrated.workspace_id, wid);
+            assert_eq!(migrated.relative_path, "target.txt");
+            // The durable midpoint: the running row now carries the modern
+            // relative postcondition.
+            let pending = handle.pending_tool_runs().unwrap();
+            assert_eq!(pending.len(), 1);
+            let stored: FilePostcondition =
+                serde_json::from_value(pending[0].postcondition.clone().unwrap()).unwrap();
+            assert_eq!(stored.relative_path, "target.txt");
+            assert_eq!(stored.expected_hash, expected);
+            drop(runtime_x);
+            drop(keep_x);
+        }
+        let (deps2, _keep2) = reopen_runtime(&dir, Arc::new(scripted_provider(vec![])), vec![]);
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let reports = runtime2.recover().unwrap();
+        let report = reports.iter().find(|r| r.session_id == session).unwrap();
+        assert_eq!(report.crashed_ops.len(), 1);
+        assert_eq!(report.crashed_ops[0].status, "completed");
+        assert_eq!(report.crashed_ops[0].effect, EffectStatus::Verified);
+        let handle2 = runtime2
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+        assert!(handle2.pending_tool_runs().unwrap().is_empty());
+        // The resume went through the modern postcondition: no second
+        // legacy migration was journaled.
+        assert!(!handle2.events_range(1, None).unwrap().iter().any(|e| {
+            e.payload
+                .as_ref()
+                .is_some_and(|p| p.get("legacy_migrated_to").is_some())
+        }));
+        // Idempotent: a second sweep finds nothing pending.
+        let reports = runtime2.recover().unwrap();
+        assert!(reports.iter().all(|r| r.crashed_ops.is_empty()));
     }
 
     #[tokio::test]
@@ -23512,7 +23947,34 @@ mod tests {
             }
             // Multi-component contract: a mixed repo must never certify a
             // firmware change through the root Rust family alone — the
-            // component-specific family owns it.
+            // component-specific family owns it. Content-deciding manifests
+            // are probed through an ADMITTED, anchored root (candidate
+            // generation): the manifests must exist on disk, or the probes
+            // refuse typed and derivation fails closed.
+            let mixed_root = tempdir().unwrap();
+            std::fs::create_dir_all(mixed_root.path().join("src")).unwrap();
+            std::fs::create_dir_all(mixed_root.path().join("firmware").join("src")).unwrap();
+            std::fs::write(mixed_root.path().join("Cargo.toml"), "").unwrap();
+            std::fs::write(mixed_root.path().join("src").join("a.rs"), "").unwrap();
+            std::fs::write(
+                mixed_root.path().join("firmware").join("CMakeLists.txt"),
+                "",
+            )
+            .unwrap();
+            std::fs::write(
+                mixed_root.path().join("firmware").join("platformio.ini"),
+                "",
+            )
+            .unwrap();
+            std::fs::write(
+                mixed_root
+                    .path()
+                    .join("firmware")
+                    .join("src")
+                    .join("main.cpp"),
+                "",
+            )
+            .unwrap();
             let mixed = vec![
                 "Cargo.toml".to_string(),
                 "src/a.rs".to_string(),
@@ -23520,10 +23982,7 @@ mod tests {
                 "firmware/platformio.ini".to_string(),
                 "firmware/src/main.cpp".to_string(),
             ];
-            let profile = faktor_verify::derive::detect_project_profile(
-                std::path::Path::new("/nonexistent-verify-root"),
-                &mixed,
-            );
+            let profile = faktor_verify::derive::detect_project_profile(mixed_root.path(), &mixed);
             let derived = faktor_verify::derive::derive_checks(
                 &profile,
                 &[std::path::PathBuf::from("firmware/src/main.cpp")],
@@ -30302,7 +30761,13 @@ mod tests {
                 vec![],
             );
             let runtime1 = AgentRuntime::new(deps1).unwrap();
-            let ws = manager1.create_workspace("/w").unwrap();
+            // The legacy VerifyHash row records an ABSOLUTE path; the
+            // workspace root is the tempdir so the path is provably inside
+            // and migrates (audit P1-F). The turn identity assertions below
+            // are what this test pins.
+            let ws = manager1
+                .create_workspace(dir.path().to_str().unwrap())
+                .unwrap();
             let handle = manager1.create_session(ws, "t", "fake", "m").unwrap();
             session = handle.id();
             let receipt = handle.submit_prompt("crash me", &[]).unwrap();

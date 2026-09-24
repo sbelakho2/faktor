@@ -4740,6 +4740,7 @@ fn doctor_run_with_config(
     let mut issues = 0usize;
     doctor_worker_plane_line(config_path, &mut lines, &mut issues);
     doctor_sandbox_shell_line(config_path, &mut lines, &mut issues);
+    doctor_network_isolation_line(&mut lines);
     match SessionManager::open_quick(data_dir.join("store"), data_dir.join("cas")) {
         Ok(session) => {
             lines.push("store: ok".into());
@@ -5349,6 +5350,36 @@ fn doctor_sandbox_shell_line(
             *issues += 1;
         }
     }
+}
+
+/// The honest network-isolation strength of this build (audit item 8): the
+/// per-process spawn backend this platform has, what a spawn has PROVEN at
+/// runtime in this process, and the exact isolation every browser launch
+/// selects. Purely informational and never config-gated: no backend on this
+/// platform is a documented platform fact (spawns are refused typed), not a
+/// doctor issue. The wording never presents app-level proxy configuration as
+/// confinement.
+fn doctor_network_isolation_line(lines: &mut Vec<String>) {
+    let backend = if faktor_terminal::broker_only_supported() {
+        "deny_all+broker_only_available"
+    } else {
+        "unavailable (no per-process backend on this platform; DenyAll and BrokerOnly spawns \
+         are refused typed, proxy flags are application configuration only)"
+    };
+    let proof = faktor_terminal::platform_network_enforcement();
+    lines.push(format!(
+        "sandbox network isolation: backend={backend} runtime_proof={}{}",
+        proof.as_tag(),
+        if proof == faktor_terminal::NetworkEnforcement::AppLevel {
+            " (no isolated spawn has proven itself in this process)"
+        } else {
+            ""
+        },
+    ));
+    lines.push(format!(
+        "browser network isolation: {}",
+        faktor_browser::platform_isolation_label()
+    ));
 }
 
 /// "enabled" — so the doctor cannot certify a daemon that would not start.
@@ -8598,6 +8629,52 @@ mod tests {
         let report = doctor_run(garbage.path(), false);
         assert!(report.issues >= 1, "{:?}", report.lines);
         assert!(report.lines.iter().any(|l| l.starts_with("store: FAILED")));
+    }
+
+    /// Audit item 8: doctor reports the platform's network-isolation
+    /// strength and the browser selection honestly — app-level proxy
+    /// configuration is never worded as confinement and no missing backend
+    /// is masked.
+    #[test]
+    fn doctor_reports_network_isolation_strength_honestly() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let session =
+                SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
+                    .unwrap();
+            session
+                .create_session(session.create_workspace("/w").unwrap(), "t", "p", "m")
+                .unwrap();
+        }
+        let report = doctor_run(dir.path(), false);
+        assert_eq!(report.issues, 0, "{:?}", report.lines);
+        let sandbox = report
+            .lines
+            .iter()
+            .find(|l| l.starts_with("sandbox network isolation:"))
+            .expect("sandbox network isolation line");
+        let browser = report
+            .lines
+            .iter()
+            .find(|l| l.starts_with("browser network isolation:"))
+            .expect("browser network isolation line");
+        assert!(
+            sandbox.contains("runtime_proof="),
+            "the spawn-proof state must be named: {sandbox}"
+        );
+        if faktor_terminal::broker_only_supported() {
+            assert!(
+                sandbox.contains("backend=deny_all+broker_only_available"),
+                "{sandbox}"
+            );
+            assert!(browser.contains("BrokerOnly requested"), "{browser}");
+        } else {
+            assert!(sandbox.contains("backend=unavailable"), "{sandbox}");
+            assert!(sandbox.contains("refused typed"), "{sandbox}");
+            assert!(browser.contains("NOT OS-confined"), "{browser}");
+            assert!(browser.contains(std::env::consts::OS), "{browser}");
+            assert!(!browser.contains("OS-confined per child"), "{browser}");
+        }
     }
 
     /// The additive `doctor --config` worker-plane boundary audit: the

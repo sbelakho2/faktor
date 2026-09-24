@@ -51,7 +51,8 @@ use crate::egress::{
 use crate::error::BrowserError;
 use crate::interception::{InterceptionPolicy, Interceptor};
 use crate::launch::{
-    resolve_executable, ChromiumLauncher, LaunchOptions, LaunchedBrowser, KILL_GRACE_MS,
+    resolve_executable, BrowserIsolationState, ChromiumLauncher, LaunchOptions, LaunchedBrowser,
+    KILL_GRACE_MS,
 };
 use crate::page::{Page, PageHost, PageInner, PageState, VerificationSignal};
 use crate::profile::{validate_profile_name, IncognitoProfile, ProfileStore, MAX_ACCOUNT_BYTES};
@@ -330,6 +331,11 @@ pub struct BrowserHealth {
     pub state: BrowserState,
     pub pages: usize,
     pub proxy_url: String,
+    /// The ACTUAL network-isolation strength of this child (never an
+    /// aspiration): OS-confined BrokerOnly where the sandbox namespace was
+    /// produced, app-level proxy-only everywhere else. [`BrowserIsolationState::strength_label`]
+    /// is the honest one-line spelling every surface must print.
+    pub isolation: BrowserIsolationState,
     pub last_used_ms: i64,
     pub requests_total: u64,
     pub blocked_total: u64,
@@ -929,6 +935,13 @@ impl BrowserManager {
             }
         };
         let scratch_dir = self.profiles.rooted().join(&profiles.scratch_rel);
+        // Request OS-level BrokerOnly confinement where the platform has a
+        // backend; elsewhere the child inherits and the launch carries the
+        // honest app-level reason (never silently worded as confinement).
+        // The single selection locus is `select_network_isolation`, shared
+        // with the doctor surface.
+        let (network_isolation, app_level_reason) =
+            crate::launch::select_network_isolation(broker.addr());
         let launch = self
             .launcher
             .launch(
@@ -944,6 +957,8 @@ impl BrowserManager {
                     owner_profile: identity.profile.clone(),
                     extra_args: self.config.extra_args.clone(),
                     launch_timeout_ms: self.config.launch_timeout_ms,
+                    network_isolation,
+                    app_level_reason,
                 },
                 cancel,
             )
@@ -1360,6 +1375,7 @@ impl BrowserManager {
                     state,
                     pages: instance.page_count(),
                     proxy_url: instance.broker.proxy_url(),
+                    isolation: instance.launched.isolation.clone(),
                     last_used_ms: instance.last_used_ms.load(Ordering::SeqCst),
                     requests_total: accounting.requests_total,
                     blocked_total: accounting.blocked_total,

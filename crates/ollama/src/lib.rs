@@ -25,8 +25,10 @@ use faktor_provider::catalog::{
 };
 #[cfg(test)]
 use faktor_provider::egress::PolicyCheckedHttpTransport;
-use faktor_provider::egress::{execute_get, execute_post_json, EgressError, HttpTransport};
-use faktor_provider::egress::{BudgetComponent, BudgetedBody, ResponseBudget};
+use faktor_provider::egress::{
+    execute_get, execute_post_json, read_json_bounded, BudgetComponent, CheckedResponse,
+    EgressError, HttpTransport, ResponseBudget,
+};
 use faktor_provider::sanitize::ErrorScrubber;
 use faktor_provider::transport::{
     guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES, PROVIDER_CEILING_MS,
@@ -97,6 +99,59 @@ pub const OLLAMA_ERROR_BODY_MAX_BYTES: usize = 64 * 1024;
 /// same metadata call are bounded by this same per-attempt bound.
 pub const OLLAMA_METADATA_TIMEOUT_MS: u64 = 30_000;
 
+/// Hard bound on the RAW bytes of ONE metadata JSON body (`/api/tags`,
+/// `/api/show`, `/api/ps`): a real tags list, capability document and
+/// loaded-model list are all far below this, while a hostile daemon cannot
+/// stream an unbounded body into RAM. The read is cut at the cap with the
+/// typed egress budget refusal — metadata is never read through a naked
+/// `resp.json()`.
+pub const OLLAMA_METADATA_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The production metadata read bound (head/idle/total all equal the
+/// documented metadata timeout, byte cap [`OLLAMA_METADATA_MAX_BYTES`]).
+const OLLAMA_METADATA_BOUND: std::time::Duration =
+    std::time::Duration::from_millis(OLLAMA_METADATA_TIMEOUT_MS);
+
+/// The [`ResponseBudget`] ONE metadata body read obeys.
+fn metadata_budget(bound: std::time::Duration) -> ResponseBudget {
+    ResponseBudget::for_timeout(bound, OLLAMA_METADATA_MAX_BYTES)
+}
+
+/// Map a checked metadata read failure onto the host-facing error type:
+/// a malformed body (or a byte/frame breach) is a terminal `Malformed`
+/// refusal, a stalled head/idle/total read is a retryable `Network` error,
+/// and a transport/gate refusal keeps [`egress_to_host_error`]'s mapping.
+fn metadata_read_error(what: &str, e: EgressError) -> Error {
+    match &e {
+        EgressError::MalformedResponse { .. } => {
+            Error::new(ErrorKind::Malformed, format!("ollama {what} body: {e}"))
+        }
+        EgressError::ResponseBudgetExceeded {
+            component: BudgetComponent::Head | BudgetComponent::Idle | BudgetComponent::Total,
+            ..
+        } => Error::new(ErrorKind::Network, format!("ollama {what} body: {e}")),
+        EgressError::ResponseBudgetExceeded { .. } => {
+            Error::new(ErrorKind::Malformed, format!("ollama {what} body: {e}"))
+        }
+        _ => egress_to_host_error(e),
+    }
+}
+
+/// Read ONE metadata JSON body under the metadata budget through the shared
+/// budget-aware checked-response helper: a giant body is cut at
+/// [`OLLAMA_METADATA_MAX_BYTES`], a streaming body at the idle bound, and
+/// malformed JSON is the typed `Malformed` refusal — `resp.json()` is never
+/// reachable from the adapter.
+async fn read_metadata_json<T: serde::de::DeserializeOwned>(
+    what: &str,
+    resp: CheckedResponse,
+    bound: std::time::Duration,
+) -> Result<T, Error> {
+    read_json_bounded(resp, &metadata_budget(bound))
+        .await
+        .map_err(|e| metadata_read_error(what, e))
+}
+
 /// Await response HEADERS under the stream's existing first-byte deadline
 /// (default 60 s), capped by the overall deadline when the operation set
 /// one. `0` on both knobs keeps the historical unbounded behavior, but
@@ -113,9 +168,9 @@ fn request_head_timeout_ms(deadlines: StreamDeadlines) -> u64 {
 /// Execute one stream request, bounding the wait for response headers by
 /// [`request_head_timeout_ms`] (a typed `Timeout` on breach).
 async fn execute_with_head_timeout(
-    fut: impl std::future::Future<Output = Result<reqwest::Response, EgressError>>,
+    fut: impl std::future::Future<Output = Result<CheckedResponse, EgressError>>,
     deadlines: StreamDeadlines,
-) -> Result<reqwest::Response, ProviderError> {
+) -> Result<CheckedResponse, ProviderError> {
     let bound_ms = request_head_timeout_ms(deadlines);
     if bound_ms == 0 {
         return fut.await.map_err(ProviderError::from);
@@ -145,7 +200,7 @@ enum ErrorBodyRead {
 /// truncated or the read stalled. The HTTP status still classifies the
 /// error. The budget is REQUIRED — an adapter never reads a response body
 /// directly.
-async fn read_error_body_bounded(resp: reqwest::Response, cap: usize, bound_ms: u64) -> String {
+async fn read_error_body_bounded(resp: CheckedResponse, cap: usize, bound_ms: u64) -> String {
     let budget_ms = if bound_ms == 0 {
         PROVIDER_CEILING_MS
     } else {
@@ -153,7 +208,7 @@ async fn read_error_body_bounded(resp: reqwest::Response, cap: usize, bound_ms: 
     };
     let budget = ResponseBudget::from_millis(budget_ms, budget_ms, budget_ms, cap as u64, None);
     let read = async {
-        let mut body = BudgetedBody::new(resp, budget);
+        let mut body = resp.into_budgeted(budget);
         let mut out: Vec<u8> = Vec::new();
         loop {
             match body.next_chunk().await {
@@ -416,9 +471,7 @@ impl OllamaProvider {
                     format!("ollama /api/ps returned {}", resp.status()),
                 ));
             }
-            resp.json()
-                .await
-                .map_err(|e| Error::new(ErrorKind::Malformed, format!("ollama ps body: {e}")))
+            read_metadata_json("ps", resp, OLLAMA_METADATA_BOUND).await
         })
         .await?;
         let probed = self.probed.read().unwrap().clone();
@@ -480,9 +533,7 @@ impl OllamaProvider {
                     format!("ollama tags returned {}", resp.status()),
                 ));
             }
-            resp.json()
-                .await
-                .map_err(|e| Error::new(ErrorKind::Malformed, format!("ollama tags body: {e}")))
+            read_metadata_json("tags", resp, OLLAMA_METADATA_BOUND).await
         })
         .await?;
         let mut names: Vec<String> = tags.models.into_iter().map(|m| m.name).collect();
@@ -507,9 +558,7 @@ impl OllamaProvider {
                     format!("ollama cannot see model {model}"),
                 ));
             }
-            resp.json()
-                .await
-                .map_err(|e| Error::new(ErrorKind::Malformed, format!("ollama show body: {e}")))
+            read_metadata_json("show", resp, OLLAMA_METADATA_BOUND).await
         })
         .await?;
         Ok(caps_from_show(model, &show))
@@ -536,9 +585,7 @@ impl OllamaProvider {
                     format!("ollama /api/ps returned {}", resp.status()),
                 ));
             }
-            resp.json()
-                .await
-                .map_err(|e| Error::new(ErrorKind::Malformed, format!("ollama ps body: {e}")))
+            read_metadata_json("ps", resp, OLLAMA_METADATA_BOUND).await
         })
         .await?;
         Ok(ps_allocated_context(&body, model)?.map(|c| c as usize))
@@ -929,7 +976,7 @@ pub(crate) fn ollama_chat_stream(
                             }
                             let lines: LineStream = Box::pin(guarded_lines(
                                 utf8_line_stream(
-                                    BudgetedBody::new(r, deadlines.response_budget()).into_stream(),
+                                    r.stream_frames(&deadlines.response_budget()),
                                     MAX_LINE_BYTES,
                                 ),
                                 deadlines,
@@ -1375,12 +1422,12 @@ fn validate_embedding_batch(inputs: &[String]) -> Result<(), ProviderError> {
 /// into memory. Over the cap is a typed `Malformed` refusal (retrying the
 /// same hostile body can never help); any other budget/transport failure is
 /// the retryable `Network` error.
-async fn read_body_bounded(resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, ProviderError> {
+async fn read_body_bounded(resp: CheckedResponse, cap: usize) -> Result<Vec<u8>, ProviderError> {
     let budget = ResponseBudget::for_timeout(
         std::time::Duration::from_millis(PROVIDER_CEILING_MS),
         cap as u64,
     );
-    match BudgetedBody::new(resp, budget).read_all().await {
+    match resp.into_budgeted(budget).read_all().await {
         Ok(bytes) => Ok(bytes),
         Err(EgressError::ResponseBudgetExceeded {
             component: BudgetComponent::Bytes,
@@ -3513,7 +3560,7 @@ mod tests {
             _req: reqwest::Request,
         ) -> futures::future::BoxFuture<
             '_,
-            Result<reqwest::Response, faktor_provider::egress::EgressError>,
+            Result<CheckedResponse, faktor_provider::egress::EgressError>,
         > {
             Box::pin(async {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -3832,14 +3879,141 @@ mod tests {
             let resp = execute_get(transport.as_ref(), &url)
                 .await
                 .map_err(egress_to_host_error)?;
-            resp.json::<serde_json::Value>()
-                .await
-                .map_err(|e| Error::new(ErrorKind::Malformed, format!("tags body: {e}")))
+            read_metadata_json::<serde_json::Value>(
+                "tags",
+                resp,
+                std::time::Duration::from_millis(100),
+            )
+            .await
         })
         .await
         .unwrap_err();
         assert!(matches!(err.kind, ErrorKind::Timeout), "{err:?}");
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// HOSTILE giant metadata bodies are cut at
+    /// [`OLLAMA_METADATA_MAX_BYTES`], typed, for every metadata endpoint
+    /// (`/api/tags`, `/api/ps`, `/api/show`): the metadata path can never
+    /// buffer an unbounded body into RAM (`resp.json()` is gone).
+    #[tokio::test]
+    async fn metadata_endpoints_cut_a_hostile_giant_json_body_typed() {
+        let giant = OLLAMA_METADATA_MAX_BYTES as usize + 64 * 1024;
+        let head: &'static str = Box::leak(
+            format!("HTTP/1.1 200 OK\r\ncontent-length: {giant}\r\n\r\n").into_boxed_str(),
+        );
+
+        // /api/tags
+        let provider = error_path_provider(stalling_http_server(head, giant).await);
+        let started = std::time::Instant::now();
+        let err = provider.discover_models().await.unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::Malformed), "tags: {err:?}");
+        assert!(format!("{err:?}").contains("max-bytes"), "tags: {err:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        // /api/ps
+        let provider = error_path_provider(stalling_http_server(head, giant).await);
+        let err = provider.ps_allocated("qwen3.8").await.unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::Malformed), "ps: {err:?}");
+        assert!(format!("{err:?}").contains("max-bytes"), "ps: {err:?}");
+
+        // /api/show
+        let provider = error_path_provider(stalling_http_server(head, giant).await);
+        let err = provider.probe_model("qwen3.8").await.unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::Malformed), "show: {err:?}");
+        assert!(format!("{err:?}").contains("max-bytes"), "show: {err:?}");
+    }
+
+    /// A STREAMING metadata body (valid prefix, then silence) is cut by the
+    /// idle window at the metadata read seam: typed, wall-clock bounded, no
+    /// unbounded wait.
+    #[tokio::test]
+    async fn metadata_read_cuts_a_streaming_body_by_idle_typed() {
+        let head = "HTTP/1.1 200 OK\r\ncontent-length: 1048576\r\n\r\n";
+        let base = stalling_http_server(head, 16).await;
+        let transport: Arc<dyn HttpTransport> = Arc::new(PolicyCheckedHttpTransport::permissive());
+        let resp = execute_get(transport.as_ref(), &format!("{base}/api/ps"))
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = read_metadata_json::<serde_json::Value>(
+            "ps",
+            resp,
+            std::time::Duration::from_millis(150),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::Network), "{err:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// Malformed metadata JSON is the typed `Malformed` refusal (never a
+    /// partial value, never a panic).
+    #[tokio::test]
+    async fn malformed_metadata_json_is_typed() {
+        let server = MockServer::new();
+        server.route(
+            "GET",
+            "/api/tags",
+            MockAction::Respond {
+                status: 200,
+                body: "not json".into(),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
+        let err = provider.discover_models().await.unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::Malformed), "{err:?}");
+    }
+
+    /// The NORMAL metadata flows still parse: `/api/tags` discovery,
+    /// `/api/show` probing (architecture-prefixed context length) and the
+    /// `/api/ps` runtime allocation that shrinks the effective window.
+    #[tokio::test]
+    async fn normal_metadata_parses_across_tags_show_and_ps() {
+        let server = MockServer::new();
+        server.route(
+            "GET",
+            "/api/tags",
+            MockAction::Respond {
+                status: 200,
+                body: r#"{"models":[{"name":"qwen3.8"}]}"#.into(),
+            },
+        );
+        server.route(
+            "POST",
+            "/api/show",
+            MockAction::Respond {
+                status: 200,
+                body: r#"{"model_info":{"general.architecture":"qwen3","qwen3.context_length":262144},"capabilities":["completion","tools","thinking"]}"#.into(),
+            },
+        );
+        server.route(
+            "GET",
+            "/api/ps",
+            MockAction::Respond {
+                status: 200,
+                body: r#"{"models":[{"name":"qwen3.8","details":{"context_length":65536}}]}"#
+                    .into(),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OllamaProvider::permissive_for_tests(OllamaConfig::new(Some(base)));
+
+        assert_eq!(
+            provider.discover_models().await.unwrap(),
+            vec!["qwen3.8".to_string()]
+        );
+        let caps = provider.probe_model("qwen3.8").await.unwrap();
+        assert_eq!(caps.context, 262144);
+        assert!(caps.tools);
+        let context = provider.runtime_context("qwen3.8").await.unwrap();
+        assert_eq!(context.model_max, 262144);
+        assert_eq!(
+            context.runtime_effective,
+            Some(65536),
+            "the /api/ps allocation shrinks the runtime window"
+        );
     }
 
     /// Adversarial: a daemon/gateway error body that echoes request

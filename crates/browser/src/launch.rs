@@ -21,10 +21,90 @@ use tokio::io::AsyncBufReadExt;
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::time::Deadline;
 use faktor_fs::RootedDir;
-use faktor_terminal::{browser_env_spec, ProcessOwner, ProcessSupervisor, SpawnConfig};
+use faktor_terminal::{
+    browser_env_spec, BrokerOnlyBridge, NetworkIsolation, ProcessOwner, ProcessSupervisor,
+    SpawnConfig,
+};
 
 use crate::error::BrowserError;
 use crate::timeutil::{deadline_instant, now_ms};
+
+/// The ACTUAL network-isolation strength of one launched browser child: the
+/// honest state any surface (health, doctor, logs) must print. The two
+/// states are never presented as equivalent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserIsolationState {
+    /// The child is OS-confined (Linux BrokerOnly network namespace): it can
+    /// reach exactly the relayed broker endpoint and nothing else — no
+    /// external route exists, so a raw socket cannot bypass the broker.
+    OsConfinedBrokerOnly { endpoint: String },
+    /// Application-level policy only: Chromium runs behind the proxy and
+    /// the destination gate, but its raw sockets are NOT OS-confined. The
+    /// reason names why (platform without a BrokerOnly backend, explicit
+    /// app-level configuration, ...). Never worded as confinement.
+    AppLevelProxyOnly { reason: String },
+}
+
+impl BrowserIsolationState {
+    /// True only for the OS-confined state.
+    pub fn is_os_confined(&self) -> bool {
+        matches!(self, BrowserIsolationState::OsConfinedBrokerOnly { .. })
+    }
+
+    /// The honest one-line strength label every surface prints.
+    pub fn strength_label(&self) -> String {
+        match self {
+            BrowserIsolationState::OsConfinedBrokerOnly { endpoint } => format!(
+                "OS-confined (BrokerOnly): the child reaches only the relayed broker endpoint \
+                 {endpoint} and has no external route"
+            ),
+            BrowserIsolationState::AppLevelProxyOnly { reason } => {
+                format!("app-level proxy only (raw sockets are NOT OS-confined): {reason}")
+            }
+        }
+    }
+}
+
+/// The one launch-time isolation selection: where a BrokerOnly backend
+/// exists the launch REQUESTS it (the spawn layer must produce the sandbox
+/// namespace or refuse typed — never a silent downgrade); where it does not,
+/// the launch inherits with the honest app-level reason. The manager and the
+/// doctor surface read this same function, so they can never disagree about
+/// the platform state.
+pub fn select_network_isolation(
+    endpoint: std::net::SocketAddr,
+) -> (NetworkIsolation, Option<String>) {
+    if faktor_terminal::broker_only_supported() {
+        (NetworkIsolation::BrokerOnly { endpoint }, None)
+    } else {
+        (NetworkIsolation::Inherit, Some(app_level_reason()))
+    }
+}
+
+/// The honest app-level reason for platforms without a BrokerOnly backend
+/// (proxy flags are application configuration, never confinement).
+pub fn app_level_reason() -> String {
+    format!(
+        "platform {} has no OS-level BrokerOnly backend; the browser is proxy-only at the \
+         application level and BrokerOnly requests are refused typed",
+        std::env::consts::OS
+    )
+}
+
+/// The platform-level one-line isolation statement doctor/health print
+/// before any child exists (the wording of the selection above).
+pub fn platform_isolation_label() -> String {
+    if faktor_terminal::broker_only_supported() {
+        "BrokerOnly requested for every browser launch (OS-confined per child on this \
+         platform; a spawn whose sandbox cannot be created fails closed typed)"
+            .to_string()
+    } else {
+        format!(
+            "app-level proxy only (raw Chromium sockets are NOT OS-confined): {}",
+            app_level_reason()
+        )
+    }
+}
 
 /// Launch parameters for one browser child.
 #[derive(Debug, Clone)]
@@ -52,6 +132,18 @@ pub struct LaunchOptions {
     pub extra_args: Vec<String>,
     /// How long to wait for the DevTools endpoint.
     pub launch_timeout_ms: u64,
+    /// The OS-level network isolation to request for this child. The
+    /// manager selects [`NetworkIsolation::BrokerOnly`] where the platform
+    /// supports it; where it does not (or when the operator explicitly
+    /// chose app-level), the child inherits and `app_level_reason` carries
+    /// the honest explanation.
+    pub network_isolation: NetworkIsolation,
+    /// Why this launch is proxy-only. `Some` exactly when no OS
+    /// confinement is requested (platform without a backend, explicit
+    /// app-level config); `None` demands that the spawn layer produce the
+    /// BrokerOnly sandbox — a launch that requested confinement and did
+    /// not get it fails typed, never downgrades.
+    pub app_level_reason: Option<String>,
 }
 
 /// Flags an extra-arg list may never contain: they would defeat the
@@ -198,6 +290,13 @@ pub struct LaunchedBrowser {
     /// Bounded tail of the child's stderr (diagnostics only).
     pub stderr_tail: Vec<String>,
     pub started_ms: i64,
+    /// The ACTUAL isolation strength of this child (never an aspiration).
+    pub isolation: BrowserIsolationState,
+    /// The live BrokerOnly sandbox bridge, when the child was OS-confined.
+    /// Dropping the launch (or the instance) releases the sandbox namespace
+    /// and its relays; the supervisor's registry row also owns it, so the
+    /// bridge cannot outlive the child's registry entry.
+    pub network_bridge: Option<Arc<BrokerOnlyBridge>>,
     supervisor: Arc<ProcessSupervisor>,
     armed: AtomicBool,
 }
@@ -208,6 +307,7 @@ impl std::fmt::Debug for LaunchedBrowser {
             .field("pid", &self.pid)
             .field("child_id", &self.child_id)
             .field("owner", &self.owner)
+            .field("isolation", &self.isolation)
             .field("started_ms", &self.started_ms)
             .field("armed", &self.armed.load(Ordering::SeqCst))
             .finish()
@@ -324,6 +424,34 @@ fn split_authority(authority: &str) -> Option<(&str, u16)> {
     Some((host, port.parse().ok()?))
 }
 
+/// The explicit port of an already-validated DevTools URL.
+pub fn devtools_ws_port(url: &str) -> Option<u16> {
+    let rest = url.strip_prefix("ws://")?;
+    let (authority, _path) = rest.split_once('/')?;
+    split_authority(authority).map(|(_, port)| port)
+}
+
+/// Rewrite ONLY the port of an already-validated DevTools URL, preserving
+/// scheme, loopback host and DevTools path. Used when the confined child
+/// announced an in-sandbox port that the host reaches through the
+/// BrokerOnly relay's exposed host port.
+pub fn rewrite_devtools_ws_port(url: &str, port: u16) -> Result<String, String> {
+    let rest = url
+        .strip_prefix("ws://")
+        .ok_or_else(|| "announced endpoint is not a ws:// URL".to_string())?;
+    let (authority, path) = rest
+        .split_once('/')
+        .ok_or_else(|| "announced endpoint has no DevTools path".to_string())?;
+    let (host, _old_port) = split_authority(authority)
+        .ok_or_else(|| "announced endpoint has no explicit host:port".to_string())?;
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    Ok(format!("ws://{host}:{port}/{path}"))
+}
+
 /// Launches Chromium through the supervisor and waits for its DevTools
 /// endpoint.
 pub struct ChromiumLauncher {
@@ -358,14 +486,29 @@ impl ChromiumLauncher {
                 profile: options.owner_profile.clone(),
             },
             capture: false,
+            network_isolation: options.network_isolation,
             ..SpawnConfig::default()
         };
+        // A requested BrokerOnly confinement that the spawn layer refuses is
+        // a typed isolation failure — never a proxy-only child.
         let spawned = self
             .supervisor
             .spawn_detached_with_pipes(config)
-            .map_err(|e| BrowserError::BrowserUnavailable {
-                detail: format!("supervisor refused the chromium spawn: {e}"),
+            .map_err(|e| {
+                if options.network_isolation.is_broker_only() {
+                    BrowserError::IsolationUnavailable {
+                        detail: format!(
+                            "the spawn layer refused BrokerOnly confinement; the browser is not \
+                         run proxy-only-but-unconfined: {e}"
+                        ),
+                    }
+                } else {
+                    BrowserError::BrowserUnavailable {
+                        detail: format!("supervisor refused the chromium spawn: {e}"),
+                    }
+                }
             })?;
+        let network_bridge = spawned.network_bridge.clone();
         let pid = spawned.child_pid;
         let child_id = self
             .supervisor
@@ -394,7 +537,7 @@ impl ChromiumLauncher {
         let mut reader = tokio::io::BufReader::new(stderr);
         let mut tail: Vec<String> = Vec::new();
         let mut line = String::new();
-        let ws_url = loop {
+        let announced = loop {
             line.clear();
             let read = tokio::select! {
                 biased;
@@ -453,6 +596,65 @@ impl ChromiumLauncher {
                 tail.push(trimmed);
             }
         };
+        // A confined child listens on ITS namespace's loopback: the host can
+        // reach it only through the bridge's exposed relay port. The
+        // announced in-sandbox port is swapped for that host port (scheme,
+        // loopback host and DevTools path are preserved; the announced URL
+        // already passed [`validate_devtools_ws_url`]). Every failure is a
+        // typed isolation refusal with the child killed — never a dial to an
+        // unreachable in-sandbox port.
+        let ws_url = match &network_bridge {
+            Some(bridge) => {
+                let Some(in_sandbox_port) = devtools_ws_port(&announced) else {
+                    self.kill_quietly(child_id);
+                    return Err(BrowserError::IsolationUnavailable {
+                        detail: "the confined child announced a DevTools endpoint without an \
+                                 explicit port; refusing to dial"
+                            .to_string(),
+                    });
+                };
+                let host_port = match bridge.expose_loopback_port(in_sandbox_port) {
+                    Ok(port) => port,
+                    Err(e) => {
+                        self.kill_quietly(child_id);
+                        return Err(BrowserError::IsolationUnavailable {
+                            detail: format!(
+                                "cannot expose the confined child's DevTools port \
+                                 {in_sandbox_port} through the BrokerOnly relay: {e}"
+                            ),
+                        });
+                    }
+                };
+                match rewrite_devtools_ws_port(&announced, host_port) {
+                    Ok(url) => url,
+                    Err(e) => {
+                        self.kill_quietly(child_id);
+                        return Err(BrowserError::IsolationUnavailable {
+                            detail: format!(
+                                "cannot rewrite the confined DevTools endpoint onto the relay \
+                                 port: {e}"
+                            ),
+                        });
+                    }
+                }
+            }
+            None => announced,
+        };
+        // The ACTUAL isolation of this child: an OS-confined child carries
+        // the live BrokerOnly bridge (its broker endpoint is the only thing
+        // the sandbox can reach); otherwise the launch is app-level and the
+        // honest reason travels with the state.
+        let isolation = match &network_bridge {
+            Some(bridge) => BrowserIsolationState::OsConfinedBrokerOnly {
+                endpoint: bridge.endpoint().to_string(),
+            },
+            None => BrowserIsolationState::AppLevelProxyOnly {
+                reason: options
+                    .app_level_reason
+                    .clone()
+                    .unwrap_or_else(|| "no OS-level network isolation was requested".to_string()),
+            },
+        };
         Ok(LaunchedBrowser {
             pid,
             child_id,
@@ -463,6 +665,8 @@ impl ChromiumLauncher {
             devtools_ws_url: ws_url,
             stderr_tail: tail,
             started_ms,
+            isolation,
+            network_bridge,
             supervisor: self.supervisor.clone(),
             armed: AtomicBool::new(true),
         })
@@ -549,6 +753,8 @@ mod tests {
             owner_profile: "procurement-cn".to_string(),
             extra_args: Vec::new(),
             launch_timeout_ms: 1000,
+            network_isolation: NetworkIsolation::Inherit,
+            app_level_reason: Some("test: app-level proxy only".to_string()),
         }
     }
 
@@ -600,6 +806,82 @@ mod tests {
         assert_eq!(resolve_executable(Some(&exe)).unwrap(), exe);
         let err = resolve_executable(Some(&tmp.path().join("missing"))).unwrap_err();
         assert_eq!(err.code(), "browser_unavailable");
+    }
+
+    #[test]
+    fn devtools_port_helpers_preserve_host_and_path() {
+        let url = "ws://127.0.0.1:34567/devtools/browser/abc-123";
+        assert_eq!(devtools_ws_port(url), Some(34567));
+        assert_eq!(devtools_ws_port("ws://127.0.0.1/devtools/browser/x"), None);
+        assert_eq!(devtools_ws_port("http://127.0.0.1:1/x"), None);
+        let rewritten = rewrite_devtools_ws_port(url, 40001).unwrap();
+        assert_eq!(rewritten, "ws://127.0.0.1:40001/devtools/browser/abc-123");
+        assert!(validate_devtools_ws_url(&rewritten).is_ok());
+        // IPv6 loopback keeps its brackets.
+        let v6 = "ws://[::1]:9222/devtools/browser/id1";
+        assert_eq!(devtools_ws_port(v6), Some(9222));
+        assert_eq!(
+            rewrite_devtools_ws_port(v6, 5).unwrap(),
+            "ws://[::1]:5/devtools/browser/id1"
+        );
+        // Malformed inputs are typed errors, never a silently wrong URL.
+        for bad in [
+            "http://127.0.0.1:1/devtools/browser/x",
+            "ws://127.0.0.1/devtools/browser/x",
+            "ws://127.0.0.1:1",
+        ] {
+            assert!(rewrite_devtools_ws_port(bad, 7).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn isolation_selection_matches_the_platform_backend() {
+        let endpoint: std::net::SocketAddr = "127.0.0.1:4444".parse().unwrap();
+        let (mode, reason) = select_network_isolation(endpoint);
+        if faktor_terminal::broker_only_supported() {
+            assert!(mode.is_broker_only());
+            assert_eq!(reason, None);
+            assert!(platform_isolation_label().contains("BrokerOnly requested"));
+        } else {
+            assert_eq!(mode, NetworkIsolation::Inherit);
+            let reason = reason.expect("app-level platforms carry the honest reason");
+            assert!(
+                reason.contains("no OS-level BrokerOnly backend"),
+                "{reason}"
+            );
+            let label = platform_isolation_label();
+            assert!(label.contains("NOT OS-confined"), "{label}");
+            assert!(!label.contains("BrokerOnly requested"), "{label}");
+        }
+    }
+
+    /// On macOS/Windows the proxy flags stay application configuration: a
+    /// BrokerOnly request is refused typed BEFORE any child exists and is
+    /// never converted into a proxy-only-but-unconfined launch.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broker_only_request_is_refused_typed_on_unsupported_platforms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = std::sync::Arc::new(faktor_cas::Cas::open(tmp.path().join("cas")).unwrap());
+        let supervisor = ProcessSupervisor::new(cas);
+        let launcher = ChromiumLauncher::new(supervisor.clone());
+        let scratch = tempfile::tempdir().unwrap();
+        let mut opts = options();
+        opts.scratch_root = RootedDir::create(scratch.path()).unwrap();
+        opts.network_isolation = NetworkIsolation::BrokerOnly {
+            endpoint: "127.0.0.1:43123".parse().unwrap(),
+        };
+        opts.app_level_reason = None;
+        let err = launcher
+            .launch(opts, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "isolation_unavailable", "{err:?}");
+        assert!(err.to_string().contains("BrokerOnly"), "{err}");
+        assert!(
+            supervisor.alive().is_empty(),
+            "the refused confined launch must leave no child behind"
+        );
     }
 
     #[test]

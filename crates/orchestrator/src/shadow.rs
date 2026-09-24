@@ -136,17 +136,28 @@ pub enum ShadowRetireFault {
 }
 
 /// Typed refusal of [`ShadowRoots::new`] (audit residual): the service is
-/// rooted at a path that cannot be trusted as a daemon-owned shadow root.
+/// rooted at a path that cannot be trusted as a daemon-owned shadow root, or
+/// constructed with copy limits that cannot bound a base copy.
 ///
 /// The degenerate case is the empty/unanchored derivation: a store opened at
 /// an empty data root yields `PathBuf::new().join("shadows")` = the bare
 /// RELATIVE path `shadows`, which would silently write shadows under the
 /// process working directory. There is NO fallback: the refusal is typed and
 /// the caller must open its store at an explicit data root.
+///
+/// Invalid limits (zero caps, or an entries cap above the base-map cap) are
+/// refused the SAME typed way — construction is fallible by contract, so an
+/// out-of-range configuration can never abort the process with a panic.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ShadowRootError {
     #[error("degenerate shadow root {}: {reason}", root.display())]
     DegenerateRoot { root: PathBuf, reason: &'static str },
+    #[error("invalid shadow copy limit {field} = {value}: {constraint}")]
+    InvalidLimits {
+        field: &'static str,
+        value: u128,
+        constraint: &'static str,
+    },
 }
 
 /// The shadow service: one per daemon data dir. Begins/stages/discards
@@ -190,17 +201,35 @@ impl ShadowRoots {
     }
 
     /// [`ShadowRoots::new`] with explicit copy caps: same typed root
-    /// validation, no alternate construction path can bypass it.
+    /// validation, no alternate construction path can bypass it. Invalid
+    /// caps are TYPED refusals ([`ShadowRootError::InvalidLimits`]) — never
+    /// panics: a zero cap cannot bound anything and an entries cap above
+    /// [`MAX_BASE_ENTRIES`] can never be enforced by the base-map it mirrors.
     pub fn new_with_limits(
         manager: Arc<SessionManager>,
         shadows_root: PathBuf,
         limits: ShadowCopyLimits,
     ) -> Result<Arc<Self>, ShadowRootError> {
-        if limits.max_entries == 0 || limits.max_total_bytes == 0 {
-            panic!("shadow copy caps must be >= 1");
+        if limits.max_entries == 0 {
+            return Err(ShadowRootError::InvalidLimits {
+                field: "max_entries",
+                value: 0,
+                constraint: "must be >= 1",
+            });
+        }
+        if limits.max_total_bytes == 0 {
+            return Err(ShadowRootError::InvalidLimits {
+                field: "max_total_bytes",
+                value: 0,
+                constraint: "must be >= 1",
+            });
         }
         if limits.max_entries > MAX_BASE_ENTRIES {
-            panic!("shadow copy entries cap exceeds the base-map cap");
+            return Err(ShadowRootError::InvalidLimits {
+                field: "max_entries",
+                value: limits.max_entries as u128,
+                constraint: "must not exceed MAX_BASE_ENTRIES (the base-map cap)",
+            });
         }
         validate_shadows_root(&shadows_root)?;
         Ok(Arc::new(Self {

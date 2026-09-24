@@ -12,7 +12,7 @@ use faktor_cloud::{
     DurableSpendRow, EntitlementService, MemoryBillingStore, OrganizationId, SpendCategory,
     VENDOR_HTTP_TIMEOUT_MS,
 };
-use faktor_provider::egress::{EgressError, HttpTransport};
+use faktor_provider::egress::{CheckedResponse, EgressError, HttpTransport};
 use reqwest::Request;
 
 /// One scripted HTTP reply.
@@ -86,7 +86,7 @@ impl HttpTransport for ScriptedTransport {
         &self,
         req: Request,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<reqwest::Response, EgressError>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<CheckedResponse, EgressError>> + Send + '_>,
     > {
         let recorded = Recorded {
             method: req.method().to_string(),
@@ -117,7 +117,9 @@ impl HttpTransport for ScriptedTransport {
             let response = builder
                 .body(reqwest::Body::from(reply.body))
                 .map_err(|e| EgressError::Build(e.to_string()))?;
-            Ok(reqwest::Response::from(response))
+            Ok(CheckedResponse::from_response(reqwest::Response::from(
+                response,
+            )))
         })
     }
 }
@@ -463,7 +465,7 @@ impl HttpTransport for StallingTransport {
         &self,
         _req: Request,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<reqwest::Response, EgressError>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<CheckedResponse, EgressError>> + Send + '_>,
     > {
         Box::pin(std::future::pending())
     }

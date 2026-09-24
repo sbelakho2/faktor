@@ -70,6 +70,11 @@ pub enum BrowserError {
         code: i64,
         message: String,
     },
+    /// The requested OS-level network confinement could not be applied
+    /// (BrokerOnly refused by the spawn layer, or a confined launch lost
+    /// its sandbox bridge). The browser was NOT run proxy-only-but-
+    /// unconfined: fail closed, never a silent downgrade.
+    IsolationUnavailable { detail: String },
     /// The operation was cancelled by its caller token.
     Cancelled,
     /// The operation deadline expired.
@@ -163,6 +168,7 @@ impl BrowserError {
             BrowserError::LaunchTimeout { .. } => "launch_timeout",
             BrowserError::Cdp { .. } => "cdp",
             BrowserError::CdpCommand { .. } => "cdp_command",
+            BrowserError::IsolationUnavailable { .. } => "isolation_unavailable",
             BrowserError::Cancelled => "cancelled",
             BrowserError::Deadline { .. } => "deadline",
             BrowserError::VerificationRequired { .. } => "verification_required",
@@ -214,6 +220,9 @@ impl fmt::Display for BrowserError {
                 code,
                 message,
             } => write!(f, "cdp command {method} failed ({code}): {message}"),
+            BrowserError::IsolationUnavailable { detail } => {
+                write!(f, "browser network isolation unavailable: {detail}")
+            }
             BrowserError::Cancelled => write!(f, "cancelled"),
             BrowserError::Deadline { detail } => write!(f, "deadline exceeded: {detail}"),
             BrowserError::VerificationRequired { kind } => {

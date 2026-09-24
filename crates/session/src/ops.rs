@@ -768,26 +768,7 @@ impl SessionHandle {
         // row change and the journal event can never disagree.
         let current = self.state()?;
         let target = if kind == EventKind::PermissionDenied {
-            let preferred = if self.open_batch_has_pending_siblings()? {
-                AgentState::ExecutingTool
-            } else {
-                AgentState::ReadyForNextTurn
-            };
-            // Never bypass the machine: pick the first LEGAL landing (a
-            // self-transition is legal and idempotent), never a forced one.
-            if faktor_core::state::StateMachine::new(current)
-                .transition(preferred)
-                .is_ok()
-            {
-                preferred
-            } else if faktor_core::state::StateMachine::new(current)
-                .transition(AgentState::ReadyForNextTurn)
-                .is_ok()
-            {
-                AgentState::ReadyForNextTurn
-            } else {
-                current
-            }
+            self.negative_permission_landing(current)?
         } else {
             target
         };
@@ -885,6 +866,98 @@ impl SessionHandle {
         // batch resolves), so a pending sibling exists iff at least two
         // batch calls still await a result.
         Ok(calls.iter().filter(|c| !answered.contains(*c)).count() > 1)
+    }
+
+    /// The landing state of a NEGATIVE permission outcome — an explicit
+    /// `Deny` or a durable-deadline reconciliation (`PermissionExpired`):
+    /// prefer keeping the batch on `ExecutingTool` while any sibling call is
+    /// still unresolved (the approved/executing siblings must stay
+    /// reachable), else the documented `ReadyForNextTurn`; only ever a LEGAL
+    /// machine edge (a self-transition as the last resort), never a forced
+    /// hop. Shared verbatim by both paths so an expiry lands exactly where
+    /// the equivalent Deny would.
+    fn negative_permission_landing(&self, current: AgentState) -> faktor_core::Result<AgentState> {
+        let preferred = if self.open_batch_has_pending_siblings()? {
+            AgentState::ExecutingTool
+        } else {
+            AgentState::ReadyForNextTurn
+        };
+        // Never bypass the machine: pick the first LEGAL landing (a
+        // self-transition is legal and idempotent), never a forced one.
+        if faktor_core::state::StateMachine::new(current)
+            .transition(preferred)
+            .is_ok()
+        {
+            Ok(preferred)
+        } else if faktor_core::state::StateMachine::new(current)
+            .transition(AgentState::ReadyForNextTurn)
+            .is_ok()
+        {
+            Ok(AgentState::ReadyForNextTurn)
+        } else {
+            Ok(current)
+        }
+    }
+
+    /// Reconcile this session's durable permission expiry (P1-E): every
+    /// still-`pending` row whose `expires_ms` passed while NO live waiter
+    /// existed (the post-restart world) is terminalized as `expired` and
+    /// journaled as ONE `PermissionExpired` event — never a fake Deny — in
+    /// a single store transaction, landing on the same state an explicit
+    /// `Deny` would (sibling-batch aware). Requires the per-session command
+    /// guard; called by [`SessionHandle::recover_all_with`] before the
+    /// crash state is decided. Idempotent: a second sweep with no expired
+    /// rows touches nothing and appends nothing.
+    pub fn expire_pending_permissions(
+        &self,
+    ) -> faktor_core::Result<faktor_store::ExpiredPermissionResolution> {
+        let _guard = self.command_guard();
+        self.expire_pending_permissions_locked()
+    }
+
+    /// [`Self::expire_pending_permissions`] without taking the command guard
+    /// (recovery already holds it). Never call this without the guard.
+    pub(crate) fn expire_pending_permissions_locked(
+        &self,
+    ) -> faktor_core::Result<faktor_store::ExpiredPermissionResolution> {
+        let now = self.now_ms();
+        let expired = self
+            .manager
+            .store()
+            .expired_pending_permissions(self.id, now)
+            .map_err(crate::map_store_err)?;
+        if expired.is_empty() {
+            return Ok(faktor_store::ExpiredPermissionResolution::default());
+        }
+        let current = self.state()?;
+        let target = self.negative_permission_landing(current)?;
+        crate::journal::validate_transition(current, EventKind::PermissionExpired, target)?;
+        // One sweep, one event: the payload names every terminalized row (the
+        // store stamps the ids/ops it actually changed inside the same
+        // transaction); a single expired row also carries its op for the
+        // journal's op column.
+        let op_id = match expired.as_slice() {
+            [(_, op)] => Some(*op),
+            _ => None,
+        };
+        let event = command_event(
+            EventKind::PermissionExpired,
+            target,
+            op_id,
+            now,
+            Some(serde_json::json!({
+                "reason": "durable permission deadline elapsed while no live waiter owned the request",
+                "expired_count": expired.len(),
+            })),
+        )?;
+        // The atomic store command re-verifies `current` inside its
+        // transaction and re-derives the expired set there: the row changes
+        // and the journal event commit together or not at all.
+        self.manager
+            .store()
+            .expire_pending_permissions_for_session(self.id, now, current, event)
+            .map_err(crate::map_store_err)
+            .map_err(Into::into)
     }
 
     pub fn pending_permission(
@@ -1462,6 +1535,161 @@ mod tests {
             AgentState::ReadyForNextTurn,
             "the denied call alone is not a sibling"
         );
+    }
+
+    /// A manager whose clock is manual: durable permission deadlines can be
+    /// driven past without sleeping (P1-E).
+    fn clocked_manager(
+        t0: i64,
+    ) -> (
+        tempfile::TempDir,
+        std::sync::Arc<faktor_core::time::TestClock>,
+        std::sync::Arc<SessionManager>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = std::sync::Arc::new(faktor_core::time::TestClock::new(t0));
+        let m = SessionManager::open_with_clock(
+            dir.path().join("store"),
+            dir.path().join("cas"),
+            true,
+            clock.clone(),
+        )
+        .unwrap();
+        (dir, clock, m)
+    }
+
+    #[test]
+    fn expire_pending_permissions_terminalizes_and_never_fakes_a_deny() {
+        let t0 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let (_d, clock, m) = clocked_manager(t0);
+        let s = session(&m);
+        to_streaming(&s);
+        let op = s.ops().all()[0];
+        let req = s
+            .request_permission(
+                op,
+                &Capability::ExecuteShell {
+                    command: "cargo test".into(),
+                },
+            )
+            .unwrap();
+        // Nothing past the deadline yet: the sweep is invisible (no event,
+        // no row change, no state move) even though no live waiter exists.
+        let early = s.expire_pending_permissions().unwrap();
+        assert!(early.is_empty());
+        assert_eq!(early.event_seq, None);
+        assert_eq!(s.state().unwrap(), AgentState::WaitingForPermission);
+        assert!(s.pending_permission(req.id).unwrap().is_some());
+        let seq_before = s.last_event_seq().unwrap().unwrap();
+        // Manual clock past the durable deadline: the restart world.
+        clock.set(req.expires_ms + 1);
+        let resolution = s.expire_pending_permissions().unwrap();
+        assert_eq!(resolution.expired, vec![(req.id, op)]);
+        assert!(resolution.event_seq.is_some());
+        assert_eq!(s.state().unwrap(), AgentState::ReadyForNextTurn);
+        assert!(s.pending_permission(req.id).unwrap().is_none());
+        assert_eq!(
+            m.store().permission_decision(req.id).unwrap().as_deref(),
+            Some("expired")
+        );
+        // The journal explains WHY: PermissionExpired, never a fake Deny.
+        let events = s.events_range(1, None).unwrap();
+        let expiry: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::PermissionExpired)
+            .collect();
+        assert_eq!(expiry.len(), 1, "one sweep, one event");
+        assert_eq!(expiry[0].state, AgentState::ReadyForNextTurn);
+        assert_eq!(expiry[0].op_id, Some(op));
+        assert_eq!(
+            expiry[0].payload.as_ref().unwrap()["permission_ids"],
+            serde_json::json!([req.id])
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e.kind,
+                EventKind::PermissionGranted | EventKind::PermissionDenied
+            )),
+            "expiry is journaled as itself, never laundered through Deny/Granted"
+        );
+        // A late resolution attempt finds nothing to own: refused, and the
+        // durable row stays terminal.
+        assert!(s
+            .resolve_permission(req.id, faktor_core::capability::PermissionDecision::Allow)
+            .is_err());
+        assert_eq!(
+            m.store().permission_decision(req.id).unwrap().as_deref(),
+            Some("expired")
+        );
+        // Idempotent: a second sweep appends nothing.
+        let seq_after = s.last_event_seq().unwrap().unwrap();
+        assert!(s.expire_pending_permissions().unwrap().is_empty());
+        assert_eq!(s.last_event_seq().unwrap().unwrap(), seq_after);
+        assert!(seq_after > seq_before);
+    }
+
+    #[test]
+    fn expired_permission_mid_batch_lands_by_the_deny_sibling_rule() {
+        let t0 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let (_d, clock, m) = clocked_manager(t0);
+        let s = session(&m);
+        to_streaming(&s);
+        let turn_op = s.ops().all()[0];
+        // The model's batch is durable as unanswered tool_call parts before
+        // any permission hop: the expired call has a live sibling.
+        let mid = s
+            .put_message(
+                s.proposed_message_seq().unwrap(),
+                "assistant",
+                serde_json::json!({ "parts": [] }),
+            )
+            .unwrap();
+        s.put_tool_call_part(mid, "c1", "read_file", serde_json::json!({}), "completed")
+            .unwrap();
+        s.put_tool_call_part(mid, "c2", "write_file", serde_json::json!({}), "completed")
+            .unwrap();
+        let req = s
+            .request_permission(
+                turn_op,
+                &Capability::ReadWorkspace {
+                    path: "/w/p".into(),
+                },
+            )
+            .unwrap();
+        clock.set(req.expires_ms + 1);
+        let resolution = s.expire_pending_permissions().unwrap();
+        assert_eq!(resolution.expired, vec![(req.id, turn_op)]);
+        assert_eq!(
+            s.state().unwrap(),
+            AgentState::ExecutingTool,
+            "an unanswered sibling keeps the batch executing — the exact Deny landing"
+        );
+        let ev = s
+            .events_range(1, None)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == EventKind::PermissionExpired)
+            .expect("expiry journaled");
+        assert_eq!(ev.state, AgentState::ExecutingTool);
+        // The still-open sibling's own permission hop stays legal and the
+        // batch can continue to execute it.
+        let req2 = s
+            .request_permission(
+                turn_op,
+                &Capability::ReadWorkspace {
+                    path: "/w/q".into(),
+                },
+            )
+            .unwrap();
+        s.resolve_permission(req2.id, faktor_core::capability::PermissionDecision::Allow)
+            .unwrap();
+        assert_eq!(s.state().unwrap(), AgentState::ExecutingTool);
     }
 
     #[test]

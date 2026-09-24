@@ -14,8 +14,16 @@
 //! - `Manual` — never re-run automatically; requires a human.
 //! - `None` — no recovery action.
 //!
+//! Before the crash state is decided (and before the session is interactable
+//! again), the sweep reconciles durable PERMISSION expiry (P1-E): a pending
+//! permission whose `expires_ms` passed while no live waiter existed is
+//! terminalized (`decision = 'expired'`) and journaled as
+//! `EventKind::PermissionExpired` in one transaction, landing where an
+//! explicit Deny would — so a restarted session can never stay parked in
+//! `WaitingForPermission` forever.
+//!
 //! The sweep is idempotent: finished rows are never re-scanned, and a second
-//! `recover_all` appends nothing.
+//! `recover_all` appends nothing (including no second expiry event).
 
 use std::fs;
 use std::path::Path;
@@ -273,6 +281,23 @@ impl SessionHandle {
     pub fn recover_all_with(&self, hasher: &dyn FileHasher) -> faktor_core::Result<RecoveryReport> {
         let _guard = self.command_guard();
         let session_id = self.id;
+
+        // P1-E, FIRST — before the crash state is decided and before the
+        // session is interactable again: reconcile durable permission expiry.
+        // A pending permission whose deadline passed while no live waiter
+        // existed (a restart) is terminalized as `expired` and journaled as
+        // `PermissionExpired` (one transaction), landing where an explicit
+        // Deny would. Without this the machine can stay parked in
+        // `WaitingForPermission` forever on a row no resolver may ever own.
+        let expired = self.expire_pending_permissions_locked()?;
+        if !expired.is_empty() {
+            tracing::warn!(
+                session = %session_id,
+                expired = expired.expired.len(),
+                "reconciled expired permissions at recovery"
+            );
+        }
+
         let current = self.state()?;
         let pending = self.pending_tool_runs()?;
 
@@ -288,7 +313,7 @@ impl SessionHandle {
             orphans,
             interrupted_turn: false,
             contradiction: false,
-            applied: false,
+            applied: expired.event_seq.is_some(),
         };
 
         if pending.is_empty() {
@@ -413,7 +438,7 @@ mod tests {
         (meta, op)
     }
 
-    fn to_executing(s: &SessionHandle) {
+    fn to_executing(s: &SessionHandle) -> crate::ops::PermissionRequest {
         s.submit_prompt("x", &[]).unwrap();
         s.append_event(
             EventKind::ContextPrepared,
@@ -445,7 +470,7 @@ mod tests {
                 path: "/w/a".into(),
             },
         )
-        .unwrap();
+        .unwrap()
     }
 
     #[test]
@@ -645,6 +670,95 @@ mod tests {
         // From FailedRecoverable the user may re-prompt (never blind replay).
         s.submit_prompt("try again", &[]).unwrap();
         assert_eq!(s.state().unwrap(), AgentState::Preparing);
+    }
+
+    /// P1-E: a pending permission whose deadline elapsed while the daemon was
+    /// down (no live waiter existed) must be reconciled by recovery BEFORE
+    /// the crash state is decided: durable row terminal `expired`, one
+    /// `PermissionExpired` journal event (never a fake Deny), and the session
+    /// must not stay parked in `WaitingForPermission`.
+    #[test]
+    fn recover_expires_pending_permissions_before_deciding_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let clock = Arc::new(faktor_core::time::TestClock::new(t0));
+        let m = crate::SessionManager::open_with_clock(
+            dir.path().join("store"),
+            dir.path().join("cas"),
+            true,
+            clock.clone(),
+        )
+        .unwrap();
+        let s = session(&m);
+        let req = to_executing(&s);
+        assert_eq!(s.state().unwrap(), AgentState::WaitingForPermission);
+        let sid = s.id();
+        // CRASH: the world stops with the permission still pending.
+        drop(s);
+        drop(m);
+        // The daemon was down past the durable deadline and nothing was live.
+        clock.set(req.expires_ms + 1);
+        let m2 = crate::SessionManager::open_with_clock(
+            dir.path().join("store"),
+            dir.path().join("cas"),
+            true,
+            clock.clone(),
+        )
+        .unwrap();
+        let s2 = m2.get_session(sid).unwrap().unwrap();
+        let report = s2.recover_all_with(&NotFoundHasher).unwrap();
+        assert!(
+            report.applied,
+            "the expiry reconciliation changed durable state"
+        );
+        assert!(
+            !report.interrupted_turn,
+            "the elapsed permission was the only durable interruption"
+        );
+        assert_eq!(report.state, AgentState::ReadyForNextTurn);
+        assert_eq!(s2.state().unwrap(), AgentState::ReadyForNextTurn);
+        assert_ne!(s2.state().unwrap(), AgentState::WaitingForPermission);
+        // Durable row: terminal expired, and NOT resolvable any more.
+        assert!(s2.pending_permission(req.id).unwrap().is_none());
+        assert_eq!(
+            m2.store().permission_decision(req.id).unwrap().as_deref(),
+            Some("expired")
+        );
+        // The journal explains why: PermissionExpired (never a fake Deny)
+        // with the exact rows the sweep changed.
+        let events = s2.events_range(1, None).unwrap();
+        let expired: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::PermissionExpired)
+            .collect();
+        assert_eq!(expired.len(), 1, "one sweep, one event");
+        assert_eq!(expired[0].op_id, Some(req.op_id));
+        assert_eq!(expired[0].state, AgentState::ReadyForNextTurn);
+        assert_eq!(
+            expired[0].payload.as_ref().unwrap()["permission_ids"],
+            serde_json::json!([req.id])
+        );
+        assert!(!events.iter().any(|e| matches!(
+            e.kind,
+            EventKind::PermissionGranted | EventKind::PermissionDenied
+        )));
+        // SECOND recovery: idempotent — no rows, no events.
+        let seq = s2.last_event_seq().unwrap().unwrap();
+        let second = s2.recover_all_with(&NotFoundHasher).unwrap();
+        assert!(!second.applied);
+        assert!(second.crashed_ops.is_empty());
+        assert_eq!(s2.last_event_seq().unwrap().unwrap(), seq);
+        assert_eq!(s2.state().unwrap(), AgentState::ReadyForNextTurn);
+        assert_eq!(
+            m2.store().permission_decision(req.id).unwrap().as_deref(),
+            Some("expired")
+        );
+        // The recovered session is interactable again.
+        s2.submit_prompt("try again", &[]).unwrap();
+        assert_eq!(s2.state().unwrap(), AgentState::Preparing);
     }
 
     #[test]
