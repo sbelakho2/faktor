@@ -12,6 +12,7 @@ import dev.faktor.backend.NativeClient
 import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeApiException
 import dev.faktor.shared.NativeCompletionContract
+import dev.faktor.shared.NativePermissionReplyRefusal
 import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeProtocolException
 import dev.faktor.shared.NativeRequests
@@ -559,6 +560,42 @@ object FrontendSmoke {
             assertTrue(permissions[0].detail.contains("bash"), "detail JSON must be kept")
         }
 
+        step("permission reply: typed 409 refusals classify and render explicitly") {
+            val conflict = NativeApiException(
+                409, "conflict", "permission 7 unknown or already resolved", false
+            )
+            assertTrue(NativePermissionReplyRefusal.isUnknownOrResolved(conflict))
+            assertEquals(false, NativePermissionReplyRefusal.isSessionMismatch(conflict))
+            val conflictText = NativePermissionReplyRefusal.describe(conflict, "7")
+            assertTrue(
+                conflictText != null && conflictText.contains("already resolved"),
+                conflictText ?: "no conflict text"
+            )
+            val mismatch = NativeApiException(
+                409, "permission_session_mismatch",
+                "permission 7 is owned by session 8, not session 9", false
+            )
+            assertTrue(NativePermissionReplyRefusal.isSessionMismatch(mismatch))
+            val mismatchText = NativePermissionReplyRefusal.describe(mismatch, "7")
+            assertTrue(
+                mismatchText != null && mismatchText.contains("different session"),
+                mismatchText ?: "no mismatch text"
+            )
+            assertEquals(
+                null,
+                NativePermissionReplyRefusal.describe(
+                    NativeApiException(409, "shadow_unregistered", "no shadow", false), "7"
+                ),
+                "unrelated 409 codes keep their own surface"
+            )
+            val panel = PermissionsPanel()
+            panel.update(parseNativePermissionList(PERMISSION_LIST_JSON))
+            panel.setReplyRefusal(conflictText!!)
+            assertEquals(conflictText, panel.refusalText())
+            assertTrue(panel.headerText().contains("last reply refused"), panel.headerText())
+            assertEquals(1, panel.count(), "a refused reply keeps the pending list")
+        }
+
         step("attachments ride the task-run/tournament requests") {
             assertEquals(
                 "{\"goal\":\"g\",\"criteria\":[\"c\"],\"files\":[\"/tmp/a.rs\",\"/tmp/b.rs\"]}",
@@ -572,9 +609,11 @@ object FrontendSmoke {
                 "{\"goal\":\"g\",\"criteria\":[\"c\"],\"n\":3,\"files\":[\"/tmp/a.rs\"]}",
                 NativeRequests.startTournament("g", listOf("c"), 3, files = listOf("/tmp/a.rs"))
             )
+            // The strict reply DTO carries the OWNING session id (the fixture
+            // permission belongs to session 9, not the panel's session 7).
             assertEquals(
-                "{\"permission_id\":\"7\",\"decision\":\"allow\"}",
-                NativeRequests.permissionReply("7", "allow")
+                "{\"session_id\":\"9\",\"permission_id\":\"7\",\"decision\":\"allow\"}",
+                NativeRequests.permissionReply("9", "7", "allow")
             )
             assertEquals(
                 "{\"selector\":\"line_range\",\"start\":2,\"end\":5}",
@@ -1747,6 +1786,20 @@ object FrontendSmoke {
                     step("permission list is served (reply route reachable)") {
                         val permissions = client.permissions(sid)
                         println("  pending permissions=${permissions.size}")
+                    }
+                    step("unknown permission id is a typed 409 conflict (never a blind retry)") {
+                        try {
+                            client.replyPermission(sid, "999999", "allow")
+                            fail("an unknown permission id must not answer 200")
+                        } catch (e: NativeApiException) {
+                            if (e.status != 409 || e.code != "conflict" || e.retryable) {
+                                fail("unexpected permission refusal ${e.status} ${e.code}")
+                            }
+                            assertTrue(
+                                NativePermissionReplyRefusal.isUnknownOrResolved(e),
+                                "the conflict must classify as unknown/resolved"
+                            )
+                        }
                     }
                     step("unknown tournament is a typed 404") {
                         try {

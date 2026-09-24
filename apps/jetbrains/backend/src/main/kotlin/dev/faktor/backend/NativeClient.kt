@@ -393,11 +393,19 @@ class NativeClient(
             request("GET", "/native/permissions", query("session" to sessionId))
         )
 
-    fun replyPermission(permissionId: String, decision: String): NativePermissionAck =
+    /**
+     * Resolve ONE live pending permission with `allow`/`deny`; the strict
+     * body names the session that OWNS the request. An unknown/expired/
+     * already-resolved id is a typed 409 `conflict`, a live waiter owned by
+     * another session a typed 409 `permission_session_mismatch` (see
+     * [dev.faktor.shared.NativePermissionReplyRefusal]); neither is ever
+     * retried blindly.
+     */
+    fun replyPermission(sessionId: String, permissionId: String, decision: String): NativePermissionAck =
         parseNativePermissionAck(
             request(
                 "POST", "/native/permission/reply", null,
-                NativeRequests.permissionReply(permissionId, decision)
+                NativeRequests.permissionReply(sessionId, permissionId, decision)
             )
         )
 

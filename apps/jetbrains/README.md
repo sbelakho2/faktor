@@ -53,7 +53,7 @@ were removed by the Faktor-owned-UI migration).
 | providers | `GET /native/providers` (registry view; `/models` catalog remains the fallback join) |
 | terminals | `GET /native/terminals?session={id}`, `GET /native/session/{id}/terminal/events`, `POST /native/session/{id}/terminal` (session-owned spawn), `GET /pty/{pty_id}/output` (snapshot) |
 | history / lifecycle | `GET /session/list`, start/stop/attach, `restart()` (session+cursor preserved), `reconnectStream()` (SSE cursor resume) |
-| permissions | `GET /permission/list?session_id={id}`, `POST /permission/reply` |
+| permissions | `GET /native/permissions?session={id}`, `POST /native/permission/reply` (strict `{session_id, permission_id, decision}`; typed 409 `conflict` / `permission_session_mismatch`) |
 
 SSE frames carry `event:`, `id:` (journal sequence = resume cursor) and one
 JSON `data:` line. Heartbeats are ignored but advance the cursor; oversized

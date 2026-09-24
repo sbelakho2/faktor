@@ -25,6 +25,7 @@ import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.NativePermissionEntry
+import dev.faktor.shared.NativePermissionReplyRefusal
 import dev.faktor.shared.NativeProjection
 import dev.faktor.shared.NativeTaskRun
 import dev.faktor.shared.NativeTournament
@@ -699,8 +700,7 @@ class FaktorChatPanel(
                                     )
                                 }
                             } else {
-                                service.replyPermission(permission.id, decision)
-                                onEdt { appendSystem("permission ${permission.id}: $decision") }
+                                replyPermissionBlocking(permission, decision)
                             }
                         }
                     }
@@ -711,9 +711,7 @@ class FaktorChatPanel(
 
             override fun onPermissionReply(permission: NativePermissionEntry, decision: String) {
                 runAsync("permission ${permission.id} $decision") {
-                    service.replyPermission(permission.id, decision)
-                    onEdt { appendSystem("permission ${permission.id}: $decision") }
-                    refreshTaskTreeBlocking()
+                    replyPermissionBlocking(permission, decision)
                 }
             }
         })
@@ -876,10 +874,7 @@ class FaktorChatPanel(
         permissionsPanel.setListener(object : PermissionsPanel.Listener {
             override fun onPermissionReply(permission: NativePermissionEntry, decision: String) {
                 runAsync("permission ${permission.id} $decision") {
-                    service.replyPermission(permission.id, decision)
-                    onEdt { appendSystem("permission ${permission.id}: $decision") }
-                    refreshPermissionsBlocking()
-                    refreshTaskTreeBlocking()
+                    replyPermissionBlocking(permission, decision)
                 }
             }
 
@@ -1050,6 +1045,44 @@ class FaktorChatPanel(
         refreshTerminalsBlocking()
         refreshProvidersBlocking()
         refreshHistoryBlocking()
+    }
+
+    /**
+     * Resolve one live pending permission. The reply carries the OWNING
+     * session id from the entry ([NativePermissionEntry.sessionId]) — never
+     * the panel's current session, which may not be the owner. The daemon's
+     * typed 409 refusals (unknown/expired/already resolved, or a live waiter
+     * owned by another session) are surfaced explicitly in the transcript and
+     * the permissions panel; a refused reply is never retried blindly.
+     */
+    private fun replyPermissionBlocking(permission: NativePermissionEntry, decision: String) {
+        var refusal: String? = null
+        try {
+            service.replyPermission(permission.sessionId, permission.id, decision)
+            onEdt { appendSystem("permission ${permission.id}: $decision") }
+        } catch (e: NativeApiException) {
+            refusal = NativePermissionReplyRefusal.describe(e, permission.id)
+                ?: "permission reply refused (status ${e.status} ${e.code}: ${e.detail})"
+        }
+        val text = refusal
+        // Re-read the authority BEFORE recording the refusal so the refreshed
+        // list cannot wipe the typed state; a refresh failure must not hide
+        // the refusal either.
+        try {
+            refreshPermissionsBlocking()
+            refreshTaskTreeBlocking()
+        } catch (e: Exception) {
+            onEdt {
+                appendSystem("permission refresh failed: ${e.message ?: e.javaClass.simpleName}")
+            }
+        } finally {
+            if (text != null) {
+                onEdt {
+                    appendSystem(text)
+                    permissionsPanel.setReplyRefusal(text)
+                }
+            }
+        }
     }
 
     /** Pending permissions of the session; an absent route is recorded. */

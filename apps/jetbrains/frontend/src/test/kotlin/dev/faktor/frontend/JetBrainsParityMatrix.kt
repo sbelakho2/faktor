@@ -341,9 +341,10 @@ internal object ParityMatrix {
                     panel.submitReply("deny")
                     assertEquals("7", repliedId)
                     assertEquals("deny", repliedDecision)
+                    // The strict reply DTO carries the OWNING session id.
                     assertEquals(
-                        "{\"permission_id\":\"7\",\"decision\":\"allow\"}",
-                        NativeRequests.permissionReply("7", "allow")
+                        "{\"session_id\":\"9\",\"permission_id\":\"7\",\"decision\":\"allow\"}",
+                        NativeRequests.permissionReply("9", "7", "allow")
                     )
                 },
                 daemonCheck = { fakeDaemonCheck("permissions", "permissions") }

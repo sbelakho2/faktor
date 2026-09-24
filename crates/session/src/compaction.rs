@@ -94,20 +94,21 @@ impl SessionHandle {
         };
 
         let _guard = self.command_guard();
-        self.manager
-            .store()
-            .record_compaction(self.id, before, after, target, accepted, strategy)
-            .map_err(crate::map_store_err)?;
         let kind = if accepted {
             EventKind::ContextCompacted
         } else {
             EventKind::CompactRejected
         };
+        // Validate against the pre-state read ONCE; the atomic store command
+        // re-verifies it inside the same transaction as the row insert, so a
+        // compaction row can never exist without its journal event.
         let current = self.state()?;
-        self.transition_locked(
+        crate::journal::validate_transition(current, kind, current)?;
+        let event = crate::ops::command_event(
             kind,
             current,
             None,
+            self.now_ms(),
             Some(serde_json::json!({
                 "before": before,
                 "after": after,
@@ -117,6 +118,12 @@ impl SessionHandle {
                 "reduction": reduction_ratio,
             })),
         )?;
+        self.manager
+            .store()
+            .record_compaction_and_event(
+                self.id, before, after, target, accepted, strategy, current, event,
+            )
+            .map_err(crate::map_store_err)?;
         Ok(CompactionRecord {
             accepted,
             before,
@@ -272,5 +279,54 @@ mod tests {
             s.replay_journal().unwrap().state,
             faktor_core::state::AgentState::Preparing
         );
+    }
+
+    #[test]
+    fn compaction_seams_reopen_old_or_new_only() {
+        // One compaction command = ONE transaction: a crash at any durability
+        // boundary reopens on exactly the old world (no event) or exactly the
+        // new one (row and event together).
+        for seam in [
+            "session_command_side_row",
+            "session_command_precommit",
+            "session_command_committed",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let m =
+                crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let s = session(&m);
+            let sid = s.id();
+            m.store().crash_arm(faktor_store::CrashArm {
+                point: seam,
+                ordinal: 0,
+            });
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = s.record_compaction_defaults(100_000, 40_000, 50_000, "summarize");
+            }));
+            assert!(caught.is_err(), "seam {seam} must fire");
+            drop(s);
+            drop(m);
+            let m =
+                crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let s = m.get_session(sid).unwrap().unwrap();
+            let compacted = s
+                .events_range(1, None)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind == EventKind::ContextCompacted)
+                .count();
+            match seam {
+                "session_command_committed" => {
+                    assert_eq!(compacted, 1, "committed compaction journals once");
+                }
+                _ => {
+                    assert_eq!(compacted, 0, "rolled-back compaction leaves no event");
+                }
+            }
+            // Compaction is interior: the state is preserved either way.
+            assert_eq!(s.state().unwrap(), faktor_core::state::AgentState::Idle);
+        }
     }
 }

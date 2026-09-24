@@ -20,6 +20,7 @@ use std::fmt;
 mod cas;
 mod edit_txn;
 mod scheduler_dag;
+mod session_commands;
 mod store_journal;
 
 /// The declared equality class of one crash boundary.

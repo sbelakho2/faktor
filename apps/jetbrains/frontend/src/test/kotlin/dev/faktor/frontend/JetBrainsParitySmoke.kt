@@ -302,11 +302,24 @@ object JetBrainsParitySmoke {
         panel.submitReply("deny")
         assertEquals("7", repliedId)
         assertEquals("deny", repliedDecision)
-        // The reply body is the strict daemon DTO.
+        // The reply body is the strict session-scoped daemon DTO; the entry
+        // owns session 9, which is what the reply must name.
+        assertEquals("9", permission.sessionId)
         assertEquals(
-            "{\"permission_id\":\"7\",\"decision\":\"allow\"}",
-            NativeRequests.permissionReply("7", "allow")
+            "{\"session_id\":\"9\",\"permission_id\":\"7\",\"decision\":\"allow\"}",
+            NativeRequests.permissionReply(permission.sessionId, permission.id, "allow")
         )
+        // A typed 409 refusal is recorded as an explicit panel state, and a
+        // later clean view clears it.
+        panel.setReplyRefusal("permission 7 is unknown, expired or already resolved (409 conflict)")
+        assertTrue(
+            panel.refusalText()!!.contains("409 conflict"),
+            panel.refusalText() ?: "no refusal"
+        )
+        assertTrue(panel.headerText().contains("last reply refused"), panel.headerText())
+        panel.update(permissions)
+        assertEquals(null, panel.refusalText())
+        assertEquals(false, panel.headerText().contains("refused"), panel.headerText())
     }
 
     // ----------------------------------------------------------- 5. terminal
@@ -634,7 +647,8 @@ object JetBrainsParitySmoke {
                 assertEquals("m", chat.settingsView().selectedModel())
             }
             registry.observables["permissions"] = {
-                // Pending list rendered; the reply posts the strict body.
+                // Pending list rendered; the reply posts the strict DTO with
+                // the OWNING session id (the entry belongs to session 9).
                 assertEquals(1, chat.permissionsView().count())
                 assertTrue(
                     chat.permissionsView().unitLabel(0).contains("capability=shell"),
@@ -642,11 +656,46 @@ object JetBrainsParitySmoke {
                 )
                 chat.permissionsView().submitReply("deny")
                 await("permission reply routed") {
-                    daemon.lastRequest("POST", "/native/permission/reply") != null
+                    daemon.requestCount("POST", "/native/permission/reply") >= 1
                 }
                 assertEquals(
-                    "{\"permission_id\":\"7\",\"decision\":\"deny\"}",
+                    "{\"session_id\":\"9\",\"permission_id\":\"7\",\"decision\":\"deny\"}",
                     daemon.lastRequest("POST", "/native/permission/reply")!!.body
+                )
+                // Typed 409 conflict (unknown/expired/already resolved) is
+                // surfaced as an explicit panel state (naming the exact id),
+                // never retried.
+                chat.permissionsView().submitReply("allow")
+                await("typed conflict surfaced") {
+                    chat.permissionsView().refusalText()?.contains("409 conflict") == true
+                }
+                assertTrue(
+                    chat.permissionsView().refusalText()!!.contains("permission 7"),
+                    chat.permissionsView().refusalText() ?: "no refusal"
+                )
+                assertEquals(
+                    "{\"session_id\":\"9\",\"permission_id\":\"7\",\"decision\":\"allow\"}",
+                    daemon.lastRequest("POST", "/native/permission/reply")!!.body
+                )
+                assertEquals(
+                    2,
+                    daemon.requestCount("POST", "/native/permission/reply"),
+                    "a typed 409 conflict is never retried"
+                )
+                // Typed 409 permission_session_mismatch is surfaced too.
+                chat.permissionsView().submitReply("deny")
+                await("typed session mismatch surfaced") {
+                    chat.permissionsView().refusalText()
+                        ?.contains("permission_session_mismatch") == true
+                }
+                assertTrue(
+                    chat.permissionsView().headerText().contains("last reply refused"),
+                    chat.permissionsView().headerText()
+                )
+                assertEquals(
+                    3,
+                    daemon.requestCount("POST", "/native/permission/reply"),
+                    "a session mismatch is never retried"
                 )
             }
             registry.observables["terminal"] = {
@@ -930,7 +979,18 @@ object JetBrainsParitySmoke {
         }
         daemon.on("GET", "/native/session/7/board") { _, response -> response.json(200, PARITY_BOARD_PAGE_JSON) }
         daemon.on("GET", "/native/permissions") { _, response -> response.json(200, PARITY_PERMISSION_LIST_JSON) }
-        daemon.on("POST", "/native/permission/reply") { _, response -> response.json(200, PERMISSION_ACK_JSON) }
+        // Reply attempts: first applies, then one typed 409 conflict and one
+        // typed 409 permission_session_mismatch — the driven assertions prove
+        // each refusal is surfaced and never retried.
+        var permissionReplies = 0
+        daemon.on("POST", "/native/permission/reply") { _, response ->
+            permissionReplies += 1
+            when (permissionReplies) {
+                1 -> response.json(200, PERMISSION_ACK_JSON)
+                2 -> response.json(409, PERMISSION_CONFLICT_JSON)
+                else -> response.json(409, PERMISSION_SESSION_MISMATCH_JSON)
+            }
+        }
         daemon.on("GET", "/native/agents") { _, response -> response.json(200, PARITY_AGENTS_JSON) }
         daemon.on("GET", "/native/terminals") { _, response -> response.json(200, PARITY_TERMINALS_JSON) }
         daemon.on("GET", "/native/session/7/terminal/events") { _, response ->
@@ -995,6 +1055,15 @@ object JetBrainsParitySmoke {
     private const val CREATED_JSON = "{\"id\":\"7\",\"title\":\"parity\",\"created_ms\":1750000000000}"
 
     private const val PERMISSION_ACK_JSON = "{\"ok\":true}"
+
+    private const val PERMISSION_CONFLICT_JSON =
+        "{\"error\":{\"code\":\"conflict\"," +
+            "\"message\":\"permission 7 unknown or already resolved\",\"retryable\":false}}"
+
+    private const val PERMISSION_SESSION_MISMATCH_JSON =
+        "{\"error\":{\"code\":\"permission_session_mismatch\"," +
+            "\"message\":\"permission 7 is owned by session 8, not session 9\"," +
+            "\"retryable\":false}}"
 
     private const val TASK_RUN_STARTED_JSON =
         "{\"task_id\":3,\"run_id\":\"run-9\",\"state\":\"Running\"}"

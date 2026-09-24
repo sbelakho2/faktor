@@ -46,6 +46,9 @@ class PermissionsPanel : JPanel(BorderLayout()) {
 
     private var reason: String? = null
 
+    /** The last typed reply refusal (409 conflict / session mismatch), if any. */
+    private var refusal: String? = null
+
     init {
         list.selectionMode = ListSelectionModel.SINGLE_SELECTION
         list.addListSelectionListener { applySelection() }
@@ -73,6 +76,7 @@ class PermissionsPanel : JPanel(BorderLayout()) {
     fun update(permissions: List<NativePermissionEntry>) {
         available = true
         reason = null
+        refusal = null
         val selectedId = list.selectedValue?.id
         model.clear()
         for (permission in permissions) model.addElement(permission)
@@ -95,10 +99,26 @@ class PermissionsPanel : JPanel(BorderLayout()) {
     fun setUnavailable(detailText: String) {
         available = false
         reason = detailText
+        refusal = null
         model.clear()
         detail.text = detailText
         updateButtons()
     }
+
+    /**
+     * One reply was refused with the daemon's typed 409 (unknown/expired/
+     * already resolved, or a waiter owned by another session). The pending
+     * list is kept and the refusal is recorded explicitly — never retried
+     * behind the operator's back.
+     */
+    fun setReplyRefusal(detailText: String) {
+        refusal = detailText
+        detail.text = detailText
+        updateButtons()
+    }
+
+    /** The last typed reply refusal, or null when the last view was clean. */
+    fun refusalText(): String? = refusal
 
     fun count(): Int = model.size()
 
@@ -150,7 +170,8 @@ class PermissionsPanel : JPanel(BorderLayout()) {
         header.text = if (!available) {
             "pending permissions: unavailable ($reason)"
         } else {
-            "pending permissions: ${model.size()}"
+            val refused = if (refusal != null) " (last reply refused)" else ""
+            "pending permissions: ${model.size()}$refused"
         }
     }
 }

@@ -2045,6 +2045,461 @@ impl Store {
         )?;
         Ok(seq)
     }
+}
+
+// ------------------------------------------- atomic session commands
+//
+// A session command that mutates BOTH a side table (tool_run / permission
+// / checkpoint / compaction) and the journal used to be two separate
+// writes: a crash between them left side-table reality absent from the
+// journal, violating journal-as-authority. [`SessionCommandTxn`] makes
+// each such command ONE SQLite transaction (BEGIN IMMEDIATE): verify the
+// session is still in the caller-observed state, mutate the side row,
+// verify exactly one row changed, append the journal event through the
+// shared gapless-seq path (which also moves the session state), then
+// COMMIT. At every crash point the durable world is exactly the OLD state
+// or exactly the NEW state, never a hybrid.
+
+/// The journal half of one atomic session command: the event appended in
+/// the SAME transaction as the command's side-table row. `ts_ms` is the
+/// caller's clock (the session layer's injectable clock); side-row
+/// timestamps keep using the store's wall clock exactly as the raw writes
+/// did.
+#[derive(Debug, Clone)]
+pub struct CommandEvent {
+    pub kind: EventKind,
+    pub state: AgentState,
+    pub op_id: Option<OpId>,
+    pub ts_ms: i64,
+    pub payload: Option<serde_json::Value>,
+    pub payload_ver: i64,
+}
+
+/// One logical session command inside ONE SQLite transaction
+/// (`BEGIN IMMEDIATE`). The session must exist and be exactly in the
+/// caller's `expected_state` or the command refuses with `Conflict`
+/// BEFORE any write (no side row, no event). The command's side row and
+/// its journal event then commit together; the deterministic crash seams
+/// fire at the three durability boundaries:
+///
+/// - `session_command_side_row`: the side row is written, the event is
+///   not yet (panic rolls the WHOLE command back — old state);
+/// - `session_command_precommit`: the event is written, COMMIT is not yet
+///   (panic rolls the WHOLE command back — old state);
+/// - `session_command_committed`: COMMIT returned, the acknowledgement
+///   was lost (the command is durable — new state).
+///
+/// Dropping without [`Self::commit`] rolls the whole command back,
+/// exactly like a process death before the durability boundary.
+#[doc(hidden)]
+pub struct SessionCommandTxn<'a> {
+    tx: rusqlite::Transaction<'a>,
+    session: SessionId,
+    expected_state: AgentState,
+    seam: &'a CrashSeam,
+}
+
+impl<'a> SessionCommandTxn<'a> {
+    /// BEGIN IMMEDIATE, read the session row inside the transaction and
+    /// verify it is exactly in `expected_state`. Missing session or a
+    /// mismatch refuses typed before any write.
+    fn begin(
+        conn: &'a mut Connection,
+        seam: &'a CrashSeam,
+        session: SessionId,
+        expected_state: AgentState,
+    ) -> StoreResult<Self> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT state FROM session WHERE id = ?1",
+                params![session.raw() as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let raw = raw.ok_or_else(|| {
+            StoreError::Conflict(format!(
+                "session {session} does not exist; session command refused"
+            ))
+        })?;
+        let current: AgentState = parse_json(&format!("session {session} state"), &raw)?;
+        if current != expected_state {
+            return Err(StoreError::Conflict(format!(
+                "session {session} state is {current:?}, expected {expected_state:?}; \
+                     session command refused before any write"
+            )));
+        }
+        Ok(Self {
+            tx,
+            session,
+            expected_state,
+            seam,
+        })
+    }
+
+    /// The session this command belongs to.
+    pub fn session(&self) -> SessionId {
+        self.session
+    }
+
+    /// The pre-state this command verified inside the transaction.
+    pub fn expected_state(&self) -> AgentState {
+        self.expected_state
+    }
+
+    /// The transaction connection, for the shared gapless-seq insert path.
+    fn conn(&self) -> &Connection {
+        &self.tx
+    }
+
+    /// Durability boundary: the side row is written, the event is not yet.
+    fn side_row_applied(&self) {
+        self.seam.trip("session_command_side_row");
+    }
+
+    /// Durability boundary: the event is written, COMMIT is not yet.
+    fn precommit(&self) {
+        self.seam.trip("session_command_precommit");
+    }
+
+    /// COMMIT the command, then trip the post-commit boundary: the
+    /// command is durable and the acknowledgement was lost.
+    fn commit(self) -> StoreResult<()> {
+        self.tx.commit()?;
+        self.seam.trip("session_command_committed");
+        Ok(())
+    }
+}
+
+impl Store {
+    /// `request_permission` as ONE transaction: insert the pending permission
+    /// row and append `ToolRequested` (state `WaitingForPermission`) together.
+    /// Returns `(permission_id, expires_ms, event_seq)`. The permission window
+    /// is stamped from the store clock exactly like the raw insert.
+    pub fn insert_permission_and_event(
+        &self,
+        session_id: SessionId,
+        op_id: OpId,
+        capability: &str,
+        expected_state: AgentState,
+        mut event: CommandEvent,
+    ) -> StoreResult<(i64, i64, EventSeq)> {
+        let mut conn = self.write();
+        let txn = SessionCommandTxn::begin(&mut conn, &self.seam, session_id, expected_state)?;
+        let expires_ms = now_ms() + Self::PERMISSION_WINDOW_MS;
+        let changed = txn.tx.execute(
+            "INSERT INTO permission(session_id, op_id, capability, decision, expires_ms)
+             VALUES (?1, ?2, ?3, 'pending', ?4)",
+            params![
+                session_id.raw() as i64,
+                op_id.raw() as i64,
+                capability,
+                expires_ms
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Migration(
+                "insert_permission: expected exactly one inserted row".into(),
+            ));
+        }
+        let id = txn.tx.last_insert_rowid();
+        // The journal names the id this transaction actually allocated; the
+        // caller cannot know it before the insert.
+        if let Some(serde_json::Value::Object(obj)) = &mut event.payload {
+            obj.insert("permission_id".into(), serde_json::json!(id));
+        }
+        txn.side_row_applied();
+        let seq = self.insert_event_locked(
+            txn.conn(),
+            session_id,
+            event.op_id,
+            event.kind,
+            event.state,
+            event.ts_ms,
+            event.payload,
+            event.payload_ver,
+        )?;
+        txn.precommit();
+        txn.commit()?;
+        Ok((id, expires_ms, seq))
+    }
+
+    /// `resolve_permission` as ONE transaction: terminalize an expired row /
+    /// change exactly ONE pending row owned by `session_id`, append the
+    /// decision event and commit. A refusal (unknown, already terminal, wrong
+    /// session, expired) still commits the expiry terminalization — exactly
+    /// like the raw resolver — and returns the typed `Conflict`; the decision
+    /// event is never written when no row changed. The event's op id is taken
+    /// from the durable permission row, so the journal always names the same
+    /// operation the row belongs to.
+    pub fn resolve_permission_and_event(
+        &self,
+        id: i64,
+        session_id: SessionId,
+        decision: &str,
+        expected_state: AgentState,
+        mut event: CommandEvent,
+    ) -> StoreResult<EventSeq> {
+        let mut conn = self.write();
+        let txn = SessionCommandTxn::begin(&mut conn, &self.seam, session_id, expected_state)?;
+        let now = now_ms();
+        txn.tx.execute(
+            "UPDATE permission SET decision = 'expired', resolved_ms = ?2
+             WHERE id = ?1 AND decision = 'pending' AND expires_ms <= ?2",
+            params![id, now],
+        )?;
+        let changed = txn.tx.execute(
+            "UPDATE permission SET decision = ?2, resolved_ms = ?3
+             WHERE id = ?1 AND session_id = ?4 AND decision = 'pending' AND expires_ms > ?3",
+            params![id, decision, now, session_id.raw() as i64],
+        )?;
+        if changed != 1 {
+            // Commit BEFORE refusing: an expired row's terminalization must
+            // survive even though the resolution itself is refused.
+            txn.commit()?;
+            return Err(StoreError::Conflict(format!(
+                "permission {id} is not pending"
+            )));
+        }
+        let op_raw: i64 = txn.tx.query_row(
+            "SELECT op_id FROM permission WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        event.op_id = Some(id_field(&format!("permission {id} op_id"), op_raw)?);
+        txn.side_row_applied();
+        let seq = self.insert_event_locked(
+            txn.conn(),
+            session_id,
+            event.op_id,
+            event.kind,
+            event.state,
+            event.ts_ms,
+            event.payload,
+            event.payload_ver,
+        )?;
+        txn.precommit();
+        txn.commit()?;
+        Ok(seq)
+    }
+
+    /// `start_tool_run` as ONE transaction: insert the running tool_run row
+    /// and append `ToolStarted` (state `ExecutingTool`) together. Returns
+    /// `(tool_run_row_id, event_seq)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_tool_run_and_event(
+        &self,
+        session_id: SessionId,
+        op_id: OpId,
+        tool: &str,
+        args: serde_json::Value,
+        recovery: serde_json::Value,
+        expected_hash: Option<String>,
+        replay_descriptor: Option<serde_json::Value>,
+        expected_state: AgentState,
+        event: CommandEvent,
+    ) -> StoreResult<(i64, EventSeq)> {
+        let mut conn = self.write();
+        let txn = SessionCommandTxn::begin(&mut conn, &self.seam, session_id, expected_state)?;
+        let changed = txn.tx.execute(
+            "INSERT INTO tool_run(session_id, op_id, tool, args, status, started_ms, effect_status, recovery, expected_hash, replay_descriptor)
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5, 'unknown', ?6, ?7, ?8)",
+            params![
+                session_id.raw() as i64,
+                op_id.raw() as i64,
+                tool,
+                args.to_string(),
+                now_ms(),
+                recovery.to_string(),
+                expected_hash,
+                replay_descriptor.map(|d| d.to_string()),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Migration(
+                "start_tool_run: expected exactly one inserted row".into(),
+            ));
+        }
+        let row_id = txn.tx.last_insert_rowid();
+        txn.side_row_applied();
+        let seq = self.insert_event_locked(
+            txn.conn(),
+            session_id,
+            event.op_id,
+            event.kind,
+            event.state,
+            event.ts_ms,
+            event.payload,
+            event.payload_ver,
+        )?;
+        txn.precommit();
+        txn.commit()?;
+        Ok((row_id, seq))
+    }
+
+    /// `finish_tool_run` as ONE transaction: move exactly ONE still-running
+    /// tool_run row to its terminal status and append the completion event
+    /// together. Zero changed rows (unknown or already finished) is the typed
+    /// `Conflict`; the event is never written without the row.
+    pub fn finish_tool_run_and_event(
+        &self,
+        session_id: SessionId,
+        op_id: OpId,
+        status: &str,
+        effect_status: &str,
+        expected_state: AgentState,
+        event: CommandEvent,
+    ) -> StoreResult<EventSeq> {
+        let mut conn = self.write();
+        let txn = SessionCommandTxn::begin(&mut conn, &self.seam, session_id, expected_state)?;
+        let changed = txn.tx.execute(
+            "UPDATE tool_run SET status = ?3, effect_status = ?4, ended_ms = ?5
+             WHERE session_id = ?1 AND op_id = ?2 AND status = 'running'",
+            params![
+                session_id.raw() as i64,
+                op_id.raw() as i64,
+                status,
+                effect_status,
+                now_ms()
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "tool run {op_id} is not running"
+            )));
+        }
+        txn.side_row_applied();
+        let seq = self.insert_event_locked(
+            txn.conn(),
+            session_id,
+            event.op_id,
+            event.kind,
+            event.state,
+            event.ts_ms,
+            event.payload,
+            event.payload_ver,
+        )?;
+        txn.precommit();
+        txn.commit()?;
+        Ok(seq)
+    }
+
+    /// `put_checkpoint` as ONE transaction: insert the checkpoint row (with a
+    /// duplicate-sequence check inside the same transaction) and append
+    /// `CheckpointCreated` together. Returns `(checkpoint_row_id, event_seq)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_checkpoint_and_event(
+        &self,
+        session_id: SessionId,
+        sequence: i64,
+        path: &str,
+        before_hash: &str,
+        after_hash: &str,
+        after_cas_hash: Option<&str>,
+        expected_state: AgentState,
+        event: CommandEvent,
+    ) -> StoreResult<(i64, EventSeq)> {
+        let mut conn = self.write();
+        let txn = SessionCommandTxn::begin(&mut conn, &self.seam, session_id, expected_state)?;
+        let duplicate: Option<i64> = txn
+            .tx
+            .query_row(
+                "SELECT id FROM checkpoint WHERE session_id = ?1 AND sequence = ?2 LIMIT 1",
+                params![session_id.raw() as i64, sequence],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if duplicate.is_some() {
+            return Err(StoreError::Conflict(format!(
+                "checkpoint sequence {sequence} already exists"
+            )));
+        }
+        let changed = txn.tx.execute(
+            "INSERT INTO checkpoint(session_id, sequence, path, before_hash, after_hash, after_cas_hash, before_exists, after_exists, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                session_id.raw() as i64,
+                sequence,
+                path,
+                before_hash,
+                after_hash,
+                after_cas_hash,
+                1i64,
+                1i64,
+                now_ms()
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Migration(
+                "put_checkpoint: expected exactly one inserted row".into(),
+            ));
+        }
+        let id = txn.tx.last_insert_rowid();
+        txn.side_row_applied();
+        let seq = self.insert_event_locked(
+            txn.conn(),
+            session_id,
+            event.op_id,
+            event.kind,
+            event.state,
+            event.ts_ms,
+            event.payload,
+            event.payload_ver,
+        )?;
+        txn.precommit();
+        txn.commit()?;
+        Ok((id, seq))
+    }
+
+    /// `record_compaction` as ONE transaction: insert the compaction row and
+    /// append the accepted/rejected compaction event together.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_compaction_and_event(
+        &self,
+        session_id: SessionId,
+        before_tokens: i64,
+        after_tokens: i64,
+        target_tokens: i64,
+        accepted: bool,
+        strategy: &str,
+        expected_state: AgentState,
+        event: CommandEvent,
+    ) -> StoreResult<EventSeq> {
+        let mut conn = self.write();
+        let txn = SessionCommandTxn::begin(&mut conn, &self.seam, session_id, expected_state)?;
+        let changed = txn.tx.execute(
+            "INSERT INTO compaction(session_id, before_tokens, after_tokens, target_tokens, accepted, strategy, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                session_id.raw() as i64,
+                before_tokens,
+                after_tokens,
+                target_tokens,
+                accepted as i64,
+                strategy,
+                now_ms()
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Migration(
+                "record_compaction: expected exactly one inserted row".into(),
+            ));
+        }
+        txn.side_row_applied();
+        let seq = self.insert_event_locked(
+            txn.conn(),
+            session_id,
+            event.op_id,
+            event.kind,
+            event.state,
+            event.ts_ms,
+            event.payload,
+            event.payload_ver,
+        )?;
+        txn.precommit();
+        txn.commit()?;
+        Ok(seq)
+    }
 
     // -------------------------------------------------- actor batch surface
 
@@ -19428,5 +19883,502 @@ mod legacy_verification_import_tests {
             .unwrap()
             .iter()
             .any(|(_, key, _)| key == "va:8:1"));
+    }
+}
+
+#[cfg(test)]
+mod session_command_txn_tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::{Arc, Barrier};
+
+    use super::*;
+
+    const OP: u64 = 42;
+
+    /// The three durability boundaries of every atomic session command.
+    const SEAMS: [&str; 3] = [
+        "session_command_side_row",
+        "session_command_precommit",
+        "session_command_committed",
+    ];
+
+    const CMDS: [Cmd; 6] = [
+        Cmd::Permission,
+        Cmd::Grant,
+        Cmd::StartTool,
+        Cmd::FinishTool,
+        Cmd::Checkpoint,
+        Cmd::Compaction,
+    ];
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Cmd {
+        Permission,
+        Grant,
+        StartTool,
+        FinishTool,
+        Checkpoint,
+        Compaction,
+    }
+
+    impl Cmd {
+        fn name(self) -> &'static str {
+            match self {
+                Cmd::Permission => "request_permission",
+                Cmd::Grant => "resolve_permission",
+                Cmd::StartTool => "start_tool_run",
+                Cmd::FinishTool => "finish_tool_run",
+                Cmd::Checkpoint => "put_checkpoint",
+                Cmd::Compaction => "record_compaction",
+            }
+        }
+    }
+
+    fn setup() -> (tempfile::TempDir, Store, SessionId) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("store"), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let row = store.create_session(ws, "s", "p", "m").unwrap();
+        (dir, store, row.id)
+    }
+
+    fn ev(kind: EventKind, state: AgentState, payload: serde_json::Value) -> CommandEvent {
+        CommandEvent {
+            kind,
+            state,
+            op_id: Some(OpId::new(OP)),
+            ts_ms: now_ms(),
+            payload: Some(payload),
+            payload_ver: 1,
+        }
+    }
+
+    /// Execute one logical command of the fixed pipeline against the state the
+    /// previous commands produced.
+    fn execute(store: &Store, sid: SessionId, cmd: Cmd, pid: &mut Option<i64>) {
+        match cmd {
+            Cmd::Permission => {
+                let (id, _, _) = store
+                    .insert_permission_and_event(
+                        sid,
+                        OpId::new(OP),
+                        "{\"capability\":\"read\"}",
+                        AgentState::Idle,
+                        ev(
+                            EventKind::ToolRequested,
+                            AgentState::WaitingForPermission,
+                            serde_json::json!({ "capability": "read" }),
+                        ),
+                    )
+                    .expect("permission request");
+                *pid = Some(id);
+            }
+            Cmd::Grant => {
+                store
+                    .resolve_permission_and_event(
+                        pid.expect("permission requested first"),
+                        sid,
+                        "allow",
+                        AgentState::WaitingForPermission,
+                        ev(
+                            EventKind::PermissionGranted,
+                            AgentState::ExecutingTool,
+                            serde_json::json!({ "decision": "allow" }),
+                        ),
+                    )
+                    .expect("permission resolution");
+            }
+            Cmd::StartTool => {
+                store
+                    .start_tool_run_and_event(
+                        sid,
+                        OpId::new(OP),
+                        "read_file",
+                        serde_json::json!({ "path": "a" }),
+                        serde_json::json!({ "strategy": "none" }),
+                        None,
+                        None,
+                        AgentState::ExecutingTool,
+                        ev(
+                            EventKind::ToolStarted,
+                            AgentState::ExecutingTool,
+                            serde_json::json!({ "tool": "read_file" }),
+                        ),
+                    )
+                    .expect("tool start");
+            }
+            Cmd::FinishTool => {
+                store
+                    .finish_tool_run_and_event(
+                        sid,
+                        OpId::new(OP),
+                        "completed",
+                        "verified",
+                        AgentState::ExecutingTool,
+                        ev(
+                            EventKind::ToolCompleted,
+                            AgentState::Validating,
+                            serde_json::json!({ "status": "completed" }),
+                        ),
+                    )
+                    .expect("tool finish");
+            }
+            Cmd::Checkpoint => {
+                store
+                    .put_checkpoint_and_event(
+                        sid,
+                        0,
+                        "a.rs",
+                        &"11".repeat(32),
+                        &"22".repeat(32),
+                        None,
+                        AgentState::Validating,
+                        ev(
+                            EventKind::CheckpointCreated,
+                            AgentState::Validating,
+                            serde_json::json!({ "sequence": 0, "path": "a.rs" }),
+                        ),
+                    )
+                    .expect("checkpoint");
+            }
+            Cmd::Compaction => {
+                store
+                    .record_compaction_and_event(
+                        sid,
+                        100_000,
+                        40_000,
+                        50_000,
+                        true,
+                        "summarize",
+                        AgentState::Validating,
+                        ev(
+                            EventKind::ContextCompacted,
+                            AgentState::Validating,
+                            serde_json::json!({ "accepted": true }),
+                        ),
+                    )
+                    .expect("compaction");
+            }
+        }
+    }
+
+    fn run_prefix(store: &Store, sid: SessionId, upto: Cmd) -> Option<i64> {
+        let mut pid = None;
+        for cmd in CMDS {
+            if cmd == upto {
+                break;
+            }
+            execute(store, sid, cmd, &mut pid);
+        }
+        pid
+    }
+
+    /// Semantic durable state, timestamps excluded: equality IS old-vs-new.
+    #[derive(Debug, PartialEq, Eq)]
+    struct World(Vec<String>);
+
+    fn query_lines(conn: &Connection, sql: &str, sid: SessionId) -> Vec<String> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let mut rows = stmt.query(params![sid.raw() as i64]).unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            let n = row.as_ref().column_count();
+            let mut line = String::new();
+            for i in 0..n {
+                if i > 0 {
+                    line.push('|');
+                }
+                let v: rusqlite::types::Value = row.get(i).unwrap();
+                line.push_str(&format!("{v:?}"));
+            }
+            out.push(line);
+        }
+        out
+    }
+
+    fn world(store: &Store, sid: SessionId) -> World {
+        let conn = store.write();
+        let mut lines = Vec::new();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM session WHERE id = ?1",
+                params![sid.raw() as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        lines.push(format!("state:{state}"));
+        lines.extend(query_lines(
+            &conn,
+            "SELECT seq, kind, state, op_id, payload, payload_ver FROM event WHERE session_id = ?1 ORDER BY seq",
+            sid,
+        ));
+        lines.extend(query_lines(
+            &conn,
+            "SELECT id, op_id, decision, resolved_ms IS NOT NULL FROM permission WHERE session_id = ?1 ORDER BY id",
+            sid,
+        ));
+        lines.extend(query_lines(
+            &conn,
+            "SELECT id, op_id, tool, status, effect_status, expected_hash FROM tool_run WHERE session_id = ?1 ORDER BY id",
+            sid,
+        ));
+        lines.extend(query_lines(
+            &conn,
+            "SELECT id, sequence, path, before_hash, after_hash, restored_ms IS NOT NULL FROM checkpoint WHERE session_id = ?1 ORDER BY id",
+            sid,
+        ));
+        lines.extend(query_lines(
+            &conn,
+            "SELECT id, before_tokens, after_tokens, target_tokens, accepted, strategy FROM compaction WHERE session_id = ?1 ORDER BY id",
+            sid,
+        ));
+        World(lines)
+    }
+
+    fn reference_world(completed: usize) -> World {
+        let (dir, store, sid) = setup();
+        let mut pid = None;
+        for cmd in CMDS.iter().take(completed) {
+            execute(&store, sid, *cmd, &mut pid);
+        }
+        let w = world(&store, sid);
+        drop(store);
+        drop(dir);
+        w
+    }
+
+    fn crashed_world(cmd: Cmd, seam: &'static str) -> World {
+        let (dir, store, sid) = setup();
+        let pid = run_prefix(&store, sid, cmd);
+        store.crash_arm(CrashArm {
+            point: seam,
+            ordinal: 0,
+        });
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            let mut pid = pid;
+            execute(&store, sid, cmd, &mut pid);
+        }));
+        assert!(caught.is_err(), "seam {seam} at {} must fire", cmd.name());
+        drop(store);
+        let reopened = Store::open(dir.path().join("store"), true).unwrap();
+        let w = world(&reopened, sid);
+        drop(reopened);
+        drop(dir);
+        w
+    }
+
+    #[test]
+    fn crash_at_each_seam_reopens_exactly_old_or_exactly_new() {
+        for (idx, cmd) in CMDS.iter().enumerate() {
+            let old = reference_world(idx);
+            let new = reference_world(idx + 1);
+            assert_ne!(old, new, "{} must change the durable world", cmd.name());
+            for seam in SEAMS {
+                let durable = crashed_world(*cmd, seam);
+                match seam {
+                    "session_command_committed" => assert_eq!(
+                        durable,
+                        new,
+                        "{} after {seam}: the committed command must be durable",
+                        cmd.name()
+                    ),
+                    _ => assert_eq!(
+                        durable,
+                        old,
+                        "{} at {seam}: the crashed command must roll back whole",
+                        cmd.name()
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expected_state_mismatch_refuses_before_any_write() {
+        for (idx, cmd) in CMDS.iter().enumerate() {
+            let old = reference_world(idx);
+            let (dir, store, sid) = setup();
+            let pid = run_prefix(&store, sid, *cmd);
+            // Suspended is never the pipeline's current state at any command.
+            let wrong = AgentState::Suspended;
+            let err = match cmd {
+                Cmd::Permission => store
+                    .insert_permission_and_event(
+                        sid,
+                        OpId::new(OP),
+                        "cap",
+                        wrong,
+                        ev(
+                            EventKind::ToolRequested,
+                            AgentState::WaitingForPermission,
+                            serde_json::json!({}),
+                        ),
+                    )
+                    .map(|_| ())
+                    .unwrap_err(),
+                Cmd::Grant => store
+                    .resolve_permission_and_event(
+                        pid.expect("permission"),
+                        sid,
+                        "allow",
+                        wrong,
+                        ev(
+                            EventKind::PermissionGranted,
+                            AgentState::ExecutingTool,
+                            serde_json::json!({}),
+                        ),
+                    )
+                    .map(|_| ())
+                    .unwrap_err(),
+                Cmd::StartTool => store
+                    .start_tool_run_and_event(
+                        sid,
+                        OpId::new(OP),
+                        "read_file",
+                        serde_json::json!({}),
+                        serde_json::json!({}),
+                        None,
+                        None,
+                        wrong,
+                        ev(
+                            EventKind::ToolStarted,
+                            AgentState::ExecutingTool,
+                            serde_json::json!({}),
+                        ),
+                    )
+                    .map(|_| ())
+                    .unwrap_err(),
+                Cmd::FinishTool => store
+                    .finish_tool_run_and_event(
+                        sid,
+                        OpId::new(OP),
+                        "completed",
+                        "verified",
+                        wrong,
+                        ev(
+                            EventKind::ToolCompleted,
+                            AgentState::Validating,
+                            serde_json::json!({}),
+                        ),
+                    )
+                    .map(|_| ())
+                    .unwrap_err(),
+                Cmd::Checkpoint => store
+                    .put_checkpoint_and_event(
+                        sid,
+                        0,
+                        "a.rs",
+                        &"11".repeat(32),
+                        &"22".repeat(32),
+                        None,
+                        wrong,
+                        ev(
+                            EventKind::CheckpointCreated,
+                            AgentState::Validating,
+                            serde_json::json!({}),
+                        ),
+                    )
+                    .map(|_| ())
+                    .unwrap_err(),
+                Cmd::Compaction => store
+                    .record_compaction_and_event(
+                        sid,
+                        100_000,
+                        40_000,
+                        50_000,
+                        true,
+                        "summarize",
+                        wrong,
+                        ev(
+                            EventKind::ContextCompacted,
+                            AgentState::Validating,
+                            serde_json::json!({}),
+                        ),
+                    )
+                    .map(|_| ())
+                    .unwrap_err(),
+            };
+            assert!(
+                matches!(err, StoreError::Conflict(_)),
+                "{} with a wrong expected state must refuse with Conflict: {err:?}",
+                cmd.name()
+            );
+            assert_eq!(
+                world(&store, sid),
+                old,
+                "{} refused before any write",
+                cmd.name()
+            );
+            drop(store);
+            drop(dir);
+        }
+    }
+
+    #[test]
+    fn concurrent_duplicate_resolution_has_exactly_one_winner() {
+        let (_dir, store, sid) = setup();
+        let (id, _, _) = store
+            .insert_permission_and_event(
+                sid,
+                OpId::new(OP),
+                "cap",
+                AgentState::Idle,
+                ev(
+                    EventKind::ToolRequested,
+                    AgentState::WaitingForPermission,
+                    serde_json::json!({}),
+                ),
+            )
+            .unwrap();
+        let store = Arc::new(store);
+        let barrier = Arc::new(Barrier::new(2));
+        let spawn = |decision: &'static str, kind: EventKind| {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .resolve_permission_and_event(
+                        id,
+                        sid,
+                        decision,
+                        AgentState::WaitingForPermission,
+                        ev(kind, AgentState::ExecutingTool, serde_json::json!({})),
+                    )
+                    .map(|_| ())
+            })
+        };
+        let allow = spawn("allow", EventKind::PermissionGranted);
+        let deny = spawn("deny", EventKind::PermissionDenied);
+        let r1 = allow.join().unwrap();
+        let r2 = deny.join().unwrap();
+        assert!(
+            r1.is_ok() != r2.is_ok(),
+            "exactly one resolver must win; got {r1:?} / {r2:?}"
+        );
+        let loser = if r1.is_ok() { &r2 } else { &r1 };
+        assert!(
+            matches!(loser, Err(StoreError::Conflict(_))),
+            "the loser must refuse typed: {loser:?}"
+        );
+        let conn = store.write();
+        let resolutions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM event WHERE session_id = ?1
+                 AND kind IN ('permission_granted', 'permission_denied')",
+                params![sid.raw() as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolutions, 1, "exactly one resolution event");
+        let decision: String = conn
+            .query_row(
+                "SELECT decision FROM permission WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let winner = if r1.is_ok() { "allow" } else { "deny" };
+        assert_eq!(decision, winner, "the durable decision matches the winner");
     }
 }

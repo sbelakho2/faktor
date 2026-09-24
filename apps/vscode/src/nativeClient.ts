@@ -535,6 +535,35 @@ export interface NativeBlockerEntry {
   readonly state: string | null;
 }
 
+/**
+ * One live pending permission request (`GET /native/permissions?session=`).
+ * `session_id` names the session that OWNS the request; resolution is
+ * contextual, so a reply must carry that same session id (the daemon refuses
+ * a live waiter owned by another session with a typed 409
+ * `permission_session_mismatch`).
+ */
+export interface NativePermissionEntry {
+  readonly id: string;
+  readonly sessionId: string;
+  readonly capability: string;
+  readonly detail: string;
+}
+
+/** The resolution ack (`POST /native/permission/reply`, 200 `{ok:true}`). */
+export interface NativePermissionAck {
+  readonly ok: boolean;
+}
+
+/**
+ * The daemon's two typed 409 permission-reply refusals, classified:
+ *   - `unknown_or_resolved`: the id is unknown, expired, timed out or already
+ *     resolved (`conflict`);
+ *   - `session_mismatch`: a live waiter exists but belongs to another session
+ *     (`permission_session_mismatch`).
+ * Anything else is not a permission-reply refusal and must be surfaced as-is.
+ * A refused reply is NEVER retried blindly: the id's authority may be gone.
+ */
+export type NativePermissionReplyFailure = 'unknown_or_resolved' | 'session_mismatch';
 
 export interface NativeTaskBudget {
   readonly maxTokens: number | null;
@@ -2197,6 +2226,82 @@ export function validateBoardPage(json: Json): NativeBoardPage {
   };
 }
 
+/**
+ * One permission `detail` is a free-form JSON value on the wire; it is
+ * normalized to display text (a string stays verbatim, anything else is
+ * serialized) — never dropped, never re-parsed as structure.
+ */
+function permissionDetailText(object: JsonObject, path: string): string {
+  const value = field(object, 'detail', path);
+  if (typeof value === 'string') {
+    return value;
+  }
+  return JSON.stringify(value);
+}
+
+/** Strict parse of the live pending set (`GET /native/permissions`). */
+export function validatePermissionList(json: Json): NativePermissionEntry[] {
+  const path = 'GET /native/permissions';
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, ['permissions']);
+  return fObjectArray(object, 'permissions', path).map((entry, index) => {
+    const itemPath = `${path}.permissions[${index}]`;
+    checkResponseKeys(entry, itemPath, ['id', 'session_id', 'capability', 'detail']);
+    return {
+      id: fString(entry, 'id', itemPath),
+      sessionId: fString(entry, 'session_id', itemPath),
+      capability: fString(entry, 'capability', itemPath),
+      detail: permissionDetailText(entry, itemPath),
+    };
+  });
+}
+
+/** Strict parse of the resolution ack (`POST /native/permission/reply`). */
+export function validatePermissionAck(json: Json): NativePermissionAck {
+  const path = 'POST /native/permission/reply';
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, ['ok']);
+  return { ok: fBool(object, 'ok', path) };
+}
+
+/**
+ * Classify a failed permission reply into the daemon's typed 409 refusals.
+ * Returns null for anything that is not one of them (a 401/500/400 stays a
+ * plain `NativeApiError`); callers surface the typed state and never retry
+ * blindly, because a refused reply may name an id whose authority is gone.
+ */
+export function classifyPermissionReplyFailure(
+  error: unknown,
+): NativePermissionReplyFailure | null {
+  if (!(error instanceof NativeApiError) || error.status !== 409) {
+    return null;
+  }
+  if (error.code === 'conflict') {
+    return 'unknown_or_resolved';
+  }
+  if (error.code === 'permission_session_mismatch') {
+    return 'session_mismatch';
+  }
+  return null;
+}
+
+/** Operator-facing text for one typed permission-reply refusal. */
+export function permissionReplyFailureMessage(
+  failure: NativePermissionReplyFailure,
+  permissionId: string,
+): string {
+  if (failure === 'session_mismatch') {
+    return (
+      `permission ${permissionId} is owned by a different session ` +
+      '(409 permission_session_mismatch); refresh the pending list and reply from the owning session'
+    );
+  }
+  return (
+    `permission ${permissionId} is unknown, expired or already resolved (409 conflict); ` +
+    'refresh the pending list'
+  );
+}
+
 export function validateMessagePage(json: Json): NativeMessagePage {
   const path = 'GET /native/messages';
   const object = asObject(json, path);
@@ -3652,6 +3757,38 @@ export class NativeClient {
         ...(post.refs !== undefined && post.refs.length > 0 ? { refs: [...post.refs] } : {}),
       },
       validate: validateBoardPost,
+    });
+  }
+
+  /**
+   * The live pending permission requests of one session
+   * (`GET /native/permissions?session=`). Each entry names the session that
+   * OWNS it; a reply must carry that session id, never a guessed one.
+   */
+  permissions(sessionId: string): Promise<NativePermissionEntry[]> {
+    return this.request('GET', '/native/permissions', {
+      query: { session: sessionId },
+      validate: validatePermissionList,
+    });
+  }
+
+  /**
+   * Resolve ONE live pending permission with `allow`/`deny`
+   * (`POST /native/permission/reply`). The strict body is
+   * `{session_id, permission_id, decision}`: resolution is contextual, so
+   * the named session must own the request. An unknown/expired/already
+   * resolved id is a typed 409 `conflict`, a live waiter owned by another
+   * session a typed 409 `permission_session_mismatch` (see
+   * `classifyPermissionReplyFailure`); neither is ever retried blindly.
+   */
+  replyPermission(
+    sessionId: string,
+    permissionId: string,
+    decision: 'allow' | 'deny',
+  ): Promise<NativePermissionAck> {
+    return this.request('POST', '/native/permission/reply', {
+      body: { session_id: sessionId, permission_id: permissionId, decision },
+      validate: validatePermissionAck,
     });
   }
 

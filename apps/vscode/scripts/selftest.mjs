@@ -778,6 +778,21 @@ async function validatorRejects() {
     );
     assertProtocol(
       () =>
+        nc.validatePermissionList({
+          permissions: [{ id: '7', session_id: 9, capability: 'shell', detail: {} }],
+        }),
+      'expected a string, got number',
+    );
+    assertProtocol(
+      () =>
+        nc.validatePermissionList({
+          permissions: [{ id: '7', capability: 'shell', detail: {} }],
+        }),
+      'missing required field session_id',
+    );
+    assertProtocol(() => nc.validatePermissionAck({ ok: 'yes' }), 'expected a boolean');
+    assertProtocol(
+      () =>
         nc.validateTournament({
           ...clone(tournamentJson),
           candidates: [{ ...tournamentJson.candidates[0], cost_micro: 'not-a-number' }],
@@ -2839,6 +2854,132 @@ async function boardAndForwardingTests() {
     });
     const parsed = ts.parseCompletionContract(inherited);
     assert('reason' in parsed, 'inherited-only members must be refused');
+  });
+}
+
+async function permissionReplyTests() {
+  await test('pending permissions parse with the OWNING session and free-form detail text', () => {
+    const list = nc.validatePermissionList({
+      permissions: [
+        { id: '7', session_id: '9', capability: 'shell', detail: { tool: 'bash' } },
+        { id: '8', session_id: '7', capability: 'write_file', detail: 'write a.ts' },
+      ],
+    });
+    assertEqual(list.length, 2);
+    assertEqual(list[0].id, '7');
+    assertEqual(list[0].sessionId, '9');
+    assertEqual(list[0].capability, 'shell');
+    assertEqual(list[0].detail, '{"tool":"bash"}', 'object detail must be kept as text');
+    assertEqual(list[1].sessionId, '7');
+    assertEqual(list[1].detail, 'write a.ts');
+  });
+
+  await test('permission reply sends the strict session-scoped body and accepts {ok:true}', async () => {
+    const { client, calls } = makeClient({
+      'POST /native/permission/reply': () => jsonResponse({ ok: true }),
+    });
+    const ack = await client.replyPermission('9', '7', 'allow');
+    assertEqual(ack.ok, true);
+    assertDeepEqual(findCall(calls, 'POST', '/native/permission/reply').body, {
+      session_id: '9',
+      permission_id: '7',
+      decision: 'allow',
+    });
+    assertEqual(calls.filter((call) => call.path === '/native/permission/reply').length, 1);
+  });
+
+  await test('unknown/expired id: the typed 409 conflict is surfaced and never retried', async () => {
+    const { client, calls } = makeClient({
+      'POST /native/permission/reply': () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              code: 'conflict',
+              message: 'permission 7 unknown or already resolved',
+              retryable: false,
+            },
+          }),
+          { status: 409 },
+        ),
+    });
+    let refused = null;
+    await assertRejects(
+      () => client.replyPermission('9', '7', 'allow'),
+      (error) => {
+        refused = error;
+        return (
+          error instanceof nc.NativeApiError &&
+          error.status === 409 &&
+          error.code === 'conflict' &&
+          error.retryable === false
+        );
+      },
+      'typed conflict refusal',
+    );
+    assertEqual(nc.classifyPermissionReplyFailure(refused), 'unknown_or_resolved');
+    assert(
+      nc.permissionReplyFailureMessage('unknown_or_resolved', '7').includes('already resolved'),
+      'the surfaced state must name the resolution authority',
+    );
+    assertEqual(
+      calls.filter((call) => call.path === '/native/permission/reply').length,
+      1,
+      'a typed 409 must never be retried blindly',
+    );
+  });
+
+  await test('foreign session: the typed 409 permission_session_mismatch is surfaced and never retried', async () => {
+    const { client, calls } = makeClient({
+      'POST /native/permission/reply': () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              code: 'permission_session_mismatch',
+              message: 'permission 7 is owned by session 8, not session 9',
+              retryable: false,
+            },
+          }),
+          { status: 409 },
+        ),
+    });
+    let refused = null;
+    await assertRejects(
+      () => client.replyPermission('9', '7', 'deny'),
+      (error) => {
+        refused = error;
+        return (
+          error instanceof nc.NativeApiError &&
+          error.status === 409 &&
+          error.code === 'permission_session_mismatch' &&
+          error.retryable === false
+        );
+      },
+      'typed session-mismatch refusal',
+    );
+    assertEqual(nc.classifyPermissionReplyFailure(refused), 'session_mismatch');
+    assert(
+      nc.permissionReplyFailureMessage('session_mismatch', '7').includes('different session'),
+      'the surfaced state must name the ownership conflict',
+    );
+    assertEqual(
+      calls.filter((call) => call.path === '/native/permission/reply').length,
+      1,
+      'a session mismatch must never be retried blindly',
+    );
+  });
+
+  await test('unrelated API errors are never classified as permission-reply refusals', () => {
+    assertEqual(
+      nc.classifyPermissionReplyFailure(new nc.NativeApiError(401, 'unauthorized', 'nope', false)),
+      null,
+    );
+    assertEqual(
+      nc.classifyPermissionReplyFailure(new nc.NativeApiError(409, 'shadow_unregistered', 'no shadow', false)),
+      null,
+      'other 409 codes stay plain API errors',
+    );
+    assertEqual(nc.classifyPermissionReplyFailure(new Error('transport down')), null);
+    assertEqual(nc.classifyPermissionReplyFailure(undefined), null);
   });
 }
 
@@ -5550,6 +5691,7 @@ async function main() {
   await completionContractTests();
   await pendingSubmissionTests();
   await boardAndForwardingTests();
+  await permissionReplyTests();
   await draftPreservationTests();
   await runStateTests();
   await workspaceBindingTests();

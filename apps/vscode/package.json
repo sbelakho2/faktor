@@ -17,6 +17,7 @@
     "onCommand:faktor.openChat",
     "onCommand:faktor.newTask",
     "onCommand:faktor.cancelTask",
+    "onCommand:faktor.replyPermission",
     "onCommand:faktor.refresh",
     "onCommand:faktor.controlPlaneSignIn",
     "onCommand:faktor.controlPlaneSignOut",
@@ -45,6 +46,10 @@
       {
         "command": "faktor.cancelTask",
         "title": "Faktor: Cancel Active Task"
+      },
+      {
+        "command": "faktor.replyPermission",
+        "title": "Faktor: Reply to Pending Permission"
       },
       {
         "command": "faktor.refresh",
