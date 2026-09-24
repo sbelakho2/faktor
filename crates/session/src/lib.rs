@@ -140,7 +140,7 @@ pub use read_service::{
     DbReadKind, DbReadService, DbReadServiceConfig, DbReadStats, DEFAULT_READ_QUEUE_CAPACITY,
     DEFAULT_READ_WORKERS, MAX_READ_WORKERS,
 };
-pub use recovery::{FileHasher, RecoveredOp, RecoveryAction, RecoveryReport, SystemFileHasher};
+pub use recovery::{RecoveredOp, RecoveryAction, RecoveryReport};
 pub use retention::{LiveReferenceScanner, LiveReferenceSet, ScanLimits, DEFAULT_SCAN_LIMITS};
 pub use task::{
     CompletionContractGate, Task, TaskBudget, TaskError, TaskPatch, VerificationRecord,
@@ -305,8 +305,6 @@ pub const MAX_ARTIFACT_SUMMARY_BYTES: usize = 4096;
 pub const MAX_PAGE_SIZE: i64 = 200;
 /// Hard limit on the task ledger JSON.
 pub const MAX_LEDGER_BYTES: usize = 1 << 20;
-/// Hard limit on a recovery file read for hash verification.
-pub const MAX_VERIFY_BYTES: usize = 64 << 20;
 
 // ---------------------------------------------------------------- layered budgets
 // (Audit 26) Lifetimes are LAYERED and bounded; there is deliberately NO

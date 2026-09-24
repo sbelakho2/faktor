@@ -5,7 +5,7 @@
 use crate::cancellation::CancellationToken;
 use crate::error::{Error, Result};
 use crate::hash::FileHash;
-use crate::id::{OpId, SessionId};
+use crate::id::{OpId, SessionId, WorkspaceId, WorktreeId};
 use crate::retry::RetryPolicy;
 use crate::time::Deadline;
 
@@ -44,6 +44,22 @@ pub enum EffectStatus {
     Verified,
     Applied,
     Failed,
+}
+
+/// Durable workspace-write postcondition (spec §7, v7) shared by every
+/// recovery consumer: the expected state a deterministic write tool declared
+/// for the file it wrote — `relative_path` is resolved against the workspace
+/// root (canonical, traversal/symlink-safe) and `expected_hash` is BLAKE3 of
+/// the bytes AS WRITTEN (never of the JSON encoding of the content argument,
+/// and never of a raw pathname). Crash recovery verifies the CURRENT file
+/// bytes through the workspace handle against this identity; a legacy
+/// `VerifyHash` pathname is migrated ONCE into this shape before any read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FilePostcondition {
+    pub workspace_id: WorkspaceId,
+    pub worktree_id: WorktreeId,
+    pub relative_path: String,
+    pub expected_hash: FileHash,
 }
 
 /// Identity of one PHYSICAL attempt of a logical model call (attempt

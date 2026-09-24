@@ -2051,21 +2051,40 @@ impl WorkersCfg {
 ///
 /// Enabling the section requires `[workers] enabled = true` (there is no
 /// plane to expose otherwise); the pair is refused at config load. `Debug`
-/// redacts the transport bearer.
-#[derive(Clone, PartialEq, Eq, serde::Serialize, Default)]
+/// redacts the transport bearer, and the bearer is a
+/// [`SecretValue`](faktor_security::secret::SecretValue) — no `Display`, no
+/// serde — so the only reader is the constant-time worker-plane header
+/// check.
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct WorkerPlaneCfg {
-    #[serde(default)]
     pub enabled: bool,
-    #[serde(default)]
     pub bind: Option<String>,
-    #[serde(default)]
     pub tls: bool,
-    #[serde(default)]
     pub trusted_gateway: bool,
-    #[serde(default)]
     pub auth: Option<String>,
-    #[serde(default)]
-    pub bearer: Option<String>,
+    pub bearer: Option<SecretValue>,
+}
+
+impl serde::Serialize for WorkerPlaneCfg {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut out = serializer.serialize_struct("WorkerPlaneCfg", 6)?;
+        out.serialize_field("enabled", &self.enabled)?;
+        out.serialize_field("bind", &self.bind)?;
+        out.serialize_field("tls", &self.tls)?;
+        out.serialize_field("trusted_gateway", &self.trusted_gateway)?;
+        out.serialize_field("auth", &self.auth)?;
+        // The transport bearer is a credential with no serde: the saved
+        // config projection never writes it (absent and present both render
+        // as `null`), so a saved file can never carry the plaintext. A
+        // reloaded `gateway_mtls` section refuses typed for the missing
+        // bearer — fail closed, never a fabricated credential.
+        out.serialize_field("bearer", &Option::<String>::None)?;
+        out.end()
+    }
 }
 
 impl std::fmt::Debug for WorkerPlaneCfg {
@@ -2138,7 +2157,10 @@ impl<'de> serde::Deserialize<'de> for WorkerPlaneCfg {
                         4 => out.tls = map.next_value::<bool>()?,
                         8 => out.trusted_gateway = map.next_value::<bool>()?,
                         16 => out.auth = map.next_value::<Option<String>>()?,
-                        _ => out.bearer = map.next_value::<Option<String>>()?,
+                        // The wire value is read as text and wrapped (zeroized,
+                        // redacted) IMMEDIATELY: no plaintext field is ever
+                        // stored on the config type.
+                        _ => out.bearer = map.next_value::<Option<String>>()?.map(SecretValue::new),
                     }
                 }
                 Ok(out)
@@ -7064,7 +7086,56 @@ mod completion_cfg_tests {
         cfg.validate().unwrap();
         let resolved = cfg.worker_plane.resolve().unwrap().unwrap();
         assert_eq!(resolved.auth, faktor_server::WorkerPlaneAuth::GatewayMtls);
-        assert_eq!(resolved.bearer.as_deref(), Some("gw-secret"));
+        assert_eq!(
+            resolved.bearer.as_ref().map(SecretValue::expose),
+            Some("gw-secret")
+        );
+    }
+
+    /// The `[worker_plane]` transport bearer is a credential: Debug, the
+    /// saved-config JSON projection and every boundary refusal must never
+    /// carry the planted bytes, while the resolved config still uses it for
+    /// the constant-time header check.
+    #[test]
+    fn worker_plane_bearer_is_wrapped_and_never_rendered() {
+        const PLANTED: &str = "PLANTED-WORKER-PLANE-BEARER-do-not-leak-0123456789";
+        let json = format!(
+            r#"{{"model": "m", "cloud": {{"enabled": true}}, "workers": {{"enabled": true, "organization": "org_local"}}, "worker_plane": {{"enabled": true, "auth": "gateway_mtls", "trusted_gateway": true, "bearer": "{PLANTED}"}}}}"#
+        );
+        let cfg: Config = serde_json::from_str(&json).unwrap();
+        cfg.validate().unwrap();
+        // The parsed field really is the wrapped planted secret.
+        let resolved = cfg.worker_plane.resolve().unwrap().unwrap();
+        assert_eq!(
+            resolved.bearer.as_ref().map(SecretValue::expose),
+            Some(PLANTED)
+        );
+        // Debug of the section and the resolved bind config: redacted.
+        for rendered in [
+            format!("{:?}", cfg.worker_plane),
+            format!("{:?}", resolved),
+            format!("{:?}", Some(&cfg.worker_plane)),
+        ] {
+            assert!(!rendered.contains(PLANTED), "leaked: {rendered}");
+            assert!(rendered.contains("redacted"), "{rendered}");
+        }
+        // The saved-config projection never writes the bearer back.
+        let saved = serde_json::to_string(&cfg.worker_plane).unwrap();
+        assert!(!saved.contains(PLANTED), "saved config leaked: {saved}");
+        assert!(!saved.contains("PLANTED"), "{saved}");
+        // A refusal on a malformed (oversized) bearer names the shape, never
+        // the value.
+        let oversized_value = PLANTED.repeat(20);
+        let oversized = format!(
+            r#"{{"model": "m", "cloud": {{"enabled": true}}, "workers": {{"enabled": true, "organization": "org_local"}}, "worker_plane": {{"enabled": true, "trusted_gateway": true, "bearer": "{oversized_value}"}}}}"#
+        );
+        let cfg: Config = serde_json::from_str(&oversized).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(!err.contains(PLANTED), "refusal leaked: {err}");
+        assert!(
+            err.contains("printable ASCII"),
+            "the refusal names the shape: {err}"
+        );
     }
 
     #[test]

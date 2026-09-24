@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 faktor-core.workspace = true
 faktor-provider.workspace = true
+faktor-security.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -16,7 +17,6 @@ tracing.workspace = true
 blake3.workspace = true
 
 [dev-dependencies]
-faktor-security.workspace = true
 futures.workspace = true
 http = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }

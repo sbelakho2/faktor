@@ -70,7 +70,7 @@ use faktor_security::secret::SecretValue;
 use crate::oidc::{
     constant_time_eq, hmac_sha256, map_membership_claims, ClaimMapping, CodeExchangeRequest,
     IdTokenExpectations, OidcAdapter, OidcClaims, OidcDiscovery, OidcError, OidcMembership,
-    OidcTokenSet,
+    OidcNonce, OidcTokenSet,
 };
 
 /// Default discovery cache TTL when the provider sends no `Cache-Control`.
@@ -1032,9 +1032,9 @@ impl AsyncOidcAdapter for NetworkOidcAdapter {
         let nonce = payload
             .get("nonce")
             .and_then(|value| value.as_str())
-            .map(str::to_string);
+            .map(OidcNonce::new);
         if let Some(expected_nonce) = &expected.nonce {
-            if nonce.as_deref() != Some(expected_nonce.as_str()) {
+            if nonce.as_ref() != Some(expected_nonce) {
                 return Err(OidcError::NonceMismatch);
             }
         }

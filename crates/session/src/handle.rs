@@ -14,7 +14,6 @@ use crate::journal::{replay, ReplayOutcome};
 use crate::manager::SessionManager;
 use crate::ops::OpRegistry;
 use crate::process::ProcessRegistry;
-use crate::recovery::SystemFileHasher;
 use crate::SessionError;
 
 /// A handle to one session. Cheap to clone; all handles to the same session
@@ -26,7 +25,6 @@ pub struct SessionHandle {
     /// Shared per-session registries; every handle clone sees the same ops
     /// and process ownership.
     pub(crate) resources: Arc<crate::manager::SessionResources>,
-    pub(crate) system_hasher: Arc<SystemFileHasher>,
 }
 
 /// Receipt of an accepted (or queued) prompt.
@@ -85,13 +83,11 @@ impl SessionHandle {
         manager: Arc<SessionManager>,
         id: SessionId,
         resources: Arc<crate::manager::SessionResources>,
-        system_hasher: Arc<SystemFileHasher>,
     ) -> Self {
         Self {
             manager,
             id,
             resources,
-            system_hasher,
         }
     }
 
@@ -182,10 +178,6 @@ impl SessionHandle {
                 crate::payload::PAYLOAD_SCHEMA_V,
             )
             .map_err(crate::map_store_err)?)
-    }
-
-    pub(crate) fn system_hasher(&self) -> &Arc<SystemFileHasher> {
-        &self.system_hasher
     }
 
     // ---------------------------------------------------------------- read state

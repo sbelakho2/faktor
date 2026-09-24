@@ -608,7 +608,7 @@ fn expectations(nonce: Option<&str>, now_ms: i64) -> IdTokenExpectations {
     IdTokenExpectations {
         issuer: ISSUER.into(),
         audience: CLIENT.into(),
-        nonce: nonce.map(str::to_string),
+        nonce: nonce.map(|n| n.into()),
         now_ms,
         clock_skew_ms: 0,
     }

@@ -4,13 +4,17 @@
 //! An [`AcquisitionRequest`] is deliberately opaque about what the datum
 //! *means*: it names an identity (a URL or an opaque ref), the fields the
 //! caller wants, and how fresh they must be. Normalization is conservative:
-//! it only lowercases the scheme and host of URL-like identities, drops the
-//! fragment and default ports, and never reorders or rewrites the query, so
-//! two distinct requests can never be coalesced by accident.
+//! URL-like identities canonicalize their host through the ONE shared
+//! destination authority (`faktor_security::destination::canonicalize_request_host`)
+//! so identity keys agree with the egress destination gate, lowercase the
+//! scheme, drop the fragment and default ports, validate non-default ports
+//! and never reorder or rewrite the query, so two distinct requests can
+//! never be coalesced by accident.
 
 use std::collections::BTreeSet;
 use std::fmt;
 
+use faktor_security::destination::canonicalize_request_host;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{invalid, AcquisitionError};
@@ -213,10 +217,16 @@ impl fmt::Display for AcquisitionKey {
 
 /// Normalize one identity conservatively.
 ///
-/// * URL-like identities (`http://` / `https://`): lowercase scheme and
-///   host, drop the fragment, drop `:80`/`:443` default ports, keep the path
-///   and query exactly, and refuse embedded credentials. A missing path
-///   becomes `/`.
+/// * URL-like identities (`http://` / `https://`): the host is canonicalized
+///   by the ONE shared destination authority
+///   ([`canonicalize_request_host`], `faktor-security::destination`), so an
+///   identity key and the egress destination gate can never disagree about
+///   which host a spelling names (lowercase, trailing-dot strip, UTS-46
+///   IDN/punycode, IPv4/IPv6 literal canonicalization, strict label
+///   grammar); the scheme is lowercased, the fragment is dropped, the
+///   default port (`:80`/`:443`) is stripped and a non-default port is
+///   validated (`1..=65535`); the path and query are kept exactly; embedded
+///   credentials are refused. A missing path becomes `/`.
 /// * Any other identity: trim and collapse internal whitespace runs; the
 ///   case is preserved because opaque refs may be case-sensitive.
 ///
@@ -263,11 +273,28 @@ fn normalize_url(scheme: &str, rest: &str) -> Result<String, AcquisitionError> {
     if authority.contains('@') {
         return Err(invalid("identity must not carry credentials"));
     }
-    let host = strip_default_port(&authority.to_ascii_lowercase(), scheme);
-    let mut out = String::with_capacity(scheme.len() + 3 + host.len() + path_and_query.len());
+    let (host_raw, port_raw) = split_authority(authority)?;
+    let host = canonicalize_request_host(host_raw, false, None).map_err(|reason| {
+        invalid(format!(
+            "identity host {host_raw:?} is not a canonical destination host: {reason}"
+        ))
+    })?;
+    let port = canonical_port(port_raw, scheme)?;
+    let mut out = String::with_capacity(scheme.len() + 3 + host.len() + 8 + path_and_query.len());
     out.push_str(scheme);
     out.push_str("://");
-    out.push_str(&host);
+    if host.contains(':') {
+        // Unbracketed canonical IPv6 text is re-bracketed for the URL form.
+        out.push('[');
+        out.push_str(&host);
+        out.push(']');
+    } else {
+        out.push_str(&host);
+    }
+    if let Some(port) = port {
+        out.push(':');
+        out.push_str(&port.to_string());
+    }
     if path_and_query.is_empty() {
         out.push('/');
     } else {
@@ -281,12 +308,47 @@ fn normalize_url(scheme: &str, rest: &str) -> Result<String, AcquisitionError> {
     Ok(out)
 }
 
-fn strip_default_port(authority: &str, scheme: &str) -> String {
-    let default = if scheme == "http" { ":80" } else { ":443" };
-    match authority.strip_suffix(default) {
-        Some(host) if !host.is_empty() => host.to_string(),
-        _ => authority.to_string(),
+/// Split a URL authority into (host text, optional port text): bracketed
+/// IPv6 hosts are de-bracketed, a single `:` splits host and port, and an
+/// unbracketed multi-`:` authority is treated as an IPv6 literal (the shared
+/// canonicalizer then validates or refuses it).
+fn split_authority(authority: &str) -> Result<(&str, Option<&str>), AcquisitionError> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return Err(invalid("identity has an unterminated IPv6 host"));
+        };
+        let host = &rest[..end];
+        let after = &rest[end + 1..];
+        if after.is_empty() {
+            return Ok((host, None));
+        }
+        let Some(port) = after.strip_prefix(':') else {
+            return Err(invalid("identity has a malformed host:port"));
+        };
+        return Ok((host, Some(port)));
     }
+    if authority.matches(':').count() == 1 {
+        let (host, port) = authority.split_once(':').expect("one colon present");
+        return Ok((host, Some(port)));
+    }
+    Ok((authority, None))
+}
+
+/// Canonicalize one optional port: digits only, `1..=65535`; the scheme's
+/// default port (`http` 80 / `https` 443) is dropped so both spellings key
+/// identically.
+fn canonical_port(raw: Option<&str>, scheme: &str) -> Result<Option<u16>, AcquisitionError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let port: u16 = raw
+        .parse()
+        .ok()
+        .filter(|_| !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()))
+        .filter(|port| *port != 0)
+        .ok_or_else(|| invalid("identity port must be a number 1..=65535"))?;
+    let default = if scheme == "http" { 80 } else { 443 };
+    Ok((port != default).then_some(port))
 }
 
 fn collapse_whitespace(raw: &str) -> String {
@@ -331,6 +393,80 @@ mod tests {
             normalize_identity("https://h/?a=1&b=2").unwrap(),
             normalize_identity("https://h/?b=2&a=1").unwrap()
         );
+    }
+
+    /// Audit bypass 5: identity canonicalization must be the SAME authority
+    /// the egress destination gate matches against, or one side accepts a
+    /// spelling the other treats as a different host. The normalized host is
+    /// exactly `canonicalize_request_host`'s output (and a fixed point of
+    /// it), so identity keys agree with destination authority keys.
+    #[test]
+    fn identity_host_canonicalization_is_the_shared_destination_authority() {
+        for (raw, host) in [
+            ("https://EXAMPLE.com./x", "EXAMPLE.com."),
+            ("https://exämple.com/x", "exämple.com"),
+            ("http://127.000.0.01/x", "127.000.0.01"),
+            ("https://[0:0:0:0:0:0:0:1]/x", "0:0:0:0:0:0:0:1"),
+            ("https://Example.COM:8443/x", "Example.COM"),
+            ("http://localhost:8080/x", "localhost"),
+        ] {
+            let canonical = canonicalize_request_host(host, false, None).unwrap();
+            let normalized = normalize_identity(raw).unwrap();
+            let host_in_url = if canonical.contains(':') {
+                format!("[{canonical}]")
+            } else {
+                canonical.clone()
+            };
+            assert!(
+                normalized.contains(&format!("://{host_in_url}")),
+                "{raw} normalized to {normalized}, but the destination authority says {canonical:?}"
+            );
+            // The shared authority's output is itself canonical: both sides
+            // are fixed points of the same function.
+            assert_eq!(
+                canonicalize_request_host(&canonical, false, None).unwrap(),
+                canonical,
+                "destination canonicalization must be idempotent"
+            );
+        }
+        // Equivalent spellings produce the SAME coalescing key, so the
+        // identity cannot be used to smuggle a second name for one host past
+        // coalescing/caching.
+        let a = AcquisitionRequest::new(
+            "https://EXAMPLE.com./p",
+            RequestedFields::of([RequestedField::Identity]),
+            RequestedFreshness::Live,
+        )
+        .unwrap();
+        let b = AcquisitionRequest::new(
+            "https://example.com/p",
+            RequestedFields::of([RequestedField::Identity]),
+            RequestedFreshness::Live,
+        )
+        .unwrap();
+        assert_eq!(
+            a.coalescing_key().unwrap(),
+            b.coalescing_key().unwrap(),
+            "equivalent host spellings must coalesce identically"
+        );
+    }
+
+    #[test]
+    fn non_canonical_destination_hosts_and_ports_are_refused() {
+        for hostile in [
+            "https://my_host/x",
+            "https://-bad.com/x",
+            "https://bad-.com/x",
+            "https://h:0/x",
+            "https://h:99999/x",
+            "https://h:abc/x",
+            "https://[::1/x",
+        ] {
+            assert!(
+                normalize_identity(hostile).is_err(),
+                "{hostile} must be refused: the destination gate would refuse it"
+            );
+        }
     }
 
     #[test]
