@@ -1,6 +1,6 @@
 //! Static source-authority certification (audit 31/107-109).
 //!
-//! Eight structural invariants are locked by scanning the repository's
+//! Nine structural invariants are locked by scanning the repository's
 //! *production* Rust sources (`crates/*/src`, test modules and out-of-line
 //! `#[cfg(test)] mod` bodies excluded):
 //!
@@ -59,6 +59,14 @@
 //!    allowlist is TIGHT — exact (manifest, key) pairs, each with a written
 //!    justification, asserted load-bearing and non-stale — and a planted
 //!    `faktor.someApiKey` setting fails the scan.
+//! 9. **ONE egress address-classification authority** — `AddressClass`,
+//!    `classify_ip`, `EgressAddressPolicy` and `vet_resolved_answers` are
+//!    defined ONCE in `crates/security/src/network.rs` (generated from the
+//!    pinned IANA special-purpose CSVs). Browser/provider production code
+//!    inside `crates/browser/src` and `crates/provider/src` may `pub use`
+//!    them but never re-define a classifier, class enum or answer-vetting
+//!    function locally; a planted `fn classify_v4` in either crate is a
+//!    red scan.
 //!
 //! Scanning methodology: per file, comments and string literals are masked
 //! out and every `#[cfg(...)]`-gated item that can never compile in a
@@ -1133,6 +1141,102 @@ mod scans {
             &offenders,
             scanned,
             4,
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // scan 2b: ONE egress address-classification authority
+    // ------------------------------------------------------------------
+
+    /// The address-class authority (`AddressClass`, `classify_ip`,
+    /// `EgressAddressPolicy`, `vet_resolved_answers`) is defined ONCE in
+    /// `crates/security/src/network.rs`. The provider resolver and the
+    /// browser broker MUST consume it: a locally re-defined classifier,
+    /// class enum or answer-vetting function is a red test — that
+    /// duplication is exactly what let the two tables drift and let the
+    /// browser skip literal-IP vetting. A `pub use` re-export is fine; a
+    /// definition is not.
+    const EGRESS_AUTHORITY_MARKERS: &[&str] = &[
+        "fn classify_v4",
+        "fn classify_v6",
+        "fn classify_ip",
+        "enum AddressClass",
+        "enum IpClass",
+        "fn embedded_v4",
+        "fn class_permitted",
+        "fn vet_resolved_answers",
+    ];
+
+    fn egress_authority_redefinition_offenders(f: &File<'_>) -> Vec<String> {
+        find_markers(f, EGRESS_AUTHORITY_MARKERS)
+            .into_iter()
+            .map(|(line, text)| {
+                format!(
+                    "{}:{line}: {text}  [address classification lives ONCE in \
+                     faktor_security::network; consume it instead of redefining it]",
+                    f.rel
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn browser_and_provider_never_redefine_the_egress_address_authority() {
+        // The authority itself must exist with its generated pinned table, so
+        // this scan cannot pass by everyone deleting classification.
+        let authority = std::fs::read_to_string(repo_root().join("crates/security/src/network.rs"))
+            .expect("the egress address authority crates/security/src/network.rs must exist");
+        for marker in [
+            "pub fn classify_ip",
+            "pub fn vet_resolved_answers",
+            "pub enum AddressClass",
+            "pub struct EgressAddressPolicy",
+            "// BEGIN GENERATED IANA TABLE",
+        ] {
+            assert!(
+                authority.contains(marker),
+                "faktor_security::network is missing {marker:?}"
+            );
+        }
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for rel in walk_crate_sources() {
+            let consumer =
+                rel.starts_with("crates/browser/") || rel.starts_with("crates/provider/");
+            if !consumer || is_test_file(&rel) {
+                continue;
+            }
+            let Some(f) = load(&rel) else {
+                continue;
+            };
+            scanned += 1;
+            offenders.extend(egress_authority_redefinition_offenders(&f));
+        }
+        assert_no_offenders(
+            "egress address authority scan: browser/provider must consume \
+             faktor_security::network (no local classify_v4/classify_v6/AddressClass/\
+             IpClass/vet_resolved_answers definitions)",
+            &offenders,
+            scanned,
+            8,
+        );
+        // Negative proof: a planted local classifier FIRES, and re-exporting
+        // the authority is the sanctioned shape that does not.
+        let planted = synthetic_file(
+            "crates/browser/src/evil.rs",
+            "fn classify_v4(v4: u8) -> u8 { v4 }\n",
+        );
+        assert!(
+            !egress_authority_redefinition_offenders(&planted).is_empty(),
+            "a planted local classifier must fire the scan"
+        );
+        let planted = synthetic_file(
+            "crates/provider/src/resolver.rs",
+            "pub use faktor_security::network::{AddressClass, EgressAddressPolicy};\n",
+        );
+        assert!(
+            egress_authority_redefinition_offenders(&planted).is_empty(),
+            "re-exporting the authority is the sanctioned shape"
         );
     }
 

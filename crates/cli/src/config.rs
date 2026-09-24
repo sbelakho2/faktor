@@ -3527,8 +3527,8 @@ impl ProviderCfg {
             return Ok(());
         };
         let port: Option<u16> = port_text.and_then(|p| p.parse().ok());
-        let class = faktor_provider::resolver::AddressClass::classify(ip);
-        if class == faktor_provider::resolver::AddressClass::Global {
+        let class = faktor_security::network::classify_ip(ip);
+        if class == faktor_security::network::AddressClass::Global {
             return Ok(());
         }
         // An exact allowlist entry for this destination is the operator
@@ -3556,7 +3556,7 @@ impl ProviderCfg {
                 return Ok(());
             }
         }
-        if class == faktor_provider::resolver::AddressClass::Loopback && self.allows_loopback() {
+        if class == faktor_security::network::AddressClass::Loopback && self.allows_loopback() {
             return Ok(());
         }
         Err(format!(

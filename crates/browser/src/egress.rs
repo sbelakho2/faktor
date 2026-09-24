@@ -43,6 +43,12 @@ use tokio::task::JoinSet;
 
 use faktor_core::cancellation::CancellationToken;
 use faktor_security::destination::RequestTarget;
+use faktor_security::secret::SecretValue;
+use zeroize::Zeroizing;
+
+/// The address-class rule for one egress leg, re-exported from the single
+/// [`faktor_security::network`] authority (never defined locally).
+pub use faktor_security::network::EgressAddressPolicy;
 
 use crate::error::BrowserError;
 use crate::interception::ResourceType;
@@ -382,11 +388,11 @@ impl DestinationPolicy {
     ///
     /// DNS-rebinding closure: the broker resolves the permitted hostname
     /// exactly once at connect time ([`connect_destination`]), bounds the
-    /// answer set, classifies EVERY address and refuses the whole set when
-    /// any answer is outside the permitted classes (see [`IpClass`] and the
-    /// parity note above it). A stale "resolved by name later" bypass no
-    /// longer exists: the connect uses the vetted [`std::net::SocketAddr`]
-    /// list only.
+    /// answer set, classifies EVERY address — literal or resolved — through
+    /// the single [`faktor_security::network`] authority and refuses the
+    /// whole set when any answer is outside the permitted classes. A stale
+    /// "resolved by name later" bypass no longer exists: the connect uses
+    /// the vetted [`std::net::SocketAddr`] list only.
     pub fn decide_destination(&self, host: &str, port: u16) -> DestinationDecision {
         let Some(canonical) = canonical_host(host) else {
             return DestinationDecision::Blocked {
@@ -512,63 +518,157 @@ fn canonical_host(host: &str) -> Option<String> {
     Some(target.host)
 }
 
-/// Upstream proxy credentials. Debug is redacted; there is no Display, no
-/// Serialize, and no accessor for the password outside the broker's own
-/// `Proxy-Authorization` writer.
+/// Hard bound on one upstream-proxy username, in bytes.
+pub const MAX_PROXY_USERNAME_BYTES: usize = 1024;
+
+/// Hard bound on one upstream-proxy password, in bytes.
+pub const MAX_PROXY_PASSWORD_BYTES: usize = 4096;
+
+/// Refuse credential text that could inject header structure or overshoot
+/// the bound, before any credential value exists.
+fn validate_credential_field(name: &str, value: &str, limit: usize) -> Result<(), BrowserError> {
+    if value.len() > limit {
+        return Err(BrowserError::invalid_config(format!(
+            "{name} exceeds the {limit}-byte bound"
+        )));
+    }
+    if value
+        .bytes()
+        .any(|byte| byte == b'\r' || byte == b'\n' || byte == 0)
+    {
+        return Err(BrowserError::invalid_config(format!(
+            "{name} must not contain CR, LF or NUL"
+        )));
+    }
+    Ok(())
+}
+
+/// Upstream proxy credentials. The password is a zeroizing
+/// [`SecretValue`]; Debug redacts BOTH fields (a username can itself carry
+/// a token), there is no Display, no Serialize, and no accessor for the
+/// password outside the broker's own `Proxy-Authorization` writer.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProxyCredentials {
     username: String,
-    password: String,
+    password: SecretValue,
 }
 
 impl ProxyCredentials {
+    /// Bounded construction: enforces the byte bounds and rejects CR/LF/NUL
+    /// header-injection material in either field.
+    pub fn try_new(
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Result<Self, BrowserError> {
+        let username = username.into();
+        let password = password.into();
+        validate_credential_field("proxy username", &username, MAX_PROXY_USERNAME_BYTES)?;
+        validate_credential_field("proxy password", &password, MAX_PROXY_PASSWORD_BYTES)?;
+        Ok(Self {
+            username,
+            password: SecretValue::new(password),
+        })
+    }
+
+    /// Panicking convenience for tests and compile-time-known configuration;
+    /// fallible configuration must use [`ProxyCredentials::try_new`].
     pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
-        Self {
-            username: username.into(),
-            password: password.into(),
-        }
+        Self::try_new(username, password).expect("proxy credentials within bounds")
     }
 
     pub fn username(&self) -> &str {
         &self.username
     }
 
-    /// The Basic `Proxy-Authorization` value. Only ever written to the
-    /// broker→upstream socket.
-    fn basic_header(&self) -> String {
+    /// The Basic `Proxy-Authorization` value, built entirely from zeroizing
+    /// temporaries: the `username:password` material and the base64 encoding
+    /// are wiped when they drop. Only ever written to the broker→upstream
+    /// socket, straight from this buffer (never copied into an ordinary
+    /// request-head `String`).
+    fn basic_header(&self) -> Zeroizing<String> {
         use base64::Engine as _;
-        let raw = format!("{}:{}", self.username, self.password);
-        format!(
-            "Basic {}",
-            base64::engine::general_purpose::STANDARD.encode(raw)
-        )
+        let mut raw = Zeroizing::new(String::with_capacity(
+            self.username.len() + 1 + self.password.len(),
+        ));
+        raw.push_str(&self.username);
+        raw.push(':');
+        raw.push_str(self.password.expose());
+        let encoded =
+            Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(raw.as_bytes()));
+        Zeroizing::new(format!("Basic {}", encoded.as_str()))
     }
 }
 
 impl fmt::Debug for ProxyCredentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProxyCredentials")
-            .field("username", &self.username)
+            .field("username", &"[redacted]")
             .field("password", &"[redacted]")
             .finish()
     }
 }
 
-/// One upstream HTTP proxy.
+/// One upstream HTTP proxy. The host is stored CANONICALIZED through the
+/// shared [`RequestTarget`] authority (lowercase, UTS-46 punycode, one
+/// trailing dot stripped, canonical IP literal text) and carries no scheme,
+/// userinfo or embedded port. The address policy applied to the broker→proxy
+/// leg is the proxy's OWN rule — default [`EgressAddressPolicy::EXTERNAL`] —
+/// never inherited from the destination policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamProxy {
     pub host: String,
     pub port: u16,
     pub credentials: Option<ProxyCredentials>,
+    pub address_policy: EgressAddressPolicy,
 }
 
 impl UpstreamProxy {
-    pub fn new(host: impl Into<String>, port: u16) -> Self {
-        Self {
-            host: host.into(),
+    /// Fallible construction: canonicalizes `host` through the shared
+    /// authority and refuses hostile/ambiguous forms — userinfo, embedded
+    /// port, scheme, whitespace/control characters, malformed IDN,
+    /// zone-scoped IPv6 and port 0.
+    pub fn try_new(host: impl Into<String>, port: u16) -> Result<Self, BrowserError> {
+        let host = host.into();
+        if port == 0 {
+            return Err(BrowserError::invalid_config(
+                "upstream proxy port must not be 0",
+            ));
+        }
+        if host.is_empty() {
+            return Err(BrowserError::invalid_config(
+                "upstream proxy host must not be empty",
+            ));
+        }
+        if host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(BrowserError::invalid_config(
+                "upstream proxy host must not contain whitespace or control characters",
+            ));
+        }
+        let target = RequestTarget::parse(&host).map_err(|error| {
+            BrowserError::invalid_config(format!("invalid upstream proxy host {host:?}: {error}"))
+        })?;
+        if !target.scheme.is_empty() {
+            return Err(BrowserError::invalid_config(
+                "upstream proxy host must not carry a scheme",
+            ));
+        }
+        if target.port.is_some() {
+            return Err(BrowserError::invalid_config(
+                "upstream proxy host must not carry an embedded port; pass the port separately",
+            ));
+        }
+        Ok(Self {
+            host: target.host,
             port,
             credentials: None,
-        }
+            address_policy: EgressAddressPolicy::EXTERNAL,
+        })
+    }
+
+    /// Panicking convenience for tests and compile-time-known configuration;
+    /// fallible configuration must use [`UpstreamProxy::try_new`].
+    pub fn new(host: impl Into<String>, port: u16) -> Self {
+        Self::try_new(host, port).expect("valid upstream proxy host")
     }
 
     pub fn with_credentials(mut self, credentials: ProxyCredentials) -> Self {
@@ -576,11 +676,22 @@ impl UpstreamProxy {
         self
     }
 
+    /// The explicit local rule for THIS proxy leg. Only an operator naming a
+    /// local proxy may set it; it never widens the destination policy.
+    pub fn with_address_policy(mut self, policy: EgressAddressPolicy) -> Self {
+        self.address_policy = policy;
+        self
+    }
+
     fn validate(&self) -> Result<(), BrowserError> {
-        if self.host.is_empty() || self.port == 0 {
-            return Err(BrowserError::invalid_config(
-                "upstream proxy needs a non-empty host and non-zero port",
-            ));
+        // `host` is a public field: re-run the canonical gate so a hand-built
+        // struct cannot smuggle an unvetted host into the connect path.
+        let canonical = UpstreamProxy::try_new(self.host.clone(), self.port)?;
+        if canonical.host != self.host {
+            return Err(BrowserError::invalid_config(format!(
+                "upstream proxy host {:?} is not canonical ({:?})",
+                self.host, canonical.host
+            )));
         }
         Ok(())
     }
@@ -1809,7 +1920,8 @@ async fn serve_connect(
         return Err("CONNECT request carried unexpected bytes".to_string());
     }
     let upstream = inner.upstream.select(&host);
-    let mut target = match connect_destination(upstream, &host, port, &inner).await {
+    let endpoint = connect_endpoint(upstream, &host, port, &inner);
+    let mut target = match connect_destination(endpoint, &inner).await {
         Ok(stream) => stream,
         Err(_detail) if inner.shutdown.is_cancelled() => return Ok(()),
         Err(detail) => {
@@ -1929,16 +2041,27 @@ async fn send_upstream_connect(
     } else {
         format!("{host}:{port}")
     };
-    let mut head = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
-    if let Some(credentials) = &upstream.credentials {
-        head.push_str(&format!(
-            "Proxy-Authorization: {}\r\n",
-            credentials.basic_header()
-        ));
+    // One head, one write: the credential (when present) is appended from
+    // its zeroizing value into a zeroizing byte buffer, so the secret never
+    // lands in an ordinary request-head String and the head stays one
+    // contiguous write (peers may parse a single read).
+    let seed = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
+    let credential = upstream
+        .credentials
+        .as_ref()
+        .map(ProxyCredentials::basic_header);
+    let mut head = Zeroizing::new(Vec::<u8>::with_capacity(
+        seed.len() + credential.as_ref().map_or(0, |value| value.len() + 22) + 40,
+    ));
+    head.extend_from_slice(seed.as_bytes());
+    if let Some(value) = &credential {
+        head.extend_from_slice(b"Proxy-Authorization: ");
+        head.extend_from_slice(value.as_bytes());
+        head.extend_from_slice(b"\r\n");
     }
-    head.push_str("Proxy-Connection: keep-alive\r\n\r\n");
+    head.extend_from_slice(b"Proxy-Connection: keep-alive\r\n\r\n");
     upstream_stream
-        .write_all(head.as_bytes())
+        .write_all(&head)
         .await
         .map_err(|e| format!("upstream CONNECT write failed: {e}"))?;
     let read = tokio::select! {
@@ -2082,7 +2205,8 @@ async fn serve_forward(
         }
     };
     let upstream = inner.upstream.select(&host);
-    let mut target = match connect_destination(upstream, &host, port, &inner).await {
+    let endpoint = connect_endpoint(upstream, &host, port, &inner);
+    let mut target = match connect_destination(endpoint, &inner).await {
         Ok(stream) => stream,
         Err(_detail) if inner.shutdown.is_cancelled() => return Ok(()),
         Err(detail) => {
@@ -2117,19 +2241,29 @@ async fn serve_forward(
         out.push_str(&format!("{name}: {value}\r\n"));
     }
     out.push_str(&format!("Host: {host_header}\r\n"));
-    if let Some(upstream) = upstream {
-        if let Some(credentials) = &upstream.credentials {
-            out.push_str(&format!(
-                "Proxy-Authorization: {}\r\n",
-                credentials.basic_header()
-            ));
-        }
-    }
+    let credential = upstream
+        .and_then(|upstream| upstream.credentials.as_ref())
+        .map(ProxyCredentials::basic_header);
     // Exactly one authoritative Content-Length describes the canonical body,
     // whatever framing the client used; `Connection: close` keeps the single
-    // logical request unambiguous on the upstream leg.
-    out.push_str(&format!("Content-Length: {}\r\n", body.len()));
-    out.push_str("Connection: close\r\n\r\n");
+    // logical request unambiguous on the upstream leg. The
+    // Proxy-Authorization value (if any) is appended from its zeroizing
+    // buffer into a zeroizing head buffer — never copied into an ordinary
+    // String — and the head stays one contiguous write.
+    let tail = format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut wire_head = Zeroizing::new(Vec::<u8>::with_capacity(
+        out.len() + credential.as_ref().map_or(0, |value| value.len() + 22) + tail.len(),
+    ));
+    wire_head.extend_from_slice(out.as_bytes());
+    if let Some(value) = &credential {
+        wire_head.extend_from_slice(b"Proxy-Authorization: ");
+        wire_head.extend_from_slice(value.as_bytes());
+        wire_head.extend_from_slice(b"\r\n");
+    }
+    wire_head.extend_from_slice(tail.as_bytes());
     tracing::debug!(
         method = %request.method,
         host = %host,
@@ -2137,7 +2271,7 @@ async fn serve_forward(
         "egress: request allowed"
     );
     let write = async {
-        target.write_all(out.as_bytes()).await?;
+        target.write_all(&wire_head).await?;
         if !body.is_empty() {
             target.write_all(&body).await?;
         }
@@ -2177,210 +2311,136 @@ async fn serve_forward(
     }
 }
 
-// ---------------------------------------------------------- resolver mirror
+// ------------------------------------------------- destination-connect vetting
 //
-// PARITY NOTE: this is a deliberate MIRROR of the central egress resolver in
-// the `faktor-provider` crate (`crates/provider/src/resolver.rs`).
-// faktor-browser does not depend on the model-provider hub (it must stay
-// model-free), so the address classification table, the answer-set bound and
-// the "refuse the whole mixed set, never filter" rule are kept in lockstep
-// by hand — same ranges, same defaults, same adversarial tests. Any change
-// to the provider's `AddressClass` / `EgressAddressPolicy` must land here
-// too (and in this module's tests).
+// Every broker connect — a direct destination OR an upstream proxy leg — is
+// vetted through the single `faktor_security::network` address authority.
+// There is no locally maintained class table: the hand-mirrored classifier
+// that used to live here was deleted (and the static-authority scan fails if
+// a local redefinition reappears).
 
 /// Default hard bound on the number of addresses one broker connect may
-/// consume (mirrors the provider resolver's `DEFAULT_MAX_DNS_ANSWERS`).
+/// consume.
 pub const MAX_RESOLVED_ADDRESSES: usize = 16;
 
-/// Address class of one resolved IP (mirror of the provider's
-/// `AddressClass`; `Global` is the only class any policy permits besides the
-/// explicit loopback rule).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IpClass {
-    Global,
-    Loopback,
-    Private,
-    LinkLocal,
-    Cgnat,
-    Documentation,
-    Benchmark,
-    Multicast,
-    Unspecified,
-    Reserved,
+/// One connect endpoint. Each leg carries its OWN address policy: the
+/// destination uses the connector policy's explicit `allow_loopback` rule,
+/// the upstream proxy uses [`UpstreamProxy::address_policy`] (default
+/// EXTERNAL). The upstream policy is NEVER inherited from the destination,
+/// so a loopback-tolerant destination policy cannot turn the proxy host into
+/// a loopback/metadata connect.
+enum ConnectEndpoint<'a> {
+    Destination {
+        host: String,
+        port: u16,
+        address_policy: EgressAddressPolicy,
+    },
+    UpstreamProxy {
+        proxy: &'a UpstreamProxy,
+    },
 }
 
-impl IpClass {
-    pub(crate) fn as_str(self) -> &'static str {
+impl ConnectEndpoint<'_> {
+    fn host(&self) -> &str {
         match self {
-            IpClass::Global => "global",
-            IpClass::Loopback => "loopback",
-            IpClass::Private => "private",
-            IpClass::LinkLocal => "link_local",
-            IpClass::Cgnat => "cgnat",
-            IpClass::Documentation => "documentation",
-            IpClass::Benchmark => "benchmark",
-            IpClass::Multicast => "multicast",
-            IpClass::Unspecified => "unspecified",
-            IpClass::Reserved => "reserved",
+            ConnectEndpoint::Destination { host, .. } => host,
+            ConnectEndpoint::UpstreamProxy { proxy } => &proxy.host,
+        }
+    }
+
+    fn port(&self) -> u16 {
+        match self {
+            ConnectEndpoint::Destination { port, .. } => *port,
+            ConnectEndpoint::UpstreamProxy { proxy } => proxy.port,
+        }
+    }
+
+    fn address_policy(&self) -> EgressAddressPolicy {
+        match self {
+            ConnectEndpoint::Destination { address_policy, .. } => *address_policy,
+            ConnectEndpoint::UpstreamProxy { proxy } => proxy.address_policy,
         }
     }
 }
 
-/// Classify one IP exactly like the provider resolver (including embedded
-/// IPv4 in mapped/compatible/6to4/NAT64 forms).
-pub(crate) fn classify_ip(ip: std::net::IpAddr) -> IpClass {
-    match ip {
-        std::net::IpAddr::V4(v4) => classify_v4(v4),
-        std::net::IpAddr::V6(v6) => classify_v6(v6),
+/// The destination-leg policy installed by one connector policy.
+fn destination_address_policy(policy: &DestinationPolicy) -> EgressAddressPolicy {
+    EgressAddressPolicy::from_allow_loopback(policy.allow_loopback)
+}
+
+/// The endpoint for one broker connect: the selected upstream proxy leg when
+/// one applies, otherwise the destination itself (with the connector's
+/// explicit loopback rule).
+fn connect_endpoint<'a>(
+    upstream: Option<&'a UpstreamProxy>,
+    host: &str,
+    port: u16,
+    inner: &BrokerInner,
+) -> ConnectEndpoint<'a> {
+    match upstream {
+        Some(proxy) => ConnectEndpoint::UpstreamProxy { proxy },
+        None => ConnectEndpoint::Destination {
+            host: host.to_string(),
+            port,
+            address_policy: destination_address_policy(&inner.policy),
+        },
     }
 }
 
-fn classify_v4(v4: std::net::Ipv4Addr) -> IpClass {
-    let o = v4.octets();
-    if v4.is_unspecified() {
-        return IpClass::Unspecified;
-    }
-    if v4.is_loopback() {
-        return IpClass::Loopback;
-    }
-    if v4.is_link_local() {
-        return IpClass::LinkLocal;
-    }
-    if v4.is_private() {
-        return IpClass::Private;
-    }
-    if v4.is_multicast() {
-        return IpClass::Multicast;
-    }
-    if o[0] == 100 && (64..=127).contains(&o[1]) {
-        return IpClass::Cgnat;
-    }
-    if v4.is_documentation() {
-        return IpClass::Documentation;
-    }
-    if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
-        return IpClass::Benchmark;
-    }
-    if o[0] == 0
-        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
-        || (o[0] == 192 && o[1] == 88 && o[2] == 99)
-        || o[0] >= 240
-    {
-        return IpClass::Reserved;
-    }
-    IpClass::Global
-}
-
-fn classify_v6(v6: std::net::Ipv6Addr) -> IpClass {
-    let s = v6.segments();
-    if v6.is_unspecified() {
-        return IpClass::Unspecified;
-    }
-    if v6.is_loopback() {
-        return IpClass::Loopback;
-    }
-    if v6.is_multicast() {
-        return IpClass::Multicast;
-    }
-    if (s[0] & 0xffc0) == 0xfe80 {
-        return IpClass::LinkLocal;
-    }
-    if (s[0] & 0xfe00) == 0xfc00 {
-        return IpClass::Private;
-    }
-    if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0xffff {
-        return classify_v4(embedded_v4(s[6], s[7]));
-    }
-    if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
-        return classify_v4(embedded_v4(s[6], s[7]));
-    }
-    if s[0] == 0x2002 {
-        return classify_v4(embedded_v4(s[1], s[2]));
-    }
-    if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
-        return classify_v4(embedded_v4(s[6], s[7]));
-    }
-    if s[0] == 0x2001 && s[1] == 0x0db8 {
-        return IpClass::Documentation;
-    }
-    if s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0 {
-        return IpClass::Benchmark;
-    }
-    if (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
-        || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0010)
-        || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0020)
-    {
-        return IpClass::Reserved;
-    }
-    IpClass::Global
-}
-
-fn embedded_v4(hi: u16, lo: u16) -> std::net::Ipv4Addr {
-    std::net::Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8)
-}
-
-/// May an address of this class be connected to? Global always; loopback
-/// only under the connector's explicit `allow_loopback` rule; nothing else.
-pub(crate) fn class_permitted(class: IpClass, allow_loopback: bool) -> bool {
-    matches!(class, IpClass::Global) || (allow_loopback && matches!(class, IpClass::Loopback))
-}
-
-/// Vet one resolution: bound the answer set and classify EVERY address; any
-/// refused class refuses the WHOLE set (a mixed public/private answer set is
-/// a rebinding signal, never filtered into a racing subset).
-pub(crate) fn vet_resolved_answers(
+/// Bound the answer set and vet EVERY address through the shared authority;
+/// any refused class refuses the WHOLE set (a mixed public/private answer
+/// set is a rebinding signal, never filtered into a racing subset).
+fn vet_connect_answers(
     host: &str,
     answers: Vec<SocketAddr>,
-    allow_loopback: bool,
+    address_policy: EgressAddressPolicy,
 ) -> Result<Vec<SocketAddr>, String> {
     if answers.is_empty() {
         return Err(format!("DNS for {host} returned no addresses"));
     }
     if answers.len() > MAX_RESOLVED_ADDRESSES {
         return Err(format!(
-            "DNS for {host} answered with {} addresses, over the bound of              {MAX_RESOLVED_ADDRESSES}",
+            "DNS for {host} answered with {} addresses, over the bound of \
+             {MAX_RESOLVED_ADDRESSES}",
             answers.len()
         ));
     }
-    for addr in &answers {
-        let class = classify_ip(addr.ip());
-        if !class_permitted(class, allow_loopback) {
-            return Err(format!(
-                "DNS for {host} resolved to a {} address, which the egress address                  policy refuses",
-                class.as_str()
-            ));
-        }
-    }
+    faktor_security::network::vet_resolved_answers(&answers, address_policy).map_err(
+        |refusal| {
+            format!(
+                "DNS for {host} resolved to a {} address ({}), which the egress \
+             address policy refuses",
+                refusal.class, refusal.address
+            )
+        },
+    )?;
     Ok(answers)
 }
 
 async fn connect_destination(
-    upstream: Option<&UpstreamProxy>,
-    host: &str,
-    port: u16,
+    endpoint: ConnectEndpoint<'_>,
     inner: &Arc<BrokerInner>,
 ) -> Result<TcpStream, String> {
-    let (connect_host, connect_port) = match upstream {
-        Some(upstream) => (upstream.host.clone(), upstream.port),
-        None => (host.to_string(), port),
-    };
-    let allow_loopback = inner.policy.allow_loopback;
-    // A literal-IP destination cannot be rebound: the broker policy already
-    // decided that exact address upstream (explicit naming), so it connects
-    // directly. A NAME is resolved EXACTLY ONCE, its full answer set is
-    // vetted, and the connect uses only those `SocketAddr`s — no second
-    // resolution between the decision and the socket (the upstream proxy
-    // leg is vetted identically).
-    let literal: Option<std::net::IpAddr> = connect_host.parse().ok();
+    let host = endpoint.host().to_string();
+    let port = endpoint.port();
+    let address_policy = endpoint.address_policy();
+    // A literal-IP host is NOT a bypass: it is vetted through the SAME
+    // classification + policy function as a resolved name, as a
+    // single-address answer set (no DNS involved). A NAME is resolved
+    // EXACTLY ONCE, its full answer set is vetted, and the connect uses only
+    // those `SocketAddr`s — no second resolution between the decision and
+    // the socket. Both the direct and the upstream-proxy legs use this one
+    // path, each with its own `address_policy`.
     let attempt = async {
-        let vetted = if let Some(ip) = literal {
-            vec![SocketAddr::new(ip, connect_port)]
-        } else {
-            let answers = tokio::net::lookup_host((connect_host.as_str(), connect_port))
-                .await
-                .map(|addrs| addrs.collect::<Vec<SocketAddr>>())
-                .map_err(|_| format!("cannot resolve {connect_host}:{connect_port}"))?;
-            vet_resolved_answers(&connect_host, answers, allow_loopback)?
+        let vetted = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => vet_connect_answers(&host, vec![SocketAddr::new(ip, port)], address_policy)?,
+            Err(_) => {
+                let answers = tokio::net::lookup_host((host.as_str(), port))
+                    .await
+                    .map(|addrs| addrs.collect::<Vec<SocketAddr>>())
+                    .map_err(|_| format!("cannot resolve {host}:{port}"))?;
+                vet_connect_answers(&host, answers, address_policy)?
+            }
         };
         let mut last_error: Option<std::io::Error> = None;
         for addr in vetted {
@@ -2390,7 +2450,7 @@ async fn connect_destination(
             }
         }
         Err(format!(
-            "cannot connect {connect_host}:{connect_port}: {}",
+            "cannot connect {host}:{port}: {}",
             last_error
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| "no vetted address".to_string())
@@ -2404,9 +2464,7 @@ async fn connect_destination(
     match result {
         Ok(Ok(stream)) => Ok(stream),
         Ok(Err(detail)) => Err(detail),
-        Err(_) => Err(format!(
-            "connect to {connect_host}:{connect_port} timed out"
-        )),
+        Err(_) => Err(format!("connect to {host}:{port} timed out")),
     }
 }
 
@@ -2690,14 +2748,110 @@ mod tests {
     }
 
     #[test]
-    fn credentials_never_render_their_password() {
-        let credentials = ProxyCredentials::new("user", "hunter2-secret");
-        let rendered = format!("{credentials:?}");
-        assert!(!rendered.contains("hunter2-secret"));
-        assert!(rendered.contains("[redacted]"));
+    fn credentials_are_bounded_and_never_render_their_secrets() {
+        let credentials = ProxyCredentials::new("PLANTED-USER-NAME", "PLANTED-PASSWORD-2f6c");
+        let proxy = UpstreamProxy::new("proxy.test", 8080).with_credentials(credentials.clone());
+        let selector = UpstreamSelector::new(Some(proxy.clone()));
+        let config = BrokerConfig {
+            upstream: selector.clone(),
+            ..BrokerConfig::default()
+        };
+        // Debug is redacted through every nesting level; there is no Display
+        // and no Serialize on credentials at all.
+        for rendered in [
+            format!("{credentials:?}"),
+            format!("{proxy:?}"),
+            format!("{selector:?}"),
+            format!("{config:?}"),
+        ] {
+            assert!(!rendered.contains("PLANTED-USER-NAME"), "{rendered}");
+            assert!(!rendered.contains("PLANTED-PASSWORD-2f6c"), "{rendered}");
+        }
+        assert!(format!("{credentials:?}").contains("[redacted]"));
+        // The Basic value carries the real material (only ever written to
+        // the upstream socket) and is base64 of `user:pass`.
         let header = credentials.basic_header();
         assert!(header.starts_with("Basic "));
-        assert!(!header.contains("hunter2-secret"));
+        assert!(!header.contains("PLANTED-PASSWORD-2f6c"));
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(header.strip_prefix("Basic ").unwrap())
+            .unwrap();
+        assert_eq!(decoded, b"PLANTED-USER-NAME:PLANTED-PASSWORD-2f6c");
+        // Bounds and header-injection material, refused with a typed error.
+        assert!(matches!(
+            ProxyCredentials::try_new("u".repeat(MAX_PROXY_USERNAME_BYTES + 1), "p"),
+            Err(BrowserError::InvalidConfig { .. })
+        ));
+        assert!(ProxyCredentials::try_new("u", "p".repeat(MAX_PROXY_PASSWORD_BYTES + 1)).is_err());
+        assert!(ProxyCredentials::try_new(
+            "u".repeat(MAX_PROXY_USERNAME_BYTES),
+            "p".repeat(MAX_PROXY_PASSWORD_BYTES)
+        )
+        .is_ok());
+        for bad in ["bad\ruser", "bad\nuser", "bad\0user"] {
+            assert!(ProxyCredentials::try_new(bad, "p").is_err(), "{bad:?}");
+            assert!(ProxyCredentials::try_new("u", bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn upstream_proxy_host_is_canonicalized_and_hostile_forms_are_refused() {
+        assert_eq!(
+            UpstreamProxy::try_new("EXAMPLE.COM.", 8080).unwrap().host,
+            "example.com"
+        );
+        assert_eq!(
+            UpstreamProxy::try_new("bücher.example", 8080).unwrap().host,
+            "xn--bcher-kva.example"
+        );
+        assert_eq!(
+            UpstreamProxy::try_new("[0:0:0:0:0:0:0:1]", 8080)
+                .unwrap()
+                .host,
+            "::1"
+        );
+        assert_eq!(
+            UpstreamProxy::try_new("127.000.000.001", 8080)
+                .unwrap()
+                .host,
+            "127.0.0.1"
+        );
+        for hostile in [
+            "",
+            " ",
+            "user@proxy.test",
+            "user:pass@proxy.test",
+            "proxy.test:8080",
+            "http://proxy.test",
+            "bad host",
+            "proxy.test\n",
+            "proxy.test\0",
+            "fe80::1%eth0",
+            "[fe80::1%25eth0]",
+            "2130706433",
+            "*",
+        ] {
+            let error = UpstreamProxy::try_new(hostile, 8080)
+                .expect_err(&format!("{hostile:?} must be refused"));
+            assert!(
+                matches!(error, BrowserError::InvalidConfig { .. }),
+                "{hostile:?}: typed refusal expected, got {error:?}"
+            );
+        }
+        assert!(UpstreamProxy::try_new("proxy.test", 0).is_err());
+        // A hand-built non-canonical struct is refused by validate().
+        let hand_built = UpstreamProxy {
+            host: "PROXY.TEST".to_string(),
+            port: 8080,
+            credentials: None,
+            address_policy: EgressAddressPolicy::EXTERNAL,
+        };
+        assert!(hand_built.validate().is_err());
+        assert!(UpstreamProxy::try_new("proxy.test", 8080)
+            .unwrap()
+            .validate()
+            .is_ok());
     }
 
     #[test]
@@ -3061,7 +3215,7 @@ mod tests {
         }
     }
 
-    // --- resolver mirror (parity with crates/provider/src/resolver.rs) ---
+    // --- connect vetting through the single faktor-security authority ---
 
     fn ip(text: &str) -> std::net::IpAddr {
         text.parse().expect("test IP")
@@ -3071,37 +3225,49 @@ mod tests {
         SocketAddr::new(ip(text), port)
     }
 
+    fn test_inner(policy: DestinationPolicy) -> Arc<BrokerInner> {
+        Arc::new(BrokerInner {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            policy,
+            upstream: UpstreamSelector::default(),
+            max_request_bytes: 32 * 1024,
+            max_request_body_bytes: 1024 * 1024,
+            connect_timeout: Duration::from_millis(500),
+            copy_idle_timeout: Duration::from_millis(500),
+            copy_max: Duration::from_millis(500),
+            shutdown_grace: Duration::from_millis(100),
+            accounting: Mutex::new(AccountingCounters::default()),
+            active: AtomicUsize::new(0),
+            started_ms: 0,
+            state: Mutex::new(BrokerState::Running),
+            last_error: Mutex::new(None),
+            shutdown: CancellationToken::new(),
+            terminal: Notify::new(),
+        })
+    }
+
     #[test]
-    fn mirrored_classification_covers_the_special_ranges() {
-        for (text, want) in [
-            ("8.8.8.8", IpClass::Global),
-            ("127.0.0.1", IpClass::Loopback),
-            ("169.254.169.254", IpClass::LinkLocal),
-            ("10.0.0.1", IpClass::Private),
-            ("192.168.1.1", IpClass::Private),
-            ("100.64.0.1", IpClass::Cgnat),
-            ("192.0.2.1", IpClass::Documentation),
-            ("198.18.0.1", IpClass::Benchmark),
-            ("224.0.0.1", IpClass::Multicast),
-            ("0.0.0.0", IpClass::Unspecified),
-            ("240.0.0.1", IpClass::Reserved),
-            ("::1", IpClass::Loopback),
-            ("fe80::1", IpClass::LinkLocal),
-            ("fc00::1", IpClass::Private),
-            ("ff02::1", IpClass::Multicast),
-            ("2001:db8::1", IpClass::Documentation),
-            ("2606:4700::1111", IpClass::Global),
-            ("::ffff:127.0.0.1", IpClass::Loopback),
-            ("::ffff:169.254.169.254", IpClass::LinkLocal),
-            ("64:ff9b::7f00:1", IpClass::Loopback),
-            ("2002:7f00:1::", IpClass::Loopback),
+    fn classify_ip_comes_from_the_shared_authority() {
+        use faktor_security::network::{classify_ip, AddressClass};
+        assert_eq!(classify_ip(ip("127.0.0.1")), AddressClass::Loopback);
+        assert_eq!(classify_ip(ip("169.254.169.254")), AddressClass::LinkLocal);
+        // Ranges the deleted mirror missed, plus transition/tunneling forms
+        // that are never classified by their embedded IPv4 address.
+        for text in [
+            "64:ff9b:1::1",
+            "100:0:0:1::1",
+            "3fff::1",
+            "5f00::1",
+            "::ffff:8.8.8.8",
+            "64:ff9b::7f00:1",
+            "2002:7f00:1::",
         ] {
-            assert_eq!(classify_ip(ip(text)), want, "{text}");
+            assert_ne!(classify_ip(ip(text)), AddressClass::Global, "{text}");
         }
     }
 
     #[test]
-    fn mirror_vetting_refuses_malicious_and_mixed_answers_wholesale() {
+    fn answer_vetting_bounds_the_set_and_refuses_wholesale() {
         for (label, answer) in [
             ("loopback", "127.0.0.1"),
             ("metadata", "169.254.169.254"),
@@ -3109,38 +3275,190 @@ mod tests {
             ("v6 loopback", "::1"),
             ("v6 link-local", "fe80::1"),
         ] {
-            let err = vet_resolved_answers("allowed.test", vec![sa(answer, 443)], false)
-                .expect_err(label);
+            let err = vet_connect_answers(
+                "allowed.test",
+                vec![sa(answer, 443)],
+                EgressAddressPolicy::EXTERNAL,
+            )
+            .expect_err(label);
             assert!(err.contains("refuses"), "{label}: {err}");
         }
         // Mixed public/private: the whole set is refused, never filtered.
-        let err = vet_resolved_answers(
+        let err = vet_connect_answers(
             "allowed.test",
             vec![sa("93.184.216.34", 443), sa("127.0.0.1", 443)],
-            false,
+            EgressAddressPolicy::EXTERNAL,
         )
         .expect_err("mixed set");
         assert!(err.contains("refuses"), "{err}");
         // The explicit loopback rule admits loopback and nothing else.
         assert_eq!(
-            vet_resolved_answers("local.test", vec![sa("127.0.0.1", 11434)], true).unwrap(),
+            vet_connect_answers(
+                "local.test",
+                vec![sa("127.0.0.1", 11434)],
+                EgressAddressPolicy::LOCAL
+            )
+            .unwrap(),
             vec![sa("127.0.0.1", 11434)]
         );
-        let err =
-            vet_resolved_answers("local.test", vec![sa("169.254.169.254", 80)], true).unwrap_err();
+        let err = vet_connect_answers(
+            "local.test",
+            vec![sa("169.254.169.254", 80)],
+            EgressAddressPolicy::LOCAL,
+        )
+        .unwrap_err();
         assert!(err.contains("link_local"), "{err}");
         // Answer-set bound, empty set.
         let flood: Vec<SocketAddr> = (1..=MAX_RESOLVED_ADDRESSES + 1)
             .map(|i| sa(&format!("93.184.216.{i}"), 443))
             .collect();
-        let err = vet_resolved_answers("flood.test", flood, false).unwrap_err();
+        let err =
+            vet_connect_answers("flood.test", flood, EgressAddressPolicy::EXTERNAL).unwrap_err();
         assert!(err.contains("over the bound"), "{err}");
-        let err = vet_resolved_answers("empty.test", Vec::new(), false).unwrap_err();
+        let err = vet_connect_answers("empty.test", Vec::new(), EgressAddressPolicy::EXTERNAL)
+            .unwrap_err();
         assert!(err.contains("no addresses"), "{err}");
     }
 
+    #[tokio::test]
+    async fn literal_ip_destinations_are_class_vetted_before_any_dial() {
+        // The P0 bypass: a literal-IP host used to skip classification. Bind
+        // a listener so a skipped vet would actually connect.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let loopback_port = listener.local_addr().unwrap().port();
+        let inner = test_inner(DestinationPolicy::first_party_only(Vec::new()));
+        for (literal, port) in [
+            ("127.0.0.1", loopback_port),
+            ("169.254.169.254", 9),
+            ("10.0.0.1", 9),
+            ("172.16.0.1", 9),
+            ("192.168.1.1", 9),
+            ("100.64.0.1", 9),
+            ("::1", loopback_port),
+            ("fe80::1", 9),
+            ("fc00::1", 9),
+        ] {
+            let endpoint = ConnectEndpoint::Destination {
+                host: literal.to_string(),
+                port,
+                address_policy: EgressAddressPolicy::EXTERNAL,
+            };
+            let err = connect_destination(endpoint, &inner)
+                .await
+                .expect_err(literal);
+            assert!(err.contains("refuses"), "{literal}: {err}");
+        }
+        // The explicit local rule connects loopback and only loopback.
+        let endpoint = ConnectEndpoint::Destination {
+            host: "127.0.0.1".to_string(),
+            port: loopback_port,
+            address_policy: EgressAddressPolicy::LOCAL,
+        };
+        assert!(
+            connect_destination(endpoint, &inner).await.is_ok(),
+            "local loopback must connect"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_proxy_leg_policy_is_independent_of_the_destination() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // The destination policy tolerates loopback...
+        let inner =
+            test_inner(DestinationPolicy::first_party_only(Vec::new()).with_allow_loopback(true));
+        // ...but the proxy's own default (EXTERNAL) still refuses a loopback
+        // proxy instead of inheriting the destination's rule.
+        let external_proxy = UpstreamProxy::try_new("127.0.0.1", port).unwrap();
+        let err = connect_destination(
+            ConnectEndpoint::UpstreamProxy {
+                proxy: &external_proxy,
+            },
+            &inner,
+        )
+        .await
+        .expect_err("loopback proxy under EXTERNAL");
+        assert!(err.contains("loopback"), "{err}");
+        // Metadata on the proxy leg is refused even under LOCAL.
+        let metadata_proxy = UpstreamProxy::try_new("169.254.169.254", 80)
+            .unwrap()
+            .with_address_policy(EgressAddressPolicy::LOCAL);
+        let err = connect_destination(
+            ConnectEndpoint::UpstreamProxy {
+                proxy: &metadata_proxy,
+            },
+            &inner,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("refuses"), "{err}");
+        // An operator explicitly naming a local proxy installs LOCAL on the
+        // proxy leg; it never widens the destination leg.
+        let local_proxy = UpstreamProxy::try_new("127.0.0.1", port)
+            .unwrap()
+            .with_address_policy(EgressAddressPolicy::LOCAL);
+        assert!(connect_destination(
+            ConnectEndpoint::UpstreamProxy {
+                proxy: &local_proxy
+            },
+            &inner
+        )
+        .await
+        .is_ok());
+        let endpoint = ConnectEndpoint::Destination {
+            host: "127.0.0.1".to_string(),
+            port,
+            address_policy: EgressAddressPolicy::EXTERNAL,
+        };
+        assert!(connect_destination(endpoint, &inner).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn broker_wire_path_refuses_literal_ip_without_the_explicit_rule() {
+        // End-to-end over the real broker wire path: the CONNECT target is a
+        // literal IP, which used to skip class vetting entirely.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_port = listener.local_addr().unwrap().port();
+        let policy =
+            DestinationPolicy::first_party_only(vec![HostPattern::parse("127.0.0.1").unwrap()])
+                .with_allowed_ports(vec![origin_port]);
+        let broker = EgressBroker::start(BrokerConfig {
+            policy: policy.clone(),
+            ..BrokerConfig::default()
+        })
+        .await
+        .unwrap();
+        let connect = format!(
+            "CONNECT 127.0.0.1:{origin_port} HTTP/1.1\r\nHost: 127.0.0.1:{origin_port}\r\n\r\n"
+        );
+        let response = send_raw_request(broker.addr(), &connect).await;
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+        assert!(response.contains("loopback"), "{response}");
+        broker.shutdown().await;
+        // With the explicit loopback rule the same literal connects.
+        let broker = EgressBroker::start(BrokerConfig {
+            policy: policy.with_allow_loopback(true),
+            ..BrokerConfig::default()
+        })
+        .await
+        .unwrap();
+        let response = send_raw_request(broker.addr(), &connect).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        broker.shutdown().await;
+    }
+
+    async fn send_raw_request(addr: SocketAddr, request: &str) -> String {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut buffer = [0u8; 4096];
+        match tokio::time::timeout(Duration::from_millis(1500), stream.read(&mut buffer)).await {
+            Ok(Ok(n)) => String::from_utf8_lossy(&buffer[..n]).to_string(),
+            _ => String::new(),
+        }
+    }
+
     #[test]
-    fn mirror_policy_defaults_to_external_only_and_opt_in_installs_the_rule() {
+    fn destination_policy_loopback_rule_defaults_to_external_only() {
         let policy =
             DestinationPolicy::first_party_only(vec![HostPattern::parse("example.com").unwrap()]);
         assert!(!policy.allow_loopback);

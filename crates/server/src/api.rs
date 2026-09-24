@@ -1751,7 +1751,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn native_bootstrap_strict_dtos_and_cursor_stream() {
         let dir = tempfile::tempdir().unwrap();
-        let deps = test_deps(dir.path());
+        let mut deps = test_deps(dir.path());
+        // The live-waiter leg must not race the default requester cap under a
+        // loaded parallel suite: the route reads `deps.permissions`, so give
+        // the test a requester whose only expiry is the durable deadline.
+        let permissions = ChannelPermissionRequester::new(std::time::Duration::from_secs(3600));
+        deps.permissions = permissions.clone();
         let token = deps.auth_token.clone();
         let handle = serve(deps, 0).await.unwrap();
         let client = reqwest::Client::new();
@@ -1843,8 +1848,9 @@ pub(crate) mod tests {
         assert!(receipt["accepted"].as_bool().unwrap());
 
         // Native permission surface: the live set is empty, ids/decisions
-        // are strict, and an unknown resolve is a typed 409 (never a
-        // double grant).
+        // are strict, and every reply for an id that is NOT a live waiter is
+        // a typed 409 — a reply can never plant a decision for a future
+        // request.
         let listing: serde_json::Value = client
             .get(format!("{base}/native/permissions?session={sid}"))
             .bearer_auth(token.as_str())
@@ -1869,18 +1875,26 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 400, "unknown query fields stay strict");
-        for (body, expect) in [
+        for (body, expect, why) in [
             (
                 serde_json::json!({"permission_id": "1", "decision": "maybe"}),
                 400,
+                "missing session_id",
             ),
             (
-                serde_json::json!({"permission_id": "0", "decision": "allow"}),
+                serde_json::json!({"session_id": sid, "permission_id": "0", "decision": "allow"}),
                 400,
+                "zero permission id",
             ),
             (
-                serde_json::json!({"permission_id": "999", "decision": "allow", "x": 1}),
+                serde_json::json!({"session_id": "abc", "permission_id": "1", "decision": "allow"}),
                 400,
+                "invalid session id",
+            ),
+            (
+                serde_json::json!({"session_id": sid, "permission_id": "999", "decision": "allow", "x": 1}),
+                400,
+                "unknown field",
             ),
         ] {
             let resp = client
@@ -1890,12 +1904,12 @@ pub(crate) mod tests {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), expect, "{body}");
+            assert_eq!(resp.status(), expect, "{why}: {body}");
         }
-        // An unknown id is the requester's documented pre-resolution: the
-        // first reply lands, the second is a typed 409 (never a double
-        // grant).
-        let body = serde_json::json!({"permission_id": "999", "decision": "allow"});
+        // An id that is not a LIVE waiter is refused on every reply — the
+        // first reply cannot plant an Allow for a later request.
+        let body =
+            serde_json::json!({"session_id": sid, "permission_id": "999", "decision": "allow"});
         let resp = client
             .post(format!("{base}/native/permission/reply"))
             .bearer_auth(token.as_str())
@@ -1903,7 +1917,11 @@ pub(crate) mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200, "{body}");
+        assert_eq!(
+            resp.status(),
+            409,
+            "no pre-authorization for a future id: {body}"
+        );
         let resp = client
             .post(format!("{base}/native/permission/reply"))
             .bearer_auth(token.as_str())
@@ -1911,7 +1929,74 @@ pub(crate) mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 409, "double resolve is a typed conflict");
+        assert_eq!(resp.status(), 409, "still nothing to resolve: {body}");
+
+        // A LIVE waiter: the reply is bound to the owning session. A
+        // wrong-session reply is a typed 409 and must NOT consume the waiter;
+        // only the owning session's reply resolves it (200 means a real
+        // waiter received the decision).
+        let sid_num = faktor_core::id::SessionId::new(sid.parse::<u64>().unwrap());
+        let permissions_for_waiter = permissions.clone();
+        let waiter = tokio::spawn(async move {
+            faktor_agent::PermissionRequester::request(
+                &*permissions_for_waiter,
+                sid_num,
+                &faktor_session::ops::PermissionRequest {
+                    id: 4242,
+                    op_id: faktor_core::id::OpId::new(1),
+                    capability: faktor_core::capability::Capability::ExecuteShell {
+                        command: "ls".into(),
+                    },
+                    event_seq: faktor_core::id::EventSeq::new(1),
+                    expires_ms: i64::MAX,
+                },
+            )
+            .await
+        });
+        for _ in 0..200 {
+            if !permissions.pending_ids().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(permissions.pending_ids(), vec![4242], "live waiter listed");
+        let wrong = serde_json::json!({
+            "session_id": "999999", "permission_id": "4242", "decision": "allow"
+        });
+        let resp = client
+            .post(format!("{base}/native/permission/reply"))
+            .bearer_auth(token.as_str())
+            .json(&wrong)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "{wrong}");
+        let error: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            error["error"]["code"], "permission_session_mismatch",
+            "wrong-session refusal is typed: {error}"
+        );
+        assert_eq!(
+            permissions.pending_ids(),
+            vec![4242],
+            "the wrong-session reply does not consume the live waiter"
+        );
+        let right = serde_json::json!({
+            "session_id": sid, "permission_id": "4242", "decision": "allow"
+        });
+        let resp = client
+            .post(format!("{base}/native/permission/reply"))
+            .bearer_auth(token.as_str())
+            .json(&right)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{right}");
+        assert_eq!(
+            waiter.await.unwrap().unwrap(),
+            faktor_core::capability::PermissionDecision::Allow
+        );
+        assert!(permissions.pending_ids().is_empty(), "authority drains");
 
         // The native SSE stream replays the durable journal from cursor 0.
         let resp = client
@@ -2133,8 +2218,8 @@ pub(crate) mod tests {
                 if let Some(pid) = permissions.pending_ids().first().copied() {
                     assert!(
                         permissions
-                            .resolve(pid, PermissionDecision::Allow)
-                            .expect("permission authority is not poisoned"),
+                            .resolve(drive_id, pid, PermissionDecision::Allow)
+                            .expect("the permission belongs to the driving session"),
                         "the permission hop resolves once"
                     );
                     return;
@@ -9505,13 +9590,13 @@ pub(crate) mod tests {
         // No registry configured is a 200 fallback shape, never a 500.
         let dir = tempfile::tempdir().unwrap();
         let deps = test_deps(dir.path());
-        let pw = deps.server_password.clone();
+        let token = deps.auth_token.clone();
         let handle = serve(deps, 0).await.unwrap();
         let client = reqwest::Client::new();
         let base = format!("http://{}", handle.addr);
         let resp = client
             .get(format!("{base}/native/semantic/status"))
-            .header("x-faktor-server-password", pw.as_str())
+            .bearer_auth(token.as_str())
             .send()
             .await
             .unwrap();
@@ -9525,7 +9610,7 @@ pub(crate) mod tests {
         // Capabilities mirror the same fallback-only registry.
         let resp = client
             .get(format!("{base}/native/semantic/capabilities"))
-            .header("x-faktor-server-password", pw.as_str())
+            .bearer_auth(token.as_str())
             .send()
             .await
             .unwrap();

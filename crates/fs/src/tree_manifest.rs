@@ -73,7 +73,11 @@
 
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use faktor_core::error::ErrorKind;
+
+use crate::rooted::{RootedDir, RootedEntry, RootedEntryKind, WalkBudget, WalkStep};
 
 /// Version prefix of the canonical digest (`tm1:<64-hex>`). Old content-only
 /// digests are bare 64-char hex and can never equal a canonical one.
@@ -207,17 +211,44 @@ pub fn is_tree_manifest_digest(value: &str) -> bool {
 
 /// Build the canonical manifest of every non-directory entry under `root`.
 ///
-/// The root path itself is canonicalized (its identity is the caller's
-/// choice); symlinks INSIDE the tree are never followed, so no entry can
-/// resolve outside the root and loops cannot hang the walk. Regular files
-/// are streamed (bounded RAM) with a unix TOCTOU identity check between
-/// lstat and open.
+/// The root's identity is the caller's choice (it is canonicalized once);
+/// every entry below it is reached through the rooted-directory authority:
+/// directories are opened handle-relative (`openat`/NT relative open),
+/// children are inspected with no-follow semantics, and symlinks INSIDE the
+/// tree are never followed — they are hashed as their literal target, so no
+/// entry can resolve outside the root and loops cannot hang the walk.
+/// Regular files are streamed (bounded RAM) through the open handle.
 pub fn tree_manifest(root: &Path, max_entries: usize) -> Result<TreeManifest, TreeManifestError> {
     if max_entries == 0 {
         return Err(TreeManifestError::Malformed(
             "tree manifest max_entries must be >= 1".into(),
         ));
     }
+    // The canonical manifest's historical whole-operation bound is the entry
+    // cap (plus the depth cap): entry/depth-exhaustion is a typed Oversized
+    // refusal and the read budget is unbounded because the manifest's job is
+    // a whole-tree digest (streamed, never materialized).
+    // max_entries + 1 directories: with the depth cap a tree can never hold
+    // more dirs than entries + 1, so this directory bound can never refuse
+    // before the historical entry bound does (parity).
+    let mut budget = WalkBudget::new(
+        max_entries,
+        max_entries.saturating_add(1),
+        MAX_TREE_MANIFEST_DEPTH,
+        u64::MAX,
+        u64::MAX,
+    );
+    tree_manifest_budgeted(root, &mut budget)
+}
+
+/// [`tree_manifest`] with an explicit whole-operation [`WalkBudget`]. The
+/// caller owns every cap (entries, directories, depth, total file bytes,
+/// total bytes read); exhaustion is the typed
+/// [`TreeManifestError::Oversized`] refusal — never a partial manifest.
+pub fn tree_manifest_budgeted(
+    root: &Path,
+    budget: &mut WalkBudget,
+) -> Result<TreeManifest, TreeManifestError> {
     let canonical = root
         .canonicalize()
         .map_err(|e| TreeManifestError::RootUnavailable(format!("{}: {e}", root.display())))?;
@@ -227,113 +258,117 @@ pub fn tree_manifest(root: &Path, max_entries: usize) -> Result<TreeManifest, Tr
             root.display()
         )));
     }
+    let dir = RootedDir::open(&canonical)
+        .map_err(|e| TreeManifestError::RootUnavailable(format!("{}: {e}", root.display())))?;
     let mut manifest = TreeManifest::default();
-    let mut count = 0usize;
-    // Iterative DFS with an explicit stack: every frame is one directory
-    // whose entries are sorted, so the traversal itself is deterministic.
-    let mut stack: Vec<(PathBuf, String, usize)> = vec![(canonical.clone(), String::new(), 0)];
-    while let Some((dir, prefix, depth)) = stack.pop() {
-        if depth > MAX_TREE_MANIFEST_DEPTH {
-            return Err(TreeManifestError::Oversized(format!(
-                "tree manifest walk exceeded MAX_TREE_MANIFEST_DEPTH ({MAX_TREE_MANIFEST_DEPTH})"
-            )));
-        }
-        let mut children: Vec<(std::ffi::OsString, PathBuf)> = Vec::new();
-        let read = fs::read_dir(&dir)
-            .map_err(|e| TreeManifestError::Io(format!("read_dir {}: {e}", dir.display())))?;
-        for entry in read {
-            let entry = entry
-                .map_err(|e| TreeManifestError::Io(format!("read_dir {}: {e}", dir.display())))?;
-            children.push((entry.file_name(), entry.path()));
-        }
-        children.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, path) in children {
-            count += 1;
-            if count > max_entries {
-                return Err(TreeManifestError::Oversized(format!(
-                    "tree manifest exceeds {max_entries} entries; refusing a partial manifest"
-                )));
+    let mut failure: Option<TreeManifestError> = None;
+    {
+        let mut visit = |entry: &RootedEntry,
+                         _depth: usize,
+                         budget: &mut WalkBudget|
+         -> Result<WalkStep, crate::Error> {
+            if failure.is_some() {
+                return Ok(WalkStep::Stop);
             }
-            let name = name.into_string().map_err(|bad| {
-                TreeManifestError::Malformed(format!(
-                    "tree manifest entry name {bad:?} is not valid UTF-8; a lossy fold would collide distinct names"
-                ))
-            })?;
-            // Internal atomic-write temporaries (an in-flight or crashed CAS
-            // writer's `.{name}.kp-tmp-*`) are daemon bookkeeping, never
-            // working content: they are invisible to the canonical manifest
-            // exactly like `.git` is (a materialized root must digest the
-            // same with or without a crash residue temp).
-            if crate::atomic::is_internal_temp_name(&name) {
-                continue;
-            }
-            let rel = join_relative(&prefix, &name);
-            if rel.len() > MAX_TREE_MANIFEST_PATH_BYTES {
-                return Err(TreeManifestError::Oversized(format!(
-                    "tree manifest path of {} bytes exceeds MAX_TREE_MANIFEST_PATH_BYTES ({MAX_TREE_MANIFEST_PATH_BYTES})",
-                    rel.len()
-                )));
-            }
-            let meta = fs::symlink_metadata(&path)
-                .map_err(|e| TreeManifestError::Io(format!("metadata {}: {e}", path.display())))?;
-            let file_type = meta.file_type();
-            if file_type.is_symlink() {
-                let target = fs::read_link(&path).map_err(|e| {
-                    TreeManifestError::Io(format!("read_link {}: {e}", path.display()))
-                })?;
-                let bytes = link_target_bytes(&target);
-                if bytes.len() > MAX_TREE_MANIFEST_LINK_BYTES {
-                    return Err(TreeManifestError::Oversized(format!(
-                        "tree manifest symlink {rel:?} target of {} bytes exceeds MAX_TREE_MANIFEST_LINK_BYTES ({MAX_TREE_MANIFEST_LINK_BYTES})",
-                        bytes.len()
-                    )));
+            match manifest_entry(&dir, &mut manifest, entry, budget) {
+                Ok(step) => Ok(step),
+                Err(e) => {
+                    failure = Some(e);
+                    Ok(WalkStep::Stop)
                 }
-                manifest.entries.push(TreeEntry {
-                    normalized_path: rel,
-                    kind: TreeEntryKind::Symlink,
-                    mode: CanonicalMode::Symlink,
-                    payload_digest: blake3::hash(&bytes).to_hex().to_string(),
-                });
-            } else if file_type.is_dir() {
-                if TREE_MANIFEST_SKIP_DIRS.contains(&name.as_str()) {
-                    continue;
-                }
-                stack.push((path, rel, depth + 1));
-            } else if file_type.is_file() {
-                let file = fs::File::open(&path)
-                    .map_err(|e| TreeManifestError::Io(format!("open {}: {e}", path.display())))?;
-                // unix TOCTOU hardening: the opened file must be the very
-                // entry lstat classified (a swapped entry can never smuggle
-                // bytes from a different file into this manifest entry).
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    let opened = file.metadata().map_err(|e| {
-                        TreeManifestError::Io(format!("metadata {}: {e}", path.display()))
-                    })?;
-                    if meta.dev() != opened.dev() || meta.ino() != opened.ino() {
-                        return Err(TreeManifestError::Malformed(format!(
-                            "tree manifest entry {rel:?} changed identity between metadata and open (TOCTOU)"
-                        )));
-                    }
-                }
-                let payload_digest = hash_reader(file)
-                    .map_err(|e| TreeManifestError::Io(format!("read {}: {e}", path.display())))?;
-                manifest.entries.push(TreeEntry {
-                    normalized_path: rel,
-                    kind: TreeEntryKind::Regular,
-                    mode: canonical_mode(&meta),
-                    payload_digest,
-                });
-            } else {
-                manifest.special_files.push(rel);
             }
+        };
+        if let Err(e) = dir.walk_bounded(Path::new(""), budget, TREE_MANIFEST_SKIP_DIRS, &mut visit)
+        {
+            return Err(manifest_walk_error(e));
         }
+    }
+    if let Some(e) = failure {
+        return Err(e);
     }
     manifest
         .entries
         .sort_by(|a, b| a.normalized_path.cmp(&b.normalized_path));
     Ok(manifest)
+}
+
+/// One entry of a budgeted manifest walk.
+fn manifest_entry(
+    dir: &RootedDir,
+    manifest: &mut TreeManifest,
+    entry: &RootedEntry,
+    budget: &mut WalkBudget,
+) -> Result<WalkStep, TreeManifestError> {
+    let name = entry.name.to_str().ok_or_else(|| {
+        TreeManifestError::Malformed(format!(
+            "tree manifest entry name {:?} is not valid UTF-8; a lossy fold would collide distinct names",
+            entry.name
+        ))
+    })?;
+    // Internal atomic-write temporaries (an in-flight or crashed CAS
+    // writer's `.{name}.kp-tmp-*`) are daemon bookkeeping, never working
+    // content: they are invisible to the canonical manifest exactly like
+    // `.git` is (a materialized root must digest the same with or without a
+    // crash residue temp).
+    if crate::atomic::is_internal_temp_name(name) {
+        // Internal atomic-write temporaries are daemon bookkeeping, never
+        // content: a temp-named DIRECTORY is not descended either.
+        return Ok(if entry.kind == RootedEntryKind::Directory {
+            WalkStep::SkipDir
+        } else {
+            WalkStep::Continue
+        });
+    }
+    let rel = entry.rel.to_str().ok_or_else(|| {
+        TreeManifestError::Malformed(format!(
+            "tree manifest path {:?} is not valid UTF-8; a lossy fold would collide distinct paths",
+            entry.rel
+        ))
+    })?;
+    if rel.len() > MAX_TREE_MANIFEST_PATH_BYTES {
+        return Err(TreeManifestError::Oversized(format!(
+            "tree manifest path of {} bytes exceeds MAX_TREE_MANIFEST_PATH_BYTES ({MAX_TREE_MANIFEST_PATH_BYTES})",
+            rel.len()
+        )));
+    }
+    match entry.kind {
+        RootedEntryKind::Directory => Ok(WalkStep::Continue),
+        RootedEntryKind::Symlink => {
+            let target = dir.read_link(&entry.rel).map_err(manifest_io)?;
+            let bytes = link_target_bytes(&target);
+            if bytes.len() > MAX_TREE_MANIFEST_LINK_BYTES {
+                return Err(TreeManifestError::Oversized(format!(
+                    "tree manifest symlink {rel:?} target of {} bytes exceeds MAX_TREE_MANIFEST_LINK_BYTES ({MAX_TREE_MANIFEST_LINK_BYTES})",
+                    bytes.len()
+                )));
+            }
+            budget
+                .charge_read_bytes(bytes.len() as u64)
+                .map_err(manifest_walk_error)?;
+            manifest.entries.push(TreeEntry {
+                normalized_path: rel.to_string(),
+                kind: TreeEntryKind::Symlink,
+                mode: CanonicalMode::Symlink,
+                payload_digest: blake3::hash(&bytes).to_hex().to_string(),
+            });
+            Ok(WalkStep::Continue)
+        }
+        RootedEntryKind::File => {
+            let mut file = dir.open_read(&entry.rel).map_err(manifest_io)?;
+            let payload_digest = hash_reader_charged(&mut file, budget).map_err(manifest_io)?;
+            manifest.entries.push(TreeEntry {
+                normalized_path: rel.to_string(),
+                kind: TreeEntryKind::Regular,
+                mode: canonical_mode_for(entry.executable()),
+                payload_digest,
+            });
+            Ok(WalkStep::Continue)
+        }
+        RootedEntryKind::Other => {
+            manifest.special_files.push(rel.to_string());
+            Ok(WalkStep::Continue)
+        }
+    }
 }
 
 /// The canonical digest of `root` (`tm1:<64-hex>`), refusing with the typed
@@ -346,15 +381,17 @@ pub fn tree_manifest_digest(root: &Path, max_entries: usize) -> Result<String, T
 /// Manifest-faithful bounded copy of every entry under `src_root` into the
 /// existing `dst_root`.
 ///
-/// Regular files are streamed through the durable atomic sequence (temp +
-/// fsync + rename + parent fsync) with their permission bits preserved, so
-/// the canonical mode of the copy is the source's. Symlinks are recreated
-/// as LITERAL symlinks (never followed), so loops/escapes are copyable and
-/// stay links. Special files are the typed
-/// [`TreeManifestError::SpecialFile`] refusal. Internal atomic temporaries
-/// (`.kp-tmp-*`) are skipped exactly like [`crate::copy_tree_skip`]. The
-/// returned manifest covers the copied entries (sorted), so a caller can
-/// record it without a second walk of the source.
+/// The copy walks the SOURCE through the rooted-directory authority (every
+/// entry is reached handle-relative; symlinks are recreated as LITERAL
+/// symlinks and never followed, so loops/escapes are copyable and stay
+/// links) and writes each destination through the same authority (temp entry
+/// created with `open_create_new` + fsync + anchored publish). Regular files
+/// stream through the durable atomic sequence with their permission bits
+/// preserved, so the canonical mode of the copy is the source's. Special
+/// files are the typed [`TreeManifestError::SpecialFile`] refusal. Internal
+/// atomic temporaries (`.kp-tmp-*`) are skipped exactly like
+/// [`crate::copy_tree_skip`]. The returned manifest covers the copied entries
+/// (sorted), so a caller can record it without a second walk of the source.
 pub fn copy_tree_manifest(
     src_root: &Path,
     dst_root: &Path,
@@ -367,6 +404,27 @@ pub fn copy_tree_manifest(
             "copy caps must be >= 1".into(),
         ));
     }
+    // The copy's whole-operation budget: entries/dirs/depth as for the
+    // manifest, and BOTH byte budgets equal the historical total bound (the
+    // copy reads exactly the bytes it writes; symlink targets count toward
+    // the total exactly as before).
+    let mut budget = WalkBudget::new(
+        max_entries,
+        max_entries.saturating_add(1),
+        MAX_TREE_MANIFEST_DEPTH,
+        max_total_bytes,
+        max_total_bytes,
+    );
+    copy_tree_manifest_budgeted(src_root, dst_root, skip_dirs, &mut budget)
+}
+
+/// [`copy_tree_manifest`] with an explicit whole-operation [`WalkBudget`].
+pub fn copy_tree_manifest_budgeted(
+    src_root: &Path,
+    dst_root: &Path,
+    skip_dirs: &[&str],
+    budget: &mut WalkBudget,
+) -> Result<TreeManifest, TreeManifestError> {
     for name in skip_dirs {
         if name.is_empty()
             || name.contains('/')
@@ -395,137 +453,194 @@ pub fn copy_tree_manifest(
             "copy source and destination are the same tree".into(),
         ));
     }
+    let src_dir = RootedDir::open(&src).map_err(|e| {
+        TreeManifestError::RootUnavailable(format!("copy source {}: {e}", src.display()))
+    })?;
+    let dst_dir = RootedDir::open(&dst).map_err(|e| {
+        TreeManifestError::RootUnavailable(format!("copy destination {}: {e}", dst.display()))
+    })?;
     let mut manifest = TreeManifest::default();
-    let mut count = 0usize;
-    let mut total = 0u64;
-    let mut stack: Vec<(PathBuf, PathBuf, String, usize)> =
-        vec![(src.clone(), dst.clone(), String::new(), 0)];
-    while let Some((src_dir, dst_dir, prefix, depth)) = stack.pop() {
-        if depth > MAX_TREE_MANIFEST_DEPTH {
-            return Err(TreeManifestError::Oversized(format!(
-                "tree manifest copy exceeded MAX_TREE_MANIFEST_DEPTH ({MAX_TREE_MANIFEST_DEPTH})"
-            )));
-        }
-        let mut children: Vec<(std::ffi::OsString, PathBuf)> = Vec::new();
-        let read = fs::read_dir(&src_dir)
-            .map_err(|e| TreeManifestError::Io(format!("read_dir {}: {e}", src_dir.display())))?;
-        for entry in read {
-            let entry = entry.map_err(|e| {
-                TreeManifestError::Io(format!("read_dir {}: {e}", src_dir.display()))
-            })?;
-            children.push((entry.file_name(), entry.path()));
-        }
-        children.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, src_path) in children {
-            count += 1;
-            if count > max_entries {
-                return Err(TreeManifestError::Oversized(format!(
-                    "tree manifest copy exceeds {max_entries} entries"
-                )));
+    let mut failure: Option<TreeManifestError> = None;
+    {
+        let mut visit = |entry: &RootedEntry,
+                         _depth: usize,
+                         budget: &mut WalkBudget|
+         -> Result<WalkStep, crate::Error> {
+            if failure.is_some() {
+                return Ok(WalkStep::Stop);
             }
-            let name = name.into_string().map_err(|bad| {
-                TreeManifestError::Malformed(format!(
-                    "tree manifest copy entry name {bad:?} is not valid UTF-8"
-                ))
-            })?;
-            let rel = join_relative(&prefix, &name);
-            if rel.len() > MAX_TREE_MANIFEST_PATH_BYTES {
-                return Err(TreeManifestError::Oversized(format!(
-                    "tree manifest copy path of {} bytes exceeds MAX_TREE_MANIFEST_PATH_BYTES ({MAX_TREE_MANIFEST_PATH_BYTES})",
-                    rel.len()
-                )));
+            match copy_entry(&src_dir, &dst_dir, &mut manifest, entry, budget) {
+                Ok(step) => Ok(step),
+                Err(e) => {
+                    failure = Some(e);
+                    Ok(WalkStep::Stop)
+                }
             }
-            if crate::atomic::is_internal_temp_name(&name) {
-                // A concurrent in-flight daemon temp is never part of a
-                // materialized copy (parity with `copy_tree_skip`).
-                continue;
-            }
-            let dst_path = dst_dir.join(&name);
-            let meta = fs::symlink_metadata(&src_path).map_err(|e| {
-                TreeManifestError::Io(format!("metadata {}: {e}", src_path.display()))
-            })?;
-            let file_type = meta.file_type();
-            if file_type.is_symlink() {
-                let target = fs::read_link(&src_path).map_err(|e| {
-                    TreeManifestError::Io(format!("read_link {}: {e}", src_path.display()))
-                })?;
-                let bytes = link_target_bytes(&target);
-                if bytes.len() > MAX_TREE_MANIFEST_LINK_BYTES {
-                    return Err(TreeManifestError::Oversized(format!(
-                        "tree manifest copy symlink {rel:?} target of {} bytes exceeds MAX_TREE_MANIFEST_LINK_BYTES ({MAX_TREE_MANIFEST_LINK_BYTES})",
-                        bytes.len()
-                    )));
-                }
-                total = total.saturating_add(bytes.len() as u64);
-                if total > max_total_bytes {
-                    return Err(TreeManifestError::Oversized(format!(
-                        "tree manifest copy of {rel:?} would exceed the {max_total_bytes}-byte total bound"
-                    )));
-                }
-                create_symlink(&target, &dst_path)
-                    .map_err(|e| TreeManifestError::Io(format!("symlink {rel:?}: {e}")))?;
-                manifest.entries.push(TreeEntry {
-                    normalized_path: rel,
-                    kind: TreeEntryKind::Symlink,
-                    mode: CanonicalMode::Symlink,
-                    payload_digest: blake3::hash(&bytes).to_hex().to_string(),
-                });
-            } else if file_type.is_dir() {
-                if skip_dirs.contains(&name.as_str()) {
-                    continue;
-                }
-                fs::create_dir_all(&dst_path).map_err(|e| {
-                    TreeManifestError::Io(format!("mkdir {}: {e}", dst_path.display()))
-                })?;
-                stack.push((src_path, dst_path, rel, depth + 1));
-            } else if file_type.is_file() {
-                let size = meta.len();
-                total = total.saturating_add(size);
-                if total > max_total_bytes {
-                    return Err(TreeManifestError::Oversized(format!(
-                        "tree manifest copy of {rel:?} would exceed the {max_total_bytes}-byte total bound"
-                    )));
-                }
-                let file = fs::File::open(&src_path).map_err(|e| {
-                    TreeManifestError::Io(format!("open {}: {e}", src_path.display()))
-                })?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    let opened = file.metadata().map_err(|e| {
-                        TreeManifestError::Io(format!("metadata {}: {e}", src_path.display()))
-                    })?;
-                    if meta.dev() != opened.dev() || meta.ino() != opened.ino() {
-                        return Err(TreeManifestError::Malformed(format!(
-                            "tree manifest copy entry {rel:?} changed identity between metadata and open (TOCTOU)"
-                        )));
-                    }
-                }
-                let (n, hash) = crate::copy_open_file(&file, &dst_path, Some(meta.permissions()))
-                    .map_err(|e| TreeManifestError::Io(format!("copy {rel:?}: {e}")))?;
-                if n != size {
-                    return Err(TreeManifestError::Malformed(format!(
-                        "tree manifest copy of {rel:?} changed size mid-copy ({n} of {size} bytes)"
-                    )));
-                }
-                manifest.entries.push(TreeEntry {
-                    normalized_path: rel,
-                    kind: TreeEntryKind::Regular,
-                    mode: canonical_mode(&meta),
-                    payload_digest: hash.to_hex(),
-                });
-            } else {
-                manifest.special_files.push(rel);
-                return Err(TreeManifestError::SpecialFile {
-                    paths: manifest.special_files,
-                });
+        };
+        if let Err(e) = src_dir.walk_bounded(Path::new(""), budget, skip_dirs, &mut visit) {
+            if failure.is_none() {
+                failure = Some(manifest_walk_error(e));
             }
         }
+    }
+    if let Some(e) = failure {
+        return Err(e);
     }
     manifest
         .entries
         .sort_by(|a, b| a.normalized_path.cmp(&b.normalized_path));
     Ok(manifest)
+}
+
+/// Copy one source entry into the destination authority.
+fn copy_entry(
+    src: &RootedDir,
+    dst: &RootedDir,
+    manifest: &mut TreeManifest,
+    entry: &RootedEntry,
+    budget: &mut WalkBudget,
+) -> Result<WalkStep, TreeManifestError> {
+    let name = entry.name.to_str().ok_or_else(|| {
+        TreeManifestError::Malformed(format!(
+            "tree manifest copy entry name {:?} is not valid UTF-8",
+            entry.name
+        ))
+    })?;
+    let rel = entry.rel.to_str().ok_or_else(|| {
+        TreeManifestError::Malformed(format!(
+            "tree manifest copy path {:?} is not valid UTF-8",
+            entry.rel
+        ))
+    })?;
+    if rel.len() > MAX_TREE_MANIFEST_PATH_BYTES {
+        return Err(TreeManifestError::Oversized(format!(
+            "tree manifest copy path of {} bytes exceeds MAX_TREE_MANIFEST_PATH_BYTES ({MAX_TREE_MANIFEST_PATH_BYTES})",
+            rel.len()
+        )));
+    }
+    if crate::atomic::is_internal_temp_name(name) {
+        // A concurrent in-flight daemon temp is never part of a
+        // materialized copy (parity with `copy_tree_skip`); a temp-named
+        // DIRECTORY is not descended either.
+        return Ok(if entry.kind == RootedEntryKind::Directory {
+            WalkStep::SkipDir
+        } else {
+            WalkStep::Continue
+        });
+    }
+    match entry.kind {
+        RootedEntryKind::Directory => {
+            dst.create_dir_all(&entry.rel).map_err(manifest_io)?;
+            Ok(WalkStep::Continue)
+        }
+        RootedEntryKind::Symlink => {
+            let target = src.read_link(&entry.rel).map_err(manifest_io)?;
+            let bytes = link_target_bytes(&target);
+            if bytes.len() > MAX_TREE_MANIFEST_LINK_BYTES {
+                return Err(TreeManifestError::Oversized(format!(
+                    "tree manifest copy symlink {rel:?} target of {} bytes exceeds MAX_TREE_MANIFEST_LINK_BYTES ({MAX_TREE_MANIFEST_LINK_BYTES})",
+                    bytes.len()
+                )));
+            }
+            budget
+                .charge_file_bytes(bytes.len() as u64)
+                .map_err(manifest_walk_error)?;
+            dst.create_symlink(&target, &entry.rel)
+                .map_err(manifest_io)?;
+            manifest.entries.push(TreeEntry {
+                normalized_path: rel.to_string(),
+                kind: TreeEntryKind::Symlink,
+                mode: CanonicalMode::Symlink,
+                payload_digest: blake3::hash(&bytes).to_hex().to_string(),
+            });
+            Ok(WalkStep::Continue)
+        }
+        RootedEntryKind::File => {
+            let size = entry.size;
+            let mut file = src.open_read(&entry.rel).map_err(manifest_io)?;
+            let permissions = file.metadata().map(|m| m.permissions()).ok();
+            let (n, hash) = copy_open_file_rooted(dst, &entry.rel, &mut file, permissions, budget)
+                .map_err(manifest_io)?;
+            if n != size {
+                return Err(TreeManifestError::Malformed(format!(
+                    "tree manifest copy of {rel:?} changed size mid-copy ({n} of {size} bytes)"
+                )));
+            }
+            manifest.entries.push(TreeEntry {
+                normalized_path: rel.to_string(),
+                kind: TreeEntryKind::Regular,
+                mode: canonical_mode_for(entry.executable()),
+                payload_digest: hash.to_hex(),
+            });
+            Ok(WalkStep::Continue)
+        }
+        RootedEntryKind::Other => {
+            manifest.special_files.push(rel.to_string());
+            Err(TreeManifestError::SpecialFile {
+                paths: manifest.special_files.clone(),
+            })
+        }
+    }
+}
+
+/// Stream one open source file into a fresh destination temp via the
+/// anchored authority (exclusive create -> write -> fsync -> anchored
+/// publish) and return (bytes copied, hash). The budget is charged for every
+/// byte read; a failure removes the temp entry.
+fn copy_open_file_rooted(
+    dst: &RootedDir,
+    dst_rel: &Path,
+    src: &mut fs::File,
+    permissions: Option<fs::Permissions>,
+    budget: &mut WalkBudget,
+) -> Result<(u64, crate::FileHash), crate::Error> {
+    use std::io::Write as _;
+    let name = dst_rel
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let parent = dst_rel.parent().unwrap_or_else(|| Path::new(""));
+    let tmp_rel = parent.join(format!(
+        ".{}.kp-tmp-{}-{}",
+        name,
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> Result<(u64, crate::FileHash), crate::Error> {
+        let mut out = dst.open_create_new(&tmp_rel)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = [0u8; 64 * 1024];
+        let mut copied = 0u64;
+        loop {
+            let n = src
+                .read(&mut buf)
+                .map_err(|e| crate::Error::internal(format!("read {dst_rel:?}: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            budget.charge_read_bytes(n as u64)?;
+            out.write_all(&buf[..n])
+                .map_err(|e| crate::Error::internal(format!("write {}: {e}", tmp_rel.display())))?;
+            hasher.update(&buf[..n]);
+            copied += n as u64;
+        }
+        if let Some(perms) = permissions {
+            out.set_permissions(perms).map_err(|e| {
+                crate::Error::internal(format!("set permissions {}: {e}", tmp_rel.display()))
+            })?;
+        }
+        out.flush()
+            .map_err(|e| crate::Error::internal(format!("flush {}: {e}", tmp_rel.display())))?;
+        out.sync_all()
+            .map_err(|e| crate::Error::internal(format!("fsync {}: {e}", tmp_rel.display())))?;
+        drop(out);
+        dst.atomic_publish(&tmp_rel, dst_rel)?;
+        Ok((copied, crate::FileHash::from(hasher.finalize().into())))
+    })();
+    if result.is_err() {
+        let _ = dst.remove_file(&tmp_rel);
+    }
+    result
 }
 
 /// The canonical byte serialization folded into the digest. Length prefixes
@@ -553,22 +668,23 @@ fn canonical_digest(entries: &[&TreeEntry]) -> String {
     )
 }
 
-fn join_relative(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}/{name}")
-    }
-}
-
-fn hash_reader(mut reader: impl Read) -> std::io::Result<String> {
+/// Stream-hash an open file through the budget: every byte read is charged
+/// ([`WalkBudget::charge_read_bytes`]) so whole-operation read budgets are
+/// honest.
+fn hash_reader_charged(
+    mut reader: impl Read,
+    budget: &mut WalkBudget,
+) -> Result<String, crate::Error> {
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let n = reader.read(&mut buf)?;
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| crate::Error::internal(format!("read: {e}")))?;
         if n == 0 {
             break;
         }
+        budget.charge_read_bytes(n as u64)?;
         hasher.update(&buf[..n]);
     }
     Ok(hasher.finalize().to_hex().to_string())
@@ -576,21 +692,34 @@ fn hash_reader(mut reader: impl Read) -> std::io::Result<String> {
 
 /// The canonical mode of one regular file: the ANY-execute-bit projection
 /// (`100755` when any of `0o111` is set, else `100644`).
-fn canonical_mode(meta: &fs::Metadata) -> CanonicalMode {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if meta.permissions().mode() & 0o111 != 0 {
-            CanonicalMode::ExecutableFile
-        } else {
-            CanonicalMode::RegularFile
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = meta;
+fn canonical_mode_for(executable: bool) -> CanonicalMode {
+    if executable {
+        CanonicalMode::ExecutableFile
+    } else {
         CanonicalMode::RegularFile
     }
+}
+
+/// Map a handle-walk failure onto the manifest's typed refusal space. A
+/// containment refusal (a link where the walk required a real entry, a
+/// bogus path) is a [`TreeManifestError::Malformed`] refusal: the tree no
+/// longer is what it claimed to be.
+fn manifest_walk_error(e: crate::Error) -> TreeManifestError {
+    match e.kind {
+        ErrorKind::Oversized => TreeManifestError::Oversized(e.message),
+        ErrorKind::Malformed => TreeManifestError::Malformed(e.message),
+        ErrorKind::Permission => TreeManifestError::Malformed(format!(
+            "containment refusal during the tree walk: {}",
+            e.message
+        )),
+        ErrorKind::NotFound => TreeManifestError::RootUnavailable(e.message),
+        _ => TreeManifestError::Io(e.message),
+    }
+}
+
+/// Map a per-entry io failure (open/read/stat) onto the manifest space.
+fn manifest_io(e: crate::Error) -> TreeManifestError {
+    manifest_walk_error(e)
 }
 
 /// The LITERAL symlink target bytes hashed into the manifest. Unix hashes
@@ -607,35 +736,6 @@ fn link_target_bytes(target: &Path) -> Vec<u8> {
     target.to_string_lossy().into_owned().into_bytes()
 }
 
-#[cfg(unix)]
-fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
-}
-
-#[cfg(windows)]
-fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    // Windows must choose the link kind at creation time. The manifest
-    // hashes the literal target either way; resolving here only PICKS the
-    // API and a broken/looping link falls back to a file link.
-    let resolved = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        link.parent().unwrap_or_else(|| Path::new(".")).join(target)
-    };
-    match fs::metadata(&resolved) {
-        Ok(meta) if meta.is_dir() => std::os::windows::fs::symlink_dir(target, link),
-        _ => std::os::windows::fs::symlink_file(target, link),
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn create_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "symlink copy is unsupported on this platform",
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,6 +743,266 @@ mod tests {
 
     fn digest(root: &Path) -> String {
         tree_manifest_digest(root, MAX_TREE_MANIFEST_ENTRIES).unwrap()
+    }
+
+    /// Parity vector: the canonical digest and every per-entry digest of a
+    /// clean fixture tree, captured with the PRE-rewrite path-based walker,
+    /// must stay byte-identical after the rooted-handle rewrite. A drift
+    /// means the traversal or the canonical serialization changed.
+    #[cfg(unix)]
+    #[test]
+    fn clean_tree_digest_parity_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        write(&root, "a/x.txt", b"x");
+        write(&root, "a/y/z.txt", b"z");
+        write(&root, "b.txt", b"b");
+        write(&root, "tool.sh", b"#!/bin/sh\n");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(root.join("tool.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+            std::os::unix::fs::symlink("../a/x.txt", root.join("link")).unwrap();
+        }
+        assert_eq!(
+            digest(&root),
+            "tm1:ea537450a1fbb6ebc3ce15d477e7095b74854e18465a0e07ea714920bed45020"
+        );
+        let manifest = tree_manifest(&root, 100).unwrap();
+        let rows: Vec<(String, u32, String)> = manifest
+            .entries()
+            .iter()
+            .map(|e| {
+                (
+                    e.normalized_path.clone(),
+                    e.mode.octal(),
+                    e.payload_digest.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "a/x.txt".to_string(),
+                    0o100_644,
+                    "3ae7d805f6789a6402acb70ad4096a85a56bf6804eaf25c0493ac697548d30b5".to_string()
+                ),
+                (
+                    "a/y/z.txt".to_string(),
+                    0o100_644,
+                    "1104908ab930e671002c7cd7f3fc921570b1bf64ecfa12fe363585c630eaca6b".to_string()
+                ),
+                (
+                    "b.txt".to_string(),
+                    0o100_644,
+                    "10e5cf3d3c8a4f9f3468c8cc58eea84892a22fdadbc1acb22410190044c1d553".to_string()
+                ),
+                (
+                    "link".to_string(),
+                    0o120_000,
+                    "88971e633741657ff005b75df6fb88081045add7e7708cc00babb7fbc74e2dd1".to_string()
+                ),
+                (
+                    "tool.sh".to_string(),
+                    0o100_755,
+                    "bc1f407a11c9377c8b9b13f956b279c8462775105eb958fc9ae3c40de87cc96e".to_string()
+                ),
+            ]
+        );
+    }
+
+    struct SeamClear;
+    impl Drop for SeamClear {
+        fn drop(&mut self) {
+            crate::rooted::clear_entry_seam();
+        }
+    }
+
+    /// Install the (process-global) entry seam; the shared lock serializes
+    /// every seam-using test in the binary.
+    fn install_seam(
+        f: impl Fn(&Path) + Send + 'static,
+    ) -> (std::sync::MutexGuard<'static, ()>, SeamClear) {
+        let guard = crate::rooted::ENTRY_SEAM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::rooted::install_entry_seam(Box::new(f));
+        (guard, SeamClear)
+    }
+
+    /// A file enumerated as a regular file, swapped for an outside symlink in
+    /// the enumeration -> open window, is a typed refusal: the outside bytes
+    /// are never hashed into any manifest entry.
+    #[cfg(unix)]
+    #[test]
+    fn manifest_refuses_a_file_swapped_for_an_outside_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        write(&outside, "secret.txt", b"outside-manifest-secret");
+        let root = dir.path().join("root");
+        write(&root, "seam-swap.txt", b"inside");
+        let swap_root = root.clone();
+        let swap_target = outside.join("secret.txt");
+        let (_lock, _clear) = install_seam(move |rel| {
+            if rel == Path::new("seam-swap.txt") {
+                let _ = fs::remove_file(swap_root.join("seam-swap.txt"));
+                let _ = std::os::unix::fs::symlink(&swap_target, swap_root.join("seam-swap.txt"));
+            }
+        });
+        let err = tree_manifest(&root, MAX_TREE_MANIFEST_ENTRIES).unwrap_err();
+        assert!(
+            matches!(err, TreeManifestError::Malformed(_)),
+            "expected a loud containment refusal, got {err:?}"
+        );
+        assert_eq!(
+            fs::read(outside.join("secret.txt")).unwrap(),
+            b"outside-manifest-secret"
+        );
+    }
+
+    /// A directory swapped for an outside symlink before descent is refused;
+    /// the outside tree is never entered and the moved-away original stays
+    /// intact (the walk never follows the replacement).
+    #[cfg(unix)]
+    #[test]
+    fn manifest_refuses_a_dir_swapped_for_an_outside_symlink_before_descent() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        write(&outside, "marker.txt", b"outside-dir-secret");
+        let root = dir.path().join("root");
+        write(&root, "a-seam/keep.txt", b"inside");
+        let swap_root = root.clone();
+        let swap_outside = outside.clone();
+        let (_lock, _clear) = install_seam(move |rel| {
+            if rel == Path::new("a-seam") {
+                // libc rename: the static-authority scan forbids the std
+                // rename spelling outside the sanctioned atomic module, and
+                // this is test scaffolding, not a publish.
+                let from =
+                    std::ffi::CString::new(swap_root.join("a-seam").to_str().unwrap()).unwrap();
+                let to = std::ffi::CString::new(swap_root.join("a-seam-moved").to_str().unwrap())
+                    .unwrap();
+                // SAFETY: both CStrings are NUL-terminated valid paths.
+                unsafe {
+                    libc::rename(from.as_ptr(), to.as_ptr());
+                }
+                let _ = std::os::unix::fs::symlink(&swap_outside, swap_root.join("a-seam"));
+            }
+        });
+        let err = tree_manifest(&root, MAX_TREE_MANIFEST_ENTRIES).unwrap_err();
+        assert!(
+            matches!(err, TreeManifestError::Malformed(_)),
+            "expected a loud containment refusal, got {err:?}"
+        );
+        assert!(outside.join("marker.txt").exists());
+        assert!(!outside.join("keep.txt").exists());
+        assert!(root.join("a-seam-moved/keep.txt").exists());
+    }
+
+    /// The manifest copy refuses the same swap and leaves no partial or temp
+    /// entry in the destination.
+    #[cfg(unix)]
+    #[test]
+    fn copy_refuses_a_source_file_swapped_for_an_outside_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        write(&outside, "secret.txt", b"outside-copy-secret");
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        write(&src, "copy-seam.txt", b"inside");
+        fs::create_dir_all(&dst).unwrap();
+        let swap_src = src.clone();
+        let swap_target = outside.join("secret.txt");
+        let (_lock, _clear) = install_seam(move |rel| {
+            if rel == Path::new("copy-seam.txt") {
+                let _ = fs::remove_file(swap_src.join("copy-seam.txt"));
+                let _ = std::os::unix::fs::symlink(&swap_target, swap_src.join("copy-seam.txt"));
+            }
+        });
+        let err = copy_tree_manifest(&src, &dst, MAX_TREE_MANIFEST_ENTRIES, 1024 * 1024, &[])
+            .unwrap_err();
+        assert!(
+            matches!(err, TreeManifestError::Malformed(_)),
+            "expected a loud containment refusal, got {err:?}"
+        );
+        assert!(!dst.join("copy-seam.txt").exists());
+        for entry in fs::read_dir(&dst).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(!name.contains("kp-tmp-"), "temp leaked: {name}");
+        }
+        assert_eq!(
+            fs::read(outside.join("secret.txt")).unwrap(),
+            b"outside-copy-secret"
+        );
+    }
+
+    /// VCS bookkeeping and internal atomic-temp directories are invisible to
+    /// BOTH the manifest and the copy (old `copy_tree_skip` parity): they are
+    /// charged to the walk budget but never visited, descended or
+    /// materialized.
+    #[test]
+    fn skipped_and_temp_dirs_are_never_walked_or_materialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        write(&src, "keep.txt", b"keep");
+        write(&src, ".git/objects/blob", b"plumbing");
+        write(&src, "x.kp-tmp-crash/sub/file.txt", b"residue");
+        fs::create_dir_all(&dst).unwrap();
+        let manifest = copy_tree_manifest(
+            &src,
+            &dst,
+            MAX_TREE_MANIFEST_ENTRIES,
+            1024 * 1024,
+            TREE_MANIFEST_SKIP_DIRS,
+        )
+        .unwrap();
+        let paths: Vec<&str> = manifest
+            .entries()
+            .iter()
+            .map(|e| e.normalized_path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["keep.txt"]);
+        assert!(
+            !dst.join(".git").exists(),
+            "a skipped VCS dir must not be materialized"
+        );
+        assert!(
+            !dst.join("x.kp-tmp-crash").exists(),
+            "a temp-named dir must not be materialized"
+        );
+        assert_eq!(fs::read(dst.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    /// Budget exhaustion through the explicit whole-operation budgets is a
+    /// typed Oversized refusal for both the manifest walk and the copy.
+    #[test]
+    fn budget_exhaustion_is_typed_oversized() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        write(&src, "a.txt", b"a");
+        write(&src, "b.txt", b"bb");
+        write(&src, "sub/c.txt", b"ccc");
+        fs::create_dir_all(&dst).unwrap();
+
+        let mut budget = WalkBudget::new(1, 100, 64, u64::MAX, u64::MAX);
+        assert!(matches!(
+            tree_manifest_budgeted(&src, &mut budget),
+            Err(TreeManifestError::Oversized(_))
+        ));
+
+        let mut budget = WalkBudget::new(100, 100, 64, 1, 1);
+        assert!(matches!(
+            copy_tree_manifest_budgeted(&src, &dst, &[], &mut budget),
+            Err(TreeManifestError::Oversized(_))
+        ));
+
+        let mut budget = WalkBudget::new(100, 100, 0, u64::MAX, u64::MAX);
+        assert!(matches!(
+            tree_manifest_budgeted(&src, &mut budget),
+            Err(TreeManifestError::Oversized(_))
+        ));
     }
 
     fn write(root: &Path, rel: &str, bytes: &[u8]) -> PathBuf {

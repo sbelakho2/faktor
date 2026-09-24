@@ -5114,13 +5114,23 @@ impl Store {
 
     // ---------------------------------------------------------------- permissions
 
+    /// The durable window (ms) one permission request stays resolvable. It is
+    /// written once at insert and NEVER refreshed: the live requester computes
+    /// its remaining wait from this durable deadline, so a daemon restart
+    /// cannot grant a fresh full window.
+    pub const PERMISSION_WINDOW_MS: i64 = 60_000;
+
+    /// Insert a pending permission and return `(id, expires_ms)`. The caller
+    /// (the live requester) derives its timeout from the returned durable
+    /// deadline.
     pub fn insert_permission(
         &self,
         session_id: SessionId,
         op_id: OpId,
         capability: &str,
-    ) -> StoreResult<i64> {
+    ) -> StoreResult<(i64, i64)> {
         let conn = self.write();
+        let expires_ms = now_ms() + Self::PERMISSION_WINDOW_MS;
         conn.execute(
             "INSERT INTO permission(session_id, op_id, capability, decision, expires_ms)
              VALUES (?1, ?2, ?3, 'pending', ?4)",
@@ -5128,27 +5138,62 @@ impl Store {
                 session_id.raw() as i64,
                 op_id.raw() as i64,
                 capability,
-                now_ms() + 60_000
+                expires_ms
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        Ok((conn.last_insert_rowid(), expires_ms))
     }
 
-    pub fn resolve_permission(&self, id: i64, decision: &str) -> StoreResult<()> {
+    /// Resolve a pending, UNEXPIRED permission owned by `session_id`.
+    ///
+    /// Expiry is durable state, not a filter only some readers remember: an
+    /// id whose `expires_ms` passed while still `pending` is atomically
+    /// transitioned to the terminal `expired` decision (never left pending),
+    /// and the resolution refuses. The update requires the session to own the
+    /// row and exactly one row to change; zero rows (unknown, already
+    /// terminal, wrong session, expired) is the typed
+    /// `Conflict("permission {id} is not pending")`, so a losing double
+    /// resolve can never journal.
+    pub fn resolve_permission(
+        &self,
+        id: i64,
+        session_id: SessionId,
+        decision: &str,
+    ) -> StoreResult<()> {
         let conn = self.write();
-        conn.execute(
-            "UPDATE permission SET decision = ?2, resolved_ms = ?3 WHERE id = ?1 AND decision = 'pending'",
-            params![id, decision, now_ms()],
+        let tx = conn.unchecked_transaction()?;
+        let now = now_ms();
+        tx.execute(
+            "UPDATE permission SET decision = 'expired', resolved_ms = ?2
+             WHERE id = ?1 AND decision = 'pending' AND expires_ms <= ?2",
+            params![id, now],
         )?;
+        let changed = tx.execute(
+            "UPDATE permission SET decision = ?2, resolved_ms = ?3
+             WHERE id = ?1 AND session_id = ?4 AND decision = 'pending' AND expires_ms > ?3",
+            params![id, decision, now, session_id.raw() as i64],
+        )?;
+        // Commit BEFORE refusing: an expired row's terminalization must
+        // survive even though the resolution itself is refused.
+        tx.commit()?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "permission {id} is not pending"
+            )));
+        }
         Ok(())
     }
 
+    /// A still-resolvable pending permission: `None` for unknown, already
+    /// terminal, or EXPIRED rows (the durable deadline is the filter; an
+    /// expired row is terminalized by [`Self::resolve_permission`]).
     pub fn pending_permission(&self, id: i64) -> StoreResult<Option<(SessionId, OpId, String)>> {
         let conn = self.read()?;
         let raw: Option<(i64, i64, String)> = conn
             .query_row(
-                "SELECT session_id, op_id, capability FROM permission WHERE id = ?1 AND decision = 'pending'",
-                params![id],
+                "SELECT session_id, op_id, capability FROM permission
+                 WHERE id = ?1 AND decision = 'pending' AND expires_ms > ?2",
+                params![id, now_ms()],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
@@ -5160,6 +5205,19 @@ impl Store {
             ))),
             None => Ok(None),
         }
+    }
+
+    /// The durable `decision` of a permission row in ANY state (`pending`,
+    /// `allow`, `deny`, `expired`), for audit and tests. `None` = unknown id.
+    pub fn permission_decision(&self, id: i64) -> StoreResult<Option<String>> {
+        let conn = self.read()?;
+        Ok(conn
+            .query_row(
+                "SELECT decision FROM permission WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     // ---------------------------------------------------------------- prompt queue
@@ -10598,7 +10656,6 @@ fn validate_prefix_segments_json(json: &str) -> StoreResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faktor_core::capability::PermissionDecision;
     use faktor_core::state::TaskState;
 
     fn tmp_store() -> (tempfile::TempDir, Store) {
@@ -11533,20 +11590,136 @@ mod tests {
         let ws = store.create_workspace("/w").unwrap();
         let s = store.create_session(ws, "t", "p", "m").unwrap();
         let op = OpId::new(5);
-        let pid = store.insert_permission(s.id, op, "execute_shell").unwrap();
+        let (pid, expires_ms) = store.insert_permission(s.id, op, "execute_shell").unwrap();
+        assert!(
+            expires_ms > now_ms(),
+            "the durable deadline must be in the future"
+        );
         let pending = store.pending_permission(pid).unwrap().unwrap();
         assert_eq!(pending.0, s.id);
         assert_eq!(pending.1, op);
         assert_eq!(pending.2, "execute_shell");
-        store.resolve_permission(pid, "allow").unwrap();
+        store.resolve_permission(pid, s.id, "allow").unwrap();
         assert!(store.pending_permission(pid).unwrap().is_none());
-        // Resolving again must not change anything (first decision wins).
-        store.resolve_permission(pid, "deny").unwrap();
+        // The PERSISTED decision is the real assertion (never comparing a
+        // literal to itself): read the row back.
         assert_eq!(
-            PermissionDecision::Allow,
-            PermissionDecision::Allow,
-            "first decision wins"
+            store.permission_decision(pid).unwrap().as_deref(),
+            Some("allow")
         );
+        // A second resolve changes exactly zero rows: typed Conflict, and
+        // the first persisted decision wins.
+        let err = store
+            .resolve_permission(pid, s.id, "deny")
+            .expect_err("second resolve must conflict");
+        assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+        assert_eq!(
+            store.permission_decision(pid).unwrap().as_deref(),
+            Some("allow"),
+            "first decision wins durably"
+        );
+    }
+
+    #[test]
+    fn expired_permission_is_terminal_and_refuses_resolution() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let (pid, _) = store
+            .insert_permission(s.id, OpId::new(6), "execute_shell")
+            .unwrap();
+        // Force the durable deadline into the past (no sleeping in tests).
+        store
+            .write()
+            .execute(
+                "UPDATE permission SET expires_ms = ?2 WHERE id = ?1",
+                params![pid, now_ms() - 1],
+            )
+            .unwrap();
+        assert!(
+            store.pending_permission(pid).unwrap().is_none(),
+            "an expired permission is not pending"
+        );
+        let err = store
+            .resolve_permission(pid, s.id, "allow")
+            .expect_err("an expired permission cannot be resolved");
+        assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+        assert_eq!(
+            store.permission_decision(pid).unwrap().as_deref(),
+            Some("expired"),
+            "expiry is an explicit terminal state, never pending"
+        );
+        // Terminal stays terminal: another attempt changes nothing.
+        let err = store
+            .resolve_permission(pid, s.id, "deny")
+            .expect_err("terminal expired stays terminal");
+        assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+        assert_eq!(
+            store.permission_decision(pid).unwrap().as_deref(),
+            Some("expired")
+        );
+    }
+
+    #[test]
+    fn wrong_session_resolution_is_refused_and_leaves_the_row_pending() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let other = store.create_session(ws, "t2", "p", "m").unwrap();
+        let (pid, _) = store
+            .insert_permission(s.id, OpId::new(7), "fs.write")
+            .unwrap();
+        let err = store
+            .resolve_permission(pid, other.id, "allow")
+            .expect_err("a foreign session cannot resolve the permission");
+        assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+        assert!(
+            store.pending_permission(pid).unwrap().is_some(),
+            "the wrong-session attempt must not consume the row"
+        );
+        assert_eq!(
+            store.permission_decision(pid).unwrap().as_deref(),
+            Some("pending")
+        );
+        // The owning session still resolves it.
+        store.resolve_permission(pid, s.id, "allow").unwrap();
+        assert_eq!(
+            store.permission_decision(pid).unwrap().as_deref(),
+            Some("allow")
+        );
+    }
+
+    #[test]
+    fn permission_deadline_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pid, expires_ms, s_id) = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            let (pid, expires) = store
+                .insert_permission(s.id, OpId::new(8), "fs.write")
+                .unwrap();
+            (pid, expires, s.id)
+        };
+        // "Restart": reopen the same data root. The durable deadline is the
+        // SAME value — a restart can never extend the window.
+        let store = Store::open(dir.path(), true).unwrap();
+        let persisted: i64 = store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT expires_ms FROM permission WHERE id = ?1",
+                params![pid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, expires_ms, "the deadline is durable");
+        if expires_ms > now_ms() {
+            assert!(store.pending_permission(pid).unwrap().is_some());
+            store.resolve_permission(pid, s_id, "deny").unwrap();
+        } else {
+            assert!(store.pending_permission(pid).unwrap().is_none());
+        }
     }
 
     #[test]
@@ -16817,7 +16990,8 @@ mod typed_ledger_tests {
         let s = store.create_session(ws, "t", "p", "m").unwrap();
         let pid = store
             .insert_permission(s.id, OpId::new(3), "fs.write")
-            .unwrap();
+            .unwrap()
+            .0;
         assert_eq!(
             store.pending_permission(pid).unwrap().unwrap().1,
             OpId::new(3)

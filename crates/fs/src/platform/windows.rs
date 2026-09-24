@@ -101,6 +101,15 @@ const MAX_COMPONENTS: usize = 4096;
 /// Bound on a reparse target extracted from `FSCTL_GET_REPARSE_POINT`.
 const MAX_REPARSE_TARGET_UNITS: usize = 32 * 1024;
 
+/// `FILE_ATTRIBUTE_DIRECTORY` (`winnt.h`): re-exported so the rooted walker
+/// classifies enumerated children without reaching into windows-sys itself.
+#[cfg(windows)]
+pub(crate) const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+/// `FILE_ATTRIBUTE_REPARSE_POINT` (`winnt.h`): a child carrying it is
+/// inspected through the handle, never followed silently.
+#[cfg(windows)]
+pub(crate) const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
 const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 const SYMLINK_FLAG_RELATIVE: u32 = 1;
@@ -600,7 +609,7 @@ pub(crate) fn parse_reparse_data(data: &[u8]) -> Result<ParsedReparse, ReparseEr
 #[cfg(windows)]
 mod nt {
     use std::collections::VecDeque;
-    use std::ffi::{c_void, OsString};
+    use std::ffi::{c_void, OsStr, OsString};
     use std::fs::File;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -615,17 +624,18 @@ mod nt {
     };
     use windows_sys::Win32::Foundation::{
         GetLastError, RtlNtStatusToDosError, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
-        ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, HANDLE,
-        INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE, STATUS_ACCESS_DENIED,
+        ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND,
+        HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE, STATUS_ACCESS_DENIED,
         STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
         UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FileAttributeTagInfo, FileIdInfo, GetFileInformationByHandleEx,
-        GetFinalPathNameByHandleW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
-        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_READ_EA, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, SYNCHRONIZE, VOLUME_NAME_DOS,
+        CreateFileW, FileAttributeTagInfo, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
+        FileIdInfo, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY,
+        FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING, SYNCHRONIZE, VOLUME_NAME_DOS,
     };
     use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
     use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
@@ -639,6 +649,28 @@ mod nt {
 
     const INITIAL_REPARSE_BUF: usize = 16 * 1024;
     const MAX_REPARSE_BUF: usize = 128 * 1024;
+    const INITIAL_DIR_BUF: usize = 64 * 1024;
+    const MAX_DIR_BUF: usize = 1024 * 1024;
+
+    /// One raw child record from a handle-relative directory enumeration.
+    pub(crate) struct RawDirEntry {
+        pub(crate) name: Vec<u16>,
+        pub(crate) attributes: u32,
+        pub(crate) size: u64,
+        pub(crate) modified: i64,
+    }
+
+    /// How a reparse point is classified by the containment policy.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ReparseClass {
+        /// `IO_REPARSE_TAG_SYMLINK`: hashed literally by the manifest, never
+        /// followed.
+        Symlink,
+        /// `IO_REPARSE_TAG_MOUNT_POINT` (junction): reported as a directory;
+        /// descent is refused by the strict no-follow child open (the rooted
+        /// authority never traverses a link).
+        MountPoint,
+    }
 
     /// Volume serial + 128-bit file id: the Windows identity pair.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -981,6 +1013,172 @@ mod nt {
         }
     }
 
+    /// Enumerate up to `max` child records of an open directory handle
+    /// (`GetFileInformationByHandleEx(FileIdBothDirectory*)`, handle-relative:
+    /// no path string exists at this layer). `.`/`..` are skipped; a
+    /// directory holding more than `max` entries returns `truncated = true`
+    /// and is never enumerated further (bounded memory).
+    pub(crate) fn windows_list_dir_raw(
+        handle: &OwnedHandle,
+        max: usize,
+    ) -> Result<(Vec<RawDirEntry>, bool), Error> {
+        let mut buf = vec![0u8; INITIAL_DIR_BUF];
+        let mut entries: Vec<RawDirEntry> = Vec::new();
+        let mut first = true;
+        let mut truncated = false;
+        'outer: loop {
+            let class = if first {
+                FileIdBothDirectoryRestartInfo
+            } else {
+                FileIdBothDirectoryInfo
+            };
+            // SAFETY: `buf` is a writable output buffer of `buf.len()` bytes
+            // and `handle` is a live directory handle opened with
+            // FILE_LIST_DIRECTORY; the kernel writes at most `buf.len()`
+            // bytes.
+            let ok = unsafe {
+                GetFileInformationByHandleEx(
+                    raw(handle),
+                    class,
+                    buf.as_mut_ptr().cast::<c_void>(),
+                    buf.len() as u32,
+                )
+            };
+            if ok == 0 {
+                // SAFETY: GetLastError reads the calling thread's last-error
+                // slot after the failed call above.
+                let code = unsafe { GetLastError() };
+                if code == ERROR_NO_MORE_FILES {
+                    break;
+                }
+                if code == ERROR_MORE_DATA || code == ERROR_INSUFFICIENT_BUFFER {
+                    if buf.len() >= MAX_DIR_BUF {
+                        return Err(Error::oversized(format!(
+                            "directory enumeration exceeds the {MAX_DIR_BUF}-byte record bound"
+                        )));
+                    }
+                    buf.resize(buf.len() * 2, 0);
+                    continue;
+                }
+                return Err(Error::internal(format!(
+                    "directory enumeration failed: win32 error {code}"
+                )));
+            }
+            first = false;
+            let mut offset = 0usize;
+            loop {
+                let header = std::mem::size_of::<FILE_ID_BOTH_DIR_INFO>();
+                if offset + header > buf.len() {
+                    break 'outer;
+                }
+                // SAFETY: the kernel wrote a full record starting at
+                // `offset` (bounds checked above) inside our live buffer.
+                let info = unsafe { &*(buf.as_ptr().add(offset) as *const FILE_ID_BOTH_DIR_INFO) };
+                let name_units = (info.FileNameLength as usize) / 2;
+                if name_units == 0 || offset + header + name_units * 2 > buf.len() {
+                    return Err(Error::internal(
+                        "directory enumeration returned a malformed record",
+                    ));
+                }
+                // SAFETY: `FileName` is the first unit of the record's name
+                // field and the name bytes were bounds-checked above; the
+                // slice borrows the live buffer for this iteration.
+                let name =
+                    unsafe { std::slice::from_raw_parts(info.FileName.as_ptr(), name_units) };
+                if name != [b'.' as u16] && name != [b'.' as u16, b'.' as u16] {
+                    if entries.len() >= max {
+                        truncated = true;
+                        break 'outer;
+                    }
+                    entries.push(RawDirEntry {
+                        name: name.to_vec(),
+                        attributes: info.FileAttributes,
+                        size: if info.EndOfFile > 0 {
+                            info.EndOfFile as u64
+                        } else {
+                            0
+                        },
+                        modified: info.LastWriteTime,
+                    });
+                }
+                let next = info.NextEntryOffset as usize;
+                if next == 0 {
+                    break;
+                }
+                offset += next;
+            }
+        }
+        Ok((entries, truncated))
+    }
+
+    /// Open a child directory RELATIVE to an already-open parent handle with
+    /// strict no-follow semantics (`NtCreateFile` with
+    /// `FILE_OPEN_REPARSE_POINT`): a child that is a reparse point is
+    /// refused, so the rooted walk never descends a link.
+    pub(crate) fn windows_open_child_dir(
+        parent: &OwnedHandle,
+        name: &OsStr,
+    ) -> Result<OwnedHandle, Error> {
+        let units: Vec<u16> = name.encode_wide().collect();
+        let display = OsString::from_wide(&units);
+        let handle = nt_open_relative(raw(parent), &units, true)
+            .map_err(|e| map_nt_error(Path::new("<child>"), 0, &units, &[], true, e))?;
+        let info = attribute_tag(raw(&handle)).ok_or_else(|| {
+            Error::internal(format!(
+                "directory child {display:?}: attribute query failed"
+            ))
+        })?;
+        if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(Error::permission(format!(
+                "directory child {display:?} is a reparse point; the rooted walk never descends a link"
+            )));
+        }
+        Ok(handle)
+    }
+
+    /// Classify `rel` as a reparse point (symlink vs junction) or `None` when
+    /// it is not reparse-tagged at all. The entry is opened handle-relative
+    /// with `FILE_OPEN_REPARSE_POINT` and the tag read from the handle; a
+    /// non-permitted tag is a typed refusal.
+    pub(crate) fn windows_reparse_class(
+        root: &Path,
+        rel: &Path,
+    ) -> Result<Option<ReparseClass>, Error> {
+        let outcome = walk(root, rel, OpenKind::ReparsePoint, false, false)?;
+        let info = attribute_tag(raw(&outcome.handle))
+            .ok_or_else(|| Error::internal(format!("{}: attribute query failed", rel.display())))?;
+        if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+            return Ok(None);
+        }
+        let parsed = read_reparse(raw(&outcome.handle))?;
+        Ok(Some(match parsed.tag {
+            IO_REPARSE_TAG_SYMLINK => ReparseClass::Symlink,
+            IO_REPARSE_TAG_MOUNT_POINT => ReparseClass::MountPoint,
+            other => {
+                return Err(Error::permission(format!(
+                    "{rel:?}: reparse tag {other:#010X} is not permitted in a workspace path"
+                )))
+            }
+        }))
+    }
+
+    /// Read the LITERAL substitute name of a symlink reparse point (never
+    /// followed, never resolved). A junction has no literal symlink target
+    /// and is refused.
+    pub(crate) fn read_reparse_link(root: &Path, rel: &Path) -> Result<PathBuf, Error> {
+        let outcome = walk(root, rel, OpenKind::ReparsePoint, false, false)?;
+        let parsed = read_reparse(raw(&outcome.handle))?;
+        match parsed.tag {
+            IO_REPARSE_TAG_SYMLINK => Ok(PathBuf::from(OsString::from_wide(&parsed.substitute))),
+            IO_REPARSE_TAG_MOUNT_POINT => Err(Error::permission(format!(
+                "{rel:?}: a junction has no literal symlink target"
+            ))),
+            other => Err(Error::permission(format!(
+                "{rel:?}: reparse tag {other:#010X} is not permitted in a workspace path"
+            ))),
+        }
+    }
+
     /// One walk over `rel` under the canonical directory `root`.
     ///
     /// `seam` fires the deterministic test hook before each component open;
@@ -1029,7 +1227,8 @@ mod nt {
                 walk_seam(&comp);
             }
             let last = pending.is_empty();
-            let directory = !last || matches!(kind, OpenKind::Directory);
+            let directory =
+                !last || matches!(kind, OpenKind::Directory | OpenKind::NoFollowDirectory);
             let handle = match nt_open_relative(raw(&dir), &comp, directory) {
                 Ok(handle) => handle,
                 Err(NtOpenError::Status(status))
@@ -1056,6 +1255,26 @@ mod nt {
                 ))
             })?;
             if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                if matches!(kind, OpenKind::NoFollow | OpenKind::NoFollowDirectory) {
+                    return Err(Error::permission(format!(
+                        "{rel:?}: final entry is a reparse point and the walk requires \
+                         no-follow semantics {}",
+                        walk_diag(comp_index, &comp, &pos),
+                    )));
+                }
+                if matches!(kind, OpenKind::ReparsePoint) && last {
+                    let id = require_identity(raw(&handle), rel)?;
+                    if id.volume_serial != root_id.volume_serial {
+                        return Err(Error::permission(format!(
+                            "{rel:?}: resolved entry is on volume {:#x}, not the workspace volume {:#x}",
+                            id.volume_serial, root_id.volume_serial
+                        )));
+                    }
+                    return Ok(WalkOutcome {
+                        handle,
+                        missing: VecDeque::new(),
+                    });
+                }
                 hops += 1;
                 if hops > MAX_SYMLINK_HOPS {
                     return Err(Error::permission(format!(
@@ -1317,7 +1536,10 @@ mod nt {
 }
 
 #[cfg(windows)]
-pub(crate) use nt::{canonicalize_within, lexical_check, open_no_follow_walk, opened_is_path};
+pub(crate) use nt::{
+    canonicalize_within, lexical_check, open_no_follow_walk, opened_is_path, read_reparse_link,
+    windows_list_dir_raw, windows_open_child_dir, windows_reparse_class, RawDirEntry, ReparseClass,
+};
 
 #[cfg(test)]
 mod tests {
@@ -1520,6 +1742,50 @@ mod tests {
             PathHazard::TooManyComponents.into_error(p).kind,
             ErrorKind::Oversized
         );
+    }
+
+    /// P0-52 (Windows, statically/behaviorally reviewed on a Windows
+    /// runner; not compilable on the unix host): a junction planted where
+    /// the rooted walker expects a real directory is REPORTED as a directory
+    /// entry (reparse tag inspected through the handle) but the descent
+    /// REFUSES it — the strict no-follow child open never follows a
+    /// reparse point — and the junction target is never entered.
+    #[cfg(windows)]
+    #[test]
+    fn rooted_walk_refuses_a_junction_before_descent() {
+        use crate::rooted::{RootedDir, RootedEntryKind, WalkBudget, WalkStep};
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("marker.txt"), b"outside").unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        make_junction(&root.join("j"), &outside);
+
+        let rooted = RootedDir::open(&root).unwrap();
+        let listing = rooted.list_entries(std::path::Path::new(""), 64).unwrap();
+        let entry = listing
+            .entries
+            .iter()
+            .find(|e| e.name == "j")
+            .expect("the junction is listed");
+        // The reparse-aware classification reports it as a directory entry
+        // (mount-point tag), never as a followed directory.
+        assert_eq!(entry.kind, RootedEntryKind::Directory);
+
+        let mut budget = WalkBudget::new(100, 100, 8, 1 << 20, 1 << 20);
+        let err = rooted
+            .walk_bounded(
+                std::path::Path::new(""),
+                &mut budget,
+                &[],
+                &mut |_, _, _| Ok(WalkStep::Continue),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err}");
+        // The junction target was never entered.
+        assert!(outside.join("marker.txt").exists());
+        assert!(!outside.join("marker.txt").is_dir());
     }
 
     // ------------------------------------------------- reparse parser

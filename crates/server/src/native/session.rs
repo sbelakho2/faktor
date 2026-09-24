@@ -859,16 +859,23 @@ pub(crate) async fn native_permissions(
 }
 
 /// Strict native permission-reply DTO (`POST /native/permission/reply`).
+/// Resolution is CONTEXTUAL: the reply must name the session that owns the
+/// permission, never only the id.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativePermissionReplyRequest {
+    pub session_id: String,
     pub permission_id: String,
     pub decision: String,
 }
 
-/// `POST /native/permission/reply` — resolve ONE pending permission
-/// request with `allow`/`deny`. Unknown/already-resolved ids are a typed
-/// 409 (never a double-resolve), malformed bodies a 400.
+/// `POST /native/permission/reply` — resolve ONE LIVE pending permission
+/// request with `allow`/`deny`. `200 {ok:true}` means a live waiter owned by
+/// the named session actually received the decision; an unknown/already
+/// resolved/timed-out/expired id is a typed 409 (never a pre-authorized
+/// decision planted for a later request), a live waiter owned by a DIFFERENT
+/// session a typed 409 `permission_session_mismatch`, malformed bodies a
+/// 400.
 pub(crate) async fn native_permission_reply(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -880,6 +887,10 @@ pub(crate) async fn native_permission_reply(
     let Json(req) = match body {
         Ok(b) => b,
         Err(_) => return wire_status(malformed_body("invalid native permission reply body")),
+    };
+    let session_id = match parse_session_id(&req.session_id) {
+        Ok(id) => id,
+        Err(e) => return wire_status(e),
     };
     let pid: i64 = match req.permission_id.parse() {
         Ok(p) if p > 0 => p,
@@ -895,7 +906,7 @@ pub(crate) async fn native_permission_reply(
         "deny" => faktor_core::capability::PermissionDecision::Deny,
         other => return wire_status(malformed_body(&format!("invalid decision {other:?}"))),
     };
-    match state.deps.permissions.resolve(pid, decision) {
+    match state.deps.permissions.resolve(session_id, pid, decision) {
         Ok(true) => {}
         Ok(false) => {
             return wire_status(ApiError {
@@ -905,12 +916,12 @@ pub(crate) async fn native_permission_reply(
                 retryable: false,
             })
         }
-        Err(poisoned) => {
+        Err(mismatch) => {
             return wire_status(ApiError {
-                code: "authority_poisoned",
-                message: poisoned.to_string(),
-                http_status: 503,
-                retryable: true,
+                code: "permission_session_mismatch",
+                message: mismatch.to_string(),
+                http_status: 409,
+                retryable: false,
             })
         }
     }

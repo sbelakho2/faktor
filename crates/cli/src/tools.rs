@@ -10,8 +10,7 @@
 //! ring-buffer output, CAS spill). A ctx missing any of these components
 //! errors honestly — no tool silently falls back to raw std::fs.
 
-use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use faktor_agent::{
@@ -24,6 +23,7 @@ use faktor_core::id::SessionId;
 use faktor_core::op::EffectStatus;
 use faktor_core::resource::ResourceClass;
 use faktor_edit::{EditOp, EditRequest, RepairMode};
+use faktor_fs::rooted::WalkBudget;
 use faktor_fs::WorkspaceHandle;
 use faktor_sandbox::PermissionEngine;
 use faktor_terminal::{EnvSpec, ProcessOwner, SpawnConfig};
@@ -32,8 +32,18 @@ const READ_DEFAULT_MAX: usize = 64 * 1024;
 const READ_HARD_MAX: usize = 4 * 1024 * 1024;
 const WRITE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const SEARCH_PER_FILE: usize = 2 * 1024 * 1024;
-const SEARCH_MAX_HITS: usize = 64;
+/// Maximum MATCH lines one search returns. One line is reserved for the
+/// explicit completeness footer, so a capped search still fits the
+/// historical 64-line output bound while saying it is partial.
+const SEARCH_MAX_HITS: usize = 63;
 const SEARCH_MAX_DEPTH: usize = 16;
+/// Whole-operation search budget: entries inspected, directories opened and
+/// bytes accounted/read. Exhaustion is never silent — the search returns a
+/// partial result with `complete: false` and the budget's truncation reason.
+const SEARCH_MAX_ENTRIES: usize = 100_000;
+const SEARCH_MAX_DIRS: usize = 20_000;
+const SEARCH_MAX_TOTAL_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+const SEARCH_MAX_TOTAL_READ_BYTES: u64 = 256 * 1024 * 1024;
 const COMMAND_MAX_LEN: usize = 4096;
 const COMMAND_DEFAULT_DEADLINE_MS: u64 = 30_000;
 const COMMAND_ARTIFACT_MAX: usize = 1024 * 1024;
@@ -56,6 +66,21 @@ fn require_workspace(
         Error::permission("tool requires the permission engine (no sandbox wired)")
     })?;
     Ok((ws, sandbox))
+}
+
+/// Lexically map a caller-supplied path to workspace-relative form (an
+/// absolute path must already name a location under the workspace root).
+/// The result is only an input to the handle-relative authority; it is never
+/// reopened by pathname.
+fn workspace_rel(ws: &WorkspaceHandle, raw: &str) -> Result<PathBuf, Error> {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        path.strip_prefix(ws.root())
+            .map(|p| p.to_path_buf())
+            .map_err(|_| Error::permission(format!("path escapes workspace: {raw:?}")))
+    } else {
+        Ok(path.to_path_buf())
+    }
 }
 
 /// Evaluate one capability. Hard DENY always refuses (workspace
@@ -81,31 +106,6 @@ fn sandbox_gate(
                 Err(Error::permission(format!("permission required: {what}")))
             }
         }
-    }
-}
-
-/// Bounded read: metadata FIRST, then at most `max + 1` bytes. A 30GB file
-/// never enters RAM — the size check happens before any byte is read.
-fn bounded_read(path: &Path, max: usize) -> Result<Vec<u8>, Error> {
-    let meta = std::fs::metadata(path).map_err(|e| err_not_found(path, e))?;
-    let mut f = std::fs::File::open(path).map_err(|e| err_not_found(path, e))?;
-    let mut bytes = Vec::new();
-    if meta.len() > max as u64 {
-        bytes.resize(max + 1, 0);
-        f.read_exact(&mut bytes)
-            .map_err(|e| Error::internal(format!("read {}: {e}", path.display())))?;
-    } else {
-        f.read_to_end(&mut bytes)
-            .map_err(|e| Error::internal(format!("read {}: {e}", path.display())))?;
-    }
-    Ok(bytes)
-}
-
-fn err_not_found(path: &Path, e: std::io::Error) -> Error {
-    if e.kind() == std::io::ErrorKind::NotFound {
-        Error::not_found(format!("{}", path.display()))
-    } else {
-        Error::new(ErrorKind::Internal, format!("{}: {e}", path.display()))
     }
 }
 
@@ -138,20 +138,23 @@ pub fn read_file_tool() -> Tool {
                     .unwrap_or(READ_DEFAULT_MAX as u64) as usize;
                 let max = max.clamp(1, READ_HARD_MAX);
                 let rel = Path::new(path);
-                // Canonical/symlink-safe resolution against the workspace
-                // root; the capability is derived from the RESOLVED path.
-                let resolved = ws.resolve(rel)?;
+                // Capability derived from the workspace-relative path; the
+                // read itself is handle-relative (`ws.read`): the path is
+                // never resolved and reopened as an absolute pathname.
+                let capability_path = ws.root().join(rel);
                 sandbox_gate(
                     &ctx,
                     &sandbox,
                     &Capability::ReadWorkspace {
-                        path: resolved.clone(),
+                        path: capability_path,
                     },
                     "read_file",
                 )?;
-                let data = bounded_read(&resolved, max)?;
-                let truncated = data.len() > max;
-                let bytes = if truncated { &data[..max] } else { &data[..] };
+                let data = ws.read(rel, max)?;
+                // The digest says whether the returned bytes cover the whole
+                // file: a `Slice` digest IS the truncation marker.
+                let truncated = !data.digest.is_full();
+                let bytes = &data.bytes;
                 let text = String::from_utf8_lossy(bytes).to_string();
                 Ok(ToolOutcome {
                     text: if truncated {
@@ -882,31 +885,48 @@ pub fn search_tool() -> Tool {
                 if pattern.len() > 1024 {
                     return Err(Error::oversized("pattern too long"));
                 }
-                let root_rel = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-                let root = ws.resolve(Path::new(root_rel))?;
+                let root_rel = workspace_rel(
+                    &ws,
+                    args.get("path").and_then(|p| p.as_str()).unwrap_or("."),
+                )?;
                 sandbox_gate(
                     &ctx,
                     &sandbox,
-                    &Capability::ReadWorkspace { path: root.clone() },
+                    &Capability::ReadWorkspace {
+                        path: ws.root().join(&root_rel),
+                    },
                     "search",
                 )?;
-                // Traversal can be large: bounded on a blocking thread.
+                // Traversal can be large: bounded on a blocking thread. The
+                // walker is handle-relative (`ws.list_entries`/`ws.read`) —
+                // no absolute pathname is enumerated or reopened.
                 let pattern = pattern.to_string();
-                let hits = tokio::task::spawn_blocking(move || {
-                    walk_search(&root, &pattern, &sandbox, 0, SEARCH_MAX_HITS)
+                let search_ws = ws.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let mut budget = WalkBudget::new(
+                        SEARCH_MAX_ENTRIES,
+                        SEARCH_MAX_DIRS,
+                        SEARCH_MAX_DEPTH,
+                        SEARCH_MAX_TOTAL_FILE_BYTES,
+                        SEARCH_MAX_TOTAL_READ_BYTES,
+                    );
+                    walk_search(&search_ws, &root_rel, &pattern, &mut budget)
                 })
                 .await
                 .map_err(|e| Error::internal(format!("search task panicked: {e}")))?;
-                if hits.is_empty() {
-                    return Ok(ToolOutcome {
-                        text: "no matches".into(),
-                        exit_code: Some(1),
-                        ..Default::default()
-                    });
+                let mut text = if outcome.hits.is_empty() {
+                    "no matches".to_string()
+                } else {
+                    outcome.hits.join("\n")
+                };
+                if let Some(reason) = &outcome.truncation_reason {
+                    // A partial result NEVER looks complete: the refusal
+                    // names the budget/hit cap that stopped the walk.
+                    text.push_str(&format!("\ncomplete: false; truncation_reason: {reason}"));
                 }
                 Ok(ToolOutcome {
-                    text: hits.join("\n"),
-                    exit_code: Some(0),
+                    text,
+                    exit_code: Some(if outcome.hits.is_empty() { 1 } else { 0 }),
                     ..Default::default()
                 })
             })
@@ -914,52 +934,132 @@ pub fn search_tool() -> Tool {
     }
 }
 
-/// Bounded workspace walk: skips vcs/build dirs, never follows symlinks
-/// (an in-workspace link pointing outside must not leak files), checks each
-/// file's size BEFORE reading (2MiB cap), and stops at `max` hits.
+/// Outcome of one bounded search walk: the match paths plus explicit
+/// completeness. `complete: false` always carries the truncation reason.
+struct SearchWalkOutcome {
+    hits: Vec<String>,
+    truncation_reason: Option<String>,
+}
+
+/// Bounded workspace walk through the rooted handle authority: directories
+/// are enumerated with `ws.list_entries` and files read with `ws.read`, so a
+/// symlink swapped in after enumeration is refused by the handle walk (never
+/// followed out of the workspace) and no absolute pathname is reopened.
+/// VCS/build dirs are skipped, each file's size is checked BEFORE reading
+/// (2MiB cap), and the whole walk is charged to `budget`; exhaustion or the
+/// hit cap yields a partial result with an explicit truncation reason —
+/// never a shorter result that looks complete.
 fn walk_search(
-    dir: &Path,
+    ws: &WorkspaceHandle,
+    rel_dir: &Path,
     pattern: &str,
-    sandbox: &PermissionEngine,
+    budget: &mut WalkBudget,
+) -> SearchWalkOutcome {
+    let mut hits: Vec<String> = Vec::new();
+    let mut truncation_reason: Option<String> = None;
+    let _ = walk_search_dir(
+        ws,
+        rel_dir,
+        0,
+        pattern,
+        budget,
+        &mut hits,
+        &mut truncation_reason,
+    );
+    SearchWalkOutcome {
+        hits,
+        truncation_reason,
+    }
+}
+
+/// One directory frame of the search walk. Returns `false` when the walk was
+/// truncated (the reason is set) and must stop.
+#[allow(clippy::too_many_arguments)]
+fn walk_search_dir(
+    ws: &WorkspaceHandle,
+    rel_dir: &Path,
     depth: usize,
-    max: usize,
-) -> Vec<String> {
-    let mut hits = Vec::new();
-    if depth > SEARCH_MAX_DEPTH {
-        return hits;
+    pattern: &str,
+    budget: &mut WalkBudget,
+    hits: &mut Vec<String>,
+    truncation_reason: &mut Option<String>,
+) -> bool {
+    if let Err(e) = budget.charge_directory(depth) {
+        *truncation_reason = Some(e.message);
+        return false;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return hits;
+    let cap = budget.remaining_entries();
+    let listing = match ws.list_entries(rel_dir, cap) {
+        Ok(listing) => listing,
+        Err(e) => {
+            *truncation_reason = Some(e.message);
+            return false;
+        }
     };
-    for entry in entries.flatten() {
-        if hits.len() >= max {
-            return hits;
+    if listing.overflowed {
+        *truncation_reason = Some(format!(
+            "directory listing exceeded the remaining {cap}-entry walk budget"
+        ));
+        return false;
+    }
+    for entry in listing.entries {
+        if let Err(e) = budget.charge_entry(depth) {
+            *truncation_reason = Some(e.message);
+            return false;
         }
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name == ".git" || name.starts_with("target") || name == "node_modules" {
-            continue;
-        }
-        let Ok(ft) = entry.file_type() else {
-            continue;
-        };
-        if ft.is_symlink() {
-            continue;
-        }
-        if ft.is_dir() {
-            hits.extend(walk_search(&path, pattern, sandbox, depth + 1, max));
-            continue;
-        }
-        if !sandbox.is_within_workspace(&path) {
-            continue;
-        }
-        if let Ok(bytes) = bounded_read(&path, SEARCH_PER_FILE) {
-            if bytes.len() <= SEARCH_PER_FILE && String::from_utf8_lossy(&bytes).contains(pattern) {
-                hits.push(path.to_string_lossy().to_string());
+        if entry.is_dir() {
+            // VCS bookkeeping and build outputs are never content.
+            let name = entry.name.to_string_lossy();
+            if name == ".git" || name.as_ref() == "node_modules" || name.starts_with("target") {
+                continue;
             }
+            if !walk_search_dir(
+                ws,
+                &entry.rel,
+                depth + 1,
+                pattern,
+                budget,
+                hits,
+                truncation_reason,
+            ) {
+                return false;
+            }
+            continue;
+        }
+        if !entry.is_file() {
+            // Symlinks are never followed by the search walk.
+            continue;
+        }
+        if let Err(e) = budget.charge_file_bytes(entry.size) {
+            *truncation_reason = Some(e.message);
+            return false;
+        }
+        if entry.size > SEARCH_PER_FILE as u64 {
+            continue;
+        }
+        if hits.len() >= SEARCH_MAX_HITS {
+            *truncation_reason = Some(format!("hit cap of {SEARCH_MAX_HITS} matches reached"));
+            return false;
+        }
+        // Handle-relative bounded read: a file swapped for an escaping link
+        // after enumeration is refused, a grown file yields a Slice digest —
+        // both are skipped, never half-searched.
+        let data = match ws.read(&entry.rel, SEARCH_PER_FILE) {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+        if !data.digest.is_full() {
+            continue;
+        }
+        if let Err(e) = budget.charge_read_bytes(data.size as u64) {
+            *truncation_reason = Some(e.message);
+            return false;
+        }
+        if String::from_utf8_lossy(&data.bytes).contains(pattern) {
+            hits.push(entry.rel.to_string_lossy().into_owned());
         }
     }
-    hits
+    true
 }
 
 /// Marker appended to a run_command excerpt when the durable artifact was
@@ -2080,8 +2180,18 @@ mod tests {
         assert_eq!(out.exit_code, Some(0));
         assert!(!out.text.contains(".git"), "vcs dirs must be skipped");
         assert!(
+            out.text.contains("complete: false"),
+            "a capped search must say it is partial: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("truncation_reason:"),
+            "a capped search must name the reason: {}",
+            out.text
+        );
+        assert!(
             out.text.lines().count() <= 64,
-            "search must cap at 64 hits, got {}",
+            "search must cap at 64 output lines, got {}",
             out.text.lines().count()
         );
         // The old tool's depth cap and size cap held; a too-big file is
@@ -2093,6 +2203,140 @@ mod tests {
         assert!(
             !out.text.contains("huge.txt"),
             "oversized files are skipped"
+        );
+    }
+
+    /// The read tool is handle-relative: an in-workspace link keeps working
+    /// (parity), while a file swapped for an escaping link is refused even
+    /// when the sandbox policy allows external reads — containment is not
+    /// policy-dependent.
+    #[tokio::test]
+    async fn read_file_is_handle_relative_and_never_reads_an_outside_marker() {
+        let f = fixture(SandboxPolicy {
+            read_external: Rule::Allow,
+            ..Default::default()
+        });
+        std::fs::write(f.root.join("inside.txt"), "inside-content").unwrap();
+        // Absolute in-root link target: use the canonical root so the walk's
+        // component-wise containment check matches (macOS tempdir paths are
+        // symlinked through /private).
+        let canonical_root = f.root.canonicalize().unwrap();
+        std::os::unix::fs::symlink(canonical_root.join("inside.txt"), f.root.join("alias.txt"))
+            .unwrap();
+        let read = read_file_tool();
+        let out = (read.execute)(ctx(&f), serde_json::json!({"path": "alias.txt"}))
+            .await
+            .unwrap();
+        assert_eq!(out.text, "inside-content");
+        assert_eq!(out.exit_code, Some(0));
+
+        // A regular file read successfully, then swapped for an outside
+        // symlink: the next read is refused and the outside bytes untouched.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "outside-marker").unwrap();
+        std::fs::write(f.root.join("swap.txt"), "inside").unwrap();
+        (read.execute)(ctx(&f), serde_json::json!({"path": "swap.txt"}))
+            .await
+            .unwrap();
+        std::fs::remove_file(f.root.join("swap.txt")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), f.root.join("swap.txt"))
+            .unwrap();
+        let err = (read.execute)(ctx(&f), serde_json::json!({"path": "swap.txt"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err}");
+        assert_eq!(
+            std::fs::read(outside.path().join("secret.txt")).unwrap(),
+            b"outside-marker"
+        );
+    }
+
+    /// Search walks handle-relative: symlinked dirs/files pointing outside
+    /// are never enumerated or read, even with read_external Allow; a clean
+    /// in-workspace file is still found.
+    #[tokio::test]
+    async fn search_never_reads_an_outside_marker_even_when_read_external_allows() {
+        let f = fixture(SandboxPolicy {
+            read_external: Rule::Allow,
+            ..Default::default()
+        });
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "outside-search-needle").unwrap();
+        std::os::unix::fs::symlink(outside.path(), f.root.join("link")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), f.root.join("alias.txt"))
+            .unwrap();
+        std::fs::write(f.root.join("clean.txt"), "clean-content").unwrap();
+
+        let search = search_tool();
+        let out = (search.execute)(
+            ctx(&f),
+            serde_json::json!({"pattern": "outside-search-needle"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, Some(1));
+        assert!(
+            !out.text.contains("outside-search-needle"),
+            "outside bytes must never be searched: {}",
+            out.text
+        );
+        let out = (search.execute)(ctx(&f), serde_json::json!({"pattern": "clean-content"}))
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.text.contains("clean.txt"), "{}", out.text);
+        assert_eq!(
+            std::fs::read(outside.path().join("secret.txt")).unwrap(),
+            b"outside-search-needle"
+        );
+    }
+
+    /// A capped search never looks complete: it returns a bounded partial
+    /// result plus `complete: false` and the concrete truncation reason.
+    #[tokio::test]
+    async fn search_reports_incomplete_with_a_truncation_reason_at_the_cap() {
+        let f = fixture(SandboxPolicy::default());
+        for i in 0..80 {
+            std::fs::write(f.root.join(format!("cap{i:03}.txt")), "cap-needle-here").unwrap();
+        }
+        let search = search_tool();
+        let out = (search.execute)(ctx(&f), serde_json::json!({"pattern": "cap-needle-here"}))
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.text.contains("complete: false"), "{}", out.text);
+        assert!(out.text.contains("truncation_reason:"), "{}", out.text);
+        assert!(
+            out.text.lines().count() <= 64,
+            "bounded output: {}",
+            out.text.lines().count()
+        );
+    }
+
+    /// A search stopped by the whole-operation budget reports the typed
+    /// budget reason (never a shorter result that looks complete).
+    #[tokio::test]
+    async fn search_reports_a_budget_truncation_reason() {
+        let f = fixture(SandboxPolicy::default());
+        // A tree deeper than the search's depth budget.
+        let mut deep = f.root.clone();
+        for _ in 0..(SEARCH_MAX_DEPTH + 3) {
+            deep = deep.join("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(f.root.join("a-shallow.txt"), "budget-needle").unwrap();
+        std::fs::write(deep.join("deep.txt"), "budget-needle").unwrap();
+        let search = search_tool();
+        let out = (search.execute)(ctx(&f), serde_json::json!({"pattern": "budget-needle"}))
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0), "the shallow match is real");
+        assert!(out.text.contains("a-shallow.txt"), "{}", out.text);
+        assert!(out.text.contains("complete: false"), "{}", out.text);
+        assert!(
+            out.text.contains("depth budget"),
+            "the typed budget reason must be named: {}",
+            out.text
         );
     }
 
