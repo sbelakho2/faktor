@@ -26,7 +26,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use faktor_provider::egress::{execute_raw, EgressError, HttpTransport, RawRequest, RawResponse};
+use faktor_provider::egress::{
+    execute_raw, EgressError, HttpTransport, RawRequest, RawResponse, ResponseBudget, RouteLabel,
+    MAX_RAW_RESPONSE_BYTES,
+};
 
 use crate::billing::UsageTotals;
 use crate::entitlements::EntitlementService;
@@ -60,9 +63,16 @@ async fn execute_raw_bounded(
     transport: &dyn HttpTransport,
     request: RawRequest,
 ) -> Result<RawResponse, ControlPlaneError> {
+    // Every vendor-page read passes an explicit response budget: head/idle/
+    // total all equal the documented attempt bound, and the body is capped
+    // by the seam's materialization bound.
+    let budget = ResponseBudget::for_timeout(
+        Duration::from_millis(VENDOR_HTTP_TIMEOUT_MS),
+        MAX_RAW_RESPONSE_BYTES as u64,
+    );
     match tokio::time::timeout(
         Duration::from_millis(VENDOR_HTTP_TIMEOUT_MS),
-        execute_raw(transport, request),
+        execute_raw(transport, request, &budget),
     )
     .await
     {
@@ -311,6 +321,7 @@ impl BillingVendorAdapter {
         loop {
             let last_attempt = attempt + 1 >= self.config.max_attempts;
             let mut request = RawRequest::new("POST", url.clone())
+                .route(RouteLabel::BillingVendorReport)
                 .header("accept", "application/json")
                 .header("content-type", "application/json")
                 .header("user-agent", self.config.user_agent.clone())

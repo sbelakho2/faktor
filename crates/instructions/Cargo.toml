@@ -9,3 +9,6 @@ rust-version.workspace = true
 serde.workspace = true
 tempfile.workspace = true
 blake3.workspace = true
+
+[lints]
+workspace = true

@@ -188,7 +188,8 @@ fn cross_host_redirect_target_is_refused_by_the_destination_policy() {
 #[test]
 fn checked_transport_refuses_an_unexpected_destination() {
     let policy = DestinationPolicy::parse_lines(["https://api.mouser.com"]).expect("policy");
-    let transport = faktor_provider::egress::CheckedHttpClient::with_policy(policy);
+    let transport = faktor_provider::egress::CheckedHttpClient::try_with_policy(policy)
+        .expect("checked client builds");
     let url = reqwest::Url::parse("https://evil.example/collect").expect("url");
     let error = transport.check(&url).expect_err("unexpected destination");
     assert!(

@@ -25,7 +25,9 @@ use faktor_commerce::{SourceError, SourceId};
 use crate::browser::{BrowserFallback, FallbackObservation};
 use crate::config::ConfigError;
 use crate::context::AcquireCtx;
-use crate::http::{Header, HttpRequest, HttpResponse, HttpTransport, TransportError};
+use crate::http::{
+    Header, HttpRequest, HttpResponse, HttpTransport, ResponseBudget, TransportError,
+};
 use crate::secrets::{CredentialProvider, SecretString};
 
 /// A transport that always fails: the safest default for a context that
@@ -35,7 +37,11 @@ pub struct NoopTransport;
 
 #[async_trait]
 impl HttpTransport for NoopTransport {
-    async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse, TransportError> {
+    async fn execute(
+        &self,
+        _request: HttpRequest,
+        _budget: ResponseBudget,
+    ) -> Result<HttpResponse, TransportError> {
         Err(TransportError::EgressUnavailable)
     }
 }
@@ -201,7 +207,11 @@ impl FixtureTransport {
 
 #[async_trait]
 impl HttpTransport for FixtureTransport {
-    async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+    async fn execute(
+        &self,
+        request: HttpRequest,
+        _budget: ResponseBudget,
+    ) -> Result<HttpResponse, TransportError> {
         let mut state = self.lock();
         state.requests.push(request);
         match state.queue.pop_front() {

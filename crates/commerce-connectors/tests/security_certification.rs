@@ -394,6 +394,7 @@ impl faktor_commerce_connectors::http::HttpTransport for CurlTransport {
     async fn execute(
         &self,
         request: faktor_commerce_connectors::http::HttpRequest,
+        _budget: faktor_commerce_connectors::http::ResponseBudget,
     ) -> Result<
         faktor_commerce_connectors::http::HttpResponse,
         faktor_commerce_connectors::http::TransportError,

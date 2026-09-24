@@ -11,3 +11,6 @@ faktor-session.workspace = true
 faktor-store.workspace = true
 tokio.workspace = true
 tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -148,3 +148,12 @@ codegen-units = 4
 
 [profile.test]
 opt-level = 1
+
+# Static unsafe policy (Phase D item 22): ordinary crates deny `unsafe_code`
+# via lint configuration; the only `#[allow(unsafe_code)]` sites are the
+# narrow platform-authority modules enumerated by
+# `tests/static-authority` (pty/fs/terminal/sandbox/browser plus the
+# winjob/git/session OS-boundary seams and test-only modules), each carrying
+# a `// SAFETY:` justification for every unsafe block/function.
+[workspace.lints.rust]
+unsafe_code = "deny"

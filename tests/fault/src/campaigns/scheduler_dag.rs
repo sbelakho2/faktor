@@ -283,7 +283,20 @@ async fn run_phase(
         }
     }
 
+    // The crash-time terminal map is captured BEFORE the simulated crash of
+    // a parked phase: a real process death destroys the scheduler before any
+    // in-memory teardown runs, so the parked op is observed Running here —
+    // the RAII lease's abort-settle (which correctly marks an aborted run
+    // Cancelled) is an artifact of simulating the crash with `abort()` and
+    // must not rewrite what the crashed phase left behind. A clean phase
+    // snapshots after the executor completes.
+    let statuses: Vec<(u64, TaskStatus)>;
     if parked_op.is_some() {
+        statuses = sched
+            .statuses()
+            .into_iter()
+            .map(|(o, st)| (o.raw(), st))
+            .collect();
         // The crash: abort the executor mid-flight, drop the scheduler.
         handle.abort();
         let _ = handle.await;
@@ -301,16 +314,16 @@ async fn run_phase(
         for done in pending.drain(..) {
             journal_terminal(store, session, seed, done);
         }
+        statuses = sched
+            .statuses()
+            .into_iter()
+            .map(|(o, st)| (o.raw(), st))
+            .collect();
     }
 
     let counts = counters
         .iter()
         .map(|c| c.load(Ordering::SeqCst))
-        .collect::<Vec<_>>();
-    let statuses = sched
-        .statuses()
-        .into_iter()
-        .map(|(o, st)| (o.raw(), st))
         .collect::<Vec<_>>();
     drop(sched);
     Ok(PhaseOutcome {

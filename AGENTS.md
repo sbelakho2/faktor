@@ -53,7 +53,7 @@ before pushing:
 - `cargo check --workspace`
 - `cargo test --workspace`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo run -p faktor-cli -- doctor --data-dir /tmp/kp-ci`
+- `cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci`
 
 - Each crate's unit tests must pass before the crate is considered done.
 - Long tests are `#[ignore]`-gated and named with `[soak]`, `[perf]`,

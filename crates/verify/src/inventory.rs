@@ -666,12 +666,35 @@ pub fn discover_repo_inventory(root: &Path) -> RepoInventory {
 }
 
 /// [`discover_repo_inventory`] under explicit resource budgets (adversarial
-/// tests and callers with tighter scope). Git is attempted first; a git
-/// failure falls back to the native traversal with the typed reason, while
-/// git LIMIT hits (output cap, untracked cap, deadline) are typed
-/// non-Complete verdicts — a limit hit is never silently papered over by a
-/// fallback that would implicitly claim git-equivalence.
+/// tests and callers with tighter scope). Git is attempted first through
+/// the STANDALONE process authority ([`ProcessSupervisor::try_shared`]); a
+/// failure to initialize it, or a git failure, falls back to the native
+/// traversal with the typed reason, while git LIMIT hits (output cap,
+/// untracked cap, deadline) are typed non-Complete verdicts — a limit hit is
+/// never silently papered over by a fallback that would implicitly claim
+/// git-equivalence. Daemon graphs call
+/// [`discover_repo_inventory_with_supervisor`] instead, so the normal graph
+/// never touches a global process authority.
 pub fn discover_repo_inventory_with_budget(root: &Path, budget: &InventoryBudget) -> RepoInventory {
+    match ProcessSupervisor::try_shared() {
+        Ok(supervisor) => discover_repo_inventory_with_supervisor(root, budget, &supervisor),
+        Err(e) => discover_repo_inventory_without_git(
+            root,
+            budget,
+            format!("no standalone process authority: {e}"),
+        ),
+    }
+}
+
+/// [`discover_repo_inventory_with_budget`] over an INJECTED supervisor: the
+/// daemon graph passes its ONE `Arc<ProcessSupervisor>` here, so every
+/// inventory `git` child belongs to the daemon's bounded registry and no
+/// global fallback exists on the normal path.
+pub fn discover_repo_inventory_with_supervisor(
+    root: &Path,
+    budget: &InventoryBudget,
+    supervisor: &ProcessSupervisor,
+) -> RepoInventory {
     let wall = budget.max_wall.min(MAX_INVENTORY_WALL_CEILING);
     let deadline = Instant::now() + wall;
     if budget.max_wall.is_zero() {
@@ -685,20 +708,21 @@ pub fn discover_repo_inventory_with_budget(root: &Path, budget: &InventoryBudget
             source: InventorySource::Native,
         };
     }
-    let (mut files, mut completeness, source) = match try_git_inventory(root, budget, deadline) {
-        GitAttempt::Complete(files) => {
-            (files, InventoryCompleteness::Complete, InventorySource::Git)
-        }
-        GitAttempt::Incomplete(inventory) => return inventory,
-        GitAttempt::Fallback { reason } => {
-            let native = native_inventory(root, budget, deadline);
-            (
-                native.files,
-                native.completeness,
-                InventorySource::NativeGitFallback { reason },
-            )
-        }
-    };
+    let (mut files, mut completeness, source) =
+        match try_git_inventory(root, budget, deadline, supervisor) {
+            GitAttempt::Complete(files) => {
+                (files, InventoryCompleteness::Complete, InventorySource::Git)
+            }
+            GitAttempt::Incomplete(inventory) => return inventory,
+            GitAttempt::Fallback { reason } => {
+                let native = native_inventory(root, budget, deadline);
+                (
+                    native.files,
+                    native.completeness,
+                    InventorySource::NativeGitFallback { reason },
+                )
+            }
+        };
     if completeness.is_complete() {
         files.sort();
         files.dedup();
@@ -710,6 +734,43 @@ pub fn discover_repo_inventory_with_budget(root: &Path, budget: &InventoryBudget
         files,
         completeness,
         source,
+    }
+}
+
+/// The native-only discovery used when no process authority exists at all
+/// (standalone [`discover_repo_inventory_with_budget`] with a failed
+/// `try_shared`): the typed reason records WHY git was skipped, and the
+/// native traversal still honors every budget.
+fn discover_repo_inventory_without_git(
+    root: &Path,
+    budget: &InventoryBudget,
+    reason: String,
+) -> RepoInventory {
+    let wall = budget.max_wall.min(MAX_INVENTORY_WALL_CEILING);
+    let deadline = Instant::now() + wall;
+    if budget.max_wall.is_zero() {
+        return RepoInventory {
+            files: Vec::new(),
+            completeness: InventoryCompleteness::WallBudgetExceeded {
+                max: budget.max_wall,
+            },
+            source: InventorySource::Native,
+        };
+    }
+    let native = native_inventory(root, budget, deadline);
+    let mut files = native.files;
+    let mut completeness = native.completeness;
+    if completeness.is_complete() {
+        files.sort();
+        files.dedup();
+        if let Some(probe) = probe_manifests(root, &files, budget, deadline) {
+            completeness = probe;
+        }
+    }
+    RepoInventory {
+        files,
+        completeness,
+        source: InventorySource::NativeGitFallback { reason },
     }
 }
 
@@ -761,7 +822,13 @@ fn bounded_git_reason(text: &str) -> String {
     line.chars().take(GIT_REASON_MAX_CHARS).collect()
 }
 
-fn run_git(root: &Path, budget: &InventoryBudget, deadline: Instant, args: &[&str]) -> GitRun {
+fn run_git(
+    root: &Path,
+    budget: &InventoryBudget,
+    deadline: Instant,
+    args: &[&str],
+    supervisor: &ProcessSupervisor,
+) -> GitRun {
     let remaining = deadline.saturating_duration_since(Instant::now());
     let timeout = budget.git_timeout.min(remaining);
     if timeout.is_zero() {
@@ -779,12 +846,7 @@ fn run_git(root: &Path, budget: &InventoryBudget, deadline: Instant, args: &[&st
         artifact_max: budget.git_output_bytes.max(4096),
         network_isolation: faktor_terminal::NetworkIsolation::Inherit,
     };
-    match ProcessSupervisor::shared().run_sync(
-        cfg,
-        timeout,
-        budget.git_output_bytes,
-        GIT_STDERR_CAP,
-    ) {
+    match supervisor.run_sync(cfg, timeout, budget.git_output_bytes, GIT_STDERR_CAP) {
         Ok(out) if out.timed_out => GitRun::TimedOut { after: timeout },
         Ok(out) if out.exit_code != Some(0) => {
             let reason = bounded_git_reason(&out.stderr_head);
@@ -819,13 +881,18 @@ fn git_incomplete(completeness: InventoryCompleteness) -> GitAttempt {
     })
 }
 
-fn try_git_inventory(root: &Path, budget: &InventoryBudget, deadline: Instant) -> GitAttempt {
+fn try_git_inventory(
+    root: &Path,
+    budget: &InventoryBudget,
+    deadline: Instant,
+    supervisor: &ProcessSupervisor,
+) -> GitAttempt {
     if !root.is_dir() {
         return GitAttempt::Fallback {
             reason: "repository root is not a readable directory".to_string(),
         };
     }
-    let tracked = match run_git(root, budget, deadline, &["ls-files", "-z"]) {
+    let tracked = match run_git(root, budget, deadline, &["ls-files", "-z"], supervisor) {
         GitRun::Output(text) => parse_z(&text),
         GitRun::Capped => {
             return git_incomplete(InventoryCompleteness::OutputCapped {
@@ -850,6 +917,7 @@ fn try_git_inventory(root: &Path, budget: &InventoryBudget, deadline: Instant) -
         budget,
         deadline,
         &["ls-files", "--others", "--exclude-standard", "-z"],
+        supervisor,
     ) {
         GitRun::Output(text) => parse_z(&text),
         GitRun::Capped => {

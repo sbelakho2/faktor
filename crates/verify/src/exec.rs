@@ -246,17 +246,26 @@ pub struct AsyncCheckExecutor {
     network_requirement: faktor_terminal::NetworkIsolationRequirement,
 }
 
+/// TEST convenience only: production hosts inject their supervisor via
+/// [`AsyncCheckExecutor::from_supervisor`] (the daemon graph wires its ONE
+/// supervisor here), so the normal graph never touches a global process
+/// authority.
+#[cfg(test)]
 impl Default for AsyncCheckExecutor {
     fn default() -> Self {
-        Self::new()
+        Self::try_shared().expect("standalone supervisor for crate tests")
     }
 }
 
 impl AsyncCheckExecutor {
-    /// The executor over `ProcessSupervisor::shared` (the in-process
-    /// supervisor; crate-level tests and hosts without a daemon supervisor).
-    pub fn new() -> Self {
-        Self::from_supervisor(faktor_terminal::ProcessSupervisor::shared())
+    /// The standalone executor over [`faktor_terminal::ProcessSupervisor::try_shared`]:
+    /// crate tests and one-shot hosts without a daemon supervisor. A failure
+    /// to initialize the process authority is a typed error, never a panic;
+    /// daemon-owned graphs use [`AsyncCheckExecutor::from_supervisor`].
+    pub fn try_shared() -> Result<Self, faktor_core::error::Error> {
+        Ok(Self::from_supervisor(
+            faktor_terminal::ProcessSupervisor::try_shared()?,
+        ))
     }
 
     /// The executor over an explicit supervisor — the daemon graph wires
@@ -1010,8 +1019,8 @@ mod tests {
         // The group was SIGKILLed: both pids vanish (retry briefly for reap).
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let l = (unsafe { libc::kill(leader, 0) }) == 0;
-            let g = (unsafe { libc::kill(grand, 0) }) == 0;
+            let l = ex.supervisor().pid_alive(leader as u32);
+            let g = ex.supervisor().pid_alive(grand as u32);
             if !l && !g {
                 break;
             }
@@ -1048,6 +1057,7 @@ mod tests {
         // layer of its own; the supervisor's kill path is the ONLY one).
         let dir = tempfile::tempdir().unwrap();
         let ex = AsyncCheckExecutor::default();
+        let supervisor = ex.supervisor().clone();
         let c = ctx(dir.path(), Duration::from_secs(120));
         let cancel = c.cancellation.clone();
         let script = "echo $$ > leader.pid; sleep 60 & echo $! > grand.pid; wait";
@@ -1073,8 +1083,8 @@ mod tests {
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let l = (unsafe { libc::kill(leader, 0) }) == 0;
-            let g = (unsafe { libc::kill(grand, 0) }) == 0;
+            let l = supervisor.pid_alive(leader as u32);
+            let g = supervisor.pid_alive(grand as u32);
             if !l && !g {
                 break;
             }
@@ -1187,7 +1197,7 @@ mod tests {
             "CARGO_HOME",
             "OPENAI_API_KEY",
             "TEST_PRIVATE_SECRET",
-            "KP_VERIFY_UNDECLARED",
+            "FAKTOR_TEST_VERIFY_UNDECLARED",
         ];
         let _restore = RestoreEnv(
             names
@@ -1198,7 +1208,7 @@ mod tests {
         std::env::set_var("CARGO_HOME", &cargo_home);
         std::env::set_var("OPENAI_API_KEY", "sk-verify-secret");
         std::env::set_var("TEST_PRIVATE_SECRET", "private");
-        std::env::set_var("KP_VERIFY_UNDECLARED", "must-not-arrive");
+        std::env::set_var("FAKTOR_TEST_VERIFY_UNDECLARED", "must-not-arrive");
         let ex = AsyncCheckExecutor::default();
         let c = ctx(dir.path(), Duration::from_secs(30));
         let script = format!(
@@ -1206,7 +1216,7 @@ mod tests {
              test \"$CARGO_HOME\" = '{cargo_home}' || exit 12; \
              test -z \"$OPENAI_API_KEY\" || exit 13; \
              test -z \"$TEST_PRIVATE_SECRET\" || exit 14; \
-             test -z \"$KP_VERIFY_UNDECLARED\" || exit 15; \
+             test -z \"$FAKTOR_TEST_VERIFY_UNDECLARED\" || exit 15; \
              echo verify-env-exact"
         );
         let spec = CheckSpec::new(

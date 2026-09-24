@@ -24,3 +24,6 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 async-trait.workspace = true
 rusqlite.workspace = true
+
+[lints]
+workspace = true

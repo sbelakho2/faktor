@@ -5247,6 +5247,12 @@ pub(crate) mod tests {
         );
         assert_eq!(profile["filesystem"], "workspace+external:ask-ask");
         assert_eq!(profile["network"], "none");
+        // Phase D shell contract: the daemon session terminal policy carries
+        // the EXPLICIT user-granted network-capable shell (never presented
+        // as OS isolation) — a verbatim `Required`/`os_isolated` policy is
+        // refused typed before spawn instead (see the terminal_authority
+        // refusal test).
+        assert_eq!(profile["shell"], "network_capable_user_granted");
         assert!(profile["budgets"]["maxProcesses"].as_u64().unwrap_or(0) > 0);
 
         let Some(pty_b) =

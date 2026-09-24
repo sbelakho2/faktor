@@ -19,3 +19,6 @@ tempfile.workspace = true
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Foundation"] }
+
+[lints]
+workspace = true

@@ -1,6 +1,6 @@
 //! Static source-authority certification (audit 31/107-109).
 //!
-//! Nine structural invariants are locked by scanning the repository's
+//! Ten structural invariants are locked by scanning the repository's
 //! *production* Rust sources (`crates/*/src`, test modules and out-of-line
 //! `#[cfg(test)] mod` bodies excluded):
 //!
@@ -67,6 +67,22 @@
 //!    them but never re-define a classifier, class enum or answer-vetting
 //!    function locally; a planted `fn classify_v4` in either crate is a
 //!    red scan.
+//! 10. **No plaintext secret-shaped struct fields** — a production struct
+//!     field named `password`, `*_token`, `private_key*` or `client_secret`
+//!     with type `String`/`Option<String>` is refused; the value must be a
+//!     redacting wrapper (`faktor_security::secret::SecretValue` or a
+//!     dedicated newtype). The ONLY exception is a WIRE DTO that mirrors an
+//!     external payload shape, carries the documented
+//!     `SECRET-FIELD-GATE-WIRE-DTO:` annotation and is listed, with a written
+//!     justification, in `SECRET_WIRE_DTO_ALLOWLIST`; every such DTO must
+//!     convert immediately and can never store the secret.
+//! 11. **Budgeted response-body reads** — every production egress consumer
+//!     (`crates/provider` streaming, the wire adapters, SCM, cloud OIDC,
+//!     updater, semantic, commerce connectors) must read response bodies
+//!     through the budget-aware helpers (`ResponseBudget` / `BudgetedBody`).
+//!     A direct `.bytes()`/`.text()`/`.chunk()`/`bytes_stream()` read is a
+//!     red test: unbounded reads are exactly the hang/RAM surface the
+//!     response budget exists to close.
 //!
 //! Scanning methodology: per file, comments and string literals are masked
 //! out and every `#[cfg(...)]`-gated item that can never compile in a
@@ -1448,8 +1464,12 @@ mod scans {
     ///   introspection surface inspects `deps.semantic` only.
     /// - `ProcessSupervisor::new`: the two daemon entries
     ///   (`build_daemon`, `build_daemon_with_mcp_inner`), each handing the
-    ///   ONE supervisor into the core builder, plus the terminal crate's own
-    ///   `shared()` ephemeral fallback.
+    ///   ONE supervisor into the core builder, plus the local Acquire login
+    ///   command's short-lived supervisor (its own CAS).
+    /// - `ProcessSupervisor::try_shared`: the documented STANDALONE entries
+    ///   (index `open`, hooks `try_new`, verify executor/inventory, the
+    ///   doctor probe) — fallible typed constructors, never a panic; the
+    ///   daemon graph injects its supervisor instead.
     ///
     /// A new (or stale) site anywhere is a red test, never a review nit.
     /// Out-of-line `#[cfg(test)] mod` bodies are skipped (test-only by
@@ -1480,15 +1500,28 @@ mod scans {
             "ProcessSupervisor::new",
             &[
                 ("crates/cli/src/main.rs", 2),
-                // The terminal crate's own `ProcessSupervisor::shared`
-                // fallback (env-var hook registry / crate-level tests): an
-                // ephemeral per-process supervisor, documented in place.
-                ("crates/terminal/src/lib.rs", 1),
                 // Faktor Acquire `commerce login` (docs/acquire.md §14): the
                 // LOCAL admin command opens the headed dedicated profile
                 // browser through a short-lived supervisor over its own CAS.
                 // Never a model tool, never the daemon's model environment.
                 ("crates/cli/src/tools_market.rs", 1),
+            ],
+        ),
+        // The STANDALONE process authority (`try_shared`) has exactly these
+        // production sites. Daemon-owned subsystems (index/hooks/verify)
+        // take the daemon's ONE supervisor by injection; each `try_shared`
+        // site below is a documented standalone entry point (a fallible
+        // constructor that returns a typed error, never a panic), and the
+        // doctor site is the read-only diagnostic probe. The normal graph
+        // (`build_daemon*`) contains none.
+        (
+            "ProcessSupervisor::try_shared",
+            &[
+                ("crates/hooks/src/lib.rs", 1),
+                ("crates/index/src/service.rs", 1),
+                ("crates/verify/src/exec.rs", 1),
+                ("crates/verify/src/inventory.rs", 1),
+                ("crates/cli/src/main.rs", 1),
             ],
         ),
     ];
@@ -4225,5 +4258,984 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             "// exact money only: no f64 anywhere\n",
         );
         assert!(commerce_float_offenders("crates/commerce/src/money.rs", &comment).is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // scan 10: plaintext secret-shaped production struct fields
+    //
+    //  * a production struct field named `password`, `*_token`,
+    //    `private_key*` or `client_secret` whose type is `String` /
+    //    `Option<String>` is a plaintext credential: refused;
+    //  * the ONE exception is a wire DTO that mirrors an external payload
+    //    shape, carries the literal
+    //    `SECRET-FIELD-GATE-WIRE-DTO: <justification>` annotation in the
+    //    contiguous comment block immediately above the struct AND is
+    //    listed in `SECRET_WIRE_DTO_ALLOWLIST` with a written
+    //    justification; such a DTO must convert immediately (its secret
+    //    bytes are wrapped before any domain use) and can never store them.
+    // ------------------------------------------------------------------
+
+    /// A field name is secret-shaped when it is `password`, any `*_token`
+    /// (this covers `access_token` / `id_token` / `refresh_token`), any
+    /// `private_key*` (this covers `private_key_pkcs8_pem`) or exactly
+    /// `client_secret`. Everything else (`token_type`, `token_hash`,
+    /// `password_hash`, `webhook_secret`, `credentials_path`, …) is not a
+    /// credential value and deliberately passes.
+    fn is_secret_field_name(name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        name == "password"
+            || name.ends_with("_token")
+            || name.starts_with("private_key")
+            || name == "client_secret"
+    }
+
+    /// The documented wire-DTO annotation marker. The justification must be
+    /// written after the marker (same line) and be at least
+    /// [`SECRET_FIELD_WIRE_DTO_MIN_JUSTIFICATION`] characters long.
+    const SECRET_FIELD_WIRE_DTO_ANNOTATION: &str = "SECRET-FIELD-GATE-WIRE-DTO:";
+
+    /// Minimum written justification after the annotation marker.
+    const SECRET_FIELD_WIRE_DTO_MIN_JUSTIFICATION: usize = 40;
+
+    /// The exact annotated wire DTOs. Each entry is `(file, struct,
+    /// justification)`; the justification documents WHY the plaintext shape
+    /// is a wire capture that converts immediately. Every entry is asserted
+    /// load-bearing (the struct really exists, carries the annotation and
+    /// really holds secret-shaped fields) and non-stale by the tests below;
+    /// keep this list TINY.
+    const SECRET_WIRE_DTO_ALLOWLIST: &[(&str, &str, &str)] = &[
+        (
+            "crates/cloud/src/oidc_net.rs",
+            "RawTokenResponse",
+            "OIDC token-endpoint provider response: parsed and converted to OidcTokenSet \
+             (SecretValue fields) in the same block, never stored as plaintext.",
+        ),
+        (
+            "crates/commerce-connectors/src/digikey/normalize.rs",
+            "TokenResponse",
+            "DigiKey OAuth token-endpoint provider response: token_from_response extracts \
+             the token into the connector SecretString at the same boundary, never stored.",
+        ),
+    ];
+
+    fn is_wire_dto_allowlisted(rel: &str, struct_name: &str) -> bool {
+        SECRET_WIRE_DTO_ALLOWLIST
+            .iter()
+            .any(|(file, name, _)| *file == rel && *name == struct_name)
+    }
+
+    /// Production text with comments, string/char literals and test-gated
+    /// ranges blanked out (newlines kept): byte offsets still match
+    /// `f.src` exactly, but only real production code positions carry bytes.
+    fn production_code_bytes(f: &File<'_>) -> Vec<u8> {
+        let mut out = f.src.as_bytes().to_vec();
+        for (i, byte) in out.iter_mut().enumerate() {
+            if *byte == b'\n' {
+                continue;
+            }
+            let kept = f.kept.iter().any(|(a, z)| i >= *a && i < *z);
+            if !kept || !f.code[i] {
+                *byte = b' ';
+            }
+        }
+        out
+    }
+
+    fn parse_ident(bytes: &[u8], from: usize) -> Option<(String, usize)> {
+        let mut i = from;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        Some((String::from_utf8_lossy(&bytes[start..i]).to_string(), i))
+    }
+
+    /// The secret-shaped plaintext fields of ONE struct body field segment
+    /// (`pub access_token: Option<String>` → `Some("access_token")`). The
+    /// field name is the last identifier before the top-level `:`; the type
+    /// must be EXACTLY `String` or `Option<String>` (whitespace ignored).
+    /// Wrappers (`SecretValue`, `Option<SecretValue>`, dedicated newtypes)
+    /// never match.
+    fn parse_secret_field(segment: &[u8]) -> Option<String> {
+        let mut depth = 0i32;
+        let mut colon = None;
+        for (idx, byte) in segment.iter().enumerate() {
+            match byte {
+                b'(' | b'[' | b'{' | b'<' => depth += 1,
+                b')' | b']' | b'}' | b'>' => depth = depth.saturating_sub(1),
+                b':' if depth == 0 => {
+                    colon = Some(idx);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let colon = colon?;
+        let before = &segment[..colon];
+        let after = &segment[colon + 1..];
+        let mut end = before.len();
+        while end > 0 && before[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        let mut start = end;
+        while start > 0 && (before[start - 1].is_ascii_alphanumeric() || before[start - 1] == b'_')
+        {
+            start -= 1;
+        }
+        if start == end {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&before[start..end]).to_string();
+        if !is_secret_field_name(&name) {
+            return None;
+        }
+        let ty: String = after
+            .iter()
+            .filter(|b| !b.is_ascii_whitespace())
+            .map(|b| char::from(*b))
+            .collect();
+        matches!(ty.as_str(), "String" | "Option<String>").then_some(name)
+    }
+
+    /// One production struct with its secret-shaped plaintext fields.
+    struct SecretStruct {
+        name: String,
+        fields: Vec<String>,
+        line: usize,
+        at: usize,
+    }
+
+    /// The brace-body structs of one production file that declare
+    /// secret-shaped plaintext fields. Tuple/unit structs never carry named
+    /// fields; generics and where-clauses before the body are skipped.
+    fn production_secret_structs(f: &File<'_>) -> Vec<SecretStruct> {
+        let bytes = production_code_bytes(f);
+        let n = bytes.len();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i + 6 <= n {
+            if &bytes[i..i + 6] == b"struct" {
+                let left_ok = i == 0 || {
+                    let b = bytes[i - 1];
+                    !(b.is_ascii_alphanumeric() || b == b'_')
+                };
+                let right_ok = i + 6 == n || {
+                    let b = bytes[i + 6];
+                    !(b.is_ascii_alphanumeric() || b == b'_')
+                };
+                if left_ok && right_ok {
+                    if let Some((name, fields)) = parse_struct_secret_fields(&bytes, i) {
+                        if !fields.is_empty() {
+                            out.push(SecretStruct {
+                                name,
+                                fields,
+                                line: line_of(f.src, i),
+                                at: i,
+                            });
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    fn parse_struct_secret_fields(bytes: &[u8], struct_at: usize) -> Option<(String, Vec<String>)> {
+        let n = bytes.len();
+        let (name, mut i) = parse_ident(bytes, struct_at + "struct".len())?;
+        let mut depth = 0i32;
+        let mut body = None;
+        while i < n {
+            match bytes[i] {
+                b'(' | b'[' | b'<' => depth += 1,
+                b')' | b']' | b'>' => depth -= 1,
+                b'{' if depth <= 0 => {
+                    body = Some(i);
+                    break;
+                }
+                b';' if depth <= 0 => return None,
+                _ => {}
+            }
+            i += 1;
+        }
+        let body = body?;
+        let mut d = 0i32;
+        let mut end = None;
+        let mut j = body;
+        while j < n {
+            match bytes[j] {
+                b'{' => d += 1,
+                b'}' => {
+                    d -= 1;
+                    if d == 0 {
+                        end = Some(j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let end = end?;
+        let mut fields = Vec::new();
+        let mut segment_start = body + 1;
+        let mut depth = 0i32;
+        let mut k = body + 1;
+        while k <= end {
+            if k == end || (bytes[k] == b',' && depth == 0) {
+                if let Some(field) = parse_secret_field(&bytes[segment_start..k]) {
+                    fields.push(field);
+                }
+                segment_start = k + 1;
+            } else {
+                match bytes[k] {
+                    b'(' | b'[' | b'{' | b'<' => depth += 1,
+                    b')' | b']' | b'}' | b'>' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            k += 1;
+        }
+        Some((name, fields))
+    }
+
+    /// The justification of the documented wire-DTO annotation, when a
+    /// comment in the contiguous comment/attribute block immediately above
+    /// the struct carries the marker with a long-enough justification. A
+    /// blank line, a code line or a marker inside a string/attribute never
+    /// counts; only `//`-comment lines and single-line attributes may sit in
+    /// the block.
+    fn wire_dto_annotation(f: &File<'_>, struct_at: usize) -> Option<String> {
+        let line = line_of(f.src, struct_at);
+        if line < 2 {
+            return None;
+        }
+        let lines: Vec<&str> = f.src.lines().collect();
+        let mut i = line - 2;
+        loop {
+            let text = lines.get(i)?.trim();
+            if text.is_empty() {
+                return None;
+            }
+            if text.starts_with("//") {
+                if let Some((_, rest)) = text.split_once(SECRET_FIELD_WIRE_DTO_ANNOTATION) {
+                    let justification = rest.trim_start_matches(':').trim();
+                    if justification.chars().count() >= SECRET_FIELD_WIRE_DTO_MIN_JUSTIFICATION {
+                        return Some(justification.to_string());
+                    }
+                    return None;
+                }
+            } else if !(text.starts_with("#[") || text.starts_with("#!")) {
+                return None;
+            }
+            if i == 0 {
+                return None;
+            }
+            i -= 1;
+        }
+    }
+
+    /// Scan-10 offenders of one production file: secret-shaped plaintext
+    /// struct fields outside the allowlisted, annotated wire DTOs. An
+    /// annotation that is not allowlisted is itself an offender (a new wire
+    /// DTO must be documented in the scan), so the exception can never be
+    /// widened silently.
+    fn secret_field_offenders(rel: &str, f: &File<'_>) -> Vec<String> {
+        let rel = normalize_rel(rel);
+        let mut offenders = Vec::new();
+        for found in production_secret_structs(f) {
+            let fields = found.fields.join(", ");
+            match wire_dto_annotation(f, found.at) {
+                Some(_) if is_wire_dto_allowlisted(&rel, &found.name) => {}
+                Some(_) => offenders.push(format!(
+                    "{rel}:{}: struct {} carries the {} annotation but is not in \
+                     SECRET_WIRE_DTO_ALLOWLIST; document it (with a justification) or wrap \
+                     {fields} in a redacting secret type",
+                    found.line, found.name, SECRET_FIELD_WIRE_DTO_ANNOTATION
+                )),
+                None => offenders.push(format!(
+                    "{rel}:{}: struct {} declares secret-shaped plaintext field(s) {fields}; \
+                     wrap them in faktor_security::secret::SecretValue (a genuine wire DTO \
+                     must carry the {SECRET_FIELD_WIRE_DTO_ANNOTATION} annotation and be \
+                     allowlisted)",
+                    found.line, found.name
+                )),
+            }
+        }
+        offenders
+    }
+
+    /// The real-tree invariant: no production struct declares a plaintext
+    /// secret-shaped `String`/`Option<String>` field outside the exact,
+    /// annotated, justified wire-DTO allowlist.
+    #[test]
+    fn production_structs_never_hold_plaintext_secret_fields() {
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for rel in walk_crate_sources() {
+            if is_test_file(&rel) {
+                continue;
+            }
+            let Some(f) = load(&rel) else {
+                continue;
+            };
+            scanned += 1;
+            offenders.extend(secret_field_offenders(&rel, &f));
+        }
+        assert_no_offenders(
+            "secret-field scan: production structs must wrap password/*_token/private_key*/\
+             client_secret values in a redacting secret type (faktor_security::secret::\
+             SecretValue); only annotated+allowlisted wire DTOs may mirror a plaintext wire \
+             shape and must convert immediately",
+            &offenders,
+            scanned,
+            100,
+        );
+    }
+
+    /// The allowlist entries are exact, justified, load-bearing (the struct
+    /// exists, is annotated, and really declares the secret-shaped fields)
+    /// and never stale; every annotated struct in the tree is listed, so a
+    /// new annotation is a red scan until it is documented.
+    #[test]
+    fn secret_wire_dto_allowlist_entries_are_documented_and_load_bearing() {
+        assert!(
+            SECRET_WIRE_DTO_ALLOWLIST.len() <= 4,
+            "the wire-DTO allowlist must stay tiny ({} entries)",
+            SECRET_WIRE_DTO_ALLOWLIST.len()
+        );
+        for (file, struct_name, justification) in SECRET_WIRE_DTO_ALLOWLIST {
+            assert!(
+                justification.len() >= SECRET_FIELD_WIRE_DTO_MIN_JUSTIFICATION,
+                "allowlist entry {file} {struct_name} needs a real written justification"
+            );
+            let f = load(file).unwrap_or_else(|| panic!("allowlisted file missing: {file}"));
+            let found = production_secret_structs(&f)
+                .into_iter()
+                .find(|found| found.name == *struct_name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "allowlist entry {file} {struct_name} is stale: the struct no longer \
+                         declares secret-shaped plaintext fields"
+                    )
+                });
+            assert!(
+                wire_dto_annotation(&f, found.at).is_some(),
+                "allowlist entry {file} {struct_name} lost its \
+                 {SECRET_FIELD_WIRE_DTO_ANNOTATION} annotation"
+            );
+            assert!(
+                !found.fields.is_empty(),
+                "allowlist entry {file} {struct_name} is load-bearing: it must declare a \
+                 secret-shaped field"
+            );
+        }
+        // Every annotated struct in the tree is documented: exactly the
+        // allowlisted set may carry the annotation.
+        let mut documented = Vec::new();
+        for rel in walk_crate_sources() {
+            if is_test_file(&rel) {
+                continue;
+            }
+            let Some(f) = load(&rel) else {
+                continue;
+            };
+            for found in production_secret_structs(&f) {
+                if wire_dto_annotation(&f, found.at).is_some() {
+                    documented.push(format!("{rel}:{}", found.name));
+                }
+            }
+        }
+        documented.sort();
+        let mut expected: Vec<String> = SECRET_WIRE_DTO_ALLOWLIST
+            .iter()
+            .map(|(file, name, _)| format!("{file}:{name}"))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            documented, expected,
+            "the set of wire-DTO-annotated structs must be exactly SECRET_WIRE_DTO_ALLOWLIST"
+        );
+    }
+
+    /// Planted-fixture proof: every secret-shaped family fires; wrapped
+    /// fields, comments, strings and test-gated structs never do; a
+    /// non-adjacent or unjustified annotation never exempts; an annotated
+    /// struct outside the allowlist is still an offender.
+    #[test]
+    fn secret_field_scan_fires_on_planted_plaintext_credentials() {
+        for (src, needle) in [
+            ("pub struct Cfg { pub password: String }\n", "password"),
+            ("struct Cfg { access_token: String }\n", "access_token"),
+            ("struct Cfg { id_token: Option<String> }\n", "id_token"),
+            (
+                "struct Cfg { refresh_token: Option<String> }\n",
+                "refresh_token",
+            ),
+            (
+                "struct Cfg { pub client_secret: String }\n",
+                "client_secret",
+            ),
+            (
+                "pub struct Cfg { pub private_key_pkcs8_pem: String }\n",
+                "private_key_pkcs8_pem",
+            ),
+        ] {
+            let f = synthetic_file("crates/cloud/src/evil.rs", src);
+            let offenders = secret_field_offenders("crates/cloud/src/evil.rs", &f);
+            assert_eq!(offenders.len(), 1, "{src}: {offenders:?}");
+            assert!(
+                offenders[0].contains(needle),
+                "the offender must name {needle}: {offenders:?}"
+            );
+        }
+        // Multiple planted fields in one struct are reported together.
+        let f = synthetic_file(
+            "crates/cloud/src/evil.rs",
+            "struct Cfg { password: String, access_token: Option<String>, token_type: String }\n",
+        );
+        let offenders = secret_field_offenders("crates/cloud/src/evil.rs", &f);
+        assert_eq!(offenders.len(), 1);
+        assert!(
+            offenders[0].contains("password") && offenders[0].contains("access_token"),
+            "{offenders:?}"
+        );
+        assert!(
+            !offenders[0].contains("token_type"),
+            "token_type is not a credential: {offenders:?}"
+        );
+        // Wrapped fields never fire.
+        let f = synthetic_file(
+            "crates/cloud/src/good.rs",
+            "struct Cfg {\n    password: SecretValue,\n    access_token: Option<SecretValue>,\n\
+             client_secret: WrappedSecret,\n    private_key_pem: Pem,\n}\n",
+        );
+        assert!(
+            secret_field_offenders("crates/cloud/src/good.rs", &f).is_empty(),
+            "{:?}",
+            secret_field_offenders("crates/cloud/src/good.rs", &f)
+        );
+        // A mention in a comment, a string or a test-gated struct is never
+        // production code.
+        let f = synthetic_file(
+            "crates/cloud/src/good.rs",
+            "// password: String is forbidden\nconst X: &str = \"id_token: String\";\n\
+             #[cfg(test)]\nmod tests {\n    struct T { access_token: String }\n}\n",
+        );
+        assert!(secret_field_offenders("crates/cloud/src/good.rs", &f).is_empty());
+        // An annotation alone does not exempt: the struct must ALSO be
+        // allowlisted, and the justification must be real.
+        let annotated = format!(
+            "// {SECRET_FIELD_WIRE_DTO_ANNOTATION} a planted fixture struct that is not in the allowlist\n\
+             #[derive(Debug)]\nstruct Planted {{ access_token: String }}\n"
+        );
+        let f = synthetic_file("crates/cloud/src/evil.rs", &annotated);
+        let offenders = secret_field_offenders("crates/cloud/src/evil.rs", &f);
+        assert_eq!(offenders.len(), 1, "{offenders:?}");
+        assert!(
+            offenders[0].contains("not in SECRET_WIRE_DTO_ALLOWLIST"),
+            "{offenders:?}"
+        );
+        let short = format!(
+            "// {SECRET_FIELD_WIRE_DTO_ANNOTATION} too short\nstruct Planted {{ id_token: String }}\n"
+        );
+        let f = synthetic_file("crates/cloud/src/evil.rs", &short);
+        assert_eq!(
+            secret_field_offenders("crates/cloud/src/evil.rs", &f).len(),
+            1,
+            "a marker without a written justification must not exempt"
+        );
+        // A blank line between the annotation and the struct breaks adjacency.
+        let not_adjacent = format!(
+            "// {SECRET_FIELD_WIRE_DTO_ANNOTATION} a sufficiently long planted justification text here\n\n\
+             struct Planted {{ id_token: String }}\n"
+        );
+        let f = synthetic_file("crates/cloud/src/evil.rs", &not_adjacent);
+        assert_eq!(
+            secret_field_offenders("crates/cloud/src/evil.rs", &f).len(),
+            1
+        );
+        // A field-level annotation can never exempt the struct.
+        let field_level = format!(
+            "struct Planted {{\n    // {SECRET_FIELD_WIRE_DTO_ANNOTATION} a sufficiently long planted justification text here\n    id_token: String,\n}}\n"
+        );
+        let f = synthetic_file("crates/cloud/src/evil.rs", &field_level);
+        assert_eq!(
+            secret_field_offenders("crates/cloud/src/evil.rs", &f).len(),
+            1
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // scan 2c: budgeted response-body reads in production egress consumers
+    // ------------------------------------------------------------------
+
+    /// Every production crate whose code consumes a response body from the
+    /// `HttpTransport` seam / the checked client. A body read here MUST go
+    /// through the budget-aware helpers (`ResponseBudget` +
+    /// `BudgetedBody::next_chunk`/`read_all`/`into_stream`, or `execute_raw`
+    /// with a budget), never a direct read method.
+    const EGRESS_CONSUMER_ROOTS: &[&str] = &[
+        "crates/provider/src/",
+        "crates/openai/src/",
+        "crates/anthropic/src/",
+        "crates/google/src/",
+        "crates/deepseek/src/",
+        "crates/gateway/src/",
+        "crates/ollama/src/",
+        "crates/scm/src/",
+        "crates/cloud/src/",
+        "crates/updater/src/",
+        "crates/semantic/src/",
+        "crates/commerce-connectors/src/",
+    ];
+
+    /// The ONE file allowed to name the raw read methods: it implements the
+    /// budget-aware helpers themselves.
+    const EGRESS_BUDGET_HELPER: &str = "crates/provider/src/egress.rs";
+
+    fn is_egress_consumer(rel: &str) -> bool {
+        let rel = normalize_rel(rel);
+        EGRESS_CONSUMER_ROOTS
+            .iter()
+            .any(|root| rel.starts_with(root))
+    }
+
+    /// Offenders of one production consumer file: a direct response-body
+    /// read. `.bytes_stream(` and `.chunk()` are unambiguous. `.bytes()` and
+    /// `.text()` are flagged only when AWAITED: a response body read always
+    /// awaits, while synchronous accessors (`payload.text()` on a browser
+    /// capture, `str::bytes()` iteration) never do. The `.await` window
+    /// tolerates rustfmt splitting the call and the await across lines.
+    fn direct_body_read_offenders(f: &File<'_>) -> Vec<String> {
+        let mut offenders = Vec::new();
+        for (line, text) in find_markers(f, &[".bytes_stream("]) {
+            offenders.push(format!(
+                "{}:{line}: {text}  [unbounded stream collection; use BudgetedBody]",
+                f.rel
+            ));
+        }
+        for (line, text) in find_markers(f, &[".chunk()"]) {
+            offenders.push(format!(
+                "{}:{line}: {text}  [direct body read; use BudgetedBody::next_chunk]",
+                f.rel
+            ));
+        }
+        for marker in [".bytes()", ".text()"] {
+            for at in find_marker_offsets(f, marker) {
+                if awaited_within(f, at + marker.len(), 64) {
+                    let line = line_of(f.src, at);
+                    offenders.push(format!(
+                        "{}:{line}: {}  [direct body read; use BudgetedBody::read_all]",
+                        f.rel,
+                        trim_line(f.src, at)
+                    ));
+                }
+            }
+        }
+        offenders
+    }
+
+    /// The budgeted-body-read certification: production egress consumers
+    /// never read a response body directly. The budget authority must exist
+    /// first, so the scan cannot pass by deleting the helpers everyone is
+    /// supposed to use.
+    #[test]
+    fn no_direct_response_body_reads_in_production_egress_consumers() {
+        let authority = std::fs::read_to_string(repo_root().join(EGRESS_BUDGET_HELPER))
+            .expect("the checked transport crates/provider/src/egress.rs must exist");
+        for marker in [
+            "pub struct ResponseBudget",
+            "pub struct BudgetedBody",
+            "pub enum BudgetComponent",
+        ] {
+            assert!(
+                authority.contains(marker),
+                "the checked transport is missing {marker:?}; the response budget \
+                 authority must live in egress.rs"
+            );
+        }
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for rel in walk_crate_sources() {
+            if !is_egress_consumer(&rel) || is_test_file(&rel) || rel == EGRESS_BUDGET_HELPER {
+                continue;
+            }
+            let Some(f) = load(&rel) else {
+                continue;
+            };
+            scanned += 1;
+            offenders.extend(direct_body_read_offenders(&f));
+        }
+        assert_no_offenders(
+            "egress body-read scan: production consumers must read response bodies \
+             through the budget-aware helpers (ResponseBudget/BudgetedBody); direct \
+             .bytes()/.text()/.chunk()/bytes_stream() reads are unbounded",
+            &offenders,
+            scanned,
+            30,
+        );
+    }
+
+    /// Planted-fixture proof: a direct unbounded read FAILS the scan (the
+    /// regression it exists for), while the budget-aware shapes — and a
+    /// non-await `.bytes()` iterator over a `&str` — pass.
+    #[test]
+    fn budgeted_body_read_scan_fires_on_planted_unbounded_reads() {
+        for src in [
+            "async fn f(r: reqwest::Response) -> Vec<u8> { r.bytes().await.unwrap() }\n",
+            "async fn f(r: reqwest::Response) -> String { r.text().await.unwrap() }\n",
+            "fn f(r: reqwest::Response) { let _ = r.bytes_stream(); }\n",
+            "async fn f(r: reqwest::Response) { let _ = r.chunk().await; }\n",
+            // rustfmt may split the call and the await across lines: the
+            // window must still catch both.
+            "async fn f(r: reqwest::Response) -> Vec<u8> {\n    r.bytes()\n        .await\n        .unwrap()\n}\n",
+            "async fn f(r: reqwest::Response) -> String {\n    r.text()\n        .await\n        .unwrap()\n}\n",
+        ] {
+            let f = synthetic_file("crates/scm/src/evil.rs", src);
+            assert_eq!(
+                direct_body_read_offenders(&f).len(),
+                1,
+                "the planted unbounded read must fire: {src}"
+            );
+        }
+        for src in [
+            "async fn f(r: reqwest::Response, b: ResponseBudget) -> Vec<u8> { BudgetedBody::new(r, b).read_all().await.unwrap() }\n",
+            "fn f(r: reqwest::Response, b: ResponseBudget) { let _ = BudgetedBody::new(r, b).into_stream(); }\n",
+            "fn f(v: &str) -> bool { v.bytes().all(|b| b.is_ascii_graphic()) }\n",
+        ] {
+            let f = synthetic_file("crates/scm/src/good.rs", src);
+            assert!(
+                direct_body_read_offenders(&f).is_empty(),
+                "the compliant fixture must pass: {src} -> {:?}",
+                direct_body_read_offenders(&f)
+            );
+        }
+        // The rule is scoped to the production consumer trees only.
+        assert!(is_egress_consumer("crates/scm/src/lib.rs"));
+        assert!(is_egress_consumer("crates/openai/src/lib.rs"));
+        assert!(is_egress_consumer(
+            r"crates\commerce-connectors\src\http.rs"
+        ));
+        assert!(!is_egress_consumer("crates/browser/src/egress.rs"));
+        assert!(!is_egress_consumer("tests/integration/src/lib.rs"));
+    }
+
+    // ------------------------------------------------------------------
+    // scan N: unsafe / OS-boundary policy (Phase D item 22)
+    // ------------------------------------------------------------------
+
+    /// Every crate source file allowed to contain `unsafe` code, with the
+    /// EXACT number of `allow(unsafe_code)` attributes it must carry.
+    ///
+    /// - Authority modules (`pty`/`fs`/`terminal`/`sandbox`/`browser-platform`
+    ///   plus the `winjob` Job-Object crate) put a FILE-level
+    ///   `#![allow(unsafe_code)]` on the platform module; `terminal` and
+    ///   `fs::tree_manifest` place FUNCTION-level allows on the few raw
+    ///   syscall functions.
+    /// - OS-boundary seams outside those crates: `git` process identity,
+    ///   `session` thread-CPU clock (function-level allows).
+    /// - Test-only locations: the out-of-line integration tests
+    ///   (`pty/tests`, `winjob/tests`, `cloud/tests`) and cfg(test) modules
+    ///   inside `terminal`, `fs::tree_manifest`, `orchestrator` and `cli`.
+    ///
+    /// A new unsafe site, a new `allow(unsafe_code)` attribute, a stale
+    /// entry or a missing `// SAFETY:` justification is a red test.
+    const UNSAFE_ALLOWED_FILES: &[(&str, usize)] = &[
+        // --- platform authority modules (file-level allow) ---
+        ("crates/pty/src/unix.rs", 1),
+        ("crates/pty/src/windows.rs", 1),
+        ("crates/pty/src/guardian/mod.rs", 1),
+        ("crates/fs/src/platform/unix.rs", 1),
+        ("crates/fs/src/platform/windows.rs", 1),
+        ("crates/fs/src/rooted.rs", 1),
+        ("crates/terminal/src/budget.rs", 1),
+        ("crates/terminal/src/sandbox/linux.rs", 1),
+        ("crates/winjob/src/lib.rs", 1),
+        // --- function-level allows in mixed files ---
+        ("crates/terminal/src/lib.rs", 12),
+        ("crates/fs/src/tree_manifest.rs", 3),
+        ("crates/git/src/guard.rs", 3),
+        ("crates/session/src/actor.rs", 1),
+        // --- test-only locations ---
+        ("crates/pty/tests/guardian.rs", 1),
+        ("crates/pty/tests/windows_lifecycle.rs", 1),
+        ("crates/winjob/tests/windows_tree.rs", 1),
+        ("crates/cloud/tests/durability_memory.rs", 1),
+        ("crates/orchestrator/src/shadow_tests.rs", 1),
+        ("crates/cli/src/main.rs", 2),
+        ("tests/coding-benchmark/src/daemon.rs", 1),
+        ("tests/coding-benchmark/src/process.rs", 1),
+    ];
+
+    /// Every `.rs` file under `crates/` and `tests/` (including out-of-line
+    /// test dirs and examples) — the exact surface the workspace
+    /// `unsafe_code` deny lint compiles.
+    fn crate_rs_files_all() -> Vec<String> {
+        let mut out = Vec::new();
+        for root in [repo_root().join("crates"), repo_root().join("tests")] {
+            crate_rs_files_under(&root, &mut out);
+        }
+        out.sort();
+        out
+    }
+
+    fn crate_rs_files_under(root: &std::path::Path, out: &mut Vec<String>) {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(ft) = entry.file_type() else { continue };
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if ft.is_dir() {
+                    if name == "target" || name.starts_with('.') {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if ft.is_file() && path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let rel = path
+                        .strip_prefix(repo_root())
+                        .expect("under repo root")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.push(rel);
+                }
+            }
+        }
+    }
+
+    /// Code-masked `unsafe` occurrences in raw source (comments and string
+    /// literals can never satisfy the scan): `(line index, trimmed line)`.
+    fn unsafe_sites_in(src: &str) -> Vec<(usize, String)> {
+        let bytes = src.as_bytes();
+        let code = code_mask(src);
+        let mut starts: Vec<usize> = vec![0];
+        for (i, b) in bytes.iter().enumerate() {
+            if *b == b'\n' {
+                starts.push(i + 1);
+            }
+        }
+        let mut out = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find("unsafe") {
+            let at = from + rel;
+            from = at + 6;
+            let before_ok =
+                at == 0 || !bytes[at - 1].is_ascii_alphanumeric() && bytes[at - 1] != b'_';
+            let after_ok = at + 6 >= bytes.len()
+                || !bytes[at + 6].is_ascii_alphanumeric() && bytes[at + 6] != b'_';
+            if !before_ok || !after_ok {
+                continue;
+            }
+            if !code[at..at + 6].iter().all(|c| *c) {
+                continue;
+            }
+            let tail = src[at + 6..].trim_start_matches([' ', '\t']);
+            if !(tail.starts_with('{')
+                || tail.starts_with("fn")
+                || tail.starts_with("impl")
+                || tail.starts_with("extern")
+                || tail.starts_with("trait"))
+            {
+                continue;
+            }
+            let li = starts.partition_point(|s| *s <= at).saturating_sub(1);
+            out.push((li, src.lines().nth(li).unwrap_or("").trim().to_string()));
+        }
+        out
+    }
+
+    /// The `// SAFETY:` justification must sit within the eight lines above
+    /// the occurrence (the workspace convention for blocks and `unsafe fn`s).
+    fn safety_declared(src: &str, line: usize) -> bool {
+        let lines: Vec<&str> = src.lines().collect();
+        let lo = line.saturating_sub(8);
+        lines[lo..=line.min(lines.len().saturating_sub(1))]
+            .iter()
+            .any(|l| l.contains("SAFETY:"))
+    }
+
+    fn allow_attr_occurrences(src: &str) -> usize {
+        let bytes = src.as_bytes();
+        let code = code_mask(src);
+        let mut n = 0usize;
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find("allow(unsafe_code)") {
+            let at = from + rel;
+            from = at + 1;
+            if code[at..at + "allow(unsafe_code)".len()].iter().all(|c| *c) {
+                n += 1;
+            }
+        }
+        let _ = bytes;
+        n
+    }
+
+    /// A file's unsafe-policy offenders: sites outside the enumerated
+    /// locations, missing SAFETY comments, and count/documented mismatches.
+    fn unsafe_policy_offenders(rel: &str, src: &str) -> Vec<String> {
+        let normalized = normalize_rel(rel);
+        let expected = UNSAFE_ALLOWED_FILES
+            .iter()
+            .find(|(file, _)| *file == normalized.as_str());
+        let sites = unsafe_sites_in(src);
+        let mut offenders = Vec::new();
+        if sites.is_empty() {
+            if let Some((_, want)) = expected {
+                offenders.push(format!(
+                    "{normalized}: documented unsafe location has zero unsafe sites (stale entry)"
+                ));
+                let _ = want;
+            }
+            return offenders;
+        }
+        match expected {
+            None => {
+                for (line, text) in &sites {
+                    offenders.push(format!(
+                        "{normalized}:{}: unsafe outside the enumerated authority locations: {text}",
+                        line + 1
+                    ));
+                }
+            }
+            Some((_, want)) => {
+                let seen = allow_attr_occurrences(src);
+                if seen != *want {
+                    offenders.push(format!(
+                        "{normalized}: {seen} `allow(unsafe_code)` attribute(s), documented {want}; \
+                         a new allow location requires updating the static policy"
+                    ));
+                }
+                for (line, text) in &sites {
+                    if !safety_declared(src, *line) {
+                        offenders.push(format!(
+                            "{normalized}:{}: unsafe without a preceding `// SAFETY:` comment: {text}",
+                            line + 1
+                        ));
+                    }
+                }
+            }
+        }
+        offenders
+    }
+
+    #[test]
+    fn unsafe_code_lives_only_in_the_enumerated_authority_locations() {
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for rel in crate_rs_files_all() {
+            let path = repo_root().join(&rel);
+            let Ok(src) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            scanned += 1;
+            offenders.extend(unsafe_policy_offenders(&rel, &src));
+        }
+        // Every documented location must exist on disk (stale entries are
+        // red, never silently skipped).
+        for (file, _) in UNSAFE_ALLOWED_FILES {
+            if !repo_root().join(file).is_file() {
+                offenders.push(format!("{file}: documented unsafe location does not exist"));
+            }
+        }
+        assert_no_offenders(
+            "unsafe/OS-boundary policy: ordinary crates must contain no `unsafe`; \
+             authority locations are enumerated exactly and every unsafe block/function \
+             needs a `// SAFETY:` comment",
+            &offenders,
+            scanned,
+            50,
+        );
+    }
+
+    #[test]
+    fn unsafe_scan_fires_on_new_sites_allows_and_missing_justification() {
+        // A new unsafe site in an ordinary crate is an offender.
+        let planted = "pub fn f() {\n    unsafe { libc::kill(0, 0) }\n}\n";
+        assert!(
+            !unsafe_policy_offenders("crates/evil/src/lib.rs", planted).is_empty(),
+            "a planted unsafe site outside the authority list must fire"
+        );
+        // The documented file with an extra UNJUSTIFIED site fires even
+        // though its allow count is right.
+        let unjustified = "pub fn f() {\n    unsafe { libc::kill(0, 0) }\n}\n";
+        let file = "crates/session/src/actor.rs";
+        let offenders = unsafe_policy_offenders(file, unjustified);
+        assert!(
+            offenders.iter().any(|o| o.contains("SAFETY:")),
+            "missing SAFETY must fire: {offenders:?}"
+        );
+        // The same site WITH a SAFETY comment passes the site check (the
+        // allow-count check is independent and needs the documented count).
+        let justified = "pub fn f() {\n    // SAFETY: zero-signal probe on a live pid.\n    #[allow(unsafe_code)]\n    unsafe { libc::kill(0, 0) }\n}\n";
+        let offenders = unsafe_policy_offenders(file, justified);
+        assert!(
+            !offenders.iter().any(|o| o.contains("SAFETY:")),
+            "a justified site must not be a SAFETY offender: {offenders:?}"
+        );
+        // A comment that merely names unsafe never counts as a site.
+        assert!(unsafe_sites_in("// unsafe { inside a comment }\nfn f() {}\n").is_empty());
+        assert!(unsafe_sites_in("fn f() -> &'static str { \"unsafe { x }\" }\n").is_empty());
+        assert!(
+            unsafe_sites_in("fn f() -> &'static str { \"x\" } // unsafe fn trailing\n").is_empty()
+        );
+    }
+
+    /// The workspace lint configuration itself: every member opts into the
+    /// workspace `unsafe_code = "deny"`, and no member re-allows it at the
+    /// package level (the only allows are the code-level, enumerated ones).
+    #[test]
+    fn workspace_lint_config_denies_unsafe_code_for_every_member() {
+        let root_manifest =
+            std::fs::read_to_string(repo_root().join("Cargo.toml")).expect("workspace Cargo.toml");
+        assert!(
+            root_manifest.contains("[workspace.lints.rust]"),
+            "workspace lints must define the rust lint set"
+        );
+        assert!(
+            root_manifest.contains("unsafe_code = \"deny\""),
+            "the workspace must deny unsafe_code"
+        );
+        let members = {
+            let at = root_manifest.find("members = [").expect("members list");
+            let body = &root_manifest[at + "members = [".len()..];
+            let end = body.find(']').expect("members terminator");
+            body[..end]
+                .split(',')
+                .filter_map(|entry| {
+                    let entry = entry.trim();
+                    let entry = entry.strip_prefix('"')?.strip_suffix('"')?;
+                    Some(entry.to_string())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(members.len() > 40, "workspace member walk is not empty");
+        for member in &members {
+            let manifest_path = repo_root().join(member).join("Cargo.toml");
+            let manifest = std::fs::read_to_string(&manifest_path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", manifest_path.display()));
+            assert!(
+                !manifest.contains("unsafe_code = \"allow\""),
+                "{member}: a package-level unsafe_code allow would bypass the policy; \
+                 use a narrow #[allow(unsafe_code)] in the enumerated location instead"
+            );
+            let inherits = manifest.contains("[lints]") && manifest.contains("workspace = true");
+            let manual_deny = manifest.contains("unsafe_code = \"deny\"");
+            assert!(
+                inherits || manual_deny,
+                "{member}: must opt into the workspace lints ([lints] workspace = true) or \
+                 deny unsafe_code manually"
+            );
+        }
     }
 }

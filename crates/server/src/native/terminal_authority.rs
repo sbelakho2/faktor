@@ -41,12 +41,12 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use faktor_core::capability::{Capability, CapabilityKind, CapabilitySet, PermissionDecision};
 use faktor_core::id::{OpId, SessionId, TaskId};
 use faktor_pty::{EnvSpec, Pty, PtyConfig};
-use faktor_sandbox::{PermissionEngine, Rule, SandboxPolicy};
+use faktor_sandbox::{PermissionEngine, Rule, SandboxGuarantee, SandboxPolicy, ShellExecutionMode};
 use faktor_session::{
     SessionHandle, SessionManager, TerminalDurableRow, TerminalEventKind, TerminalLedgerRecord,
     TERMINAL_RECONCILE_COLLECTED, TERMINAL_RECONCILE_KILLED,
 };
-use faktor_terminal::{BudgetEnforcement, BudgetPlatform, TreeBudgetGuard};
+use faktor_terminal::{BudgetEnforcement, BudgetPlatform, NetworkIsolation, TreeBudgetGuard};
 use serde::{Deserialize, Serialize};
 
 /// Bound of one terminal command / arg / cwd (bytes; mirrors the ACP param
@@ -290,6 +290,13 @@ pub struct ExecutionProfile {
     pub filesystem: String,
     /// The network guarantee tag (`none` | `best_effort` | `required`).
     pub network: String,
+    /// The shell-execution contract tag (`os_isolated` |
+    /// `network_capable_user_granted`) the spawn was admitted under: NEVER
+    /// presented as equivalent strength to OS isolation. Legacy rows
+    /// (written before the tag existed) default to the empty string — no
+    /// tag is fabricated for evidence that never recorded one.
+    #[serde(default)]
+    pub shell: String,
     /// The REQUESTED budgets of the profile.
     pub budgets: TerminalBudgets,
     /// Whether the profile was enforced STRICTLY: a requested limit the
@@ -330,8 +337,9 @@ impl ExecutionProfile {
 }
 
 /// A spawn admitted by an [`ExecutionAuthority`]: the resolved command, the
-/// authorized cwd and env-name projection, and the effective profile. A PTY
-/// is created ONLY from this value.
+/// authorized cwd and env-name projection, the effective profile, and the
+/// spawn-layer network-isolation requirement the policy derived. A PTY is
+/// created ONLY from this value.
 #[derive(Debug, Clone)]
 pub struct AuthorizedTerminalSpawn {
     command: String,
@@ -341,6 +349,10 @@ pub struct AuthorizedTerminalSpawn {
     rows: u16,
     cols: u16,
     profile: ExecutionProfile,
+    /// The policy-derived spawn requirement: `Required` guarantee →
+    /// [`NetworkIsolation::DenyAll`]. The spawn layer ENFORCES it or refuses
+    /// typed before any child exists.
+    network_isolation: NetworkIsolation,
 }
 
 impl AuthorizedTerminalSpawn {
@@ -372,6 +384,14 @@ impl AuthorizedTerminalSpawn {
 
     pub fn profile(&self) -> &ExecutionProfile {
         &self.profile
+    }
+
+    /// The spawn-layer network-isolation requirement this admitted spawn
+    /// carries (audit P0-39): `Required` → [`NetworkIsolation::DenyAll`],
+    /// anything else inherits. The spawn site either enforces it or refuses
+    /// typed BEFORE exec — never a warn-and-run downgrade.
+    pub fn network_isolation(&self) -> NetworkIsolation {
+        self.network_isolation
     }
 
     /// The PtyConfig of this admitted spawn. The env authority is the ONE
@@ -515,8 +535,23 @@ impl Default for TerminalAuthorityPolicy {
             // policy allows ExecuteShell by default (the interactive `Ask`
             // rule of the tool path does not apply to an already-proven
             // session-owned terminal).
+            //
+            // Phase D shell contract: a session terminal is the user's OWN
+            // interactive shell, requested through the authenticated
+            // native/ACP control surface, so this production policy carries
+            // the EXPLICIT user-granted network-capable shape. The crate's
+            // secure `Required`/`OsIsolated` default governs untrusted tool
+            // shell execution; pushing it into this PTY layer (which has no
+            // per-process network-isolation backend) would refuse every
+            // interactive terminal. The durable profile records the weaker
+            // mode honestly (`network: "none"`,
+            // `shell: "network_capable_user_granted"`), and a policy that
+            // really demands `Required` still refuses the spawn typed at
+            // the PTY layer (never a warn-and-run downgrade).
             sandbox: SandboxPolicy {
                 execute_shell: Rule::Allow,
+                network_guarantee: SandboxGuarantee::None,
+                shell_execution: ShellExecutionMode::NetworkCapableUserGranted,
                 ..SandboxPolicy::default()
             },
             budgets: TerminalBudgets::default(),
@@ -753,6 +788,8 @@ impl ExecutionAuthority for SessionExecutionAuthority {
             }
         }
         let spawn_profile = self.policy.sandbox.spawn_profile();
+        let network_isolation =
+            NetworkIsolation::from(self.policy.sandbox.network_guarantee.network_requirement());
         let profile = ExecutionProfile {
             session_id: sid.raw(),
             task_id: row.task_id.raw(),
@@ -763,6 +800,7 @@ impl ExecutionAuthority for SessionExecutionAuthority {
             capabilities: self.policy.granted.to_string(),
             filesystem: spawn_profile.filesystem,
             network: spawn_profile.network,
+            shell: spawn_profile.shell,
             budgets,
             strict_budgets: self.policy.strict_budgets,
             budget_enforcement: None,
@@ -777,6 +815,7 @@ impl ExecutionAuthority for SessionExecutionAuthority {
             rows: request.rows,
             cols: request.cols,
             profile,
+            network_isolation,
         })
     }
 }
@@ -1660,6 +1699,21 @@ impl TerminalService {
     ) -> Result<TerminalCreation, TerminalServiceError> {
         let mut profile = authorized.profile().clone();
         let task_id = TaskId::new(profile.task_id);
+        // Fail-closed spawn-layer gate (audit P0-39): the policy DECIDES the
+        // network-isolation requirement; this PTY layer ENFORCES it or
+        // refuses typed BEFORE any child exists. A `DenyAll` request demands
+        // OS-level network isolation, which the interactive PTY backends do
+        // not provide on any platform — so the spawn is refused typed with
+        // the canonical "sandbox unavailable" wording, never a warn-and-run
+        // unenforced shell (no PTY, no child, no durable row).
+        if authorized.network_isolation() == NetworkIsolation::DenyAll {
+            return Err(TerminalServiceError::Denied(format!(
+                "sandbox unavailable: refusing spawn under NetworkIsolation::DenyAll of `{}` \
+                 BEFORE spawn: this PTY layer provides no per-process network-isolation \
+                 backend; never running the child unenforced",
+                authorized.command()
+            )));
+        }
         let cfg = authorized.to_pty_config();
         let pty = Pty::spawn(&cfg).map_err(|e| TerminalServiceError::Refused(e.message))?;
         let pid = pty.pid();
@@ -2873,6 +2927,82 @@ mod tests {
     }
 
     #[test]
+    fn required_network_guarantee_refuses_the_pty_spawn_typed_before_any_child_exists() {
+        // Phase D (audit P0-39): the crate-default `SandboxPolicy` demands
+        // OS-level network isolation (`Required` + `os_isolated`). The
+        // interactive PTY layer has no per-process network-isolation
+        // backend on any platform, so a spawn under that verbatim policy
+        // must be refused TYPED before any child exists — never a
+        // warn-and-run unenforced shell. (The production daemon terminal
+        // policy carries the explicit user-granted shape instead; see the
+        // profile test above.)
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("candidate");
+        std::fs::create_dir_all(&root).unwrap();
+        let (manager, sid) = manager_at(dir.path(), &root, "authority-required-refusal");
+        let policy = TerminalAuthorityPolicy {
+            sandbox: SandboxPolicy {
+                execute_shell: Rule::Allow,
+                // Verbatim secure default: Required + OsIsolated.
+                ..SandboxPolicy::default()
+            },
+            ..TerminalAuthorityPolicy::default()
+        };
+        assert_eq!(policy.sandbox.network_guarantee, SandboxGuarantee::Required);
+        assert_eq!(
+            policy.sandbox.shell_execution,
+            ShellExecutionMode::OsIsolated
+        );
+        assert!(
+            policy.sandbox.validate().is_ok(),
+            "the secure pairing is valid"
+        );
+
+        // Authority level: the admitted spawn carries the DenyAll
+        // requirement (the policy→spawn mapping is the one locus) and the
+        // profile evidence names the OS-isolation demand honestly.
+        let authority = SessionExecutionAuthority::with_policy(manager.clone(), policy.clone());
+        let request = spawn_request("/bin/sh", &["-c", "true"]);
+        let admitted = authority
+            .authorize_terminal_spawn(&principal_of(&manager, &sid), &sid, &request)
+            .expect("the admission itself records the profile");
+        assert_eq!(admitted.network_isolation(), NetworkIsolation::DenyAll);
+        assert_eq!(admitted.profile().network, "required");
+        assert_eq!(admitted.profile().shell, "os_isolated");
+
+        // Spawn level: typed refusal, no PTY, no child body, nothing
+        // journaled.
+        let marker = root.join("required-body-ran.txt");
+        let program = format!("echo ran > {}", marker.display());
+        let request = spawn_request("/bin/sh", &["-c", program.as_str()]);
+        let service = service_with_policy(&manager, policy);
+        match service.spawn(&sid, &request) {
+            Err(TerminalServiceError::Denied(message)) => {
+                assert!(message.contains("sandbox unavailable"), "{message}");
+                assert!(message.contains("DenyAll"), "{message}");
+                assert!(message.contains("unenforced"), "{message}");
+            }
+            other => panic!(
+                "a Required policy must refuse the PTY spawn typed: {:?}",
+                other.err()
+            ),
+        }
+        assert_eq!(service.live_rows(), 0);
+        assert!(
+            !marker.exists(),
+            "the refused child never exec'd its program body"
+        );
+        let handle = manager
+            .get_session(SessionId::new(sid.parse().unwrap()))
+            .unwrap()
+            .unwrap();
+        assert!(
+            handle.ledger_terminal_rows(None).unwrap().is_empty(),
+            "a sandbox-refused spawn journals nothing"
+        );
+    }
+
+    #[test]
     fn authorized_spawn_records_the_exact_profile_durably_and_it_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("candidate");
@@ -2880,6 +3010,12 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         let (manager, sid) = manager_at(dir.path(), &root, "authority-profile");
         let (probe, _map) = recording_probe();
+        // The PRODUCTION authority (`SessionExecutionAuthority::new` over
+        // `TerminalAuthorityPolicy::default()`): the daemon terminal policy
+        // carries the explicit user-granted network-capable shell, so the
+        // spawn is admitted (no sandbox refusal) and the durable profile
+        // records that honest, strictly-weaker mode — never an OS-isolation
+        // claim the PTY layer does not enforce.
         let service = TerminalService::with_execution_authority(
             manager.clone(),
             probe,
@@ -2907,6 +3043,10 @@ mod tests {
         assert_eq!(profile.capabilities, "*");
         assert_eq!(profile.filesystem, "workspace+external:ask-ask");
         assert_eq!(profile.network, "none");
+        assert_eq!(
+            profile.shell, "network_capable_user_granted",
+            "the durable row records the explicit user-granted shell shape, never os_isolated"
+        );
         assert_eq!(profile.budgets, TerminalBudgets::default());
         assert_eq!(
             profile.env_names,
@@ -3029,6 +3169,10 @@ mod tests {
         assert!(!profile.strict_budgets);
         assert_eq!(profile.budgets.wall_time_ms, 3000);
         assert_eq!(profile.budgets.max_processes, 2);
+        assert!(
+            profile.shell.is_empty(),
+            "a legacy row never recorded a shell tag: no tag is fabricated"
+        );
     }
 
     #[test]

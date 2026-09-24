@@ -980,7 +980,8 @@ async fn an_incomplete_release_dir_is_never_adopted_and_current_stays_previous()
 
 /// Re-materializing rebuilds an incomplete directory atomically (the temp is
 /// complete before the old directory is touched), leaves exactly the two
-/// release files, and clears stale `.kp-tmp-` residue.
+/// release files, and clears stale atomic-temp residue of BOTH spellings
+/// (legacy `.kp-tmp-*` crash residue and the current `.faktor-tmp-*`).
 #[tokio::test]
 async fn rematerializing_rebuilds_an_incomplete_release_and_clears_temp_residue() {
     let host = fixture([]);
@@ -995,14 +996,20 @@ async fn rematerializing_rebuilds_an_incomplete_release_and_clears_temp_residue(
         .await
         .unwrap();
     let layout = host.updater.layout();
-    // Crash residue: no manifest, plus a stale partial temp dir from the
-    // interrupted materialization.
+    // Crash residue: no manifest, plus stale partial temp dirs from
+    // interrupted materializations under both spellings (an older release
+    // wrote `.kp-tmp-*`; the current writer mints `.faktor-tmp-*`).
     std::fs::remove_file(layout.release_manifest(&staged.release_id)).unwrap();
-    let stale = layout
+    let stale_legacy = layout
         .versions_dir()
         .join(format!(".{}.kp-tmp-999-1", staged.release_id));
-    std::fs::create_dir_all(&stale).unwrap();
-    std::fs::write(stale.join("faktor"), b"partial").unwrap();
+    let stale_faktor = layout
+        .versions_dir()
+        .join(format!(".{}.faktor-tmp-999-2", staged.release_id));
+    for stale in [&stale_legacy, &stale_faktor] {
+        std::fs::create_dir_all(stale).unwrap();
+        std::fs::write(stale.join("faktor"), b"partial").unwrap();
+    }
 
     let dir = layout
         .materialize_release(
@@ -1020,12 +1027,19 @@ async fn rematerializing_rebuilds_an_incomplete_release_and_clears_temp_residue(
         std::fs::read(layout.release_manifest(&staged.release_id)).unwrap(),
         signed
     );
-    assert!(!stale.exists(), "stale temp residue is cleared");
+    assert!(
+        !stale_legacy.exists(),
+        "legacy stale temp residue is cleared"
+    );
+    assert!(
+        !stale_faktor.exists(),
+        "Faktor stale temp residue is cleared"
+    );
     let temps: Vec<String> = std::fs::read_dir(layout.versions_dir())
         .unwrap()
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().to_string())
-        .filter(|name| name.contains(".kp-tmp-"))
+        .filter(|name| name.contains(".faktor-tmp-") || name.contains(".kp-tmp-"))
         .collect();
     assert!(temps.is_empty(), "no temp residue survives: {temps:?}");
     let mut entries: Vec<String> = std::fs::read_dir(&dir)

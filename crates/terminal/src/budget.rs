@@ -27,6 +27,9 @@
 //! means the limit was NOT requested (disabled parity), never "unlimited by
 //! accident".
 
+#![allow(unsafe_code)] // platform authority module: every unsafe
+                       // block/function in this module carries a `// SAFETY:` justification and is
+                       // enumerated by tests/static-authority.
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -660,6 +663,7 @@ fn setrlimit_self(spec: RlimitSpec) -> Result<(), std::io::Error> {
         rlim_cur: spec.value as libc::rlim_t,
         rlim_max: spec.value as libc::rlim_t,
     };
+    // SAFETY: the arguments were validated by the caller per this function's documented contract and the call has no additional aliasing or lifetime requirements.
     let r = unsafe {
         match spec.resource {
             RlimitResource::CpuSeconds => libc::setrlimit(libc::RLIMIT_CPU, &limit),

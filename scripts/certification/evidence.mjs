@@ -466,6 +466,7 @@ const WORKFLOWS = {
   nightly: {
     expected: [
       'fault-scale',
+      'soak',
       'longrun',
       'efficiency',
       'economy',

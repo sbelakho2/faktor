@@ -516,6 +516,110 @@ selftest.
 `scripts/woodpecker/setup.md` documents the two-project layout, the exact
 server-side settings and UI steps, and what a PR diff cannot change.
 
+### 2.12 Exact-SHA CI certification (`scripts/certify.sh`)
+
+Local green gates are necessary but never sufficient. The release gate for
+an exact commit is the required Woodpecker context `ci/woodpecker/pr/pr`
+(the untrusted PR workflow's status; the context string is fixed by
+`WOODPECKER_STATUS_CONTEXT_FORMAT`, see `docs/ci-enforcement.md` §2 and
+`scripts/woodpecker/setup.md` §7).
+
+`bash scripts/certify.sh [--commit <40-hex-sha>]` runs the local cargo gates
+and then verifies CI over the Woodpecker API for the exact shipped commit:
+
+1. `GET /api/repos/lookup/{owner}/{repo}` resolves the repository id
+   (`--repo owner/name` / `WOODPECKER_REPO`, or `WOODPECKER_REPO_ID`).
+2. `GET /api/repos/{id}/pipelines?event=pull_request&per_page=50` is filtered
+   to the exact commit SHA; `--pipeline <number>` may select one explicitly
+   (it must still belong to the same SHA).
+3. `GET /api/repos/{id}/pipelines/{number}` must contain the `pr` workflow
+   with state `success` (pipeline status must agree).
+
+It fails on `context-absent` (no pipeline for the SHA, or pipelines that
+belong to another SHA), `context-pending` (`pending/running/blocked/...`),
+`context-failure` (`failure/killed/canceled/declined/skipped`),
+`context-error` (`error`) and `context-unknown`. Without
+`WOODPECKER_HOST`/`WOODPECKER_TOKEN` it exits 2 with explicit operator
+instructions — never a silent pass. `--local-only` runs the cargo gates and
+prints that the result is **not** a release certificate.
+
+Pass and fail both write `target/certification/release-manifest.json`
+(`faktor-release-certification/v1`): repository, exact commit, exact tree
+(`git rev-parse '<sha>^{tree}'`), context, pipeline number/status, `pr`
+workflow state, run URL (`<host>/repos/<id>/pipeline/<number>`), the sha256
+of every packaged artifact (`--artifact PATH`, or auto-discovered
+`.vsix`/plugin-zip/`target/release/faktor-cli`) with an `artifact_digest`,
+and an `evidence_digest` = sha256 of the canonical JSON of the verification
+core (context, commit, tree, run, statuses, artifacts). Rejection codes are
+recorded in `problems[]`.
+
+`bash scripts/certify.sh --selftest` proves the whole matrix hermetically
+against the mock API in
+`scripts/certification/fixtures/woodpecker-api/mock_server.py`: success,
+absent, other-SHA, pending, failure, error, wrong-workflow, missing
+credentials (operator error), manifest field binding and deterministic
+evidence digest.
+
+**Commit-message claims are not evidence.** A commit message, PR
+description, local test run, or any boolean environment flag never
+certifies: only the required context succeeding at the exact commit SHA
+does. The manifest's `evidence_policy` field states this, and the digest
+binds the record to the exact SHA/tree it was observed for.
+
+### 2.13 Ignored-test inventory and nightly lanes
+
+Every `#[ignore]`d test is inventoried by `node
+scripts/check-ignored-tests.mjs` against
+`scripts/certification/ignored-tests.json`:
+
+- the ignore reason must start with one of the documented tags
+  `[fault] [soak] [security] [release] [perf] [live-paid]` (plus the
+  AGENTS.md `[visual]` baseline category);
+- every test must be either assigned to a lane or documented as
+  manual/live-paid with a reason (the Windows re-exec helper is registered
+  under `non_test`);
+- lane assignment is checked executably: the lane's step must exist in
+  `.woodpecker/trusted/nightly.yaml` (fault/release/soak) or
+  `.woodpecker/trusted/trusted.yaml` (`perf`), the recorded command must
+  match the step verbatim, and the command must select (`-p <package>`) the
+  package that owns the test file;
+- both drift directions fail: a discovered ignored test with no entry is
+  `unassigned`, and an entry whose test no longer exists is
+  `stale-registry`.
+
+Nightly lanes: `fault-scale` runs `faktor-tests-fault` + `faktor-updater`
+ignored tests, `soak` runs the bounded keyless `[soak]` set
+(`faktor-tests-accounting-modelcheck`), and `longrun` is the release lane;
+the key-gated `coding-benchmark-real-model` step is the live-paid lane. The
+12h/24h/10 GiB wall-clock soaks stay manual by design and are recorded as
+such in the registry. The certificate jobs run the inventory check first,
+and `--selftest` proves the planted-violation fixtures under
+`scripts/certification/fixtures/ignored-tests/` (an unassigned ignored test
+fails with `unassigned`; an unconventional tag fails with
+`unconventional-tag`).
+
+### 2.14 Image pins and Gradle integrity
+
+- Every container image in `.woodpecker/**` is pinned by multi-arch index
+  digest; `sh scripts/check-ci-image-pins.sh` (the `image-pins` step in the
+  PR and trusted workflows) fails on any `image:` line without `@sha256:`.
+  The Windows self-hosted `powershell` shell image is the only line allowed
+  to carry an explicit `digest-exempt: <reason>` annotation.
+- `apps/jetbrains/gradle/wrapper/gradle-wrapper.properties` pins
+  `distributionSha256Sum` for `gradle-9.7.1-bin.zip`
+  (`acd53f1e…f804d20a`, cross-checked against
+  `https://services.gradle.org/distributions/gradle-9.7.1-bin.zip.sha256`
+  on 2026-09-24). `bash scripts/check-gradle-integrity.sh` (run in the
+  JetBrains build lane before `./gradlew`) verifies that checksum, the
+  committed wrapper JAR against the published
+  `gradle-9.7.1-wrapper.jar.sha256`, the dependency verification metadata
+  (present, sha256-checked, no `<trusted-artifacts>` bypass) and the
+  committed `gradle.lockfile` per subproject. The metadata records both the
+  CI `linux/amd64` IntelliJ Platform distribution and the aarch64 one, so
+  strict verification works on the CI agent and on arm64 developer hosts.
+  Regenerate deliberately with `./gradlew --write-locks
+  --write-verification-metadata sha256 :frontend:buildPlugin`.
+
 ---
 
 ## 3. Honest current status
@@ -871,6 +975,13 @@ Concretely, to ship:
    `ui_parity` requires every executable axis of the Faktor-owned UI.
    `BLOCKED_EXTERNAL`/`PARTIAL` surfaces are carried into the release
    notes; no claim is made for unproven assets.
+8. `bash scripts/certify.sh --commit <sha>` (see §2.12) verifies the
+   required Woodpecker context `ci/woodpecker/pr/pr` at that exact SHA and
+   writes `target/certification/release-manifest.json` with
+   `"status": "passed"` and an empty `problems[]`, binding commit, tree,
+   context, run URL, artifact digests and the certification evidence
+   digest. Missing API credentials are an operator error (exit 2), never a
+   pass; commit-message claims and local flags are not evidence.
 
 Any new commit — including a docs-only change — invalidates the previous
 certificate and requires a fresh run.

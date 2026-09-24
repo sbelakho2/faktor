@@ -54,6 +54,11 @@ use crate::payload::PayloadDir;
 /// Bound on one staged payload file (the runtime's own payload bound).
 const MAX_STAGED_PAYLOAD_BYTES: usize = faktor_worker::MAX_PAYLOAD_BYTES;
 
+/// Documented wall-clock budget for ONE worker control-plane request
+/// (register/heartbeat/claim/submit): head, idle and total all bound by this
+/// value, so a stalled control plane can never park a worker forever.
+const WORKER_CONTROL_TIMEOUT_MS: u64 = 30_000;
+
 fn load_config(data_dir: &Path, config_path: Option<PathBuf>) -> Result<Config, String> {
     let path = config_path.unwrap_or_else(|| data_dir.join("faktor-plus.json"));
     if !path.exists() {
@@ -197,13 +202,22 @@ impl HttpWorkerTransport {
     ) -> Result<serde_json::Value, WorkerRuntimeError> {
         let url = format!("{}{}", self.base, path);
         let mut request = RawRequest::new(method, url)
+            .route(faktor_provider::egress::RouteLabel::WorkerControlPlane)
             .header("authorization", format!("Bearer {}", self.token.expose()));
         if let Some(body) = body {
-            request = request.json_body(&body);
+            request = request
+                .json_body(&body)
+                .map_err(|e| WorkerRuntimeError::Transport(e.to_string()))?;
         }
+        // The control-plane call is materialized under an explicit budget:
+        // a stalled control plane can never park a worker forever.
+        let budget = faktor_provider::egress::ResponseBudget::for_timeout(
+            std::time::Duration::from_millis(WORKER_CONTROL_TIMEOUT_MS),
+            faktor_provider::egress::MAX_RAW_RESPONSE_BYTES as u64,
+        );
         let response = self
             .runtime
-            .block_on(execute_raw(&*self.transport, request))
+            .block_on(execute_raw(&*self.transport, request, &budget))
             .map_err(|e| WorkerRuntimeError::Transport(e.to_string()))?;
         let status = response.status;
         let text = response.body_text();

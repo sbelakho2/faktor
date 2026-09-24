@@ -44,7 +44,12 @@ pub enum SandboxGuarantee {
     /// BEFORE exec. Policy code never pre-judges platform capability — a
     /// permitted shell under `ExecuteShell` + `Network(deny)` would
     /// otherwise open its own sockets, so an unenforceable requirement is
-    /// a spawn refusal, never a warn-and-run downgrade.
+    /// a spawn refusal, never a warn-and-run downgrade. THE SECURE DEFAULT
+    /// for untrusted shell execution: platforms with no backend
+    /// (macOS/Windows today) refuse the shell typed instead of running it
+    /// unenforced; Windows Job Objects are process containment, never
+    /// network security.
+    #[default]
     Required,
     /// Best-effort: commands run behind the existing app-level capability
     /// gates only and map to `Inherit` at the spawn seam. NETWORK_ISOLATION_NOTE:
@@ -52,12 +57,49 @@ pub enum SandboxGuarantee {
     /// under BestEffort — the capability engine stops app-level egress, but
     /// a permitted shell can still open sockets itself; no OS-level deny
     /// backend backs this. The note is logged whenever a shell runs under
-    /// this guarantee.
+    /// this guarantee. Explicit opt-in only: this is the shape a
+    /// user-granted network-capable shell carries.
     BestEffort,
     /// No network-isolation guarantee is claimed by this policy; commands
-    /// map to `Inherit`. The host documents its own threat model.
-    #[default]
+    /// map to `Inherit`. Explicit opt-in only (the user-granted
+    /// network-capable shell shape).
     None,
+}
+
+/// The shell-execution contract of a policy: the honest, surfaced
+/// distinction between an OS-isolated shell and a network-capable shell the
+/// user explicitly granted. The two are NEVER presented as equivalent
+/// strength — [`SpawnProfile::shell`] and the doctor surface carry this
+/// exact tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellExecutionMode {
+    /// Shell children run with OS-level network isolation REQUIRED
+    /// (`SandboxGuarantee::Required`). The secure default; on platforms
+    /// without a backend the spawn is refused typed, never downgraded.
+    #[default]
+    OsIsolated,
+    /// The user EXPLICITLY granted a network-capable shell: children
+    /// inherit the daemon network namespace behind app-level gates only
+    /// (the [`NETWORK_ISOLATION_NOTE`] caveat applies). Strictly weaker
+    /// than [`ShellExecutionMode::OsIsolated`]; config that selects it is
+    /// explicit and the resulting state is surfaced as user-granted.
+    NetworkCapableUserGranted,
+}
+
+impl ShellExecutionMode {
+    /// The stable snake_case tag (also its serde tag).
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            ShellExecutionMode::OsIsolated => "os_isolated",
+            ShellExecutionMode::NetworkCapableUserGranted => "network_capable_user_granted",
+        }
+    }
+
+    /// True when the OS-level isolation guarantee is required.
+    pub const fn is_os_isolated(self) -> bool {
+        matches!(self, ShellExecutionMode::OsIsolated)
+    }
 }
 
 /// What the policy DEMANDS of the spawn layer (no platform detection here).
@@ -80,6 +122,11 @@ pub struct SpawnProfile {
     /// The typed network guarantee tag of the policy
     /// (`none|best_effort|required`).
     pub network: String,
+    /// The typed shell-execution contract tag (`os_isolated` |
+    /// `network_capable_user_granted`): NEVER presented as equivalent
+    /// strength — `network_capable_user_granted` is an explicit user grant
+    /// backed by app-level gates only.
+    pub shell: String,
 }
 
 impl SandboxGuarantee {
@@ -111,6 +158,73 @@ impl SandboxPolicy {
         SpawnProfile {
             filesystem,
             network: self.network_guarantee.as_tag().to_string(),
+            shell: self.shell_execution.as_tag().to_string(),
+        }
+    }
+
+    /// The validated shell-execution contract of this policy: the single
+    /// surface doctor/UI state reads. The pairing is enforced by
+    /// [`SandboxPolicy::validate`]; this accessor is total and never
+    /// presents the user-granted mode as equivalent to OS isolation.
+    pub fn shell_execution_state(&self) -> ShellExecutionState {
+        ShellExecutionState {
+            mode: self.shell_execution,
+            network_guarantee: self.network_guarantee,
+        }
+    }
+
+    /// Validate the policy's internal contract: `OsIsolated` requires the
+    /// `Required` guarantee (so a spawn either isolates or refuses typed),
+    /// and the user-granted network-capable shell requires a non-`Required`
+    /// guarantee (an explicit, strictly-weaker grant). Config boundaries
+    /// call this; a violation is a typed refusal, never a silent
+    /// reinterpretation of either mode.
+    pub fn validate(&self) -> Result<(), String> {
+        match (self.shell_execution, self.network_guarantee) {
+            (ShellExecutionMode::OsIsolated, SandboxGuarantee::Required) => Ok(()),
+            (
+                ShellExecutionMode::NetworkCapableUserGranted,
+                SandboxGuarantee::BestEffort | SandboxGuarantee::None,
+            ) => Ok(()),
+            (ShellExecutionMode::OsIsolated, other) => Err(format!(
+                "shell execution 'os_isolated' requires network_guarantee 'required', got \
+                 '{}'; set [sandbox] shell = \"network_capable_user_granted\" to grant a \
+                 network-capable shell explicitly (app-level only)",
+                other.as_tag()
+            )),
+            (ShellExecutionMode::NetworkCapableUserGranted, other) => Err(format!(
+                "shell execution 'network_capable_user_granted' conflicts with \
+                 network_guarantee '{}'; a user-granted network-capable shell cannot carry \
+                 the OS-isolation requirement (set network_guarantee to \"none\" or \
+                 \"best_effort\")",
+                other.as_tag()
+            )),
+        }
+    }
+}
+
+/// The surfaced shell-execution state (doctor/UI): the mode plus the
+/// guarantee that backs it. [`ShellExecutionState::strength_label`] is the
+/// honest one-line description any surface must print.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ShellExecutionState {
+    pub mode: ShellExecutionMode,
+    pub network_guarantee: SandboxGuarantee,
+}
+
+impl ShellExecutionState {
+    /// The honest strength label: OS isolation or an explicit user grant
+    /// that is app-level only — never both "equivalent network safety".
+    pub fn strength_label(&self) -> &'static str {
+        match self.mode {
+            ShellExecutionMode::OsIsolated => {
+                "OS-isolated shell (network_guarantee=required; spawn refused typed where no \
+                 OS backend exists)"
+            }
+            ShellExecutionMode::NetworkCapableUserGranted => {
+                "network-capable shell GRANTED BY USER (app-level gates only; NOT equivalent \
+                 to OS isolation and NOT a network guarantee)"
+            }
         }
     }
 }
@@ -278,10 +392,21 @@ pub struct SandboxPolicy {
     /// `DenyAll`: the terminal crate runs the child isolated or refuses
     /// typed before exec (never a preflight guess and never a downgrade);
     /// `BestEffort` maps to `Inherit` with the documented app-level-only
-    /// caveat; `None` (default) claims nothing. Defaults to `None` so
-    /// existing policies keep their exact semantics.
+    /// caveat; `None` claims nothing. The secure DEFAULT is `Required`:
+    /// untrusted shell execution is OS-isolated by default, and a
+    /// network-capable shell must be granted explicitly (with
+    /// [`ShellExecutionMode::NetworkCapableUserGranted`]).
     #[serde(default)]
     pub network_guarantee: SandboxGuarantee,
+    /// The shell-execution contract of this policy. Defaults to
+    /// [`ShellExecutionMode::OsIsolated`] (requires `Required`); the
+    /// user-granted network-capable mode is an explicit opt-in that must
+    /// pair with a non-`Required` guarantee. [`SandboxPolicy::validate`]
+    /// enforces the pairing; the state is surfaced through
+    /// [`SandboxPolicy::shell_execution_state`] and
+    /// [`SpawnProfile::shell`].
+    #[serde(default)]
+    pub shell_execution: ShellExecutionMode,
 }
 
 impl Default for SandboxPolicy {
@@ -295,7 +420,11 @@ impl Default for SandboxPolicy {
             network: NetworkGate::default(),
             mcp: Rule::Allow,
             git: Rule::Allow,
-            network_guarantee: SandboxGuarantee::None,
+            // Secure default (item 10): untrusted shell execution demands
+            // OS-level network isolation; platforms without a backend
+            // refuse the spawn typed instead of running it unenforced.
+            network_guarantee: SandboxGuarantee::Required,
+            shell_execution: ShellExecutionMode::OsIsolated,
         }
     }
 }
@@ -966,11 +1095,13 @@ mod tests {
         assert_eq!(p, back);
         assert_eq!(back.network_guarantee, SandboxGuarantee::Required);
         // Pre-existing configs without the field still parse (serde
-        // default), with the documented default = None.
+        // default), with the documented secure default = Required.
         let mut v = serde_json::to_value(SandboxPolicy::default()).unwrap();
         v.as_object_mut().unwrap().remove("network_guarantee");
         let back: SandboxPolicy = serde_json::from_value(v).unwrap();
-        assert_eq!(back.network_guarantee, SandboxGuarantee::None);
+        assert_eq!(back.network_guarantee, SandboxGuarantee::Required);
+        assert_eq!(back.shell_execution, ShellExecutionMode::OsIsolated);
+        assert!(back.validate().is_ok());
     }
 
     // ------------- P0-39 network-isolation authority (policy -> spawn) ---
@@ -987,7 +1118,8 @@ mod tests {
         // the network guarantee tag is the policy's own.
         let profile = SandboxPolicy::default().spawn_profile();
         assert_eq!(profile.filesystem, "workspace+external:ask-ask");
-        assert_eq!(profile.network, "none");
+        assert_eq!(profile.network, "required");
+        assert_eq!(profile.shell, "os_isolated");
         // Deny-everything external ⇒ workspace-only.
         let locked = SandboxPolicy {
             read_external: Rule::Deny,
@@ -1000,6 +1132,7 @@ mod tests {
             SpawnProfile {
                 filesystem: "workspace".into(),
                 network: "required".into(),
+                shell: "os_isolated".into(),
             }
         );
         // Deterministic: the same policy projects the same profile, and the
@@ -1109,7 +1242,11 @@ mod tests {
         );
         assert_eq!(
             SandboxPolicy::default().network_guarantee,
-            SandboxGuarantee::None
+            SandboxGuarantee::Required
+        );
+        assert_eq!(
+            SandboxPolicy::default().shell_execution,
+            ShellExecutionMode::OsIsolated
         );
     }
 
@@ -1178,5 +1315,65 @@ mod tests {
             !mapping.contains("Required => NetworkIsolationRequirement::Inherit"),
             "no Required => Inherit path may exist"
         );
+    }
+
+    #[test]
+    fn secure_default_requires_os_isolation_for_shells() {
+        // Item 10: the untrusted-shell default is OS isolation (Required =>
+        // DenyAll at the spawn seam). Other platforms refuse the spawn
+        // typed; they never run the shell unenforced.
+        let p = SandboxPolicy::default();
+        assert_eq!(p.network_guarantee, SandboxGuarantee::Required);
+        assert_eq!(p.shell_execution, ShellExecutionMode::OsIsolated);
+        assert_eq!(
+            p.network_guarantee.network_requirement(),
+            NetworkIsolationRequirement::DenyAll
+        );
+        assert!(p.validate().is_ok());
+        let state = p.shell_execution_state();
+        assert_eq!(state.mode, ShellExecutionMode::OsIsolated);
+        assert!(state.strength_label().contains("OS-isolated"));
+        assert!(!state.strength_label().contains("GRANTED BY USER"));
+        assert_eq!(p.spawn_profile().shell, "os_isolated");
+    }
+
+    #[test]
+    fn user_granted_network_capable_shell_is_distinct_and_validated() {
+        // The full-functionality shell is an EXPLICIT user grant, strictly
+        // weaker than OS isolation, and its state label says so.
+        for guarantee in [SandboxGuarantee::BestEffort, SandboxGuarantee::None] {
+            let policy = SandboxPolicy {
+                execute_shell: Rule::Allow,
+                network_guarantee: guarantee,
+                shell_execution: ShellExecutionMode::NetworkCapableUserGranted,
+                ..Default::default()
+            };
+            assert!(policy.validate().is_ok(), "{guarantee:?}");
+            let state = policy.shell_execution_state();
+            assert_eq!(state.mode, ShellExecutionMode::NetworkCapableUserGranted);
+            assert!(state.strength_label().contains("GRANTED BY USER"));
+            assert!(state.strength_label().contains("NOT equivalent"));
+            let profile = policy.spawn_profile();
+            assert_eq!(profile.shell, "network_capable_user_granted");
+            assert_eq!(profile.network, guarantee.as_tag());
+        }
+        // Mismatched pairings are typed refusals, never silent
+        // reinterpretations of either mode.
+        let isolated_with_inherit = SandboxPolicy {
+            network_guarantee: SandboxGuarantee::None,
+            ..Default::default()
+        };
+        let err = isolated_with_inherit.validate().unwrap_err();
+        assert!(err.contains("network_capable_user_granted"), "{err}");
+        let granted_with_required = SandboxPolicy {
+            shell_execution: ShellExecutionMode::NetworkCapableUserGranted,
+            ..Default::default()
+        };
+        let err = granted_with_required.validate().unwrap_err();
+        assert!(err.contains("conflicts"), "{err}");
+        // The whole state (mode + guarantee) survives serde as evidence.
+        let json = serde_json::to_value(granted_with_required.shell_execution_state()).unwrap();
+        let back: ShellExecutionState = serde_json::from_value(json).unwrap();
+        assert_eq!(back, granted_with_required.shell_execution_state());
     }
 }

@@ -120,7 +120,7 @@ pub fn build_scm_daemon(
     let payload_root = cfg.payload_root(data_dir)?;
     let payloads = PayloadDir::new(payload_root);
     let private_key_name = app_cfg
-        .private_key
+        .key_payload
         .as_deref()
         .ok_or("cloud github_app: an enabled section requires `private_key`")?;
     let webhook_secret_name = app_cfg
@@ -139,7 +139,7 @@ pub fn build_scm_daemon(
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut token_config = GitHubAppTokenConfig {
         app_id: app_cfg.app_id.unwrap_or(0),
-        private_key_pkcs8_pem: private_key_pem,
+        private_key_pkcs8_pem: private_key_pem.into(),
         api_base: app_config.api_base.clone(),
         user_agent: app_config.user_agent.clone(),
         ..Default::default()

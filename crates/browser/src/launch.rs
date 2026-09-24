@@ -540,8 +540,8 @@ mod tests {
         LaunchOptions {
             executable: PathBuf::from("/bin/true"),
             headless: true,
-            profile_dir: PathBuf::from("/tmp/kp-profile"),
-            scratch_dir: PathBuf::from("/tmp/kp-scratch"),
+            profile_dir: PathBuf::from("/tmp/faktor-ci-profile"),
+            scratch_dir: PathBuf::from("/tmp/faktor-ci-scratch"),
             scratch_root,
             scratch_rel: PathBuf::from("scratch"),
             proxy_addr: "127.0.0.1:34567".parse().unwrap(),
@@ -564,7 +564,7 @@ mod tests {
             .any(|a| a == "--remote-debugging-address=127.0.0.1"));
         assert!(args
             .iter()
-            .any(|a| a.starts_with("--user-data-dir=/tmp/kp-profile")));
+            .any(|a| a.starts_with("--user-data-dir=/tmp/faktor-ci-profile")));
         assert!(!args.iter().any(|a| a == "--no-proxy-server"));
         assert!(!args.iter().any(|a| a == "--headless"));
         assert!(args.iter().any(|a| a == "--headless=new"));

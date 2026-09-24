@@ -22,7 +22,18 @@
 //! pure.
 
 use faktor_acquire::http::{resolve_redirect, validate_fetch_url};
-use faktor_provider::egress::{check_url, execute_raw, MockHttpTransport, RawRequest};
+use faktor_provider::egress::{
+    check_url, execute_raw, MockHttpTransport, RawRequest, ResponseBudget,
+};
+
+/// The response budget every test read passes: one 30 s wall bound and the
+/// seam's materialization byte cap.
+fn test_budget() -> ResponseBudget {
+    ResponseBudget::for_timeout(
+        std::time::Duration::from_secs(30),
+        faktor_provider::egress::MAX_RAW_RESPONSE_BYTES as u64,
+    )
+}
 use faktor_security::destination::DestinationPolicy;
 
 const BASE: &str = "https://api.allowed.example/v1/base";
@@ -90,9 +101,13 @@ async fn resolved_redirects_cannot_diverge_from_the_parsed_gate() {
         // 2. A hand-built RawRequest executes through the mock; the
         // transport observes the request's OWN parsed URL.
         let transport = MockHttpTransport::new(200, "{}");
-        let response = execute_raw(&transport, RawRequest::new("GET", resolved.clone()))
-            .await
-            .unwrap_or_else(|e| panic!("canonical {resolved:?} must build/execute: {e}"));
+        let response = execute_raw(
+            &transport,
+            RawRequest::new("GET", resolved.clone()),
+            &test_budget(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("canonical {resolved:?} must build/execute: {e}"));
         assert_eq!(response.status, 200);
         let requests = transport.requests();
         assert_eq!(requests.len(), 1);
@@ -139,9 +154,13 @@ async fn backslash_authority_shapes_land_on_the_canonical_origin_not_a_smuggled_
                     "{location:?} -> {resolved:?} must be allowed by the parsed gate"
                 );
                 let transport = MockHttpTransport::new(200, "{}");
-                execute_raw(&transport, RawRequest::new("GET", resolved.clone()))
-                    .await
-                    .expect("canonical allowed URL executes");
+                execute_raw(
+                    &transport,
+                    RawRequest::new("GET", resolved.clone()),
+                    &test_budget(),
+                )
+                .await
+                .expect("canonical allowed URL executes");
                 assert_eq!(transport.requests()[0].1, resolved);
             }
             Err(_) => {
@@ -172,7 +191,12 @@ async fn backslash_authority_shapes_land_on_the_canonical_origin_not_a_smuggled_
         // The RawRequest itself builds (execute_raw does not gate); the gate
         // decision is what a policy transport would enforce on this exact
         // parsed URL:
-        let _ = execute_raw(&transport, RawRequest::new("GET", resolved.clone())).await;
+        let _ = execute_raw(
+            &transport,
+            RawRequest::new("GET", resolved.clone()),
+            &test_budget(),
+        )
+        .await;
         assert_eq!(transport.requests()[0].1, resolved);
         assert!(check_url(&policy, &parsed).is_err());
     }

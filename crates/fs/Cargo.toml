@@ -33,3 +33,6 @@ windows-sys = { version = "0.61.2", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
 ] }
+
+[lints]
+workspace = true

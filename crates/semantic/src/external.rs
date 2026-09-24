@@ -34,7 +34,9 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use faktor_core::{CancellationToken, CommandSpec, EnvSpec};
-use faktor_provider::egress::{execute_post_json, HttpTransport};
+use faktor_provider::egress::{
+    execute_post_json, BudgetComponent, BudgetedBody, EgressError, HttpTransport, ResponseBudget,
+};
 use faktor_terminal::{ProcessOwner, ProcessSupervisor, SpawnConfig};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -1029,24 +1031,43 @@ async fn http_post_and_read(
                 detail: format!("provider endpoint answered HTTP {status}"),
             });
         }
-        let mut response = response;
+        // The REQUIRED response budget: head/idle/total all equal the
+        // caller's timeout and the byte cap is the caller's body bound.
+        // Reads go through the shared budget-aware reader — never a direct
+        // body read.
+        let budget = ResponseBudget::for_timeout(timeout, max_body as u64);
+        let mut body = BudgetedBody::new(response, budget);
         let mut bytes: Vec<u8> = Vec::new();
-        while let Some(chunk) =
-            response
-                .chunk()
-                .await
-                .map_err(|e| SemanticError::ProviderFailed {
-                    provider: provider.to_string(),
-                    detail: format!("provider response read failed: {e}"),
-                })?
-        {
-            if bytes.len().saturating_add(chunk.len()) > max_body {
-                return Err(SemanticError::Oversized {
-                    max: max_body,
-                    actual: bytes.len().saturating_add(chunk.len()),
-                });
+        loop {
+            match body.next_chunk().await {
+                Ok(Some(chunk)) => {
+                    if bytes.len().saturating_add(chunk.len()) > max_body {
+                        return Err(SemanticError::Oversized {
+                            max: max_body,
+                            actual: bytes.len().saturating_add(chunk.len()),
+                        });
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(EgressError::ResponseBudgetExceeded {
+                    component: BudgetComponent::Bytes,
+                    ..
+                }) => {
+                    // The budget refused the chunk that would cross the
+                    // bound: the read is over `max_body` by construction.
+                    return Err(SemanticError::Oversized {
+                        max: max_body,
+                        actual: max_body.saturating_add(1),
+                    });
+                }
+                Err(e) => {
+                    return Err(SemanticError::ProviderFailed {
+                        provider: provider.to_string(),
+                        detail: format!("provider response read failed: {e}"),
+                    });
+                }
             }
-            bytes.extend_from_slice(&chunk);
         }
         Ok::<Vec<u8>, SemanticError>(bytes)
     };
@@ -1874,7 +1895,7 @@ mod tests {
         };
         let provider = http_config(
             "http://provider.example/context",
-            Some("KP_SEMANTIC_MISSING_TEST_TOKEN"),
+            Some("FAKTOR_TEST_SEMANTIC_MISSING_TOKEN"),
         )
         .build(&env)
         .unwrap();

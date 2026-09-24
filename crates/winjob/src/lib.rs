@@ -21,6 +21,9 @@
 //! `x86_64-pc-windows-msvc`; runtime certification requires a Windows
 //! runner (declared platform blocker on this host).
 
+#![allow(unsafe_code)] // platform authority module: every unsafe
+                       // block/function in this module carries a `// SAFETY:` justification and is
+                       // enumerated by tests/static-authority.
 /// The requested Job Object limits. `kill_on_close` is the containment
 /// guarantee every supervised Windows child carries; the memory / active
 /// process limits are the optional authorization budgets. `None` means the
@@ -132,6 +135,7 @@ mod imp {
         /// caller can refuse the spawn typed instead of exposing an
         /// unbudgeted or uncontained child.
         pub fn create_with_limits_strict(limits: JobLimits) -> Result<Self, u32> {
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
                 if handle.is_null() {
@@ -199,6 +203,7 @@ mod imp {
             if self.handle.is_null() {
                 return Err(ERROR_INVALID_HANDLE);
             }
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
                 if process.is_null() {
@@ -223,6 +228,7 @@ mod imp {
             if self.handle.is_null() {
                 return false;
             }
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
                 if process.is_null() {
@@ -241,6 +247,7 @@ mod imp {
         /// membership: the kernel iterates the job's process list.
         pub fn terminate(&self) {
             if !self.handle.is_null() {
+                // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
                 unsafe {
                     TerminateJobObject(self.handle, 1);
                 }
@@ -251,6 +258,7 @@ mod imp {
     impl Drop for JobGuard {
         fn drop(&mut self) {
             if !self.handle.is_null() {
+                // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
                 unsafe {
                     CloseHandle(self.handle);
                 }

@@ -19,3 +19,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 faktor-provider = { workspace = true, features = ["test-utils"] }
+
+[lints]
+workspace = true

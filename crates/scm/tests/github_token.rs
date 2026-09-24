@@ -177,7 +177,7 @@ fn token_source(
     let source = GitHubAppTokenSource::new(
         GitHubAppTokenConfig {
             app_id: APP_ID,
-            private_key_pkcs8_pem: TEST_PRIVATE_KEY.to_string(),
+            private_key_pkcs8_pem: TEST_PRIVATE_KEY.into(),
             api_base: "https://github.test".to_string(),
             user_agent: "faktor-test/0.1".to_string(),
             max_attempts,

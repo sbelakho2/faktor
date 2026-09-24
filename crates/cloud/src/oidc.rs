@@ -15,9 +15,11 @@
 //! adapter outside this seam; this crate only consumes OIDC claims.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Mutex;
 
 use base64::Engine as _;
+use faktor_security::secret::SecretValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -34,23 +36,50 @@ pub struct OidcDiscovery {
     pub supported_algorithms: Vec<String>,
 }
 
-/// One authorization-code exchange request (PKCE).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// One authorization-code exchange request (PKCE). `code` and
+/// `code_verifier` are [`SecretValue`]s: zeroized on drop, redacted `Debug`,
+/// no `Display` and no serde. The carrier never logs them; the network
+/// adapter is the one place that [`exposes`](SecretValue::expose) them, into
+/// the token-endpoint form.
+#[derive(Clone, PartialEq, Eq)]
 pub struct CodeExchangeRequest {
-    pub code: String,
+    pub code: SecretValue,
     pub redirect_uri: String,
-    pub code_verifier: String,
+    pub code_verifier: SecretValue,
+}
+
+impl fmt::Debug for CodeExchangeRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CodeExchangeRequest")
+            .field("code", &"[redacted]")
+            .field("redirect_uri", &self.redirect_uri)
+            .field("code_verifier", &"[redacted]")
+            .finish()
+    }
 }
 
 /// The token endpoint response (the ID token is the verification input).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Both bearer tokens are [`SecretValue`]s. `OidcTokenSet` deliberately has
+/// NO serde: the token-endpoint WIRE shape is the private
+/// `RawTokenResponse` DTO in [`crate::oidc_net`], [`Deserialize`]d and
+/// converted into this type immediately (before any domain use).
+#[derive(Clone, PartialEq, Eq)]
 pub struct OidcTokenSet {
-    pub access_token: String,
-    pub id_token: String,
+    pub access_token: SecretValue,
+    pub id_token: SecretValue,
     pub token_type: String,
     pub expires_in_s: i64,
+}
+
+impl fmt::Debug for OidcTokenSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OidcTokenSet")
+            .field("access_token", &"[redacted]")
+            .field("id_token", &"[redacted]")
+            .field("token_type", &self.token_type)
+            .field("expires_in_s", &self.expires_in_s)
+            .finish()
+    }
 }
 
 /// What a verifier must check besides the signature.
@@ -385,7 +414,7 @@ impl OidcAdapter for FakeOidcAdapter {
             .codes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .get(&request.code)
+            .get(request.code.expose())
             .cloned()
             .ok_or_else(|| OidcError::CodeExchangeRefused("unknown or already-used code".into()))?;
         if !claims.audience.iter().any(|aud| aud == &self.client_id) {
@@ -394,9 +423,11 @@ impl OidcAdapter for FakeOidcAdapter {
             ));
         }
         Ok(OidcTokenSet {
-            access_token: base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(hmac_sha256(b"access", request.code.as_bytes())),
-            id_token: self.sign_claims(&claims),
+            access_token: SecretValue::new(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(hmac_sha256(b"access", request.code.expose().as_bytes())),
+            ),
+            id_token: SecretValue::new(self.sign_claims(&claims)),
             token_type: "Bearer".into(),
             expires_in_s: 3600,
         })
@@ -637,10 +668,13 @@ mod tests {
             })
             .unwrap();
         let verified = adapter
-            .verify_id_token(&tokens.id_token, &expectations(now))
+            .verify_id_token(tokens.id_token.expose(), &expectations(now))
             .unwrap();
         assert_eq!(verified.subject, "sub-1");
         assert!(verified.email_verified);
+        assert!(!tokens.access_token.expose().is_empty());
+        assert_eq!(tokens.token_type, "Bearer");
+        assert_eq!(tokens.expires_in_s, 3600);
 
         let mapping = ClaimMapping {
             email_claim: "email".into(),
@@ -797,5 +831,90 @@ mod tests {
             .map_membership(&claims(1_700_000_000_000), &relaxed)
             .unwrap();
         assert_eq!(membership.role, Role::Member, "no group match = default");
+    }
+
+    /// The compile-time negative proof: neither OIDC carrier has `Display`
+    /// or `Serialize`. The probe only compiles while neither impl exists.
+    macro_rules! assert_no_display_no_serialize {
+        ($ty:ty) => {{
+            trait AmbiguousIfImpl<A> {
+                fn probe() {}
+            }
+            impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+            impl<T: ?Sized + std::fmt::Display> AmbiguousIfImpl<u8> for T {}
+            impl<T: ?Sized + ::serde::Serialize> AmbiguousIfImpl<u16> for T {}
+            let _ = <$ty as AmbiguousIfImpl<_>>::probe;
+        }};
+    }
+
+    #[test]
+    fn planted_tokens_never_leak_through_debug_display_serde_or_panic() {
+        assert_no_display_no_serialize!(OidcTokenSet);
+        assert_no_display_no_serialize!(CodeExchangeRequest);
+        const PLANTED_ACCESS: &str = "PLANTED-ACCESS-TOKEN-do-not-leak-0123456789";
+        const PLANTED_ID: &str = "PLANTED-ID-TOKEN-do-not-leak-0123456789";
+        const PLANTED_CODE: &str = "PLANTED-AUTH-CODE-do-not-leak-0123456789";
+        const PLANTED_VERIFIER: &str = "PLANTED-PKCE-VERIFIER-do-not-leak-0123456789";
+        let tokens = OidcTokenSet {
+            access_token: PLANTED_ACCESS.into(),
+            id_token: PLANTED_ID.into(),
+            token_type: "Bearer".into(),
+            expires_in_s: 3600,
+        };
+        let request = CodeExchangeRequest {
+            code: PLANTED_CODE.into(),
+            redirect_uri: "https://app.example/cb".into(),
+            code_verifier: PLANTED_VERIFIER.into(),
+        };
+        for (planted, rendered) in [
+            (PLANTED_ACCESS, format!("{tokens:?}")),
+            (PLANTED_ID, format!("{tokens:?}")),
+            (PLANTED_CODE, format!("{request:?}")),
+            (PLANTED_VERIFIER, format!("{request:?}")),
+            (PLANTED_ACCESS, format!("{:?}", Some(tokens.clone()))),
+            (PLANTED_ID, format!("{:?}", vec![tokens.clone()])),
+            (PLANTED_CODE, format!("{:?}", (request.clone(), 1u8))),
+        ] {
+            assert!(!rendered.contains(planted), "leaked via {rendered}");
+        }
+        // Panic formatting of both carriers stays redacted.
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("exchange failed for {request:?} / {tokens:?}")
+        }))
+        .expect_err("the closure must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        for planted in [PLANTED_ACCESS, PLANTED_ID, PLANTED_CODE, PLANTED_VERIFIER] {
+            assert!(
+                !message.contains(planted),
+                "panic payload leaked: {message}"
+            );
+        }
+        // A code-exchange refusal names only the cause, never the inputs.
+        let err = adapter_refusal_with_planted_code();
+        let rendered = format!("{err} {err:?}");
+        assert!(!rendered.contains(PLANTED_CODE), "error leaked: {rendered}");
+        assert!(
+            !rendered.contains(PLANTED_VERIFIER),
+            "error leaked: {rendered}"
+        );
+    }
+
+    /// Drive a refusal using planted secret inputs and hand back the error;
+    /// every refusal path must be diagnosable without the secret bytes.
+    fn adapter_refusal_with_planted_code() -> OidcError {
+        const PLANTED_CODE: &str = "PLANTED-AUTH-CODE-do-not-leak-0123456789";
+        const PLANTED_VERIFIER: &str = "PLANTED-PKCE-VERIFIER-do-not-leak-0123456789";
+        let adapter = FakeOidcAdapter::new(ISSUER, CLIENT, b"secret-one");
+        adapter
+            .exchange_code(&CodeExchangeRequest {
+                code: PLANTED_CODE.into(),
+                redirect_uri: "https://app.example/cb".into(),
+                code_verifier: PLANTED_VERIFIER.into(),
+            })
+            .unwrap_err()
     }
 }

@@ -228,15 +228,54 @@ pub fn atomic_publish_at(root: &RootedDir, tmp_rel: &Path, dest_rel: &Path) -> R
     }
 }
 
-/// A unique temp path in the same directory as `path`: same filesystem, so
-/// the rename is atomic, and never colliding with concurrent writers.
-/// True when `name` is an internal atomic-write temporary (`<name>.kp-tmp-*`).
-/// Copy/walk paths skip these so a concurrent CAS writer's in-flight
-/// temporaries can never leak into a materialized snapshot (reviewer
-/// worktrees, shadow roots) — internal metadata must not appear inside a
-/// materialized repository root.
+/// Marker in the name of an internal atomic-write temporary produced by the
+/// CURRENT writers: `.<name>.faktor-tmp-<pid>-<uuid>`.
+pub const FAKTOR_TEMP_MARKER: &str = ".faktor-tmp-";
+
+/// Marker used by pre-migration ("kp") writers: `.<name>.kp-tmp-<pid>-<uuid>`.
+pub const LEGACY_KP_TEMP_MARKER: &str = ".kp-tmp-";
+
+/// True when `name` is an internal atomic-write temporary under the current
+/// Faktor marker.
+pub fn is_faktor_temp(name: &str) -> bool {
+    name.contains(FAKTOR_TEMP_MARKER)
+}
+
+/// True when `name` is internal atomic-write residue written before the
+/// naming migration. Recognition/cleanup only: no writer mints this spelling
+/// anymore.
+///
+/// Compatibility intent: cleanup and snapshot walks must keep accepting the
+/// legacy spelling so crash residue left by an older release is never
+/// mistaken for ordinary workspace content.
+///
+/// Retirement note: this predicate (and [`LEGACY_KP_TEMP_MARKER`]) may be
+/// deleted once no supported installation can still carry `.kp-tmp-*`
+/// residue; until then every recognizer goes through
+/// [`is_internal_temp_name`].
+pub fn is_legacy_kp_temp(name: &str) -> bool {
+    name.contains(LEGACY_KP_TEMP_MARKER)
+}
+
+/// True when `name` is an internal atomic-write temporary under EITHER
+/// spelling: `is_faktor_temp(name) || is_legacy_kp_temp(name)`. Copy/walk
+/// paths skip these so a concurrent CAS writer's in-flight temporaries (and
+/// any crash residue from an older release) can never leak into a
+/// materialized snapshot (reviewer worktrees, shadow roots) — internal
+/// metadata must not appear inside a materialized repository root.
 pub fn is_internal_temp_name(name: &str) -> bool {
-    name.contains(".kp-tmp-")
+    is_faktor_temp(name) || is_legacy_kp_temp(name)
+}
+
+/// The canonical unique temp name for `target_name` (same directory as the
+/// target, so the rename is atomic, and never colliding with concurrent
+/// writers). New writers only ever mint the Faktor spelling.
+pub(crate) fn temp_name(target_name: &str) -> String {
+    format!(
+        ".{target_name}.faktor-tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    )
 }
 
 fn nonce_temp(path: &Path) -> Result<PathBuf, Error> {
@@ -247,11 +286,7 @@ fn nonce_temp(path: &Path) -> Result<PathBuf, Error> {
         .file_name()
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
-    Ok(parent.join(format!(
-        ".{name}.kp-tmp-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    )))
+    Ok(parent.join(temp_name(&name)))
 }
 
 fn write_and_fsync(tmp: &Path, bytes: &[u8]) -> Result<(), Error> {
@@ -532,6 +567,31 @@ mod tests {
         atomic_replace_cas(&target, &expected, b"two").unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"two");
         assert!(!lock.is_poisoned());
+    }
+
+    /// Naming migration (Phase F item 24): new writers mint only the Faktor
+    /// spelling, while recognition accepts BOTH it and the legacy `kp`
+    /// spelling, so crash residue from an older release can never read as
+    /// ordinary workspace content.
+    #[test]
+    fn internal_temp_naming_migrates_to_faktor_and_recognizes_legacy_residue() {
+        let new = ".gen-1.json.faktor-tmp-1111-live";
+        let legacy = ".gen-1.json.kp-tmp-1111-legacy";
+        assert!(is_faktor_temp(new));
+        assert!(!is_legacy_kp_temp(new));
+        assert!(is_legacy_kp_temp(legacy));
+        assert!(!is_faktor_temp(legacy));
+        for name in [new, legacy, "x.faktor-tmp-crash", "x.kp-tmp-crash"] {
+            assert!(is_internal_temp_name(name), "{name}");
+        }
+        for name in ["f.bin", "gen-1.json", "faktor-tmp-crash"] {
+            assert!(!is_internal_temp_name(name), "{name}");
+        }
+        // Writers only mint the Faktor spelling.
+        let minted = temp_name("a.txt");
+        assert!(is_faktor_temp(&minted), "{minted}");
+        assert!(!is_legacy_kp_temp(&minted), "{minted}");
+        assert!(minted.starts_with(".a.txt.faktor-tmp-"), "{minted}");
     }
 
     #[test]

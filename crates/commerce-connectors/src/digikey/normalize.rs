@@ -34,6 +34,7 @@ pub const KEYWORD_SEARCH_MAX_STALENESS_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_PRICE_BREAKS: usize = 32;
 
 /// The OAuth client-credentials token response.
+// SECRET-FIELD-GATE-WIRE-DTO: DigiKey OAuth token-endpoint provider payload; token_from_response extracts the token into the connector SecretString at the same boundary and the DTO is never stored.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct TokenResponse {

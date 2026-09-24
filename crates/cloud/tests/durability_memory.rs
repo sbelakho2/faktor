@@ -4,6 +4,9 @@
 //! process-global, and this binary intentionally holds a single test so the
 //! measurement cannot be polluted by parallel tests.
 
+#![allow(unsafe_code)] // platform authority module: every unsafe
+                       // block/function in this module carries a `// SAFETY:` justification and is
+                       // enumerated by tests/static-authority.
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -14,8 +17,11 @@ struct CountingAllocator;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
+// SAFETY: the `GlobalAlloc` contract is honored exactly: `layout` is passed through unchanged and the returned pointer is the allocator's.
 unsafe impl GlobalAlloc for CountingAllocator {
+    // SAFETY: the `GlobalAlloc` contract is honored exactly: `layout` is passed through unchanged and the returned pointer is the allocator's.
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the `GlobalAlloc` contract is honored exactly: `layout` is passed through unchanged and the returned pointer is the allocator's.
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
             let live = LIVE.fetch_add(layout.size(), Ordering::SeqCst) + layout.size();
@@ -24,8 +30,10 @@ unsafe impl GlobalAlloc for CountingAllocator {
         ptr
     }
 
+    // SAFETY: the `GlobalAlloc` contract is honored exactly: `layout` is passed through unchanged and the returned pointer is the allocator's.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         LIVE.fetch_sub(layout.size(), Ordering::SeqCst);
+        // SAFETY: the `GlobalAlloc` contract is honored exactly: `layout` is passed through unchanged and the returned pointer is the allocator's.
         unsafe { System.dealloc(ptr, layout) }
     }
 }

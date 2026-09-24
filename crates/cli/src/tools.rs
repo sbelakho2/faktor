@@ -1239,7 +1239,7 @@ mod tests {
     use faktor_core::hash::FileHash;
     use faktor_core::id::{OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
     use faktor_core::WorkspaceIdentity;
-    use faktor_sandbox::{Rule, SandboxPolicy};
+    use faktor_sandbox::{Rule, SandboxGuarantee, SandboxPolicy, ShellExecutionMode};
     use faktor_session::SessionManager;
     use faktor_terminal::ProcessSupervisor;
     use std::path::PathBuf;
@@ -1255,6 +1255,41 @@ mod tests {
     }
 
     fn fixture(policy: SandboxPolicy) -> ToolFixture {
+        // Tool tests execute real local shells. The crate's secure default
+        // now DEMANDS OS-level network isolation, which a test process can
+        // never provide without kernel privileges — and must never fake. A
+        // fixture policy that is the untouched crate default (or the plain
+        // "allow shell" dev shape) is translated into the EXPLICIT
+        // user-granted network-capable shell: the same shape a user selects
+        // in config when full functionality is wanted. Any OTHER policy —
+        // including one that explicitly sets a guarantee or shell mode — is
+        // honored verbatim, so the Required-refusal test keeps its teeth.
+        let policy = if policy == SandboxPolicy::default()
+            || policy
+                == (SandboxPolicy {
+                    execute_shell: Rule::Allow,
+                    ..SandboxPolicy::default()
+                }) {
+            SandboxPolicy {
+                network_guarantee: SandboxGuarantee::None,
+                shell_execution: ShellExecutionMode::NetworkCapableUserGranted,
+                ..policy
+            }
+        } else {
+            policy
+        };
+        fixture_exact(policy)
+    }
+
+    /// Build the fixture with EXACTLY the given policy — no test-grant
+    /// translation. The explicit-`Required` refusal test needs this: its
+    /// `{execute_shell: Allow, network_guarantee: Required}` shape is
+    /// value-identical to the "plain allow shell" dev shape [`fixture`]
+    /// translates (the secure `Required`/`OsIsolated` pair IS the crate
+    /// default), so intent cannot be inferred from the value. Declaring the
+    /// policy verbatim keeps the sandbox contract under test instead of
+    /// silently rewriting it into the user-granted shell.
+    fn fixture_exact(policy: SandboxPolicy) -> ToolFixture {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("ws");
         std::fs::create_dir_all(&root).unwrap();
@@ -2161,7 +2196,10 @@ mod tests {
         );
         for entry in std::fs::read_dir(f.root).unwrap().flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            assert!(!name.contains("kp-tmp-"), "no temp file may leak: {name}");
+            assert!(
+                !faktor_fs::atomic::is_internal_temp_name(&name),
+                "no temp file may leak (either spelling): {name}"
+            );
         }
     }
 
@@ -2346,6 +2384,17 @@ mod tests {
             execute_shell: Rule::Allow,
             ..Default::default()
         });
+        // A shell test must run under the EXPLICIT user-granted shell, never
+        // a silent bypass of the secure default: the fixture's dev-shape
+        // translation must surface as `network_capable_user_granted` with a
+        // non-`Required` guarantee at the spawn seam.
+        let granted = f.sandbox.policy().shell_execution_state();
+        assert_eq!(granted.mode, ShellExecutionMode::NetworkCapableUserGranted);
+        assert_eq!(granted.network_guarantee, SandboxGuarantee::None);
+        assert_eq!(
+            f.sandbox.spawn_network_requirement(),
+            faktor_terminal::NetworkIsolationRequirement::Inherit
+        );
         let tool = run_command_tool();
         let out = (tool.execute)(
             ctx(&f),
@@ -2579,9 +2628,16 @@ mod tests {
         // turn — never a generic "denied by sandbox", never an unenforced
         // shell, and the program body never execs. On Linux the same spawn
         // must isolate the child or refuse typed.
-        let f = fixture(SandboxPolicy {
+        // `fixture_exact`: the secure `Required` + `OsIsolated` pair below is
+        // the crate default, so `fixture`'s "plain allow shell" test-grant
+        // translation would rewrite it into the user-granted network-capable
+        // shape and the Required refusal would never be exercised. The test
+        // pins the verbatim secure policy: production must refuse, not run
+        // the child unenforced.
+        let f = fixture_exact(SandboxPolicy {
             execute_shell: Rule::Allow,
-            network_guarantee: faktor_sandbox::SandboxGuarantee::Required,
+            network_guarantee: SandboxGuarantee::Required,
+            shell_execution: ShellExecutionMode::OsIsolated,
             ..Default::default()
         });
         assert_eq!(

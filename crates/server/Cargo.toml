@@ -49,3 +49,6 @@ faktor-provider = { workspace = true, features = ["test-utils"] }
 # implement the async artifact-fetcher seam.
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
 async-trait = "0.1"
+
+[lints]
+workspace = true

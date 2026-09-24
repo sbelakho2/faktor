@@ -5195,7 +5195,10 @@ mod verification_service_tests {
     #[tokio::test]
     async fn real_executor_runs_typed_argv_in_the_context_root() {
         let service = VerificationService::new(
-            Arc::new(faktor_verify::exec::AsyncCheckExecutor::new()),
+            Arc::new(
+                faktor_verify::exec::AsyncCheckExecutor::try_shared()
+                    .expect("standalone supervisor"),
+            ),
             VerificationPolicy::default(),
         );
         assert!(!service.is_disabled());
@@ -5218,7 +5221,10 @@ mod verification_service_tests {
     #[tokio::test]
     async fn real_executor_unavailable_when_the_program_is_missing() {
         let service = VerificationService::new(
-            Arc::new(faktor_verify::exec::AsyncCheckExecutor::new()),
+            Arc::new(
+                faktor_verify::exec::AsyncCheckExecutor::try_shared()
+                    .expect("standalone supervisor"),
+            ),
             VerificationPolicy::default(),
         );
         let dir = tempfile::tempdir().unwrap();

@@ -2209,7 +2209,7 @@ mod tests {
         ("catalog", "p.build_ollama("),
         ("router", "economic_routing_policy_with_outcomes("),
         ("budgets", "DurableBudgetLedger::new"),
-        ("index", "IndexService::open("),
+        ("index", "IndexService::open_with_supervisor("),
         ("evidence", "RepoEvidence::new("),
         ("instructions", "daemon_instructions_resolver("),
         ("verification", "daemon_verification("),
