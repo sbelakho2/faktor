@@ -45,6 +45,12 @@
 //!    literal `*.example.com` rule, IDN/punycode and trailing-dot
 //!    normalization, config-time strict parsing, and default-deny once a
 //!    policy is installed.
+//! 5. **Egress address classification** — [`network`] is THE single
+//!    address-class authority ([`network::AddressClass`],
+//!    [`network::EgressAddressPolicy`], [`network::classify_ip`],
+//!    [`network::vet_resolved_answers`]) generated from pinned IANA
+//!    special-purpose registries. Provider resolvers and the browser
+//!    broker consume it; they never re-derive classification locally.
 //!
 //! Secret-pattern syntax. The accepted subset is documented in
 //! [`PatternCompileError`]; **custom patterns are compiled at configuration
@@ -62,6 +68,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 pub mod destination;
+pub mod network;
 pub mod payload;
 pub mod registry;
 pub mod secret;

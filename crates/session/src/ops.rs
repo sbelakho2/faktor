@@ -86,6 +86,10 @@ pub struct PermissionRequest {
     pub op_id: OpId,
     pub capability: Capability,
     pub event_seq: faktor_core::id::EventSeq,
+    /// The durable deadline (`permission.expires_ms`). The live requester
+    /// computes its remaining wait from this value — never from a fresh
+    /// configured window — so a daemon restart cannot extend the deadline.
+    pub expires_ms: i64,
 }
 
 fn capability_tag(cap: &Capability) -> String {
@@ -626,7 +630,7 @@ impl SessionHandle {
         if cap_json.len() > 4096 {
             return Err(SessionError::Oversized("capability too large".into()).into());
         }
-        let id = self
+        let (id, expires_ms) = self
             .manager
             .store()
             .insert_permission(self.id, op, &cap_json)
@@ -646,6 +650,7 @@ impl SessionHandle {
             op_id: op,
             capability: capability.clone(),
             event_seq,
+            expires_ms,
         })
     }
 
@@ -655,7 +660,9 @@ impl SessionHandle {
     /// pending — a mixed batch keeps the machine on `ExecutingTool` until
     /// every call resolved, so the approved siblings stay reachable. A double
     /// resolve loses the race with `Conflict`; the journal never records two
-    /// resolutions.
+    /// resolutions. Resolution is CONTEXTUAL: the durable row must belong to
+    /// this session and, while the session tracks live operations, to one of
+    /// them — a wrong-window/wrong-session/stale reply is refused typed.
     pub fn resolve_permission(
         &self,
         id: i64,
@@ -680,21 +687,37 @@ impl SessionHandle {
             }
         };
         let _guard = self.command_guard();
-        // Pre-check: unknown or already-resolved rows are loud conflicts.
-        let op = match self
+        // The live pending row carries the owning session + op. Unknown,
+        // terminal and EXPIRED rows read as None (the durable deadline is the
+        // filter); the atomic update below is still invoked in that case so an
+        // expired-but-pending row is terminalized and the resolution refused.
+        let pending = self
             .manager
             .store()
             .pending_permission(id)
-            .map_err(crate::map_store_err)?
-        {
-            Some((_, op, _)) => op,
-            None => {
+            .map_err(crate::map_store_err)?;
+        if let Some((row_session, op, _)) = &pending {
+            // Contextual binding: only the session that owns the permission
+            // may resolve it (a wrong-window UI reply is refused typed).
+            if *row_session != self.id {
                 return Err(SessionError::Conflict(format!(
-                    "permission {id} is not pending (unknown or already resolved)"
+                    "permission {id} is not pending for session {} (owned by {row_session})",
+                    self.id
                 ))
                 .into());
             }
-        };
+            // Ownership binding: while the session tracks live operations,
+            // the permission's owning op must be one of them — a stale reply
+            // for an operation the session no longer owns is refused. A
+            // restarted daemon tracks nothing (in-process tokens only), so
+            // the durable recovery path resolves untracked ops honestly.
+            if !self.ops().all().is_empty() && self.ops().tracked(*op).is_none() {
+                return Err(SessionError::Conflict(format!(
+                    "permission {id} belongs to operation {op}, which is not currently tracked"
+                ))
+                .into());
+            }
+        }
         // Deny sibling-awareness (mixed permission batch): the denied call's
         // own result is written only after the whole batch resolves, so at
         // this point the batch may still have unresolved sibling calls (or a
@@ -731,23 +754,22 @@ impl SessionHandle {
         } else {
             target
         };
+        // The atomic update is the arbiter: exactly one row (this session,
+        // still pending, still unexpired) must transition; zero is the typed
+        // conflict (unknown, already terminal, wrong session, expired). There
+        // is no post-check race window to lose in.
         self.manager
             .store()
-            .resolve_permission(id, decision_str)
+            .resolve_permission(id, self.id, decision_str)
             .map_err(crate::map_store_err)?;
-        // Post-check: whoever lost the race must not journal.
-        if self
-            .manager
-            .store()
-            .pending_permission(id)
-            .map_err(crate::map_store_err)?
-            .is_some()
-        {
+        let Some((_, op, _)) = pending else {
+            // Unreachable: a successful update implies the live pending row
+            // read above. Kept as a typed refusal, never a panic.
             return Err(SessionError::Conflict(format!(
                 "permission {id} was resolved concurrently"
             ))
             .into());
-        }
+        };
         self.transition_locked(
             kind,
             target,
@@ -1581,6 +1603,115 @@ mod tests {
         assert_eq!(err.kind, faktor_core::ErrorKind::Malformed);
         // The permission stays pending and untouched.
         assert!(s.pending_permission(req.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn resolve_permission_refuses_a_wrong_session() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        to_streaming(&s);
+        let op = s.ops().all()[0];
+        let req = s
+            .request_permission(
+                op,
+                &Capability::ReadWorkspace {
+                    path: "/w/a".into(),
+                },
+            )
+            .unwrap();
+        // A DIFFERENT session of the same daemon replies (wrong-window UI
+        // race): refused typed, and the row is not consumed.
+        let other = session(&m);
+        let err = other
+            .resolve_permission(req.id, faktor_core::capability::PermissionDecision::Allow)
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Conflict, "{err}");
+        assert_eq!(
+            s.pending_permission(req.id).unwrap().unwrap().0,
+            s.id(),
+            "the owning session's pending row survives"
+        );
+        // The owning session still resolves it.
+        s.resolve_permission(req.id, faktor_core::capability::PermissionDecision::Allow)
+            .unwrap();
+    }
+
+    #[test]
+    fn resolve_permission_refuses_an_op_the_session_no_longer_tracks() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        to_streaming(&s);
+        let op = s.ops().all()[0];
+        let req = s
+            .request_permission(
+                op,
+                &Capability::ReadWorkspace {
+                    path: "/w/a".into(),
+                },
+            )
+            .unwrap();
+        // The permission's owning op left the ownership registry while the
+        // session still owns another live op: a stale reply is refused.
+        s.ops().unregister(op);
+        s.ops()
+            .register(OpId::new(4242), OpKind::Turn, CancellationToken::new());
+        let err = s
+            .resolve_permission(req.id, faktor_core::capability::PermissionDecision::Allow)
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Conflict, "{err}");
+        assert!(
+            s.pending_permission(req.id).unwrap().is_some(),
+            "the refused resolution leaves the durable row pending"
+        );
+        // With the session owning nothing (restarted daemon shape: in-process
+        // tokens are gone), the durable recovery path resolves honestly.
+        s.ops().unregister(OpId::new(4242));
+        s.resolve_permission(req.id, faktor_core::capability::PermissionDecision::Allow)
+            .unwrap();
+    }
+
+    #[test]
+    fn resolve_permission_terminalizes_an_expired_row_and_refuses() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        to_streaming(&s);
+        let op = s.ops().all()[0];
+        let req = s
+            .request_permission(
+                op,
+                &Capability::ReadWorkspace {
+                    path: "/w/a".into(),
+                },
+            )
+            .unwrap();
+        // Force the durable deadline into the past (the sql seam exists for
+        // exactly this kind of adversarial craft).
+        s.manager()
+            .store()
+            .sql_execute(&format!(
+                "UPDATE permission SET expires_ms = 0 WHERE id = {}",
+                req.id
+            ))
+            .unwrap();
+        assert!(s.pending_permission(req.id).unwrap().is_none());
+        let err = s
+            .resolve_permission(req.id, faktor_core::capability::PermissionDecision::Allow)
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Conflict, "{err}");
+        assert_eq!(
+            s.manager()
+                .store()
+                .permission_decision(req.id)
+                .unwrap()
+                .as_deref(),
+            Some("expired"),
+            "the refused attempt terminalized the row"
+        );
+        // Terminal stays terminal.
+        let err = s
+            .resolve_permission(req.id, faktor_core::capability::PermissionDecision::Deny)
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Conflict, "{err}");
     }
 
     #[test]

@@ -11,13 +11,15 @@
 //!
 //! [`EgressResolver`] resolves a permitted hostname **exactly once**
 //! through the injected [`HostResolver`], bounds the answer set
-//! ([`EgressResolver::max_answers`]), classifies EVERY address
-//! ([`AddressClass`]) and refuses the whole resolution when any answer sits
-//! in a class the [`EgressAddressPolicy`] does not permit (an "external"
-//! policy permits only globally routable addresses; a mixed public/private
-//! answer set is refused, never raced). The caller then connects to the
-//! returned addresses directly — there is no second resolution between the
-//! decision and the connect.
+//! ([`EgressResolver::max_answers`]), classifies EVERY address through the
+//! single [`faktor_security::network`] authority
+//! ([`AddressClass`]/[`classify_ip`](faktor_security::network::classify_ip))
+//! and refuses the whole resolution when any answer sits in a class the
+//! [`EgressAddressPolicy`] does not permit (an "external" policy permits
+//! only globally routable addresses; a mixed public/private answer set is
+//! refused, never raced). The caller then connects to the returned
+//! addresses directly — there is no second resolution between the decision
+//! and the connect.
 //!
 //! The production reqwest client installs [`ReqwestDnsResolver`] as its
 //! `dns_resolver`, so hyper's connector receives the vetted address list
@@ -27,25 +29,23 @@
 //!
 //! # Policy classes
 //!
-//! | class                              | external policy | [`EgressAddressPolicy::local`] |
-//! |------------------------------------|-----------------|-------------------------------|
-//! | `Global`                           | allow           | allow                         |
-//! | `Loopback`                         | deny            | allow (explicit rule)         |
-//! | private / link-local / CGNAT /     | deny            | deny                          |
-//! | documentation / benchmark /        |                 |                               |
-//! | multicast / unspecified / reserved |                 |                               |
-//!
-//! A local provider (Ollama) gets the explicit [`EgressAddressPolicy::local`]
-//! rule wired from its typed config — never a global "loopback is always
-//! allowed" exception. Everything except loopback stays refused even there,
-//! so a configured local endpoint can never be rebound onto cloud metadata,
-//! a LAN host or any other special range.
+//! The class table and policy live ONCE in [`faktor_security::network`]
+//! (generated from the pinned IANA special-purpose registries; see that
+//! module's docs). `EXTERNAL` permits only `Global`; `LOCAL` adds exactly
+//! one explicit rule — loopback — and still refuses private / link-local
+//! (cloud metadata) / CGNAT / documentation / benchmark / multicast /
+//! unspecified / reserved and every transition/tunneling form. A local
+//! provider (Ollama) gets the explicit [`EgressAddressPolicy::local`] rule
+//! wired from its typed config — never a global "loopback is always
+//! allowed" exception, so a configured local endpoint can never be rebound
+//! onto cloud metadata, a LAN host or any other special range.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use serde::{Deserialize, Serialize};
+
+pub use faktor_security::network::{AddressClass, EgressAddressPolicy};
 
 /// Default hard bound on the number of addresses one resolution may answer
 /// with. A hostile or broken DNS server answering with an unbounded list is
@@ -54,232 +54,6 @@ pub const DEFAULT_MAX_DNS_ANSWERS: usize = 16;
 
 /// Absolute DNS host length (RFC 1035 presentation form).
 pub const MAX_DNS_HOST_CHARS: usize = 253;
-
-/// The address class of one resolved IP, as classified by the central
-/// egress resolver. The tables mirror the IANA special-purpose registries;
-/// `Global` is the only class an external policy allows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AddressClass {
-    /// Globally routable unicast.
-    Global,
-    /// `127.0.0.0/8`, `::1`.
-    Loopback,
-    /// RFC1918 (`10/8`, `172.16/12`, `192.168/16`) and IPv6 ULA (`fc00::/7`).
-    Private,
-    /// `169.254.0.0/16` (includes the cloud-metadata endpoint
-    /// `169.254.169.254`) and `fe80::/10`.
-    LinkLocal,
-    /// `100.64.0.0/10` (carrier-grade NAT).
-    Cgnat,
-    /// `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, `2001:db8::/32`.
-    Documentation,
-    /// `198.18.0.0/15`, `2001:2::/48`.
-    Benchmark,
-    /// `224.0.0.0/4`, `ff00::/8`.
-    Multicast,
-    /// `0.0.0.0`, `::`.
-    Unspecified,
-    /// Everything else outside the global unicast space: `0.0.0.0/8`,
-    /// `192.0.0.0/24`, `192.88.99.0/24`, `240.0.0.0/4`, `100::/64`,
-    /// `2001:10::/28`, `2001:20::/28`.
-    Reserved,
-}
-
-impl AddressClass {
-    /// Classify one IP. IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible
-    /// (`::a.b.c.d`), 6to4 (`2002::/16`) and NAT64 (`64:ff9b::/96`)
-    /// addresses classify by the EMBEDDED IPv4 address — otherwise
-    /// `::ffff:127.0.0.1` would read as a global IPv6 address.
-    pub fn classify(ip: IpAddr) -> AddressClass {
-        match ip {
-            IpAddr::V4(v4) => classify_v4(v4),
-            IpAddr::V6(v6) => classify_v6(v6),
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            AddressClass::Global => "global",
-            AddressClass::Loopback => "loopback",
-            AddressClass::Private => "private",
-            AddressClass::LinkLocal => "link_local",
-            AddressClass::Cgnat => "cgnat",
-            AddressClass::Documentation => "documentation",
-            AddressClass::Benchmark => "benchmark",
-            AddressClass::Multicast => "multicast",
-            AddressClass::Unspecified => "unspecified",
-            AddressClass::Reserved => "reserved",
-        }
-    }
-}
-
-impl std::fmt::Display for AddressClass {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-fn classify_v4(v4: Ipv4Addr) -> AddressClass {
-    let o = v4.octets();
-    if v4.is_unspecified() {
-        return AddressClass::Unspecified;
-    }
-    if v4.is_loopback() {
-        return AddressClass::Loopback;
-    }
-    if v4.is_link_local() {
-        return AddressClass::LinkLocal;
-    }
-    if v4.is_private() {
-        return AddressClass::Private;
-    }
-    if v4.is_multicast() {
-        return AddressClass::Multicast;
-    }
-    if o[0] == 100 && (64..=127).contains(&o[1]) {
-        return AddressClass::Cgnat;
-    }
-    if v4.is_documentation() {
-        return AddressClass::Documentation;
-    }
-    // 198.18.0.0/15 (benchmarking).
-    if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
-        return AddressClass::Benchmark;
-    }
-    // 0.0.0.0/8 "this network" (0.0.0.0 itself is Unspecified above),
-    // 192.0.0.0/24 IETF protocol assignments, 192.88.99.0/24 (6to4
-    // relay, deprecated), 240.0.0.0/4 reserved.
-    if o[0] == 0
-        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
-        || (o[0] == 192 && o[1] == 88 && o[2] == 99)
-        || o[0] >= 240
-    {
-        return AddressClass::Reserved;
-    }
-    AddressClass::Global
-}
-
-fn classify_v6(v6: Ipv6Addr) -> AddressClass {
-    let s = v6.segments();
-    if v6.is_unspecified() {
-        return AddressClass::Unspecified;
-    }
-    if v6.is_loopback() {
-        return AddressClass::Loopback;
-    }
-    if v6.is_multicast() {
-        return AddressClass::Multicast;
-    }
-    // fe80::/10 link-local (includes fe80::/64 interface scope).
-    if (s[0] & 0xffc0) == 0xfe80 {
-        return AddressClass::LinkLocal;
-    }
-    // fc00::/7 unique-local.
-    if (s[0] & 0xfe00) == 0xfc00 {
-        return AddressClass::Private;
-    }
-    // IPv4-mapped ::ffff:0:0/96.
-    if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0xffff {
-        return classify_v4(embedded_v4(s[6], s[7]));
-    }
-    // IPv4-compatible ::a.b.c.d (/96, deprecated); :: and ::1 handled above.
-    if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
-        return classify_v4(embedded_v4(s[6], s[7]));
-    }
-    // 6to4 2002::/16 embeds the IPv4 address in segments 1-2.
-    if s[0] == 0x2002 {
-        return classify_v4(embedded_v4(s[1], s[2]));
-    }
-    // NAT64 64:ff9b::/96 embeds the IPv4 address in the low 32 bits.
-    if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
-        return classify_v4(embedded_v4(s[6], s[7]));
-    }
-    // 2001:db8::/32 documentation.
-    if s[0] == 0x2001 && s[1] == 0x0db8 {
-        return AddressClass::Documentation;
-    }
-    // 2001:2::/48 benchmarking.
-    if s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0 {
-        return AddressClass::Benchmark;
-    }
-    // 100::/64 discard-only, 2001:10::/28 and 2001:20::/28 ORCHID.
-    if (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
-        || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0010)
-        || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0020)
-    {
-        return AddressClass::Reserved;
-    }
-    AddressClass::Global
-}
-
-fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
-    Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8)
-}
-
-/// The address-class rule installed on one checked egress client.
-///
-/// `EXTERNAL` (the production default) permits only [`AddressClass::Global`].
-/// `LOCAL` carries the one EXPLICIT extra rule a local provider config may
-/// opt into: loopback. No other special class is ever permitted — a local
-/// policy still refuses link-local (cloud metadata), private, CGNAT,
-/// documentation, multicast, unspecified and reserved ranges.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EgressAddressPolicy {
-    allow_loopback: bool,
-}
-
-impl EgressAddressPolicy {
-    /// External-only: globally routable addresses only.
-    pub const EXTERNAL: EgressAddressPolicy = EgressAddressPolicy {
-        allow_loopback: false,
-    };
-
-    /// Local: globally routable addresses plus an explicit loopback rule.
-    pub const LOCAL: EgressAddressPolicy = EgressAddressPolicy {
-        allow_loopback: true,
-    };
-
-    pub const fn external() -> EgressAddressPolicy {
-        Self::EXTERNAL
-    }
-
-    pub const fn local() -> EgressAddressPolicy {
-        Self::LOCAL
-    }
-
-    /// The explicit loopback rule (the only configurable class exception).
-    pub const fn allow_loopback(&self) -> bool {
-        self.allow_loopback
-    }
-
-    /// May an address of this class be connected to?
-    pub const fn permits_class(&self, class: AddressClass) -> bool {
-        match class {
-            AddressClass::Global => true,
-            AddressClass::Loopback => self.allow_loopback,
-            AddressClass::Private
-            | AddressClass::LinkLocal
-            | AddressClass::Cgnat
-            | AddressClass::Documentation
-            | AddressClass::Benchmark
-            | AddressClass::Multicast
-            | AddressClass::Unspecified
-            | AddressClass::Reserved => false,
-        }
-    }
-
-    /// Convenience: classify then decide.
-    pub fn permits(&self, ip: IpAddr) -> bool {
-        self.permits_class(AddressClass::classify(ip))
-    }
-}
-
-impl Default for EgressAddressPolicy {
-    fn default() -> Self {
-        Self::EXTERNAL
-    }
-}
 
 /// Why a resolution was refused before any connect. Carries no raw URL and
 /// no resolver-supplied text (a hostile resolver message could echo the
@@ -449,14 +223,12 @@ impl EgressResolver {
                 limit: self.max_answers,
             });
         }
-        for addr in &answers {
-            let class = AddressClass::classify(addr.ip());
-            if !self.policy.permits_class(class) {
-                return Err(EgressResolveError::AddressClassRefused {
-                    host: host.to_string(),
-                    class,
-                });
-            }
+        if let Err(refusal) = faktor_security::network::vet_resolved_answers(&answers, self.policy)
+        {
+            return Err(EgressResolveError::AddressClassRefused {
+                host: host.to_string(),
+                class: refusal.class,
+            });
         }
         Ok(answers)
     }
@@ -500,7 +272,7 @@ impl reqwest::dns::Resolve for ReqwestDnsResolver {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -517,66 +289,11 @@ mod tests {
     }
 
     #[test]
-    fn classification_covers_the_special_ranges() {
-        let cases: &[(&str, AddressClass)] = &[
-            ("8.8.8.8", AddressClass::Global),
-            ("1.1.1.1", AddressClass::Global),
-            ("127.0.0.1", AddressClass::Loopback),
-            ("127.9.9.9", AddressClass::Loopback),
-            ("169.254.169.254", AddressClass::LinkLocal),
-            ("169.254.0.1", AddressClass::LinkLocal),
-            ("10.0.0.1", AddressClass::Private),
-            ("172.16.0.1", AddressClass::Private),
-            ("172.31.255.254", AddressClass::Private),
-            ("192.168.1.1", AddressClass::Private),
-            ("100.64.0.1", AddressClass::Cgnat),
-            ("100.127.255.254", AddressClass::Cgnat),
-            ("192.0.2.1", AddressClass::Documentation),
-            ("198.51.100.1", AddressClass::Documentation),
-            ("203.0.113.1", AddressClass::Documentation),
-            ("198.18.0.1", AddressClass::Benchmark),
-            ("198.19.255.254", AddressClass::Benchmark),
-            ("224.0.0.1", AddressClass::Multicast),
-            ("239.255.255.255", AddressClass::Multicast),
-            ("0.0.0.0", AddressClass::Unspecified),
-            ("0.1.2.3", AddressClass::Reserved),
-            ("192.0.0.8", AddressClass::Reserved),
-            ("240.0.0.1", AddressClass::Reserved),
-            ("255.255.255.255", AddressClass::Reserved),
-            ("::", AddressClass::Unspecified),
-            ("::1", AddressClass::Loopback),
-            ("2606:4700::1111", AddressClass::Global),
-            ("2001:4860:4860::8888", AddressClass::Global),
-            ("fe80::1", AddressClass::LinkLocal),
-            ("fe80::abcd:1", AddressClass::LinkLocal),
-            ("fc00::1", AddressClass::Private),
-            ("fd12:3456::1", AddressClass::Private),
-            ("ff02::1", AddressClass::Multicast),
-            ("2001:db8::1", AddressClass::Documentation),
-            ("2001:2::1", AddressClass::Benchmark),
-            ("100::1", AddressClass::Reserved),
-            // Embedded IPv4 must classify by the embedded address.
-            ("::ffff:127.0.0.1", AddressClass::Loopback),
-            ("::ffff:169.254.169.254", AddressClass::LinkLocal),
-            ("::ffff:8.8.8.8", AddressClass::Global),
-            ("64:ff9b::127.0.0.1", AddressClass::Loopback),
-            ("64:ff9b::a00:1", AddressClass::Private),
-            ("2002:7f00:1::", AddressClass::Loopback),
-            ("2002:0808:0808::", AddressClass::Global),
-        ];
-        for (text, want) in cases {
-            let ip = if text.contains(':') {
-                v6(text)
-            } else {
-                v4(text)
-            };
-            assert_eq!(AddressClass::classify(ip), *want, "{text}");
-        }
-    }
-
-    #[test]
     fn external_policy_allows_only_global_and_local_adds_loopback_only() {
-        for ip in ["8.8.8.8", "2606:4700::1111", "::ffff:8.8.8.8"] {
+        // Classification itself is tested once in the faktor-security
+        // authority (crates/security/src/network.rs); here the resolver's
+        // re-exported policy contract is pinned.
+        for ip in ["8.8.8.8", "2606:4700::1111"] {
             let ip = if ip.contains(':') { v6(ip) } else { v4(ip) };
             assert!(EgressAddressPolicy::EXTERNAL.permits(ip), "{ip}");
             assert!(EgressAddressPolicy::LOCAL.permits(ip), "{ip}");
@@ -594,7 +311,13 @@ mod tests {
             "fe80::1",
             "fc00::1",
             "2001:db8::1",
+            // Transition/tunneling forms are never classified by their
+            // embedded IPv4 address: they are refused even when the
+            // embedded address looks global or loopback.
             "::ffff:127.0.0.1",
+            "::ffff:8.8.8.8",
+            "64:ff9b::127.0.0.1",
+            "2002:7f00:1::",
         ] {
             let ip = if ip.contains(':') { v6(ip) } else { v4(ip) };
             assert!(
@@ -603,8 +326,9 @@ mod tests {
             );
         }
         // The explicit local rule permits ONLY loopback: metadata,
-        // link-local, private and every other class stay refused.
-        for ip in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+        // link-local, private, mapped loopback and every other class stay
+        // refused.
+        for ip in ["127.0.0.1", "::1"] {
             let ip = if ip.contains(':') { v6(ip) } else { v4(ip) };
             assert!(EgressAddressPolicy::LOCAL.permits(ip), "local allows {ip}");
         }
@@ -617,6 +341,7 @@ mod tests {
             "2001:db8::1",
             "0.0.0.0",
             "224.0.0.1",
+            "::ffff:127.0.0.1",
         ] {
             let ip = if ip.contains(':') { v6(ip) } else { v4(ip) };
             assert!(
@@ -702,6 +427,52 @@ mod tests {
             }
             assert_eq!(resolver.calls(), 1, "{label}: exactly one resolution");
         }
+    }
+
+    #[tokio::test]
+    async fn previously_missed_and_tunneling_iana_answers_are_refused() {
+        // Ranges the deleted hand-maintained tables missed entirely, plus
+        // transition/tunneling forms that must never be classified by their
+        // embedded IPv4 address (the resolver consumes the single
+        // faktor-security authority).
+        for (label, answer) in [
+            ("local-use nat64", "64:ff9b:1::1"),
+            ("dummy v6 prefix", "100:0:0:1::1"),
+            ("documentation 3fff", "3fff::1"),
+            ("srv6 sids", "5f00::1"),
+            ("mapped global", "::ffff:8.8.8.8"),
+            ("nat64 wkp global", "64:ff9b::808:808"),
+            ("6to4 global", "2002:0808:0808::"),
+            ("teredo", "2001::1"),
+        ] {
+            let resolver = ScriptedResolver::answering(vec![addr(answer, 443)]);
+            let egress = EgressResolver::with_resolver(
+                resolver,
+                EgressAddressPolicy::EXTERNAL,
+                DEFAULT_MAX_DNS_ANSWERS,
+            );
+            let err = egress
+                .resolve_vetted("allowed.example", 443)
+                .await
+                .expect_err(label);
+            match err {
+                EgressResolveError::AddressClassRefused { class, .. } => {
+                    assert_ne!(class, AddressClass::Global, "{label}");
+                }
+                other => panic!("{label}: expected class refusal, got {other:?}"),
+            }
+        }
+        // The explicit local rule does not re-open mapped loopback either.
+        let resolver = ScriptedResolver::answering(vec![addr("::ffff:127.0.0.1", 80)]);
+        let egress = EgressResolver::with_resolver(
+            resolver,
+            EgressAddressPolicy::LOCAL,
+            DEFAULT_MAX_DNS_ANSWERS,
+        );
+        assert!(matches!(
+            egress.resolve_vetted("local.example", 80).await,
+            Err(EgressResolveError::AddressClassRefused { .. })
+        ));
     }
 
     #[tokio::test]

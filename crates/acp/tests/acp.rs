@@ -1233,6 +1233,9 @@ impl AcpStreamBackend for NativePermissionBackend {
                     command: "echo hi".into(),
                 },
                 event_seq: EventSeq::new(1),
+                // Synthetic request: a far-future durable deadline (the
+                // configured requester cap still bounds the live wait).
+                expires_ms: i64::MAX,
             };
             let tool_call = json!({ "toolCallId": "call-1", "title": "echo" });
             let permission_id = permission.id;
@@ -1262,7 +1265,7 @@ impl AcpStreamBackend for NativePermissionBackend {
                 };
                 // The same decision path the daemon adapter uses: resolve
                 // the durable native request exactly once.
-                let _ = requester.resolve(permission_id, decision);
+                let _ = requester.resolve(SessionId::new(7), permission_id, decision);
                 decisions.lock().unwrap().push(format!("{decision:?}"));
                 outcome_value
             };

@@ -76,8 +76,8 @@ pub use download::{
 };
 pub use egress::{
     BlockReason, BrokerConfig, BrokerHandle, BrokerHealth, BrokerState, DestinationDecision,
-    DestinationPolicy, EgressAccounting, EgressBroker, HostPattern, ProxyCredentials,
-    UpstreamProxy, UpstreamSelector,
+    DestinationPolicy, EgressAccounting, EgressAddressPolicy, EgressBroker, HostPattern,
+    ProxyCredentials, UpstreamProxy, UpstreamSelector,
 };
 pub use error::{BrowserError, VerificationKind};
 pub use interception::{

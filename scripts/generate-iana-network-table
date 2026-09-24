@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Generate the static IANA longest-prefix-match address table in
+`crates/security/src/network.rs` from the pinned special-purpose registry
+CSVs in `crates/security/data/`.
+
+The runtime NEVER fetches anything: the CSVs are pinned snapshots of
+
+    https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry-1.csv
+    https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry-1.csv
+
+refreshed only by `scripts/update-iana-special-registry.sh` (an explicit
+operator action), reviewed, and committed. This script turns them into the
+`IANA_SPECIAL_TABLE` section of `network.rs` between the generated markers.
+
+Usage:
+
+    ./scripts/generate-iana-network-table            # rewrite the table
+    ./scripts/generate-iana-network-table --check    # fail if it is stale
+
+Class derivation (documented, deterministic):
+
+    Loopback Address / Loopback   -> Loopback
+    Private-Use / Unique-Local    -> Private
+    Link Local / Link-Local       -> LinkLocal
+    Shared Address Space          -> Cgnat
+    Documentation*                -> Documentation
+    Benchmarking                  -> Benchmark
+    Multicast*                    -> Multicast
+    Unspecified Address           -> Unspecified
+    IPv4-mapped / IPv4-IPv6 Translat. / 6to4 / TEREDO
+                                  -> Reserved   (NEVER Global, NEVER
+                                     classified by the embedded IPv4
+                                     address: `::ffff:127.0.0.1` once read
+                                     as loopback and `::ffff:8.8.8.8` as
+                                     global; the safest handling is to deny
+                                     every transition/tunneling form)
+    otherwise                     -> Global iff the IANA "Globally
+                                     Reachable" column says True, else
+                                     Reserved
+
+Only rows explicitly marked Globally Reachable=True become `Global`; the
+one exception is the tunneling list above, which is always denied even
+where IANA marks the prefix globally reachable (the NAT64 WKP
+`64:ff9b::/96` row claims True but embeds an arbitrary IPv4 destination).
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import ipaddress
+import pathlib
+import re
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+DATA_DIR = ROOT / "crates" / "security" / "data"
+NETWORK_RS = ROOT / "crates" / "security" / "src" / "network.rs"
+
+BEGIN_MARKER = "// BEGIN GENERATED IANA TABLE"
+END_MARKER = "// END GENERATED IANA TABLE"
+
+CSV_SOURCES = (
+    ("iana-ipv4-special.csv", False),
+    ("iana-ipv6-special.csv", True),
+)
+
+# Transition/tunneling/embedded forms that must never classify by their
+# embedded IPv4 address (and never become Global).
+TUNNELING_NAMES = ("ipv4-mapped", "ipv4-ipv6 translat", "6to4", "teredo")
+
+ANNOTATION_RE = re.compile(r"\[[^\]]*\]")
+
+
+def strip_annotations(text: str) -> str:
+    return ANNOTATION_RE.sub("", text).strip()
+
+
+def parse_truthy(cell: str) -> bool:
+    """IANA boolean cells may carry annotations (`False [1]`, `N/A [2]`)."""
+    return strip_annotations(cell).lower() == "true"
+
+
+def class_for(name: str, globally_reachable: bool) -> str:
+    folded = strip_annotations(name).lower()
+    if "loopback" in folded:
+        return "Loopback"
+    if "private-use" in folded or "unique-local" in folded:
+        return "Private"
+    if "link local" in folded or "link-local" in folded:
+        return "LinkLocal"
+    if "shared address space" in folded:
+        return "Cgnat"
+    if folded.startswith("documentation"):
+        return "Documentation"
+    if "benchmarking" in folded:
+        return "Benchmark"
+    if "multicast" in folded:
+        return "Multicast"
+    if "unspecified" in folded or "this host on this network" in folded:
+        # "Unspecified Address" plus IPv4's exact "This host on this
+        # network" (0.0.0.0/32).
+        return "Unspecified"
+    if "this network" in folded:
+        # IPv4 "This network" 0.0.0.0/8 (everything except the exact /32
+        # above is reserved source-only space).
+        return "Reserved"
+    if any(needle in folded for needle in TUNNELING_NAMES):
+        # Documented safest handling: deny, never classify by the embedded
+        # address, even where the registry claims the prefix reachable.
+        return "Reserved"
+    return "Global" if globally_reachable else "Reserved"
+
+
+def parse_network(block: str, path: pathlib.Path, line_hint: int):
+    text = strip_annotations(block)
+    try:
+        return ipaddress.ip_network(text, strict=True)
+    except ValueError as error:
+        raise SystemExit(
+            f"{path}: malformed address block {text!r} (row {line_hint}): {error}"
+        )
+
+
+def load_rows(path: pathlib.Path, is_v6: bool):
+    text = path.read_text(encoding="utf-8-sig")
+    reader = csv.reader(io.StringIO(text))
+    try:
+        header = next(reader)
+    except StopIteration:
+        raise SystemExit(f"{path}: empty CSV")
+    index = {name.strip(): i for i, name in enumerate(header)}
+    for required in ("Address Block", "Name", "Globally Reachable"):
+        if required not in index:
+            raise SystemExit(f"{path}: missing column {required!r}")
+    rows = []
+    for line, row in enumerate(reader, start=2):
+        if not any(cell.strip() for cell in row):
+            continue
+        if len(row) < len(header):
+            row = row + [""] * (len(header) - len(row))
+        block_cell = row[index["Address Block"]]
+        name = row[index["Name"]]
+        reachable = parse_truthy(row[index["Globally Reachable"]])
+        for block in block_cell.split(","):
+            if not strip_annotations(block):
+                continue
+            network = parse_network(block, path, line)
+            rows.append(
+                {
+                    "v6": is_v6,
+                    "network": network,
+                    "name": strip_annotations(name),
+                    "globally_reachable": reachable,
+                    "class": class_for(name, reachable),
+                }
+            )
+    if not rows:
+        raise SystemExit(f"{path}: no rows")
+    return rows
+
+
+def render_row(row) -> str:
+    packed = row["network"].network_address.packed
+    prefix = list(packed) + [0] * (16 - len(packed))
+    prefix_text = ", ".join(str(byte) for byte in prefix)
+    v6 = "true" if row["v6"] else "false"
+    return (
+        f"    IanaRow {{ v6: {v6}, len: {row['network'].prefixlen}, "
+        f"prefix: [{prefix_text}], class: AddressClass::{row['class']} }},"
+    )
+
+
+def render_section() -> str:
+    rows = []
+    for filename, is_v6 in CSV_SOURCES:
+        rows.extend(load_rows(DATA_DIR / filename, is_v6))
+    # Longest prefix first (per family), then network bytes: classify_ip
+    # scans the whole table and keeps the longest match, but the emitted
+    # order makes the first hit the longest one for human reading too.
+    rows.sort(
+        key=lambda row: (
+            row["v6"],
+            -row["network"].prefixlen,
+            row["network"].network_address.packed,
+        )
+    )
+    if sum(1 for row in rows if not row["v6"]) < 20 or sum(
+        1 for row in rows if row["v6"]
+    ) < 20:
+        raise SystemExit("refusing to emit a suspiciously small IANA table")
+    lines = [
+        BEGIN_MARKER,
+        "#[rustfmt::skip]",
+        "pub(crate) static IANA_SPECIAL_TABLE: &[IanaRow] = &[",
+    ]
+    lines.extend(render_row(row) for row in rows)
+    lines.append("];")
+    lines.append(END_MARKER)
+    return "\n".join(lines)
+
+
+def committed_section(text: str):
+    start = text.find(BEGIN_MARKER)
+    end = text.find(END_MARKER)
+    if start < 0 or end < 0 or end < start:
+        return None
+    return text[start : end + len(END_MARKER)]
+
+
+def main() -> int:
+    check = "--check" in sys.argv[1:]
+    unknown = [arg for arg in sys.argv[1:] if arg != "--check"]
+    if unknown:
+        print(f"unknown argument(s): {' '.join(unknown)}", file=sys.stderr)
+        return 2
+    expected = render_section()
+    text = NETWORK_RS.read_text(encoding="utf-8")
+    committed = committed_section(text)
+    if check:
+        if committed is None:
+            print(
+                f"STALE: {NETWORK_RS} has no generated IANA table markers; "
+                "run scripts/generate-iana-network-table",
+                file=sys.stderr,
+            )
+            return 1
+        if committed != expected:
+            expected_lines = expected.splitlines()
+            committed_lines = committed.splitlines()
+            for i in range(max(len(expected_lines), len(committed_lines))):
+                want = expected_lines[i] if i < len(expected_lines) else "<missing>"
+                got = committed_lines[i] if i < len(committed_lines) else "<missing>"
+                if want != got:
+                    print(
+                        "STALE: the committed IANA table differs from the "
+                        f"pinned CSVs at generated line {i + 1}:\n"
+                        f"  expected: {want}\n"
+                        f"  committed: {got}\n"
+                        "Run scripts/generate-iana-network-table",
+                        file=sys.stderr,
+                    )
+                    break
+            else:
+                print("STALE: the committed IANA table differs", file=sys.stderr)
+            return 1
+        print("generate-iana-network-table: OK (table matches the pinned CSVs)")
+        return 0
+    if committed is None:
+        print(
+            f"{NETWORK_RS}: generated table markers not found; add "
+            f"`{BEGIN_MARKER}` / `{END_MARKER}` first",
+            file=sys.stderr,
+        )
+        return 1
+    start = text.find(BEGIN_MARKER)
+    end = text.find(END_MARKER) + len(END_MARKER)
+    updated = text[:start] + expected + text[end:]
+    NETWORK_RS.write_text(updated, encoding="utf-8")
+    print(f"generate-iana-network-table: wrote {NETWORK_RS}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

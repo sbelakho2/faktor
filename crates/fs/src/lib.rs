@@ -554,30 +554,52 @@ impl WorkspaceHandle {
         self.resolve(rel).map(|p| p.exists()).unwrap_or(false)
     }
 
+    /// Legacy listing API: handle-relative now (the rooted-directory
+    /// authority enumerates an open directory handle; no path is reopened),
+    /// silently capped at `max_entries` for compatibility. Callers that must
+    /// know about truncation use [`Self::list_entries`].
     pub fn list(&self, rel: &Path, max_entries: usize) -> Result<Vec<FileMeta>, Error> {
-        let path = self.resolve(rel)?;
-        let mut out = Vec::new();
-        let rd = fs::read_dir(&path).map_err(|e| err_not_found(rel, e))?;
-        for entry in rd.flatten() {
-            if out.len() >= max_entries {
-                break;
-            }
-            if let Ok(meta) = entry.metadata() {
-                let modified_ms = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                out.push(FileMeta {
-                    path: entry.path(),
-                    size: meta.len(),
-                    modified_ms,
-                });
-            }
-        }
-        out.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(out)
+        let listing = self.list_entries(rel, max_entries)?;
+        Ok(listing
+            .entries
+            .into_iter()
+            .map(|entry| FileMeta {
+                path: self.root.join(&entry.rel),
+                size: entry.size,
+                modified_ms: entry.modified_ms,
+            })
+            .collect())
+    }
+
+    /// Handle-relative enumeration through the rooted-directory authority
+    /// (P0-52): the directory is reached by an `openat`/handle walk and its
+    /// children are inspected relative to the open handle — never a
+    /// resolve-then-`read_dir` by pathname. `truncated` reports that the
+    /// directory held more than `max` entries.
+    pub fn list_entries(&self, rel: &Path, max: usize) -> Result<crate::rooted::DirListing, Error> {
+        let rooted = RootedDir::open(&self.root)?;
+        rooted.list_entries(rel, max)
+    }
+
+    /// Budgeted handle-relative recursive walk (the shared traversal
+    /// primitive for upper-layer walkers). Every entry is charged to
+    /// `budget`; the visitor may charge reads and stop early.
+    pub fn walk_bounded<F>(
+        &self,
+        rel: &Path,
+        budget: &mut crate::rooted::WalkBudget,
+        skip_dirs: &[&str],
+        visit: &mut F,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(
+            &crate::rooted::RootedEntry,
+            usize,
+            &mut crate::rooted::WalkBudget,
+        ) -> Result<crate::rooted::WalkStep, Error>,
+    {
+        let rooted = RootedDir::open(&self.root)?;
+        rooted.walk_bounded(rel, budget, skip_dirs, visit)
     }
 
     pub fn events(&self) -> &Mutex<mpsc::Receiver<FsEvent>> {
@@ -609,7 +631,7 @@ fn err_not_found(rel: &Path, e: std::io::Error) -> Error {
 /// ran): the size that decides `Full` vs `Slice` is the file's size at open
 /// time (fstat), so no path string is re-resolved here. Either the whole
 /// file is read (`Full` digest) or exactly `max_bytes` (`Slice` digest).
-fn read_open_bounded(
+pub(crate) fn read_open_bounded(
     f: &mut fs::File,
     rel: &Path,
     max_bytes: usize,

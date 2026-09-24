@@ -12,8 +12,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use faktor_browser::{
-    BrokerConfig, BrokerState, DestinationPolicy, EgressBroker, HostPattern, ProxyCredentials,
-    UpstreamProxy, UpstreamSelector,
+    BrokerConfig, BrokerState, DestinationPolicy, EgressAddressPolicy, EgressBroker, HostPattern,
+    ProxyCredentials, UpstreamProxy, UpstreamSelector,
 };
 
 async fn spawn_origin(body: &'static str) -> SocketAddr {
@@ -177,7 +177,9 @@ async fn upstream_credentials_stay_on_the_broker_leg() {
         policy: policy(vec![HostPattern::parse("127.0.0.1").unwrap()])
             .with_allowed_ports(vec![9, 80, 443]),
         upstream: UpstreamSelector::new(Some(
-            UpstreamProxy::new("127.0.0.1", upstream.port()).with_credentials(credentials),
+            UpstreamProxy::new("127.0.0.1", upstream.port())
+                .with_address_policy(EgressAddressPolicy::LOCAL)
+                .with_credentials(credentials),
         )),
         ..BrokerConfig::default()
     })
@@ -408,7 +410,10 @@ async fn smuggled_header_lines_and_connection_tokens_never_reach_the_upstream() 
     let broker = EgressBroker::start(BrokerConfig {
         policy: policy(vec![HostPattern::parse("127.0.0.1").unwrap()])
             .with_allowed_ports(vec![9, 80, 443]),
-        upstream: UpstreamSelector::new(Some(UpstreamProxy::new("127.0.0.1", upstream.port()))),
+        upstream: UpstreamSelector::new(Some(
+            UpstreamProxy::new("127.0.0.1", upstream.port())
+                .with_address_policy(EgressAddressPolicy::LOCAL),
+        )),
         ..BrokerConfig::default()
     })
     .await
@@ -723,7 +728,12 @@ fn upstream_config(upstream: SocketAddr) -> BrokerConfig {
     BrokerConfig {
         policy: policy(vec![HostPattern::parse("127.0.0.1").unwrap()])
             .with_allowed_ports(vec![9, 80, 443]),
-        upstream: UpstreamSelector::new(Some(UpstreamProxy::new("127.0.0.1", upstream.port()))),
+        upstream: UpstreamSelector::new(Some(
+            UpstreamProxy::new("127.0.0.1", upstream.port())
+                // The mock upstream is local: its OWN leg needs the explicit
+                // local rule (never inherited from the destination policy).
+                .with_address_policy(EgressAddressPolicy::LOCAL),
+        )),
         ..BrokerConfig::default()
     }
 }
@@ -1238,7 +1248,10 @@ async fn upstream_connect_status_lines_are_parsed_strictly() {
     ];
     let upstream = spawn_scripted_upstream(responses).await;
     let broker = EgressBroker::start(BrokerConfig {
-        upstream: UpstreamSelector::new(Some(UpstreamProxy::new("127.0.0.1", upstream.port()))),
+        upstream: UpstreamSelector::new(Some(
+            UpstreamProxy::new("127.0.0.1", upstream.port())
+                .with_address_policy(EgressAddressPolicy::LOCAL),
+        )),
         ..upstream_config(upstream)
     })
     .await
@@ -1383,12 +1396,37 @@ async fn connect_tunnels_require_an_https_capable_policy() {
 }
 
 #[tokio::test]
-async fn explicit_literal_destinations_are_admitted_but_resolved_loopback_is_not() {
+async fn literal_and_resolved_loopback_need_the_explicit_address_rule() {
     let origin = spawn_origin("literal-ok").await;
-    // The policy EXPLICITLY names the literal 127.0.0.1 destination: a
-    // literal cannot be rebound, so it is admitted.
+    // A literal 127.0.0.1 destination is NOT a bypass: without the explicit
+    // address rule it is refused by the SAME class vetting a resolved name
+    // gets, before any socket connects.
     let broker = EgressBroker::start(BrokerConfig {
         policy: DestinationPolicy::first_party_only(vec![HostPattern::parse("127.0.0.1").unwrap()])
+            .with_allowed_ports(vec![origin.port()]),
+        ..BrokerConfig::default()
+    })
+    .await
+    .unwrap();
+    let refused = send_raw(
+        broker.addr(),
+        &format!(
+            "GET http://127.0.0.1:{}/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            origin.port()
+        ),
+    )
+    .await;
+    assert!(refused.starts_with("HTTP/1.1 502"), "{refused}");
+    assert!(
+        refused.contains("loopback"),
+        "the refusal names the address class: {refused}"
+    );
+    broker.shutdown().await;
+
+    // The explicit loopback address rule admits the literal...
+    let broker = EgressBroker::start(BrokerConfig {
+        policy: DestinationPolicy::first_party_only(vec![HostPattern::parse("127.0.0.1").unwrap()])
+            .with_allow_loopback(true)
             .with_allowed_ports(vec![origin.port()]),
         ..BrokerConfig::default()
     })
@@ -1405,9 +1443,10 @@ async fn explicit_literal_destinations_are_admitted_but_resolved_loopback_is_not
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     broker.shutdown().await;
 
-    // The policy names the NAME `localhost`, which resolves onto loopback:
-    // without the explicit address rule the connect is refused after the
-    // one resolution, before any socket connects.
+    // ...and the policy names the NAME `localhost`, which resolves onto
+    // loopback: without the explicit address rule that connect is refused
+    // after the one resolution, before any socket connects. The rule is per
+    // address class, never per spelling.
     let broker = EgressBroker::start(BrokerConfig {
         policy: DestinationPolicy::first_party_only(vec![HostPattern::parse("localhost").unwrap()])
             .with_allowed_ports(vec![origin.port()]),

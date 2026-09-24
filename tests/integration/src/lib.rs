@@ -309,8 +309,8 @@ async fn permission_flow_end_to_end() {
     while std::time::Instant::now() < perm_deadline {
         if let Some(pid) = perm.pending_ids().first().copied() {
             assert!(
-                perm.resolve(pid, PermissionDecision::Allow)
-                    .expect("permission authority is not poisoned"),
+                perm.resolve(row.id(), pid, PermissionDecision::Allow)
+                    .expect("the permission belongs to the driving session"),
                 "resolve once"
             );
             resolved = true;
